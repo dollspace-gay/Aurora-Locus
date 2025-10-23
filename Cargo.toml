@@ -1,0 +1,84 @@
+[package]
+name = "aurora-locus"
+version = "0.1.0"
+edition = "2021"
+authors = ["Aurora Locus Contributors"]
+description = "ATProto Personal Data Server implementation in Rust"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Use parent SDK for ATProto functionality
+atproto = { path = ".." }
+
+# HTTP Server
+axum = { version = "0.7", features = ["tokio", "ws"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "trace", "cors", "compression-gzip"] }
+futures = "0.3"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Configuration
+dotenv = "0.15"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Email
+lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder"] }
+
+# Rate limiting
+governor = "0.7"
+
+# Random generation
+rand = "0.8"
+
+# Blob storage (S3) - Disabled for Phase 1, will enable in Phase 4
+# aws-sdk-s3 = "1"
+# aws-config = "1"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+jsonwebtoken = "9"
+
+# Validation
+validator = { version = "0.18", features = ["derive"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# IPLD for content addressing
+libipld = "0.16"
+serde_cbor = "0.11"
+
+# Async trait for blob storage
+async-trait = "0.1"
+
+# Hex encoding for CID
+hex = "0.4"
+
+# SHA-256 hashing for blob CIDs
+sha2 = "0.10"
+
+# Image processing for thumbnails and metadata
+image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
