@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Admin Panel Debug</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1e1e1e; color: #d4d4d4; }
+        h1 { color: #4ec9b0; }
+        h2 { color: #569cd6; margin-top: 30px; }
+        .section { background: #252526; padding: 15px; margin: 10px 0; border-left: 3px solid #007acc; }
+        pre { background: #1e1e1e; padding: 10px; overflow-x: auto; }
+        button { background: #007acc; color: white; border: none; padding: 10px 20px; cursor: pointer; margin: 5px; }
+        button:hover { background: #005a9e; }
+        .error { color: #f48771; }
+        .success { color: #4ec9b0; }
+        .warning { color: #dcdcaa; }
+    </style>
+</head>
+<body>
+    <h1>🔍 Admin Panel Debug Tool</h1>
+
+    <div class="section">
+        <h2>1. LocalStorage Contents</h2>
+        <pre id="localStorage-content"></pre>
+    </div>
+
+    <div class="section">
+        <h2>2. Test Admin Endpoints</h2>
+        <button onclick="testEndpoint('getStats')">Test getStats</button>
+        <button onclick="testEndpoint('getUsers')">Test getUsers</button>
+        <button onclick="testEndpoint('createInviteCode')">Test createInviteCode</button>
+        <button onclick="testEndpoint('listInviteCodes')">Test listInviteCodes</button>
+        <pre id="test-results"></pre>
+    </div>
+
+    <div class="section">
+        <h2>3. Test Session</h2>
+        <button onclick="testSession()">Test getSession</button>
+        <pre id="session-results"></pre>
+    </div>
+
+    <div class="section">
+        <h2>4. Actions</h2>
+        <button onclick="window.location.href='/admin/login.html'">Go to Login</button>
+        <button onclick="clearStorage()">Clear LocalStorage</button>
+        <button onclick="location.reload()">Refresh Page</button>
+    </div>
+
+    <script>
+        const API_BASE = '/xrpc';
+
+        // Display localStorage contents
+        function showLocalStorage() {
+            const content = document.getElementById('localStorage-content');
+            const data = {
+                adminToken: localStorage.getItem('adminToken'),
+                adminDid: localStorage.getItem('adminDid'),
+                adminHandle: localStorage.getItem('adminHandle')
+            };
+            content.textContent = JSON.stringify(data, null, 2);
+
+            if (!data.adminToken) {
+                content.innerHTML += '\n\n<span class="error">⚠️ No adminToken found! You need to login first.</span>';
+            }
+        }
+
+        async function testEndpoint(endpoint) {
+            const results = document.getElementById('test-results');
+            results.textContent = `Testing ${endpoint}...\n`;
+
+            const token = localStorage.getItem('adminToken');
+            if (!token) {
+                results.innerHTML += '<span class="error">ERROR: No token in localStorage</span>';
+                return;
+            }
+
+            const endpoints = {
+                getStats: { method: 'GET', url: `${API_BASE}/com.atproto.admin.getStats` },
+                getUsers: { method: 'GET', url: `${API_BASE}/com.atproto.admin.getUsers?limit=5` },
+                createInviteCode: { method: 'POST', url: `${API_BASE}/com.atproto.admin.createInviteCode`, body: {uses: 1} },
+                listInviteCodes: { method: 'GET', url: `${API_BASE}/com.atproto.admin.listInviteCodes` }
+            };
+
+            const config = endpoints[endpoint];
+
+            try {
+                const options = {
+                    method: config.method,
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    }
+                };
+
+                if (config.body) {
+                    options.body = JSON.stringify(config.body);
+                }
+
+                const response = await fetch(config.url, options);
+                const data = await response.json();
+
+                results.innerHTML += `\n<span class="warning">Status: ${response.status} ${response.statusText}</span>\n`;
+                results.textContent += JSON.stringify(data, null, 2);
+
+                if (response.ok) {
+                    results.innerHTML += '\n\n<span class="success">✅ SUCCESS</span>';
+                } else {
+                    results.innerHTML += '\n\n<span class="error">❌ FAILED</span>';
+                }
+            } catch (error) {
+                results.innerHTML += `\n<span class="error">ERROR: ${error.message}</span>`;
+            }
+        }
+
+        async function testSession() {
+            const results = document.getElementById('session-results');
+            results.textContent = 'Testing session...\n';
+
+            const token = localStorage.getItem('adminToken');
+            if (!token) {
+                results.innerHTML += '<span class="error">ERROR: No token in localStorage</span>';
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/com.atproto.server.getSession`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                const data = await response.json();
+
+                results.innerHTML += `\n<span class="warning">Status: ${response.status}</span>\n`;
+                results.textContent += JSON.stringify(data, null, 2);
+
+                if (response.ok) {
+                    results.innerHTML += '\n\n<span class="success">✅ Session is valid</span>';
+                } else {
+                    results.innerHTML += '\n\n<span class="error">❌ Session is invalid</span>';
+                }
+            } catch (error) {
+                results.innerHTML += `\n<span class="error">ERROR: ${error.message}</span>`;
+            }
+        }
+
+        function clearStorage() {
+            localStorage.clear();
+            alert('LocalStorage cleared! Refresh to see changes.');
+            location.reload();
+        }
+
+        // Auto-run on load
+        showLocalStorage();
+    </script>
+</body>
+</html>

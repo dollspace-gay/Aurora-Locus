@@ -1,0 +1,716 @@
+/// Admin Panel API Endpoints
+///
+/// Provides REST API endpoints for the web-based admin panel, including:
+/// - Statistics and metrics
+/// - User management
+/// - Moderation queue
+/// - Report review
+/// - Invite code management
+/// - Settings configuration
+
+use crate::context::AppContext;
+use crate::error::{PdsError, PdsResult};
+use crate::auth::verify_admin_token;
+use axum::{
+    extract::{Query, State},
+    http::{header, StatusCode},
+    response::{Json, Response},
+    routing::{get, post},
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use tracing::{info, warn};
+
+/// Admin panel routes
+pub fn routes() -> Router<AppContext> {
+    Router::new()
+        .route("/xrpc/com.atproto.admin.getStats", get(get_stats))
+        .route("/xrpc/com.atproto.admin.listAccounts", get(list_accounts))
+        .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
+        .route("/xrpc/com.atproto.admin.updateSubjectStatus", post(update_subject_status))
+        .route("/xrpc/com.atproto.admin.getModerationQueue", get(get_moderation_queue))
+        .route("/xrpc/com.atproto.admin.listReports", get(list_reports))
+        .route("/xrpc/com.atproto.admin.getReport", get(get_report))
+        .route("/xrpc/com.atproto.admin.resolveReport", post(resolve_report))
+        .route("/xrpc/com.atproto.admin.listInviteCodes", get(list_invite_codes))
+        .route("/xrpc/com.atproto.admin.createInviteCodes", post(create_invite_codes))
+        .route("/xrpc/com.atproto.admin.disableInviteCode", post(disable_invite_code))
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminStats {
+    #[serde(rename = "totalUsers")]
+    pub total_users: i64,
+    #[serde(rename = "totalPosts")]
+    pub total_posts: i64,
+    #[serde(rename = "pendingReports")]
+    pub pending_reports: i64,
+    #[serde(rename = "storageUsed")]
+    pub storage_used: i64,
+    #[serde(rename = "activeUsers24h")]
+    pub active_users_24h: i64,
+    #[serde(rename = "activeUsers7d")]
+    pub active_users_7d: i64,
+}
+
+/// Get admin statistics
+async fn get_stats(
+    State(ctx): State<AppContext>,
+    headers: axum::http::HeaderMap,
+) -> PdsResult<Json<AdminStats>> {
+    // Verify admin authorization
+    verify_admin_from_headers(&headers)?;
+
+    info!("Admin stats requested");
+
+    // Get total users count
+    let total_users = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM accounts"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(0);
+
+    // Get total posts count (from repo records)
+    let total_posts = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM records WHERE collection = 'app.bsky.feed.post'"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(0);
+
+    // Get pending reports count
+    let pending_reports = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM moderation_reports WHERE status = 'open'"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(0);
+
+    // Calculate storage used (blob storage size)
+    let storage_used = calculate_storage_usage(&ctx).await.unwrap_or(0);
+
+    // Active users in last 24 hours
+    let active_users_24h = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(DISTINCT did) FROM sessions WHERE last_active > datetime('now', '-1 day')"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(0);
+
+    // Active users in last 7 days
+    let active_users_7d = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(DISTINCT did) FROM sessions WHERE last_active > datetime('now', '-7 days')"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(0);
+
+    Ok(Json(AdminStats {
+        total_users,
+        total_posts,
+        pending_reports,
+        storage_used,
+        active_users_24h,
+        active_users_7d,
+    }))
+}
+
+async fn calculate_storage_usage(ctx: &AppContext) -> PdsResult<i64> {
+    // Sum up blob sizes from database
+    let total_size = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT SUM(size) FROM blobs"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
+    Ok(total_size)
+}
+
+// ============================================================================
+// User Management
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountInfo {
+    pub did: String,
+    pub handle: String,
+    pub email: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    pub status: String,
+    #[serde(rename = "postsCount")]
+    pub posts_count: i64,
+    #[serde(rename = "followersCount")]
+    pub followers_count: i64,
+    #[serde(rename = "followingCount")]
+    pub following_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListAccountsQuery {
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListAccountsResponse {
+    pub accounts: Vec<AccountInfo>,
+    pub cursor: Option<String>,
+}
+
+/// List user accounts
+async fn list_accounts(
+    State(ctx): State<AppContext>,
+    Query(params): Query<ListAccountsQuery>,
+    headers: axum::http::HeaderMap,
+) -> PdsResult<Json<ListAccountsResponse>> {
+    verify_admin_from_headers(&headers)?;
+
+    let limit = params.limit.unwrap_or(50).min(200);
+
+    info!("Listing accounts (limit: {})", limit);
+
+    let accounts = sqlx::query_as::<_, (String, String, Option<String>, String, String)>(
+        "SELECT did, handle, email, created_at, status FROM accounts ORDER BY created_at DESC LIMIT ?"
+    )
+    .bind(limit)
+    .fetch_all(&ctx.account_db)
+    .await?;
+
+    let mut account_infos = Vec::new();
+    for (did, handle, email, created_at, status) in accounts {
+        // Get posts count
+        let posts_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM records WHERE did = ? AND collection = 'app.bsky.feed.post'"
+        )
+        .bind(&did)
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap_or(0);
+
+        // Get followers/following counts (simplified - would need graph traversal)
+        let followers_count = 0;
+        let following_count = 0;
+
+        account_infos.push(AccountInfo {
+            did,
+            handle,
+            email,
+            created_at,
+            status,
+            posts_count,
+            followers_count,
+            following_count,
+        });
+    }
+
+    Ok(Json(ListAccountsResponse {
+        accounts: account_infos,
+        cursor: None,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetAccountQuery {
+    pub did: String,
+}
+
+/// Get single account details
+async fn get_account(
+    State(ctx): State<AppContext>,
+    Query(params): Query<GetAccountQuery>,
+    headers: axum::http::HeaderMap,
+) -> PdsResult<Json<AccountInfo>> {
+    verify_admin_from_headers(&headers)?;
+
+    info!("Getting account details for {}", params.did);
+
+    let account = sqlx::query_as::<_, (String, String, Option<String>, String, String)>(
+        "SELECT did, handle, email, created_at, status FROM accounts WHERE did = ?"
+    )
+    .bind(&params.did)
+    .fetch_optional(&ctx.account_db)
+    .await?;
+
+    let (did, handle, email, created_at, status) = account
+        .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
+
+    // Get posts count
+    let posts_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM records WHERE did = ? AND collection = 'app.bsky.feed.post'"
+    )
+    .bind(&did)
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(0);
+
+    Ok(Json(AccountInfo {
+        did,
+        handle,
+        email,
+        created_at,
+        status,
+        posts_count,
+        followers_count: 0,
+        following_count: 0,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateSubjectStatusRequest {
+    pub subject: SubjectRef,
+    pub takedown: Option<TakedownStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubjectRef {
+    pub did: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TakedownStatus {
+    pub applied: bool,
+}
+
+/// Update account or content status (suspend/unsuspend)
+async fn update_subject_status(
+    State(ctx): State<AppContext>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<UpdateSubjectStatusRequest>,
+) -> PdsResult<Json<serde_json::Value>> {
+    verify_admin_from_headers(&headers)?;
+
+    let new_status = if request.takedown.as_ref().map(|t| t.applied).unwrap_or(false) {
+        "suspended"
+    } else {
+        "active"
+    };
+
+    info!("Updating subject status for {} to {}", request.subject.did, new_status);
+
+    sqlx::query(
+        "UPDATE accounts SET status = ? WHERE did = ?"
+    )
+    .bind(new_status)
+    .bind(&request.subject.did)
+    .execute(&ctx.account_db)
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "subject": request.subject.did,
+        "status": new_status
+    })))
+}
+
+// ============================================================================
+// Moderation Queue
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModerationItem {
+    pub id: String,
+    #[serde(rename = "reasonType")]
+    pub reason_type: String,
+    #[serde(rename = "reportedBy")]
+    pub reported_by: String,
+    pub content: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetModerationQueueQuery {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModerationQueueResponse {
+    pub items: Vec<ModerationItem>,
+}
+
+/// Get moderation queue items
+async fn get_moderation_queue(
+    State(ctx): State<AppContext>,
+    Query(params): Query<GetModerationQueueQuery>,
+    headers: axum::http::HeaderMap,
+) -> PdsResult<Json<ModerationQueueResponse>> {
+    verify_admin_from_headers(&headers)?;
+
+    let limit = params.limit.unwrap_or(50).min(200);
+
+    info!("Getting moderation queue (limit: {})", limit);
+
+    let items = sqlx::query_as::<_, (String, String, String, String, String)>(
+        "SELECT id, reason_type, reported_by, subject_uri, status
+         FROM moderation_reports
+         WHERE status = 'open'
+         ORDER BY created_at DESC
+         LIMIT ?"
+    )
+    .bind(limit)
+    .fetch_all(&ctx.account_db)
+    .await
+    .unwrap_or_default();
+
+    let mod_items: Vec<ModerationItem> = items.into_iter().map(|(id, reason_type, reported_by, content, status)| {
+        ModerationItem {
+            id,
+            reason_type,
+            reported_by,
+            content,
+            status,
+        }
+    }).collect();
+
+    Ok(Json(ModerationQueueResponse {
+        items: mod_items,
+    }))
+}
+
+// ============================================================================
+// Reports
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportInfo {
+    pub id: String,
+    #[serde(rename = "reasonType")]
+    pub reason_type: String,
+    #[serde(rename = "reportedBy")]
+    pub reported_by: String,
+    pub subject: String,
+    pub reason: String,
+    pub status: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListReportsQuery {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListReportsResponse {
+    pub reports: Vec<ReportInfo>,
+}
+
+/// List moderation reports
+async fn list_reports(
+    State(ctx): State<AppContext>,
+    Query(params): Query<ListReportsQuery>,
+    headers: axum::http::HeaderMap,
+) -> PdsResult<Json<ListReportsResponse>> {
+    verify_admin_from_headers(&headers)?;
+
+    let limit = params.limit.unwrap_or(50).min(200);
+
+    info!("Listing reports (limit: {})", limit);
+
+    let reports = sqlx::query_as::<_, (String, String, String, String, String, String, String)>(
+        "SELECT id, reason_type, reported_by, subject_uri, reason_text, status, created_at
+         FROM moderation_reports
+         ORDER BY created_at DESC
+         LIMIT ?"
+    )
+    .bind(limit)
+    .fetch_all(&ctx.account_db)
+    .await
+    .unwrap_or_default();
+
+    let report_infos: Vec<ReportInfo> = reports.into_iter().map(|(id, reason_type, reported_by, subject, reason, status, created_at)| {
+        ReportInfo {
+            id,
+            reason_type,
+            reported_by,
+            subject,
+            reason,
+            status,
+            created_at,
+        }
+    }).collect();
+
+    Ok(Json(ListReportsResponse {
+        reports: report_infos,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetReportQuery {
+    pub id: String,
+}
+
+/// Get single report details
+async fn get_report(
+    State(ctx): State<AppContext>,
+    Query(params): Query<GetReportQuery>,
+    headers: axum::http::HeaderMap,
+) -> PdsResult<Json<ReportInfo>> {
+    verify_admin_from_headers(&headers)?;
+
+    info!("Getting report {}", params.id);
+
+    let report = sqlx::query_as::<_, (String, String, String, String, String, String, String)>(
+        "SELECT id, reason_type, reported_by, subject_uri, reason_text, status, created_at
+         FROM moderation_reports
+         WHERE id = ?"
+    )
+    .bind(&params.id)
+    .fetch_optional(&ctx.account_db)
+    .await?;
+
+    let (id, reason_type, reported_by, subject, reason, status, created_at) = report
+        .ok_or_else(|| PdsError::NotFound("Report not found".to_string()))?;
+
+    Ok(Json(ReportInfo {
+        id,
+        reason_type,
+        reported_by,
+        subject,
+        reason,
+        status,
+        created_at,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveReportRequest {
+    pub id: String,
+    pub action: String, // "dismiss" or "takedown"
+}
+
+/// Resolve a moderation report
+async fn resolve_report(
+    State(ctx): State<AppContext>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ResolveReportRequest>,
+) -> PdsResult<Json<serde_json::Value>> {
+    verify_admin_from_headers(&headers)?;
+
+    info!("Resolving report {} with action {}", request.id, request.action);
+
+    let new_status = match request.action.as_str() {
+        "dismiss" => "dismissed",
+        "takedown" => "resolved",
+        _ => return Err(PdsError::Validation("Invalid action".to_string())),
+    };
+
+    sqlx::query(
+        "UPDATE moderation_reports SET status = ? WHERE id = ?"
+    )
+    .bind(new_status)
+    .bind(&request.id)
+    .execute(&ctx.account_db)
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "id": request.id,
+        "status": new_status
+    })))
+}
+
+// ============================================================================
+// Invite Codes
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteCodeInfo {
+    pub code: String,
+    pub uses: i64,
+    pub available: i64,
+    #[serde(rename = "createdBy")]
+    pub created_by: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListInviteCodesQuery {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListInviteCodesResponse {
+    pub codes: Vec<InviteCodeInfo>,
+}
+
+/// List invite codes
+async fn list_invite_codes(
+    State(ctx): State<AppContext>,
+    Query(params): Query<ListInviteCodesQuery>,
+    headers: axum::http::HeaderMap,
+) -> PdsResult<Json<ListInviteCodesResponse>> {
+    verify_admin_from_headers(&headers)?;
+
+    let limit = params.limit.unwrap_or(100).min(500);
+
+    info!("Listing invite codes (limit: {})", limit);
+
+    let codes = sqlx::query_as::<_, (String, i64, i64, String, String, bool)>(
+        "SELECT code, uses, available, created_by, created_at, disabled
+         FROM invite_codes
+         ORDER BY created_at DESC
+         LIMIT ?"
+    )
+    .bind(limit)
+    .fetch_all(&ctx.account_db)
+    .await
+    .unwrap_or_default();
+
+    let code_infos: Vec<InviteCodeInfo> = codes.into_iter().map(|(code, uses, available, created_by, created_at, disabled)| {
+        InviteCodeInfo {
+            code,
+            uses,
+            available,
+            created_by,
+            created_at,
+            disabled,
+        }
+    }).collect();
+
+    Ok(Json(ListInviteCodesResponse {
+        codes: code_infos,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateInviteCodesRequest {
+    pub count: i64,
+    #[serde(rename = "useCount")]
+    pub use_count: i64,
+}
+
+/// Create new invite codes
+async fn create_invite_codes(
+    State(ctx): State<AppContext>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<CreateInviteCodesRequest>,
+) -> PdsResult<Json<serde_json::Value>> {
+    verify_admin_from_headers(&headers)?;
+
+    let admin_did = extract_admin_did_from_headers(&headers)?;
+
+    info!("Creating {} invite codes", request.count);
+
+    let mut codes = Vec::new();
+    for _ in 0..request.count {
+        let code = generate_invite_code();
+
+        sqlx::query(
+            "INSERT INTO invite_codes (code, uses, available, created_by, created_at, disabled)
+             VALUES (?, 0, ?, ?, datetime('now'), 0)"
+        )
+        .bind(&code)
+        .bind(request.use_count)
+        .bind(&admin_did)
+        .execute(&ctx.account_db)
+        .await?;
+
+        codes.push(code);
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "codes": codes
+    })))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DisableInviteCodeRequest {
+    pub code: String,
+}
+
+/// Disable an invite code
+async fn disable_invite_code(
+    State(ctx): State<AppContext>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<DisableInviteCodeRequest>,
+) -> PdsResult<Json<serde_json::Value>> {
+    verify_admin_from_headers(&headers)?;
+
+    info!("Disabling invite code {}", request.code);
+
+    sqlx::query(
+        "UPDATE invite_codes SET disabled = 1 WHERE code = ?"
+    )
+    .bind(&request.code)
+    .execute(&ctx.account_db)
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "code": request.code
+    })))
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Verify admin authorization from request headers
+fn verify_admin_from_headers(headers: &axum::http::HeaderMap) -> PdsResult<()> {
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
+
+    // Extract token from "Bearer <token>"
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| PdsError::Authentication("Invalid authorization header".to_string()))?;
+
+    // Verify this is an admin token (simplified - would use proper JWT verification)
+    verify_admin_token(token)?;
+
+    Ok(())
+}
+
+/// Extract admin DID from authorization headers
+fn extract_admin_did_from_headers(_headers: &axum::http::HeaderMap) -> PdsResult<String> {
+    // Simplified - would extract from verified JWT
+    // In production, parse JWT and extract DID from claims
+    Ok("did:web:admin.localhost".to_string())
+}
+
+/// Generate a random invite code
+fn generate_invite_code() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+
+    (0..16)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_invite_code() {
+        let code = generate_invite_code();
+        assert_eq!(code.len(), 16);
+        assert!(code.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn test_generate_unique_codes() {
+        let code1 = generate_invite_code();
+        let code2 = generate_invite_code();
+        assert_ne!(code1, code2);
+    }
+}

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aurora Locus - Admin Login</title>
+    <link rel="stylesheet" href="login.css">
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-card">
+            <div class="login-header">
+                <svg class="logo" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                    <path d="M2 17l10 5 10-5"/>
+                    <path d="M2 12l10 5 10-5"/>
+                </svg>
+                <h1>Aurora Locus</h1>
+                <p>Personal Data Server Administration</p>
+            </div>
+
+            <div class="login-form-container">
+                <form id="login-form" onsubmit="handleLogin(event)">
+                    <div class="form-group">
+                        <label for="identifier">Handle or Email</label>
+                        <input
+                            type="text"
+                            id="identifier"
+                            name="identifier"
+                            placeholder="admin@localhost or admin.localhost"
+                            required
+                            autocomplete="username"
+                        >
+                    </div>
+
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input
+                            type="password"
+                            id="password"
+                            name="password"
+                            placeholder="Enter your password"
+                            required
+                            autocomplete="current-password"
+                        >
+                    </div>
+
+                    <div class="form-group checkbox-group">
+                        <label>
+                            <input type="checkbox" id="remember" name="remember">
+                            <span>Remember me</span>
+                        </label>
+                    </div>
+
+                    <div id="error-message" class="error-message" style="display: none;"></div>
+
+                    <button type="submit" class="btn-primary" id="login-btn">
+                        <span class="btn-text">Sign In</span>
+                        <span class="btn-spinner" style="display: none;">
+                            <svg class="spinner" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <circle cx="12" cy="12" r="10" stroke-width="4" stroke-opacity="0.25"/>
+                                <path d="M12 2a10 10 0 0 1 10 10" stroke-width="4"/>
+                            </svg>
+                        </span>
+                    </button>
+                </form>
+
+                <div class="login-footer">
+                    <p>Restricted Access Only</p>
+                    <p class="version">v1.0.0</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="background-pattern"></div>
+    </div>
+
+    <script src="login.js"></script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+{
+  "repo": "did:web:test2.129.222.126.193.0.0.0.0",
+  "collection": "app.bsky.feed.post",
+  "record": {
+    "text": "Hello from Aurora Locus repository!",
+    "createdAt": "2025-10-23T20:00:00Z"
+  }
+}

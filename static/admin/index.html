@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aurora Locus Admin Panel</title>
+    <link rel="stylesheet" href="/admin/style.css">
+</head>
+<body>
+    <div class="admin-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="logo">
+                <h1>Aurora Locus</h1>
+                <p class="subtitle">Admin Panel</p>
+            </div>
+
+            <nav class="nav-menu">
+                <a href="#dashboard" class="nav-item active" data-page="dashboard">
+                    <span class="icon">📊</span>
+                    Dashboard
+                </a>
+                <a href="#users" class="nav-item" data-page="users">
+                    <span class="icon">👥</span>
+                    Users
+                </a>
+                <a href="#moderation" class="nav-item" data-page="moderation">
+                    <span class="icon">🛡️</span>
+                    Moderation Queue
+                    <span class="badge" id="mod-queue-count">0</span>
+                </a>
+                <a href="#reports" class="nav-item" data-page="reports">
+                    <span class="icon">🚨</span>
+                    Reports
+                    <span class="badge" id="reports-count">0</span>
+                </a>
+                <a href="#invites" class="nav-item" data-page="invites">
+                    <span class="icon">✉️</span>
+                    Invite Codes
+                </a>
+                <a href="#settings" class="nav-item" data-page="settings">
+                    <span class="icon">⚙️</span>
+                    Settings
+                </a>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="admin-info">
+                    <p class="admin-name" id="admin-name">Admin</p>
+                    <p class="admin-role">Administrator</p>
+                </div>
+                <button class="btn-logout" onclick="logout()">Logout</button>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Dashboard Page -->
+            <div id="page-dashboard" class="page active">
+                <header class="page-header">
+                    <h2>Dashboard</h2>
+                    <p class="page-subtitle">Overview of your PDS instance</p>
+                </header>
+
+                <!-- Stats Cards -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">👥</div>
+                        <div class="stat-content">
+                            <p class="stat-label">Total Users</p>
+                            <p class="stat-value" id="stat-users">0</p>
+                            <p class="stat-change positive">+12 this week</p>
+                        </div>
+                    </div>
+
+                    <div class="stat-card">
+                        <div class="stat-icon">📝</div>
+                        <div class="stat-content">
+                            <p class="stat-label">Total Posts</p>
+                            <p class="stat-value" id="stat-posts">0</p>
+                            <p class="stat-change positive">+243 today</p>
+                        </div>
+                    </div>
+
+                    <div class="stat-card">
+                        <div class="stat-icon">🛡️</div>
+                        <div class="stat-content">
+                            <p class="stat-label">Pending Reports</p>
+                            <p class="stat-value" id="stat-reports">0</p>
+                            <p class="stat-change">Requires attention</p>
+                        </div>
+                    </div>
+
+                    <div class="stat-card">
+                        <div class="stat-icon">💾</div>
+                        <div class="stat-content">
+                            <p class="stat-label">Storage Used</p>
+                            <p class="stat-value" id="stat-storage">0 GB</p>
+                            <p class="stat-change">of 100 GB</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Charts -->
+                <div class="charts-grid">
+                    <div class="chart-card">
+                        <h3>User Growth</h3>
+                        <canvas id="userGrowthChart"></canvas>
+                    </div>
+
+                    <div class="chart-card">
+                        <h3>Activity Overview</h3>
+                        <canvas id="activityChart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Recent Activity -->
+                <div class="activity-card">
+                    <h3>Recent Activity</h3>
+                    <div class="activity-list" id="recent-activity">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Users Page -->
+            <div id="page-users" class="page">
+                <header class="page-header">
+                    <h2>User Management</h2>
+                    <div class="header-actions">
+                        <input type="text" class="search-input" placeholder="Search users..." id="user-search">
+                        <button class="btn-primary" onclick="exportUsers()">Export</button>
+                    </div>
+                </header>
+
+                <div class="table-card">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Handle</th>
+                                <th>DID</th>
+                                <th>Email</th>
+                                <th>Created</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="users-table">
+                            <!-- Populated by JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Moderation Queue Page -->
+            <div id="page-moderation" class="page">
+                <header class="page-header">
+                    <h2>Moderation Queue</h2>
+                    <div class="header-actions">
+                        <select class="filter-select" id="mod-filter">
+                            <option value="all">All Items</option>
+                            <option value="pending">Pending</option>
+                            <option value="reviewed">Reviewed</option>
+                        </select>
+                    </div>
+                </header>
+
+                <div class="moderation-queue" id="moderation-queue">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+
+            <!-- Reports Page -->
+            <div id="page-reports" class="page">
+                <header class="page-header">
+                    <h2>Content Reports</h2>
+                    <div class="header-actions">
+                        <select class="filter-select" id="report-filter">
+                            <option value="open">Open</option>
+                            <option value="resolved">Resolved</option>
+                            <option value="all">All</option>
+                        </select>
+                    </div>
+                </header>
+
+                <div class="reports-list" id="reports-list">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+
+            <!-- Invite Codes Page -->
+            <div id="page-invites" class="page">
+                <header class="page-header">
+                    <h2>Invite Codes</h2>
+                    <div class="header-actions">
+                        <button class="btn-primary" onclick="generateInvites()">Generate Codes</button>
+                    </div>
+                </header>
+
+                <div class="invite-stats">
+                    <div class="stat-item">
+                        <span class="label">Total Codes:</span>
+                        <span class="value" id="invite-total">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="label">Available:</span>
+                        <span class="value" id="invite-available">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="label">Used:</span>
+                        <span class="value" id="invite-used">0</span>
+                    </div>
+                </div>
+
+                <div class="table-card">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Code</th>
+                                <th>Uses</th>
+                                <th>Created By</th>
+                                <th>Created At</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="invites-table">
+                            <!-- Populated by JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Settings Page -->
+            <div id="page-settings" class="page">
+                <header class="page-header">
+                    <h2>Settings</h2>
+                    <p class="page-subtitle">Configure your PDS instance</p>
+                </header>
+
+                <div class="settings-grid">
+                    <div class="settings-card">
+                        <h3>General Settings</h3>
+                        <form id="general-settings-form">
+                            <div class="form-group">
+                                <label>Instance Name</label>
+                                <input type="text" id="setting-name" value="Aurora Locus PDS">
+                            </div>
+                            <div class="form-group">
+                                <label>Service URL</label>
+                                <input type="text" id="setting-url" value="https://pds.example.com">
+                            </div>
+                            <div class="form-group">
+                                <label>Max Blob Size (MB)</label>
+                                <input type="number" id="setting-blob-size" value="5">
+                            </div>
+                            <button type="submit" class="btn-primary">Save Changes</button>
+                        </form>
+                    </div>
+
+                    <div class="settings-card">
+                        <h3>Registration Settings</h3>
+                        <form id="registration-settings-form">
+                            <div class="form-group">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="setting-invite-required">
+                                    Require Invite Codes
+                                </label>
+                            </div>
+                            <div class="form-group">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="setting-email-verification">
+                                    Require Email Verification
+                                </label>
+                            </div>
+                            <button type="submit" class="btn-primary">Save Changes</button>
+                        </form>
+                    </div>
+
+                    <div class="settings-card">
+                        <h3>Moderation Settings</h3>
+                        <form id="moderation-settings-form">
+                            <div class="form-group">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="setting-auto-report">
+                                    Enable Automatic Content Filtering
+                                </label>
+                            </div>
+                            <div class="form-group">
+                                <label>Report Threshold</label>
+                                <input type="number" id="setting-report-threshold" value="3">
+                            </div>
+                            <button type="submit" class="btn-primary">Save Changes</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modals -->
+    <div id="modal-overlay" class="modal-overlay" onclick="closeModal()"></div>
+
+    <!-- User Details Modal -->
+    <div id="modal-user-details" class="modal">
+        <div class="modal-header">
+            <h3>User Details</h3>
+            <button class="modal-close" onclick="closeModal()">&times;</button>
+        </div>
+        <div class="modal-body" id="user-details-content">
+            <!-- Populated by JS -->
+        </div>
+    </div>
+
+    <!-- Report Details Modal -->
+    <div id="modal-report-details" class="modal">
+        <div class="modal-header">
+            <h3>Report Details</h3>
+            <button class="modal-close" onclick="closeModal()">&times;</button>
+        </div>
+        <div class="modal-body" id="report-details-content">
+            <!-- Populated by JS -->
+        </div>
+        <div class="modal-footer">
+            <button class="btn-secondary" onclick="closeModal()">Close</button>
+            <button class="btn-danger" onclick="takedownContent()">Takedown</button>
+            <button class="btn-primary" onclick="resolveReport()">Resolve</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="/admin/script.js"></script>
+</body>
+</html>
