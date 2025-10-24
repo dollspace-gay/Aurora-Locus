@@ -72,6 +72,10 @@ struct DPopClaims {
     /// Expiration (Unix timestamp, 60 seconds from iat)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exp: Option<i64>,
+
+    /// Server-provided nonce for replay protection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
 }
 
 /// DPoP manager for generating and signing DPoP proofs
@@ -185,6 +189,11 @@ impl DPopManager {
     /// # }
     /// ```
     pub fn generate_proof(&self, method: &str, url: &str) -> Result<String, DPopError> {
+        self.generate_proof_with_nonce(method, url, None)
+    }
+
+    /// Generate a DPoP proof with optional nonce
+    pub fn generate_proof_with_nonce(&self, method: &str, url: &str, nonce: Option<String>) -> Result<String, DPopError> {
         let jwk = self.jwk.read().clone();
         let private_key = self.private_key.read();
 
@@ -203,6 +212,7 @@ impl DPopManager {
             htu: url.to_string(),
             iat: now,
             exp: Some(now + 60), // 60 second expiration
+            nonce,
         };
 
         // Encode the header and claims

@@ -288,8 +288,58 @@ impl OAuthClient {
         code_verifier: &str,
         token_endpoint: &str,
     ) -> Result<OAuthSession, OAuthError> {
-        // Generate DPoP proof for token endpoint
-        let dpop_proof = self.dpop.generate_proof("POST", token_endpoint)?;
+        // Try token exchange, handling DPoP nonce requirements
+        let result = self.try_token_exchange(code, code_verifier, token_endpoint, None).await;
+
+        // If we got a use_dpop_nonce error, retry with nonce
+        if let Err(OAuthError::ServerError { ref error, ref description }) = result {
+            if error == "use_dpop_nonce" {
+                // Extract nonce from description (it's in the DPoP-Nonce header, but we need to make the request to get it)
+                // Make a request to get the nonce
+                let dpop_proof = self.dpop.generate_proof("POST", token_endpoint)?;
+                let mut params = HashMap::new();
+                params.insert("grant_type", "authorization_code");
+                params.insert("code", code);
+                params.insert("code_verifier", code_verifier);
+                params.insert("client_id", &self.metadata.client_id);
+                params.insert("redirect_uri", &self.metadata.redirect_uris[0]);
+
+                let nonce_response = self
+                    .http_client
+                    .post(token_endpoint)
+                    .header("DPoP", dpop_proof)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .form(&params)
+                    .send()
+                    .await?;
+
+                // Extract nonce from response headers
+                if let Some(nonce) = nonce_response.headers().get("dpop-nonce")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+                {
+                    // Retry with nonce
+                    return self.try_token_exchange(code, code_verifier, token_endpoint, Some(nonce)).await;
+                }
+            }
+        }
+
+        result
+    }
+
+    async fn try_token_exchange(
+        &self,
+        code: &str,
+        code_verifier: &str,
+        token_endpoint: &str,
+        nonce: Option<String>,
+    ) -> Result<OAuthSession, OAuthError> {
+        // Generate DPoP proof for token endpoint with optional nonce
+        let dpop_proof = if let Some(ref n) = nonce {
+            self.dpop.generate_proof_with_nonce("POST", token_endpoint, Some(n.clone()))?
+        } else {
+            self.dpop.generate_proof("POST", token_endpoint)?
+        };
 
         // Build request body
         let mut params = HashMap::new();
