@@ -260,9 +260,9 @@ OAUTH_KEYSET_FILE=./oauth-keyset.json
 OAUTH_CLIENT_ID=http://$HOSTNAME/oauth/client
 
 # Admin DIDs allowed to use OAuth admin authentication
-# This will be automatically populated after account creation
+# Add your DID here after creating an account to get admin access
 # Multiple DIDs can be comma-separated: did:plc:abc123,did:plc:def456
-PDS_ADMIN_DIDS=__PLACEHOLDER_ADMIN_DID__
+PDS_ADMIN_DIDS=$ADMIN_DID
 
 # ============================================================================
 # Storage
@@ -489,51 +489,30 @@ main() {
     prompt PORT "Server port" "3000"
     echo ""
 
-    # First-time account setup
-    print_header "First Admin Account Setup"
+    # Admin DID configuration
+    print_header "Admin DID Configuration"
 
-    echo "Aurora Locus uses OAuth 2.0 with PKCE for admin authentication."
-    echo "You'll need to create your admin account first, then configure OAuth."
+    echo "Aurora Locus uses OAuth 2.0 with DID-based admin authentication."
     echo ""
-    print_info "We'll collect your preferred admin handle and email for account creation."
+    print_info "You can either:"
+    echo "  1. Enter an admin DID now (if you already have an account DID)"
+    echo "  2. Leave blank and add it later to .env after creating your account"
     echo ""
 
-    ADMIN_HANDLE=""
-    while true; do
-        prompt ADMIN_HANDLE "Admin handle (without domain, e.g., 'admin')" "admin"
-        if [[ $ADMIN_HANDLE =~ ^[a-z0-9-]+$ ]]; then
-            break
-        else
-            print_error "Handle must contain only lowercase letters, numbers, and hyphens."
-        fi
-    done
+    prompt ADMIN_DID "Admin DID (leave blank to set later)" ""
 
-    while true; do
-        prompt ADMIN_EMAIL "Admin email address" ""
-        if validate_email "$ADMIN_EMAIL"; then
-            break
-        else
-            print_error "Invalid email address. Please try again."
+    if [ -z "$ADMIN_DID" ]; then
+        print_warning "No admin DID provided - you'll need to update PDS_ADMIN_DIDS in .env later"
+        ADMIN_DID="__PLACEHOLDER_ADMIN_DID__"
+    else
+        # Basic validation - should start with did:
+        if [[ ! $ADMIN_DID =~ ^did: ]]; then
+            print_error "Invalid DID format. Should start with 'did:'"
+            print_info "Example: did:plc:abc123xyz..."
+            exit 1
         fi
-    done
-
-    while true; do
-        prompt INITIAL_PASSWORD "Initial admin password (min 8 characters)" "" "secret"
-        if [ ${#INITIAL_PASSWORD} -ge 8 ]; then
-            prompt PASSWORD_CONFIRM "Confirm password" "" "secret"
-            if [ "$INITIAL_PASSWORD" = "$PASSWORD_CONFIRM" ]; then
-                break
-            else
-                print_error "Passwords do not match. Please try again."
-            fi
-        else
-            print_error "Password must be at least 8 characters."
-        fi
-    done
-
-    FULL_HANDLE="${ADMIN_HANDLE}.${HOSTNAME}"
-    echo ""
-    print_info "Admin account will be created as: $FULL_HANDLE"
+        print_success "Admin DID will be configured: $ADMIN_DID"
+    fi
     echo ""
 
     # Federation settings
@@ -611,95 +590,11 @@ main() {
     print_success "Data directories created"
     echo ""
 
-    # Run database migrations and create admin account
-    print_header "Initializing Database and Admin Account"
+    # Configuration complete
+    print_header "Configuration Complete"
 
-    print_info "Starting server temporarily to run migrations..."
-
-    # Start server in background with logging
-    RUST_LOG=info ./target/release/aurora-locus > server-init.log 2>&1 &
-    SERVER_PID=$!
-
-    # Wait for server to start (check health endpoint)
-    print_info "Waiting for server to start..."
-    for i in {1..30}; do
-        if curl -s http://localhost:$PORT/health > /dev/null 2>&1; then
-            print_success "Server started successfully"
-            break
-        fi
-        sleep 1
-        if [ $i -eq 30 ]; then
-            print_error "Server failed to start within 30 seconds"
-            echo ""
-            print_error "Last 20 lines of server-init.log:"
-            tail -20 server-init.log
-            echo ""
-            kill $SERVER_PID 2>/dev/null
-            exit 1
-        fi
-    done
-
-    echo ""
-    print_info "Creating admin account: $FULL_HANDLE"
-
-    # Create admin account
-    ACCOUNT_RESPONSE=$(curl -s -X POST http://localhost:$PORT/xrpc/com.atproto.server.createAccount \
-      -H "Content-Type: application/json" \
-      -d "{\"handle\":\"$FULL_HANDLE\",\"email\":\"$ADMIN_EMAIL\",\"password\":\"$INITIAL_PASSWORD\"}")
-
-    # Extract DID from response
-    ADMIN_DID=$(echo "$ACCOUNT_RESPONSE" | jq -r '.did // empty')
-
-    if [ -z "$ADMIN_DID" ]; then
-        print_error "Failed to create admin account"
-        echo "Response: $ACCOUNT_RESPONSE"
-        kill $SERVER_PID 2>/dev/null
-        exit 1
-    fi
-
-    print_success "Admin account created with DID: $ADMIN_DID"
-    echo ""
-
-    # Grant SuperAdmin role in database
-    print_info "Granting SuperAdmin role..."
-
-    sqlite3 data/accounts.db <<EOF
-INSERT INTO admin_role (did, role, granted_by, granted_at, revoked)
-VALUES ('$ADMIN_DID', 'superadmin', 'system', datetime('now'), 0);
-EOF
-
-    if [ $? -eq 0 ]; then
-        print_success "SuperAdmin role granted"
-    else
-        print_error "Failed to grant SuperAdmin role"
-        kill $SERVER_PID 2>/dev/null
-        exit 1
-    fi
-    echo ""
-
-    # Update .env with admin DID
-    print_info "Updating .env with admin DID..."
-
-    # Use sed to replace the placeholder with actual DID
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS
-        sed -i '' "s/__PLACEHOLDER_ADMIN_DID__/$ADMIN_DID/" .env
-    else
-        # Linux
-        sed -i "s/__PLACEHOLDER_ADMIN_DID__/$ADMIN_DID/" .env
-    fi
-
-    print_success ".env updated with admin DID"
-    echo ""
-
-    # Stop the temporary server
-    print_info "Stopping temporary server..."
-    kill $SERVER_PID 2>/dev/null
-    wait $SERVER_PID 2>/dev/null
-    print_success "Temporary server stopped"
-
-    # Clean up initialization log
-    rm -f server-init.log
+    print_success "All configuration files have been generated!"
+    print_info "Database will be initialized automatically on first server startup"
     echo ""
 
     # Optional: systemd service
@@ -719,36 +614,57 @@ EOF
     print_header "Installation Complete!"
 
     echo ""
-    print_success "🎉 Aurora Locus PDS is fully configured and ready to use!"
+    print_success "🎉 Aurora Locus PDS has been installed successfully!"
     echo ""
 
-    print_header "Your Admin Account"
-    echo ""
-    echo "  Handle:   $FULL_HANDLE"
-    echo "  Email:    $ADMIN_EMAIL"
-    echo "  Password: [you entered during setup]"
-    echo "  DID:      $ADMIN_DID"
-    echo "  Role:     SuperAdmin"
+    print_header "Next Steps"
     echo ""
 
-    print_header "Starting Your Server"
-    echo ""
-    print_info "Start the server with:"
+    print_info "STEP 1: Start the server"
     echo "  ./target/release/aurora-locus"
     echo ""
-    print_info "Or run in background:"
+    print_info "  Or run in background:"
     echo "  nohup ./target/release/aurora-locus > pds.log 2>&1 &"
     echo ""
 
-    print_header "Accessing Admin Functions"
+    print_info "STEP 2: Create your first account"
+    echo "  curl -X POST http://localhost:$PORT/xrpc/com.atproto.server.createAccount \\"
+    echo "    -H 'Content-Type: application/json' \\"
+    echo "    -d '{\"handle\":\"you.$HOSTNAME\",\"email\":\"you@example.com\",\"password\":\"secure-password\"}'"
     echo ""
-    print_info "OAuth Admin Login:"
+    print_warning "  SAVE THE DID from the response!"
+    echo "  Example response: {\"did\": \"did:plc:abc123xyz...\", ...}"
+    echo ""
+
+    if [ "$ADMIN_DID" = "__PLACEHOLDER_ADMIN_DID__" ]; then
+        print_info "STEP 3: Configure admin DID"
+        echo "  Edit .env and replace:"
+        echo "    PDS_ADMIN_DIDS=__PLACEHOLDER_ADMIN_DID__"
+        echo "  With your actual DID:"
+        echo "    PDS_ADMIN_DIDS=did:plc:abc123xyz..."
+        echo ""
+        print_warning "  Restart the server after updating .env!"
+        echo ""
+    else
+        print_info "STEP 3: Admin DID already configured"
+        echo "  Admin DID: $ADMIN_DID"
+        echo "  ✓ Already set in .env"
+        echo ""
+    fi
+
+    print_info "STEP 4: Grant admin role (optional - for database admin)"
+    echo "  sqlite3 data/accounts.db"
+    echo "  INSERT INTO admin_role (did, role, granted_by, granted_at, revoked)"
+    echo "    VALUES ('YOUR_DID', 'superadmin', 'system', datetime('now'), 0);"
+    echo "  .exit"
+    echo ""
+    print_info "  Note: If your DID is in PDS_ADMIN_DIDS, you automatically get admin"
+    echo "  access via OAuth without needing a database role."
+    echo ""
+
+    print_info "STEP 5: Access OAuth admin panel"
     echo "  Visit: http://localhost:$PORT/oauth/authorize"
-    echo "  Login with: $FULL_HANDLE and your password"
-    echo ""
-    print_info "Direct API Access (after login):"
-    echo "  curl http://localhost:$PORT/xrpc/com.atproto.admin.getStats \\"
-    echo "    -H 'Authorization: Bearer YOUR_OAUTH_TOKEN'"
+    echo "  Login with your handle and password"
     echo ""
 
     print_header "Testing Your PDS"
@@ -758,11 +674,6 @@ EOF
     echo ""
     print_info "Server info:"
     echo "  curl http://localhost:$PORT/xrpc/com.atproto.server.describeServer"
-    echo ""
-    print_info "Create a session (login as admin):"
-    echo "  curl -X POST http://localhost:$PORT/xrpc/com.atproto.server.createSession \\"
-    echo "    -H 'Content-Type: application/json' \\"
-    echo "    -d '{\"identifier\":\"$FULL_HANDLE\",\"password\":\"YOUR_PASSWORD\"}'"
     echo ""
 
     if [ "$SETUP_SYSTEMD" = "yes" ]; then

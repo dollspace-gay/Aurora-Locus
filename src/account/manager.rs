@@ -1281,9 +1281,14 @@ mod tests {
             },
             authentication: AuthConfig {
                 jwt_secret: "test-secret-key-for-testing-only".to_string(),
-                admin_password: "test-admin".to_string(),
                 repo_signing_key: "test-key".to_string(),
                 plc_rotation_key: "test-rotation-key".to_string(),
+                admin_dids: vec![],
+                oauth: crate::config::OAuthConfig {
+                    client_id: "test-client".to_string(),
+                    redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
+                    pds_url: "http://localhost:3000".to_string(),
+                },
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
