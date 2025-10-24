@@ -510,7 +510,8 @@ impl AccountManager {
             Err(e) => {
                 tracing::warn!("Failed to register DID with PLC directory: {}. Falling back to did:web", e);
                 // Fallback to did:web if PLC registration fails
-                let did_web = format!("did:web:{}.{}", handle, self.config.service.hostname);
+                // full_handle is already constructed above (line 463)
+                let did_web = format!("did:web:{}", full_handle);
                 Ok((did_web, private_key_hex, public_key_hex, "".to_string()))
             }
         }

@@ -267,9 +267,17 @@ pub async fn register_plc_did(
     // Create HTTP client
     let client = reqwest::Client::new();
 
+    // For genesis operations (no prev), POST to base URL
+    // For updates, POST to {plc_url}/{did}
+    let endpoint = if operation.prev.is_none() {
+        plc_url.to_string()
+    } else {
+        format!("{}/{}", plc_url, operation.did)
+    };
+
     // Submit operation to PLC directory
     let response = client
-        .post(format!("{}/{}", plc_url, operation.did))
+        .post(&endpoint)
         .json(&operation)
         .send()
         .await
