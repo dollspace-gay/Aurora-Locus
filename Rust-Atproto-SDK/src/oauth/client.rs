@@ -109,7 +109,21 @@ impl OAuthClient {
             )));
         }
 
-        let metadata: AuthorizationServerMetadata = response.json().await?;
+        let mut metadata: AuthorizationServerMetadata = response.json().await?;
+
+        // Ensure token_endpoint is an absolute URL
+        if metadata.token_endpoint.starts_with('/') {
+            // Relative URL - prepend the base URL
+            let base_url = pds_url.trim_end_matches('/');
+            metadata.token_endpoint = format!("{}{}", base_url, metadata.token_endpoint);
+        }
+
+        // Ensure authorization_endpoint is an absolute URL
+        if metadata.authorization_endpoint.starts_with('/') {
+            let base_url = pds_url.trim_end_matches('/');
+            metadata.authorization_endpoint = format!("{}{}", base_url, metadata.authorization_endpoint);
+        }
+
         Ok(metadata)
     }
 
