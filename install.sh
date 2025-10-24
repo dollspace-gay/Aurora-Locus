@@ -115,7 +115,7 @@ prompt() {
 # Generate random string
 generate_random() {
     local length=$1
-    openssl rand -base64 $length | tr -d "=+/" | cut -c1-$length
+    openssl rand -base64 $length | tr -d "=+/\n" | tr -d '\n' | cut -c1-$length
 }
 
 # Validate domain name

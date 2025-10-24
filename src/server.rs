@@ -98,18 +98,19 @@ async fn not_found() -> (StatusCode, Json<serde_json::Value>) {
 
 /// Start the HTTP server
 pub async fn serve(ctx: AppContext) -> PdsResult<()> {
-    let addr = format!("{}:{}", ctx.config.service.hostname, ctx.config.service.port);
+    // Bind to 0.0.0.0 to listen on all interfaces (IPv4 and IPv6)
+    let bind_addr = format!("0.0.0.0:{}", ctx.config.service.port);
 
-    info!("🚀 Aurora Locus PDS listening on {}", addr);
+    info!("🚀 Aurora Locus PDS listening on {}", bind_addr);
     info!("   Service DID: {}", ctx.service_did());
     info!("   Service URL: {}", ctx.service_url());
 
     let app = build_router(ctx);
 
     // Create TCP listener
-    let listener = tokio::net::TcpListener::bind(&addr)
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
-        .map_err(|e| PdsError::Internal(format!("Failed to bind to {}: {}", addr, e)))?;
+        .map_err(|e| PdsError::Internal(format!("Failed to bind to {}: {}", bind_addr, e)))?;
 
     // Axum 0.7: Router<()> can be passed directly to serve
     axum::serve(listener, app)
