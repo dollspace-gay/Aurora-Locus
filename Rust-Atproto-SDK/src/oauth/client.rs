@@ -307,7 +307,15 @@ impl OAuthClient {
         }
 
         // Parse successful response
-        let token_response: TokenResponse = response.json().await?;
+        let response_text = response.text().await?;
+        tracing::debug!("Token endpoint response: {}", response_text);
+
+        let token_response: TokenResponse = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                tracing::error!("Failed to parse token response: {}", e);
+                tracing::error!("Response body was: {}", response_text);
+                OAuthError::JsonError(e)
+            })?;
 
         // Build OAuth session (sub is now a required field)
         Ok(OAuthSession {
@@ -370,7 +378,15 @@ impl OAuthClient {
         }
 
         // Parse successful response
-        let token_response: TokenResponse = response.json().await?;
+        let response_text = response.text().await?;
+        tracing::debug!("Token endpoint response: {}", response_text);
+
+        let token_response: TokenResponse = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                tracing::error!("Failed to parse token response: {}", e);
+                tracing::error!("Response body was: {}", response_text);
+                OAuthError::JsonError(e)
+            })?;
 
         // Build OAuth session (sub is now a required field)
         Ok(OAuthSession {
