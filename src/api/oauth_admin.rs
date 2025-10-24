@@ -49,8 +49,8 @@ pub struct OAuthStateData {
 pub fn routes(state_store: OAuthStateStore) -> Router<AppContext> {
     // Create a router with the OAuth state store, then layer it over the app context
     let oauth_router = Router::new()
-        .route("/oauth/admin/login", get(initiate_oauth))
-        .route("/oauth/admin/callback", get(handle_oauth_callback))
+        .route("/admin-oauth/login", get(initiate_oauth))
+        .route("/admin-oauth/callback", get(handle_oauth_callback))
         .layer(axum::Extension(state_store));
 
     Router::new()

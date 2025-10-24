@@ -30,7 +30,7 @@ async function handleLogin(event) {
 
     try {
         // Build OAuth initiation URL
-        const oauthUrl = `/oauth/admin/login${handle ? `?handle=${encodeURIComponent(handle)}` : ''}`;
+        const oauthUrl = `/admin-oauth/login${handle ? `?handle=${encodeURIComponent(handle)}` : ''}`;
 
         // Redirect to OAuth flow
         window.location.href = oauthUrl;

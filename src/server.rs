@@ -32,6 +32,7 @@ pub fn build_router(ctx: AppContext) -> Router {
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     // Static file serving for admin panel
+    // Must come AFTER API routes to not conflict with /oauth/admin/* endpoints
     let admin_static = Router::new()
         .nest_service("/admin", ServeDir::new("static/admin"));
 
