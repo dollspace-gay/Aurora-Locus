@@ -603,14 +603,51 @@ main() {
     mkdir -p data/actors data/blobs data/tmp
     print_success "Data directories created"
     echo ""
-
-    # Configuration complete
-    print_header "Configuration Complete"
-
-    print_success "All configuration files have been generated!"
-    print_info "Database will be initialized automatically on first server startup"
+    mkdir -p data/actors data/blobs data/tmp
+    print_success "Data directories created"
     echo ""
 
+    # Initialize database with admin_roles table
+    print_header "Initializing Database"
+
+    if [ ! -f "data/account.sqlite" ]; then
+        print_info "Creating account database and admin_roles table..."
+
+        sqlite3 data/account.sqlite << 'EOSQL'
+CREATE TABLE IF NOT EXISTS admin_roles (
+    did TEXT PRIMARY KEY NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('superadmin', 'admin', 'moderator')),
+    granted_by TEXT,
+    granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_admin_role_did ON admin_roles(did);
+CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+    version BIGINT PRIMARY KEY NOT NULL,
+    description TEXT NOT NULL,
+    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    success BOOLEAN NOT NULL,
+    checksum BLOB NOT NULL,
+    execution_time BIGINT NOT NULL
+);
+INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
+VALUES (20250106000001, 'admin_moderation', CURRENT_TIMESTAMP, 1, X'00', 0);
+EOSQL
+
+        if [ "" != "__PLACEHOLDER_ADMIN_DID__" ] && [ -n "" ]; then
+            sqlite3 data/account.sqlite "INSERT INTO admin_roles (did, role, granted_by, granted_at) VALUES ('', 'superadmin', 'installer', datetime('now'));"
+            print_success "Database initialized - Admin DID \ added as superadmin"
+        else
+            print_success "Database initialized with admin_roles table"
+        fi
+    else
+        print_info "Database already exists"
+    fi
+    echo ""
+
+    print_header "Configuration Complete"
+    print_success "All configuration files have been generated!"
+    print_success "Database has been initialized"
+    echo ""
     # Optional: systemd service
     print_header "System Integration (Optional)"
 
