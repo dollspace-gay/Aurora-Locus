@@ -20,10 +20,14 @@ pub fn routes() -> Router<AppContext> {
         // Admin stats and data
         .route("/xrpc/com.atproto.admin.getStats", get(get_stats))
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
+        .route("/xrpc/com.atproto.admin.listAccounts", get(get_users)) // Alias for frontend compatibility
+        .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
+        .route("/xrpc/com.atproto.admin.updateSubjectStatus", post(update_subject_status))
         // Invite codes
         .route("/xrpc/com.atproto.admin.createInviteCode", post(create_invite_code))
         .route("/xrpc/com.atproto.admin.getInviteCodes", get(get_invite_codes))
         .route("/xrpc/com.atproto.admin.listInviteCodes", get(list_invite_codes))
+        .route("/xrpc/com.atproto.admin.disableInviteCode", post(disable_invite_code))
         // Role management
         .route("/xrpc/com.atproto.admin.grantRole", post(grant_role))
         .route("/xrpc/com.atproto.admin.revokeRole", post(revoke_role))
@@ -33,6 +37,7 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.suspendAccount", post(suspend_account))
         .route("/xrpc/com.atproto.admin.restoreAccount", post(restore_account))
         .route("/xrpc/com.atproto.admin.getModerationHistory", get(get_moderation_history))
+        .route("/xrpc/com.atproto.admin.getModerationQueue", get(get_moderation_queue))
         // Labels
         .route("/xrpc/com.atproto.admin.applyLabel", post(apply_label))
         .route("/xrpc/com.atproto.admin.removeLabel", post(remove_label))
@@ -682,5 +687,149 @@ async fn list_reports(
 
     Ok(Json(serde_json::json!({
         "reports": reports,
+    })))
+}
+
+// ============================================================================
+// Additional Endpoints for Admin Panel Compatibility
+// ============================================================================
+
+#[derive(Deserialize)]
+struct GetAccountQuery {
+    did: String,
+}
+
+/// Get single account details
+async fn get_account(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<GetAccountQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let account = ctx.account_manager
+        .get_account(&query.did)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("Account not found: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "did": account.did,
+        "handle": account.handle,
+        "email": account.email,
+        "created_at": account.created_at,
+        "email_confirmed": account.email_confirmed,
+        "takedown": account.takedown,
+    })))
+}
+
+#[derive(Deserialize)]
+struct UpdateSubjectStatusRequest {
+    subject: String, // DID or AT-URI
+    #[serde(default)]
+    action: String, // "suspend", "takedown", "restore"
+    #[serde(default)]
+    duration: Option<i64>, // Duration in seconds for temporary suspensions
+}
+
+/// Update subject status (unified moderation endpoint)
+async fn update_subject_status(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<UpdateSubjectStatusRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Extract DID from subject (handle both DID and AT-URI)
+    let did = if req.subject.starts_with("did:") {
+        req.subject.clone()
+    } else if req.subject.starts_with("at://") {
+        // Extract DID from AT-URI (format: at://did:plc:xyz/...)
+        req.subject
+            .trim_start_matches("at://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Invalid subject format".to_string()));
+    };
+
+    match req.action.as_str() {
+        "suspend" => {
+            let duration = req.duration.map(Duration::seconds);
+            ctx.account_manager
+                .suspend_account(&did, duration.as_ref())
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        "takedown" => {
+            ctx.account_manager
+                .set_account_takedown(&did, true)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        "restore" => {
+            // Restore from both suspension and takedown
+            ctx.account_manager
+                .unsuspend_account(&did)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            ctx.account_manager
+                .set_account_takedown(&did, false)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        _ => return Err((StatusCode::BAD_REQUEST, "Invalid action".to_string())),
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "did": did,
+        "action": req.action,
+    })))
+}
+
+#[derive(Deserialize)]
+struct GetModerationQueueQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// Get moderation queue (reports needing review)
+async fn get_moderation_queue(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<GetModerationQueueQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::admin::reports::ReportStatus;
+
+    // Get open reports as the moderation queue
+    let reports = ctx.report_manager
+        .list_reports(Some(ReportStatus::Open), query.limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "queue": reports,
+        "count": reports.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct DisableInviteCodeRequest {
+    code: String,
+}
+
+/// Disable an invite code
+async fn disable_invite_code(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Json(req): Json<DisableInviteCodeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    ctx.invite_code_manager
+        .disable_code(&req.code)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "code": req.code,
     })))
 }

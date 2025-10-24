@@ -7,8 +7,8 @@ description = "ATProto Personal Data Server implementation in Rust"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Use local SDK for ATProto functionality
-atproto = { path = "./Rust-Atproto-SDK" }
+# Use parent SDK for ATProto functionality
+atproto = { path = ".." }
 
 # HTTP Server
 axum = { version = "0.7", features = ["tokio", "ws"] }

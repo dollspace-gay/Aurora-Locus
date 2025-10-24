@@ -1,82 +1,44 @@
-// Admin Login Page JavaScript
-
-const API_BASE = '/xrpc';
+// Admin Login Page JavaScript - OAuth Flow
 
 // Check if already logged in
 if (localStorage.getItem('adminToken')) {
     window.location.href = '/admin/index.html';
 }
 
+// Check for OAuth callback parameters
+const urlParams = new URLSearchParams(window.location.search);
+const authCode = urlParams.get('code');
+const authState = urlParams.get('state');
+const authError = urlParams.get('error');
+
+if (authError) {
+    showError(`Authentication failed: ${authError}`);
+    // Clear URL parameters
+    window.history.replaceState({}, document.title, window.location.pathname);
+}
+
 async function handleLogin(event) {
     event.preventDefault();
 
-    const identifier = document.getElementById('identifier').value.trim();
-    const password = document.getElementById('password').value;
-    const remember = document.getElementById('remember').checked;
+    const handle = document.getElementById('handle').value.trim();
 
     // Clear previous errors
     hideError();
-
-    // Validate inputs
-    if (!identifier || !password) {
-        showError('Please enter both identifier and password');
-        return;
-    }
 
     // Show loading state
     setLoading(true);
 
     try {
-        // Call ATProto createSession endpoint
-        const response = await fetch(`${API_BASE}/com.atproto.server.createSession`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                identifier,
-                password,
-            }),
-        });
+        // Build OAuth initiation URL
+        const oauthUrl = `/oauth/admin/login${handle ? `?handle=${encodeURIComponent(handle)}` : ''}`;
 
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || 'Login failed');
-        }
-
-        const data = await response.json();
-
-        // Verify this is an admin account
-        if (!isAdminAccount(data.did, data.handle)) {
-            throw new Error('Access denied: Admin privileges required');
-        }
-
-        // Store the access token
-        const storage = remember ? localStorage : sessionStorage;
-        storage.setItem('adminToken', data.accessJwt);
-        localStorage.setItem('adminToken', data.accessJwt); // Always use localStorage for now
-
-        // Store session info
-        localStorage.setItem('adminDid', data.did);
-        localStorage.setItem('adminHandle', data.handle);
-
-        // Redirect to admin panel
-        window.location.href = '/admin/index.html';
+        // Redirect to OAuth flow
+        window.location.href = oauthUrl;
     } catch (error) {
-        console.error('Login error:', error);
-        showError(error.message || 'Login failed. Please check your credentials.');
+        console.error('OAuth initiation error:', error);
+        showError(error.message || 'Failed to start OAuth flow');
         setLoading(false);
     }
-}
-
-function isAdminAccount(did, handle) {
-    // Check if this is an admin account
-    // In a real system, this would verify admin privileges on the backend
-    // For now, check if handle contains 'admin' or specific DIDs
-    const adminHandles = ['admin', 'administrator', 'root'];
-    const handleLower = handle.toLowerCase();
-
-    return adminHandles.some(admin => handleLower.includes(admin));
 }
 
 function setLoading(isLoading) {
@@ -109,14 +71,7 @@ function hideError() {
 // Handle Enter key in form
 document.getElementById('login-form').addEventListener('submit', handleLogin);
 
-// Focus on identifier field on page load
+// Focus on handle field on page load
 document.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('identifier').focus();
+    document.getElementById('handle').focus();
 });
-
-// Handle password visibility toggle (if needed in future)
-function togglePasswordVisibility() {
-    const passwordInput = document.getElementById('password');
-    const type = passwordInput.getAttribute('type') === 'password' ? 'text' : 'password';
-    passwordInput.setAttribute('type', type);
-}
