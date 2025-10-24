@@ -43,6 +43,7 @@ impl OAuthStateStore {
 pub struct OAuthStateData {
     pub code_verifier: String,
     pub handle: Option<String>,
+    pub token_endpoint: String,
 }
 
 /// Build OAuth routes
@@ -91,11 +92,27 @@ async fn initiate_oauth(
     // Generate PKCE parameters
     let pkce = PkceParams::generate();
 
-    // Build authorization URL
+    // Discover server metadata to get token endpoint
     let handle = params.handle.as_deref().unwrap_or("user.bsky.social");
+    let pds_url = &ctx.config.authentication.oauth.pds_url;
+
+    let server_metadata = oauth_client
+        .discover_server_metadata(pds_url)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to discover server metadata: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to discover OAuth server: {}", e),
+            )
+        })?;
+
+    let token_endpoint = server_metadata.token_endpoint.clone();
+
+    // Build authorization URL
     let auth_url = oauth_client
         .build_authorization_url(
-            &ctx.config.authentication.oauth.pds_url,
+            pds_url,
             handle,
             &pkce,
         )
@@ -130,13 +147,14 @@ async fn initiate_oauth(
             )
         })?;
 
-    // Store state data
+    // Store state data including token endpoint
     state_store
         .store(
             state,
             OAuthStateData {
                 code_verifier: pkce.code_verifier,
                 handle: params.handle.clone(),
+                token_endpoint,
             },
         )
         .await;
@@ -215,16 +233,12 @@ async fn handle_oauth_callback(
         )
     })?;
 
-    // Discover authorization server metadata to get token endpoint
-    // For Bluesky, this is typically at the PDS URL
-    let token_endpoint = format!(
-        "{}/.well-known/oauth-authorization-server/token",
-        ctx.config.authentication.oauth.pds_url
-    );
+    // Use the token endpoint discovered during authorization
+    let token_endpoint = &state_data.token_endpoint;
 
     // Exchange code for tokens
     let oauth_session = oauth_client
-        .exchange_code(&code, &state_data.code_verifier, &token_endpoint)
+        .exchange_code(&code, &state_data.code_verifier, token_endpoint)
         .await
         .map_err(|e| {
             tracing::error!("Failed to exchange code: {}", e);
