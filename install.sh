@@ -1,0 +1,643 @@
+#!/bin/bash
+
+# Aurora Locus PDS Installation Script
+# Interactive setup for a production-ready ATProto Personal Data Server
+#
+# This script will:
+# - Collect configuration information
+# - Generate cryptographic keys
+# - Create OAuth keyset
+# - Configure environment variables
+# - Set up systemd service (optional)
+# - Configure nginx reverse proxy (optional)
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Print functions
+print_header() {
+    echo -e "${BLUE}"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  $1"
+    echo "═══════════════════════════════════════════════════════════"
+    echo -e "${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}✓ $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}✗ $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠ $1${NC}"
+}
+
+print_info() {
+    echo -e "${BLUE}ℹ $1${NC}"
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -eq 0 ]]; then
+        print_error "This script should NOT be run as root"
+        print_info "Run as a regular user. It will prompt for sudo when needed."
+        exit 1
+    fi
+}
+
+# Check dependencies
+check_dependencies() {
+    print_header "Checking Dependencies"
+
+    local missing_deps=()
+
+    for cmd in openssl jq xxd cargo sqlite3 curl; do
+        if ! command -v $cmd &> /dev/null; then
+            missing_deps+=("$cmd")
+            print_error "Missing: $cmd"
+        else
+            print_success "Found: $cmd"
+        fi
+    done
+
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        echo ""
+        print_error "Missing required dependencies: ${missing_deps[*]}"
+        echo ""
+        print_info "Install them with:"
+        echo "  Ubuntu/Debian: sudo apt-get install openssl jq xxd build-essential sqlite3 curl"
+        echo "  Fedora/RHEL:   sudo dnf install openssl jq vim-common gcc sqlite curl"
+        echo "  macOS:         brew install openssl jq xxd sqlite curl"
+        echo ""
+        print_info "Install Rust from: https://rustup.rs/"
+        exit 1
+    fi
+
+    echo ""
+    print_success "All dependencies found!"
+    echo ""
+}
+
+# Prompt for user input with default value
+prompt() {
+    local var_name=$1
+    local prompt_text=$2
+    local default_value=$3
+    local secret=$4
+
+    if [ -n "$default_value" ]; then
+        prompt_text="$prompt_text [$default_value]"
+    fi
+
+    if [ "$secret" = "secret" ]; then
+        read -s -p "$prompt_text: " value
+        echo ""
+    else
+        read -p "$prompt_text: " value
+    fi
+
+    if [ -z "$value" ] && [ -n "$default_value" ]; then
+        value=$default_value
+    fi
+
+    eval $var_name="'$value'"
+}
+
+# Generate random string
+generate_random() {
+    local length=$1
+    openssl rand -base64 $length | tr -d "=+/" | cut -c1-$length
+}
+
+# Validate domain name
+validate_domain() {
+    local domain=$1
+    if [[ $domain =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Validate email
+validate_email() {
+    local email=$1
+    if [[ $email =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Generate repository signing key (secp256k1)
+generate_repo_key() {
+    print_info "Generating repository signing key (secp256k1)..."
+
+    openssl ecparam -name secp256k1 -genkey -noout -out repo_key.pem
+    openssl ec -in repo_key.pem -outform DER 2>/dev/null | xxd -p -c 256 > repo_key.hex
+
+    REPO_KEY=$(cat repo_key.hex)
+    rm repo_key.pem repo_key.hex
+
+    print_success "Repository signing key generated"
+}
+
+# Generate PLC rotation key (secp256k1)
+generate_plc_key() {
+    print_info "Generating PLC rotation key (secp256k1)..."
+
+    openssl ecparam -name secp256k1 -genkey -noout -out plc_key.pem
+    openssl ec -in plc_key.pem -outform DER 2>/dev/null | xxd -p -c 256 > plc_key.hex
+
+    PLC_KEY=$(cat plc_key.hex)
+    rm plc_key.pem plc_key.hex
+
+    print_success "PLC rotation key generated"
+}
+
+# Generate OAuth keyset (P-256 for ES256)
+generate_oauth_keyset() {
+    print_info "Generating OAuth keyset (P-256/ES256)..."
+
+    # Generate P-256 key pair
+    openssl ecparam -name prime256v1 -genkey -noout -out private-legacy.pem
+    openssl pkcs8 -topk8 -nocrypt -in private-legacy.pem -out private-pkcs8.pem
+    openssl ec -in private-legacy.pem -pubout -out public.pem 2>/dev/null
+
+    # Read PEM files
+    PRIVATE_KEY_PEM=$(cat private-pkcs8.pem)
+    PUBLIC_KEY_PEM=$(cat public.pem)
+
+    # Extract key components
+    KEY_COMPONENTS_HEX=$(openssl ec -in private-legacy.pem -text -noout 2>/dev/null)
+
+    PRIV_HEX=$(echo "$KEY_COMPONENTS_HEX" | grep priv -A 3 | tail -n +2 | tr -d ' \n:')
+    PUB_HEX=$(echo "$KEY_COMPONENTS_HEX" | grep pub -A 5 | tail -n +2 | tr -d ' \n:')
+    X_HEX=$(echo "$PUB_HEX" | cut -c 3-66)
+    Y_HEX=$(echo "$PUB_HEX" | cut -c 67-130)
+
+    # Convert to base64url
+    D_B64URL=$(echo -n "$PRIV_HEX" | xxd -r -p | base64 | tr '/+' '_-' | tr -d '=')
+    X_B64URL=$(echo -n "$X_HEX" | xxd -r -p | base64 | tr '/+' '_-' | tr -d '=')
+    Y_B64URL=$(echo -n "$Y_HEX" | xxd -r -p | base64 | tr '/+' '_-' | tr -d '=')
+
+    # Generate Key ID
+    KID="$(date +%s)-$(openssl rand -hex 4)"
+
+    # Create oauth-keyset.json
+    jq -n \
+      --arg kid "$KID" \
+      --arg pkpem "$PRIVATE_KEY_PEM" \
+      --arg pubpem "$PUBLIC_KEY_PEM" \
+      --arg d "$D_B64URL" \
+      --arg x "$X_B64URL" \
+      --arg y "$Y_B64URL" \
+      '{
+        kid: $kid,
+        privateKeyPem: $pkpem,
+        publicKeyPem: $pubpem,
+        jwk: {
+          kid: $kid,
+          kty: "EC",
+          crv: "P-256",
+          alg: "ES256",
+          use: "sig",
+          d: $d,
+          x: $x,
+          y: $y
+        }
+      }' > oauth-keyset.json
+
+    # Cleanup
+    rm private-legacy.pem private-pkcs8.pem public.pem
+
+    print_success "OAuth keyset generated: oauth-keyset.json"
+}
+
+# Create .env file
+create_env_file() {
+    print_info "Creating .env configuration file..."
+
+    cat > .env << EOF
+# Aurora Locus PDS Configuration
+# Generated on $(date)
+
+# ============================================================================
+# Server Configuration
+# ============================================================================
+PDS_HOSTNAME=$HOSTNAME
+PDS_PORT=$PORT
+PDS_SERVICE_DID=did:web:$HOSTNAME
+
+# ============================================================================
+# Security
+# ============================================================================
+PDS_JWT_SECRET=$JWT_SECRET
+PDS_ADMIN_PASSWORD=$ADMIN_PASSWORD
+
+# ============================================================================
+# Cryptographic Keys
+# ============================================================================
+# Repository signing key (secp256k1) - DO NOT SHARE
+PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=$REPO_KEY
+
+# PLC rotation key (secp256k1) - DO NOT SHARE
+PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=$PLC_KEY
+
+# ============================================================================
+# OAuth Configuration
+# ============================================================================
+OAUTH_KEYSET_FILE=./oauth-keyset.json
+OAUTH_CLIENT_ID=http://$HOSTNAME/oauth/client
+
+# OAuth admin DIDs (comma-separated list of DIDs allowed to use admin OAuth)
+OAUTH_ADMIN_DIDS=$ADMIN_DID
+
+# ============================================================================
+# Storage
+# ============================================================================
+PDS_DATA_DIRECTORY=./data
+PDS_ACTOR_STORE_DIRECTORY=./data/actors
+
+# Blob storage configuration
+# Options: disk or s3
+PDS_BLOBSTORE_PROVIDER=disk
+PDS_BLOBSTORE_DISK_LOCATION=./data/blobs
+PDS_BLOBSTORE_DISK_TMP_LOCATION=./data/tmp
+
+# S3 Configuration (uncomment and configure if using S3)
+# PDS_BLOBSTORE_PROVIDER=s3
+# PDS_BLOBSTORE_S3_BUCKET=my-pds-blobs
+# PDS_BLOBSTORE_S3_REGION=us-east-1
+# PDS_BLOBSTORE_S3_ACCESS_KEY_ID=
+# PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY=
+# PDS_BLOBSTORE_S3_ENDPOINT=  # Optional: for S3-compatible services
+
+# ============================================================================
+# Database
+# ============================================================================
+PDS_ACCOUNT_DB_LOCATION=./data/accounts.db
+
+# ============================================================================
+# Email Configuration (Optional)
+# ============================================================================
+EMAIL_SMTP_URL=
+EMAIL_FROM_ADDRESS=noreply@$HOSTNAME
+
+# ============================================================================
+# Identity & Federation
+# ============================================================================
+# DID PLC Directory URL
+DID_PLC_URL=https://plc.directory
+
+# Federation settings
+FEDERATION_ENABLED=$FEDERATION_ENABLED
+FEDERATION_RELAY_URLS=$RELAY_URL
+
+# ============================================================================
+# Rate Limiting
+# ============================================================================
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_GLOBAL_HOURLY=3000
+RATE_LIMIT_GLOBAL_DAILY=10000
+RATE_LIMIT_CREATE_SESSION_HOURLY=30
+RATE_LIMIT_CREATE_SESSION_DAILY=300
+
+# ============================================================================
+# Invite Codes
+# ============================================================================
+INVITE_REQUIRED=$INVITE_REQUIRED
+INVITE_INTERVAL=604800  # 1 week in seconds
+
+# ============================================================================
+# Logging
+# ============================================================================
+RUST_LOG=info,aurora_locus=debug
+
+EOF
+
+    print_success ".env file created"
+}
+
+# Create systemd service
+create_systemd_service() {
+    print_info "Creating systemd service file..."
+
+    local service_file="/tmp/aurora-locus.service"
+
+    cat > $service_file << EOF
+[Unit]
+Description=Aurora Locus ATProto PDS
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/target/release/aurora-locus
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$INSTALL_DIR/data
+
+# Environment
+Environment=RUST_LOG=info,aurora_locus=debug
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    print_success "Systemd service file created: $service_file"
+    echo ""
+    print_info "To install the service, run:"
+    echo "  sudo cp $service_file /etc/systemd/system/"
+    echo "  sudo systemctl daemon-reload"
+    echo "  sudo systemctl enable aurora-locus"
+    echo "  sudo systemctl start aurora-locus"
+    echo ""
+}
+
+# Create nginx configuration
+create_nginx_config() {
+    print_info "Creating nginx reverse proxy configuration..."
+
+    local nginx_file="/tmp/aurora-locus-nginx.conf"
+
+    cat > $nginx_file << EOF
+# Aurora Locus PDS - Nginx Configuration
+# Place this file in /etc/nginx/sites-available/aurora-locus
+# Then: sudo ln -s /etc/nginx/sites-available/aurora-locus /etc/nginx/sites-enabled/
+
+server {
+    listen 80;
+    server_name $HOSTNAME;
+
+    # Redirect HTTP to HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $HOSTNAME;
+
+    # SSL Configuration (update paths to your certificates)
+    ssl_certificate /etc/letsencrypt/live/$HOSTNAME/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$HOSTNAME/privkey.pem;
+
+    # SSL Security Settings
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # Proxy settings
+    location / {
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+
+        # WebSocket support (for firehose)
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Headers
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # Logging
+    access_log /var/log/nginx/aurora-locus-access.log;
+    error_log /var/log/nginx/aurora-locus-error.log;
+}
+EOF
+
+    print_success "Nginx configuration created: $nginx_file"
+    echo ""
+    print_info "To install the nginx config:"
+    echo "  1. Get SSL certificates: sudo certbot --nginx -d $HOSTNAME"
+    echo "  2. Copy config: sudo cp $nginx_file /etc/nginx/sites-available/aurora-locus"
+    echo "  3. Enable site: sudo ln -s /etc/nginx/sites-available/aurora-locus /etc/nginx/sites-enabled/"
+    echo "  4. Test config: sudo nginx -t"
+    echo "  5. Reload nginx: sudo systemctl reload nginx"
+    echo ""
+}
+
+# Main installation flow
+main() {
+    clear
+    print_header "Aurora Locus PDS Installation"
+    echo ""
+    echo "This script will guide you through setting up a production-ready"
+    echo "ATProto Personal Data Server (PDS) for the Bluesky network."
+    echo ""
+    read -p "Press Enter to continue..."
+    echo ""
+
+    # Check prerequisites
+    check_root
+    check_dependencies
+
+    # Get installation directory
+    print_header "Installation Directory"
+    INSTALL_DIR=$(pwd)
+    echo "Current directory: $INSTALL_DIR"
+    prompt INSTALL_DIR "Install in this directory?" "$INSTALL_DIR"
+    cd "$INSTALL_DIR"
+    echo ""
+
+    # Collect configuration
+    print_header "Server Configuration"
+
+    while true; do
+        prompt HOSTNAME "PDS hostname (e.g., pds.example.com)" ""
+        if validate_domain "$HOSTNAME"; then
+            break
+        else
+            print_error "Invalid domain name. Please try again."
+        fi
+    done
+
+    prompt PORT "Server port" "3000"
+    echo ""
+
+    # Admin configuration
+    print_header "Admin Configuration"
+
+    while true; do
+        prompt ADMIN_EMAIL "Admin email address" ""
+        if validate_email "$ADMIN_EMAIL"; then
+            break
+        else
+            print_error "Invalid email address. Please try again."
+        fi
+    done
+
+    while true; do
+        prompt ADMIN_PASSWORD "Admin password (min 8 characters)" "" "secret"
+        if [ ${#ADMIN_PASSWORD} -ge 8 ]; then
+            prompt ADMIN_PASSWORD_CONFIRM "Confirm admin password" "" "secret"
+            if [ "$ADMIN_PASSWORD" = "$ADMIN_PASSWORD_CONFIRM" ]; then
+                break
+            else
+                print_error "Passwords do not match. Please try again."
+            fi
+        else
+            print_error "Password must be at least 8 characters."
+        fi
+    done
+
+    # Will be set after account creation
+    ADMIN_DID="# Set this after creating your admin account"
+    echo ""
+
+    # Federation settings
+    print_header "Federation Configuration"
+
+    prompt FEDERATION_ENABLED "Enable federation with Bluesky network? (true/false)" "true"
+
+    if [ "$FEDERATION_ENABLED" = "true" ]; then
+        prompt RELAY_URL "Relay server URL" "https://bsky.network"
+    else
+        RELAY_URL=""
+    fi
+    echo ""
+
+    # Invite codes
+    print_header "Invite Code Configuration"
+
+    prompt INVITE_REQUIRED "Require invite codes for registration? (true/false)" "false"
+    echo ""
+
+    # Generate cryptographic keys
+    print_header "Generating Cryptographic Keys"
+
+    print_info "Generating JWT secret..."
+    JWT_SECRET=$(generate_random 64)
+    print_success "JWT secret generated"
+
+    generate_repo_key
+    generate_plc_key
+    generate_oauth_keyset
+    echo ""
+
+    # Create configuration files
+    print_header "Creating Configuration Files"
+    create_env_file
+    echo ""
+
+    # Build the project
+    print_header "Building Aurora Locus"
+
+    print_info "This may take several minutes..."
+    if cargo build --release 2>&1 | tee build.log | grep -q "Finished"; then
+        print_success "Build completed successfully!"
+        rm build.log
+    else
+        print_error "Build failed. Check build.log for details."
+        exit 1
+    fi
+    echo ""
+
+    # Create data directories
+    print_header "Setting Up Data Directories"
+
+    mkdir -p data/actors data/blobs data/tmp
+    print_success "Data directories created"
+    echo ""
+
+    # Run database migrations
+    print_header "Running Database Migrations"
+
+    print_info "Initializing database..."
+    # The migrations will run automatically on first startup
+    print_success "Database will be initialized on first run"
+    echo ""
+
+    # Optional: systemd service
+    print_header "System Integration (Optional)"
+
+    prompt SETUP_SYSTEMD "Create systemd service file? (yes/no)" "yes"
+    if [ "$SETUP_SYSTEMD" = "yes" ]; then
+        create_systemd_service
+    fi
+
+    prompt SETUP_NGINX "Create nginx configuration? (yes/no)" "yes"
+    if [ "$SETUP_NGINX" = "yes" ]; then
+        create_nginx_config
+    fi
+
+    # Installation complete
+    print_header "Installation Complete!"
+
+    echo ""
+    print_success "Aurora Locus PDS has been successfully configured!"
+    echo ""
+    print_info "Next steps:"
+    echo ""
+    echo "1. Start the server:"
+    echo "   ./target/release/aurora-locus"
+    echo ""
+    echo "2. Create your admin account:"
+    echo "   curl -X POST http://localhost:$PORT/xrpc/com.atproto.server.createAccount \\"
+    echo "     -H 'Content-Type: application/json' \\"
+    echo "     -d '{\"handle\":\"admin.$HOSTNAME\",\"email\":\"$ADMIN_EMAIL\",\"password\":\"[your-password]\"}'"
+    echo ""
+    echo "3. Grant admin role (after account creation):"
+    echo "   sqlite3 data/accounts.db \"INSERT INTO admin_role (did, role, granted_by, granted_at) \\"
+    echo "     VALUES ('[your-did]', 'superadmin', 'system', datetime('now'));\""
+    echo ""
+    echo "4. Update OAUTH_ADMIN_DIDS in .env with your admin DID"
+    echo ""
+
+    if [ "$SETUP_SYSTEMD" = "yes" ]; then
+        echo "5. Install systemd service (see instructions above)"
+        echo ""
+    fi
+
+    if [ "$SETUP_NGINX" = "yes" ]; then
+        echo "6. Configure nginx reverse proxy (see instructions above)"
+        echo ""
+    fi
+
+    print_warning "IMPORTANT: Keep your .env file and oauth-keyset.json secure!"
+    print_warning "These files contain sensitive cryptographic keys."
+    echo ""
+
+    print_info "Configuration file: .env"
+    print_info "OAuth keyset: oauth-keyset.json"
+    print_info "Installation directory: $INSTALL_DIR"
+    echo ""
+
+    print_success "Happy hosting! 🎉"
+    echo ""
+}
+
+# Run main installation
+main
