@@ -11,6 +11,7 @@ use axum::{
     extract::FromRequestParts,
     http::request::Parts,
 };
+use uuid::Uuid;
 
 /// Authenticated context - extracts and validates session from request
 #[derive(Debug, Clone)]
@@ -93,20 +94,49 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
         parts: &mut Parts,
         state: &AppContext,
     ) -> Result<Self, Self::Rejection> {
-        // First, authenticate as normal user
+        // Extract bearer token
         let token = extract_bearer_token(&parts.headers)
             .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
 
-        let session = state
-            .account_manager
-            .validate_access_token(&token)
-            .await
-            .map_err(|e| {
-                tracing::error!("AdminAuthContext: Token validation failed: {}", e);
-                e
-            })?;
+        // Try to validate as session token first
+        let (did, session) = match state.account_manager.validate_access_token(&token).await {
+            Ok(session) => {
+                let did = session.did.clone();
+                (did, session)
+            }
+            Err(_) => {
+                // Session validation failed, try JWT validation for admin-only tokens
+                tracing::debug!("AdminAuthContext: Session validation failed, trying JWT validation");
 
-        let did = session.did.clone();
+                let token_data = verify_jwt_token(&token, &state.config.authentication.jwt_secret)?;
+
+                // Extract DID from JWT claims
+                let claims = &token_data.claims;
+                let did = claims.get("sub")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| PdsError::Authentication("Invalid JWT: missing 'sub' claim".to_string()))?
+                    .to_string();
+
+                // Check scope is admin
+                let scope = claims.get("scope")
+                    .and_then(|v| v.as_str());
+                if scope != Some("admin") {
+                    return Err(PdsError::Authentication("JWT token does not have admin scope".to_string()));
+                }
+
+                tracing::info!("AdminAuthContext: JWT validation successful for DID: {}", did);
+
+                // Create a synthetic session for admin JWT tokens
+                let session = ValidatedSession {
+                    did: did.clone(),
+                    session_id: format!("jwt-{}", Uuid::new_v4()),
+                    is_app_password: false,
+                };
+
+                (did, session)
+            }
+        };
+
         tracing::debug!("AdminAuthContext: Checking admin role for DID: {}", did);
 
         // Check if DID is in configured admin DIDs list
