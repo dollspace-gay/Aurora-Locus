@@ -187,7 +187,7 @@ async fn handle_oauth_callback(
     State(ctx): State<AppContext>,
     axum::Extension(state_store): axum::Extension<OAuthStateStore>,
     Query(params): Query<OAuthCallbackParams>,
-) -> Result<Json<OAuthLoginResponse>, (StatusCode, String)> {
+) -> Result<axum::response::Html<String>, (StatusCode, String)> {
     tracing::info!("Handling OAuth callback");
 
     // Check for errors
@@ -351,13 +351,67 @@ async fn handle_oauth_callback(
         (access_token, refresh_token)
     };
 
-    Ok(Json(OAuthLoginResponse {
-        access_token,
-        refresh_token,
-        did,
-        is_admin,
-        role,
-    }))
+    // Return HTML page that stores tokens and redirects to admin panel
+    let html = format!(r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Login Successful</title>
+    <style>
+        body {{
+            font-family: system-ui, -apple-system, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }}
+        .container {{
+            text-align: center;
+            padding: 2rem;
+        }}
+        .spinner {{
+            width: 48px;
+            height: 48px;
+            border: 4px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin: 0 auto 1rem;
+        }}
+        @keyframes spin {{
+            to {{ transform: rotate(360deg); }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="spinner"></div>
+        <h2>Login Successful!</h2>
+        <p>Redirecting to admin panel...</p>
+    </div>
+    <script>
+        // Store tokens in localStorage
+        localStorage.setItem('adminToken', {});
+        localStorage.setItem('adminRefreshToken', {});
+        localStorage.setItem('adminDid', {});
+        localStorage.setItem('adminRole', {} || 'admin');
+
+        // Redirect to admin panel
+        setTimeout(() => {{
+            window.location.href = '/admin/index.html';
+        }}, 500);
+    </script>
+</body>
+</html>"#,
+        serde_json::to_string(&access_token).unwrap(),
+        serde_json::to_string(&refresh_token).unwrap(),
+        serde_json::to_string(&did).unwrap(),
+        serde_json::to_string(&role).unwrap()
+    );
+
+    Ok(axum::response::Html(html))
 }
 
 /// OAuth client metadata
