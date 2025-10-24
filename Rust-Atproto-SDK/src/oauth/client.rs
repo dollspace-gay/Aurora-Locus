@@ -308,12 +308,12 @@ impl OAuthClient {
 
         // Parse successful response
         let response_text = response.text().await?;
-        tracing::debug!("Token endpoint response: {}", response_text);
+        eprintln!("DEBUG: Token endpoint response: {}", response_text);
 
         let token_response: TokenResponse = serde_json::from_str(&response_text)
             .map_err(|e| {
-                tracing::error!("Failed to parse token response: {}", e);
-                tracing::error!("Response body was: {}", response_text);
+                eprintln!("ERROR: Failed to parse token response: {}", e);
+                eprintln!("ERROR: Response body was: {}", response_text);
                 OAuthError::JsonError(e)
             })?;
 
@@ -379,12 +379,12 @@ impl OAuthClient {
 
         // Parse successful response
         let response_text = response.text().await?;
-        tracing::debug!("Token endpoint response: {}", response_text);
+        eprintln!("DEBUG: Token endpoint response: {}", response_text);
 
         let token_response: TokenResponse = serde_json::from_str(&response_text)
             .map_err(|e| {
-                tracing::error!("Failed to parse token response: {}", e);
-                tracing::error!("Response body was: {}", response_text);
+                eprintln!("ERROR: Failed to parse token response: {}", e);
+                eprintln!("ERROR: Response body was: {}", response_text);
                 OAuthError::JsonError(e)
             })?;
 
