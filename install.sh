@@ -801,7 +801,9 @@ VALUES
 EOSQL
 
         if [ "$ADMIN_DID" != "__PLACEHOLDER_ADMIN_DID__" ] && [ -n "$ADMIN_DID" ]; then
-            sqlite3 data/account.sqlite "INSERT INTO admin_roles (did, role, granted_by, granted_at, revoked) VALUES ('$ADMIN_DID', 'superadmin', 'installer', datetime('now'), 0);"
+            # Use RFC3339 format for timestamp (e.g., 2025-10-24T18:41:11+00:00)
+            TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S+00:00")
+            sqlite3 data/account.sqlite "INSERT INTO admin_roles (did, role, granted_by, granted_at, revoked) VALUES ('$ADMIN_DID', 'superadmin', 'installer', '$TIMESTAMP', 0);"
             print_success "Database initialized - Admin DID $ADMIN_DID added as superadmin"
         else
             print_success "Database initialized with all required tables"
