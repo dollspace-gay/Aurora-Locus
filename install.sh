@@ -624,10 +624,14 @@ CREATE TABLE IF NOT EXISTS account (
     email_confirmed BOOLEAN NOT NULL DEFAULT 0,
     email_confirmed_at DATETIME,
     deactivated_at DATETIME,
-    taken_down BOOLEAN NOT NULL DEFAULT 0
+    taken_down BOOLEAN NOT NULL DEFAULT 0,
+    plc_rotation_key TEXT,
+    plc_rotation_key_public TEXT,
+    plc_last_operation_cid TEXT
 );
 CREATE INDEX idx_account_handle ON account(handle);
 CREATE INDEX idx_account_email ON account(email) WHERE email IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_account_plc_rotation_key ON account(plc_rotation_key_public);
 
 -- Sessions table
 CREATE TABLE IF NOT EXISTS session (
@@ -785,6 +789,70 @@ CREATE INDEX IF NOT EXISTS idx_content_labels_uri ON content_labels(uri);
 CREATE INDEX IF NOT EXISTS idx_content_labels_src ON content_labels(src);
 CREATE INDEX IF NOT EXISTS idx_content_labels_val ON content_labels(val);
 
+-- DID document cache
+CREATE TABLE IF NOT EXISTS did_doc (
+    did TEXT PRIMARY KEY,
+    doc TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    cached_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_did_doc_updated_at ON did_doc(updated_at);
+
+-- Handle to DID mapping cache
+CREATE TABLE IF NOT EXISTS did_handle (
+    handle TEXT PRIMARY KEY,
+    did TEXT NOT NULL,
+    declared_at TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_did_handle_did ON did_handle(did);
+CREATE INDEX IF NOT EXISTS idx_did_handle_updated_at ON did_handle(updated_at);
+
+-- Blob metadata (permanent blobs)
+CREATE TABLE IF NOT EXISTS blob_metadata (
+    cid TEXT PRIMARY KEY,
+    mime_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    creator_did TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    width INTEGER,
+    height INTEGER,
+    alt_text TEXT,
+    thumbnail_cid TEXT,
+    FOREIGN KEY (creator_did) REFERENCES account(did) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_blob_creator ON blob_metadata(creator_did);
+CREATE INDEX IF NOT EXISTS idx_blob_created_at ON blob_metadata(created_at);
+CREATE INDEX IF NOT EXISTS idx_blob_thumbnail ON blob_metadata(thumbnail_cid);
+
+-- Temporary blob metadata (two-phase upload)
+CREATE TABLE IF NOT EXISTS temp_blob_metadata (
+    cid TEXT PRIMARY KEY,
+    mime_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    creator_did TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    width INTEGER,
+    height INTEGER,
+    FOREIGN KEY (creator_did) REFERENCES account(did) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_temp_blob_creator ON temp_blob_metadata(creator_did);
+CREATE INDEX IF NOT EXISTS idx_temp_blob_created_at ON temp_blob_metadata(created_at);
+
+-- Sequencer event log (federation)
+CREATE TABLE IF NOT EXISTS repo_seq (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    did TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event BLOB NOT NULL,
+    invalidated INTEGER NOT NULL DEFAULT 0,
+    sequenced_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repo_seq_did ON repo_seq(did);
+CREATE INDEX IF NOT EXISTS idx_repo_seq_event_type ON repo_seq(event_type);
+CREATE INDEX IF NOT EXISTS idx_repo_seq_sequenced_at ON repo_seq(sequenced_at);
+CREATE INDEX IF NOT EXISTS idx_repo_seq_seq_invalidated ON repo_seq(seq, invalidated);
+
 -- Migration tracking table
 CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     version BIGINT PRIMARY KEY NOT NULL,
@@ -797,7 +865,13 @@ CREATE TABLE IF NOT EXISTS _sqlx_migrations (
 INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
 VALUES
     (20250101000001, 'init_account', CURRENT_TIMESTAMP, 1, X'00', 0),
-    (20250106000001, 'admin_moderation', CURRENT_TIMESTAMP, 1, X'00', 0);
+    (20250103000001, 'blob_metadata', CURRENT_TIMESTAMP, 1, X'00', 0),
+    (20250104000001, 'sequencer', CURRENT_TIMESTAMP, 1, X'00', 0),
+    (20250105000001, 'did_cache', CURRENT_TIMESTAMP, 1, X'00', 0),
+    (20250106000001, 'admin_moderation', CURRENT_TIMESTAMP, 1, X'00', 0),
+    (20250107000001, 'blob_metadata_extensions', CURRENT_TIMESTAMP, 1, X'00', 0),
+    (20250108000001, 'temp_blob_table', CURRENT_TIMESTAMP, 1, X'00', 0),
+    (20250109000001, 'plc_keys', CURRENT_TIMESTAMP, 1, X'00', 0);
 EOSQL
 
         if [ "$ADMIN_DID" != "__PLACEHOLDER_ADMIN_DID__" ] && [ -n "$ADMIN_DID" ]; then
