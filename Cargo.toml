@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Use parent SDK for ATProto functionality
-atproto = { path = ".." }
+atproto = { path = "./Rust-Atproto-SDK" }
 
 # HTTP Server
 axum = { version = "0.7", features = ["tokio", "ws"] }
