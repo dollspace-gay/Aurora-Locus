@@ -35,6 +35,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> PdsResult<()> {
+    // Load .env file if it exists
+    dotenv::dotenv().ok();
+
     // Initialize logging with JSON support
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "text".to_string());
 

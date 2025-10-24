@@ -67,8 +67,18 @@ load_config() {
         exit 1
     fi
 
-    # Source .env file
-    export $(cat .env | grep -v '^#' | grep -v '^$' | xargs)
+    # Load .env file (properly handle comments and special chars)
+    while IFS='=' read -r key value; do
+        # Skip empty lines and comments
+        [[ -z "$key" || "$key" =~ ^#.* ]] && continue
+
+        # Remove inline comments and trim whitespace
+        value="${value%%#*}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        # Export the variable
+        export "$key=$value"
+    done < <(grep -E '^[A-Z_]+=.*' .env)
 
     PDS_URL="http://${PDS_HOSTNAME}:${PDS_PORT}"
 }
