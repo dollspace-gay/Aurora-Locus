@@ -94,7 +94,7 @@ impl OAuthClient {
     /// ## Returns
     ///
     /// Authorization server metadata including token and authorization endpoints
-    async fn discover_server_metadata(
+    pub async fn discover_server_metadata(
         &self,
         pds_url: &str,
     ) -> Result<AuthorizationServerMetadata, OAuthError> {
@@ -309,18 +309,13 @@ impl OAuthClient {
         // Parse successful response
         let token_response: TokenResponse = response.json().await?;
 
-        // Extract DID from token or sub claim
-        let did = token_response
-            .sub
-            .ok_or_else(|| OAuthError::MissingField("sub (DID)".to_string()))?;
-
-        // Build OAuth session
+        // Build OAuth session (sub is now a required field)
         Ok(OAuthSession {
             access_token: token_response.access_token,
             refresh_token: token_response.refresh_token,
             token_type: token_response.token_type,
             expires_in: token_response.expires_in,
-            did,
+            did: token_response.sub,
             handle: None, // Will be populated by profile fetch
             email: None,
             email_confirmed: None,
@@ -377,18 +372,13 @@ impl OAuthClient {
         // Parse successful response
         let token_response: TokenResponse = response.json().await?;
 
-        // Extract DID from token or sub claim
-        let did = token_response
-            .sub
-            .ok_or_else(|| OAuthError::MissingField("sub (DID)".to_string()))?;
-
-        // Build OAuth session
+        // Build OAuth session (sub is now a required field)
         Ok(OAuthSession {
             access_token: token_response.access_token,
             refresh_token: token_response.refresh_token,
             token_type: token_response.token_type,
             expires_in: token_response.expires_in,
-            did,
+            did: token_response.sub,
             handle: None,
             email: None,
             email_confirmed: None,

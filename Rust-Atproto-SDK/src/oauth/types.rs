@@ -164,13 +164,25 @@ impl ClientMetadata {
 }
 
 /// Token response from authorization server
+///
+/// For ATProto OAuth, the token response has these required fields per spec:
+/// - `access_token`: The access token (JWT)
+/// - `token_type`: Must be "DPoP" for ATProto
+/// - `sub`: User's DID (required by ATProto spec)
+/// - `scope`: Granted scope (required, should contain "atproto")
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenResponse {
     /// Access token
     pub access_token: String,
 
-    /// Token type (should be "DPoP")
+    /// Token type (should be "DPoP" for ATProto)
     pub token_type: String,
+
+    /// User's DID (required for ATProto OAuth)
+    pub sub: String,
+
+    /// Scope granted (required, typically "atproto")
+    pub scope: String,
 
     /// Token expiration in seconds
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,15 +191,32 @@ pub struct TokenResponse {
     /// Refresh token (for getting new access tokens)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
-
-    /// Scope granted (typically "atproto")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
-
-    /// User's DID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sub: Option<String>,
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /// OAuth error response
 #[derive(Debug, Clone, Serialize, Deserialize)]
