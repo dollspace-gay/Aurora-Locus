@@ -568,7 +568,27 @@ main() {
 
     # Create configuration files
     print_header "Creating Configuration Files"
+
+    # Backup existing .env if it exists
+    if [ -f .env ]; then
+        print_warning "Existing .env file found - backing up to .env.backup"
+        mv .env .env.backup
+    fi
+
     create_env_file
+
+    # Verify .env was created successfully
+    if [ ! -f .env ]; then
+        print_error ".env file was not created!"
+        exit 1
+    fi
+
+    if ! grep -q "PDS_JWT_SECRET" .env; then
+        print_error ".env file is missing PDS_JWT_SECRET"
+        exit 1
+    fi
+
+    print_success ".env file created and verified"
     echo ""
 
     # Build the project
@@ -596,8 +616,8 @@ main() {
 
     print_info "Starting server temporarily to run migrations..."
 
-    # Start server in background
-    ./target/release/aurora-locus &
+    # Start server in background with logging
+    RUST_LOG=info ./target/release/aurora-locus > server-init.log 2>&1 &
     SERVER_PID=$!
 
     # Wait for server to start (check health endpoint)
@@ -609,7 +629,11 @@ main() {
         fi
         sleep 1
         if [ $i -eq 30 ]; then
-            print_error "Server failed to start. Check logs."
+            print_error "Server failed to start within 30 seconds"
+            echo ""
+            print_error "Last 20 lines of server-init.log:"
+            tail -20 server-init.log
+            echo ""
             kill $SERVER_PID 2>/dev/null
             exit 1
         fi
@@ -673,6 +697,9 @@ EOF
     kill $SERVER_PID 2>/dev/null
     wait $SERVER_PID 2>/dev/null
     print_success "Temporary server stopped"
+
+    # Clean up initialization log
+    rm -f server-init.log
     echo ""
 
     # Optional: systemd service

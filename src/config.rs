@@ -60,7 +60,6 @@ pub enum BlobstoreConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     pub jwt_secret: String,
-    pub admin_password: String,
     pub repo_signing_key: String,
     pub plc_rotation_key: String,
     /// DID(s) allowed to access admin panel (comma-separated)
@@ -193,8 +192,6 @@ impl ServerConfig {
 
         let jwt_secret = env::var("PDS_JWT_SECRET")
             .map_err(|_| PdsError::Validation("JWT secret required".to_string()))?;
-        let admin_password = env::var("PDS_ADMIN_PASSWORD")
-            .map_err(|_| PdsError::Validation("Admin password required".to_string()))?;
         let repo_signing_key = env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX")
             .map_err(|_| PdsError::Validation("Repo signing key required".to_string()))?;
         let plc_rotation_key = env::var("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX")
@@ -306,7 +303,6 @@ impl ServerConfig {
             },
             authentication: AuthConfig {
                 jwt_secret,
-                admin_password,
                 repo_signing_key,
                 plc_rotation_key,
                 admin_dids,
@@ -356,11 +352,7 @@ impl ServerConfig {
             ));
         }
 
-        if self.authentication.admin_password.len() < 8 {
-            return Err(PdsError::Validation(
-                "Admin password must be at least 8 characters".to_string(),
-            ));
-        }
+        // Admin password removed - OAuth uses DID-based authentication
 
         Ok(())
     }
