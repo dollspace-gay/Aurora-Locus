@@ -302,8 +302,12 @@ EMAIL_FROM_ADDRESS=noreply@$HOSTNAME
 DID_PLC_URL=https://plc.directory
 
 # Federation settings
-FEDERATION_ENABLED=$FEDERATION_ENABLED
-FEDERATION_RELAY_URLS=$RELAY_URL
+PDS_FEDERATION_ENABLED=$FEDERATION_ENABLED
+PDS_FEDERATION_RELAY_URLS=$RELAY_URL
+PDS_FEDERATION_FIREHOSE_ENABLED=true
+PDS_FEDERATION_CRAWL_ENABLED=true
+PDS_FEDERATION_AUTO_STREAM=true
+PDS_PUBLIC_URL=$PDS_PUBLIC_URL
 
 # ============================================================================
 # Rate Limiting
@@ -522,8 +526,22 @@ main() {
 
     if [ "$FEDERATION_ENABLED" = "true" ]; then
         prompt RELAY_URL "Relay server URL" "https://bsky.network"
+
+        # Set PDS_PUBLIC_URL based on hostname and port
+        if [ -n "$HOSTNAME" ]; then
+            if [ "$PORT" = "443" ]; then
+                DEFAULT_PUBLIC_URL="https://$HOSTNAME"
+            else
+                DEFAULT_PUBLIC_URL="https://$HOSTNAME"
+            fi
+        else
+            DEFAULT_PUBLIC_URL=""
+        fi
+
+        prompt PDS_PUBLIC_URL "Public URL for this PDS (must be accessible from internet)" "$DEFAULT_PUBLIC_URL"
     else
         RELAY_URL=""
+        PDS_PUBLIC_URL=""
     fi
     echo ""
 
@@ -625,6 +643,7 @@ CREATE TABLE IF NOT EXISTS account (
     email_confirmed_at DATETIME,
     deactivated_at DATETIME,
     taken_down BOOLEAN NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
     plc_rotation_key TEXT,
     plc_rotation_key_public TEXT,
     plc_last_operation_cid TEXT
@@ -632,6 +651,7 @@ CREATE TABLE IF NOT EXISTS account (
 CREATE INDEX idx_account_handle ON account(handle);
 CREATE INDEX idx_account_email ON account(email) WHERE email IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_account_plc_rotation_key ON account(plc_rotation_key_public);
+CREATE INDEX IF NOT EXISTS idx_account_status ON account(status);
 
 -- Sessions table
 CREATE TABLE IF NOT EXISTS session (
@@ -737,21 +757,25 @@ CREATE TABLE IF NOT EXISTS admin_audit_log (
     ip_address TEXT
 );
 
--- Moderation reports
-CREATE TABLE IF NOT EXISTS moderation_reports (
+-- User reports
+CREATE TABLE IF NOT EXISTS report (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_did TEXT,
+    subject_uri TEXT,
+    subject_cid TEXT,
     reason_type TEXT NOT NULL,
+    reason TEXT,
     reported_by TEXT NOT NULL,
-    subject_uri TEXT NOT NULL,
-    reason_text TEXT,
-    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'resolved', 'dismissed')),
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    resolved_at DATETIME,
-    resolved_by TEXT
+    reported_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    resolution TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_moderation_reports_status ON moderation_reports(status);
-CREATE INDEX IF NOT EXISTS idx_moderation_reports_subject ON moderation_reports(subject_uri);
-CREATE INDEX IF NOT EXISTS idx_moderation_reports_reported_by ON moderation_reports(reported_by);
+CREATE INDEX IF NOT EXISTS idx_report_status ON report(status);
+CREATE INDEX IF NOT EXISTS idx_report_subject_did ON report(subject_did);
+CREATE INDEX IF NOT EXISTS idx_report_subject_uri ON report(subject_uri);
+CREATE INDEX IF NOT EXISTS idx_report_reported_by ON report(reported_by);
 
 -- Account moderation actions
 CREATE TABLE IF NOT EXISTS account_moderation (
