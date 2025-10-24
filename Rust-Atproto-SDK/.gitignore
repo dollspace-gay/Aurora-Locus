@@ -1,0 +1,8 @@
+# TypeScript atproto SDK reference
+bluesky-social atproto main packages-api/
+
+# Rust build artifacts
+/target/
+Cargo.lock
+.claude
+nul

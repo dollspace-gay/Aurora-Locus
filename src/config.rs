@@ -63,6 +63,21 @@ pub struct AuthConfig {
     pub admin_password: String,
     pub repo_signing_key: String,
     pub plc_rotation_key: String,
+    /// DID(s) allowed to access admin panel (comma-separated)
+    pub admin_dids: Vec<String>,
+    /// OAuth configuration for admin login
+    pub oauth: OAuthConfig,
+}
+
+/// OAuth configuration for admin authentication
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    /// OAuth client ID (URL to client metadata)
+    pub client_id: String,
+    /// OAuth redirect URI
+    pub redirect_uri: String,
+    /// PDS URL for OAuth (e.g., https://bsky.social)
+    pub pds_url: String,
 }
 
 /// Identity configuration
@@ -185,6 +200,22 @@ impl ServerConfig {
         let plc_rotation_key = env::var("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX")
             .map_err(|_| PdsError::Validation("PLC rotation key required".to_string()))?;
 
+        // Parse admin DIDs from comma-separated list
+        let admin_dids = env::var("PDS_ADMIN_DIDS")
+            .unwrap_or_else(|_| String::new())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<String>>();
+
+        // OAuth configuration for admin login
+        let oauth_client_id = env::var("PDS_OAUTH_CLIENT_ID")
+            .unwrap_or_else(|_| format!("https://{}/oauth/client-metadata.json", hostname));
+        let oauth_redirect_uri = env::var("PDS_OAUTH_REDIRECT_URI")
+            .unwrap_or_else(|_| format!("https://{}/oauth/callback", hostname));
+        let oauth_pds_url = env::var("PDS_OAUTH_PDS_URL")
+            .unwrap_or_else(|_| "https://bsky.social".to_string());
+
         let did_plc_url = env::var("PDS_DID_PLC_URL")
             .unwrap_or_else(|_| "https://plc.directory".to_string());
         let service_handle_domains = env::var("PDS_SERVICE_HANDLE_DOMAINS")
@@ -278,6 +309,12 @@ impl ServerConfig {
                 admin_password,
                 repo_signing_key,
                 plc_rotation_key,
+                admin_dids,
+                oauth: OAuthConfig {
+                    client_id: oauth_client_id,
+                    redirect_uri: oauth_redirect_uri,
+                    pds_url: oauth_pds_url,
+                },
             },
             identity: IdentityConfig {
                 did_plc_url,

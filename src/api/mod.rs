@@ -6,6 +6,7 @@ pub mod health;
 pub mod identity;
 pub mod labels;
 pub mod middleware;
+pub mod oauth_admin;
 pub mod repo;
 pub mod server;
 pub mod sync;
@@ -16,6 +17,9 @@ use axum::Router;
 
 /// Build API routes
 pub fn routes() -> Router<AppContext> {
+    // Create OAuth state store (in-memory for now)
+    let oauth_state_store = oauth_admin::OAuthStateStore::new();
+
     Router::new()
         .merge(well_known::routes())
         .merge(server::routes())
@@ -27,4 +31,6 @@ pub fn routes() -> Router<AppContext> {
         .merge(firehose::routes())
         .merge(labels::routes())
         .merge(health::routes())
+        // OAuth admin routes with their own state
+        .merge(oauth_admin::routes(oauth_state_store))
 }

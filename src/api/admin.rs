@@ -1,80 +1,49 @@
 /// Admin API Endpoints
 /// Implements com.atproto.admin.* endpoints for server administration
 use crate::{
-    account::ValidatedSession,
-    admin::{
-        InviteCode, Label, ModerationAction, ModerationRecord, Report, ReportReason,
-        ReportStatus, Role,
-    },
-    error::{PdsError, PdsResult},
+    admin::InviteCode,
+    auth::AdminAuthContext,
     AppContext,
 };
 use axum::{
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
 use chrono::Duration;
 use serde::Deserialize;
 
-/// Helper function to extract and validate admin auth manually
-/// Returns the validated session DID
-async fn validate_admin_auth(headers: &HeaderMap, ctx: &AppContext) -> Result<String, (StatusCode, String)> {
-    // Extract Bearer token from Authorization header
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing authorization header".to_string()))?;
-
-    // Validate the access token
-    let session = ctx
-        .account_manager
-        .validate_access_token(token)
-        .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e)))?;
-
-    Ok(session.did)
-}
-
 /// Build admin API routes
 pub fn routes() -> Router<AppContext> {
     Router::new()
-        // Admin stats and data (WORKING - converted to manual auth)
+        // Admin stats and data
         .route("/xrpc/com.atproto.admin.getStats", get(get_stats))
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
-        // Invite codes (WORKING - converted to manual auth)
+        // Invite codes
         .route("/xrpc/com.atproto.admin.createInviteCode", post(create_invite_code))
         .route("/xrpc/com.atproto.admin.getInviteCodes", get(get_invite_codes))
         .route("/xrpc/com.atproto.admin.listInviteCodes", get(list_invite_codes))
-        // TODO: Convert remaining endpoints to manual auth
-        // Role management (SuperAdmin only)
-        // .route("/xrpc/com.atproto.admin.grantRole", post(grant_role))
-        // .route("/xrpc/com.atproto.admin.revokeRole", post(revoke_role))
-        // .route("/xrpc/com.atproto.admin.listRoles", get(list_roles))
+        // Role management
+        .route("/xrpc/com.atproto.admin.grantRole", post(grant_role))
+        .route("/xrpc/com.atproto.admin.revokeRole", post(revoke_role))
+        .route("/xrpc/com.atproto.admin.listRoles", get(list_roles))
         // Account moderation
-        // .route("/xrpc/com.atproto.admin.takedownAccount", post(takedown_account))
-        // .route("/xrpc/com.atproto.admin.suspendAccount", post(suspend_account))
-        // .route("/xrpc/com.atproto.admin.restoreAccount", post(restore_account))
-        // .route(
-        //     "/xrpc/com.atproto.admin.getModerationHistory",
-        //     get(get_moderation_history),
-        // )
+        .route("/xrpc/com.atproto.admin.takedownAccount", post(takedown_account))
+        .route("/xrpc/com.atproto.admin.suspendAccount", post(suspend_account))
+        .route("/xrpc/com.atproto.admin.restoreAccount", post(restore_account))
+        .route("/xrpc/com.atproto.admin.getModerationHistory", get(get_moderation_history))
         // Labels
-        // .route("/xrpc/com.atproto.admin.applyLabel", post(apply_label))
-        // .route("/xrpc/com.atproto.admin.removeLabel", post(remove_label))
-        // Invite codes
-        // .route("/xrpc/com.atproto.admin.disableInviteCode", post(disable_invite_code))
-        // .route("/xrpc/com.atproto.admin.listInviteCodes", get(list_invite_codes))
+        .route("/xrpc/com.atproto.admin.applyLabel", post(apply_label))
+        .route("/xrpc/com.atproto.admin.removeLabel", post(remove_label))
         // Reports
-        // .route("/xrpc/com.atproto.admin.submitReport", post(submit_report))
-        // .route("/xrpc/com.atproto.admin.updateReportStatus", post(update_report_status))
-        // .route("/xrpc/com.atproto.admin.listReports", get(list_reports))
+        .route("/xrpc/com.atproto.admin.submitReport", post(submit_report))
+        .route("/xrpc/com.atproto.admin.updateReportStatus", post(update_report_status))
+        .route("/xrpc/com.atproto.admin.listReports", get(list_reports))
 }
 
 // ============================================================================
-// Working Endpoints (Manual Auth)
+// Admin Endpoints (OAuth Authentication via AdminAuthContext)
 // ============================================================================
 
 #[derive(Deserialize)]
@@ -88,48 +57,24 @@ struct CreateInviteCodeRequest {
 /// Create an invite code
 async fn create_invite_code(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
+    auth: AdminAuthContext,
     Json(req): Json<CreateInviteCodeRequest>,
 ) -> Result<Json<InviteCode>, (StatusCode, String)> {
-    eprintln!("[DEBUG] create_invite_code: Function entered");
-
-    // Validate admin authentication
-    eprintln!("[DEBUG] create_invite_code: Validating auth");
-    let admin_did = match validate_admin_auth(&headers, &ctx).await {
-        Ok(did) => {
-            eprintln!("[DEBUG] create_invite_code: Auth succeeded for DID: {}", did);
-            did
-        }
-        Err(e) => {
-            eprintln!("[DEBUG] create_invite_code: Auth failed: {:?}", e);
-            return Err(e);
-        }
-    };
-
     // Create invite code
-    eprintln!("[DEBUG] create_invite_code: Creating invite with uses={:?}, expires_days={:?}", req.uses, req.expires_days);
     let uses = req.uses.unwrap_or(1);
     let expires_in = req.expires_days.map(Duration::days);
 
-    eprintln!("[DEBUG] create_invite_code: Calling invite_manager.create_invite");
     let code = ctx
         .invite_manager
-        .create_invite(&admin_did, uses, expires_in, req.note.clone(), req.for_account.clone())
+        .create_invite(&auth.did, uses, expires_in, req.note.clone(), req.for_account.clone())
         .await
-        .map_err(|e| {
-            eprintln!("[DEBUG] create_invite_code: invite_manager.create_invite failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    eprintln!("[DEBUG] create_invite_code: Invite created successfully: {}", code.code);
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log the action
-    eprintln!("[DEBUG] create_invite_code: Logging admin action");
     let _ = ctx.admin_role_manager
-        .log_action(&admin_did, "invite.create", None, Some(&code.code), None)
+        .log_action(&auth.did, "invite.create", None, Some(&code.code), None)
         .await;
 
-    eprintln!("[DEBUG] create_invite_code: Returning success");
     Ok(Json(code))
 }
 
@@ -147,12 +92,9 @@ struct GetInviteCodesResponse {
 /// Get all invite codes
 async fn get_invite_codes(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
+    _auth: AdminAuthContext,
     Query(query): Query<GetInviteCodesQuery>,
 ) -> Result<Json<GetInviteCodesResponse>, (StatusCode, String)> {
-    // Validate admin authentication
-    let _admin_did = validate_admin_auth(&headers, &ctx).await?;
-
     // Get all invite codes
     let codes = ctx
         .invite_manager
@@ -181,12 +123,9 @@ struct ListInviteCodesResponse {
 /// List invite codes (ATProto standard endpoint)
 async fn list_invite_codes(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
-    Query(query): Query<ListInviteCodesQuery>,
+    _auth: AdminAuthContext,
+    Query(_query): Query<ListInviteCodesQuery>,
 ) -> Result<Json<ListInviteCodesResponse>, (StatusCode, String)> {
-    // Validate admin authentication
-    let _admin_did = validate_admin_auth(&headers, &ctx).await?;
-
     // Get all invite codes (ignore cursor for now, return all)
     let codes = ctx
         .invite_manager
@@ -200,10 +139,8 @@ async fn list_invite_codes(
 /// Get server statistics
 async fn get_stats(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
+    _auth: AdminAuthContext,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Validate admin authentication
-    let _admin_did = validate_admin_auth(&headers, &ctx).await?;
 
     // Get statistics from database
     let total_users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account")
@@ -246,11 +183,9 @@ struct GetUsersParams {
 /// Get list of users
 async fn get_users(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
+    _auth: AdminAuthContext,
     Query(params): Query<GetUsersParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Validate admin authentication
-    let _admin_did = validate_admin_auth(&headers, &ctx).await?;
 
     let limit = params.limit.unwrap_or(50).min(100);
 
@@ -289,5 +224,463 @@ async fn get_users(
     Ok(Json(serde_json::json!({
         "users": users,
         "cursor": cursor,
+    })))
+}
+
+// ============================================================================
+// Role Management Endpoints
+// ============================================================================
+
+#[derive(Deserialize)]
+struct GrantRoleRequest {
+    did: String,
+    role: String,
+}
+
+/// Grant admin role to a user
+async fn grant_role(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<GrantRoleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::admin::roles::Role;
+
+    // Parse role
+    let role = Role::from_str(&req.role)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // Grant role
+    let admin_role = ctx.admin_role_manager
+        .grant_role(&req.did, role, &auth.did, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "role.grant", Some(&req.did), Some(&req.role), None)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "did": req.did,
+        "role": req.role,
+        "admin_role": admin_role,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RevokeRoleRequest {
+    did: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Revoke admin role from a user
+async fn revoke_role(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RevokeRoleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Revoke role (revoke_role doesn't take a specific role, revokes the active role)
+    ctx.admin_role_manager
+        .revoke_role(&req.did, &auth.did, req.reason.clone())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "role.revoke", Some(&req.did), req.reason.as_deref(), None)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "did": req.did,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ListRolesQuery {
+    did: Option<String>,
+}
+
+/// List admin roles
+async fn list_roles(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<ListRolesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if let Some(did) = query.did {
+        // Get role for specific user
+        let role_record = ctx.admin_role_manager
+            .get_role(&did)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        Ok(Json(serde_json::json!({
+            "did": did,
+            "role": role_record,
+        })))
+    } else {
+        // List all active role assignments
+        let assignments = ctx.admin_role_manager
+            .list_active_roles()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        Ok(Json(serde_json::json!({
+            "roles": assignments,
+        })))
+    }
+}
+
+// ============================================================================
+// Account Moderation Endpoints
+// ============================================================================
+
+#[derive(Deserialize)]
+struct TakedownAccountRequest {
+    did: String,
+    reason: String,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// Takedown an account (remove from public view)
+async fn takedown_account(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<TakedownAccountRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::admin::moderation::ModerationAction;
+
+    // Apply takedown action
+    let record = ctx.moderation_manager
+        .apply_action(
+            &req.did,
+            ModerationAction::Takedown,
+            &req.reason,
+            &auth.did,
+            None,
+            None,
+            req.notes.clone(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "account.takedown", Some(&req.did), Some(&req.reason), None)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "moderation_id": record.id,
+        "did": req.did,
+        "action": "takedown",
+    })))
+}
+
+#[derive(Deserialize)]
+struct SuspendAccountRequest {
+    did: String,
+    reason: String,
+    #[serde(default)]
+    duration_days: Option<i64>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// Suspend an account temporarily
+async fn suspend_account(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SuspendAccountRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::admin::moderation::ModerationAction;
+
+    let expires_in = req.duration_days.map(Duration::days);
+
+    // Apply suspension
+    let record = ctx.moderation_manager
+        .apply_action(
+            &req.did,
+            ModerationAction::Suspend,
+            &req.reason,
+            &auth.did,
+            expires_in,
+            None,
+            req.notes.clone(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "account.suspend", Some(&req.did), Some(&req.reason), None)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "moderation_id": record.id,
+        "did": req.did,
+        "action": "suspend",
+        "expires_at": record.expires_at,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RestoreAccountRequest {
+    did: String,
+    moderation_id: i64,
+    reason: String,
+}
+
+/// Restore an account after takedown/suspension
+async fn restore_account(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RestoreAccountRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Reverse moderation action
+    ctx.moderation_manager
+        .reverse_action(req.moderation_id, &auth.did, &req.reason)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "account.restore", Some(&req.did), Some(&req.reason), None)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "did": req.did,
+    })))
+}
+
+#[derive(Deserialize)]
+struct GetModerationHistoryQuery {
+    did: String,
+}
+
+/// Get moderation history for an account
+async fn get_moderation_history(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<GetModerationHistoryQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let history = ctx.moderation_manager
+        .get_history(&query.did)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "did": query.did,
+        "history": history,
+    })))
+}
+
+// ============================================================================
+// Label Management Endpoints
+// ============================================================================
+
+#[derive(Deserialize)]
+struct ApplyLabelRequest {
+    uri: String,
+    #[serde(default)]
+    cid: Option<String>,
+    val: String,
+    #[serde(default)]
+    expires_days: Option<i64>,
+}
+
+/// Apply a label to content
+async fn apply_label(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<ApplyLabelRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let expires_in = req.expires_days.map(Duration::days);
+
+    let label = ctx.label_manager
+        .apply_label(
+            &req.uri,
+            req.cid.as_deref(),
+            &req.val,
+            &auth.did,
+            expires_in,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "label.apply", None, Some(&req.val), Some(&req.uri))
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "label": label,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RemoveLabelRequest {
+    uri: String,
+    #[serde(default)]
+    cid: Option<String>,
+    val: String,
+}
+
+/// Remove a label from content
+async fn remove_label(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RemoveLabelRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let label = ctx.label_manager
+        .remove_label(
+            &req.uri,
+            req.cid.as_deref(),
+            &req.val,
+            &auth.did,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "label.remove", None, Some(&req.val), Some(&req.uri))
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "label": label,
+    })))
+}
+
+// ============================================================================
+// Report Management Endpoints
+// ============================================================================
+
+#[derive(Deserialize)]
+struct SubmitReportRequest {
+    #[serde(default)]
+    subject_did: Option<String>,
+    #[serde(default)]
+    subject_uri: Option<String>,
+    #[serde(default)]
+    subject_cid: Option<String>,
+    reason_type: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Submit a report
+async fn submit_report(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SubmitReportRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::admin::reports::ReportReason;
+
+    // Parse reason type
+    let reason_type = ReportReason::from_str(&req.reason_type)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // Submit report
+    let report = ctx.report_manager
+        .submit_report(
+            req.subject_did.as_deref(),
+            req.subject_uri.as_deref(),
+            req.subject_cid.as_deref(),
+            reason_type,
+            req.reason.as_deref(),
+            &auth.did,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "report": report,
+    })))
+}
+
+#[derive(Deserialize)]
+struct UpdateReportStatusRequest {
+    report_id: i64,
+    status: String,
+    #[serde(default)]
+    resolution: Option<String>,
+}
+
+/// Update report status
+async fn update_report_status(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<UpdateReportStatusRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::admin::reports::ReportStatus;
+
+    // Parse status
+    let status = ReportStatus::from_str(&req.status)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // Update status
+    ctx.report_manager
+        .update_status(
+            req.report_id,
+            status,
+            &auth.did,
+            req.resolution.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "report.update", None, Some(&req.status), None)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "report_id": req.report_id,
+        "status": req.status,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ListReportsQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// List reports
+async fn list_reports(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<ListReportsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::admin::reports::ReportStatus;
+
+    // Parse status filter if provided
+    let status_filter = if let Some(status_str) = query.status {
+        Some(ReportStatus::from_str(&status_str)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?)
+    } else {
+        None
+    };
+
+    // List reports
+    let reports = ctx.report_manager
+        .list_reports(status_filter, query.limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "reports": reports,
     })))
 }

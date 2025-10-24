@@ -37,6 +37,10 @@ pub struct WriteOp {
     pub value: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validate: Option<bool>,
+    /// Expected CID of the current record (for optimistic concurrency)
+    /// If provided, the operation will fail if the current record's CID doesn't match
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_cid: Option<String>,
 }
 
 /// Repository manager for a single actor
@@ -89,12 +93,49 @@ impl RepositoryManager {
             return Err(PdsError::NotFound(format!("Repository not found for {}", self.did)));
         }
 
-        // Get current repo root
-        let repo_root = self.store.get_repo_root(&self.did).await?;
+        // Create empty SDK repo
+        let mut repo = SdkRepo::create(did);
 
-        // For now, create an empty SDK repo
-        // TODO: Load MST blocks from repo_block table and reconstruct tree
-        let repo = SdkRepo::create(did);
+        // Get all blocks from storage
+        let all_blocks = self.store.get_all_blocks(&self.did).await?;
+
+        if !all_blocks.is_empty() {
+            // Reconstruct MST from blocks
+            // The blocks include both MST nodes and leaf values
+            // We need to deserialize them and rebuild the tree structure
+
+            // Get current repo root to know which commit we're loading
+            let repo_root = self.store.get_repo_root(&self.did).await?;
+
+            // Parse the root CID
+            let root_cid_str = &repo_root.cid;
+
+            // For each block, we need to determine if it's a node or a leaf
+            // and reconstruct the repository state
+            // Since we're using the SDK's Repository which has an internal MST,
+            // we need to insert records back into it
+
+            // Get all records from the database
+            let records = self.store.list_all_records(&self.did).await?;
+
+            // Reconstruct each record by loading its content from blocks
+            for record in records {
+                // Get the record content from blocks
+                if let Some(content) = self.store.get_block(&self.did, &record.cid).await? {
+                    // Insert the record back into the MST
+                    // Parse collection and rkey from URI (format: at://did/collection/rkey)
+                    let uri_parts: Vec<&str> = record.uri.split('/').collect();
+                    if uri_parts.len() >= 4 {
+                        let collection = uri_parts[2];
+                        let rkey = uri_parts[3];
+
+                        // Re-insert into the repository
+                        repo.put_record(collection, rkey, content)
+                            .map_err(|e| PdsError::Internal(format!("Failed to load record: {}", e)))?;
+                    }
+                }
+            }
+        }
 
         Ok(repo)
     }
@@ -191,6 +232,9 @@ impl RepositoryManager {
             }
         }
 
+        // Get previous commit CID before creating new commit
+        let prev_commit_cid = repo.head().map(|cid| cid.to_string());
+
         // Create signed commit
         let commit_cid = repo.commit(sign_fn)
             .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
@@ -198,9 +242,12 @@ impl RepositoryManager {
         let rev = repo.rev()
             .ok_or_else(|| PdsError::Internal("No revision after commit".to_string()))?;
 
+        // Export repository to CAR format to get all blocks
+        let car_bytes = repo.export_car()
+            .map_err(|e| PdsError::Internal(format!("CAR export failed: {}", e)))?;
+
         // Store commit blocks to database
-        // TODO: Extract blocks from MST and store in repo_block table
-        // For now, just update the repo_root
+        // Update the repo_root
         self.store.update_repo_root(
             &self.did,
             &commit_cid.to_string(),
@@ -214,8 +261,8 @@ impl RepositoryManager {
                 self.did.clone(),
                 commit_cid.to_string(),
                 rev.to_string(),
-                None, // TODO: Track previous commit CID
-                vec![], // TODO: Include CAR file bytes with commit blocks
+                prev_commit_cid,
+                car_bytes.clone(),
                 commit_ops,
             );
 
@@ -261,6 +308,7 @@ impl RepositoryManager {
             rkey: rkey.clone(),
             value: Some(value),
             validate,
+            swap_cid: None, // Creates don't use swap CID
         }];
 
         let (commit_cid, rev) = self.apply_writes(writes, sign_fn).await?;
@@ -287,6 +335,7 @@ impl RepositoryManager {
             rkey: rkey.to_string(),
             value: Some(value),
             validate,
+            swap_cid: None, // Can be added later if needed
         }];
 
         self.apply_writes(writes, sign_fn).await
@@ -308,6 +357,7 @@ impl RepositoryManager {
             rkey: rkey.to_string(),
             value: None,
             validate: None, // Validation not needed for deletes
+            swap_cid: None, // Can be added later if needed
         }];
 
         self.apply_writes(writes, sign_fn).await
@@ -319,13 +369,21 @@ impl RepositoryManager {
         let record = self.store.get_record(&self.did, uri).await?;
 
         if let Some(rec) = record {
-            // TODO: Load actual record content from MST blocks
-            // For now, return a placeholder indicating the record exists
-            Ok(Some(serde_json::json!({
-                "uri": rec.uri,
-                "cid": rec.cid,
-                "value": null // TODO: deserialize from blocks
-            })))
+            // Load actual record content from blocks
+            if let Some(content) = self.store.get_block(&self.did, &rec.cid).await? {
+                // Deserialize the record content from bytes
+                let value: serde_json::Value = serde_json::from_slice(&content)
+                    .map_err(|e| PdsError::Internal(format!("Failed to deserialize record: {}", e)))?;
+
+                Ok(Some(serde_json::json!({
+                    "uri": rec.uri,
+                    "cid": rec.cid,
+                    "value": value
+                })))
+            } else {
+                // Block not found - this shouldn't happen
+                Err(PdsError::Internal(format!("Block not found for record {}", uri)))
+            }
         } else {
             Ok(None)
         }
@@ -340,31 +398,88 @@ impl RepositoryManager {
     ) -> PdsResult<Vec<serde_json::Value>> {
         let records = self.store.list_records(&self.did, collection, limit, cursor).await?;
 
-        // Convert to JSON array
-        let results = records
-            .into_iter()
-            .map(|rec| {
-                serde_json::json!({
+        // Convert to JSON array, loading each record's content
+        let mut results = Vec::new();
+        for rec in records {
+            // Load actual record content from blocks
+            if let Some(content) = self.store.get_block(&self.did, &rec.cid).await? {
+                // Deserialize the record content from bytes
+                let value: serde_json::Value = serde_json::from_slice(&content)
+                    .map_err(|e| PdsError::Internal(format!("Failed to deserialize record: {}", e)))?;
+
+                results.push(serde_json::json!({
                     "uri": rec.uri,
                     "cid": rec.cid,
-                    "value": null // TODO: load from blocks
-                })
-            })
-            .collect();
+                    "value": value
+                }));
+            } else {
+                // Block not found - log warning but continue
+                tracing::warn!("Block not found for record {}", rec.uri);
+            }
+        }
 
         Ok(results)
     }
 
     /// Get repository description
-    pub async fn describe_repo(&self) -> PdsResult<serde_json::Value> {
-        let repo_root = self.store.get_repo_root(&self.did).await?;
+    pub async fn describe_repo(
+        &self,
+        account_manager: Option<&crate::account::AccountManager>,
+        identity_resolver: Option<&crate::identity::IdentityResolver>,
+    ) -> PdsResult<serde_json::Value> {
+        let _repo_root = self.store.get_repo_root(&self.did).await?;
+
+        // 1. Resolve handle from DID
+        let handle = if let Some(acc_mgr) = account_manager {
+            // Try to get handle from local account
+            acc_mgr.get_account(&self.did)
+                .await
+                .ok()
+                .map(|acc| acc.handle)
+        } else {
+            None
+        }
+        .or_else(|| {
+            // Fallback: extract from DID if it's a web DID
+            if self.did.starts_with("did:web:") {
+                self.did.strip_prefix("did:web:").map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+        // 2. Fetch DID document
+        let did_doc = if let Some(resolver) = identity_resolver {
+            resolver.resolve_did(&self.did)
+                .await
+                .ok()
+                .and_then(|doc| serde_json::to_value(&doc).ok())
+        } else {
+            None
+        };
+
+        // 3. Enumerate collections
+        let collections = self.store.get_collections(&self.did).await?;
+
+        // 4. Verify handle is correct (if we have a resolver)
+        let handle_is_correct = if let Some(resolver) = identity_resolver {
+            resolver.get_handle_for_did(&self.did)
+                .await
+                .ok()
+                .flatten()
+                .map(|resolved| resolved == handle)
+                .unwrap_or(true)
+        } else {
+            true
+        };
 
         Ok(serde_json::json!({
             "did": self.did,
-            "handle": "unknown", // TODO: resolve from DID
-            "didDoc": null, // TODO: fetch DID document
-            "collections": [], // TODO: enumerate collections
-            "handleIsCorrect": true,
+            "handle": handle,
+            "didDoc": did_doc,
+            "collections": collections,
+            "handleIsCorrect": handle_is_correct,
         }))
     }
 
@@ -399,7 +514,7 @@ impl RepositoryManager {
                 collection: write.collection,
                 rkey: write.rkey,
                 record: write.value,
-                swap_cid: None, // TODO: support swap CID for optimistic concurrency
+                swap_cid: write.swap_cid,
                 validate: write.validate,
             });
         }
@@ -481,6 +596,40 @@ impl RepositoryManager {
                     }
                 }
             }
+
+            // Validate swap CID for optimistic concurrency (Update/Delete only)
+            if let Some(ref swap_cid) = write.swap_cid {
+                match write.action {
+                    WriteOpAction::Update | WriteOpAction::Delete => {
+                        // Construct URI and check current record CID
+                        let uri = format!("at://{}/{}/{}", self.did, write.collection, write.rkey);
+
+                        match self.store.get_record(&self.did, &uri).await? {
+                            Some(current_record) => {
+                                if current_record.cid != *swap_cid {
+                                    return Err(PdsError::Validation(format!(
+                                        "Swap CID mismatch for {}/{}: expected '{}', found '{}'",
+                                        write.collection, write.rkey, swap_cid, current_record.cid
+                                    )));
+                                }
+                            }
+                            None => {
+                                return Err(PdsError::NotFound(format!(
+                                    "Cannot swap CID - record not found: {}/{}",
+                                    write.collection, write.rkey
+                                )));
+                            }
+                        }
+                    }
+                    WriteOpAction::Create => {
+                        // swap_cid doesn't make sense for Create operations
+                        return Err(PdsError::Validation(format!(
+                            "swap_cid cannot be used with Create action for {}/{}",
+                            write.collection, write.rkey
+                        )));
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -516,6 +665,7 @@ impl RepositoryManager {
                 rkey: w.rkey,
                 value: w.record,
                 validate: w.validate,
+                swap_cid: w.swap_cid,
             }
         }).collect();
 
@@ -594,6 +744,7 @@ mod tests {
                 rkey: "post1".to_string(),
                 value: Some(serde_json::json!({"text": "Post 1"})),
                 validate: None,
+                swap_cid: None,
             },
             WriteOp {
                 action: WriteOpAction::Create,
@@ -601,6 +752,7 @@ mod tests {
                 rkey: "post2".to_string(),
                 value: Some(serde_json::json!({"text": "Post 2"})),
                 validate: None,
+                swap_cid: None,
             },
         ];
 

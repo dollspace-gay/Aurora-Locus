@@ -96,16 +96,7 @@ impl AppContext {
         let invite_manager = Arc::new(InviteCodeManager::new(account_db.clone()));
         let report_manager = Arc::new(ReportManager::new(account_db.clone()));
 
-        // Initialize sequencer (using account_db for now, could be separate database)
-        let sequencer = Arc::new(Sequencer::new(account_db.clone(), SequencerConfig::default()));
-
-        // Initialize rate limiter
-        let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig::default()));
-
-        // Initialize mailer
-        let mailer = Arc::new(Mailer::new(config.email.clone())?);
-
-        // Initialize relay client (optional - only if relay servers configured and federation enabled)
+        // Initialize relay client first (optional - only if relay servers configured and federation enabled)
         let relay_client = if config.federation.enabled && !config.federation.relay_urls.is_empty() {
             tracing::info!("Federation enabled with {} relay server(s)", config.federation.relay_urls.len());
             let relay_config = RelayConfig {
@@ -120,6 +111,19 @@ impl AppContext {
             tracing::info!("Federation disabled - no relay integration");
             None
         };
+
+        // Initialize sequencer with relay client (using account_db for now, could be separate database)
+        let sequencer = Arc::new(Sequencer::with_relay(
+            account_db.clone(),
+            SequencerConfig::default(),
+            relay_client.clone()
+        ));
+
+        // Initialize rate limiter
+        let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig::default()));
+
+        // Initialize mailer
+        let mailer = Arc::new(Mailer::new(config.email.clone())?);
 
         Ok(Self {
             config: Arc::new(config),

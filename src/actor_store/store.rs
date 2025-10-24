@@ -287,6 +287,20 @@ impl ActorStore {
         Ok(records)
     }
 
+    /// Get all distinct collections for a DID
+    pub async fn get_collections(&self, did: &str) -> PdsResult<Vec<String>> {
+        let pool = self.open_db(did).await?;
+
+        let collections: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT collection FROM record ORDER BY collection"
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        Ok(collections)
+    }
+
     /// Create or update a record
     pub async fn put_record(
         &self,
@@ -402,6 +416,34 @@ impl ActorStore {
         }
 
         Ok(blocks)
+    }
+
+    /// List all records in the repository
+    pub async fn list_all_records(&self, did: &str) -> PdsResult<Vec<Record>> {
+        let pool = self.open_db(did).await?;
+
+        let rows = sqlx::query(
+            "SELECT uri, cid, collection, rkey, repo_rev, indexed_at, takedown_ref
+             FROM record
+             ORDER BY collection, rkey"
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        let records = rows
+            .into_iter()
+            .map(|row| Record {
+                uri: row.get("uri"),
+                cid: row.get("cid"),
+                collection: row.get("collection"),
+                rkey: row.get("rkey"),
+                repo_rev: row.get("repo_rev"),
+                indexed_at: row.get("indexed_at"),
+                takedown_ref: row.get("takedown_ref"),
+            })
+            .collect();
+
+        Ok(records)
     }
 
     /// Destroy an actor's repository (delete all data)

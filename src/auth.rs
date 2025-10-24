@@ -109,13 +109,30 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
         let did = session.did.clone();
         tracing::debug!("AdminAuthContext: Checking admin role for DID: {}", did);
 
-        // TEMPORARY: Bypass admin role check for debugging
-        tracing::warn!("AdminAuthContext: BYPASSING role check - granting SuperAdmin to {}", did);
+        // Check if DID is in configured admin DIDs list
+        let is_configured_admin = state.config.authentication.admin_dids.contains(&did);
+
+        // Try to get role from database
+        let role = if let Some(admin_role) = state.admin_role_manager.get_role(&did).await? {
+            // User has a role in the database
+            tracing::info!("AdminAuthContext: User {} has role {} from database", did, admin_role.role.as_str());
+            admin_role.role
+        } else if is_configured_admin {
+            // User is in configured admin DIDs, grant SuperAdmin
+            tracing::info!("AdminAuthContext: User {} is configured admin, granting SuperAdmin", did);
+            Role::SuperAdmin
+        } else {
+            // User is not an admin
+            tracing::warn!("AdminAuthContext: User {} is not an admin", did);
+            return Err(PdsError::Authorization(
+                "Admin role required".to_string()
+            ));
+        };
 
         Ok(AdminAuthContext {
             did,
             session,
-            role: Role::SuperAdmin,  // Temporary - bypass role check
+            role,
         })
     }
 }
@@ -134,21 +151,41 @@ macro_rules! require_admin_role {
     };
 }
 
+/// Verify a JWT token with full validation
+///
+/// This performs:
+/// 1. JWT signature verification
+/// 2. Expiration checking
+/// 3. Claims validation
+pub fn verify_jwt_token(token: &str, jwt_secret: &str) -> Result<jsonwebtoken::TokenData<serde_json::Value>, PdsError> {
+    use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+
+    let decoding_key = DecodingKey::from_secret(jwt_secret.as_bytes());
+    let mut validation = Validation::new(Algorithm::HS256);
+    // Allow some clock skew (5 minutes)
+    validation.leeway = 300;
+
+    decode::<serde_json::Value>(token, &decoding_key, &validation)
+        .map_err(|e| {
+            tracing::warn!("JWT verification failed: {}", e);
+            match e.kind() {
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
+                    PdsError::Authentication("Token has expired".to_string())
+                }
+                jsonwebtoken::errors::ErrorKind::InvalidSignature => {
+                    PdsError::Authentication("Invalid token signature".to_string())
+                }
+                _ => PdsError::Authentication(format!("Invalid token: {}", e))
+            }
+        })
+}
+
 /// Simplified admin token verification for admin panel
 /// This is a basic check - for more secure verification, use AdminAuthContext extractor
-pub fn verify_admin_token(token: &str) -> Result<(), PdsError> {
-    // For now, just verify the token is not empty
-    // In a production system, this would:
-    // 1. Parse and validate JWT signature
-    // 2. Check token expiration
-    // 3. Verify admin role in token claims
-    // 4. Check against revocation list
+pub fn verify_admin_token(token: &str, jwt_secret: &str) -> Result<(), PdsError> {
+    // Perform full JWT verification
+    verify_jwt_token(token, jwt_secret)?;
 
-    if token.is_empty() {
-        return Err(PdsError::Authentication("Invalid admin token".to_string()));
-    }
-
-    // TODO: Implement full JWT verification with admin role check
-    // For now, accept any non-empty token (development only)
+    // Token is valid
     Ok(())
 }

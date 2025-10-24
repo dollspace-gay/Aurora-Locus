@@ -157,6 +157,15 @@ impl PlcSigner {
         Self::new(&key_bytes)
     }
 
+    /// Sign raw bytes (for repository commits)
+    ///
+    /// Returns a 64-byte signature
+    pub fn sign(&self, data: &[u8]) -> Vec<u8> {
+        use k256::ecdsa::signature::Signer;
+        let signature: k256::ecdsa::Signature = self.signing_key.sign(data);
+        signature.to_bytes().to_vec()
+    }
+
     /// Sign a PLC operation
     ///
     /// This creates a deterministic signature over the canonical JSON representation

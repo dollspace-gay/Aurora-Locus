@@ -175,12 +175,17 @@ struct ApplyWritesRequest {
     swap_commit: Option<String>,
 }
 
-/// Dummy signer for development
-/// TODO: Replace with actual key signing using stored private keys
-fn dummy_signer(_hash: &[u8; 32]) -> Result<Vec<u8>, atproto::repo::RepoError> {
-    // Return a dummy 64-byte signature
-    // In production, this should use the actor's private key
-    Ok(vec![0u8; 64])
+/// Creates a proper signing function using the repository's stored private key
+///
+/// Uses PlcSigner with the repo_signing_key from configuration to sign repository commits
+fn create_repo_signer(
+    repo_key_hex: &str,
+) -> impl Fn(&[u8; 32]) -> Result<Vec<u8>, atproto::repo::RepoError> + '_ {
+    move |hash: &[u8; 32]| {
+        let signer = crate::crypto::plc::PlcSigner::from_hex(repo_key_hex)
+            .map_err(|e| atproto::repo::RepoError::Signing(format!("Failed to create signer: {}", e)))?;
+        Ok(signer.sign(hash))
+    }
 }
 
 /// Create a new record
@@ -215,10 +220,13 @@ async fn create_record(
         ctx.sequencer.clone(),
     );
 
+    // Create signer from repo key
+    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
+
     // Create the record
     tracing::debug!("create_record: Calling repo_mgr.create_record");
     let (uri, cid, _rev) = repo_mgr
-        .create_record(&req.collection, req.rkey.as_deref(), req.record, req.validate, dummy_signer)
+        .create_record(&req.collection, req.rkey.as_deref(), req.record, req.validate, signer)
         .await
         .map_err(|e| {
             tracing::error!("create_record: Failed to create record: {}", e);
@@ -248,9 +256,12 @@ async fn put_record(
     // Create repository manager
     let repo_mgr = RepositoryManager::with_sequencer(session.did.clone(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
 
+    // Create signer from repo key
+    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
+
     // Update the record
     let (cid, _rev) = repo_mgr
-        .update_record(&req.collection, &req.rkey, req.record, req.validate, dummy_signer)
+        .update_record(&req.collection, &req.rkey, req.record, req.validate, signer)
         .await?;
 
     let uri = format!("at://{}/{}/{}", session.did, req.collection, req.rkey);
@@ -277,9 +288,12 @@ async fn delete_record(
     // Create repository manager
     let repo_mgr = RepositoryManager::with_sequencer(session.did.clone(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
 
+    // Create signer from repo key
+    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
+
     // Delete the record
     repo_mgr
-        .delete_record(&req.collection, &req.rkey, dummy_signer)
+        .delete_record(&req.collection, &req.rkey, signer)
         .await?;
 
     Ok(Json(serde_json::json!({})))
@@ -338,17 +352,33 @@ async fn list_records(
     // Create repository manager
     let repo_mgr = RepositoryManager::new(did.clone(), (*ctx.actor_store).clone());
 
-    // List records
+    // Fetch limit + 1 to determine if there are more records
+    let fetch_limit = query.limit + 1;
     let records = repo_mgr
-        .list_records(&query.collection, query.limit, query.cursor.as_deref())
+        .list_records(&query.collection, fetch_limit, query.cursor.as_deref())
         .await?;
+
+    // Determine if we have more records and calculate cursor
+    let has_more = records.len() as i64 > query.limit;
+    let records_to_return = if has_more {
+        &records[0..query.limit as usize]
+    } else {
+        &records[..]
+    };
 
     // Convert to response format and fetch labels
     let mut entries = Vec::new();
-    for rec in records {
+    let mut next_cursor: Option<String> = None;
+
+    for rec in records_to_return {
         let uri = rec.get("uri").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let cid = rec.get("cid").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let value = rec.get("value").cloned().unwrap_or(serde_json::Value::Null);
+
+        // Extract rkey from URI for cursor (format: at://did/collection/rkey)
+        if let Some(rkey) = uri.split('/').last() {
+            next_cursor = Some(rkey.to_string());
+        }
 
         // Fetch labels for this record
         let labels = ctx.label_manager.get_labels(&uri).await
@@ -365,7 +395,7 @@ async fn list_records(
 
     Ok(Json(ListRecordsResponse {
         records: entries,
-        cursor: None, // TODO: Implement cursor pagination
+        cursor: if has_more { next_cursor } else { None },
     }))
 }
 
@@ -380,8 +410,11 @@ async fn describe_repo(
     // Create repository manager
     let repo_mgr = RepositoryManager::new(did.clone(), (*ctx.actor_store).clone());
 
-    // Get description
-    let desc = repo_mgr.describe_repo().await?;
+    // Get description with account manager and identity resolver
+    let desc = repo_mgr.describe_repo(
+        Some(&ctx.account_manager),
+        Some(&ctx.identity_resolver),
+    ).await?;
 
     Ok(Json(DescribeRepoResponse {
         did: desc.get("did").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -433,9 +466,12 @@ async fn apply_writes(
         session.did
     );
 
+    // Create signer from repo key
+    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
+
     // Apply batch atomically (includes validation)
     let (commit_cid, rev) = repo_mgr
-        .apply_batch_writes(prepared, dummy_signer)
+        .apply_batch_writes(prepared, signer)
         .await?;
 
     tracing::info!(

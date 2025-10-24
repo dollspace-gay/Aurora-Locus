@@ -1131,6 +1131,44 @@ impl AccountManager {
 
         Ok(())
     }
+
+    /// List all accounts with pagination
+    ///
+    /// Returns accounts ordered by DID for consistent pagination.
+    /// Use the last DID as cursor for next page.
+    pub async fn list_accounts(
+        &self,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> PdsResult<Vec<Account>> {
+        let query = if let Some(cursor_did) = cursor {
+            sqlx::query_as::<_, Account>(
+                "SELECT did, handle, email, password_hash, created_at, email_confirmed,
+                        email_confirmed_at, deactivated_at, taken_down, plc_rotation_key,
+                        plc_rotation_key_public, plc_last_operation_cid
+                 FROM account
+                 WHERE did > ?1
+                 ORDER BY did
+                 LIMIT ?2"
+            )
+            .bind(cursor_did)
+            .bind(limit)
+        } else {
+            sqlx::query_as::<_, Account>(
+                "SELECT did, handle, email, password_hash, created_at, email_confirmed,
+                        email_confirmed_at, deactivated_at, taken_down, plc_rotation_key,
+                        plc_rotation_key_public, plc_last_operation_cid
+                 FROM account
+                 ORDER BY did
+                 LIMIT ?1"
+            )
+            .bind(limit)
+        };
+
+        let accounts = query.fetch_all(&self.db).await?;
+
+        Ok(accounts)
+    }
 }
 
 #[cfg(test)]

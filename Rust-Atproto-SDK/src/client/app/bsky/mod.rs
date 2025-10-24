@@ -1,0 +1,12 @@
+//! Auto-generated module file
+
+pub mod actor;
+pub mod bookmark;
+pub mod embed;
+pub mod feed;
+pub mod graph;
+pub mod labeler;
+pub mod notification;
+pub mod richtext;
+pub mod unspecced;
+pub mod video;

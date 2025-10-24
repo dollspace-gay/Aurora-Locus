@@ -1,6 +1,7 @@
 /// Main Sequencer implementation
 use crate::{
     error::{PdsError, PdsResult},
+    federation::RelayClient,
     sequencer::{
         events::{AccountEvent, CommitEvent, IdentityEvent},
         EventType, SeqEvent, SeqRow,
@@ -10,7 +11,7 @@ use chrono::Utc;
 use serde_cbor;
 use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// Sequencer configuration
 #[derive(Debug, Clone)]
@@ -37,6 +38,7 @@ pub struct Sequencer {
     db: SqlitePool,
     config: SequencerConfig,
     last_seq: Arc<RwLock<Option<i64>>>,
+    relay_client: Option<Arc<Mutex<RelayClient>>>,
 }
 
 impl Sequencer {
@@ -46,6 +48,17 @@ impl Sequencer {
             db,
             config,
             last_seq: Arc::new(RwLock::new(None)),
+            relay_client: None,
+        }
+    }
+
+    /// Create a new sequencer with relay client for federation
+    pub fn with_relay(db: SqlitePool, config: SequencerConfig, relay_client: Option<Arc<Mutex<RelayClient>>>) -> Self {
+        Self {
+            db,
+            config,
+            last_seq: Arc::new(RwLock::new(None)),
+            relay_client,
         }
     }
 
@@ -54,8 +67,13 @@ impl Sequencer {
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode commit event: {}", e)))?;
 
-        self.insert_event(&evt.repo, EventType::Commit, event_bytes)
-            .await
+        let seq = self.insert_event(&evt.repo, EventType::Commit, event_bytes)
+            .await?;
+
+        // Publish to relay if configured
+        self.publish_to_relay("commit", &evt.repo, seq, Some(&evt.commit)).await;
+
+        Ok(seq)
     }
 
     /// Sequence an identity event
@@ -63,8 +81,13 @@ impl Sequencer {
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode identity event: {}", e)))?;
 
-        self.insert_event(&evt.did, EventType::Identity, event_bytes)
-            .await
+        let seq = self.insert_event(&evt.did, EventType::Identity, event_bytes)
+            .await?;
+
+        // Publish to relay if configured
+        self.publish_to_relay("identity", &evt.did, seq, None).await;
+
+        Ok(seq)
     }
 
     /// Sequence an account event
@@ -72,8 +95,13 @@ impl Sequencer {
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode account event: {}", e)))?;
 
-        self.insert_event(&evt.did, EventType::Account, event_bytes)
-            .await
+        let seq = self.insert_event(&evt.did, EventType::Account, event_bytes)
+            .await?;
+
+        // Publish to relay if configured
+        self.publish_to_relay("account", &evt.did, seq, None).await;
+
+        Ok(seq)
     }
 
     /// Insert event into database
@@ -235,6 +263,31 @@ impl Sequencer {
                     evt,
                 }))
             }
+        }
+    }
+
+    /// Publish event to relay (non-blocking, errors logged but not propagated)
+    async fn publish_to_relay(&self, event_type: &str, did: &str, seq: i64, commit_cid: Option<&str>) {
+        if let Some(ref relay_client) = self.relay_client {
+            use crate::federation::relay::RelayEvent;
+
+            let relay_event = RelayEvent {
+                event_type: event_type.to_string(),
+                did: did.to_string(),
+                seq,
+                commit: commit_cid.map(|cid| serde_json::json!({ "cid": cid })),
+                time: Utc::now().to_rfc3339(),
+            };
+
+            let client = relay_client.clone();
+            let event_type_owned = event_type.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = client.lock().await.publish_event(&relay_event).await {
+                    tracing::warn!("Failed to publish event to relay: {} seq={}: {}", event_type_owned, relay_event.seq, e);
+                } else {
+                    tracing::debug!("Event published to relay: {} seq={}", event_type_owned, relay_event.seq);
+                }
+            });
         }
     }
 

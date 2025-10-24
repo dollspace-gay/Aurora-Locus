@@ -2,6 +2,7 @@
 ///
 /// Validates records against ATProto lexicon schemas
 use crate::error::PdsError;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -14,6 +15,19 @@ pub struct ValidationError {
 
 /// Validation result with detailed errors
 pub type ValidationResult = Result<(), Vec<ValidationError>>;
+
+/// Validate a datetime string in RFC3339 format
+///
+/// ATProto requires datetime strings to be in RFC3339 format with timezone.
+/// Examples of valid formats:
+/// - `2025-01-10T12:00:00Z`
+/// - `2025-01-10T12:00:00.123Z`
+/// - `2025-01-10T12:00:00+00:00`
+/// - `2025-01-10T12:00:00-05:00`
+fn validate_datetime(datetime_str: &str) -> bool {
+    // Try to parse as RFC3339
+    DateTime::parse_from_rfc3339(datetime_str).is_ok()
+}
 
 /// Record validator
 pub struct RecordValidator {
@@ -123,13 +137,20 @@ impl RecordValidator {
                         message: "Required field 'createdAt' is missing".to_string(),
                     }),
                     Some(created_at) => {
-                        if !created_at.is_string() {
+                        if let Some(s) = created_at.as_str() {
+                            // Validate RFC3339 datetime format
+                            if !validate_datetime(s) {
+                                errors.push(ValidationError {
+                                    path: "$.createdAt".to_string(),
+                                    message: format!("Field 'createdAt' must be a valid RFC3339 datetime string: '{}'", s),
+                                });
+                            }
+                        } else {
                             errors.push(ValidationError {
                                 path: "$.createdAt".to_string(),
                                 message: "Field 'createdAt' must be a string (datetime)".to_string(),
                             });
                         }
-                        // TODO: Validate datetime format
                     }
                 }
 
@@ -255,11 +276,26 @@ impl RecordValidator {
                 }
 
                 // Required: createdAt
-                if record.get("createdAt").is_none() {
-                    errors.push(ValidationError {
+                match record.get("createdAt") {
+                    None => errors.push(ValidationError {
                         path: "$.createdAt".to_string(),
                         message: "Required field 'createdAt' is missing".to_string(),
-                    });
+                    }),
+                    Some(created_at) => {
+                        if let Some(s) = created_at.as_str() {
+                            if !validate_datetime(s) {
+                                errors.push(ValidationError {
+                                    path: "$.createdAt".to_string(),
+                                    message: format!("Field 'createdAt' must be a valid RFC3339 datetime string: '{}'", s),
+                                });
+                            }
+                        } else {
+                            errors.push(ValidationError {
+                                path: "$.createdAt".to_string(),
+                                message: "Field 'createdAt' must be a string (datetime)".to_string(),
+                            });
+                        }
+                    }
                 }
 
                 if errors.is_empty() {
@@ -302,11 +338,26 @@ impl RecordValidator {
                 }
 
                 // Required: createdAt
-                if record.get("createdAt").is_none() {
-                    errors.push(ValidationError {
+                match record.get("createdAt") {
+                    None => errors.push(ValidationError {
                         path: "$.createdAt".to_string(),
                         message: "Required field 'createdAt' is missing".to_string(),
-                    });
+                    }),
+                    Some(created_at) => {
+                        if let Some(s) = created_at.as_str() {
+                            if !validate_datetime(s) {
+                                errors.push(ValidationError {
+                                    path: "$.createdAt".to_string(),
+                                    message: format!("Field 'createdAt' must be a valid RFC3339 datetime string: '{}'", s),
+                                });
+                            }
+                        } else {
+                            errors.push(ValidationError {
+                                path: "$.createdAt".to_string(),
+                                message: "Field 'createdAt' must be a string (datetime)".to_string(),
+                            });
+                        }
+                    }
                 }
 
                 if errors.is_empty() {
@@ -334,11 +385,26 @@ impl RecordValidator {
                 }
 
                 // Required: createdAt
-                if record.get("createdAt").is_none() {
-                    errors.push(ValidationError {
+                match record.get("createdAt") {
+                    None => errors.push(ValidationError {
                         path: "$.createdAt".to_string(),
                         message: "Required field 'createdAt' is missing".to_string(),
-                    });
+                    }),
+                    Some(created_at) => {
+                        if let Some(s) = created_at.as_str() {
+                            if !validate_datetime(s) {
+                                errors.push(ValidationError {
+                                    path: "$.createdAt".to_string(),
+                                    message: format!("Field 'createdAt' must be a valid RFC3339 datetime string: '{}'", s),
+                                });
+                            }
+                        } else {
+                            errors.push(ValidationError {
+                                path: "$.createdAt".to_string(),
+                                message: "Field 'createdAt' must be a string (datetime)".to_string(),
+                            });
+                        }
+                    }
                 }
 
                 if errors.is_empty() {
@@ -464,6 +530,132 @@ mod tests {
         });
 
         let result = validator.validate("app.bsky.graph.follow", &follow);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_datetime_valid_formats() {
+        // RFC3339 with Z timezone
+        assert!(validate_datetime("2025-01-10T12:00:00Z"));
+
+        // RFC3339 with milliseconds and Z
+        assert!(validate_datetime("2025-01-10T12:00:00.123Z"));
+
+        // RFC3339 with microseconds
+        assert!(validate_datetime("2025-01-10T12:00:00.123456Z"));
+
+        // RFC3339 with +00:00 timezone
+        assert!(validate_datetime("2025-01-10T12:00:00+00:00"));
+
+        // RFC3339 with -05:00 timezone (EST)
+        assert!(validate_datetime("2025-01-10T12:00:00-05:00"));
+
+        // RFC3339 with +09:30 timezone (Australia)
+        assert!(validate_datetime("2025-01-10T12:00:00+09:30"));
+    }
+
+    #[test]
+    fn test_validate_datetime_invalid_formats() {
+        // Missing timezone
+        assert!(!validate_datetime("2025-01-10T12:00:00"));
+
+        // Invalid format (no T separator)
+        assert!(!validate_datetime("2025-01-10 12:00:00Z"));
+
+        // Invalid date
+        assert!(!validate_datetime("2025-13-45T12:00:00Z"));
+
+        // Invalid time
+        assert!(!validate_datetime("2025-01-10T25:00:00Z"));
+
+        // Completely invalid
+        assert!(!validate_datetime("not a date"));
+
+        // Empty string
+        assert!(!validate_datetime(""));
+    }
+
+    #[test]
+    fn test_validate_post_invalid_datetime() {
+        let validator = RecordValidator::new();
+
+        let post = json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Hello world!",
+            "createdAt": "2025-01-10 12:00:00"  // Missing timezone, invalid format
+        });
+
+        let result = validator.validate("app.bsky.feed.post", &post);
+        assert!(result.is_err());
+
+        if let Err(errors) = result {
+            assert!(errors.iter().any(|e| e.path == "$.createdAt" && e.message.contains("RFC3339")));
+        }
+    }
+
+    #[test]
+    fn test_validate_post_valid_datetime_formats() {
+        let validator = RecordValidator::new();
+
+        // Test various valid datetime formats
+        let valid_datetimes = vec![
+            "2025-01-10T12:00:00Z",
+            "2025-01-10T12:00:00.123Z",
+            "2025-01-10T12:00:00+00:00",
+            "2025-01-10T12:00:00-05:00",
+        ];
+
+        for datetime in valid_datetimes {
+            let post = json!({
+                "$type": "app.bsky.feed.post",
+                "text": "Hello world!",
+                "createdAt": datetime
+            });
+
+            let result = validator.validate("app.bsky.feed.post", &post);
+            assert!(result.is_ok(), "Failed for datetime: {}", datetime);
+        }
+    }
+
+    #[test]
+    fn test_validate_like_invalid_datetime() {
+        let validator = RecordValidator::new();
+
+        let like = json!({
+            "$type": "app.bsky.feed.like",
+            "subject": {"uri": "at://did:plc:test/app.bsky.feed.post/123", "cid": "bafytest"},
+            "createdAt": "invalid-datetime"
+        });
+
+        let result = validator.validate("app.bsky.feed.like", &like);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_follow_invalid_datetime() {
+        let validator = RecordValidator::new();
+
+        let follow = json!({
+            "$type": "app.bsky.graph.follow",
+            "subject": "did:plc:test123",
+            "createdAt": "2025-01-10"  // Date only, missing time and timezone
+        });
+
+        let result = validator.validate("app.bsky.graph.follow", &follow);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_repost_invalid_datetime() {
+        let validator = RecordValidator::new();
+
+        let repost = json!({
+            "$type": "app.bsky.feed.repost",
+            "subject": {"uri": "at://did:plc:test/app.bsky.feed.post/123", "cid": "bafytest"},
+            "createdAt": 1234567890  // Number instead of string
+        });
+
+        let result = validator.validate("app.bsky.feed.repost", &repost);
         assert!(result.is_err());
     }
 }

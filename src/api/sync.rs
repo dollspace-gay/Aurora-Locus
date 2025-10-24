@@ -183,9 +183,21 @@ pub async fn get_blocks(
     // Create CAR encoder
     let mut encoder = CarEncoder::new(&root_cid)?;
 
-    // Fetch the requested blocks
-    // TODO: Query repo_block table for these CIDs
-    let blocks = vec![]; // Vec<(Cid, Vec<u8>)>
+    // Fetch the requested blocks from repo_block table
+    let cid_strings: Vec<String> = cids.iter().map(|c| c.to_string()).collect();
+    let block_data = ctx
+        .actor_store
+        .get_blocks_by_cids(&params.did, &cid_strings)
+        .await?;
+
+    // Convert to (Cid, Vec<u8>) format
+    let blocks: Vec<(Cid, Vec<u8>)> = block_data
+        .into_iter()
+        .filter_map(|(cid_str, content)| {
+            Cid::from_str(&cid_str).ok().map(|cid| (cid, content))
+        })
+        .collect();
+
     encoder.add_blocks(blocks)?;
 
     let car_bytes = encoder.finalize();
@@ -207,15 +219,34 @@ pub async fn list_repos(
 ) -> PdsResult<Json<ListReposResponse>> {
     let limit = params.limit.unwrap_or(500).min(1000);
 
-    // Get list of all DIDs
-    // TODO: Add pagination support to actor_store
-    // For now, return empty list
-    let repos = vec![];
+    // Get list of all accounts with pagination
+    let accounts = ctx
+        .account_manager
+        .list_accounts(params.cursor.as_deref(), limit)
+        .await?;
 
-    Ok(Json(ListReposResponse {
-        repos,
-        cursor: None,
-    }))
+    // Build repository info for each account
+    let mut repos = Vec::new();
+    for account in &accounts {
+        // Get the repository root for this DID
+        if let Ok(repo_root) = ctx.actor_store.get_repo_root(&account.did).await {
+            repos.push(RepoInfo {
+                did: account.did.clone(),
+                head: repo_root.cid,
+                rev: repo_root.rev,
+            });
+        }
+    }
+
+    // Determine next cursor
+    let cursor = if repos.len() as i64 == limit {
+        // There may be more results, return the last DID as cursor
+        accounts.last().map(|a| a.did.clone())
+    } else {
+        None
+    };
+
+    Ok(Json(ListReposResponse { repos, cursor }))
 }
 
 /// Build sync API routes

@@ -1,0 +1,77 @@
+[package]
+name = "atproto"
+version = "0.1.0"
+edition = "2021"
+authors = ["ATProto Rust SDK Contributors"]
+description = "Rust SDK for the AT Protocol (ATProto)"
+license = "MIT"
+repository = "https://github.com/yourusername/rust-atproto-sdk"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Async traits
+async-trait = "0.1"
+
+# Regex for text processing
+regex = "1.11"
+lazy_static = "1.5"
+
+# URL encoding
+urlencoding = "2.1"
+
+# Thread-safe data structures
+parking_lot = "0.12"
+
+# Unicode segmentation for grapheme support
+unicode-segmentation = "1.12"
+
+# WebSocket support
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures = "0.3"
+
+# CBOR and CAR format support (for firehose)
+serde_cbor = "0.11"
+libipld = { version = "0.16", features = ["dag-cbor", "serde-codec"] }
+libipld-cbor = "0.16"
+serde_bytes = "0.11"
+
+# Base64 encoding/decoding (for JWT parsing)
+base64 = "0.21"
+
+# OAuth and PKCE support
+sha2 = { version = "0.10", features = ["oid"] }  # SHA-256 for PKCE code challenge (with OID support for RSA)
+rand = "0.8"                                      # Random generation for code verifier and state
+
+# DPoP (Demonstrating Proof of Possession) support
+rsa = { version = "0.9", features = ["sha2"] }    # RSA key generation and signing
+jsonwebtoken = "9.2"                              # JWT creation and signing for DPoP
+uuid = { version = "1.6", features = ["v4"] }     # Unique identifiers for DPoP jti
+
+# URL building
+url = "2.5"            # URL parsing and building
+
+# Password hashing (Argon2id - OWASP recommended)
+argon2 = { version = "0.5", features = ["std"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[lib]
+name = "atproto"
+path = "src/lib.rs"
