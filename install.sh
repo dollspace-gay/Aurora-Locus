@@ -287,7 +287,7 @@ PDS_BLOBSTORE_DISK_TMP_LOCATION=./data/tmp
 # ============================================================================
 # Database
 # ============================================================================
-PDS_ACCOUNT_DB_LOCATION=./data/accounts.db
+PDS_ACCOUNT_DB_LOCATION=./data/account.sqlite
 
 # ============================================================================
 # Email Configuration (Optional)
@@ -607,20 +607,185 @@ main() {
     print_success "Data directories created"
     echo ""
 
-    # Initialize database with admin_roles table
+    # Initialize database with all required tables
     print_header "Initializing Database"
 
     if [ ! -f "data/account.sqlite" ]; then
-        print_info "Creating account database and admin_roles table..."
+        print_info "Creating account database with all required tables..."
 
         sqlite3 data/account.sqlite << 'EOSQL'
-CREATE TABLE IF NOT EXISTS admin_roles (
+-- Account management tables
+CREATE TABLE IF NOT EXISTS account (
     did TEXT PRIMARY KEY NOT NULL,
+    handle TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    email_confirmed BOOLEAN NOT NULL DEFAULT 0,
+    email_confirmed_at DATETIME,
+    deactivated_at DATETIME,
+    taken_down BOOLEAN NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_account_handle ON account(handle);
+CREATE INDEX idx_account_email ON account(email) WHERE email IS NOT NULL;
+
+-- Sessions table
+CREATE TABLE IF NOT EXISTS session (
+    id TEXT PRIMARY KEY NOT NULL,
+    did TEXT NOT NULL,
+    access_token TEXT UNIQUE NOT NULL,
+    refresh_token TEXT UNIQUE NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL,
+    app_password_name TEXT,
+    FOREIGN KEY (did) REFERENCES account(did) ON DELETE CASCADE
+);
+CREATE INDEX idx_session_did ON session(did);
+CREATE INDEX idx_session_access_token ON session(access_token);
+CREATE INDEX idx_session_refresh_token ON session(refresh_token);
+CREATE INDEX idx_session_expires_at ON session(expires_at);
+
+-- Refresh tokens table
+CREATE TABLE IF NOT EXISTS refresh_token (
+    id TEXT PRIMARY KEY NOT NULL,
+    did TEXT NOT NULL,
+    token TEXT UNIQUE NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL,
+    used BOOLEAN NOT NULL DEFAULT 0,
+    used_at DATETIME,
+    FOREIGN KEY (did) REFERENCES account(did) ON DELETE CASCADE
+);
+CREATE INDEX idx_refresh_token_did ON refresh_token(did);
+CREATE INDEX idx_refresh_token_token ON refresh_token(token);
+CREATE INDEX idx_refresh_token_expires_at ON refresh_token(expires_at);
+
+-- Email tokens (for confirmation and password reset)
+CREATE TABLE IF NOT EXISTS email_token (
+    token TEXT PRIMARY KEY NOT NULL,
+    did TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL,
+    used BOOLEAN NOT NULL DEFAULT 0,
+    FOREIGN KEY (did) REFERENCES account(did) ON DELETE CASCADE
+);
+CREATE INDEX idx_email_token_did ON email_token(did);
+CREATE INDEX idx_email_token_expires_at ON email_token(expires_at);
+
+-- App passwords
+CREATE TABLE IF NOT EXISTS app_password (
+    did TEXT NOT NULL,
+    name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    privileged BOOLEAN NOT NULL DEFAULT 0,
+    PRIMARY KEY (did, name),
+    FOREIGN KEY (did) REFERENCES account(did) ON DELETE CASCADE
+);
+CREATE INDEX idx_app_password_did ON app_password(did);
+
+-- Invite codes
+CREATE TABLE IF NOT EXISTS invite_code (
+    code TEXT PRIMARY KEY NOT NULL,
+    available INTEGER NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0,
+    disabled BOOLEAN NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    for_account TEXT,
+    expires_at DATETIME,
+    note TEXT
+);
+CREATE INDEX idx_invite_code_created_by ON invite_code(created_by);
+
+-- Invite code usage tracking
+CREATE TABLE IF NOT EXISTS invite_code_use (
+    code TEXT NOT NULL,
+    used_by TEXT NOT NULL,
+    used_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (code, used_by)
+);
+CREATE INDEX idx_invite_code_use_used_by ON invite_code_use(used_by);
+
+-- Admin roles and permissions (with id column for Rust code compatibility)
+CREATE TABLE IF NOT EXISTS admin_roles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    did TEXT NOT NULL UNIQUE,
     role TEXT NOT NULL CHECK(role IN ('superadmin', 'admin', 'moderator')),
     granted_by TEXT,
-    granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    granted_at TEXT NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    revoked_at TEXT,
+    revoked_by TEXT,
+    notes TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_admin_role_did ON admin_roles(did);
+
+-- Admin audit log
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_did TEXT NOT NULL,
+    action TEXT NOT NULL,
+    subject_did TEXT,
+    details TEXT,
+    timestamp TEXT NOT NULL,
+    ip_address TEXT
+);
+
+-- Moderation reports
+CREATE TABLE IF NOT EXISTS moderation_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reason_type TEXT NOT NULL,
+    reported_by TEXT NOT NULL,
+    subject_uri TEXT NOT NULL,
+    reason_text TEXT,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'resolved', 'dismissed')),
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at DATETIME,
+    resolved_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_moderation_reports_status ON moderation_reports(status);
+CREATE INDEX IF NOT EXISTS idx_moderation_reports_subject ON moderation_reports(subject_uri);
+CREATE INDEX IF NOT EXISTS idx_moderation_reports_reported_by ON moderation_reports(reported_by);
+
+-- Account moderation actions
+CREATE TABLE IF NOT EXISTS account_moderation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    did TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('suspend', 'takedown', 'flag', 'warn')),
+    reason TEXT,
+    moderated_by TEXT,
+    moderated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME,
+    reversed INTEGER NOT NULL DEFAULT 0,
+    reversed_at DATETIME,
+    reversed_by TEXT,
+    reversal_reason TEXT,
+    report_id INTEGER,
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_account_moderation_did ON account_moderation(did);
+CREATE INDEX IF NOT EXISTS idx_account_moderation_expires ON account_moderation(expires_at);
+CREATE INDEX IF NOT EXISTS idx_account_moderation_reversed ON account_moderation(reversed);
+CREATE INDEX IF NOT EXISTS idx_account_moderation_action ON account_moderation(action);
+
+-- Content labels
+CREATE TABLE IF NOT EXISTS content_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uri TEXT NOT NULL,
+    cid TEXT,
+    val TEXT NOT NULL,
+    neg INTEGER NOT NULL DEFAULT 0,
+    src TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME
+);
+CREATE INDEX IF NOT EXISTS idx_content_labels_uri ON content_labels(uri);
+CREATE INDEX IF NOT EXISTS idx_content_labels_src ON content_labels(src);
+CREATE INDEX IF NOT EXISTS idx_content_labels_val ON content_labels(val);
+
+-- Migration tracking table
 CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     version BIGINT PRIMARY KEY NOT NULL,
     description TEXT NOT NULL,
@@ -630,14 +795,16 @@ CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     execution_time BIGINT NOT NULL
 );
 INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
-VALUES (20250106000001, 'admin_moderation', CURRENT_TIMESTAMP, 1, X'00', 0);
+VALUES
+    (20250101000001, 'init_account', CURRENT_TIMESTAMP, 1, X'00', 0),
+    (20250106000001, 'admin_moderation', CURRENT_TIMESTAMP, 1, X'00', 0);
 EOSQL
 
-        if [ "" != "__PLACEHOLDER_ADMIN_DID__" ] && [ -n "" ]; then
-            sqlite3 data/account.sqlite "INSERT INTO admin_roles (did, role, granted_by, granted_at) VALUES ('', 'superadmin', 'installer', datetime('now'));"
-            print_success "Database initialized - Admin DID \ added as superadmin"
+        if [ "$ADMIN_DID" != "__PLACEHOLDER_ADMIN_DID__" ] && [ -n "$ADMIN_DID" ]; then
+            sqlite3 data/account.sqlite "INSERT INTO admin_roles (did, role, granted_by, granted_at, revoked) VALUES ('$ADMIN_DID', 'superadmin', 'installer', datetime('now'), 0);"
+            print_success "Database initialized - Admin DID $ADMIN_DID added as superadmin"
         else
-            print_success "Database initialized with admin_roles table"
+            print_success "Database initialized with all required tables"
         fi
     else
         print_info "Database already exists"
