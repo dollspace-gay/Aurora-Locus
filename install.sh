@@ -586,6 +586,20 @@ main() {
     # Create data directories
     print_header "Setting Up Data Directories"
 
+    # Clean existing databases for fresh install
+    if [ -d "data" ]; then
+        if [ -f "data/account.sqlite" ] || [ -f "data/sequencer.sqlite" ] || [ -f "data/did_cache.sqlite" ]; then
+            print_warning "Existing database files found"
+            prompt CLEAN_DB "Delete existing databases for fresh install? (yes/no)" "yes"
+            if [ "$CLEAN_DB" = "yes" ]; then
+                rm -f data/*.sqlite data/*.sqlite-*
+                print_success "Existing databases deleted"
+            else
+                print_warning "Keeping existing databases - may cause migration conflicts!"
+            fi
+        fi
+    fi
+
     mkdir -p data/actors data/blobs data/tmp
     print_success "Data directories created"
     echo ""
