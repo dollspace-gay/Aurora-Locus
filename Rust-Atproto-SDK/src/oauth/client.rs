@@ -295,9 +295,28 @@ impl OAuthClient {
             .send()
             .await?;
 
+        // Capture status and headers before consuming response
+        let status = response.status();
+        let headers = response.headers().clone();
+        let content_type = headers.get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+
         // Handle error responses
-        if !response.status().is_success() {
-            let error_response: OAuthErrorResponse = response.json().await?;
+        if !status.is_success() {
+            let error_text = response.text().await
+                .unwrap_or_else(|e| format!("Failed to read error body: {}", e));
+
+            let error_response: OAuthErrorResponse = serde_json::from_str(&error_text)
+                .unwrap_or_else(|_| OAuthErrorResponse {
+                    error: "http_error".to_string(),
+                    error_description: Some(format!(
+                        "HTTP {} - Content-Type: {} - Body: {}",
+                        status, content_type, error_text
+                    )),
+                    error_uri: None,
+                });
+
             return Err(OAuthError::ServerError {
                 error: error_response.error,
                 description: error_response
@@ -307,14 +326,20 @@ impl OAuthClient {
         }
 
         // Parse successful response
-        let response_text = response.text().await?;
-        eprintln!("DEBUG: Token endpoint response: {}", response_text);
+        let response_text = response.text().await
+            .map_err(|e| {
+                OAuthError::InvalidResponse(format!(
+                    "Failed to read response body (status: {}, content-type: {}): {}",
+                    status, content_type, e
+                ))
+            })?;
 
         let token_response: TokenResponse = serde_json::from_str(&response_text)
             .map_err(|e| {
-                eprintln!("ERROR: Failed to parse token response: {}", e);
-                eprintln!("ERROR: Response body was: {}", response_text);
-                OAuthError::JsonError(e)
+                OAuthError::InvalidResponse(format!(
+                    "Failed to parse token response (status: {}, content-type: {}): {} - Body: {}",
+                    status, content_type, e, response_text
+                ))
             })?;
 
         // Build OAuth session (sub is now a required field)
@@ -366,9 +391,28 @@ impl OAuthClient {
             .send()
             .await?;
 
+        // Capture status and headers before consuming response
+        let status = response.status();
+        let headers = response.headers().clone();
+        let content_type = headers.get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+
         // Handle error responses
-        if !response.status().is_success() {
-            let error_response: OAuthErrorResponse = response.json().await?;
+        if !status.is_success() {
+            let error_text = response.text().await
+                .unwrap_or_else(|e| format!("Failed to read error body: {}", e));
+
+            let error_response: OAuthErrorResponse = serde_json::from_str(&error_text)
+                .unwrap_or_else(|_| OAuthErrorResponse {
+                    error: "http_error".to_string(),
+                    error_description: Some(format!(
+                        "HTTP {} - Content-Type: {} - Body: {}",
+                        status, content_type, error_text
+                    )),
+                    error_uri: None,
+                });
+
             return Err(OAuthError::ServerError {
                 error: error_response.error,
                 description: error_response
@@ -378,14 +422,20 @@ impl OAuthClient {
         }
 
         // Parse successful response
-        let response_text = response.text().await?;
-        eprintln!("DEBUG: Token endpoint response: {}", response_text);
+        let response_text = response.text().await
+            .map_err(|e| {
+                OAuthError::InvalidResponse(format!(
+                    "Failed to read response body (status: {}, content-type: {}): {}",
+                    status, content_type, e
+                ))
+            })?;
 
         let token_response: TokenResponse = serde_json::from_str(&response_text)
             .map_err(|e| {
-                eprintln!("ERROR: Failed to parse token response: {}", e);
-                eprintln!("ERROR: Response body was: {}", response_text);
-                OAuthError::JsonError(e)
+                OAuthError::InvalidResponse(format!(
+                    "Failed to parse token response (status: {}, content-type: {}): {} - Body: {}",
+                    status, content_type, e, response_text
+                ))
             })?;
 
         // Build OAuth session (sub is now a required field)
