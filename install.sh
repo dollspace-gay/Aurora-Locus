@@ -242,7 +242,6 @@ PDS_SERVICE_DID=did:web:$HOSTNAME
 # Security
 # ============================================================================
 PDS_JWT_SECRET=$JWT_SECRET
-PDS_ADMIN_PASSWORD=$ADMIN_PASSWORD
 
 # ============================================================================
 # Cryptographic Keys
@@ -256,11 +255,14 @@ PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=$PLC_KEY
 # ============================================================================
 # OAuth Configuration
 # ============================================================================
+# OAuth keyset for admin authentication (P-256/ES256)
 OAUTH_KEYSET_FILE=./oauth-keyset.json
 OAUTH_CLIENT_ID=http://$HOSTNAME/oauth/client
 
-# OAuth admin DIDs (comma-separated list of DIDs allowed to use admin OAuth)
-OAUTH_ADMIN_DIDS=$ADMIN_DID
+# Admin DIDs allowed to use OAuth admin authentication
+# This will be automatically populated after account creation
+# Multiple DIDs can be comma-separated: did:plc:abc123,did:plc:def456
+PDS_ADMIN_DIDS=__PLACEHOLDER_ADMIN_DID__
 
 # ============================================================================
 # Storage
@@ -487,8 +489,24 @@ main() {
     prompt PORT "Server port" "3000"
     echo ""
 
-    # Admin configuration
-    print_header "Admin Configuration"
+    # First-time account setup
+    print_header "First Admin Account Setup"
+
+    echo "Aurora Locus uses OAuth 2.0 with PKCE for admin authentication."
+    echo "You'll need to create your admin account first, then configure OAuth."
+    echo ""
+    print_info "We'll collect your preferred admin handle and email for account creation."
+    echo ""
+
+    ADMIN_HANDLE=""
+    while true; do
+        prompt ADMIN_HANDLE "Admin handle (without domain, e.g., 'admin')" "admin"
+        if [[ $ADMIN_HANDLE =~ ^[a-z0-9-]+$ ]]; then
+            break
+        else
+            print_error "Handle must contain only lowercase letters, numbers, and hyphens."
+        fi
+    done
 
     while true; do
         prompt ADMIN_EMAIL "Admin email address" ""
@@ -500,10 +518,10 @@ main() {
     done
 
     while true; do
-        prompt ADMIN_PASSWORD "Admin password (min 8 characters)" "" "secret"
-        if [ ${#ADMIN_PASSWORD} -ge 8 ]; then
-            prompt ADMIN_PASSWORD_CONFIRM "Confirm admin password" "" "secret"
-            if [ "$ADMIN_PASSWORD" = "$ADMIN_PASSWORD_CONFIRM" ]; then
+        prompt INITIAL_PASSWORD "Initial admin password (min 8 characters)" "" "secret"
+        if [ ${#INITIAL_PASSWORD} -ge 8 ]; then
+            prompt PASSWORD_CONFIRM "Confirm password" "" "secret"
+            if [ "$INITIAL_PASSWORD" = "$PASSWORD_CONFIRM" ]; then
                 break
             else
                 print_error "Passwords do not match. Please try again."
@@ -513,8 +531,9 @@ main() {
         fi
     done
 
-    # Will be set after account creation
-    ADMIN_DID="# Set this after creating your admin account"
+    FULL_HANDLE="${ADMIN_HANDLE}.${HOSTNAME}"
+    echo ""
+    print_info "Admin account will be created as: $FULL_HANDLE"
     echo ""
 
     # Federation settings
@@ -572,12 +591,88 @@ main() {
     print_success "Data directories created"
     echo ""
 
-    # Run database migrations
-    print_header "Running Database Migrations"
+    # Run database migrations and create admin account
+    print_header "Initializing Database and Admin Account"
 
-    print_info "Initializing database..."
-    # The migrations will run automatically on first startup
-    print_success "Database will be initialized on first run"
+    print_info "Starting server temporarily to run migrations..."
+
+    # Start server in background
+    ./target/release/aurora-locus &
+    SERVER_PID=$!
+
+    # Wait for server to start (check health endpoint)
+    print_info "Waiting for server to start..."
+    for i in {1..30}; do
+        if curl -s http://localhost:$PORT/health > /dev/null 2>&1; then
+            print_success "Server started successfully"
+            break
+        fi
+        sleep 1
+        if [ $i -eq 30 ]; then
+            print_error "Server failed to start. Check logs."
+            kill $SERVER_PID 2>/dev/null
+            exit 1
+        fi
+    done
+
+    echo ""
+    print_info "Creating admin account: $FULL_HANDLE"
+
+    # Create admin account
+    ACCOUNT_RESPONSE=$(curl -s -X POST http://localhost:$PORT/xrpc/com.atproto.server.createAccount \
+      -H "Content-Type: application/json" \
+      -d "{\"handle\":\"$FULL_HANDLE\",\"email\":\"$ADMIN_EMAIL\",\"password\":\"$INITIAL_PASSWORD\"}")
+
+    # Extract DID from response
+    ADMIN_DID=$(echo "$ACCOUNT_RESPONSE" | jq -r '.did // empty')
+
+    if [ -z "$ADMIN_DID" ]; then
+        print_error "Failed to create admin account"
+        echo "Response: $ACCOUNT_RESPONSE"
+        kill $SERVER_PID 2>/dev/null
+        exit 1
+    fi
+
+    print_success "Admin account created with DID: $ADMIN_DID"
+    echo ""
+
+    # Grant SuperAdmin role in database
+    print_info "Granting SuperAdmin role..."
+
+    sqlite3 data/accounts.db <<EOF
+INSERT INTO admin_role (did, role, granted_by, granted_at, revoked)
+VALUES ('$ADMIN_DID', 'superadmin', 'system', datetime('now'), 0);
+EOF
+
+    if [ $? -eq 0 ]; then
+        print_success "SuperAdmin role granted"
+    else
+        print_error "Failed to grant SuperAdmin role"
+        kill $SERVER_PID 2>/dev/null
+        exit 1
+    fi
+    echo ""
+
+    # Update .env with admin DID
+    print_info "Updating .env with admin DID..."
+
+    # Use sed to replace the placeholder with actual DID
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS
+        sed -i '' "s/__PLACEHOLDER_ADMIN_DID__/$ADMIN_DID/" .env
+    else
+        # Linux
+        sed -i "s/__PLACEHOLDER_ADMIN_DID__/$ADMIN_DID/" .env
+    fi
+
+    print_success ".env updated with admin DID"
+    echo ""
+
+    # Stop the temporary server
+    print_info "Stopping temporary server..."
+    kill $SERVER_PID 2>/dev/null
+    wait $SERVER_PID 2>/dev/null
+    print_success "Temporary server stopped"
     echo ""
 
     # Optional: systemd service
@@ -597,45 +692,90 @@ main() {
     print_header "Installation Complete!"
 
     echo ""
-    print_success "Aurora Locus PDS has been successfully configured!"
+    print_success "🎉 Aurora Locus PDS is fully configured and ready to use!"
     echo ""
-    print_info "Next steps:"
+
+    print_header "Your Admin Account"
     echo ""
-    echo "1. Start the server:"
-    echo "   ./target/release/aurora-locus"
+    echo "  Handle:   $FULL_HANDLE"
+    echo "  Email:    $ADMIN_EMAIL"
+    echo "  Password: [you entered during setup]"
+    echo "  DID:      $ADMIN_DID"
+    echo "  Role:     SuperAdmin"
     echo ""
-    echo "2. Create your admin account:"
-    echo "   curl -X POST http://localhost:$PORT/xrpc/com.atproto.server.createAccount \\"
-    echo "     -H 'Content-Type: application/json' \\"
-    echo "     -d '{\"handle\":\"admin.$HOSTNAME\",\"email\":\"$ADMIN_EMAIL\",\"password\":\"[your-password]\"}'"
+
+    print_header "Starting Your Server"
     echo ""
-    echo "3. Grant admin role (after account creation):"
-    echo "   sqlite3 data/accounts.db \"INSERT INTO admin_role (did, role, granted_by, granted_at) \\"
-    echo "     VALUES ('[your-did]', 'superadmin', 'system', datetime('now'));\""
+    print_info "Start the server with:"
+    echo "  ./target/release/aurora-locus"
     echo ""
-    echo "4. Update OAUTH_ADMIN_DIDS in .env with your admin DID"
+    print_info "Or run in background:"
+    echo "  nohup ./target/release/aurora-locus > pds.log 2>&1 &"
+    echo ""
+
+    print_header "Accessing Admin Functions"
+    echo ""
+    print_info "OAuth Admin Login:"
+    echo "  Visit: http://localhost:$PORT/oauth/authorize"
+    echo "  Login with: $FULL_HANDLE and your password"
+    echo ""
+    print_info "Direct API Access (after login):"
+    echo "  curl http://localhost:$PORT/xrpc/com.atproto.admin.getStats \\"
+    echo "    -H 'Authorization: Bearer YOUR_OAUTH_TOKEN'"
+    echo ""
+
+    print_header "Testing Your PDS"
+    echo ""
+    print_info "Health check:"
+    echo "  curl http://localhost:$PORT/health"
+    echo ""
+    print_info "Server info:"
+    echo "  curl http://localhost:$PORT/xrpc/com.atproto.server.describeServer"
+    echo ""
+    print_info "Create a session (login as admin):"
+    echo "  curl -X POST http://localhost:$PORT/xrpc/com.atproto.server.createSession \\"
+    echo "    -H 'Content-Type: application/json' \\"
+    echo "    -d '{\"identifier\":\"$FULL_HANDLE\",\"password\":\"YOUR_PASSWORD\"}'"
     echo ""
 
     if [ "$SETUP_SYSTEMD" = "yes" ]; then
-        echo "5. Install systemd service (see instructions above)"
         echo ""
+        print_info "OPTIONAL: Install systemd service"
+        echo "  sudo cp /tmp/aurora-locus.service /etc/systemd/system/"
+        echo "  sudo systemctl daemon-reload"
+        echo "  sudo systemctl enable aurora-locus"
+        echo "  sudo systemctl start aurora-locus"
     fi
 
     if [ "$SETUP_NGINX" = "yes" ]; then
-        echo "6. Configure nginx reverse proxy (see instructions above)"
         echo ""
+        print_info "OPTIONAL: Configure nginx reverse proxy"
+        echo "  1. Get SSL certificate:"
+        echo "     sudo certbot --nginx -d $HOSTNAME"
+        echo "  2. Install config:"
+        echo "     sudo cp /tmp/aurora-locus-nginx.conf /etc/nginx/sites-available/aurora-locus"
+        echo "     sudo ln -s /etc/nginx/sites-available/aurora-locus /etc/nginx/sites-enabled/"
+        echo "  3. Reload nginx:"
+        echo "     sudo nginx -t && sudo systemctl reload nginx"
     fi
 
-    print_warning "IMPORTANT: Keep your .env file and oauth-keyset.json secure!"
-    print_warning "These files contain sensitive cryptographic keys."
+    echo ""
+    print_header "Security Reminder"
+    print_warning "Keep these files SECRET - they contain cryptographic keys:"
+    echo "  - .env (JWT secret, signing keys)"
+    echo "  - oauth-keyset.json (OAuth private key)"
+    echo ""
+    print_info "Generated files:"
+    echo "  📄 .env                    - Configuration"
+    echo "  🔐 oauth-keyset.json       - OAuth P-256 keyset"
+    echo "  📁 data/                   - Data directory"
+    echo "  🚀 target/release/aurora-locus - Server binary"
     echo ""
 
-    print_info "Configuration file: .env"
-    print_info "OAuth keyset: oauth-keyset.json"
+    print_success "Installation complete! 🎉"
+    echo ""
+    print_info "Your admin account will be: $FULL_HANDLE"
     print_info "Installation directory: $INSTALL_DIR"
-    echo ""
-
-    print_success "Happy hosting! 🎉"
     echo ""
 }
 
