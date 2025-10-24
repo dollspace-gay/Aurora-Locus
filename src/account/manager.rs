@@ -460,7 +460,14 @@ impl AccountManager {
         // Build PLC operation
         let service_url = format!("https://{}", self.config.service.hostname);
 
-        let full_handle = format!("{}.{}", handle, self.config.identity.service_handle_domains[0]);
+        // Check if handle already includes the domain
+        let full_handle = if handle.contains('.') && self.config.identity.service_handle_domains.iter().any(|d| handle.ends_with(d)) {
+            // Handle is already full (e.g., "test.locus.dollsky.social")
+            handle.to_string()
+        } else {
+            // Handle needs domain appended (e.g., "test" -> "test.locus.dollsky.social")
+            format!("{}.{}", handle, self.config.identity.service_handle_domains[0])
+        };
 
         let services = serde_json::json!([{
             "id": "#atproto_pds",
@@ -468,18 +475,22 @@ impl AccountManager {
             "serviceEndpoint": service_url
         }]);
 
+        // Get proper multibase encoding for public key
+        let public_key_multibase = signer.public_key_multibase();
+        let public_key_did_key = signer.public_key_did_key();
+
         let verification_methods = serde_json::json!([{
             "id": format!("{}#atproto", did),
             "type": "Multikey",
             "controller": did.clone(),
-            "publicKeyMultibase": format!("z{}", public_key_hex)
+            "publicKeyMultibase": public_key_multibase
         }]);
 
         let also_known_as = vec![format!("at://{}", full_handle)];
 
         let operation = PlcOperationBuilder::new()
             .did(did.clone())
-            .rotation_keys(vec![public_key_hex.clone()])
+            .rotation_keys(vec![public_key_did_key])
             .also_known_as(also_known_as)
             .services(services)
             .verification_methods(verification_methods)

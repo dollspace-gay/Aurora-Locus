@@ -42,9 +42,8 @@ pub fn build_router(ctx: AppContext) -> Router {
         .route("/metrics", get(metrics_handler))
         // Server description endpoint
         .route("/xrpc/com.atproto.server.describeServer", get(describe_server))
-        // Well-known endpoints will be added in Phase 6
-        // .route("/.well-known/did.json", get(well_known_did))
-        // .route("/.well-known/atproto-did", get(well_known_atproto_did))
+        // Well-known endpoints for DID resolution
+        .merge(crate::api::well_known::routes())
         // API routes (Phase 2) - merge before with_state
         .merge(crate::api::routes())
         // Provide state - converts Router<AppContext> to Router<()>

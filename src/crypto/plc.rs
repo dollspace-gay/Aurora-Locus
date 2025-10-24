@@ -204,11 +204,20 @@ impl PlcSigner {
     }
 
     /// Get the public key in multibase format (for DID documents)
+    /// Returns base58btc encoding with 'z' prefix
     pub fn public_key_multibase(&self) -> String {
-        let public_key_hex = self.public_key_hex();
-        // Multibase prefix 'z' for base58btc, but we'll use a simpler approach
-        // In production, you'd use proper multibase encoding
-        format!("did:key:z{}", public_key_hex)
+        let verifying_key = self.signing_key.verifying_key();
+        let public_key_bytes = verifying_key.to_encoded_point(true); // Compressed
+        let compressed_bytes = public_key_bytes.as_bytes();
+
+        // Encode as base58btc with multibase 'z' prefix
+        let encoded = bs58::encode(compressed_bytes).into_string();
+        format!("z{}", encoded)
+    }
+
+    /// Get the public key as a did:key identifier
+    pub fn public_key_did_key(&self) -> String {
+        format!("did:key:{}", self.public_key_multibase())
     }
 
     /// Get the verifying key (public key)
@@ -267,13 +276,9 @@ pub async fn register_plc_did(
     // Create HTTP client
     let client = reqwest::Client::new();
 
-    // For genesis operations (no prev), POST to base URL
-    // For updates, POST to {plc_url}/{did}
-    let endpoint = if operation.prev.is_none() {
-        plc_url.to_string()
-    } else {
-        format!("{}/{}", plc_url, operation.did)
-    };
+    // Both genesis and update operations POST to {plc_url}/{did}
+    // The PLC directory determines if it's a create or update based on whether the DID exists
+    let endpoint = format!("{}/{}", plc_url.trim_end_matches('/'), operation.did);
 
     // Submit operation to PLC directory
     let response = client
