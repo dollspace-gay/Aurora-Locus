@@ -87,7 +87,7 @@ impl AdminRoleManager {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO admin_role (did, role, granted_by, granted_at, notes)
+            INSERT INTO admin_roles (did, role, granted_by, granted_at, notes)
             VALUES (?, ?, ?, ?, ?)
             "#,
         )
@@ -125,7 +125,7 @@ impl AdminRoleManager {
 
         let result = sqlx::query(
             r#"
-            UPDATE admin_role
+            UPDATE admin_roles
             SET revoked = 1,
                 revoked_at = ?,
                 revoked_by = ?,
@@ -152,7 +152,7 @@ impl AdminRoleManager {
         let row = sqlx::query(
             r#"
             SELECT id, did, role, granted_by, granted_at, revoked, revoked_at, revoked_by, notes
-            FROM admin_role
+            FROM admin_roles
             WHERE did = ? AND revoked = 0
             ORDER BY granted_at DESC
             LIMIT 1
@@ -207,7 +207,7 @@ impl AdminRoleManager {
         let rows = sqlx::query(
             r#"
             SELECT id, did, role, granted_by, granted_at, revoked, revoked_at, revoked_by, notes
-            FROM admin_role
+            FROM admin_roles
             WHERE revoked = 0
             ORDER BY granted_at DESC
             "#,
@@ -311,7 +311,7 @@ mod tests {
         // Create table
         sqlx::query(
             r#"
-            CREATE TABLE admin_role (
+            CREATE TABLE admin_roles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 did TEXT NOT NULL UNIQUE,
                 role TEXT NOT NULL,
@@ -384,7 +384,7 @@ mod tests {
 
         sqlx::query(
             r#"
-            CREATE TABLE admin_role (
+            CREATE TABLE admin_roles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 did TEXT NOT NULL UNIQUE,
                 role TEXT NOT NULL,
