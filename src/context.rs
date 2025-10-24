@@ -55,11 +55,9 @@ impl AppContext {
         // Initialize account database
         let account_db = db::create_pool(&config.storage.account_db, db::DatabaseOptions::default()).await?;
 
-        // Run migrations
-        sqlx::migrate!("./migrations")
-            .run(&account_db)
-            .await
-            .map_err(|e| PdsError::Internal(format!("Failed to run migrations: {}", e)))?;
+        // NOTE: Database schema is set up by install.sh during installation
+        // We do NOT run migrations at startup to avoid checksum mismatches
+
 
         // Test connection
         db::test_connection(&account_db).await?;
