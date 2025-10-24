@@ -35,8 +35,20 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> PdsResult<()> {
-    // Load .env file if it exists
-    dotenv::dotenv().ok();
+    // Load .env file - search from current dir up to project root
+    if let Err(e) = dotenv::from_path(".env") {
+        // Try parent directory
+        if let Err(e2) = dotenv::from_path("../.env") {
+            // Try two levels up (for when running from target/release)
+            if let Err(e3) = dotenv::from_path("../../.env") {
+                eprintln!("Warning: No .env file found (.env, ../.env, ../../.env)");
+                eprintln!("  Current dir .env: {}", e);
+                eprintln!("  Parent dir .env: {}", e2);
+                eprintln!("  Grandparent .env: {}", e3);
+                eprintln!("Using system environment variables only");
+            }
+        }
+    }
 
     // Initialize logging with JSON support
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "text".to_string());
