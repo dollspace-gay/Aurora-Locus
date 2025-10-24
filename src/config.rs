@@ -209,7 +209,7 @@ impl ServerConfig {
         let oauth_client_id = env::var("PDS_OAUTH_CLIENT_ID")
             .unwrap_or_else(|_| format!("https://{}/oauth/client-metadata.json", hostname));
         let oauth_redirect_uri = env::var("PDS_OAUTH_REDIRECT_URI")
-            .unwrap_or_else(|_| format!("https://{}/oauth/callback", hostname));
+            .unwrap_or_else(|_| format!("https://{}/admin-oauth/callback", hostname));
         let oauth_pds_url = env::var("PDS_OAUTH_PDS_URL")
             .unwrap_or_else(|_| "https://bsky.social".to_string());
 
