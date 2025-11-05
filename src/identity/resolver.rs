@@ -182,6 +182,57 @@ impl IdentityResolver {
         Ok(doc)
     }
 
+    /// Get atproto signing key from DID document (for Phase 4: Service Auth)
+    ///
+    /// This extracts the public signing key from the DID document's verificationMethod.
+    /// The key is used to verify service auth JWTs in cross-PDS requests.
+    ///
+    /// # Returns
+    /// The signing key in PEM format (ES256/P-256)
+    pub async fn get_signing_key(&self, did: &str) -> PdsResult<Vec<u8>> {
+        // Resolve DID document (with caching)
+        let doc = self.resolve_did(did).await?;
+
+        // Find the atproto signing key in verificationMethod
+        for vm in &doc.verification_method {
+            // Check if this is an atproto signing key
+            // ATProto keys typically have id like "did:plc:abc123#atproto"
+            if vm.id.contains("#atproto") {
+                // Extract public key from multibase format
+                if let Some(multibase_key) = &vm.public_key_multibase {
+                    // Decode multibase key
+                    // For now, we'll return the raw key bytes
+                    // TODO: Proper multibase decoding and PEM conversion
+                    // This is a simplified implementation - production needs proper
+                    // multibase decoding and conversion to PEM format
+
+                    return Ok(multibase_key.as_bytes().to_vec());
+                }
+            }
+        }
+
+        // If no atproto key found, try the first verification method
+        if let Some(vm) = doc.verification_method.first() {
+            if let Some(multibase_key) = &vm.public_key_multibase {
+                return Ok(multibase_key.as_bytes().to_vec());
+            }
+        }
+
+        Err(PdsError::IdentityResolution(format!(
+            "No signing key found in DID document for {}",
+            did
+        )))
+    }
+
+    /// Invalidate cached signing key for a DID (force re-fetch)
+    ///
+    /// This should be called when identity events are received via relay,
+    /// indicating that the DID document has changed.
+    pub async fn invalidate_signing_key(&self, did: &str) -> PdsResult<()> {
+        // Invalidating the DID document invalidates the signing key
+        self.invalidate_did(did).await
+    }
+
     /// Update handle for a DID
     ///
     /// This updates the cache and should be called when a user changes their handle

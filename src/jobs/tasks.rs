@@ -149,3 +149,103 @@ pub async fn cleanup_orphaned_temp_blobs(ctx: &AppContext) -> PdsResult<u64> {
 
     Ok(deleted_count)
 }
+
+/// Trigger PDS discovery refresh (Phase 1)
+pub async fn refresh_pds_discovery(ctx: &AppContext) -> PdsResult<usize> {
+    if let Some(discovery) = &ctx.pds_discovery {
+        discovery.refresh_instances().await?;
+        let instances = discovery.get_known_instances().await;
+        Ok(instances.len())
+    } else {
+        Ok(0)
+    }
+}
+
+/// Process relay event from firehose (Phase 3)
+pub async fn process_relay_event(ctx: &AppContext, event: crate::federation::relay::RelayEvent) -> PdsResult<()> {
+    use tracing::{debug, info, warn};
+
+    // Start timing for metrics
+    let start_time = std::time::Instant::now();
+    let event_type = event.event_type.clone();
+
+    // Log event details
+    debug!(
+        "Processing relay event: type='{}', did='{}', seq={}",
+        event.event_type, event.did, event.seq
+    );
+
+    match event.event_type.as_str() {
+        "commit" => {
+            // Handle commit events - cache commit info for future queries
+            info!("Received commit from {}: seq={}", event.did, event.seq);
+
+            // TODO: In a full implementation:
+            // - Store commit metadata in database
+            // - Index content for search
+            // - Update relationship graphs
+            // - Trigger notifications for followers
+
+            // For now, just log it
+            if let Some(commit_data) = event.commit {
+                debug!("Commit data: {:?}", commit_data);
+            }
+        }
+
+        "identity" => {
+            // Handle identity events - invalidate DID cache
+            info!("Received identity update for {}", event.did);
+
+            // Invalidate identity cache for this DID
+            let identity_resolver = &ctx.identity_resolver;
+            if let Err(e) = identity_resolver.invalidate_did(&event.did).await {
+                warn!("Failed to invalidate DID cache for {}: {}", event.did, e);
+            } else {
+                debug!("✓ Invalidated DID cache for {}", event.did);
+            }
+        }
+
+        "account" => {
+            // Handle account events - update account status
+            info!("Received account update for {}", event.did);
+
+            // TODO: In a full implementation:
+            // - Update account status (suspended, deleted, etc.)
+            // - Trigger UI updates
+            // - Update follower/following counts
+
+            if let Some(account_data) = event.commit {
+                debug!("Account data: {:?}", account_data);
+            }
+        }
+
+        "handle" => {
+            // Handle handle change events
+            info!("Received handle change for {}", event.did);
+
+            // Invalidate identity cache (handles are part of identity)
+            if let Err(e) = ctx.identity_resolver.invalidate_did(&event.did).await {
+                warn!("Failed to invalidate cache for handle change {}: {}", event.did, e);
+            }
+        }
+
+        "tombstone" => {
+            // Handle tombstone events (deleted repos)
+            info!("Received tombstone for {}", event.did);
+
+            // TODO: Mark repo as deleted
+            // TODO: Clean up cached data
+        }
+
+        _ => {
+            // Unknown event type
+            debug!("Unknown relay event type: {}", event.event_type);
+        }
+    }
+
+    // Record metrics
+    let duration = start_time.elapsed().as_secs_f64();
+    crate::metrics::record_relay_event(&event_type, duration);
+
+    Ok(())
+}

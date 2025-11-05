@@ -621,6 +621,56 @@ impl BlobStore {
 
         Ok(blobs)
     }
+
+    /// List blob CIDs for sync protocol (com.atproto.sync.listBlobs)
+    ///
+    /// Returns just the CID strings for a DID with cursor-based pagination.
+    ///
+    /// # Arguments
+    ///
+    /// * `did` - The DID to list blobs for
+    /// * `since` - Optional since parameter (not yet implemented)
+    /// * `limit` - Maximum number of CIDs to return
+    /// * `cursor` - Optional cursor for pagination (CID to start after)
+    ///
+    /// # Returns
+    ///
+    /// Vec of CID strings, ordered by CID (lexically)
+    pub async fn list_blob_cids(
+        &self,
+        did: &str,
+        _since: Option<&str>,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> PdsResult<Vec<String>> {
+        let query = if let Some(cursor) = cursor {
+            sqlx::query_scalar(
+                "SELECT cid FROM blob_metadata
+                 WHERE creator_did = ?1 AND cid > ?2
+                 ORDER BY cid ASC
+                 LIMIT ?3"
+            )
+            .bind(did)
+            .bind(cursor)
+            .bind(limit)
+        } else {
+            sqlx::query_scalar(
+                "SELECT cid FROM blob_metadata
+                 WHERE creator_did = ?1
+                 ORDER BY cid ASC
+                 LIMIT ?2"
+            )
+            .bind(did)
+            .bind(limit)
+        };
+
+        let cids = query
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        Ok(cids)
+    }
 }
 
 #[cfg(test)]

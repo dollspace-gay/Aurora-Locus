@@ -58,6 +58,7 @@ rand = "0.8"
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+url = "2.5"
 base64 = "0.22"
 jsonwebtoken = "9"
 
@@ -89,6 +90,9 @@ sha2 = "0.10"
 
 # secp256k1 for PLC operation signing
 k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+
+# P-256 (secp256r1) for DPoP JWT verification
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 
 # Base58 encoding for multibase keys
 bs58 = "0.5"

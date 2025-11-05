@@ -1,6 +1,7 @@
 /// API routes and handlers
 pub mod admin;
 pub mod blob;
+pub mod federation;
 pub mod firehose;
 pub mod health;
 pub mod identity;
@@ -10,6 +11,7 @@ pub mod oauth_admin;
 pub mod repo;
 pub mod server;
 pub mod sync;
+pub mod sync_helpers;
 pub mod well_known;
 
 use crate::context::AppContext;
@@ -31,6 +33,7 @@ pub fn routes() -> Router<AppContext> {
         .merge(firehose::routes())
         .merge(labels::routes())
         .merge(health::routes())
+        .merge(federation::routes())
         // OAuth admin routes with their own state
         .merge(oauth_admin::routes(oauth_state_store))
 }

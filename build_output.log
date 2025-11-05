@@ -1,0 +1,1720 @@
+   Compiling proc-macro2 v1.0.101
+   Compiling quote v1.0.41
+   Compiling unicode-ident v1.0.20
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling cfg-if v1.0.4
+   Compiling version_check v0.9.5
+   Compiling typenum v1.19.0
+   Compiling memchr v2.7.6
+   Compiling zeroize v1.8.2
+   Compiling windows_x86_64_msvc v0.53.1
+   Compiling generic-array v0.14.9
+   Compiling parking_lot_core v0.9.12
+   Compiling const-oid v0.9.6
+   Compiling subtle v2.6.1
+   Compiling scopeguard v1.2.0
+   Compiling windows-link v0.2.1
+   Compiling lock_api v0.4.14
+   Compiling autocfg v1.5.0
+   Compiling itoa v1.0.15
+   Compiling pin-project-lite v0.2.16
+   Compiling syn v2.0.107
+   Compiling bytes v1.10.1
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.4
+   Compiling once_cell v1.21.3
+   Compiling futures-core v0.3.31
+   Compiling cc v1.2.41
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.6
+   Compiling digest v0.10.7
+   Compiling windows-sys v0.61.2
+   Compiling log v0.4.28
+   Compiling futures-sink v0.3.31
+   Compiling icu_properties_data v2.0.1
+   Compiling icu_normalizer_data v2.0.0
+   Compiling windows-targets v0.53.5
+   Compiling getrandom v0.2.16
+   Compiling windows-sys v0.60.2
+   Compiling zerocopy v0.8.27
+   Compiling thiserror v1.0.69
+   Compiling libm v0.2.15
+   Compiling num-traits v0.2.19
+   Compiling slab v0.4.11
+   Compiling cpufeatures v0.2.17
+   Compiling futures-channel v0.3.31
+   Compiling pin-utils v0.1.0
+   Compiling stable_deref_trait v1.2.1
+   Compiling socket2 v0.6.1
+   Compiling rand_core v0.6.4
+   Compiling fnv v1.0.7
+   Compiling futures-io v0.3.31
+   Compiling synstructure v0.13.2
+   Compiling futures-task v0.3.31
+   Compiling windows_x86_64_msvc v0.52.6
+   Compiling tracing-core v0.1.34
+   Compiling crossbeam-utils v0.8.21
+   Compiling http v1.3.1
+   Compiling syn v1.0.109
+   Compiling percent-encoding v2.3.2
+   Compiling writeable v0.6.1
+   Compiling litemap v0.8.0
+   Compiling arrayvec v0.7.6
+   Compiling serde_derive v1.0.228
+   Compiling zerofrom-derive v0.1.6
+   Compiling yoke-derive v0.8.0
+   Compiling zerovec-derive v0.11.1
+   Compiling displaydoc v0.2.5
+   Compiling mio v1.1.0
+   Compiling zerocopy-derive v0.8.27
+   Compiling tokio-macros v2.6.0
+   Compiling tracing-attributes v0.1.30
+   Compiling zerofrom v0.1.6
+   Compiling thiserror-impl v1.0.69
+   Compiling yoke v0.8.0
+   Compiling futures-macro v0.3.31
+   Compiling zerovec v0.11.4
+   Compiling tracing v0.1.41
+   Compiling smallvec v1.15.1
+   Compiling zerotrie v0.2.2
+   Compiling futures-util v0.3.31
+   Compiling tinystr v0.8.1
+   Compiling potential_utf v0.1.3
+   Compiling icu_locale_core v2.0.0
+   Compiling parking_lot v0.12.5
+   Compiling icu_collections v2.0.0
+   Compiling thiserror v2.0.17
+   Compiling tokio v1.48.0
+   Compiling icu_provider v2.0.0
+   Compiling data-encoding v2.9.0
+   Compiling ryu v1.0.20
+   Compiling form_urlencoded v1.2.2
+   Compiling sha2 v0.10.9
+   Compiling proc-macro-error-attr v1.0.4
+   Compiling serde_json v1.0.145
+   Compiling libc v0.2.177
+   Compiling windows_x86_64_msvc v0.48.5
+   Compiling equivalent v1.0.2
+   Compiling base64 v0.22.1
+   Compiling byteorder v1.5.0
+   Compiling icu_properties v2.0.1
+   Compiling icu_normalizer v2.0.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling thiserror-impl v2.0.17
+   Compiling proc-macro-error v1.0.4
+   Compiling httparse v1.10.1
+   Compiling rand_chacha v0.3.1
+   Compiling idna_adapter v1.2.1
+   Compiling num-integer v0.1.46
+   Compiling anyhow v1.0.100
+   Compiling utf8_iter v1.0.4
+   Compiling hashbrown v0.16.0
+   Compiling base64ct v1.8.0
+   Compiling idna v1.1.0
+   Compiling indexmap v2.12.0
+   Compiling rand v0.8.5
+   Compiling either v1.15.0
+   Compiling toml v0.5.11
+   Compiling spin v0.9.8
+   Compiling arrayref v0.3.9
+   Compiling unicode-xid v0.2.6
+   Compiling constant_time_eq v0.3.1
+   Compiling proc-macro-crate v1.1.3
+   Compiling synstructure v0.12.6
+   Compiling windows-targets v0.52.6
+   Compiling url v2.5.7
+   Compiling tokio-util v0.7.16
+   Compiling http-body v1.0.1
+   Compiling blake3 v1.8.2
+   Compiling windows-link v0.1.3
+   Compiling simd-adler32 v0.3.7
+   Compiling tower-service v0.3.3
+   Compiling allocator-api2 v0.2.21
+   Compiling bitflags v2.10.0
+   Compiling data-encoding-macro-internal v0.1.16
+   Compiling pem-rfc7468 v0.7.0
+   Compiling match-lookup v0.1.1
+   Compiling mime v0.3.17
+   Compiling keccak v0.1.5
+   Compiling httpdate v1.0.3
+   Compiling pkg-config v0.3.32
+   Compiling const-str v0.4.3
+   Compiling vcpkg v0.2.15
+   Compiling sha3 v0.10.8
+   Compiling base256emoji v1.0.2
+   Compiling data-encoding-macro v0.1.18
+   Compiling der v0.7.10
+   Compiling multihash-derive v0.8.1
+   Compiling blake2s_simd v1.0.3
+   Compiling libsqlite3-sys v0.30.1
+   Compiling blake2b_simd v1.0.3
+   Compiling num-bigint v0.4.6
+   Compiling serde-big-array v0.3.3
+   Compiling core2 v0.4.0
+   Compiling crc32fast v1.5.0
+   Compiling native-tls v0.2.14
+   Compiling unsigned-varint v0.7.2
+   Compiling base-x v0.2.11
+   Compiling tower-layer v0.3.3
+   Compiling adler2 v2.0.1
+   Compiling miniz_oxide v0.8.9
+   Compiling multibase v0.9.2
+   Compiling schannel v0.1.28
+   Compiling crossbeam-epoch v0.9.18
+   Compiling sha1 v0.10.6
+   Compiling serde_bytes v0.11.19
+   Compiling try-lock v0.2.5
+   Compiling rayon-core v1.13.0
+   Compiling atomic-waker v1.1.2
+   Compiling getrandom v0.3.4
+   Compiling foldhash v0.1.5
+   Compiling h2 v0.4.12
+   Compiling hashbrown v0.15.5
+   Compiling want v0.3.1
+   Compiling crossbeam-deque v0.8.6
+   Compiling concurrent-queue v2.5.0
+   Compiling spki v0.7.3
+   Compiling windows-result v0.3.4
+   Compiling windows-strings v0.4.2
+   Compiling http-body-util v0.1.3
+   Compiling windows-sys v0.59.0
+   Compiling equator-macro v0.4.2
+   Compiling sync_wrapper v1.0.2
+   Compiling ahash v0.8.12
+   Compiling crc-catalog v2.4.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling utf-8 v0.7.6
+   Compiling parking v2.2.1
+   Compiling hyper v1.7.0
+   Compiling tinyvec v1.10.0
+   Compiling equator v0.4.2
+   Compiling event-listener v5.4.1
+   Compiling multihash v0.18.1
+   Compiling crc v3.3.0
+   Compiling cid v0.10.1
+   Compiling tokio-stream v0.1.17
+   Compiling windows-registry v0.5.3
+   Compiling pkcs8 v0.10.2
+   Compiling libipld-core v0.16.0
+   Compiling flate2 v1.1.4
+   Compiling futures-intrusive v0.5.0
+   Compiling windows-targets v0.48.5
+   Compiling hashlink v0.10.0
+   Compiling chrono v0.4.42
+   Compiling crossbeam-queue v0.3.12
+   Compiling lazy_static v1.5.0
+   Compiling serde_urlencoded v0.7.1
+   Compiling async-trait v0.1.89
+   Compiling hmac v0.12.1
+   Compiling aho-corasick v1.1.3
+   Compiling ipnet v2.11.0
+   Compiling regex-syntax v0.8.8
+   Compiling uuid v1.18.1
+   Compiling sqlx-core v0.8.6
+   Compiling hyper-util v0.1.17
+   Compiling home v0.5.11
+   Compiling windows-sys v0.48.0
+   Compiling regex-automata v0.4.13
+   Compiling unicode-normalization v0.1.24
+   Compiling aligned-vec v0.6.4
+   Compiling tower v0.5.2
+   Compiling tokio-native-tls v0.3.1
+   Compiling atoi v2.0.0
+   Compiling futures-executor v0.3.31
+   Compiling psm v0.1.27
+   Compiling unicode-bidi v0.3.18
+   Compiling strsim v0.11.1
+   Compiling unicode-properties v0.1.3
+   Compiling minimal-lexical v0.2.1
+   Compiling num-conv v0.1.0
+   Compiling powerfmt v0.2.0
+   Compiling rustversion v1.0.22
+   Compiling ident_case v1.0.1
+   Compiling paste v1.0.15
+   Compiling time-core v0.1.6
+   Compiling built v0.7.7
+   Compiling time-macros v0.2.24
+   Compiling stringprep v0.1.5
+   Compiling rav1e v0.7.1
+   Compiling darling_core v0.20.11
+   Compiling nom v7.1.3
+   Compiling deranged v0.5.4
+   Compiling flume v0.11.1
+   Compiling hkdf v0.12.4
+   Compiling v_frame v0.3.9
+   Compiling hashbrown v0.14.5
+   Compiling etcetera v0.8.0
+   Compiling rayon v1.11.0
+   Compiling num-rational v0.4.2
+   Compiling md-5 v0.10.6
+   Compiling profiling-procmacros v1.0.17
+   Compiling signature v2.2.0
+   Compiling ff v0.13.1
+   Compiling ring v0.17.14
+   Compiling stacker v0.1.22
+   Compiling encoding_rs v0.8.35
+   Compiling fastrand v2.3.0
+   Compiling quick-error v2.0.1
+   Compiling base16ct v0.2.0
+   Compiling num-bigint-dig v0.8.4
+   Compiling winapi v0.3.9
+   Compiling whoami v1.6.1
+   Compiling unicase v2.8.1
+   Compiling dotenvy v0.15.7
+   Compiling hex v0.4.3
+   Compiling mime_guess v2.0.5
+   Compiling sqlx-postgres v0.8.6
+   Compiling time v0.3.44
+   Compiling sec1 v0.7.3
+   Compiling maybe-rayon v0.1.1
+   Compiling darling_macro v0.20.11
+   Compiling group v0.13.0
+   Compiling profiling v1.0.17
+   Compiling av1-grain v0.2.4
+   Compiling sqlx-sqlite v0.8.6
+   Compiling tungstenite v0.24.0
+   Compiling itertools v0.12.1
+   Compiling num-iter v0.1.45
+   Compiling quick-protobuf v0.8.1
+   Compiling half v2.7.1
+   Compiling num-derive v0.4.2
+   Compiling fax_derive v0.2.0
+   Compiling arg_enum_proc_macro v0.3.4
+   Compiling crypto-bigint v0.5.5
+   Compiling simd_helpers v0.1.0
+   Compiling multer v3.1.0
+   Compiling bitstream-io v2.6.0
+   Compiling weezl v0.1.10
+   Compiling compression-core v0.4.29
+   Compiling untrusted v0.9.0
+   Compiling heck v0.5.0
+   Compiling protobuf v2.28.0
+   Compiling portable-atomic v1.11.1
+   Compiling new_debug_unreachable v1.0.6
+   Compiling zune-core v0.4.12
+   Compiling imgref v1.12.0
+   Compiling noop_proc_macro v0.3.0
+   Compiling iri-string v0.7.8
+   Compiling loop9 v0.1.5
+   Compiling zune-jpeg v0.4.21
+   Compiling elliptic-curve v0.13.8
+   Compiling sqlx-macros-core v0.8.6
+   Compiling tower-http v0.6.6
+   Compiling compression-codecs v0.4.31
+   Compiling fax v0.2.6
+   Compiling libipld-pb v0.16.0
+   Compiling tokio-tungstenite v0.24.0
+   Compiling axum-core v0.4.5
+   Compiling darling v0.20.11
+   Compiling simple_asn1 v0.6.3
+   Compiling futures v0.3.31
+   Compiling regex v1.12.2
+   Compiling hyper-tls v0.6.0
+   Compiling rfc6979 v0.4.0
+   Compiling libipld-json v0.16.0
+   Compiling libipld-cbor v0.16.0
+   Compiling libipld-macro v0.16.0
+   Compiling pkcs1 v0.7.5
+   Compiling tungstenite v0.21.0
+   Compiling raw-cpuid v11.6.0
+   Compiling zune-inflate v0.2.54
+   Compiling fdeflate v0.3.7
+   Compiling libipld-cbor-derive v0.16.0
+   Compiling windows-sys v0.52.0
+   Compiling password-hash v0.5.0
+   Compiling pem v3.0.6
+   Compiling avif-serialize v0.8.6
+   Compiling headers-core v0.3.0
+   Compiling pxfm v0.1.25
+   Compiling serde_path_to_error v0.1.20
+   Compiling blake2 v0.10.6
+   Compiling rustls-pki-types v1.12.0
+   Compiling bytemuck v1.24.0
+   Compiling rgb v0.8.52
+   Compiling matchit v0.7.3
+   Compiling bit_field v0.10.3
+   Compiling half v1.8.3
+   Compiling color_quant v1.1.0
+   Compiling byteorder-lite v0.1.0
+   Compiling lebe v0.5.3
+   Compiling prometheus v0.13.4
+   Compiling image-webp v0.2.4
+   Compiling moxcms v0.7.7
+   Compiling exr v1.73.0
+   Compiling gif v0.13.3
+   Compiling serde_cbor v0.11.2
+   Compiling axum v0.7.9
+   Compiling ravif v0.11.20
+   Compiling reqwest v0.12.24
+   Compiling qoi v0.4.1
+   Compiling argon2 v0.5.3
+   Compiling headers v0.4.1
+   Compiling socket2 v0.5.10
+   Compiling jsonwebtoken v9.3.1
+   Compiling libipld v0.16.0
+   Compiling quanta v0.12.6
+   Compiling png v0.18.0
+   Compiling tokio-tungstenite v0.21.0
+   Compiling rsa v0.9.8
+   Compiling ecdsa v0.16.9
+   Compiling validator_derive v0.18.2
+   Compiling chumsky v0.9.3
+   Compiling tiff v0.10.3
+   Compiling sqlx-macros v0.8.6
+   Compiling async-compression v0.4.32
+   Compiling backon v1.6.0
+   Compiling dashmap v6.1.0
+   Compiling idna v0.5.0
+   Compiling matchers v0.2.0
+   Compiling sharded-slab v0.1.7
+   Compiling combine v4.6.7
+   Compiling hostname v0.4.1
+   Compiling itertools v0.13.0
+   Compiling email-encoding v0.4.1
+   Compiling tracing-serde v0.2.0
+   Compiling nu-ansi-term v0.50.3
+   Compiling tracing-log v0.2.0
+   Compiling spinning_top v0.3.0
+   Compiling nom v8.0.0
+   Compiling thread_local v1.1.9
+   Compiling http-range-header v0.4.2
+   Compiling urlencoding v2.1.3
+   Compiling futures-timer v3.0.3
+   Compiling no-std-compat v0.4.1
+   Compiling email_address v0.2.9
+   Compiling base64 v0.21.7
+   Compiling arc-swap v1.7.1
+   Compiling quoted_printable v0.5.1
+   Compiling unicode-segmentation v1.12.0
+   Compiling nonzero_ext v0.3.0
+   Compiling sha1_smol v1.0.1
+   Compiling governor v0.7.0
+   Compiling lettre v0.11.19
+   Compiling redis v0.27.6
+   Compiling atproto v0.1.0 (F:\locus\Aurora-Locus\Rust-Atproto-SDK)
+   Compiling tower-http v0.5.2
+   Compiling tracing-subscriber v0.3.20
+   Compiling validator v0.18.1
+   Compiling sqlx v0.8.6
+   Compiling axum-extra v0.9.6
+warning: unused variable: `description`
+   --> Rust-Atproto-SDK\src\oauth\client.rs:295:57
+    |
+295 |         if let Err(OAuthError::ServerError { ref error, ref description }) = result {
+    |                                                         ^^^^^^^^^^^^^^^ help: try ignoring the field: `description: _`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+   Compiling image v0.25.8
+   Compiling k256 v0.13.4
+   Compiling tower v0.4.13
+   Compiling dotenv v0.15.0
+   Compiling base32 v0.5.1
+   Compiling bs58 v0.5.1
+warning: `atproto` (lib) generated 1 warning
+   Compiling aurora-locus v0.1.0 (F:\locus\Aurora-Locus)
+warning: unused imports: `ModerationAction` and `ModerationRecord`
+  --> src\admin\mod.rs:13:22
+   |
+13 | pub use moderation::{ModerationAction, ModerationManager, ModerationRecord};
+   |                      ^^^^^^^^^^^^^^^^                     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `Label`
+  --> src\admin\mod.rs:14:18
+   |
+14 | pub use labels::{Label, LabelManager};
+   |                  ^^^^^
+
+warning: unused imports: `ReportReason`, `ReportStatus`, and `Report`
+  --> src\admin\mod.rs:16:19
+   |
+16 | pub use reports::{Report, ReportManager, ReportReason, ReportStatus};
+   |                   ^^^^^^                 ^^^^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused imports: `PdsError` and `PdsResult`
+  --> src\api\firehose.rs:44:13
+   |
+44 |     error::{PdsError, PdsResult},
+   |             ^^^^^^^^  ^^^^^^^^^
+
+warning: unused import: `DateTime`
+  --> src\api\labels.rs:12:14
+   |
+12 | use chrono::{DateTime, Utc};
+   |              ^^^^^^^^
+
+warning: unused import: `error`
+  --> src\api\middleware.rs:15:15
+   |
+15 | use tracing::{error, info, warn};
+   |               ^^^^^
+
+warning: unused imports: `PdsError` and `PdsResult`
+ --> src\api\oauth_admin.rs:2:21
+  |
+2 | use crate::{error::{PdsError, PdsResult}, AppContext};
+  |                     ^^^^^^^^  ^^^^^^^^^
+
+warning: unused imports: `HeaderMap` and `IntoResponse`
+ --> src\api\oauth_admin.rs:6:12
+  |
+6 |     http::{HeaderMap, StatusCode},
+  |            ^^^^^^^^^
+7 |     response::{IntoResponse, Redirect},
+  |                ^^^^^^^^^^^^
+
+warning: unused import: `PdsError`
+ --> src\api\well_known.rs:6:13
+  |
+6 |     error::{PdsError, PdsResult},
+  |             ^^^^^^^^
+
+warning: unused import: `std::time::Duration`
+  --> src\cache\mod.rs:14:5
+   |
+14 | use std::time::Duration;
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src\federation\relay.rs:12:5
+   |
+12 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused import: `authentication::FederationAuthenticator`
+  --> src\federation\mod.rs:14:9
+   |
+14 | pub use authentication::FederationAuthenticator;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PdsDiscovery`
+  --> src\federation\mod.rs:15:21
+   |
+15 | pub use discovery::{PdsDiscovery, PdsInstance};
+   |                     ^^^^^^^^^^^^
+
+warning: unused import: `search::FederatedSearch`
+  --> src\federation\mod.rs:17:9
+   |
+17 | pub use search::FederatedSearch;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CounterVec` and `register_counter_vec`
+  --> src\metrics.rs:12:5
+   |
+12 |     register_counter_vec, register_gauge, register_histogram_vec, register_int_counter_vec,
+   |     ^^^^^^^^^^^^^^^^^^^^
+13 |     register_int_gauge, CounterVec, Gauge, HistogramVec, IntCounterVec, IntGauge, TextEncoder,
+   |                         ^^^^^^^^^^
+
+warning: unused import: `crate::error::PdsResult`
+  --> src\sequencer\mod.rs:12:5
+   |
+12 | use crate::error::PdsResult;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `IntoResponse`
+  --> src\server.rs:12:16
+   |
+12 |     response::{IntoResponse, Json, Response},
+   |                ^^^^^^^^^^^^
+
+warning: unused import: `Utc`
+ --> src\validation\mod.rs:5:24
+  |
+5 | use chrono::{DateTime, Utc};
+  |                        ^^^
+
+warning: unused variable: `root_cid_str`
+   --> src\actor_store\repository.rs:111:17
+    |
+111 |             let root_cid_str = &repo_root.cid;
+    |                 ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_root_cid_str`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `since`
+   --> src\actor_store\repository.rs:487:36
+    |
+487 |     pub async fn export_car(&self, since: Option<&str>) -> PdsResult<Vec<u8>> {
+    |                                    ^^^^^ help: if this is intentional, prefix it with an underscore: `_since`
+
+warning: unused variable: `pool`
+   --> src\actor_store\store.rs:409:13
+    |
+409 |         let pool = self.open_db(did).await?;
+    |             ^^^^ help: if this is intentional, prefix it with an underscore: `_pool`
+
+warning: this function depends on never type fallback being `()`
+   --> src\cache\mod.rs:159:5
+    |
+159 | /     pub async fn set<T: Serialize>(
+160 | |         &self,
+161 | |         category: &str,
+162 | |         key: &str,
+163 | |         value: &T,
+164 | |         ttl_secs: Option<u64>,
+165 | |     ) -> PdsResult<()> {
+    | |______________________^
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in Rust 2024 and in a future release in all editions!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/never-type-fallback.html>
+    = help: specify the types explicitly
+note: in edition 2024, the requirement `!: FromRedisValue` will fail
+   --> src\cache\mod.rs:177:14
+    |
+177 |         conn.set_ex(&cache_key, json, ttl)
+    |              ^^^^^^
+    = note: `#[warn(dependency_on_unit_never_type_fallback)]` on by default
+help: use `()` annotations to avoid fallback changes
+    |
+177 |         conn.set_ex::<_, _, ()>(&cache_key, json, ttl)
+    |                    ++++++++++++
+
+warning: this function depends on never type fallback being `()`
+   --> src\cache\mod.rs:189:5
+    |
+189 |     pub async fn delete(&self, category: &str, key: &str) -> PdsResult<()> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in Rust 2024 and in a future release in all editions!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/never-type-fallback.html>
+    = help: specify the types explicitly
+note: in edition 2024, the requirement `!: FromRedisValue` will fail
+   --> src\cache\mod.rs:195:14
+    |
+195 |         conn.del(&cache_key).await.map_err(|e| {
+    |              ^^^
+help: use `()` annotations to avoid fallback changes
+    |
+195 |         conn.del::<_, ()>(&cache_key).await.map_err(|e| {
+    |                 +++++++++
+
+warning: this function depends on never type fallback being `()`
+   --> src\cache\mod.rs:215:5
+    |
+215 |     pub async fn increment(&self, category: &str, key: &str, ttl_secs: u64) -> PdsResult<i64> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in Rust 2024 and in a future release in all editions!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/never-type-fallback.html>
+    = help: specify the types explicitly
+note: in edition 2024, the requirement `!: FromRedisValue` will fail
+   --> src\cache\mod.rs:230:18
+    |
+230 |             conn.expire(&cache_key, ttl_secs as i64)
+    |                  ^^^^^^
+help: use `()` annotations to avoid fallback changes
+    |
+230 |             conn.expire::<_, ()>(&cache_key, ttl_secs as i64)
+    |                        +++++++++
+
+warning: unused variable: `connection_string`
+  --> src\db\mod.rs:37:9
+   |
+37 |     let connection_string = format!(
+   |         ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_connection_string`
+
+warning: unused variable: `port_str`
+  --> src\mailer\mod.rs:40:32
+   |
+40 |                     let (host, port_str) = if let Some((h, p)) = host_part.split_once(':') {
+   |                                ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_port_str`
+
+warning: methods `is_account_pending_deletion` and `cancel_account_deletion` are never used
+   --> src\account\manager.rs:911:18
+    |
+ 22 | impl AccountManager {
+    | ------------------- methods in this implementation
+...
+911 |     pub async fn is_account_pending_deletion(&self, did: &str) -> PdsResult<bool> {
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+924 |     pub async fn cancel_account_deletion(&self, did: &str) -> PdsResult<()> {
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: field `key_location` is never read
+  --> src\actor_store\mod.rs:52:9
+   |
+49 | pub struct ActorLocation {
+   |            ------------- field in this struct
+...
+52 |     pub key_location: PathBuf,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `ActorLocation` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: struct `RepoBlock` is never constructed
+  --> src\actor_store\models.rs:17:12
+   |
+17 | pub struct RepoBlock {
+   |            ^^^^^^^^^
+
+warning: struct `Blob` is never constructed
+  --> src\actor_store\models.rs:38:12
+   |
+38 | pub struct Blob {
+   |            ^^^^
+
+warning: struct `RecordBlob` is never constructed
+  --> src\actor_store\models.rs:51:12
+   |
+51 | pub struct RecordBlob {
+   |            ^^^^^^^^^^
+
+warning: struct `Backlink` is never constructed
+  --> src\actor_store\models.rs:58:12
+   |
+58 | pub struct Backlink {
+   |            ^^^^^^^^
+
+warning: struct `AccountPref` is never constructed
+  --> src\actor_store\models.rs:66:12
+   |
+66 | pub struct AccountPref {
+   |            ^^^^^^^^^^^
+
+warning: struct `CommitData` is never constructed
+  --> src\actor_store\models.rs:74:12
+   |
+74 | pub struct CommitData {
+   |            ^^^^^^^^^^
+
+warning: method `export_car` is never used
+   --> src\actor_store\repository.rs:487:18
+    |
+ 56 | impl RepositoryManager {
+    | ---------------------- method in this implementation
+...
+487 |     pub async fn export_car(&self, since: Option<&str>) -> PdsResult<Vec<u8>> {
+    |                  ^^^^^^^^^^
+
+warning: methods `count_records` and `destroy` are never used
+   --> src\actor_store\store.rs:349:18
+    |
+ 36 | impl ActorStore {
+    | --------------- methods in this implementation
+...
+349 |     pub async fn count_records(&self, did: &str, collection: &str) -> PdsResult<i64> {
+    |                  ^^^^^^^^^^^^^
+...
+450 |     pub async fn destroy(&self, did: &str) -> PdsResult<()> {
+    |                  ^^^^^^^
+
+warning: struct `AuditLogEntry` is never constructed
+  --> src\admin\mod.rs:23:12
+   |
+23 | pub struct AuditLogEntry {
+   |            ^^^^^^^^^^^^^
+
+warning: method `can_act_as` is never used
+  --> src\admin\roles.rs:38:12
+   |
+19 | impl Role {
+   | --------- method in this implementation
+...
+38 |     pub fn can_act_as(&self, required: Role) -> bool {
+   |            ^^^^^^^^^^
+
+warning: method `has_role` is never used
+   --> src\admin\roles.rs:197:18
+    |
+ 63 | impl AdminRoleManager {
+    | --------------------- method in this implementation
+...
+197 |     pub async fn has_role(&self, did: &str, required_role: Role) -> PdsResult<bool> {
+    |                  ^^^^^^^^
+
+warning: method `get_code` is never used
+   --> src\admin\invites.rs:201:18
+    |
+ 48 | impl InviteCodeManager {
+    | ---------------------- method in this implementation
+...
+201 |     pub async fn get_code(&self, code: &str) -> PdsResult<Option<InviteCode>> {
+    |                  ^^^^^^^^
+
+warning: method `get_report` is never used
+   --> src\admin\reports.rs:190:18
+    |
+ 98 | impl ReportManager {
+    | ------------------ method in this implementation
+...
+190 |     pub async fn get_report(&self, report_id: i64) -> PdsResult<Option<Report>> {
+    |                  ^^^^^^^^^^
+
+warning: fields `limit` and `cursor` are never read
+   --> src\api\admin.rs:116:5
+    |
+114 | struct ListInviteCodesQuery {
+    |        -------------------- fields in this struct
+115 |     #[serde(default)]
+116 |     limit: Option<i64>,
+    |     ^^^^^
+117 |     #[serde(default)]
+118 |     cursor: Option<String>,
+    |     ^^^^^^
+    |
+    = note: `ListInviteCodesQuery` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `cursor` is never read
+  --> src\api\labels.rs:27:9
+   |
+18 | pub struct QueryLabelsParams {
+   |            ----------------- field in this struct
+...
+27 |     pub cursor: Option<String>,
+   |         ^^^^^^
+   |
+   = note: `QueryLabelsParams` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `authenticate` is never used
+  --> src\api\middleware.rs:32:14
+   |
+32 | pub async fn authenticate(
+   |              ^^^^^^^^^^^^
+
+warning: struct `RequestId` is never constructed
+   --> src\api\middleware.rs:168:12
+    |
+168 | pub struct RequestId(pub String);
+    |            ^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> src\api\middleware.rs:171:12
+    |
+170 | impl RequestId {
+    | -------------- associated function in this implementation
+171 |     pub fn new() -> Self {
+    |            ^^^
+
+warning: function `request_logging` is never used
+   --> src\api\middleware.rs:191:14
+    |
+191 | pub async fn request_logging(
+    |              ^^^^^^^^^^^^^^^
+
+warning: function `should_log_request` is never used
+   --> src\api\middleware.rs:250:4
+    |
+250 | fn should_log_request(path: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `log_db_query` is never used
+   --> src\api\middleware.rs:273:14
+    |
+273 | pub async fn log_db_query<T, F>(
+    |              ^^^^^^^^^^^^
+
+warning: field `handle` is never read
+  --> src\api\oauth_admin.rs:45:9
+   |
+43 | pub struct OAuthStateData {
+   |            -------------- field in this struct
+44 |     pub code_verifier: String,
+45 |     pub handle: Option<String>,
+   |         ^^^^^^
+   |
+   = note: `OAuthStateData` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: struct `OAuthLoginResponse` is never constructed
+   --> src\api\oauth_admin.rs:177:8
+    |
+177 | struct OAuthLoginResponse {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: field `swap_commit` is never read
+  --> src\api\repo.rs:40:5
+   |
+31 | struct CreateRecordRequest {
+   |        ------------------- field in this struct
+...
+40 |     swap_commit: Option<String>,
+   |     ^^^^^^^^^^^
+   |
+   = note: `CreateRecordRequest` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `swap_record` and `swap_commit` are never read
+  --> src\api\repo.rs:62:5
+   |
+54 | struct PutRecordRequest {
+   |        ---------------- fields in this struct
+...
+62 |     swap_record: Option<String>,
+   |     ^^^^^^^^^^^
+63 |     #[serde(skip_serializing_if = "Option::is_none")]
+64 |     swap_commit: Option<String>,
+   |     ^^^^^^^^^^^
+   |
+   = note: `PutRecordRequest` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `swap_record` and `swap_commit` are never read
+  --> src\api\repo.rs:83:5
+   |
+78 | struct DeleteRecordRequest {
+   |        ------------------- fields in this struct
+...
+83 |     swap_record: Option<String>,
+   |     ^^^^^^^^^^^
+84 |     #[serde(skip_serializing_if = "Option::is_none")]
+85 |     swap_commit: Option<String>,
+   |     ^^^^^^^^^^^
+   |
+   = note: `DeleteRecordRequest` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `cid` is never read
+  --> src\api\repo.rs:96:5
+   |
+91 | struct GetRecordQuery {
+   |        -------------- field in this struct
+...
+96 |     cid: Option<String>,
+   |     ^^^
+   |
+   = note: `GetRecordQuery` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `reverse` is never read
+   --> src\api\repo.rs:121:5
+    |
+113 | struct ListRecordsQuery {
+    |        ---------------- field in this struct
+...
+121 |     reverse: Option<bool>,
+    |     ^^^^^^^
+    |
+    = note: `ListRecordsQuery` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `validate` and `swap_commit` are never read
+   --> src\api\repo.rs:172:5
+    |
+169 | struct ApplyWritesRequest {
+    |        ------------------ fields in this struct
+...
+172 |     validate: Option<bool>,
+    |     ^^^^^^^^
+...
+175 |     swap_commit: Option<String>,
+    |     ^^^^^^^^^^^
+    |
+    = note: `ApplyWritesRequest` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `since` is never read
+  --> src\api\sync.rs:28:9
+   |
+24 | pub struct GetRepoParams {
+   |            ------------- field in this struct
+...
+28 |     pub since: Option<String>,
+   |         ^^^^^
+   |
+   = note: `GetRepoParams` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `session` is never read
+  --> src\auth.rs:20:9
+   |
+18 | pub struct AuthContext {
+   |            ----------- field in this struct
+19 |     pub did: String,
+20 |     pub session: ValidatedSession,
+   |         ^^^^^^^
+   |
+   = note: `AuthContext` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: struct `OptionalAuthContext` is never constructed
+  --> src\auth.rs:49:12
+   |
+49 | pub struct OptionalAuthContext {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: fields `session` and `role` are never read
+  --> src\auth.rs:85:9
+   |
+83 | pub struct AdminAuthContext {
+   |            ---------------- fields in this struct
+84 |     pub did: String,
+85 |     pub session: ValidatedSession,
+   |         ^^^^^^^
+86 |     pub role: Role,
+   |         ^^^^
+   |
+   = note: `AdminAuthContext` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `verify_admin_token` is never used
+   --> src\auth.rs:215:8
+    |
+215 | pub fn verify_admin_token(token: &str, jwt_secret: &str) -> Result<(), PdsError> {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: struct `BackupConfig` is never constructed
+  --> src\backup\mod.rs:12:12
+   |
+12 | pub struct BackupConfig {
+   |            ^^^^^^^^^^^^
+
+warning: associated function `from_env` is never used
+  --> src\backup\mod.rs:47:12
+   |
+45 | impl BackupConfig {
+   | ----------------- associated function in this implementation
+46 |     /// Load from environment variables
+47 |     pub fn from_env() -> Self {
+   |            ^^^^^^^^
+
+warning: struct `BackupScheduler` is never constructed
+  --> src\backup\mod.rs:74:12
+   |
+74 | pub struct BackupScheduler {
+   |            ^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `start`, `run_backup`, `last_backup_time`, and `is_backup_due` are never used
+   --> src\backup\mod.rs:81:12
+    |
+ 79 | impl BackupScheduler {
+    | -------------------- associated items in this implementation
+ 80 |     /// Create a new backup scheduler
+ 81 |     pub fn new(config: BackupConfig) -> Self {
+    |            ^^^
+...
+ 89 |     pub async fn start(mut self) -> PdsResult<()> {
+    |                  ^^^^^
+...
+120 |     pub async fn run_backup(&self) -> PdsResult<PathBuf> {
+    |                  ^^^^^^^^^^
+...
+180 |     pub fn last_backup_time(&self) -> Option<DateTime<Utc>> {
+    |            ^^^^^^^^^^^^^^^^
+...
+185 |     pub fn is_backup_due(&self) -> bool {
+    |            ^^^^^^^^^^^^^
+
+warning: struct `BackupMetadata` is never constructed
+   --> src\backup\mod.rs:203:12
+    |
+203 | pub struct BackupMetadata {
+    |            ^^^^^^^^^^^^^^
+
+warning: function `list_backups` is never used
+   --> src\backup\mod.rs:212:8
+    |
+212 | pub fn list_backups(backup_dir: &Path) -> PdsResult<Vec<BackupMetadata>> {
+    |        ^^^^^^^^^^^^
+
+warning: function `get_dir_size` is never used
+   --> src\backup\mod.rs:272:4
+    |
+272 | fn get_dir_size(path: &Path) -> Result<u64, std::io::Error> {
+    |    ^^^^^^^^^^^^
+
+warning: function `cleanup_old_backups` is never used
+   --> src\backup\mod.rs:287:8
+    |
+287 | pub fn cleanup_old_backups(backup_dir: &Path, retain_days: u32) -> PdsResult<usize> {
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `put`, `exists`, and `size` are never used
+  --> src\blob_store\mod.rs:26:14
+   |
+24 | pub trait BlobBackend: Send + Sync {
+   |           ----------- methods in this trait
+25 |     /// Store a blob and return its CID
+26 |     async fn put(&self, cid: &str, data: Vec<u8>, mime_type: &str) -> PdsResult<()>;
+   |              ^^^
+...
+35 |     async fn exists(&self, cid: &str) -> PdsResult<bool>;
+   |              ^^^^^^
+...
+38 |     async fn size(&self, cid: &str) -> PdsResult<Option<u64>>;
+   |              ^^^^
+
+warning: method `ensure_blob_dir` is never used
+  --> src\blob_store\disk.rs:39:14
+   |
+19 | impl DiskBlobBackend {
+   | -------------------- method in this implementation
+...
+39 |     async fn ensure_blob_dir(&self, cid: &str) -> PdsResult<PathBuf> {
+   |              ^^^^^^^^^^^^^^^
+
+warning: associated items `generate_thumbnail`, `commit_blob`, `upload`, `store_metadata`, `store_metadata_full`, and `get_temp_blob_metadata` are never used
+   --> src\blob_store\store.rs:73:8
+    |
+ 37 | impl BlobStore {
+    | -------------- associated items in this implementation
+...
+ 73 |     fn generate_thumbnail(data: &[u8], mime_type: &str, max_size: u32) -> Option<Vec<u8>> {
+    |        ^^^^^^^^^^^^^^^^^^
+...
+170 |     pub async fn commit_blob(&self, cid: &str) -> PdsResult<()> {
+    |                  ^^^^^^^^^^^
+...
+249 |     pub async fn upload(&self, data: Vec<u8>, mime_type: Option<&str>, creator_did: &str) -> PdsResult<BlobRef> {
+    |                  ^^^^^^
+...
+381 |     async fn store_metadata(&self, cid: &str, mime_type: &str, size: i64, creator_did: &str) -> PdsResult<()> {
+    |              ^^^^^^^^^^^^^^
+...
+402 |     async fn store_metadata_full(
+    |              ^^^^^^^^^^^^^^^^^^^
+...
+468 |     async fn get_temp_blob_metadata(&self, cid: &str) -> PdsResult<Option<TempBlob>> {
+    |              ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `CacheConfig` is never constructed
+  --> src\cache\mod.rs:19:12
+   |
+19 | pub struct CacheConfig {
+   |            ^^^^^^^^^^^
+
+warning: associated function `from_env` is never used
+  --> src\cache\mod.rs:58:12
+   |
+56 | impl CacheConfig {
+   | ---------------- associated function in this implementation
+57 |     /// Load from environment variables
+58 |     pub fn from_env() -> Self {
+   |            ^^^^^^^^
+
+warning: struct `CacheClient` is never constructed
+  --> src\cache\mod.rs:90:12
+   |
+90 | pub struct CacheClient {
+   |            ^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src\cache\mod.rs:97:18
+    |
+ 95 | impl CacheClient {
+    | ---------------- associated items in this implementation
+ 96 |     /// Create a new cache client
+ 97 |     pub async fn new(config: CacheConfig) -> PdsResult<Self> {
+    |                  ^^^
+...
+122 |     fn build_key(&self, category: &str, key: &str) -> String {
+    |        ^^^^^^^^^
+...
+127 |     pub async fn get<T: DeserializeOwned>(&self, category: &str, key: &str) -> PdsResult<Option<T>> {
+    |                  ^^^
+...
+159 |     pub async fn set<T: Serialize>(
+    |                  ^^^
+...
+189 |     pub async fn delete(&self, category: &str, key: &str) -> PdsResult<()> {
+    |                  ^^^^^^
+...
+204 |     pub async fn exists(&self, category: &str, key: &str) -> PdsResult<bool> {
+    |                  ^^^^^^
+...
+215 |     pub async fn increment(&self, category: &str, key: &str, ttl_secs: u64) -> PdsResult<i64> {
+    |                  ^^^^^^^^^
+...
+242 |     pub async fn ttl(&self, category: &str, key: &str) -> PdsResult<i64> {
+    |                  ^^^
+...
+253 |     pub async fn flush_pattern(&self, pattern: &str) -> PdsResult<u64> {
+    |                  ^^^^^^^^^^^^^
+...
+281 |     pub async fn ping(&self) -> PdsResult<()> {
+    |                  ^^^^
+...
+298 |     pub async fn stats(&self) -> PdsResult<CacheStats> {
+    |                  ^^^^^
+
+warning: struct `CacheStats` is never constructed
+   --> src\cache\mod.rs:336:12
+    |
+336 | pub struct CacheStats {
+    |            ^^^^^^^^^^
+
+warning: constant `DID_DOC` is never used
+   --> src\cache\mod.rs:344:15
+    |
+344 |     pub const DID_DOC: &str = "did:doc:";
+    |               ^^^^^^^
+
+warning: constant `HANDLE` is never used
+   --> src\cache\mod.rs:345:15
+    |
+345 |     pub const HANDLE: &str = "did:handle:";
+    |               ^^^^^^
+
+warning: constant `SESSION` is never used
+   --> src\cache\mod.rs:346:15
+    |
+346 |     pub const SESSION: &str = "session:";
+    |               ^^^^^^^
+
+warning: constant `RATE_LIMIT` is never used
+   --> src\cache\mod.rs:347:15
+    |
+347 |     pub const RATE_LIMIT: &str = "ratelimit:";
+    |               ^^^^^^^^^^
+
+warning: constant `REPO_META` is never used
+   --> src\cache\mod.rs:348:15
+    |
+348 |     pub const REPO_META: &str = "repo:meta:";
+    |               ^^^^^^^^^
+
+warning: field `relay_client` is never read
+  --> src\context.rs:39:9
+   |
+23 | pub struct AppContext {
+   |            ---------- field in this struct
+...
+39 |     pub relay_client: Option<Arc<tokio::sync::Mutex<RelayClient>>>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `AppContext` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: field `max_connections` is never read
+  --> src\db\mod.rs:16:9
+   |
+15 | pub struct DatabaseOptions {
+   |            --------------- field in this struct
+16 |     pub max_connections: u32,
+   |         ^^^^^^^^^^^^^^^
+   |
+   = note: `DatabaseOptions` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `run_migrations` is never used
+  --> src\db\mod.rs:62:14
+   |
+62 | pub async fn run_migrations(pool: &SqlitePool) -> PdsResult<()> {
+   |              ^^^^^^^^^^^^^^
+
+warning: struct `RefreshToken` is never constructed
+  --> src\db\account.rs:40:12
+   |
+40 | pub struct RefreshToken {
+   |            ^^^^^^^^^^^^
+
+warning: struct `EmailToken` is never constructed
+  --> src\db\account.rs:52:12
+   |
+52 | pub struct EmailToken {
+   |            ^^^^^^^^^^
+
+warning: struct `InviteCode` is never constructed
+  --> src\db\account.rs:63:12
+   |
+63 | pub struct InviteCode {
+   |            ^^^^^^^^^^
+
+warning: struct `InviteCodeUse` is never constructed
+  --> src\db\account.rs:74:12
+   |
+74 | pub struct InviteCodeUse {
+   |            ^^^^^^^^^^^^^
+
+warning: struct `AppPassword` is never constructed
+  --> src\db\account.rs:82:12
+   |
+82 | pub struct AppPassword {
+   |            ^^^^^^^^^^^
+
+warning: struct `PostgresConfig` is never constructed
+  --> src\db\postgres.rs:12:12
+   |
+12 | pub struct PostgresConfig {
+   |            ^^^^^^^^^^^^^^
+
+warning: associated function `from_env` is never used
+  --> src\db\postgres.rs:48:12
+   |
+46 | impl PostgresConfig {
+   | ------------------- associated function in this implementation
+47 |     /// Load from environment variables
+48 |     pub fn from_env() -> PdsResult<Self> {
+   |            ^^^^^^^^
+
+warning: function `create_pool` is never used
+  --> src\db\postgres.rs:82:14
+   |
+82 | pub async fn create_pool(config: PostgresConfig) -> PdsResult<PgPool> {
+   |              ^^^^^^^^^^^
+
+warning: function `run_migrations` is never used
+   --> src\db\postgres.rs:106:14
+    |
+106 | pub async fn run_migrations(pool: &PgPool) -> PdsResult<()> {
+    |              ^^^^^^^^^^^^^^
+
+warning: variants `Repository`, `DidResolution`, and `AtProto` are never constructed
+  --> src\error.rs:31:5
+   |
+12 | pub enum PdsError {
+   |          -------- variants in this enum
+...
+31 |     Repository(String),
+   |     ^^^^^^^^^^
+...
+39 |     DidResolution(String),
+   |     ^^^^^^^^^^^^^
+...
+63 |     AtProto(String),
+   |     ^^^^^^^
+   |
+   = note: `PdsError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: struct `FederationConfig` is never constructed
+  --> src\federation\mod.rs:23:12
+   |
+23 | pub struct FederationConfig {
+   |            ^^^^^^^^^^^^^^^^
+
+warning: associated function `from_env` is never used
+  --> src\federation\mod.rs:66:12
+   |
+64 | impl FederationConfig {
+   | --------------------- associated function in this implementation
+65 |     /// Load from environment variables
+66 |     pub fn from_env() -> Self {
+   |            ^^^^^^^^
+
+warning: struct `FederationAuthenticator` is never constructed
+  --> src\federation\authentication.rs:16:12
+   |
+16 | pub struct FederationAuthenticator {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `verify_remote_token`, `extract_pds_endpoint`, `verify_token_with_pds`, `fetch_remote_profile`, and `is_trusted_pds` are never used
+   --> src\federation\authentication.rs:24:12
+    |
+ 22 | impl FederationAuthenticator {
+    | ---------------------------- associated items in this implementation
+ 23 |     /// Create a new federation authenticator
+ 24 |     pub fn new(identity_resolver: Arc<IdentityResolver>) -> Self {
+    |            ^^^
+...
+ 39 |     pub async fn verify_remote_token(&self, did: &str, token: &str) -> PdsResult<RemoteUser> {
+    |                  ^^^^^^^^^^^^^^^^^^^
+...
+ 68 |     fn extract_pds_endpoint(&self, did_doc: &DidDocument) -> Option<String> {
+    |        ^^^^^^^^^^^^^^^^^^^^
+...
+ 86 |     async fn verify_token_with_pds(
+    |              ^^^^^^^^^^^^^^^^^^^^^
+...
+142 |     pub async fn fetch_remote_profile(&self, did: &str) -> PdsResult<RemoteProfile> {
+    |                  ^^^^^^^^^^^^^^^^^^^^
+...
+177 |     pub async fn is_trusted_pds(&self, did: &str, trusted_instances: &[String]) -> PdsResult<bool> {
+    |                  ^^^^^^^^^^^^^^
+
+warning: struct `RemoteUser` is never constructed
+   --> src\federation\authentication.rs:193:12
+    |
+193 | pub struct RemoteUser {
+    |            ^^^^^^^^^^
+
+warning: struct `SessionResponse` is never constructed
+   --> src\federation\authentication.rs:202:8
+    |
+202 | struct SessionResponse {
+    |        ^^^^^^^^^^^^^^^
+
+warning: struct `RemoteProfile` is never constructed
+   --> src\federation\authentication.rs:211:12
+    |
+211 | pub struct RemoteProfile {
+    |            ^^^^^^^^^^^^^
+
+warning: struct `PdsInstance` is never constructed
+  --> src\federation\discovery.rs:19:12
+   |
+19 | pub struct PdsInstance {
+   |            ^^^^^^^^^^^
+
+warning: struct `PdsDiscovery` is never constructed
+  --> src\federation\discovery.rs:43:12
+   |
+43 | pub struct PdsDiscovery {
+   |            ^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src\federation\discovery.rs:51:12
+    |
+ 49 | impl PdsDiscovery {
+    | ----------------- associated items in this implementation
+ 50 |     /// Create a new PDS discovery service
+ 51 |     pub fn new(relay_servers: Vec<String>) -> Self {
+    |            ^^^
+...
+ 63 |     pub async fn discover_from_relays(&self) -> PdsResult<Vec<PdsInstance>> {
+    |                  ^^^^^^^^^^^^^^^^^^^^
+...
+ 92 |     async fn fetch_instances_from_relay(&self, relay_url: &str) -> PdsResult<Vec<PdsInstance>> {
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+136 |     pub async fn discover_via_wellknown(&self, domain: &str) -> PdsResult<PdsInstance> {
+    |                  ^^^^^^^^^^^^^^^^^^^^^^
+...
+155 |     async fn fetch_pds_info(&self, pds_url: &str, did: &str) -> PdsResult<PdsInstance> {
+    |              ^^^^^^^^^^^^^^
+...
+178 |     pub async fn get_known_instances(&self) -> Vec<PdsInstance> {
+    |                  ^^^^^^^^^^^^^^^^^^^
+...
+184 |     pub async fn add_instance(&self, instance: PdsInstance) {
+    |                  ^^^^^^^^^^^^
+...
+190 |     pub async fn find_by_did(&self, did: &str) -> Option<PdsInstance> {
+    |                  ^^^^^^^^^^^
+...
+196 |     pub async fn find_open_instances(&self) -> Vec<PdsInstance> {
+    |                  ^^^^^^^^^^^^^^^^^^^
+...
+206 |     pub async fn refresh_instances(&self) -> PdsResult<()> {
+    |                  ^^^^^^^^^^^^^^^^^
+
+warning: struct `RelayResponse` is never constructed
+   --> src\federation\discovery.rs:230:8
+    |
+230 | struct RelayResponse {
+    |        ^^^^^^^^^^^^^
+
+warning: struct `RepoEntry` is never constructed
+   --> src\federation\discovery.rs:237:8
+    |
+237 | struct RepoEntry {
+    |        ^^^^^^^^^
+
+warning: struct `ServerDescription` is never constructed
+   --> src\federation\discovery.rs:243:8
+    |
+243 | struct ServerDescription {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: field `event_sender` is never read
+  --> src\federation\relay.rs:49:5
+   |
+46 | pub struct RelayClient {
+   |            ----------- field in this struct
+...
+49 |     event_sender: Option<mpsc::Sender<RelayEvent>>,
+   |     ^^^^^^^^^^^^
+
+warning: associated items `subscribe_firehose`, `connect_to_relay`, `parse_relay_event`, and `fetch_repo` are never used
+   --> src\federation\relay.rs:66:18
+    |
+ 52 | impl RelayClient {
+    | ---------------- associated items in this implementation
+...
+ 66 |     pub async fn subscribe_firehose(&mut self) -> PdsResult<mpsc::Receiver<RelayEvent>> {
+    |                  ^^^^^^^^^^^^^^^^^^
+...
+ 86 |     async fn connect_to_relay(relay_url: String, tx: mpsc::Sender<RelayEvent>, reconnect_interval: u64) {
+    |              ^^^^^^^^^^^^^^^^
+...
+150 |     fn parse_relay_event(data: &[u8]) -> PdsResult<RelayEvent> {
+    |        ^^^^^^^^^^^^^^^^^
+...
+196 |     pub async fn fetch_repo(&self, did: &str) -> PdsResult<Vec<u8>> {
+    |                  ^^^^^^^^^^
+
+warning: struct `RelayStats` is never constructed
+   --> src\federation\relay.rs:234:12
+    |
+234 | pub struct RelayStats {
+    |            ^^^^^^^^^^
+
+warning: struct `FederatedSearch` is never constructed
+  --> src\federation\search.rs:14:12
+   |
+14 | pub struct FederatedSearch {
+   |            ^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src\federation\search.rs:23:12
+    |
+ 21 | impl FederatedSearch {
+    | -------------------- associated items in this implementation
+ 22 |     /// Create a new federated search client
+ 23 |     pub fn new(discovery: Arc<PdsDiscovery>, max_concurrent: usize, timeout_secs: u64) -> Self {
+    |            ^^^
+...
+ 36 |     pub async fn search_actors(&self, query: &str, limit: usize) -> PdsResult<Vec<ActorResult>> {
+    |                  ^^^^^^^^^^^^^
+...
+ 75 |     pub async fn search_posts(&self, query: &str, limit: usize) -> PdsResult<Vec<PostResult>> {
+    |                  ^^^^^^^^^^^^
+...
+112 |     async fn search_actors_on_instance(
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+141 |     async fn search_posts_on_instance(
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+170 |     pub async fn aggregate_timeline(&self, dids: Vec<String>, limit: usize) -> PdsResult<Vec<PostResult>> {
+    |                  ^^^^^^^^^^^^^^^^^^
+...
+206 |     async fn fetch_author_feed(
+    |              ^^^^^^^^^^^^^^^^^
+
+warning: struct `ActorSearchResponse` is never constructed
+   --> src\federation\search.rs:239:8
+    |
+239 | struct ActorSearchResponse {
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ActorResult` is never constructed
+   --> src\federation\search.rs:245:12
+    |
+245 | pub struct ActorResult {
+    |            ^^^^^^^^^^^
+
+warning: struct `PostSearchResponse` is never constructed
+   --> src\federation\search.rs:262:8
+    |
+262 | struct PostSearchResponse {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: struct `PostResult` is never constructed
+   --> src\federation\search.rs:268:12
+    |
+268 | pub struct PostResult {
+    |            ^^^^^^^^^^
+
+warning: struct `FeedResponse` is never constructed
+   --> src\federation\search.rs:285:8
+    |
+285 | struct FeedResponse {
+    |        ^^^^^^^^^^^^
+
+warning: struct `FeedItem` is never constructed
+   --> src\federation\search.rs:290:8
+    |
+290 | struct FeedItem {
+    |        ^^^^^^^^
+
+warning: fields `did` and `updated_at` are never read
+  --> src\identity\mod.rs:18:9
+   |
+17 | pub struct CachedDidDoc {
+   |            ------------ fields in this struct
+18 |     pub did: String,
+   |         ^^^
+19 |     pub doc: String,  // JSON-encoded DID document
+20 |     pub updated_at: DateTime<Utc>,
+   |         ^^^^^^^^^^
+   |
+   = note: `CachedDidDoc` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `handle` and `declared_at` are never read
+  --> src\identity\mod.rs:27:9
+   |
+26 | pub struct CachedHandle {
+   |            ------------ fields in this struct
+27 |     pub handle: String,
+   |         ^^^^^^
+28 |     pub did: String,
+29 |     pub declared_at: Option<DateTime<Utc>>,
+   |         ^^^^^^^^^^^
+   |
+   = note: `CachedHandle` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: struct `HandleResolutionResult` is never constructed
+  --> src\identity\mod.rs:36:12
+   |
+36 | pub struct HandleResolutionResult {
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `DidDocResolutionResult` is never constructed
+  --> src\identity\mod.rs:42:12
+   |
+42 | pub struct DidDocResolutionResult {
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `with_ttls` is never used
+  --> src\identity\cache.rs:30:12
+   |
+19 | impl DidCache {
+   | ------------- method in this implementation
+...
+30 |     pub fn with_ttls(mut self, did_doc_ttl: Duration, handle_ttl: Duration) -> Self {
+   |            ^^^^^^^^^
+
+warning: field `use_doh` is never read
+  --> src\identity\resolver.rs:15:9
+   |
+11 | pub struct IdentityResolverConfig {
+   |            ---------------------- field in this struct
+...
+15 |     pub use_doh: bool,
+   |         ^^^^^^^
+   |
+   = note: `IdentityResolverConfig` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `config` is never read
+  --> src\identity\resolver.rs:33:5
+   |
+29 | pub struct IdentityResolver {
+   |            ---------------- field in this struct
+...
+33 |     config: IdentityResolverConfig,
+   |     ^^^^^^
+   |
+   = note: `IdentityResolver` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: function `record_http_request` is never used
+   --> src\metrics.rs:292:8
+    |
+292 | pub fn record_http_request(method: &str, path: &str, status: u16, duration: f64) {
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_db_query` is never used
+   --> src\metrics.rs:302:8
+    |
+302 | pub fn record_db_query(operation: &str, table: &str, duration: f64) {
+    |        ^^^^^^^^^^^^^^^
+
+warning: function `record_cache_access` is never used
+   --> src\metrics.rs:312:8
+    |
+312 | pub fn record_cache_access(cache_type: &str, hit: bool) {
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_background_job` is never used
+   --> src\metrics.rs:321:8
+    |
+321 | pub fn record_background_job(job_type: &str, status: &str, duration: f64) {
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_moderation_action` is never used
+   --> src\metrics.rs:331:8
+    |
+331 | pub fn record_moderation_action(action_type: &str, target_type: &str) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_report_created` is never used
+   --> src\metrics.rs:338:8
+    |
+338 | pub fn record_report_created(report_type: &str) {
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_report_resolved` is never used
+   --> src\metrics.rs:345:8
+    |
+345 | pub fn record_report_resolved(resolution: &str) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_repo_operation` is never used
+   --> src\metrics.rs:352:8
+    |
+352 | pub fn record_repo_operation(operation: &str, collection: &str) {
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_blob_upload` is never used
+   --> src\metrics.rs:359:8
+    |
+359 | pub fn record_blob_upload(mime_type: &str) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `record_account_creation` is never used
+   --> src\metrics.rs:364:8
+    |
+364 | pub fn record_account_creation(invite_required: bool) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_sequencer_event` is never used
+   --> src\metrics.rs:371:8
+    |
+371 | pub fn record_sequencer_event(event_type: &str) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_identity_resolution` is never used
+   --> src\metrics.rs:378:8
+    |
+378 | pub fn record_identity_resolution(did_method: &str, success: bool) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_handle_resolution` is never used
+   --> src\metrics.rs:385:8
+    |
+385 | pub fn record_handle_resolution(success: bool) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `did` and `invalidated` are never read
+  --> src\sequencer\mod.rs:20:9
+   |
+18 | pub struct SeqRow {
+   |            ------ fields in this struct
+19 |     pub seq: i64,
+20 |     pub did: String,
+   |         ^^^
+...
+23 |     pub invalidated: bool,
+   |         ^^^^^^^^^^^
+   |
+   = note: `SeqRow` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: enum `SeqEvent` is never used
+  --> src\sequencer\mod.rs:60:10
+   |
+60 | pub enum SeqEvent {
+   |          ^^^^^^^^
+
+warning: associated function `new` is never used
+   --> src\sequencer\events.rs:102:12
+    |
+100 | impl AccountEvent {
+    | ----------------- associated function in this implementation
+101 |     /// Create a new account event
+102 |     pub fn new(did: String, active: bool, status: Option<AccountStatus>) -> Self {
+    |            ^^^
+
+warning: fields `max_query_limit` and `backfill_limit_secs` are never read
+  --> src\sequencer\sequencer.rs:20:9
+   |
+18 | pub struct SequencerConfig {
+   |            --------------- fields in this struct
+19 |     /// Maximum number of events to return in a single query
+20 |     pub max_query_limit: i64,
+   |         ^^^^^^^^^^^^^^^
+...
+23 |     pub backfill_limit_secs: i64,
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `SequencerConfig` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `config` is never read
+  --> src\sequencer\sequencer.rs:39:5
+   |
+37 | pub struct Sequencer {
+   |            --------- field in this struct
+38 |     db: SqlitePool,
+39 |     config: SequencerConfig,
+   |     ^^^^^^
+   |
+   = note: `Sequencer` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: associated items `new`, `sequence_account`, `request_seq_range`, `decode_event`, and `get_events_for_did` are never used
+   --> src\sequencer\sequencer.rs:46:12
+    |
+ 44 | impl Sequencer {
+    | -------------- associated items in this implementation
+ 45 |     /// Create a new sequencer
+ 46 |     pub fn new(db: SqlitePool, config: SequencerConfig) -> Self {
+    |            ^^^
+...
+ 94 |     pub async fn sequence_account(&self, evt: AccountEvent) -> PdsResult<i64> {
+    |                  ^^^^^^^^^^^^^^^^
+...
+169 |     pub async fn request_seq_range(
+    |                  ^^^^^^^^^^^^^^^^^
+...
+234 |     fn decode_event(&self, row: SeqRow) -> PdsResult<Option<SeqEvent>> {
+    |        ^^^^^^^^^^^^
+...
+295 |     pub async fn get_events_for_did(&self, did: &str, limit: i64) -> PdsResult<Vec<SeqEvent>> {
+    |                  ^^^^^^^^^^^^^^^^^^
+
+warning: `aurora-locus` (bin "aurora-locus") generated 146 warnings (run `cargo fix --bin "aurora-locus"` to apply 21 suggestions)
+    Finished `release` profile [optimized] target(s) in 8m 37s
+warning: the following packages contain code that will be rejected by a future version of Rust: aurora-locus v0.1.0 (F:\locus\Aurora-Locus)
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

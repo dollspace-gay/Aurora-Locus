@@ -1,30 +1,35 @@
 /// Synchronization API endpoints
 ///
 /// Implements com.atproto.sync.* endpoints for federation and repository export
+///
+/// These endpoints enable:
+/// - Repository synchronization across PDSs
+/// - External crawlers and indexers
+/// - Backup and migration
+/// - ATProto spec compliance
 
 use crate::{
-    car::CarEncoder,
+    actor_store::car,
+    api::{middleware, sync_helpers::{assert_repo_availability, get_repo_status}},
     context::AppContext,
     error::{PdsError, PdsResult},
 };
-use libipld::Cid;
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::{header, StatusCode},
-    response::Response,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 
 /// Request parameters for getRepo
 #[derive(Debug, Deserialize)]
 pub struct GetRepoParams {
     /// DID of the repository
     pub did: String,
-    /// Optional: commit CID to retrieve specific version
+    /// Optional: commit CID to retrieve specific version (incremental sync)
     pub since: Option<String>,
 }
 
@@ -52,6 +57,36 @@ pub struct GetBlocksParams {
     pub cids: Vec<String>,
 }
 
+/// Request parameters for getBlob
+#[derive(Debug, Deserialize)]
+pub struct GetBlobParams {
+    /// DID of the repository
+    pub did: String,
+    /// CID of the blob
+    pub cid: String,
+}
+
+/// Request parameters for listBlobs
+#[derive(Debug, Deserialize)]
+pub struct ListBlobsParams {
+    /// DID of the repository
+    pub did: String,
+    /// Optional: only return blobs since this timestamp
+    pub since: Option<String>,
+    /// Optional: maximum number of results (default: 100, max: 1000)
+    pub limit: Option<i64>,
+    /// Optional: cursor for pagination
+    pub cursor: Option<String>,
+}
+
+/// Response for listBlobs
+#[derive(Debug, Serialize)]
+pub struct ListBlobsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub cids: Vec<String>,
+}
+
 /// Request parameters for listRepos
 #[derive(Debug, Deserialize)]
 pub struct ListReposParams {
@@ -75,6 +110,38 @@ pub struct RepoInfo {
     pub did: String,
     pub head: String,
     pub rev: String,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// Request parameters for getRepoStatus
+#[derive(Debug, Deserialize)]
+pub struct GetRepoStatusParams {
+    /// DID of the repository
+    pub did: String,
+}
+
+/// Response for getRepoStatus
+#[derive(Debug, Serialize)]
+pub struct GetRepoStatusResponse {
+    pub did: String,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+}
+
+/// Request parameters for getRecord
+#[derive(Debug, Deserialize)]
+pub struct GetRecordParams {
+    /// DID of the repository
+    pub did: String,
+    /// Collection name
+    pub collection: String,
+    /// Record key
+    pub rkey: String,
 }
 
 /// Get a repository as a CAR file export
@@ -82,38 +149,24 @@ pub struct RepoInfo {
 /// Implements com.atproto.sync.getRepo
 pub async fn get_repo(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(params): Query<GetRepoParams>,
 ) -> PdsResult<Response> {
-    // Validate DID exists
-    if !ctx.actor_store.exists(&params.did).await {
-        return Err(PdsError::NotFound(format!(
-            "Repository not found for DID: {}",
-            params.did
-        )));
-    }
+    // Get authentication
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
+    let auth_did = auth.did();
 
-    // Get the repository root CID
-    let repo_root = ctx.actor_store.get_repo_root(&params.did).await?;
-    let root_cid = Cid::from_str(&repo_root.cid)
-        .map_err(|e| PdsError::Internal(format!("Invalid root CID: {}", e)))?;
+    // Check repository availability (admin support to be added in Phase 7)
+    let is_admin_or_self = auth_did == params.did;
+    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
 
-    // Create CAR encoder
-    let mut encoder = CarEncoder::new(&root_cid)?;
-
-    // Get all blocks for this repository
-    let block_data = ctx.actor_store.get_all_blocks(&params.did).await?;
-
-    // Convert to (Cid, Vec<u8>) format
-    let blocks: Vec<(Cid, Vec<u8>)> = block_data
-        .into_iter()
-        .filter_map(|(cid_str, content)| {
-            Cid::from_str(&cid_str).ok().map(|cid| (cid, content))
-        })
-        .collect();
-
-    encoder.add_blocks(blocks)?;
-
-    let car_bytes = encoder.finalize();
+    // Export repository as CAR
+    let car_bytes = car::export_repo_to_car(
+        &ctx.actor_store,
+        &params.did,
+        params.since.as_deref(),
+    )
+    .await?;
 
     // Return CAR file as application/vnd.ipld.car
     Ok(Response::builder()
@@ -132,15 +185,16 @@ pub async fn get_repo(
 /// Implements com.atproto.sync.getLatestCommit
 pub async fn get_latest_commit(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(params): Query<GetLatestCommitParams>,
 ) -> PdsResult<Json<LatestCommitResponse>> {
-    // Validate DID exists
-    if !ctx.actor_store.exists(&params.did).await {
-        return Err(PdsError::NotFound(format!(
-            "Repository not found for DID: {}",
-            params.did
-        )));
-    }
+    // Get authentication
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
+    let auth_did = auth.did();
+
+    // Check repository availability (admin support to be added in Phase 7)
+    let is_admin_or_self = auth_did == params.did;
+    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
 
     // Get the repository root CID (latest commit)
     let repo_root = ctx.actor_store.get_repo_root(&params.did).await?;
@@ -156,51 +210,43 @@ pub async fn get_latest_commit(
 /// Implements com.atproto.sync.getBlocks
 pub async fn get_blocks(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(params): Query<GetBlocksParams>,
 ) -> PdsResult<Response> {
-    // Validate DID exists
-    if !ctx.actor_store.exists(&params.did).await {
+    // Get authentication
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
+    let auth_did = auth.did();
+
+    // Check repository availability (admin support to be added in Phase 7)
+    let is_admin_or_self = auth_did == params.did;
+    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
+
+    // Fetch the requested blocks
+    let block_data = ctx
+        .actor_store
+        .get_blocks_by_cids(&params.did, &params.cids)
+        .await?;
+
+    // Check if any blocks are missing
+    if block_data.len() != params.cids.len() {
+        let found_cids: Vec<&str> = block_data.iter().map(|(cid, _)| cid.as_str()).collect();
+        let missing: Vec<&str> = params
+            .cids
+            .iter()
+            .filter(|cid| !found_cids.contains(&cid.as_str()))
+            .map(|s| s.as_str())
+            .collect();
         return Err(PdsError::NotFound(format!(
-            "Repository not found for DID: {}",
-            params.did
+            "Could not find cids: {:?}",
+            missing
         )));
     }
 
-    // Validate CIDs
-    let cids: Result<Vec<Cid>, _> = params
-        .cids
-        .iter()
-        .map(|s| Cid::from_str(s))
-        .collect();
-
-    let cids = cids.map_err(|e| PdsError::Validation(format!("Invalid CID: {}", e)))?;
-
-    // Get the repository root for the CAR header
+    // Get repo root for CAR header
     let repo_root = ctx.actor_store.get_repo_root(&params.did).await?;
-    let root_cid = Cid::from_str(&repo_root.cid)
-        .map_err(|e| PdsError::Internal(format!("Invalid root CID: {}", e)))?;
 
-    // Create CAR encoder
-    let mut encoder = CarEncoder::new(&root_cid)?;
-
-    // Fetch the requested blocks from repo_block table
-    let cid_strings: Vec<String> = cids.iter().map(|c| c.to_string()).collect();
-    let block_data = ctx
-        .actor_store
-        .get_blocks_by_cids(&params.did, &cid_strings)
-        .await?;
-
-    // Convert to (Cid, Vec<u8>) format
-    let blocks: Vec<(Cid, Vec<u8>)> = block_data
-        .into_iter()
-        .filter_map(|(cid_str, content)| {
-            Cid::from_str(&cid_str).ok().map(|cid| (cid, content))
-        })
-        .collect();
-
-    encoder.add_blocks(blocks)?;
-
-    let car_bytes = encoder.finalize();
+    // Convert blocks to CAR
+    let car_bytes = car::blocks_to_car(block_data, Some(&repo_root.cid)).await?;
 
     // Return CAR file
     Ok(Response::builder()
@@ -208,6 +254,82 @@ pub async fn get_blocks(
         .header(header::CONTENT_TYPE, "application/vnd.ipld.car")
         .body(Body::from(car_bytes))
         .unwrap())
+}
+
+/// Get a blob by CID
+///
+/// Implements com.atproto.sync.getBlob
+pub async fn get_blob(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Query(params): Query<GetBlobParams>,
+) -> PdsResult<Response> {
+    // Get authentication
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
+    let auth_did = auth.did();
+
+    // Check repository availability (admin support to be added in Phase 7)
+    let is_admin_or_self = auth_did == params.did;
+    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
+
+    // Get blob from blob store
+    let (data, mime_type) = ctx
+        .blob_store
+        .get(&params.cid)
+        .await?
+        .ok_or_else(|| PdsError::NotFound("Blob not found".to_string()))?;
+
+    // Return blob with security headers (matching Bluesky pattern)
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, mime_type.as_str()),
+            (header::CONTENT_LENGTH, &data.len().to_string()),
+            (header::HeaderName::from_static("x-content-type-options"), "nosniff"),
+            (header::HeaderName::from_static("content-security-policy"), "default-src 'none'; sandbox"),
+        ],
+        data,
+    )
+        .into_response())
+}
+
+/// List blob CIDs in a repository
+///
+/// Implements com.atproto.sync.listBlobs
+pub async fn list_blobs(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Query(params): Query<ListBlobsParams>,
+) -> PdsResult<Json<ListBlobsResponse>> {
+    // Get authentication
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
+    let auth_did = auth.did();
+
+    // Check repository availability (admin support to be added in Phase 7)
+    let is_admin_or_self = auth_did == params.did;
+    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
+
+    let limit = params.limit.unwrap_or(100).min(1000);
+
+    // Get blob CIDs
+    let cids = ctx
+        .blob_store
+        .list_blob_cids(
+            &params.did,
+            params.since.as_deref(),
+            limit,
+            params.cursor.as_deref(),
+        )
+        .await?;
+
+    // Cursor is the last CID if we hit the limit
+    let cursor = if cids.len() as i64 == limit {
+        cids.last().cloned()
+    } else {
+        None
+    };
+
+    Ok(Json(ListBlobsResponse { cursor, cids }))
 }
 
 /// List all repositories on this PDS
@@ -230,10 +352,17 @@ pub async fn list_repos(
     for account in &accounts {
         // Get the repository root for this DID
         if let Ok(repo_root) = ctx.actor_store.get_repo_root(&account.did).await {
+            let (active, status) = get_repo_status(
+                account.taken_down,
+                account.deactivated_at.as_ref(),
+            );
+
             repos.push(RepoInfo {
                 did: account.did.clone(),
                 head: repo_root.cid,
                 rev: repo_root.rev,
+                active,
+                status,
             });
         }
     }
@@ -249,25 +378,94 @@ pub async fn list_repos(
     Ok(Json(ListReposResponse { repos, cursor }))
 }
 
+/// Get repository status
+///
+/// Implements com.atproto.sync.getRepoStatus
+pub async fn get_repo_status_endpoint(
+    State(ctx): State<AppContext>,
+    Query(params): Query<GetRepoStatusParams>,
+) -> PdsResult<Json<GetRepoStatusResponse>> {
+    // No auth required - this is public info about repo availability
+
+    let account = ctx
+        .account_manager
+        .get_account(&params.did)
+        .await?;
+
+    let (active, status) = get_repo_status(
+        account.taken_down,
+        account.deactivated_at.as_ref(),
+    );
+
+    let rev = if active {
+        ctx.actor_store
+            .get_repo_root(&params.did)
+            .await
+            .ok()
+            .map(|root| root.rev)
+    } else {
+        None
+    };
+
+    Ok(Json(GetRepoStatusResponse {
+        did: params.did,
+        active,
+        status,
+        rev,
+    }))
+}
+
+/// Get a specific record as CAR file
+///
+/// Implements com.atproto.sync.getRecord
+pub async fn get_record(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Query(params): Query<GetRecordParams>,
+) -> PdsResult<Response> {
+    // Get authentication
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
+    let auth_did = auth.did();
+
+    // Check repository availability (admin support to be added in Phase 7)
+    let is_admin_or_self = auth_did == params.did;
+    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
+
+    // Export record as CAR
+    let car_bytes = car::export_record_to_car(
+        &ctx.actor_store,
+        &params.did,
+        &params.collection,
+        &params.rkey,
+    )
+    .await?;
+
+    // Return CAR file
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/vnd.ipld.car")],
+        car_bytes,
+    )
+        .into_response())
+}
+
 /// Build sync API routes
 pub fn routes() -> Router<AppContext> {
     Router::new()
-        .route(
-            "/xrpc/com.atproto.sync.getRepo",
-            get(get_repo),
-        )
+        .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
         .route(
             "/xrpc/com.atproto.sync.getLatestCommit",
             get(get_latest_commit),
         )
+        .route("/xrpc/com.atproto.sync.getBlocks", get(get_blocks))
+        .route("/xrpc/com.atproto.sync.getBlob", get(get_blob))
+        .route("/xrpc/com.atproto.sync.listBlobs", get(list_blobs))
+        .route("/xrpc/com.atproto.sync.listRepos", get(list_repos))
         .route(
-            "/xrpc/com.atproto.sync.getBlocks",
-            get(get_blocks),
+            "/xrpc/com.atproto.sync.getRepoStatus",
+            get(get_repo_status_endpoint),
         )
-        .route(
-            "/xrpc/com.atproto.sync.listRepos",
-            get(list_repos),
-        )
+        .route("/xrpc/com.atproto.sync.getRecord", get(get_record))
 }
 
 #[cfg(test)]
@@ -291,5 +489,14 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("cid"));
         assert!(json.contains("rev"));
+    }
+
+    #[test]
+    fn test_list_blobs_params_deserialize() {
+        let json = r#"{"did":"did:plc:test","limit":50,"cursor":"bafyreiabc"}"#;
+        let params: ListBlobsParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.did, "did:plc:test");
+        assert_eq!(params.limit, Some(50));
+        assert_eq!(params.cursor, Some("bafyreiabc".to_string()));
     }
 }

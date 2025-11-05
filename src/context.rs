@@ -9,7 +9,15 @@ use crate::{
     config::ServerConfig,
     db,
     error::{PdsError, PdsResult},
-    federation::{RelayClient, RelayConfig},
+    federation::{
+        authentication::FederationAuthenticator,
+        discovery::PdsDiscovery,
+        dpop::{DPopNonceStore, DPopVerifier},
+        search::FederatedSearch,
+        NonceStore,
+        RelayClient,
+        RelayConfig,
+    },
     identity::{DidCache, IdentityResolver, IdentityResolverConfig},
     mailer::Mailer,
     rate_limit::{RateLimiter, RateLimitConfig},
@@ -37,6 +45,14 @@ pub struct AppContext {
     pub sequencer: Arc<Sequencer>,
     // Relay client for federation
     pub relay_client: Option<Arc<tokio::sync::Mutex<RelayClient>>>,
+    // Federation components
+    pub federation_auth: Option<Arc<FederationAuthenticator>>,
+    pub pds_discovery: Option<Arc<PdsDiscovery>>,
+    pub federated_search: Option<Arc<FederatedSearch>>,
+    pub nonce_store: Option<Arc<NonceStore>>,
+    // DPoP support (Phase 4)
+    pub dpop_nonce_store: Option<Arc<DPopNonceStore>>,
+    pub dpop_verifier: Option<Arc<DPopVerifier>>,
     // Rate limiter
     pub rate_limiter: Arc<RateLimiter>,
     // Email mailer
@@ -55,9 +71,8 @@ impl AppContext {
         // Initialize account database
         let account_db = db::create_pool(&config.storage.account_db, db::DatabaseOptions::default()).await?;
 
-        // NOTE: Database schema is set up by install.sh during installation
-        // We do NOT run migrations at startup to avoid checksum mismatches
-
+        // Run database migrations (includes OAuth tables)
+        db::run_migrations(&account_db).await?;
 
         // Test connection
         db::test_connection(&account_db).await?;
@@ -110,6 +125,59 @@ impl AppContext {
             None
         };
 
+        // Initialize federation components (Phase 1)
+        let (federation_auth, pds_discovery) = if config.federation.enabled {
+            tracing::info!("Initializing federation authenticator and PDS discovery");
+
+            // Federation authenticator for cross-PDS authentication
+            let auth = Arc::new(FederationAuthenticator::new(
+                Arc::clone(&identity_resolver)
+            ));
+
+            // PDS discovery for finding other instances
+            let discovery = Arc::new(PdsDiscovery::new(
+                config.federation.relay_urls.clone()
+            ));
+
+            (Some(auth), Some(discovery))
+        } else {
+            (None, None)
+        };
+
+        // Initialize federated search (Phase 2)
+        let federated_search = if config.federation.enabled {
+            if let Some(ref discovery) = pds_discovery {
+                tracing::info!("Initializing federated search (max_concurrent: 10, timeout: 30s)");
+                Some(Arc::new(FederatedSearch::new(
+                    Arc::clone(discovery),
+                    10,  // max_concurrent requests
+                    30,  // timeout_secs
+                )))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Initialize nonce store for service auth (Phase 4)
+        let nonce_store = if config.federation.enabled {
+            tracing::info!("Initializing nonce store for replay prevention (retention: 120s)");
+            Some(Arc::new(NonceStore::new()))
+        } else {
+            None
+        };
+
+        // Initialize DPoP support (Phase 4)
+        let (dpop_nonce_store, dpop_verifier) = if config.federation.enabled {
+            tracing::info!("Initializing DPoP support for client-to-PDS authentication");
+            let dpop_nonce = Arc::new(DPopNonceStore::new());
+            let dpop_verify = Arc::new(DPopVerifier::new(Arc::clone(&dpop_nonce)));
+            (Some(dpop_nonce), Some(dpop_verify))
+        } else {
+            (None, None)
+        };
+
         // Initialize sequencer with relay client (using account_db for now, could be separate database)
         let sequencer = Arc::new(Sequencer::with_relay(
             account_db.clone(),
@@ -137,6 +205,12 @@ impl AppContext {
             report_manager,
             sequencer,
             relay_client,
+            federation_auth,
+            pds_discovery,
+            federated_search,
+            nonce_store,
+            dpop_nonce_store,
+            dpop_verifier,
             rate_limiter,
             mailer,
         })

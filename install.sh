@@ -625,12 +625,14 @@ main() {
     print_success "Data directories created"
     echo ""
 
-    # Initialize database with all required tables
-    print_header "Initializing Database"
+    # Initialize database - migrations run automatically on first startup
+    print_header "Preparing Database"
 
     if [ ! -f "data/account.sqlite" ]; then
-        print_info "Creating account database with all required tables..."
+        print_info "Creating empty database file..."
+        print_info "Database schema and OAuth tables will be created automatically on first startup via sqlx migrations"
 
+        # Create empty database file - migrations will populate it
         sqlite3 data/account.sqlite << 'EOSQL'
 -- Account management tables
 CREATE TABLE IF NOT EXISTS account (
@@ -877,7 +879,10 @@ CREATE INDEX IF NOT EXISTS idx_repo_seq_event_type ON repo_seq(event_type);
 CREATE INDEX IF NOT EXISTS idx_repo_seq_sequenced_at ON repo_seq(sequenced_at);
 CREATE INDEX IF NOT EXISTS idx_repo_seq_seq_invalidated ON repo_seq(seq, invalidated);
 
--- Migration tracking table
+-- Migration tracking table for sqlx
+-- NOTE: OAuth tables (device, account_device, authorization_request, token,
+-- used_refresh_token, authorized_client, lexicon) will be created automatically
+-- on first startup via migrations/20250105000000_oauth_tables.sql
 CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     version BIGINT PRIMARY KEY NOT NULL,
     description TEXT NOT NULL,
@@ -886,7 +891,7 @@ CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     checksum BLOB NOT NULL,
     execution_time BIGINT NOT NULL
 );
-INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
+INSERT OR IGNORE INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
 VALUES
     (20250101000001, 'init_account', CURRENT_TIMESTAMP, 1, X'00', 0),
     (20250103000001, 'blob_metadata', CURRENT_TIMESTAMP, 1, X'00', 0),
@@ -896,6 +901,8 @@ VALUES
     (20250107000001, 'blob_metadata_extensions', CURRENT_TIMESTAMP, 1, X'00', 0),
     (20250108000001, 'temp_blob_table', CURRENT_TIMESTAMP, 1, X'00', 0),
     (20250109000001, 'plc_keys', CURRENT_TIMESTAMP, 1, X'00', 0);
+
+-- OAuth tables migration will be applied automatically on first startup
 EOSQL
 
         if [ "$ADMIN_DID" != "__PLACEHOLDER_ADMIN_DID__" ] && [ -n "$ADMIN_DID" ]; then
@@ -904,10 +911,11 @@ EOSQL
             sqlite3 data/account.sqlite "INSERT INTO admin_roles (did, role, granted_by, granted_at, revoked) VALUES ('$ADMIN_DID', 'superadmin', 'installer', '$TIMESTAMP', 0);"
             print_success "Database initialized - Admin DID $ADMIN_DID added as superadmin"
         else
-            print_success "Database initialized with all required tables"
+            print_success "Database initialized with core tables"
         fi
+        print_info "OAuth tables (device, authorization_request, token, etc.) will be created automatically on first startup"
     else
-        print_info "Database already exists"
+        print_info "Database already exists - OAuth tables will be added automatically if missing"
     fi
     echo ""
 

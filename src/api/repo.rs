@@ -196,17 +196,29 @@ async fn create_record(
 ) -> PdsResult<Json<CreateRecordResponse>> {
     tracing::info!("create_record: Starting for collection: {}", req.collection);
 
-    // Require authentication
-    let session = middleware::require_auth(State(ctx.clone()), headers).await
+    // Require authentication (local or cross-PDS) - Phase 4
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await
         .map_err(|e| {
             tracing::error!("create_record: Auth failed: {}", e);
             e
         })?;
-    tracing::debug!("create_record: Authenticated as DID: {}", session.did);
+
+    let auth_did = auth.did();
+    tracing::debug!(
+        "create_record: Authenticated as DID: {}, auth_type: {}",
+        auth_did,
+        if auth.is_local() { "local" } else { "cross_pds" }
+    );
+
+    // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
+    if auth.is_cross_pds() {
+        ctx.rate_limiter.check_cross_pds()?;
+        tracing::debug!("create_record: Cross-PDS rate limit check passed");
+    }
 
     // Verify repo matches authenticated user
-    if req.repo != session.did {
-        tracing::error!("create_record: Repo mismatch - req: {}, session: {}", req.repo, session.did);
+    if req.repo != auth_did {
+        tracing::error!("create_record: Repo mismatch - req: {}, auth: {}", req.repo, auth_did);
         return Err(PdsError::Authorization(
             "Cannot create record in another user's repo".to_string(),
         ));
@@ -215,7 +227,7 @@ async fn create_record(
     // Create repository manager with sequencer
     tracing::debug!("create_record: Creating repository manager with sequencer");
     let repo_mgr = RepositoryManager::with_sequencer(
-        session.did.clone(),
+        auth_did.to_string(),
         (*ctx.actor_store).clone(),
         ctx.sequencer.clone(),
     );
@@ -243,18 +255,24 @@ async fn put_record(
     headers: HeaderMap,
     Json(req): Json<PutRecordRequest>,
 ) -> PdsResult<Json<PutRecordResponse>> {
-    // Require authentication
-    let session = middleware::require_auth(State(ctx.clone()), headers).await?;
+    // Require authentication (local or cross-PDS) - Phase 4
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
+    let auth_did = auth.did();
+
+    // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
+    if auth.is_cross_pds() {
+        ctx.rate_limiter.check_cross_pds()?;
+    }
 
     // Verify repo matches authenticated user
-    if req.repo != session.did {
+    if req.repo != auth_did {
         return Err(PdsError::Authorization(
             "Cannot update record in another user's repo".to_string(),
         ));
     }
 
     // Create repository manager
-    let repo_mgr = RepositoryManager::with_sequencer(session.did.clone(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
+    let repo_mgr = RepositoryManager::with_sequencer(auth_did.to_string(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
 
     // Create signer from repo key
     let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
@@ -264,7 +282,7 @@ async fn put_record(
         .update_record(&req.collection, &req.rkey, req.record, req.validate, signer)
         .await?;
 
-    let uri = format!("at://{}/{}/{}", session.did, req.collection, req.rkey);
+    let uri = format!("at://{}/{}/{}", auth_did, req.collection, req.rkey);
 
     Ok(Json(PutRecordResponse { uri, cid }))
 }
@@ -275,18 +293,24 @@ async fn delete_record(
     headers: HeaderMap,
     Json(req): Json<DeleteRecordRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
-    // Require authentication
-    let session = middleware::require_auth(State(ctx.clone()), headers).await?;
+    // Require authentication (local or cross-PDS) - Phase 4
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
+    let auth_did = auth.did();
+
+    // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
+    if auth.is_cross_pds() {
+        ctx.rate_limiter.check_cross_pds()?;
+    }
 
     // Verify repo matches authenticated user
-    if req.repo != session.did {
+    if req.repo != auth_did {
         return Err(PdsError::Authorization(
             "Cannot delete record from another user's repo".to_string(),
         ));
     }
 
     // Create repository manager
-    let repo_mgr = RepositoryManager::with_sequencer(session.did.clone(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
+    let repo_mgr = RepositoryManager::with_sequencer(auth_did.to_string(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
 
     // Create signer from repo key
     let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);

@@ -277,6 +277,48 @@ lazy_static! {
         "Application uptime in seconds"
     )
     .unwrap();
+
+    // ========== Federation/Relay Metrics (Phase 3) ==========
+
+    /// Relay events received by event type
+    pub static ref RELAY_EVENTS_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "relay_events_total",
+        "Total number of relay events received",
+        &["event_type"]
+    )
+    .unwrap();
+
+    /// Relay event processing duration
+    pub static ref RELAY_EVENT_PROCESSING_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
+        "relay_event_processing_duration_seconds",
+        "Time to process relay events in seconds",
+        &["event_type"],
+        vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+    )
+    .unwrap();
+
+    /// Relay connection status (0=disconnected, 1=connected)
+    pub static ref RELAY_CONNECTION_STATUS: IntGauge = register_int_gauge!(
+        "relay_connection_status",
+        "Relay connection status (0=down, 1=up)"
+    )
+    .unwrap();
+
+    /// Total relay connections established
+    pub static ref RELAY_CONNECTIONS_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "relay_connections_total",
+        "Total number of relay connections",
+        &["relay_url", "status"]
+    )
+    .unwrap();
+
+    /// Events published to relay
+    pub static ref RELAY_EVENTS_PUBLISHED_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "relay_events_published_total",
+        "Total number of events published to relay",
+        &["event_type", "status"]
+    )
+    .unwrap();
 }
 
 /// Render metrics in Prometheus text format
@@ -392,6 +434,35 @@ pub fn record_handle_resolution(success: bool) {
 pub fn record_error(error_type: &str, module: &str) {
     ERRORS_TOTAL
         .with_label_values(&[error_type, module])
+        .inc();
+}
+
+/// Record a relay event received (Phase 3)
+pub fn record_relay_event(event_type: &str, processing_duration: f64) {
+    RELAY_EVENTS_TOTAL
+        .with_label_values(&[event_type])
+        .inc();
+    RELAY_EVENT_PROCESSING_DURATION_SECONDS
+        .with_label_values(&[event_type])
+        .observe(processing_duration);
+}
+
+/// Record relay connection status (Phase 3)
+pub fn set_relay_connection_status(connected: bool) {
+    RELAY_CONNECTION_STATUS.set(if connected { 1 } else { 0 });
+}
+
+/// Record relay connection attempt (Phase 3)
+pub fn record_relay_connection(relay_url: &str, success: bool) {
+    RELAY_CONNECTIONS_TOTAL
+        .with_label_values(&[relay_url, if success { "success" } else { "failure" }])
+        .inc();
+}
+
+/// Record event published to relay (Phase 3)
+pub fn record_relay_publish(event_type: &str, success: bool) {
+    RELAY_EVENTS_PUBLISHED_TOTAL
+        .with_label_values(&[event_type, if success { "success" } else { "failure" }])
         .inc();
 }
 

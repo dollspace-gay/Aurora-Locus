@@ -20,6 +20,7 @@ mod error;
 mod federation;
 mod identity;
 mod jobs;
+mod oauth;
 mod mailer;
 mod metrics;
 mod rate_limit;

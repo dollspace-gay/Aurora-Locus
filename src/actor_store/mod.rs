@@ -3,6 +3,7 @@
 /// Each user (actor) has their own SQLite database containing their repository data.
 /// This module manages the lifecycle and operations on these per-user databases.
 
+pub mod car;
 pub mod models;
 pub mod repository;
 pub mod store;

@@ -4,6 +4,7 @@
 /// with this PDS by resolving their DIDs and verifying signatures.
 
 use crate::error::{PdsError, PdsResult};
+use crate::federation::ServiceAuthenticator;
 use crate::identity::IdentityResolver;
 use atproto::did_doc::DidDocument;
 use reqwest::Client;
@@ -17,11 +18,15 @@ pub struct FederationAuthenticator {
     identity_resolver: Arc<IdentityResolver>,
     http_client: Client,
     cache_ttl: u64,
+    /// Service authenticator for Phase 4 (DID-based JWT verification)
+    pub authenticator: Arc<ServiceAuthenticator>,
 }
 
 impl FederationAuthenticator {
     /// Create a new federation authenticator
     pub fn new(identity_resolver: Arc<IdentityResolver>) -> Self {
+        let authenticator = Arc::new(ServiceAuthenticator::new(Arc::clone(&identity_resolver)));
+
         Self {
             identity_resolver,
             http_client: Client::builder()
@@ -29,6 +34,7 @@ impl FederationAuthenticator {
                 .build()
                 .unwrap(),
             cache_ttl: 3600, // 1 hour
+            authenticator,
         }
     }
 

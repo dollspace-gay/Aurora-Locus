@@ -28,6 +28,30 @@ impl JobScheduler {
         // Spawn monitoring tasks
         tokio::spawn(Self::health_check_job(Arc::clone(&self)));
 
+        // Spawn federation jobs (Phase 1)
+        if self.context.config.federation.enabled && self.context.pds_discovery.is_some() {
+            tokio::spawn(Self::pds_discovery_refresh_job(Arc::clone(&self)));
+            info!("Federation discovery job started");
+        }
+
+        // Spawn relay firehose subscription job (Phase 3)
+        if self.context.config.federation.enabled && self.context.relay_client.is_some() {
+            tokio::spawn(Self::relay_firehose_subscription_job(Arc::clone(&self)));
+            info!("Relay firehose subscription job started");
+        }
+
+        // Spawn nonce cleanup job (Phase 4)
+        if self.context.config.federation.enabled && self.context.nonce_store.is_some() {
+            tokio::spawn(Self::nonce_cleanup_job(Arc::clone(&self)));
+            info!("Nonce cleanup job started");
+        }
+
+        // Spawn DPoP nonce cleanup job (Phase 4)
+        if self.context.config.federation.enabled && self.context.dpop_nonce_store.is_some() {
+            tokio::spawn(Self::dpop_nonce_cleanup_job(Arc::clone(&self)));
+            info!("DPoP nonce cleanup job started");
+        }
+
         info!("Background jobs started");
     }
 
@@ -142,6 +166,112 @@ impl JobScheduler {
                     // Silent success - health is good
                 }
                 Err(e) => error!("Health check failed: {}", e),
+            }
+        }
+    }
+
+    /// PDS discovery refresh job (runs every 6 hours) - Phase 1
+    async fn pds_discovery_refresh_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(21600)); // Every 6 hours
+
+        loop {
+            interval.tick().await;
+
+            if let Some(discovery) = &scheduler.context.pds_discovery {
+                info!("Running PDS discovery refresh");
+
+                match discovery.refresh_instances().await {
+                    Ok(_) => {
+                        let instances = discovery.get_known_instances().await;
+                        info!("PDS discovery: {} instance(s) found", instances.len());
+                    }
+                    Err(e) => error!("Failed to refresh PDS instances: {}", e),
+                }
+            }
+        }
+    }
+
+    /// Relay firehose subscription job - Phase 3
+    async fn relay_firehose_subscription_job(scheduler: Arc<Self>) {
+        info!("Starting relay firehose subscription");
+
+        let relay_client = match &scheduler.context.relay_client {
+            Some(client) => client,
+            None => {
+                error!("Relay client not initialized");
+                return;
+            }
+        };
+
+        // Subscribe to firehose
+        let mut relay_client_locked = relay_client.lock().await;
+        let mut event_receiver = match relay_client_locked.subscribe_firehose().await {
+            Ok(rx) => {
+                info!("✓ Successfully subscribed to relay firehose");
+                rx
+            }
+            Err(e) => {
+                error!("Failed to subscribe to relay firehose: {}", e);
+                return;
+            }
+        };
+        drop(relay_client_locked);
+
+        // Process events as they arrive
+        let mut event_count = 0u64;
+        while let Some(event) = event_receiver.recv().await {
+            event_count += 1;
+
+            // Log progress every 100 events
+            if event_count % 100 == 0 {
+                info!("Processed {} relay events", event_count);
+            }
+
+            // Process the event
+            if let Err(e) = tasks::process_relay_event(&scheduler.context, event).await {
+                error!("Failed to process relay event: {}", e);
+            }
+        }
+
+        error!("Relay firehose subscription ended unexpectedly");
+    }
+
+    /// Nonce cleanup job (runs every 5 minutes) - Phase 4
+    async fn nonce_cleanup_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(300)); // Every 5 minutes
+
+        loop {
+            interval.tick().await;
+
+            if let Some(nonce_store) = &scheduler.context.nonce_store {
+                match nonce_store.cleanup_expired().await {
+                    Ok(count) => {
+                        if count > 0 {
+                            info!("Cleaned up {} expired nonces", count);
+                        }
+                    }
+                    Err(e) => error!("Failed to cleanup expired nonces: {}", e),
+                }
+            }
+        }
+    }
+
+    /// DPoP nonce cleanup job (runs every 5 minutes) - Phase 4
+    async fn dpop_nonce_cleanup_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(300)); // Every 5 minutes
+
+        loop {
+            interval.tick().await;
+
+            if let Some(dpop_nonce_store) = &scheduler.context.dpop_nonce_store {
+                match dpop_nonce_store.cleanup_expired().await {
+                    Ok(count) => {
+                        if count > 0 {
+                            info!("Cleaned up {} expired DPoP nonces", count);
+                        }
+                    }
+                    Err(e) => error!("Failed to cleanup expired DPoP nonces: {}", e),
+                }
             }
         }
     }

@@ -22,6 +22,8 @@ pub struct RateLimitConfig {
     pub unauthenticated_rps: u32,
     /// Requests per second for admin users
     pub admin_rps: u32,
+    /// Requests per second for cross-PDS authenticated users (Phase 4)
+    pub cross_pds_rps: u32,
     /// Burst size
     pub burst_size: u32,
 }
@@ -32,6 +34,7 @@ impl Default for RateLimitConfig {
             authenticated_rps: 100,      // 100 req/sec for authenticated
             unauthenticated_rps: 10,     // 10 req/sec for unauthenticated
             admin_rps: 1000,             // 1000 req/sec for admins
+            cross_pds_rps: 10,           // 10 req/sec for cross-PDS (10x stricter than local)
             burst_size: 50,              // Allow bursts up to 50 requests
         }
     }
@@ -43,6 +46,7 @@ pub struct RateLimiter {
     authenticated: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     unauthenticated: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     admin: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+    cross_pds: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
 }
 
 impl RateLimiter {
@@ -67,10 +71,19 @@ impl RateLimiter {
             NonZeroU32::new(config.burst_size * 2).unwrap_or(NonZeroU32::new(100).unwrap()),
         );
 
+        let cross_pds_quota = Quota::per_second(
+            NonZeroU32::new(config.cross_pds_rps)
+                .unwrap_or(NonZeroU32::new(10).unwrap()),
+        )
+        .allow_burst(
+            NonZeroU32::new(config.burst_size / 10).unwrap_or(NonZeroU32::new(5).unwrap()),
+        );
+
         Self {
             authenticated: Arc::new(GovernorLimiter::direct(auth_quota)),
             unauthenticated: Arc::new(GovernorLimiter::direct(unauth_quota)),
             admin: Arc::new(GovernorLimiter::direct(admin_quota)),
+            cross_pds: Arc::new(GovernorLimiter::direct(cross_pds_quota)),
         }
     }
 
@@ -97,6 +110,19 @@ impl RateLimiter {
     /// Check rate limit for admin user
     pub fn check_admin(&self) -> PdsResult<()> {
         match self.admin.check() {
+            Ok(_) => Ok(()),
+            Err(_) => Err(PdsError::RateLimitExceeded {
+                retry_after: std::time::Duration::from_secs(1),
+            }),
+        }
+    }
+
+    /// Check rate limit for cross-PDS authenticated user (Phase 4)
+    ///
+    /// This is 10x stricter than local authenticated users to prevent abuse
+    /// from federated instances.
+    pub fn check_cross_pds(&self) -> PdsResult<()> {
+        match self.cross_pds.check() {
             Ok(_) => Ok(()),
             Err(_) => Err(PdsError::RateLimitExceeded {
                 retry_after: std::time::Duration::from_secs(1),

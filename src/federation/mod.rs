@@ -8,13 +8,19 @@
 
 pub mod authentication;
 pub mod discovery;
+pub mod dpop;
+pub mod nonce_store;
 pub mod relay;
 pub mod search;
+pub mod service_auth;
 
 pub use authentication::FederationAuthenticator;
 pub use discovery::{PdsDiscovery, PdsInstance};
+pub use dpop::{DPopNonceStore, DPopVerifier};
+pub use nonce_store::NonceStore;
 pub use relay::{RelayClient, RelayConfig};
 pub use search::FederatedSearch;
+pub use service_auth::ServiceAuthenticator;
 
 use serde::{Deserialize, Serialize};
 
