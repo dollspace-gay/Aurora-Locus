@@ -5,6 +5,7 @@ use crate::{
     api::middleware::extract_bearer_token,
     context::AppContext,
     error::PdsError,
+    oauth::ScopeSet,
 };
 use axum::{
     async_trait,
@@ -217,5 +218,174 @@ pub fn verify_admin_token(token: &str, jwt_secret: &str) -> Result<(), PdsError>
     verify_jwt_token(token, jwt_secret)?;
 
     // Token is valid
+    Ok(())
+}
+
+// ========== OAuth 2.1 + DPoP Authentication ==========
+
+/// OAuth token information
+///
+/// Represents a validated OAuth access token with scopes and DPoP binding.
+#[derive(Debug, Clone)]
+pub struct OAuthToken {
+    /// Account DID
+    pub did: String,
+
+    /// Token ID
+    pub token_id: String,
+
+    /// OAuth client ID
+    pub client_id: String,
+
+    /// Granted scopes (space-separated)
+    pub scope: String,
+
+    /// DPoP thumbprint (if token is DPoP-bound)
+    pub dpop_thumbprint: Option<String>,
+
+    /// Device ID (if token is device-bound)
+    pub device_id: Option<String>,
+}
+
+/// OAuth authenticated context with scope enforcement
+///
+/// Extracts and validates OAuth access tokens from Authorization header.
+/// Supports DPoP token binding for enhanced security.
+///
+/// # Usage
+/// ```ignore
+/// async fn handler(auth: OAuthAuthContext) -> Result<Json<Response>, PdsError> {
+///     // auth.did - authenticated user's DID
+///     // auth.scopes - parsed OAuth scopes
+///     // auth.token - full token information
+///
+///     // Check scope manually
+///     require_scope(&auth.token.scope, &AtProtoScope::RepoCreate)?;
+///
+///     // ... handler logic
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct OAuthAuthContext {
+    pub did: String,
+    pub token: OAuthToken,
+    pub scopes: ScopeSet,
+}
+
+#[async_trait]
+impl FromRequestParts<AppContext> for OAuthAuthContext {
+    type Rejection = PdsError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppContext,
+    ) -> Result<Self, Self::Rejection> {
+        // Extract bearer token from Authorization header
+        let access_token = extract_bearer_token(&parts.headers)
+            .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
+
+        // TODO: Validate DPoP proof if present
+        // For now, we'll just validate the access token
+        // DPoP validation will be added in the next step
+
+        // Try to find OAuth token in database
+        let token_info = validate_oauth_token(state, &access_token).await?;
+
+        // Parse scopes
+        let scopes = ScopeSet::from_str(&token_info.scope)
+            .map_err(|e| PdsError::Authentication(format!("Invalid token scopes: {}", e)))?;
+
+        let did = token_info.did.clone();
+
+        Ok(OAuthAuthContext {
+            did,
+            token: token_info,
+            scopes,
+        })
+    }
+}
+
+/// Validate OAuth access token
+///
+/// Looks up the token in the database and returns token information.
+/// This is a helper function used by OAuthAuthContext and middleware.
+pub async fn validate_oauth_token(
+    ctx: &AppContext,
+    access_token: &str,
+) -> Result<OAuthToken, PdsError> {
+    // Query token table for this access token
+    // Note: In the actual implementation, access tokens should be stored hashed
+    // For now, we'll do a direct lookup
+
+    let row = sqlx::query(
+        r#"
+        SELECT token_id, did, client_id, scope, dpop_thumbprint, device_id, expires_at
+        FROM token
+        WHERE token_id = ?
+        "#,
+    )
+    .bind(access_token)
+    .fetch_optional(&ctx.account_db)
+    .await
+    .map_err(|e| PdsError::Database(e))?
+    .ok_or_else(|| PdsError::Authentication("Invalid or expired access token".to_string()))?;
+
+    // Check if token is expired
+    use sqlx::Row;
+    let expires_at: chrono::DateTime<chrono::Utc> = row.get("expires_at");
+
+    if expires_at < chrono::Utc::now() {
+        return Err(PdsError::Authentication("Access token has expired".to_string()));
+    }
+
+    Ok(OAuthToken {
+        token_id: row.get("token_id"),
+        did: row.get("did"),
+        client_id: row.get("client_id"),
+        scope: row.get("scope"),
+        dpop_thumbprint: row.get("dpop_thumbprint"),
+        device_id: row.get("device_id"),
+    })
+}
+
+/// Extract DPoP header from request
+///
+/// DPoP proof is sent in the "DPoP" HTTP header (not Authorization).
+pub fn extract_dpop_header(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("dpop")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Validate DPoP proof
+///
+/// Verifies that:
+/// 1. DPoP proof JWT is well-formed and signed correctly
+/// 2. JWK thumbprint matches the token's bound thumbprint
+/// 3. htm (HTTP method) and htu (HTTP URI) match the request
+/// 4. Proof is not expired and not reused (via jti)
+///
+/// This will be fully implemented when we integrate DPoP validation.
+pub async fn validate_dpop_proof(
+    _ctx: &AppContext,
+    _dpop_proof: &str,
+    _expected_thumbprint: &str,
+    _http_method: &str,
+    _http_uri: &str,
+) -> Result<(), PdsError> {
+    // TODO: Implement full DPoP proof validation
+    // For now, we'll skip DPoP validation and mark it as a future task
+
+    // Steps:
+    // 1. Parse DPoP proof JWT
+    // 2. Extract JWK from proof header
+    // 3. Compute JWK thumbprint
+    // 4. Verify thumbprint matches expected_thumbprint
+    // 5. Verify proof signature using JWK
+    // 6. Verify htm and htu claims
+    // 7. Verify jti is unique (replay prevention)
+    // 8. Verify proof is not expired
+
     Ok(())
 }

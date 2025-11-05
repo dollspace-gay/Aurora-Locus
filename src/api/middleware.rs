@@ -1,9 +1,11 @@
 /// Authentication and authorization middleware
 use crate::{
     account::ValidatedSession,
+    auth::OAuthAuthContext,
     context::AppContext,
     error::{PdsError, PdsResult},
     metrics,
+    oauth::AtProtoScope,
 };
 use axum::{
     extract::{Request, State},
@@ -95,6 +97,9 @@ pub enum UnifiedAuthContext {
 
     /// Cross-PDS user authenticated via service auth JWT
     CrossPDS { did: String },
+
+    /// OAuth 2.1 authenticated user with scopes
+    OAuth { did: String, scope: String },
 }
 
 impl UnifiedAuthContext {
@@ -103,6 +108,7 @@ impl UnifiedAuthContext {
         match self {
             UnifiedAuthContext::Local(session) => &session.did,
             UnifiedAuthContext::CrossPDS { did } => did,
+            UnifiedAuthContext::OAuth { did, .. } => did,
         }
     }
 
@@ -115,12 +121,29 @@ impl UnifiedAuthContext {
     pub fn is_cross_pds(&self) -> bool {
         matches!(self, UnifiedAuthContext::CrossPDS { .. })
     }
+
+    /// Check if this is OAuth authentication
+    pub fn is_oauth(&self) -> bool {
+        matches!(self, UnifiedAuthContext::OAuth { .. })
+    }
+
+    /// Get OAuth scope if this is OAuth authentication
+    pub fn oauth_scope(&self) -> Option<&str> {
+        match self {
+            UnifiedAuthContext::OAuth { scope, .. } => Some(scope),
+            _ => None,
+        }
+    }
 }
 
-/// Require authentication (local or cross-PDS) - Phase 4
+/// Require authentication (local, OAuth, or cross-PDS) - Phase 6
 ///
-/// This tries local authentication first, then falls back to service auth.
-/// Use this for endpoints that should accept both local and cross-PDS requests.
+/// This tries multiple authentication methods in order:
+/// 1. OAuth 2.1 tokens (most modern)
+/// 2. Local session tokens (legacy)
+/// 3. Service auth JWTs (cross-PDS)
+///
+/// Use this for endpoints that should accept all authentication types.
 pub async fn require_auth_unified(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -132,7 +155,26 @@ pub async fn require_auth_unified(
             PdsError::Authentication("Missing authorization header".to_string())
         })?;
 
-    // Try local auth first
+    // Try OAuth token validation first (most modern)
+    match crate::auth::validate_oauth_token(&ctx, &token).await {
+        Ok(token_info) => {
+            info!(
+                did = %token_info.did,
+                client_id = %token_info.client_id,
+                auth_type = "oauth",
+                "authentication_successful"
+            );
+            return Ok(UnifiedAuthContext::OAuth {
+                did: token_info.did,
+                scope: token_info.scope,
+            });
+        }
+        Err(_) => {
+            // OAuth failed, try local session auth
+        }
+    }
+
+    // Try local session auth
     match ctx.account_manager.validate_access_token(&token).await {
         Ok(session) => {
             info!(
@@ -160,7 +202,7 @@ pub async fn require_auth_unified(
                         Ok(true) => {
                             info!(
                                 did = %claims.iss,
-                                auth_type = "cross_pds",
+                                auth_type = "cross_pDS",
                                 "authentication_successful"
                             );
                             return Ok(UnifiedAuthContext::CrossPDS { did: claims.iss });
@@ -195,7 +237,7 @@ pub async fn require_auth_unified(
         }
     }
 
-    // Both auth methods failed
+    // All auth methods failed
     warn!("authentication_failed: invalid_token");
     metrics::record_error("AuthenticationFailed", "middleware");
     Err(PdsError::Authentication("Invalid or expired token".to_string()))
@@ -607,4 +649,34 @@ pub async fn require_service_auth(
         issued_at: claims.iat,
         expires_at: claims.exp,
     })
+}
+
+/// Enforce OAuth scope requirement on UnifiedAuthContext
+///
+/// For OAuth authentication, this enforces that the required scope is present.
+/// For other authentication types (local session, cross-PDS), this check is skipped.
+///
+/// # Arguments
+/// * `auth` - The unified authentication context
+/// * `required_scope` - The scope required for this operation
+///
+/// # Returns
+/// Ok(()) if authorized, Err if scope is missing
+///
+/// # Example
+/// ```ignore
+/// let auth = middleware::require_auth_unified(State(ctx), headers).await?;
+/// enforce_scope(&auth, &AtProtoScope::RepoCreate)?;
+/// ```
+pub fn enforce_scope(auth: &UnifiedAuthContext, required_scope: &AtProtoScope) -> PdsResult<()> {
+    match auth {
+        UnifiedAuthContext::OAuth { scope, .. } => {
+            // For OAuth, enforce scope check
+            crate::oauth::require_scope(scope, required_scope)
+        }
+        UnifiedAuthContext::Local(_) | UnifiedAuthContext::CrossPDS { .. } => {
+            // Legacy authentication types have implicit full access
+            Ok(())
+        }
+    }
 }

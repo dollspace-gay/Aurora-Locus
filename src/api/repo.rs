@@ -4,6 +4,7 @@ use crate::{
     api::{labels::LabelView, middleware},
     context::AppContext,
     error::{PdsError, PdsResult},
+    oauth::AtProtoScope,
 };
 use axum::{
     extract::{Query, State},
@@ -196,18 +197,21 @@ async fn create_record(
 ) -> PdsResult<Json<CreateRecordResponse>> {
     tracing::info!("create_record: Starting for collection: {}", req.collection);
 
-    // Require authentication (local or cross-PDS) - Phase 4
+    // Require authentication (OAuth, local, or cross-PDS) - Phase 6
     let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await
         .map_err(|e| {
             tracing::error!("create_record: Auth failed: {}", e);
             e
         })?;
 
+    // Enforce OAuth scope if using OAuth authentication
+    middleware::enforce_scope(&auth, &AtProtoScope::RepoCreate)?;
+
     let auth_did = auth.did();
     tracing::debug!(
         "create_record: Authenticated as DID: {}, auth_type: {}",
         auth_did,
-        if auth.is_local() { "local" } else { "cross_pds" }
+        if auth.is_oauth() { "oauth" } else if auth.is_local() { "local" } else { "cross_pds" }
     );
 
     // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
@@ -255,8 +259,12 @@ async fn put_record(
     headers: HeaderMap,
     Json(req): Json<PutRecordRequest>,
 ) -> PdsResult<Json<PutRecordResponse>> {
-    // Require authentication (local or cross-PDS) - Phase 4
+    // Require authentication (OAuth, local, or cross-PDS) - Phase 6
     let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
+
+    // Enforce OAuth scope if using OAuth authentication
+    middleware::enforce_scope(&auth, &AtProtoScope::RepoUpdate)?;
+
     let auth_did = auth.did();
 
     // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
@@ -293,8 +301,12 @@ async fn delete_record(
     headers: HeaderMap,
     Json(req): Json<DeleteRecordRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
-    // Require authentication (local or cross-PDS) - Phase 4
+    // Require authentication (OAuth, local, or cross-PDS) - Phase 6
     let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
+
+    // Enforce OAuth scope if using OAuth authentication
+    middleware::enforce_scope(&auth, &AtProtoScope::RepoDelete)?;
+
     let auth_did = auth.did();
 
     // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
@@ -468,18 +480,29 @@ async fn apply_writes(
     headers: HeaderMap,
     Json(req): Json<ApplyWritesRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
-    // Require authentication
-    let session = middleware::require_auth(State(ctx.clone()), headers).await?;
+    // Require authentication (OAuth, local, or cross-PDS) - Phase 6
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
+
+    // Enforce OAuth scope if using OAuth authentication
+    // apply_writes can do create/update/delete, so it requires RepoAll or Write scope
+    middleware::enforce_scope(&auth, &AtProtoScope::RepoAll)?;
+
+    let auth_did = auth.did();
+
+    // Apply stricter rate limiting for cross-PDS requests
+    if auth.is_cross_pds() {
+        ctx.rate_limiter.check_cross_pds()?;
+    }
 
     // Verify repo matches authenticated user
-    if req.repo != session.did {
+    if req.repo != auth_did {
         return Err(PdsError::Authorization(
             "Cannot apply writes to another user's repo".to_string(),
         ));
     }
 
     // Create repository manager
-    let repo_mgr = RepositoryManager::with_sequencer(session.did.clone(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
+    let repo_mgr = RepositoryManager::with_sequencer(auth_did.to_string(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
 
     // Prepare writes (converts to PreparedWrite format)
     let prepared = repo_mgr.prepare_writes(req.writes)?;
@@ -487,7 +510,7 @@ async fn apply_writes(
     tracing::info!(
         "Applying batch of {} operations for {}",
         prepared.len(),
-        session.did
+        auth_did
     );
 
     // Create signer from repo key
@@ -500,7 +523,7 @@ async fn apply_writes(
 
     tracing::info!(
         "Successfully committed batch for {} (rev: {})",
-        session.did,
+        auth_did,
         rev
     );
 
