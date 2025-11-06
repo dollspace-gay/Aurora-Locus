@@ -4,6 +4,7 @@ use crate::{
     blob_store::{BlobUploadResponse},
     context::AppContext,
     error::{PdsError, PdsResult},
+    oauth::AtProtoScope,
 };
 use axum::{
     body::Bytes,
@@ -32,8 +33,13 @@ async fn upload_blob(
     headers: HeaderMap,
     body: Bytes,
 ) -> PdsResult<impl IntoResponse> {
-    // Require authentication
-    let session = middleware::require_auth(State(ctx.clone()), headers.clone()).await?;
+    // Require authentication (OAuth, local, or cross-PDS) - Phase 6
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
+
+    // Enforce OAuth scope if using OAuth authentication
+    middleware::enforce_scope(&auth, &AtProtoScope::BlobUpload)?;
+
+    let auth_did = auth.did();
 
     // Get Content-Type from header
     let mime_type = headers
@@ -47,7 +53,7 @@ async fn upload_blob(
     // Stage blob in temporary storage (Phase 1)
     let temp_blob = ctx
         .blob_store
-        .stage_blob(data, mime_type.as_deref(), &session.did)
+        .stage_blob(data, mime_type.as_deref(), auth_did)
         .await?;
 
     // Return blob reference
