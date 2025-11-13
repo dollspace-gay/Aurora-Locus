@@ -485,7 +485,7 @@ impl RepositoryManager {
             acc_mgr.get_account(&self.did)
                 .await
                 .ok()
-                .map(|acc| acc.handle)
+                .and_then(|acc| acc.handle)
         } else {
             None
         }

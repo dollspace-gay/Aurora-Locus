@@ -93,7 +93,7 @@ async fn create_account(
                 let base_url = ctx.service_url();
                 if let Err(e) = ctx.mailer.send_verification_email(
                     email.as_ref().unwrap(),
-                    &account.handle,
+                    account.handle.as_deref().unwrap_or("unknown"),
                     &token,
                     &base_url
                 ).await {
@@ -118,7 +118,7 @@ async fn create_account(
 
     Ok(Json(CreateAccountResponse {
         did: account.did,
-        handle: account.handle,
+        handle: account.handle.unwrap_or_default(),
         access_jwt: session.access_token,
         refresh_jwt: session.refresh_token,
     }))
@@ -147,11 +147,11 @@ async fn create_session(
 
     Ok(Json(SessionResponse {
         did: account.did,
-        handle: account.handle,
+        handle: account.handle.unwrap_or_default(),
         access_jwt: session.access_token,
         refresh_jwt: session.refresh_token,
         email: account.email,
-        email_confirmed: Some(account.email_confirmed),
+        email_confirmed: Some(account.email_confirmed_at.is_some()),
     }))
 }
 
@@ -168,9 +168,9 @@ async fn get_session(
 
     Ok(Json(SessionInfo {
         did: account.did,
-        handle: account.handle,
+        handle: account.handle.unwrap_or_default(),
         email: account.email,
-        email_confirmed: Some(account.email_confirmed),
+        email_confirmed: Some(account.email_confirmed_at.is_some()),
     }))
 }
 
@@ -206,11 +206,11 @@ async fn refresh_session(
 
     Ok(Json(SessionResponse {
         did: account.did.clone(),
-        handle: account.handle.clone(),
+        handle: account.handle.clone().unwrap_or_default(),
         access_jwt: session.access_token,
         refresh_jwt: session.refresh_token,
         email: account.email,
-        email_confirmed: Some(account.email_confirmed),
+        email_confirmed: Some(account.email_confirmed_at.is_some()),
     }))
 }
 
@@ -245,7 +245,7 @@ async fn request_email_confirmation(
         ctx.mailer
             .send_verification_email(
                 account.email.as_ref().unwrap(),
-                &account.handle,
+                account.handle.as_deref().unwrap_or("unknown"),
                 &token,
                 &base_url,
             )
@@ -300,7 +300,7 @@ async fn request_password_reset(
     if ctx.mailer.is_configured() {
         let base_url = ctx.service_url();
         ctx.mailer
-            .send_password_reset_email(&email, &account.handle, &token, &base_url)
+            .send_password_reset_email(&email, account.handle.as_deref().unwrap_or("unknown"), &token, &base_url)
             .await?;
     } else {
         tracing::warn!("Email not configured, reset token generated but not sent");

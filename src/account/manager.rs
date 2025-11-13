@@ -5,7 +5,7 @@
 use crate::{
     account::AppPasswordInfo,
     config::ServerConfig,
-    db::account::{Account, Session},
+    db::account::{Account, Actor, ActorAccount, PlcKeys, Session},
     error::{PdsError, PdsResult},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -26,13 +26,16 @@ impl AccountManager {
     }
 
     /// Create a new account
+    ///
+    /// Creates a new actor with associated account credentials.
+    /// Inserts into actor, account, and plc_keys tables in a transaction.
     pub async fn create_account(
         &self,
         handle: String,
         email: Option<String>,
         password: String,
         _invite_code: Option<String>,
-    ) -> PdsResult<Account> {
+    ) -> PdsResult<ActorAccount> {
         // Note: Invite code validation is handled at the API layer
         // This keeps the AccountManager focused on account creation logic
 
@@ -63,72 +66,124 @@ impl AccountManager {
         // Generate DID with PLC registration
         let (did, plc_key, plc_key_public, plc_operation_cid) = self.generate_plc_did(&handle).await?;
 
-        // Insert account
         let now = Utc::now();
+
+        // Begin transaction to insert into multiple tables atomically
+        let mut tx = self.db.begin().await
+            .map_err(|e| PdsError::Database(e))?;
+
+        // Insert into actor table (public identity)
         sqlx::query(
-            "INSERT INTO account (did, handle, email, password_hash, created_at, email_confirmed, taken_down, plc_rotation_key, plc_rotation_key_public, plc_last_operation_cid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            "INSERT INTO actor (did, handle, created_at, takedown_ref, deactivated_at, delete_after)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL)"
         )
         .bind(&did)
         .bind(&handle)
-        .bind(&email)
-        .bind(&password_hash)
         .bind(now)
-        .bind(false)
-        .bind(false)
-        .bind(&plc_key)
-        .bind(&plc_key_public)
-        .bind(&plc_operation_cid)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| PdsError::Database(e))?;
 
-        Ok(Account {
+        // Insert into account table (private auth)
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled)
+             VALUES (?1, ?2, ?3, NULL, 0)"
+        )
+        .bind(&did)
+        .bind(&email)
+        .bind(&password_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        // Insert into plc_keys table (cryptographic material)
+        sqlx::query(
+            "INSERT INTO plc_keys (did, rotation_key, rotation_key_public, last_operation_cid)
+             VALUES (?1, ?2, ?3, ?4)"
+        )
+        .bind(&did)
+        .bind(&plc_key)
+        .bind(&plc_key_public)
+        .bind(&plc_operation_cid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        // Commit transaction
+        tx.commit().await
+            .map_err(|e| PdsError::Database(e))?;
+
+        // Return combined ActorAccount
+        Ok(ActorAccount {
+            // Actor fields
             did,
-            handle,
-            email,
-            password_hash,
+            handle: Some(handle),
             created_at: now,
-            email_confirmed: false,
-            email_confirmed_at: None,
+            takedown_ref: None,
             deactivated_at: None,
-            taken_down: false,
-            plc_rotation_key: Some(plc_key),
-            plc_rotation_key_public: Some(plc_key_public),
-            plc_last_operation_cid: Some(plc_operation_cid),
+            delete_after: None,
+            // Account fields
+            email,
+            password_hash: Some(password_hash),
+            email_confirmed_at: None,
+            invites_disabled: Some(false),
         })
     }
 
     /// Authenticate account and create session
+    ///
+    /// This function includes timing attack protection by ensuring a minimum
+    /// execution time of 350ms to prevent username enumeration via timing analysis.
     pub async fn login(
         &self,
         identifier: &str,
         password: &str,
-    ) -> PdsResult<(Account, Session)> {
-        // Find account by handle or email
-        let account = self.get_account_by_identifier(identifier).await?;
+    ) -> PdsResult<(ActorAccount, Session)> {
+        // Start timing for attack mitigation
+        let start = std::time::Instant::now();
 
-        // Check if account is deactivated or taken down
-        if account.deactivated_at.is_some() {
-            return Err(PdsError::Authorization("Account is deactivated".to_string()));
+        // Perform login logic - wrap in a scope so we can handle timing in finally block
+        let result = async {
+            // Find account by handle or email
+            let account = self.get_account_by_identifier(identifier).await?;
+
+            // Check if account is deactivated or taken down
+            if account.deactivated_at.is_some() {
+                return Err(PdsError::Authorization("Account is deactivated".to_string()));
+            }
+
+            if account.takedown_ref.is_some() {
+                return Err(PdsError::Authorization("Account has been taken down".to_string()));
+            }
+
+            // Verify password exists (must have local account)
+            let password_hash = account.password_hash.as_ref()
+                .ok_or_else(|| PdsError::Authentication("No local account credentials".to_string()))?;
+
+            // Verify password
+            let valid = atproto::server_auth::PasswordHasher::verify(password, password_hash)
+                .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
+
+            if !valid {
+                return Err(PdsError::Authentication("Invalid credentials".to_string()));
+            }
+
+            // Create session
+            let session = self.create_session(&account.did, None).await?;
+
+            Ok((account, session))
+        }.await;
+
+        // Mitigate timing attacks by ensuring minimum execution time
+        // This prevents attackers from distinguishing valid vs invalid usernames
+        // based on response time differences
+        let elapsed = start.elapsed().as_millis() as i64;
+        let wait_time = 350 - elapsed;
+        if wait_time > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_time as u64)).await;
         }
 
-        if account.taken_down {
-            return Err(PdsError::Authorization("Account has been taken down".to_string()));
-        }
-
-        // Verify password
-        let valid = atproto::server_auth::PasswordHasher::verify(password, &account.password_hash)
-            .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
-
-        if !valid {
-            return Err(PdsError::Authentication("Invalid credentials".to_string()));
-        }
-
-        // Create session
-        let session = self.create_session(&account.did, None).await?;
-
-        Ok((account, session))
+        result
     }
 
     /// Create a session for a DID
@@ -271,11 +326,16 @@ impl AccountManager {
     }
 
     /// Get account by DID
-    pub async fn get_account(&self, did: &str) -> PdsResult<Account> {
+    ///
+    /// Joins actor and account tables to get complete actor information.
+    pub async fn get_account(&self, did: &str) -> PdsResult<ActorAccount> {
         let row = sqlx::query(
-            "SELECT did, handle, email, password_hash, created_at, email_confirmed,
-                    email_confirmed_at, deactivated_at, taken_down
-             FROM account WHERE did = ?1"
+            "SELECT
+                a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
+             FROM actor a
+             LEFT JOIN account ac ON a.did = ac.did
+             WHERE a.did = ?1"
         )
         .bind(did)
         .fetch_optional(&self.db)
@@ -283,24 +343,24 @@ impl AccountManager {
         .map_err(|e| PdsError::Database(e))?
         .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
 
-        Ok(Account {
+        Ok(ActorAccount {
+            // Actor fields
             did: row.get("did"),
             handle: row.get("handle"),
+            created_at: row.get("created_at"),
+            takedown_ref: row.get("takedown_ref"),
+            deactivated_at: row.get("deactivated_at"),
+            delete_after: row.get("delete_after"),
+            // Account fields (may be None for federated actors)
             email: row.get("email"),
             password_hash: row.get("password_hash"),
-            created_at: row.get("created_at"),
-            email_confirmed: row.get("email_confirmed"),
             email_confirmed_at: row.get("email_confirmed_at"),
-            deactivated_at: row.get("deactivated_at"),
-            taken_down: row.get("taken_down"),
-            plc_rotation_key: row.get("plc_rotation_key"),
-            plc_rotation_key_public: row.get("plc_rotation_key_public"),
-            plc_last_operation_cid: row.get("plc_last_operation_cid"),
+            invites_disabled: row.get("invites_disabled"),
         })
     }
 
     /// Find account by handle or email (public for password reset)
-    pub async fn get_account_by_identifier(&self, identifier: &str) -> PdsResult<Account> {
+    pub async fn get_account_by_identifier(&self, identifier: &str) -> PdsResult<ActorAccount> {
         // Try handle first
         if let Ok(account) = self.get_account_by_handle(identifier).await {
             return Ok(account);
@@ -311,42 +371,50 @@ impl AccountManager {
     }
 
     /// Get account by handle
-    async fn get_account_by_handle(&self, handle: &str) -> PdsResult<Account> {
+    ///
+    /// Joins actor and account tables to get complete actor information.
+    async fn get_account_by_handle(&self, handle: &str) -> PdsResult<ActorAccount> {
         let row = sqlx::query(
-            "SELECT did, handle, email, password_hash, created_at, email_confirmed,
-                    email_confirmed_at, deactivated_at, taken_down,
-                    plc_rotation_key, plc_rotation_key_public, plc_last_operation_cid
-             FROM account WHERE handle = ?1"
+            "SELECT
+                a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
+             FROM actor a
+             LEFT JOIN account ac ON a.did = ac.did
+             WHERE a.handle = ?1"
         )
         .bind(handle)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| PdsError::Database(e))?
-        .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
+        .ok_or_else(|| PdsError::NotFound("Actor not found".to_string()))?;
 
-        Ok(Account {
+        Ok(ActorAccount {
+            // Actor fields
             did: row.get("did"),
             handle: row.get("handle"),
+            created_at: row.get("created_at"),
+            takedown_ref: row.get("takedown_ref"),
+            deactivated_at: row.get("deactivated_at"),
+            delete_after: row.get("delete_after"),
+            // Account fields (may be None for federated actors)
             email: row.get("email"),
             password_hash: row.get("password_hash"),
-            created_at: row.get("created_at"),
-            email_confirmed: row.get("email_confirmed"),
             email_confirmed_at: row.get("email_confirmed_at"),
-            deactivated_at: row.get("deactivated_at"),
-            taken_down: row.get("taken_down"),
-            plc_rotation_key: row.get("plc_rotation_key"),
-            plc_rotation_key_public: row.get("plc_rotation_key_public"),
-            plc_last_operation_cid: row.get("plc_last_operation_cid"),
+            invites_disabled: row.get("invites_disabled"),
         })
     }
 
     /// Get account by email
-    async fn get_account_by_email(&self, email: &str) -> PdsResult<Account> {
+    ///
+    /// Joins actor and account tables to get complete actor information.
+    async fn get_account_by_email(&self, email: &str) -> PdsResult<ActorAccount> {
         let row = sqlx::query(
-            "SELECT did, handle, email, password_hash, created_at, email_confirmed,
-                    email_confirmed_at, deactivated_at, taken_down,
-                    plc_rotation_key, plc_rotation_key_public, plc_last_operation_cid
-             FROM account WHERE email = ?1"
+            "SELECT
+                a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
+             FROM actor a
+             INNER JOIN account ac ON a.did = ac.did
+             WHERE ac.email = ?1"
         )
         .bind(email)
         .fetch_optional(&self.db)
@@ -354,25 +422,25 @@ impl AccountManager {
         .map_err(|e| PdsError::Database(e))?
         .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
 
-        Ok(Account {
+        Ok(ActorAccount {
+            // Actor fields
             did: row.get("did"),
             handle: row.get("handle"),
+            created_at: row.get("created_at"),
+            takedown_ref: row.get("takedown_ref"),
+            deactivated_at: row.get("deactivated_at"),
+            delete_after: row.get("delete_after"),
+            // Account fields
             email: row.get("email"),
             password_hash: row.get("password_hash"),
-            created_at: row.get("created_at"),
-            email_confirmed: row.get("email_confirmed"),
             email_confirmed_at: row.get("email_confirmed_at"),
-            deactivated_at: row.get("deactivated_at"),
-            taken_down: row.get("taken_down"),
-            plc_rotation_key: row.get("plc_rotation_key"),
-            plc_rotation_key_public: row.get("plc_rotation_key_public"),
-            plc_last_operation_cid: row.get("plc_last_operation_cid"),
+            invites_disabled: row.get("invites_disabled"),
         })
     }
 
     /// Check if handle exists
     async fn handle_exists(&self, handle: &str) -> PdsResult<bool> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account WHERE handle = ?1")
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actor WHERE handle = ?1")
             .bind(handle)
             .fetch_one(&self.db)
             .await
@@ -391,10 +459,10 @@ impl AccountManager {
 
         // Get current account to retrieve old handle
         let account = self.get_account(did).await?;
-        let old_handle = account.handle.clone();
+        let old_handle = account.handle.clone().unwrap_or_default();
 
         // Check if new handle is the same as current (no-op)
-        if old_handle == new_handle {
+        if account.handle.as_deref() == Some(new_handle) {
             return Ok(old_handle);
         }
 
@@ -405,8 +473,8 @@ impl AccountManager {
             }
         }
 
-        // Update handle in database
-        sqlx::query("UPDATE account SET handle = ?1 WHERE did = ?2")
+        // Update handle in actor table (not account table)
+        sqlx::query("UPDATE actor SET handle = ?1 WHERE did = ?2")
             .bind(new_handle)
             .bind(did)
             .execute(&self.db)
@@ -703,9 +771,9 @@ impl AccountManager {
             .await
             .map_err(|e| PdsError::Database(e))?;
 
-        // Mark email as confirmed in account
+        // Mark email as confirmed in account (only update email_confirmed_at)
         sqlx::query(
-            "UPDATE account SET email_confirmed = true, email_confirmed_at = ?1 WHERE did = ?2",
+            "UPDATE account SET email_confirmed_at = ?1 WHERE did = ?2",
         )
         .bind(now)
         .bind(&did)
@@ -864,8 +932,11 @@ impl AccountManager {
         // Get account
         let account = self.get_account(did).await?;
 
-        // Verify password
-        let valid = atproto::server_auth::PasswordHasher::verify(&account.password_hash, password)
+        // Verify password - must have local account credentials
+        let password_hash = account.password_hash
+            .ok_or_else(|| PdsError::Authorization("No local account credentials".to_string()))?;
+
+        let valid = atproto::server_auth::PasswordHasher::verify(password, &password_hash)
             .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
 
         if !valid {
@@ -876,7 +947,7 @@ impl AccountManager {
         let deletion_date = Utc::now() + Duration::days(30);
 
         sqlx::query(
-            "UPDATE account SET deactivated_at = ?1 WHERE did = ?2"
+            "UPDATE actor SET deactivated_at = ?1 WHERE did = ?2"
         )
         .bind(deletion_date)
         .bind(did)
@@ -909,12 +980,12 @@ impl AccountManager {
 
     /// Check if account is marked for deletion
     pub async fn is_account_pending_deletion(&self, did: &str) -> PdsResult<bool> {
-        let row = sqlx::query("SELECT deactivated_at FROM account WHERE did = ?1")
+        let row = sqlx::query("SELECT deactivated_at FROM actor WHERE did = ?1")
             .bind(did)
             .fetch_optional(&self.db)
             .await
             .map_err(|e| PdsError::Database(e))?
-            .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
+            .ok_or_else(|| PdsError::NotFound("Actor not found".to_string()))?;
 
         let deactivated_at: Option<DateTime<Utc>> = row.try_get("deactivated_at")?;
         Ok(deactivated_at.is_some())
@@ -922,7 +993,7 @@ impl AccountManager {
 
     /// Cancel account deletion (if within grace period)
     pub async fn cancel_account_deletion(&self, did: &str) -> PdsResult<()> {
-        sqlx::query("UPDATE account SET deactivated_at = NULL WHERE did = ?1")
+        sqlx::query("UPDATE actor SET deactivated_at = NULL WHERE did = ?1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -1051,50 +1122,70 @@ impl AccountManager {
     }
 
     /// Authenticate with app password
+    ///
+    /// This function includes timing attack protection by ensuring a minimum
+    /// execution time of 350ms to prevent username enumeration via timing analysis.
     pub async fn login_with_app_password(
         &self,
         identifier: &str,
         app_password: &str,
-    ) -> PdsResult<(Account, Session, String)> {
-        // Find account
-        let account = self.get_account_by_identifier(identifier).await?;
+    ) -> PdsResult<(ActorAccount, Session, String)> {
+        // Start timing for attack mitigation
+        let start = std::time::Instant::now();
 
-        // Check if account is deactivated or taken down
-        if account.deactivated_at.is_some() {
-            return Err(PdsError::Authorization("Account is deactivated".to_string()));
-        }
+        // Perform login logic - wrap in a scope so we can handle timing in finally block
+        let result = async {
+            // Find account
+            let account = self.get_account_by_identifier(identifier).await?;
 
-        if account.taken_down {
-            return Err(PdsError::Authorization("Account has been taken down".to_string()));
-        }
-
-        // Find matching app password by trying to verify against all user's app passwords
-        let rows = sqlx::query(
-            "SELECT name, password_hash FROM app_password WHERE did = ?1"
-        )
-        .bind(&account.did)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| PdsError::Database(e))?;
-
-        let mut matched_name: Option<String> = None;
-        for row in rows {
-            let name: String = row.get("name");
-            let hash: String = row.get("password_hash");
-
-            if let Ok(true) = atproto::server_auth::PasswordHasher::verify(app_password, &hash) {
-                matched_name = Some(name);
-                break;
+            // Check if account is deactivated or taken down
+            if account.deactivated_at.is_some() {
+                return Err(PdsError::Authorization("Account is deactivated".to_string()));
             }
+
+            if account.takedown_ref.is_some() {
+                return Err(PdsError::Authorization("Account has been taken down".to_string()));
+            }
+
+            // Find matching app password by trying to verify against all user's app passwords
+            let rows = sqlx::query(
+                "SELECT name, password_hash FROM app_password WHERE did = ?1"
+            )
+            .bind(&account.did)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+            let mut matched_name: Option<String> = None;
+            for row in rows {
+                let name: String = row.get("name");
+                let hash: String = row.get("password_hash");
+
+                if let Ok(true) = atproto::server_auth::PasswordHasher::verify(app_password, &hash) {
+                    matched_name = Some(name);
+                    break;
+                }
+            }
+
+            let app_password_name = matched_name
+                .ok_or_else(|| PdsError::Authentication("Invalid app password".to_string()))?;
+
+            // Create session with app_password_name
+            let session = self.create_session(&account.did, Some(app_password_name.clone())).await?;
+
+            Ok((account, session, app_password_name))
+        }.await;
+
+        // Mitigate timing attacks by ensuring minimum execution time
+        // This prevents attackers from distinguishing valid vs invalid usernames
+        // based on response time differences
+        let elapsed = start.elapsed().as_millis() as i64;
+        let wait_time = 350 - elapsed;
+        if wait_time > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_time as u64)).await;
         }
 
-        let app_password_name = matched_name
-            .ok_or_else(|| PdsError::Authentication("Invalid app password".to_string()))?;
-
-        // Create session with app_password_name
-        let session = self.create_session(&account.did, Some(app_password_name.clone())).await?;
-
-        Ok((account, session, app_password_name))
+        result
     }
 
     /// Generate random alphanumeric string
@@ -1148,36 +1239,61 @@ impl AccountManager {
     ///
     /// Returns accounts ordered by DID for consistent pagination.
     /// Use the last DID as cursor for next page.
+    /// Joins actor and account tables to get complete information.
     pub async fn list_accounts(
         &self,
         cursor: Option<&str>,
         limit: i64,
-    ) -> PdsResult<Vec<Account>> {
-        let query = if let Some(cursor_did) = cursor {
-            sqlx::query_as::<_, Account>(
-                "SELECT did, handle, email, password_hash, created_at, email_confirmed,
-                        email_confirmed_at, deactivated_at, taken_down, plc_rotation_key,
-                        plc_rotation_key_public, plc_last_operation_cid
-                 FROM account
-                 WHERE did > ?1
-                 ORDER BY did
+    ) -> PdsResult<Vec<ActorAccount>> {
+        let rows = if let Some(cursor_did) = cursor {
+            sqlx::query(
+                "SELECT
+                    a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                    ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
+                 FROM actor a
+                 LEFT JOIN account ac ON a.did = ac.did
+                 WHERE a.did > ?1
+                 ORDER BY a.did
                  LIMIT ?2"
             )
             .bind(cursor_did)
             .bind(limit)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?
         } else {
-            sqlx::query_as::<_, Account>(
-                "SELECT did, handle, email, password_hash, created_at, email_confirmed,
-                        email_confirmed_at, deactivated_at, taken_down, plc_rotation_key,
-                        plc_rotation_key_public, plc_last_operation_cid
-                 FROM account
-                 ORDER BY did
+            sqlx::query(
+                "SELECT
+                    a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                    ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
+                 FROM actor a
+                 LEFT JOIN account ac ON a.did = ac.did
+                 ORDER BY a.did
                  LIMIT ?1"
             )
             .bind(limit)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?
         };
 
-        let accounts = query.fetch_all(&self.db).await?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            accounts.push(ActorAccount {
+                // Actor fields
+                did: row.get("did"),
+                handle: row.get("handle"),
+                created_at: row.get("created_at"),
+                takedown_ref: row.get("takedown_ref"),
+                deactivated_at: row.get("deactivated_at"),
+                delete_after: row.get("delete_after"),
+                // Account fields (may be None for federated actors)
+                email: row.get("email"),
+                password_hash: row.get("password_hash"),
+                email_confirmed_at: row.get("email_confirmed_at"),
+                invites_disabled: row.get("invites_disabled"),
+            });
+        }
 
         Ok(accounts)
     }
@@ -1798,7 +1914,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(account.handle, "alice");
+        assert_eq!(account.handle, Some("alice".to_string()));
 
         // Update handle to new value
         let old_handle = manager
@@ -1810,7 +1926,7 @@ mod tests {
 
         // Verify handle was updated in database
         let updated_account = manager.get_account(&account.did).await.unwrap();
-        assert_eq!(updated_account.handle, "alice-new");
+        assert_eq!(updated_account.handle, Some("alice-new".to_string()));
 
         // Verify we can still get account by new handle
         let by_handle = manager
@@ -1848,7 +1964,7 @@ mod tests {
 
         // Verify bob's handle unchanged
         let bob_account = manager.get_account(&account2.did).await.unwrap();
-        assert_eq!(bob_account.handle, "bob");
+        assert_eq!(bob_account.handle, Some("bob".to_string()));
     }
 
     #[tokio::test]
@@ -1871,7 +1987,7 @@ mod tests {
 
         // Verify handle unchanged
         let updated_account = manager.get_account(&account.did).await.unwrap();
-        assert_eq!(updated_account.handle, "alice");
+        assert_eq!(updated_account.handle, Some("alice".to_string()));
     }
 
     #[tokio::test]
@@ -1895,6 +2011,6 @@ mod tests {
 
         // Verify handle unchanged
         let unchanged_account = manager.get_account(&account.did).await.unwrap();
-        assert_eq!(unchanged_account.handle, "alice");
+        assert_eq!(unchanged_account.handle, Some("alice".to_string()));
     }
 }

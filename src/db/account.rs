@@ -3,24 +3,81 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-/// Account record in the database
+/// Actor record - public identity information
+///
+/// Represents the public-facing identity of a user in the ATProto network.
+/// This table can contain entries for both local accounts and federated actors
+/// from other PDS instances.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct Actor {
+    /// Decentralized Identifier (DID) - primary key
+    pub did: String,
+    /// Handle (username/domain) - can be null for not-yet-claimed actors
+    pub handle: Option<String>,
+    /// When the actor was created
+    pub created_at: DateTime<Utc>,
+    /// Reference to takedown/moderation action (if any)
+    pub takedown_ref: Option<String>,
+    /// When the actor was deactivated (soft delete)
+    pub deactivated_at: Option<DateTime<Utc>>,
+    /// When the actor should be permanently deleted (after deactivation grace period)
+    pub delete_after: Option<DateTime<Utc>>,
+}
+
+/// Account record - private authentication information
+///
+/// Represents the private authentication credentials for local accounts.
+/// This table only contains entries for accounts hosted on this PDS instance.
+/// Foreign key relationship: Account.did -> Actor.did
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Account {
+    /// Decentralized Identifier (DID) - foreign key to actor.did
     pub did: String,
-    pub handle: String,
+    /// Email address (optional, but required for password auth)
     pub email: Option<String>,
+    /// Password hash (Argon2id)
     pub password_hash: String,
-    pub created_at: DateTime<Utc>,
-    pub email_confirmed: bool,
+    /// When email was confirmed
     pub email_confirmed_at: Option<DateTime<Utc>>,
+    /// Whether invite code generation is disabled for this account
+    pub invites_disabled: bool,
+}
+
+/// Combined Actor + Account data for convenience
+///
+/// This struct is used when querying both tables together for operations
+/// that need both public and private account information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorAccount {
+    // Actor fields
+    pub did: String,
+    pub handle: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub takedown_ref: Option<String>,
     pub deactivated_at: Option<DateTime<Utc>>,
-    pub taken_down: bool,
+    pub delete_after: Option<DateTime<Utc>>,
+
+    // Account fields (optional - may be None for federated actors)
+    pub email: Option<String>,
+    pub password_hash: Option<String>,
+    pub email_confirmed_at: Option<DateTime<Utc>>,
+    pub invites_disabled: Option<bool>,
+}
+
+/// PLC (Public Ledger of Credentials) key storage
+///
+/// Stores the rotation keys for DID:PLC management.
+/// Separate from Actor/Account to keep cryptographic material isolated.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct PlcKeys {
+    /// DID this key belongs to
+    pub did: String,
     /// PLC rotation key (private key, hex-encoded, 32 bytes)
-    pub plc_rotation_key: Option<String>,
+    pub rotation_key: String,
     /// PLC rotation key public (compressed public key, hex-encoded, 33 bytes)
-    pub plc_rotation_key_public: Option<String>,
+    pub rotation_key_public: String,
     /// Last PLC operation CID
-    pub plc_last_operation_cid: Option<String>,
+    pub last_operation_cid: Option<String>,
 }
 
 /// Session record in the database

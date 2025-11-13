@@ -717,8 +717,8 @@ async fn get_account(
         "handle": account.handle,
         "email": account.email,
         "created_at": account.created_at,
-        "email_confirmed": account.email_confirmed,
-        "takedown": account.taken_down,
+        "email_confirmed": account.email_confirmed_at.is_some(),
+        "takedown": account.takedown_ref.is_some(),
     })))
 }
 

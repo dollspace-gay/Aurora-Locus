@@ -353,7 +353,7 @@ pub async fn list_repos(
         // Get the repository root for this DID
         if let Ok(repo_root) = ctx.actor_store.get_repo_root(&account.did).await {
             let (active, status) = get_repo_status(
-                account.taken_down,
+                account.takedown_ref.is_some(),
                 account.deactivated_at.as_ref(),
             );
 
@@ -393,7 +393,7 @@ pub async fn get_repo_status_endpoint(
         .await?;
 
     let (active, status) = get_repo_status(
-        account.taken_down,
+        account.takedown_ref.is_some(),
         account.deactivated_at.as_ref(),
     );
 

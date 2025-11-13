@@ -75,7 +75,7 @@ impl LocalViewer {
 
         let mut profile = ProfileViewBasic {
             did: self.did.clone(),
-            handle: account.handle,
+            handle: account.handle.unwrap_or_default(),
             display_name: None,
             avatar: None,
         };

@@ -43,7 +43,7 @@ pub async fn assert_repo_availability(
     }
 
     // Check if account is takendown
-    if account.taken_down {
+    if account.takedown_ref.is_some() {
         return Err(PdsError::Validation(format!(
             "Repo has been takendown: {}",
             did
