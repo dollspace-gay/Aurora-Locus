@@ -45,6 +45,8 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.submitReport", post(submit_report))
         .route("/xrpc/com.atproto.admin.updateReportStatus", post(update_report_status))
         .route("/xrpc/com.atproto.admin.listReports", get(list_reports))
+        // Validation failures
+        .route("/xrpc/com.atproto.admin.getValidationFailures", get(get_validation_failures))
 }
 
 // ============================================================================
@@ -836,5 +838,34 @@ async fn disable_invite_code(
     Ok(Json(serde_json::json!({
         "success": true,
         "code": req.code,
+    })))
+}
+
+// ============================================================================
+// Validation Failures
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct GetValidationFailuresQuery {
+    did: String,
+    collection: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn get_validation_failures(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(params): Query<GetValidationFailuresQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let failures = ctx
+        .actor_store
+        .get_validation_failures(&params.did, params.collection.as_deref(), params.limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "did": params.did,
+        "failures": failures,
+        "count": failures.len(),
     })))
 }

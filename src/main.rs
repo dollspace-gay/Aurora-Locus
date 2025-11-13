@@ -4,7 +4,6 @@
 /// and federation capabilities for the AT Protocol network.
 
 mod account;
-mod actor_store;
 mod admin;
 mod api;
 mod auth;
@@ -12,6 +11,7 @@ mod backup;
 mod blob_store;
 mod cache;
 mod car;
+mod cli;
 mod config;
 mod context;
 mod crypto;
@@ -24,10 +24,14 @@ mod oauth;
 mod mailer;
 mod metrics;
 mod rate_limit;
+mod read_after_write;
+mod actor_store;  // Must come after read_after_write (uses its types)
 mod sequencer;
 mod server;
 mod validation;
 
+use clap::Parser;
+use cli::{Cli, Commands};
 use config::ServerConfig;
 use context::AppContext;
 use error::PdsResult;
@@ -56,6 +60,9 @@ async fn main() -> PdsResult<()> {
             .init();
     }
 
+    // Parse CLI arguments
+    let cli = Cli::parse();
+
     // Print banner
     print_banner();
 
@@ -66,12 +73,66 @@ async fn main() -> PdsResult<()> {
     let ctx = AppContext::new(config).await?;
     let ctx = std::sync::Arc::new(ctx);
 
-    // Start background jobs
-    let scheduler = std::sync::Arc::new(jobs::JobScheduler::new(Arc::clone(&ctx)));
-    scheduler.start();
+    // Handle CLI commands
+    match cli.command {
+        Some(Commands::Serve) | None => {
+            // Start background jobs
+            let scheduler = std::sync::Arc::new(jobs::JobScheduler::new(Arc::clone(&ctx)));
+            scheduler.start();
 
-    // Start server
-    server::serve((*ctx).clone()).await?;
+            // Start server
+            server::serve((*ctx).clone()).await?;
+        }
+
+        Some(Commands::MigrateOauth { did, yes, dry_run }) => {
+            if !yes && !dry_run {
+                println!("WARNING: This will revoke all active JWT sessions for {}", did);
+                println!("The user will need to re-authenticate using OAuth 2.1");
+                print!("\nContinue? [y/N]: ");
+                use std::io::{self, Write};
+                io::stdout().flush().unwrap();
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).unwrap();
+
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Migration cancelled.");
+                    return Ok(());
+                }
+            }
+
+            let result = cli::migrate_oauth::migrate_user(&ctx, &did, dry_run).await?;
+            cli::migrate_oauth::print_migration_result(&result);
+        }
+
+        Some(Commands::BulkMigrateOauth { yes, dry_run }) => {
+            if !yes && !dry_run {
+                println!("WARNING: This will revoke all active JWT sessions for ALL users");
+                println!("All users will need to re-authenticate using OAuth 2.1");
+                print!("\nContinue? [y/N]: ");
+                use std::io::{self, Write};
+                io::stdout().flush().unwrap();
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).unwrap();
+
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Bulk migration cancelled.");
+                    return Ok(());
+                }
+            }
+
+            let results = cli::migrate_oauth::bulk_migrate_users(&ctx, dry_run).await?;
+
+            println!("\n════════════════════════════════════════════════════════");
+            println!("  Bulk Migration Summary");
+            println!("════════════════════════════════════════════════════════");
+            println!("Total users processed: {}", results.len());
+            println!("Successful migrations: {}", results.iter().filter(|r| r.success).count());
+            println!("Skipped: {}", results.iter().filter(|r| !r.success).count());
+            println!("════════════════════════════════════════════════════════\n");
+        }
+    }
 
     Ok(())
 }

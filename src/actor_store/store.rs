@@ -2,6 +2,7 @@
 use crate::{
     actor_store::{get_actor_location, models::*, ActorLocation},
     error::{PdsError, PdsResult},
+    read_after_write::{LocalRecords, RecordDescript},
 };
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
@@ -101,6 +102,17 @@ impl ActorStore {
 
             CREATE INDEX IF NOT EXISTS idx_record_collection ON record(collection);
             CREATE INDEX IF NOT EXISTS idx_record_rkey ON record(rkey);
+
+            CREATE TABLE IF NOT EXISTS lexicon_failure (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                collection TEXT NOT NULL,
+                record_uri TEXT NOT NULL,
+                validation_errors TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_lexicon_failure_collection ON lexicon_failure(collection);
+            CREATE INDEX IF NOT EXISTS idx_lexicon_failure_created_at ON lexicon_failure(created_at);
             "#
         )
         .execute(&pool)
@@ -169,6 +181,38 @@ impl ActorStore {
         }
 
         Ok(pool)
+    }
+
+    /// Begin a new transaction for atomic operations
+    ///
+    /// Returns an ActorTransaction handle that provides a safe, typed interface
+    /// for performing multiple database operations atomically.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use aurora_locus::actor_store::ActorStore;
+    /// # async fn example(store: ActorStore) -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut txn = store.begin_transaction("did:plc:alice").await?;
+    ///
+    /// txn.insert_block("cid123", b"content").await?;
+    /// txn.update_repo_root("cid123", "rev456").await?;
+    ///
+    /// txn.commit().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn begin_transaction(&self, did: &str) -> PdsResult<crate::actor_store::ActorTransaction<'_>> {
+        let pool = self.open_db(did).await?;
+
+        let txn = pool.begin()
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        Ok(crate::actor_store::ActorTransaction::new(
+            txn,
+            did.to_string(),
+            Arc::new(self.clone()),
+        ))
     }
 
     /// Get the current repository root
@@ -345,6 +389,91 @@ impl ActorStore {
         Ok(())
     }
 
+    /// Get records created since a specific repo revision
+    ///
+    /// Used for read-after-write consistency to fetch records that might not
+    /// be indexed in AppView yet.
+    pub async fn get_records_since_rev(
+        &self,
+        did: &str,
+        since_rev: &str,
+    ) -> PdsResult<LocalRecords> {
+        let pool = self.open_db(did).await?;
+
+        // Fetch all records with repo_rev > since_rev
+        let rows = sqlx::query(
+            "SELECT uri, cid, collection, rkey, repo_rev, indexed_at, takedown_ref
+             FROM record
+             WHERE repo_rev > ?1
+             ORDER BY repo_rev ASC"
+        )
+        .bind(since_rev)
+        .fetch_all(&pool)
+        .await?;
+
+        let mut profile: Option<RecordDescript> = None;
+        let mut posts: Vec<RecordDescript> = Vec::new();
+
+        for row in rows.iter() {
+            let uri: String = row.get("uri");
+            let cid: String = row.get("cid");
+            let collection: String = row.get("collection");
+            let indexed_at: chrono::DateTime<chrono::Utc> = row.get("indexed_at");
+
+            // Get the record value (JSON) from the block store
+            let record_value = match self.get_record_value(did, &cid).await {
+                Ok(Some(value)) => value,
+                Ok(None) => continue, // Skip if record data not found
+                Err(_) => continue,   // Skip on error
+            };
+
+            let descript = RecordDescript {
+                uri: uri.clone(),
+                cid,
+                indexed_at: indexed_at.to_rfc3339(),
+                record: record_value,
+            };
+
+            // Categorize by collection
+            if collection == "app.bsky.actor.profile" {
+                profile = Some(descript);
+            } else if collection == "app.bsky.feed.post" {
+                posts.push(descript);
+            }
+            // Future: handle other collections (likes, reposts, follows, etc.)
+        }
+
+        let count = rows.len();
+
+        Ok(LocalRecords {
+            count,
+            profile,
+            posts,
+        })
+    }
+
+    /// Get the JSON value of a record by CID
+    async fn get_record_value(&self, did: &str, cid: &str) -> PdsResult<Option<serde_json::Value>> {
+        let pool = self.open_db(did).await?;
+
+        let block = sqlx::query(
+            "SELECT content FROM repo_block WHERE cid = ?1"
+        )
+        .bind(cid)
+        .fetch_optional(&pool)
+        .await?;
+
+        if let Some(row) = block {
+            let content: Vec<u8> = row.get("content");
+            // Decode CBOR to JSON
+            let value: serde_json::Value = serde_cbor::from_slice(&content)
+                .map_err(|e| PdsError::Internal(format!("Failed to decode record CBOR: {}", e)))?;
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Count records in a collection
     pub async fn count_records(&self, did: &str, collection: &str) -> PdsResult<i64> {
         let pool = self.open_db(did).await?;
@@ -442,6 +571,81 @@ impl ActorStore {
                 takedown_ref: row.get("takedown_ref"),
             })
             .collect();
+
+        Ok(records)
+    }
+
+    /// Track a validation failure for debugging and analysis
+    pub async fn track_validation_failure(
+        &self,
+        did: &str,
+        collection: &str,
+        record_uri: &str,
+        errors: &[crate::validation::ValidationError],
+    ) -> PdsResult<()> {
+        let pool = self.open_db(did).await?;
+
+        // Serialize validation errors to JSON
+        let errors_json = serde_json::to_string(errors)
+            .map_err(|e| PdsError::Internal(format!("Failed to serialize validation errors: {}", e)))?;
+
+        // Insert into lexicon_failure table
+        sqlx::query(
+            "INSERT INTO lexicon_failure (collection, record_uri, validation_errors)
+             VALUES (?1, ?2, ?3)"
+        )
+        .bind(collection)
+        .bind(record_uri)
+        .bind(&errors_json)
+        .execute(&pool)
+        .await?;
+
+        tracing::debug!(
+            "Tracked validation failure for {}: collection={}, errors={}",
+            record_uri,
+            collection,
+            errors.len()
+        );
+
+        Ok(())
+    }
+
+    /// Query validation failures for analysis
+    pub async fn get_validation_failures(
+        &self,
+        did: &str,
+        collection: Option<&str>,
+        limit: Option<i64>,
+    ) -> PdsResult<Vec<ValidationFailureRecord>> {
+        let pool = self.open_db(did).await?;
+
+        let records = if let Some(coll) = collection {
+            // Query by specific collection
+            let limit = limit.unwrap_or(100);
+            sqlx::query_as::<_, ValidationFailureRecord>(
+                "SELECT id, collection, record_uri, validation_errors, created_at
+                 FROM lexicon_failure
+                 WHERE collection = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2"
+            )
+            .bind(coll)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await?
+        } else {
+            // Query all failures
+            let limit = limit.unwrap_or(100);
+            sqlx::query_as::<_, ValidationFailureRecord>(
+                "SELECT id, collection, record_uri, validation_errors, created_at
+                 FROM lexicon_failure
+                 ORDER BY created_at DESC
+                 LIMIT ?1"
+            )
+            .bind(limit)
+            .fetch_all(&pool)
+            .await?
+        };
 
         Ok(records)
     }

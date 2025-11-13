@@ -1,5 +1,6 @@
 /// Configuration management for Aurora Locus PDS
 use crate::error::{PdsError, PdsResult};
+use crate::validation::ValidationMode;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ pub struct ServerConfig {
     pub rate_limit: RateLimitConfig,
     pub logging: LoggingConfig,
     pub federation: FederationConfig,
+    pub validation_mode: ValidationMode,
 }
 
 /// Service-level configuration
@@ -66,6 +68,24 @@ pub struct AuthConfig {
     pub admin_dids: Vec<String>,
     /// OAuth configuration for admin login
     pub oauth: OAuthConfig,
+    /// JWT deprecation sunset date (RFC 7231 format: "Sat, 31 Dec 2024 23:59:59 GMT")
+    /// When JWT auth will be removed in favor of OAuth 2.1
+    #[serde(default = "default_jwt_sunset_date")]
+    pub jwt_sunset_date: String,
+    /// URL to OAuth migration guide for developers
+    #[serde(default = "default_migration_guide_url")]
+    pub oauth_migration_guide_url: String,
+}
+
+fn default_jwt_sunset_date() -> String {
+    // Default to 90 days from now
+    use chrono::{Duration, Utc};
+    let sunset = Utc::now() + Duration::days(90);
+    sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+fn default_migration_guide_url() -> String {
+    "https://docs.atproto.com/guides/oauth-migration".to_string()
 }
 
 /// OAuth configuration for admin authentication
@@ -123,6 +143,8 @@ pub struct FederationConfig {
     pub enabled: bool,
     /// Bluesky relay URL (e.g., https://bsky.network)
     pub relay_urls: Vec<String>,
+    /// AppView URL for feed/profile proxying (e.g., https://api.bsky.app)
+    pub appview_url: Option<String>,
     /// Enable firehose WebSocket endpoint for event streaming
     pub firehose_enabled: bool,
     /// Allow relay to crawl repositories
@@ -261,6 +283,12 @@ impl ServerConfig {
 
         let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
+        // Validation mode
+        let validation_mode = env::var("VALIDATION_MODE")
+            .ok()
+            .and_then(|s| ValidationMode::from_str(&s))
+            .unwrap_or_default();
+
         // Federation configuration
         let federation_enabled = env::var("PDS_FEDERATION_ENABLED")
             .unwrap_or_else(|_| "false".to_string())
@@ -271,6 +299,7 @@ impl ServerConfig {
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
+        let appview_url = env::var("PDS_APPVIEW_URL").ok();
         let firehose_enabled = env::var("PDS_FEDERATION_FIREHOSE_ENABLED")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
@@ -311,6 +340,8 @@ impl ServerConfig {
                     redirect_uri: oauth_redirect_uri,
                     pds_url: oauth_pds_url,
                 },
+                jwt_sunset_date: default_jwt_sunset_date(),
+                oauth_migration_guide_url: default_migration_guide_url(),
             },
             identity: IdentityConfig {
                 did_plc_url,
@@ -332,11 +363,13 @@ impl ServerConfig {
             federation: FederationConfig {
                 enabled: federation_enabled,
                 relay_urls,
+                appview_url,
                 firehose_enabled,
                 crawl_enabled,
                 public_url,
                 auto_stream_events,
             },
+            validation_mode,
         })
     }
 

@@ -96,3 +96,13 @@ pub struct PreparedWrite {
     pub swap_cid: Option<String>,
     pub validate: Option<bool>,
 }
+
+/// Validation failure record for debugging
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ValidationFailureRecord {
+    pub id: i64,
+    pub collection: String,
+    pub record_uri: String,
+    pub validation_errors: String,  // JSON string
+    pub created_at: String,
+}

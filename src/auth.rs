@@ -14,11 +14,21 @@ use axum::{
 };
 use uuid::Uuid;
 
+/// Authentication method used for the request
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// OAuth 2.1 token (modern)
+    OAuth,
+    /// Legacy JWT session token
+    JWT,
+}
+
 /// Authenticated context - extracts and validates session from request
 #[derive(Debug, Clone)]
 pub struct AuthContext {
     pub did: String,
     pub session: ValidatedSession,
+    pub auth_method: AuthMethod,
 }
 
 #[async_trait]
@@ -29,19 +39,61 @@ impl FromRequestParts<AppContext> for AuthContext {
         parts: &mut Parts,
         state: &AppContext,
     ) -> Result<Self, Self::Rejection> {
+        use std::time::Instant;
+
         // Extract bearer token from Authorization header
         let token = extract_bearer_token(&parts.headers)
             .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
 
-        // Validate token
-        let session = state
-            .account_manager
-            .validate_access_token(&token)
-            .await?;
+        let start = Instant::now();
 
-        let did = session.did.clone();
+        // Try OAuth validation first (modern standard)
+        match validate_oauth_token(state, &token).await {
+            Ok(oauth_token) => {
+                let duration = start.elapsed().as_secs_f64();
 
-        Ok(AuthContext { did, session })
+                // Create session from OAuth token
+                let session = ValidatedSession {
+                    did: oauth_token.did.clone(),
+                    session_id: oauth_token.token_id.clone(),
+                    is_app_password: false,
+                };
+
+                // Record metrics
+                crate::metrics::record_oauth_token_exchange("validation", "success", duration);
+
+                // Store auth method in extensions for middleware
+                parts.extensions.insert(AuthMethod::OAuth);
+
+                Ok(AuthContext {
+                    did: oauth_token.did,
+                    session,
+                    auth_method: AuthMethod::OAuth,
+                })
+            }
+            Err(_) => {
+                // Fallback to JWT validation for backward compatibility
+                let session = state
+                    .account_manager
+                    .validate_access_token(&token)
+                    .await?;
+
+                let did = session.did.clone();
+                let duration = start.elapsed().as_secs_f64();
+
+                // Record metrics (JWT fallback)
+                crate::metrics::record_oauth_token_exchange("jwt_fallback", "success", duration);
+
+                // Store auth method in extensions for middleware
+                parts.extensions.insert(AuthMethod::JWT);
+
+                Ok(AuthContext {
+                    did,
+                    session,
+                    auth_method: AuthMethod::JWT,
+                })
+            }
+        }
     }
 }
 
@@ -59,17 +111,60 @@ impl FromRequestParts<AppContext> for OptionalAuthContext {
         parts: &mut Parts,
         state: &AppContext,
     ) -> Result<Self, Self::Rejection> {
+        use std::time::Instant;
+
         // Try to extract bearer token
         let token = extract_bearer_token(&parts.headers);
 
         let auth = if let Some(token) = token {
-            // Try to validate
-            match state.account_manager.validate_access_token(&token).await {
-                Ok(session) => {
-                    let did = session.did.clone();
-                    Some(AuthContext { did, session })
+            let start = Instant::now();
+
+            // Try OAuth validation first
+            match validate_oauth_token(state, &token).await {
+                Ok(oauth_token) => {
+                    let duration = start.elapsed().as_secs_f64();
+
+                    // Create session from OAuth token
+                    let session = ValidatedSession {
+                        did: oauth_token.did.clone(),
+                        session_id: oauth_token.token_id.clone(),
+                        is_app_password: false,
+                    };
+
+                    // Record metrics
+                    crate::metrics::record_oauth_token_exchange("validation_optional", "success", duration);
+
+                    // Store auth method in extensions for middleware
+                    parts.extensions.insert(AuthMethod::OAuth);
+
+                    Some(AuthContext {
+                        did: oauth_token.did,
+                        session,
+                        auth_method: AuthMethod::OAuth,
+                    })
                 }
-                Err(_) => None,
+                Err(_) => {
+                    // Fallback to JWT validation
+                    match state.account_manager.validate_access_token(&token).await {
+                        Ok(session) => {
+                            let did = session.did.clone();
+                            let duration = start.elapsed().as_secs_f64();
+
+                            // Record metrics (JWT fallback)
+                            crate::metrics::record_oauth_token_exchange("jwt_fallback_optional", "success", duration);
+
+                            // Store auth method in extensions for middleware
+                            parts.extensions.insert(AuthMethod::JWT);
+
+                            Some(AuthContext {
+                                did,
+                                session,
+                                auth_method: AuthMethod::JWT,
+                            })
+                        }
+                        Err(_) => None,
+                    }
+                }
             }
         } else {
             None

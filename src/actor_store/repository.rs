@@ -7,7 +7,7 @@ use crate::{
     actor_store::ActorStore,
     error::{PdsError, PdsResult},
     sequencer::{events::{CommitEvent, CommitOp, OpAction}, Sequencer},
-    validation::{RecordValidator, validation_errors_to_pds_error},
+    validation::{RecordValidator, ValidationMode, validation_errors_to_pds_error},
 };
 use atproto::{
     repo::Repository as SdkRepo,
@@ -54,22 +54,37 @@ pub struct RepositoryManager {
 }
 
 impl RepositoryManager {
-    /// Create a new repository manager for a DID
+    /// Create a new repository manager for a DID with default validation mode
     pub fn new(did: String, store: ActorStore) -> Self {
+        Self::with_validation_mode(did, store, ValidationMode::default())
+    }
+
+    /// Create a new repository manager with specific validation mode
+    pub fn with_validation_mode(did: String, store: ActorStore, mode: ValidationMode) -> Self {
         Self {
             did,
             store,
-            validator: RecordValidator::new(),
+            validator: RecordValidator::with_mode(mode),
             sequencer: None,
         }
     }
 
-    /// Create a new repository manager with sequencer support
+    /// Create a new repository manager with sequencer support (default validation mode)
     pub fn with_sequencer(did: String, store: ActorStore, sequencer: Arc<Sequencer>) -> Self {
+        Self::with_sequencer_and_validation(did, store, sequencer, ValidationMode::default())
+    }
+
+    /// Create a new repository manager with sequencer support and specific validation mode
+    pub fn with_sequencer_and_validation(
+        did: String,
+        store: ActorStore,
+        sequencer: Arc<Sequencer>,
+        mode: ValidationMode,
+    ) -> Self {
         Self {
             did,
             store,
-            validator: RecordValidator::new(),
+            validator: RecordValidator::with_mode(mode),
             sequencer: Some(sequencer),
         }
     }
@@ -178,7 +193,42 @@ impl RepositoryManager {
                     let should_validate = write.validate.unwrap_or(true);
                     if should_validate {
                         if let Err(errors) = self.validator.validate(collection, &value) {
-                            return Err(validation_errors_to_pds_error(errors));
+                            let uri = format!("at://{}/{}/{}", self.did, collection, rkey);
+
+                            // Track validation failure for debugging
+                            // In Optimistic mode, we track but still accept the record
+                            // In Required mode, we track and reject
+                            if self.validator.mode() == ValidationMode::Optimistic {
+                                // Track failure but continue
+                                if let Err(e) = self.store.track_validation_failure(
+                                    &self.did,
+                                    collection,
+                                    &uri,
+                                    &errors
+                                ).await {
+                                    tracing::warn!(
+                                        "Failed to track validation failure for {}: {}",
+                                        uri,
+                                        e
+                                    );
+                                }
+                                tracing::warn!(
+                                    "Validation failed for {} but accepting in Optimistic mode: {} error(s)",
+                                    uri,
+                                    errors.len()
+                                );
+                            } else {
+                                // Required mode or unknown collections - reject the record
+                                // Track the failure before returning error
+                                let _ = self.store.track_validation_failure(
+                                    &self.did,
+                                    collection,
+                                    &uri,
+                                    &errors
+                                ).await;
+
+                                return Err(validation_errors_to_pds_error(errors));
+                            }
                         }
                     }
 

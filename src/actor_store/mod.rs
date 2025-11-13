@@ -7,6 +7,7 @@ pub mod car;
 pub mod models;
 pub mod repository;
 pub mod store;
+pub mod transaction;
 
 // Re-export commonly used types (allow unused for now as they're part of the public API)
 #[allow(unused_imports)]
@@ -15,6 +16,7 @@ pub use repository::{RepositoryManager, WriteOp};
 #[allow(unused_imports)]
 pub use repository::WriteOpAction;
 pub use store::{ActorStore, ActorStoreConfig};
+pub use transaction::ActorTransaction;
 
 use std::path::PathBuf;
 

@@ -230,10 +230,11 @@ async fn create_record(
 
     // Create repository manager with sequencer
     tracing::debug!("create_record: Creating repository manager with sequencer");
-    let repo_mgr = RepositoryManager::with_sequencer(
+    let repo_mgr = RepositoryManager::with_sequencer_and_validation(
         auth_did.to_string(),
         (*ctx.actor_store).clone(),
         ctx.sequencer.clone(),
+        ctx.config.validation_mode,
     );
 
     // Create signer from repo key
@@ -280,7 +281,12 @@ async fn put_record(
     }
 
     // Create repository manager
-    let repo_mgr = RepositoryManager::with_sequencer(auth_did.to_string(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
+    let repo_mgr = RepositoryManager::with_sequencer_and_validation(
+        auth_did.to_string(),
+        (*ctx.actor_store).clone(),
+        ctx.sequencer.clone(),
+        ctx.config.validation_mode,
+    );
 
     // Create signer from repo key
     let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
@@ -322,7 +328,12 @@ async fn delete_record(
     }
 
     // Create repository manager
-    let repo_mgr = RepositoryManager::with_sequencer(auth_did.to_string(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
+    let repo_mgr = RepositoryManager::with_sequencer_and_validation(
+        auth_did.to_string(),
+        (*ctx.actor_store).clone(),
+        ctx.sequencer.clone(),
+        ctx.config.validation_mode,
+    );
 
     // Create signer from repo key
     let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
@@ -344,7 +355,11 @@ async fn get_record(
     let did = &query.repo;
 
     // Create repository manager
-    let repo_mgr = RepositoryManager::new(did.clone(), (*ctx.actor_store).clone());
+    let repo_mgr = RepositoryManager::with_validation_mode(
+        did.clone(),
+        (*ctx.actor_store).clone(),
+        ctx.config.validation_mode,
+    );
 
     // Get the record
     let uri = format!("at://{}/{}/{}", did, query.collection, query.rkey);
@@ -386,7 +401,11 @@ async fn list_records(
     let did = &query.repo;
 
     // Create repository manager
-    let repo_mgr = RepositoryManager::new(did.clone(), (*ctx.actor_store).clone());
+    let repo_mgr = RepositoryManager::with_validation_mode(
+        did.clone(),
+        (*ctx.actor_store).clone(),
+        ctx.config.validation_mode,
+    );
 
     // Fetch limit + 1 to determine if there are more records
     let fetch_limit = query.limit + 1;
@@ -444,7 +463,11 @@ async fn describe_repo(
     let did = &query.repo;
 
     // Create repository manager
-    let repo_mgr = RepositoryManager::new(did.clone(), (*ctx.actor_store).clone());
+    let repo_mgr = RepositoryManager::with_validation_mode(
+        did.clone(),
+        (*ctx.actor_store).clone(),
+        ctx.config.validation_mode,
+    );
 
     // Get description with account manager and identity resolver
     let desc = repo_mgr.describe_repo(
@@ -502,7 +525,12 @@ async fn apply_writes(
     }
 
     // Create repository manager
-    let repo_mgr = RepositoryManager::with_sequencer(auth_did.to_string(), (*ctx.actor_store).clone(), ctx.sequencer.clone());
+    let repo_mgr = RepositoryManager::with_sequencer_and_validation(
+        auth_did.to_string(),
+        (*ctx.actor_store).clone(),
+        ctx.sequencer.clone(),
+        ctx.config.validation_mode,
+    );
 
     // Prepare writes (converts to PreparedWrite format)
     let prepared = repo_mgr.prepare_writes(req.writes)?;

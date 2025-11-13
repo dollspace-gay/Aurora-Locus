@@ -60,12 +60,21 @@ impl IdentityResolver {
     /// Resolve handle to DID with caching
     ///
     /// Resolution order:
-    /// 1. Check cache first (fast path)
-    /// 2. Try DNS TXT record resolution
-    /// 3. Try HTTPS well-known resolution
-    /// 4. Cache successful resolution
+    /// 1. Check if handle is reserved
+    /// 2. Check cache first (fast path)
+    /// 3. Try DNS TXT record resolution
+    /// 4. Try HTTPS well-known resolution
+    /// 5. Cache successful resolution
     pub async fn resolve_handle(&self, handle: &str) -> PdsResult<String> {
         let normalized = handle.to_lowercase();
+
+        // Check if handle is reserved
+        if crate::identity::reserved_handles::is_reserved(&normalized) {
+            return Err(PdsError::Validation(format!(
+                "Handle '{}' is reserved and cannot be used",
+                normalized
+            )));
+        }
 
         // Check cache first
         if let Some(cached) = self.cache.get_handle(&normalized).await? {
@@ -238,6 +247,14 @@ impl IdentityResolver {
     /// This updates the cache and should be called when a user changes their handle
     pub async fn update_handle(&self, did: &str, handle: &str) -> PdsResult<()> {
         let normalized = handle.to_lowercase();
+
+        // Check if handle is reserved
+        if crate::identity::reserved_handles::is_reserved(&normalized) {
+            return Err(PdsError::Validation(format!(
+                "Handle '{}' is reserved and cannot be used",
+                normalized
+            )));
+        }
 
         // Verify the handle resolves to this DID
         let resolved_did = self.resolve_handle(&normalized).await?;

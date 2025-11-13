@@ -16,6 +16,7 @@ pub mod db;
 pub mod identity;
 pub mod crypto;
 pub mod context;
+pub mod read_after_write;  // Must come before actor_store (actor_store uses its types)
 pub mod actor_store;
 pub mod api;
 pub mod blob_store;

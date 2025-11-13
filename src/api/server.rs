@@ -73,7 +73,11 @@ async fn create_account(
     // Initialize repository for the new account
     tracing::debug!("create_account: Initializing repository for DID: {}", account.did);
     use crate::actor_store::RepositoryManager;
-    let repo_mgr = RepositoryManager::new(account.did.clone(), (*ctx.actor_store).clone());
+    let repo_mgr = RepositoryManager::with_validation_mode(
+        account.did.clone(),
+        (*ctx.actor_store).clone(),
+        ctx.config.validation_mode,
+    );
     repo_mgr.initialize().await
         .map_err(|e| {
             tracing::error!("create_account: Failed to initialize repository: {}", e);

@@ -7,7 +7,21 @@
       "Bash(cargo tree:*)",
       "Bash(cargo test:*)",
       "Bash($null)",
-      "Bash(test:*)"
+      "Bash(test:*)",
+      "Bash(bd list:*)",
+      "Bash(bd show:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo rustc:*)",
+      "Bash(cargo build:*)",
+      "Bash(rustc:*)",
+      "Bash(bd create:*)",
+      "Bash(cargo clean:*)",
+      "Bash(cat:*)",
+      "Bash(bd ready:*)",
+      "Bash(bd update:*)",
+      "Bash(bd dep add:*)",
+      "Bash(bd dep tree:*)",
+      "Bash(./target/release/aurora-locus.exe:*)"
     ],
     "deny": [],
     "ask": []

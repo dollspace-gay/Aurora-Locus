@@ -680,3 +680,60 @@ pub fn enforce_scope(auth: &UnifiedAuthContext, required_scope: &AtProtoScope) -
         }
     }
 }
+
+/// Add JWT deprecation headers to responses
+///
+/// This middleware checks if the request used JWT authentication (vs OAuth 2.1)
+/// and adds deprecation warning headers to the response to inform clients
+/// that JWT auth will be sunset in favor of OAuth.
+///
+/// Headers added for JWT authentication:
+/// - Deprecation: true
+/// - Sunset: <date> (from config)
+/// - Warning: "299 - \"JWT authentication is deprecated. Migrate to OAuth 2.1.\""
+/// - X-OAuth-Migration-Guide: <url> (from config)
+pub async fn jwt_deprecation_headers(
+    State(ctx): State<AppContext>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Check if JWT auth was used (stored in request extensions by AuthContext)
+    let is_jwt = req.extensions().get::<crate::auth::AuthMethod>()
+        .map(|method| matches!(method, crate::auth::AuthMethod::JWT))
+        .unwrap_or(false);
+
+    // Run the request handler
+    let mut response = next.run(req).await;
+
+    // Add deprecation headers if JWT was used
+    if is_jwt {
+        let headers = response.headers_mut();
+
+        headers.insert(
+            "Deprecation",
+            "true".parse().unwrap(),
+        );
+
+        headers.insert(
+            "Sunset",
+            ctx.config.authentication.jwt_sunset_date.parse().unwrap(),
+        );
+
+        headers.insert(
+            "Warning",
+            "299 - \"JWT authentication is deprecated. Migrate to OAuth 2.1.\"".parse().unwrap(),
+        );
+
+        headers.insert(
+            "X-OAuth-Migration-Guide",
+            ctx.config.authentication.oauth_migration_guide_url.parse().unwrap(),
+        );
+
+        // Record metrics
+        metrics::record_jwt_deprecation_warning();
+
+        info!("jwt_deprecation_warning_sent");
+    }
+
+    response
+}

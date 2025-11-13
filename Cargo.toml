@@ -62,6 +62,9 @@ url = "2.5"
 base64 = "0.22"
 jsonwebtoken = "9"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
 # Validation
 validator = { version = "0.18", features = ["derive"] }
 

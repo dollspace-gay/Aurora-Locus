@@ -4,9 +4,11 @@
 /// for efficient cross-server identity lookups.
 
 pub mod cache;
+pub mod reserved_handles;
 pub mod resolver;
 
 pub use cache::DidCache;
+pub use reserved_handles::{is_reserved, check_reserved};
 pub use resolver::{IdentityResolver, IdentityResolverConfig};
 
 use chrono::{DateTime, Utc};

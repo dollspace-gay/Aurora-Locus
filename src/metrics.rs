@@ -9,9 +9,9 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter_vec, register_gauge, register_histogram_vec, register_int_counter_vec,
-    register_int_gauge, CounterVec, Gauge, HistogramVec, IntCounterVec, IntGauge, TextEncoder,
-    Encoder,
+    register_counter_vec, register_gauge, register_histogram_vec, register_int_counter,
+    register_int_counter_vec, register_int_gauge, CounterVec, Gauge, HistogramVec, IntCounter,
+    IntCounterVec, IntGauge, TextEncoder, Encoder,
 };
 
 lazy_static! {
@@ -176,6 +176,33 @@ lazy_static! {
     )
     .unwrap();
 
+    // ========== Validation Metrics ==========
+
+    /// Validation operations by collection and result
+    pub static ref VALIDATION_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "validation_total",
+        "Total number of validation operations",
+        &["collection", "result"]
+    )
+    .unwrap();
+
+    /// Validation duration in seconds
+    pub static ref VALIDATION_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
+        "validation_duration_seconds",
+        "Time to validate records in seconds",
+        &["collection"],
+        vec![0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]
+    )
+    .unwrap();
+
+    /// Validation failures by collection and error type
+    pub static ref VALIDATION_FAILURES_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "validation_failures_total",
+        "Total number of validation failures",
+        &["collection", "error_type"]
+    )
+    .unwrap();
+
     // ========== Blob Storage Metrics ==========
 
     /// Blob uploads by MIME type
@@ -317,6 +344,121 @@ lazy_static! {
         "relay_events_published_total",
         "Total number of events published to relay",
         &["event_type", "status"]
+    )
+    .unwrap();
+
+    // ========== OAuth Metrics (Phase 6.2.4) ==========
+
+    /// OAuth authorization requests by client_id and status
+    pub static ref OAUTH_AUTHORIZATION_REQUESTS_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "oauth_authorization_requests_total",
+        "Total number of OAuth authorization requests",
+        &["client_id", "status"]
+    )
+    .unwrap();
+
+    /// OAuth authorization flow duration
+    pub static ref OAUTH_AUTHORIZATION_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
+        "oauth_authorization_duration_seconds",
+        "OAuth authorization flow latencies in seconds",
+        &["client_id"],
+        vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    )
+    .unwrap();
+
+    /// OAuth token exchanges by grant_type and status
+    pub static ref OAUTH_TOKEN_EXCHANGES_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "oauth_token_exchanges_total",
+        "Total number of OAuth token exchanges",
+        &["grant_type", "status"]
+    )
+    .unwrap();
+
+    /// OAuth token exchange duration
+    pub static ref OAUTH_TOKEN_EXCHANGE_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
+        "oauth_token_exchange_duration_seconds",
+        "OAuth token exchange latencies in seconds",
+        &["grant_type"],
+        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+    )
+    .unwrap();
+
+    /// DPoP verification failures by reason
+    pub static ref OAUTH_DPOP_VERIFICATION_FAILURES_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "oauth_dpop_verification_failures_total",
+        "Total number of DPoP verification failures",
+        &["reason"]
+    )
+    .unwrap();
+
+    /// PKCE verification failures by reason
+    pub static ref OAUTH_PKCE_VERIFICATION_FAILURES_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "oauth_pkce_verification_failures_total",
+        "Total number of PKCE verification failures",
+        &["reason"]
+    )
+    .unwrap();
+
+    /// OAuth token rotations (refresh token rotation)
+    pub static ref OAUTH_TOKEN_ROTATIONS_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "oauth_token_rotations_total",
+        "Total number of OAuth token rotations",
+        &["status"]
+    )
+    .unwrap();
+
+    /// Refresh token replay attack detections
+    pub static ref OAUTH_REFRESH_REPLAY_DETECTIONS_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "oauth_refresh_replay_detections_total",
+        "Total number of refresh token replay attempts detected",
+        &["did"]
+    )
+    .unwrap();
+
+    /// OAuth devices registered per user
+    pub static ref OAUTH_DEVICES_REGISTERED_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "oauth_devices_registered_total",
+        "Total number of OAuth devices registered",
+        &["did"]
+    )
+    .unwrap();
+
+    /// OAuth devices revoked
+    pub static ref OAUTH_DEVICES_REVOKED_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "oauth_devices_revoked_total",
+        "Total number of OAuth devices revoked",
+        &["did", "reason"]
+    )
+    .unwrap();
+
+    /// Active OAuth sessions (current count)
+    pub static ref OAUTH_ACTIVE_SESSIONS: IntGauge = register_int_gauge!(
+        "oauth_active_sessions",
+        "Number of active OAuth sessions"
+    )
+    .unwrap();
+
+    /// OAuth client registrations
+    pub static ref OAUTH_CLIENTS_REGISTERED_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "oauth_clients_registered_total",
+        "Total number of OAuth clients registered",
+        &["client_type"]
+    )
+    .unwrap();
+
+    /// OAuth scope grants by scope
+    pub static ref OAUTH_SCOPE_GRANTS_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "oauth_scope_grants_total",
+        "Total number of OAuth scope grants",
+        &["scope", "granted"]
+    )
+    .unwrap();
+
+    /// JWT deprecation warnings sent to clients
+    /// Tracks how many clients are still using deprecated JWT auth
+    pub static ref JWT_DEPRECATION_WARNINGS_TOTAL: IntCounter = register_int_counter!(
+        "jwt_deprecation_warnings_total",
+        "Total number of JWT deprecation warnings sent to clients"
     )
     .unwrap();
 }
@@ -464,6 +606,114 @@ pub fn record_relay_publish(event_type: &str, success: bool) {
     RELAY_EVENTS_PUBLISHED_TOTAL
         .with_label_values(&[event_type, if success { "success" } else { "failure" }])
         .inc();
+}
+
+/// Record a validation operation
+pub fn record_validation(collection: &str, success: bool, duration: f64) {
+    VALIDATION_TOTAL
+        .with_label_values(&[collection, if success { "success" } else { "failure" }])
+        .inc();
+    VALIDATION_DURATION_SECONDS
+        .with_label_values(&[collection])
+        .observe(duration);
+}
+
+/// Record a validation failure with error details
+pub fn record_validation_failure(collection: &str, error_type: &str) {
+    VALIDATION_FAILURES_TOTAL
+        .with_label_values(&[collection, error_type])
+        .inc();
+}
+
+// ========== OAuth Helper Functions (Phase 6.2.4) ==========
+
+/// Record an OAuth authorization request
+pub fn record_oauth_authorization(client_id: &str, status: &str, duration: f64) {
+    OAUTH_AUTHORIZATION_REQUESTS_TOTAL
+        .with_label_values(&[client_id, status])
+        .inc();
+    OAUTH_AUTHORIZATION_DURATION_SECONDS
+        .with_label_values(&[client_id])
+        .observe(duration);
+}
+
+/// Record an OAuth token exchange
+pub fn record_oauth_token_exchange(grant_type: &str, status: &str, duration: f64) {
+    OAUTH_TOKEN_EXCHANGES_TOTAL
+        .with_label_values(&[grant_type, status])
+        .inc();
+    OAUTH_TOKEN_EXCHANGE_DURATION_SECONDS
+        .with_label_values(&[grant_type])
+        .observe(duration);
+}
+
+/// Record a DPoP verification failure
+pub fn record_oauth_dpop_failure(reason: &str) {
+    OAUTH_DPOP_VERIFICATION_FAILURES_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record a PKCE verification failure
+pub fn record_oauth_pkce_failure(reason: &str) {
+    OAUTH_PKCE_VERIFICATION_FAILURES_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record an OAuth token rotation
+pub fn record_oauth_token_rotation(status: &str) {
+    OAUTH_TOKEN_ROTATIONS_TOTAL
+        .with_label_values(&[status])
+        .inc();
+}
+
+/// Record a refresh token replay detection
+pub fn record_oauth_replay_detection(did: &str) {
+    OAUTH_REFRESH_REPLAY_DETECTIONS_TOTAL
+        .with_label_values(&[did])
+        .inc();
+}
+
+/// Record an OAuth device registration
+pub fn record_oauth_device_registered(did: &str) {
+    OAUTH_DEVICES_REGISTERED_TOTAL
+        .with_label_values(&[did])
+        .inc();
+}
+
+/// Record an OAuth device revocation
+pub fn record_oauth_device_revoked(did: &str, reason: &str) {
+    OAUTH_DEVICES_REVOKED_TOTAL
+        .with_label_values(&[did, reason])
+        .inc();
+}
+
+/// Set active OAuth sessions count
+pub fn set_oauth_active_sessions(count: i64) {
+    OAUTH_ACTIVE_SESSIONS.set(count);
+}
+
+/// Record an OAuth client registration
+pub fn record_oauth_client_registered(client_type: &str) {
+    OAUTH_CLIENTS_REGISTERED_TOTAL
+        .with_label_values(&[client_type])
+        .inc();
+}
+
+/// Record an OAuth scope grant
+pub fn record_oauth_scope_grant(scope: &str, granted: bool) {
+    OAUTH_SCOPE_GRANTS_TOTAL
+        .with_label_values(&[scope, if granted { "true" } else { "false" }])
+        .inc();
+}
+
+/// Record a JWT deprecation warning sent to a client
+///
+/// This tracks how many clients are still using deprecated JWT authentication
+/// versus OAuth 2.1, helping monitor migration progress.
+pub fn record_jwt_deprecation_warning() {
+    JWT_DEPRECATION_WARNINGS_TOTAL.inc();
 }
 
 #[cfg(test)]
