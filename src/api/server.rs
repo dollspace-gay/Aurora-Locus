@@ -18,10 +18,14 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use serde::Serialize;
 
 /// Build server routes
 pub fn routes() -> Router<AppContext> {
     Router::new()
+        // Server metadata
+        .route("/xrpc/com.atproto.server.describeServer", get(describe_server))
+        // Account management
         .route("/xrpc/com.atproto.server.createAccount", post(create_account))
         .route("/xrpc/com.atproto.server.createSession", post(create_session))
         .route("/xrpc/com.atproto.server.getSession", get(get_session))
@@ -32,9 +36,18 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.server.requestPasswordReset", post(request_password_reset))
         .route("/xrpc/com.atproto.server.resetPassword", post(reset_password))
         .route("/xrpc/com.atproto.server.deleteAccount", post(delete_account))
+        .route("/xrpc/com.atproto.server.activateAccount", post(activate_account))
+        .route("/xrpc/com.atproto.server.deactivateAccount", post(deactivate_account))
+        .route("/xrpc/com.atproto.server.checkAccountStatus", get(check_account_status))
+        // App passwords
         .route("/xrpc/com.atproto.server.createAppPassword", post(create_app_password))
         .route("/xrpc/com.atproto.server.listAppPasswords", get(list_app_passwords))
         .route("/xrpc/com.atproto.server.revokeAppPassword", post(revoke_app_password))
+        // Invite codes
+        .route("/xrpc/com.atproto.server.getAccountInviteCodes", get(get_account_invite_codes))
+        .route("/xrpc/com.atproto.server.createInviteCode", post(create_invite_code))
+        .route("/xrpc/com.atproto.server.createInviteCodes", post(create_invite_codes))
+        // Service auth
         .route("/xrpc/com.atproto.server.getServiceAuth", get(get_service_auth))
 }
 
@@ -581,4 +594,322 @@ async fn get_service_auth(
     );
 
     Ok(Json(GetServiceAuthResponse { token }))
+}
+
+// ==================== New Endpoints for XRPC Parity ====================
+
+/// Response for describeServer
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DescribeServerResponse {
+    /// Server DID
+    did: String,
+    /// Available authentication methods
+    available_user_domains: Vec<String>,
+    /// Invite code required for registration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invite_code_required: Option<bool>,
+    /// Phone verification required
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phone_verification_required: Option<bool>,
+    /// Links (e.g., privacy policy, terms of service)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    links: Option<DescribeServerLinks>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DescribeServerLinks {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    privacy_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terms_of_service: Option<String>,
+}
+
+/// Describe server endpoint
+///
+/// Returns server metadata, DID, and available authentication methods.
+/// This is a public endpoint used for federation discovery.
+async fn describe_server(
+    State(ctx): State<AppContext>,
+) -> PdsResult<Json<DescribeServerResponse>> {
+    Ok(Json(DescribeServerResponse {
+        did: ctx.config.service.service_did.clone(),
+        available_user_domains: ctx.config.identity.service_handle_domains.clone(),
+        invite_code_required: Some(ctx.config.invites.required),
+        phone_verification_required: Some(false), // Not implemented yet
+        links: None, // TODO: Add from config if available
+    }))
+}
+
+/// Response for getAccountInviteCodes
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetAccountInviteCodesResponse {
+    codes: Vec<InviteCodeInfo>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InviteCodeInfo {
+    code: String,
+    available: i32,
+    disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    for_account: Option<String>,
+    created_at: String,
+    uses: Vec<InviteCodeUse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InviteCodeUse {
+    used_by: String,
+    used_at: String,
+}
+
+/// Get account invite codes endpoint
+///
+/// Returns all invite codes allocated to or created by the authenticated user.
+async fn get_account_invite_codes(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+) -> PdsResult<Json<GetAccountInviteCodesResponse>> {
+    // Require authentication
+    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+
+    // Get user's invite codes
+    let codes = ctx.account_manager.list_invite_codes(&validated.did).await?;
+
+    // Build response with usage information
+    let mut code_infos = Vec::new();
+    for code in codes {
+        // Get usage history for each code
+        let uses_raw = ctx.account_manager.get_invite_code_usage(&code.code).await?;
+        let uses = uses_raw.into_iter().map(|u| InviteCodeUse {
+            used_by: u.used_by,
+            used_at: u.used_at.to_rfc3339(),
+        }).collect();
+
+        code_infos.push(InviteCodeInfo {
+            code: code.code,
+            available: code.available_uses,
+            disabled: code.disabled,
+            for_account: code.created_for,
+            created_at: code.created_at.to_rfc3339(),
+            uses,
+        });
+    }
+
+    Ok(Json(GetAccountInviteCodesResponse { codes: code_infos }))
+}
+
+/// Request for createInviteCode
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateInviteCodeRequest {
+    use_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    for_account: Option<String>,
+}
+
+/// Response for createInviteCode
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateInviteCodeResponse {
+    code: String,
+}
+
+/// Create invite code endpoint
+///
+/// Allows authenticated users to create invite codes (if they have allocation).
+async fn create_invite_code(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Json(req): Json<CreateInviteCodeRequest>,
+) -> PdsResult<Json<CreateInviteCodeResponse>> {
+    // Require authentication
+    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+
+    // Validate use count
+    if req.use_count < 1 {
+        return Err(PdsError::Validation("Use count must be at least 1".to_string()));
+    }
+
+    if req.use_count > 10 {
+        return Err(PdsError::Validation("Use count cannot exceed 10".to_string()));
+    }
+
+    // Create invite code
+    let code = ctx.account_manager
+        .create_invite_code(&validated.did, req.use_count, req.for_account)
+        .await?;
+
+    Ok(Json(CreateInviteCodeResponse { code }))
+}
+
+/// Request for createInviteCodes (bulk creation)
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateInviteCodesRequest {
+    code_count: i32,
+    use_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    for_accounts: Option<Vec<String>>,
+}
+
+/// Response for createInviteCodes
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateInviteCodesResponse {
+    codes: Vec<AccountInviteCode>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountInviteCode {
+    code: String,
+    available: i32,
+    disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    for_account: Option<String>,
+    created_at: String,
+    created_by: String,
+}
+
+/// Create invite codes endpoint (bulk)
+///
+/// Allows authenticated users (or admins) to create multiple invite codes at once.
+async fn create_invite_codes(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Json(req): Json<CreateInviteCodesRequest>,
+) -> PdsResult<Json<CreateInviteCodesResponse>> {
+    // Require authentication
+    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+
+    // Validate counts
+    if req.code_count < 1 || req.code_count > 100 {
+        return Err(PdsError::Validation("Code count must be between 1 and 100".to_string()));
+    }
+
+    if req.use_count < 1 || req.use_count > 10 {
+        return Err(PdsError::Validation("Use count must be between 1 and 10".to_string()));
+    }
+
+    // Check if for_accounts matches code_count (if provided)
+    if let Some(ref accounts) = req.for_accounts {
+        if accounts.len() != req.code_count as usize {
+            return Err(PdsError::Validation(
+                "Number of for_accounts must match code_count".to_string()
+            ));
+        }
+    }
+
+    // Create codes
+    let mut codes = Vec::new();
+    for i in 0..req.code_count {
+        let for_account = req.for_accounts.as_ref().and_then(|a| a.get(i as usize).cloned());
+        let code = ctx.account_manager
+            .create_invite_code(&validated.did, req.use_count, for_account.clone())
+            .await?;
+
+        let now = Utc::now();
+        codes.push(AccountInviteCode {
+            code,
+            available: req.use_count,
+            disabled: false,
+            for_account,
+            created_at: now.to_rfc3339(),
+            created_by: validated.did.clone(),
+        });
+    }
+
+    Ok(Json(CreateInviteCodesResponse { codes }))
+}
+
+/// Activate account endpoint
+///
+/// Reactivates a deactivated account.
+async fn activate_account(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+) -> PdsResult<Json<serde_json::Value>> {
+    // Require authentication
+    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+
+    // Cancel account deletion/deactivation
+    ctx.account_manager.cancel_account_deletion(&validated.did).await?;
+
+    Ok(Json(serde_json::json!({
+        "message": "Account activated successfully"
+    })))
+}
+
+/// Deactivate account endpoint
+///
+/// Soft-deactivates an account (different from deletion).
+/// User can reactivate within grace period.
+async fn deactivate_account(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteAccountRequest>,
+) -> PdsResult<Json<serde_json::Value>> {
+    // Require authentication
+    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+
+    // Request deactivation (reuses delete logic with grace period)
+    ctx.account_manager
+        .request_account_deletion(&validated.did, &req.password)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "message": "Account deactivated. You can reactivate by logging in within 30 days."
+    })))
+}
+
+/// Response for checkAccountStatus
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckAccountStatusResponse {
+    activated: bool,
+    valid_did: bool,
+    repo_commit: Option<String>,
+    repo_rev: Option<String>,
+    repo_blocks: Option<i64>,
+    indexed_records: Option<i64>,
+    private_state_values: Option<i64>,
+    expected_blobs: Option<i64>,
+    imported_blobs: Option<i64>,
+}
+
+/// Check account status endpoint
+///
+/// Returns detailed status information about the account.
+async fn check_account_status(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+) -> PdsResult<Json<CheckAccountStatusResponse>> {
+    // Require authentication
+    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+
+    // Get account info
+    let account = ctx.account_manager.get_account(&validated.did).await?;
+
+    // Check if account is active (not deactivated or taken down)
+    let activated = account.deactivated_at.is_none() && account.takedown_ref.is_none();
+
+    // TODO: Get repo statistics from actor store
+    // For now, return basic info
+    Ok(Json(CheckAccountStatusResponse {
+        activated,
+        valid_did: true,
+        repo_commit: None,
+        repo_rev: None,
+        repo_blocks: None,
+        indexed_records: None,
+        private_state_values: None,
+        expected_blobs: None,
+        imported_blobs: None,
+    }))
 }

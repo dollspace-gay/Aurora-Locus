@@ -102,6 +102,8 @@ pub struct RefreshToken {
     pub expires_at: DateTime<Utc>,
     pub used: bool,
     pub used_at: Option<DateTime<Utc>>,
+    /// Next token ID in chain (for grace period support)
+    pub next_id: Option<String>,
 }
 
 /// Email confirmation token

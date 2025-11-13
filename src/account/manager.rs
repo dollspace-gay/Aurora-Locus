@@ -34,10 +34,15 @@ impl AccountManager {
         handle: String,
         email: Option<String>,
         password: String,
-        _invite_code: Option<String>,
+        invite_code: Option<String>,
     ) -> PdsResult<ActorAccount> {
-        // Note: Invite code validation is handled at the API layer
-        // This keeps the AccountManager focused on account creation logic
+        // Validate invite code if required
+        if self.config.invites.required {
+            let code = invite_code
+                .as_ref()
+                .ok_or_else(|| PdsError::Validation("Invite code required".to_string()))?;
+            self.validate_invite_code(code, None).await?;
+        }
 
         // Validate handle format
         self.validate_handle(&handle)?;
@@ -112,6 +117,13 @@ impl AccountManager {
         // Commit transaction
         tx.commit().await
             .map_err(|e| PdsError::Database(e))?;
+
+        // Use invite code if provided
+        if let Some(code) = invite_code {
+            if self.config.invites.required {
+                self.use_invite_code(&code, &did).await?;
+            }
+        }
 
         // Return combined ActorAccount
         Ok(ActorAccount {
@@ -222,8 +234,8 @@ impl AccountManager {
         let refresh_expires = now + Duration::days(180); // Refresh token expires in 6 months
 
         sqlx::query(
-            "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used, next_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)"
         )
         .bind(&refresh_token_id)
         .bind(did)
@@ -286,11 +298,17 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Refresh session tokens
+    /// Refresh session tokens with 2-hour grace period
+    ///
+    /// Implements token rotation with a grace period to handle concurrent refresh requests.
+    /// When a token is refreshed, the old token remains valid for 2 hours but points to
+    /// the new token, preventing race conditions.
     pub async fn refresh_session(&self, refresh_token: &str) -> PdsResult<Session> {
+        let now = Utc::now();
+
         // Find and validate refresh token
         let row = sqlx::query(
-            "SELECT id, did, token, created_at, expires_at, used, used_at FROM refresh_token WHERE token = ?1"
+            "SELECT id, did, token, created_at, expires_at, used, used_at, next_id FROM refresh_token WHERE token = ?1"
         )
         .bind(refresh_token)
         .fetch_optional(&self.db)
@@ -302,27 +320,105 @@ impl AccountManager {
         let did: String = row.get("did");
         let expires_at: DateTime<Utc> = row.get("expires_at");
         let used: bool = row.get("used");
-
-        // Check if already used
-        if used {
-            return Err(PdsError::Authentication("Refresh token already used".to_string()));
-        }
+        let next_id: Option<String> = row.get("next_id");
 
         // Check expiration
-        if Utc::now() > expires_at {
+        if now > expires_at {
             return Err(PdsError::Authentication("Refresh token expired".to_string()));
         }
 
-        // Mark old refresh token as used
-        sqlx::query("UPDATE refresh_token SET used = TRUE, used_at = ?1 WHERE id = ?2")
-            .bind(Utc::now())
-            .bind(&token_id)
-            .execute(&self.db)
-            .await
-            .map_err(|e| PdsError::Database(e))?;
+        // If token was already used but has a next_id (grace period scenario)
+        if used {
+            if let Some(next_token_id) = next_id {
+                // Return the same new session that was created before (within grace period)
+                // This handles concurrent refresh attempts
+                let next_row = sqlx::query(
+                    "SELECT s.id, s.did, s.access_token, s.refresh_token, s.created_at, s.expires_at, s.app_password_name
+                     FROM refresh_token rt
+                     JOIN session s ON s.refresh_token = (SELECT token FROM refresh_token WHERE id = ?1)
+                     WHERE rt.id = ?1"
+                )
+                .bind(&next_token_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| PdsError::Database(e))?;
 
-        // Create new session
-        self.create_session(&did, None).await
+                if let Some(session_row) = next_row {
+                    return Ok(Session {
+                        id: session_row.get("id"),
+                        did: session_row.get("did"),
+                        access_token: session_row.get("access_token"),
+                        refresh_token: session_row.get("refresh_token"),
+                        created_at: session_row.get("created_at"),
+                        expires_at: session_row.get("expires_at"),
+                        app_password_name: session_row.get("app_password_name"),
+                    });
+                }
+            }
+            return Err(PdsError::Authentication("Refresh token already used".to_string()));
+        }
+
+        // Create new refresh token
+        let new_token_id = uuid::Uuid::new_v4().to_string();
+        let new_refresh_token = self.generate_refresh_token(&did, &new_token_id)?;
+        let refresh_expires = now + Duration::days(180); // 180 days
+
+        // Insert new refresh token
+        sqlx::query(
+            "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used, next_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)"
+        )
+        .bind(&new_token_id)
+        .bind(&did)
+        .bind(&new_refresh_token)
+        .bind(now)
+        .bind(refresh_expires)
+        .bind(false)
+        .execute(&self.db)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        // Update old refresh token: mark as used, set next_id, and shorten expiration to 2 hours
+        let grace_period_expires = now + Duration::hours(2);
+        sqlx::query(
+            "UPDATE refresh_token SET used = TRUE, used_at = ?1, next_id = ?2, expires_at = ?3 WHERE id = ?4"
+        )
+        .bind(now)
+        .bind(&new_token_id)
+        .bind(grace_period_expires)
+        .execute(&self.db)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        // Create new access token
+        let new_session_id = uuid::Uuid::new_v4().to_string();
+        let access_token = self.generate_access_token(&did, &new_session_id)?;
+        let access_expires = now + Duration::hours(1);
+
+        // Insert new session
+        sqlx::query(
+            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)"
+        )
+        .bind(&new_session_id)
+        .bind(&did)
+        .bind(&access_token)
+        .bind(&new_refresh_token)
+        .bind(now)
+        .bind(access_expires)
+        .execute(&self.db)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        Ok(Session {
+            id: new_session_id,
+            did: did.to_string(),
+            access_token,
+            refresh_token: new_refresh_token,
+            created_at: now,
+            expires_at: access_expires,
+            app_password_name: None,
+        })
     }
 
     /// Get account by DID
@@ -1287,25 +1383,10 @@ impl AccountManager {
             .collect()
     }
 
-    /// Validate handle format
+    /// Validate handle format using comprehensive ATProto validation
     fn validate_handle(&self, handle: &str) -> PdsResult<()> {
-        // Basic validation (detailed validation in Phase 6)
-        if handle.is_empty() {
-            return Err(PdsError::Validation("Handle cannot be empty".to_string()));
-        }
-
-        if handle.len() < 3 {
-            return Err(PdsError::Validation("Handle must be at least 3 characters".to_string()));
-        }
-
-        if handle.len() > 253 {
-            return Err(PdsError::Validation("Handle too long".to_string()));
-        }
-
-        if !handle.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.') {
-            return Err(PdsError::Validation("Handle contains invalid characters".to_string()));
-        }
-
+        // Use comprehensive validation from identity module
+        crate::identity::validate_handle(handle, &self.config.identity.service_handle_domains)?;
         Ok(())
     }
 
@@ -1317,6 +1398,261 @@ impl AccountManager {
         }
 
         Ok(())
+    }
+
+    // ==================== Invite Code System ====================
+
+    /// Create an invite code
+    ///
+    /// # Arguments
+    /// * `created_by` - DID of the user creating the invite
+    /// * `use_count` - Number of times this invite can be used (default: 1)
+    /// * `for_account` - Optional DID if this invite is for a specific person
+    ///
+    /// # Returns
+    /// * The generated invite code string
+    pub async fn create_invite_code(
+        &self,
+        created_by: &str,
+        use_count: i32,
+        for_account: Option<String>,
+    ) -> PdsResult<String> {
+        // Generate a random invite code (format: xxxx-xxxx-xxxx-xxxx)
+        let code = format!(
+            "{}-{}-{}-{}",
+            Self::generate_random_string(4),
+            Self::generate_random_string(4),
+            Self::generate_random_string(4),
+            Self::generate_random_string(4)
+        );
+
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO invite_code (code, available_uses, disabled, created_by, created_at, created_for)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        )
+        .bind(&code)
+        .bind(use_count)
+        .bind(false)
+        .bind(created_by)
+        .bind(now)
+        .bind(&for_account)
+        .execute(&self.db)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        tracing::info!(
+            "Created invite code {} by {} (uses: {}, for: {:?})",
+            code,
+            created_by,
+            use_count,
+            for_account
+        );
+
+        Ok(code)
+    }
+
+    /// Validate an invite code and return information about it
+    ///
+    /// Checks if the code exists, is not disabled, and has available uses.
+    pub async fn validate_invite_code(&self, code: &str, used_by: Option<&str>) -> PdsResult<()> {
+        // Check if invites are required
+        if !self.config.invites.required {
+            // Invites not required, always succeed
+            return Ok(());
+        }
+
+        let row = sqlx::query(
+            "SELECT code, available_uses, disabled, created_for FROM invite_code WHERE code = ?1"
+        )
+        .bind(code)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| PdsError::Database(e))?
+        .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
+
+        let available_uses: i32 = row.get("available_uses");
+        let disabled: bool = row.get("disabled");
+        let created_for: Option<String> = row.get("created_for");
+
+        // Check if disabled
+        if disabled {
+            return Err(PdsError::Validation("Invite code has been disabled".to_string()));
+        }
+
+        // Check if uses remain
+        if available_uses <= 0 {
+            return Err(PdsError::Validation("Invite code has no uses remaining".to_string()));
+        }
+
+        // Check if code is for a specific person
+        if let Some(specific_did) = created_for {
+            if let Some(user_did) = used_by {
+                if user_did != specific_did {
+                    return Err(PdsError::Validation(
+                        "Invite code is reserved for another user".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Use an invite code (called during account creation)
+    ///
+    /// Decrements available uses and records usage.
+    pub async fn use_invite_code(&self, code: &str, used_by: &str) -> PdsResult<()> {
+        // Check if invites are required
+        if !self.config.invites.required {
+            // Invites not required, no-op
+            return Ok(());
+        }
+
+        let now = Utc::now();
+
+        // Begin transaction
+        let mut tx = self.db.begin().await.map_err(|e| PdsError::Database(e))?;
+
+        // Validate code
+        let row = sqlx::query(
+            "SELECT code, available_uses, disabled FROM invite_code WHERE code = ?1"
+        )
+        .bind(code)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| PdsError::Database(e))?
+        .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
+
+        let available_uses: i32 = row.get("available_uses");
+        let disabled: bool = row.get("disabled");
+
+        if disabled {
+            return Err(PdsError::Validation("Invite code has been disabled".to_string()));
+        }
+
+        if available_uses <= 0 {
+            return Err(PdsError::Validation("Invite code has no uses remaining".to_string()));
+        }
+
+        // Record usage
+        sqlx::query(
+            "INSERT INTO invite_code_use (code, used_by, used_at)
+             VALUES (?1, ?2, ?3)"
+        )
+        .bind(code)
+        .bind(used_by)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        // Decrement available uses
+        sqlx::query("UPDATE invite_code SET available_uses = available_uses - 1 WHERE code = ?1")
+            .bind(code)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        tx.commit().await.map_err(|e| PdsError::Database(e))?;
+
+        tracing::info!("Invite code {} used by {}", code, used_by);
+
+        Ok(())
+    }
+
+    /// List invite codes created by a user
+    pub async fn list_invite_codes(&self, created_by: &str) -> PdsResult<Vec<crate::db::account::InviteCode>> {
+        let rows = sqlx::query_as::<_, crate::db::account::InviteCode>(
+            "SELECT code, available_uses, disabled, created_by, created_at, created_for
+             FROM invite_code
+             WHERE created_by = ?1
+             ORDER BY created_at DESC"
+        )
+        .bind(created_by)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        Ok(rows)
+    }
+
+    /// Get usage history for an invite code
+    pub async fn get_invite_code_usage(&self, code: &str) -> PdsResult<Vec<crate::db::account::InviteCodeUse>> {
+        let rows = sqlx::query_as::<_, crate::db::account::InviteCodeUse>(
+            "SELECT code, used_by, used_at
+             FROM invite_code_use
+             WHERE code = ?1
+             ORDER BY used_at DESC"
+        )
+        .bind(code)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        Ok(rows)
+    }
+
+    /// Disable an invite code (admin/creator only)
+    pub async fn disable_invite_code(&self, code: &str, requesting_did: &str) -> PdsResult<()> {
+        // Verify requester is the creator or an admin
+        let row = sqlx::query("SELECT created_by FROM invite_code WHERE code = ?1")
+            .bind(code)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?
+            .ok_or_else(|| PdsError::NotFound("Invite code not found".to_string()))?;
+
+        let created_by: String = row.get("created_by");
+
+        // Check if requester is creator or admin
+        let is_admin = self.config.authentication.admin_dids.contains(&requesting_did.to_string());
+        if created_by != requesting_did && !is_admin {
+            return Err(PdsError::Authorization(
+                "Only the creator or an admin can disable this invite code".to_string(),
+            ));
+        }
+
+        // Disable the code
+        sqlx::query("UPDATE invite_code SET disabled = TRUE WHERE code = ?1")
+            .bind(code)
+            .execute(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        tracing::info!("Invite code {} disabled by {}", code, requesting_did);
+
+        Ok(())
+    }
+
+    /// Allocate invite codes to an account (periodic allocation)
+    ///
+    /// This can be called periodically (e.g., weekly) to give users new invite codes
+    /// based on the configuration.
+    pub async fn allocate_invite_codes(&self, did: &str, count: i32) -> PdsResult<Vec<String>> {
+        // Check if invites are disabled for this account
+        let row = sqlx::query("SELECT invites_disabled FROM account WHERE did = ?1")
+            .bind(did)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?
+            .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
+
+        let invites_disabled: bool = row.get("invites_disabled");
+
+        if invites_disabled {
+            return Ok(Vec::new()); // Don't allocate if disabled
+        }
+
+        // Create invite codes
+        let mut codes = Vec::new();
+        for _ in 0..count {
+            let code = self.create_invite_code(did, 1, None).await?;
+            codes.push(code);
+        }
+
+        Ok(codes)
     }
 
     /// List all accounts with pagination

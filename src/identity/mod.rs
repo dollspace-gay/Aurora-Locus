@@ -4,10 +4,12 @@
 /// for efficient cross-server identity lookups.
 
 pub mod cache;
+pub mod handle_validation;
 pub mod reserved_handles;
 pub mod resolver;
 
 pub use cache::DidCache;
+pub use handle_validation::{validate_handle, normalize_handle};
 pub use reserved_handles::{is_reserved, check_reserved};
 pub use resolver::{IdentityResolver, IdentityResolverConfig};
 
