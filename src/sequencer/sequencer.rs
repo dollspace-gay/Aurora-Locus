@@ -3,7 +3,7 @@ use crate::{
     error::{PdsError, PdsResult},
     federation::RelayClient,
     sequencer::{
-        events::{AccountEvent, CommitEvent, IdentityEvent},
+        events::{AccountEvent, CommitEvent, IdentityEvent, SyncEvent},
         EventType, SeqEvent, SeqRow,
     },
 };
@@ -76,6 +76,20 @@ impl Sequencer {
         Ok(seq)
     }
 
+    /// Sequence a sync event (lightweight repo state sync for account creation/activation)
+    pub async fn sequence_sync(&self, evt: SyncEvent) -> PdsResult<i64> {
+        let event_bytes = serde_cbor::to_vec(&evt)
+            .map_err(|e| PdsError::Internal(format!("Failed to encode sync event: {}", e)))?;
+
+        let seq = self.insert_event(&evt.did, EventType::Sync, event_bytes)
+            .await?;
+
+        // Publish to relay if configured
+        self.publish_to_relay("sync", &evt.did, seq, None).await;
+
+        Ok(seq)
+    }
+
     /// Sequence an identity event
     pub async fn sequence_identity(&self, evt: IdentityEvent) -> PdsResult<i64> {
         let event_bytes = serde_cbor::to_vec(&evt)
@@ -142,7 +156,7 @@ impl Sequencer {
         Ok(result.try_get("max_seq").ok())
     }
 
-    /// Get next event after cursor
+    /// Get next event after cursor (single event)
     pub async fn next_event(&self, cursor: i64) -> PdsResult<Option<SeqRow>> {
         let result = sqlx::query(
             r#"
@@ -163,6 +177,38 @@ impl Sequencer {
         } else {
             Ok(None)
         }
+    }
+
+    /// Get multiple events after cursor (batch query for catch-up)
+    ///
+    /// This method is optimized for catch-up scenarios where a client is behind
+    /// and needs to fetch multiple events efficiently. Returns raw SeqRow data
+    /// for minimal overhead.
+    ///
+    /// # Arguments
+    /// * `cursor` - Starting sequence number (exclusive)
+    /// * `limit` - Maximum number of events to return (default: 500)
+    pub async fn next_events(&self, cursor: i64, limit: Option<i64>) -> PdsResult<Vec<SeqRow>> {
+        let limit = limit.unwrap_or(500).min(self.config.max_query_limit);
+
+        let rows = sqlx::query(
+            r#"
+            SELECT seq, did, event_type, event, invalidated, sequenced_at
+            FROM repo_seq
+            WHERE seq > ?1 AND invalidated = 0
+            ORDER BY seq ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        rows.into_iter()
+            .map(|row| self.row_to_seq_row(row))
+            .collect()
     }
 
     /// Request events in a sequence range
@@ -240,6 +286,15 @@ impl Sequencer {
                 let evt: CommitEvent = serde_cbor::from_slice(&row.event)
                     .map_err(|e| PdsError::Internal(format!("Failed to decode commit event: {}", e)))?;
                 Ok(Some(SeqEvent::Commit {
+                    seq: row.seq,
+                    time,
+                    evt,
+                }))
+            }
+            EventType::Sync => {
+                let evt: SyncEvent = serde_cbor::from_slice(&row.event)
+                    .map_err(|e| PdsError::Internal(format!("Failed to decode sync event: {}", e)))?;
+                Ok(Some(SeqEvent::Sync {
                     seq: row.seq,
                     time,
                     evt,

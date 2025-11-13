@@ -461,6 +461,55 @@ lazy_static! {
         "Total number of JWT deprecation warnings sent to clients"
     )
     .unwrap();
+
+    // ========== Firehose Metrics ==========
+
+    /// Active firehose WebSocket connections
+    pub static ref FIREHOSE_CONNECTIONS: IntGauge = register_int_gauge!(
+        "firehose_connections_active",
+        "Number of active firehose WebSocket connections"
+    )
+    .unwrap();
+
+    /// Total events sent via firehose by event type
+    pub static ref FIREHOSE_EVENTS_SENT_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "firehose_events_sent_total",
+        "Total number of events sent via firehose",
+        &["event_type"]
+    )
+    .unwrap();
+
+    /// Clients disconnected due to slow processing
+    pub static ref FIREHOSE_SLOW_CLIENT_DISCONNECTS_TOTAL: IntCounter = register_int_counter!(
+        "firehose_slow_client_disconnects_total",
+        "Total number of firehose clients disconnected due to slow processing"
+    )
+    .unwrap();
+
+    /// Duration of backpressure blocks in seconds
+    pub static ref FIREHOSE_BACKPRESSURE_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
+        "firehose_backpressure_duration_seconds",
+        "Duration of backpressure delays in firehose",
+        &["reason"],
+        vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
+    )
+    .unwrap();
+
+    /// Firehose batch fetches (catch-up mode)
+    pub static ref FIREHOSE_BATCH_FETCHES_TOTAL: IntCounter = register_int_counter!(
+        "firehose_batch_fetches_total",
+        "Total number of batch event fetches during catch-up"
+    )
+    .unwrap();
+
+    /// Events sent per batch (catch-up mode)
+    pub static ref FIREHOSE_BATCH_SIZE: HistogramVec = register_histogram_vec!(
+        "firehose_batch_size_events",
+        "Number of events sent per batch in catch-up mode",
+        &[],
+        vec![1.0, 10.0, 50.0, 100.0, 250.0, 500.0]
+    )
+    .unwrap();
 }
 
 /// Render metrics in Prometheus text format
@@ -714,6 +763,45 @@ pub fn record_oauth_scope_grant(scope: &str, granted: bool) {
 /// versus OAuth 2.1, helping monitor migration progress.
 pub fn record_jwt_deprecation_warning() {
     JWT_DEPRECATION_WARNINGS_TOTAL.inc();
+}
+
+// ========== Firehose Helper Functions ==========
+
+/// Record a firehose connection
+pub fn record_firehose_connection_start() {
+    FIREHOSE_CONNECTIONS.inc();
+}
+
+/// Record a firehose disconnection
+pub fn record_firehose_connection_end() {
+    FIREHOSE_CONNECTIONS.dec();
+}
+
+/// Record an event sent via firehose
+pub fn record_firehose_event_sent(event_type: &str) {
+    FIREHOSE_EVENTS_SENT_TOTAL
+        .with_label_values(&[event_type])
+        .inc();
+}
+
+/// Record a slow client disconnect
+pub fn record_firehose_slow_client_disconnect() {
+    FIREHOSE_SLOW_CLIENT_DISCONNECTS_TOTAL.inc();
+}
+
+/// Record backpressure duration
+pub fn record_firehose_backpressure(reason: &str, duration: f64) {
+    FIREHOSE_BACKPRESSURE_DURATION_SECONDS
+        .with_label_values(&[reason])
+        .observe(duration);
+}
+
+/// Record a batch fetch during catch-up
+pub fn record_firehose_batch_fetch(event_count: usize) {
+    FIREHOSE_BATCH_FETCHES_TOTAL.inc();
+    FIREHOSE_BATCH_SIZE
+        .with_label_values(&[])
+        .observe(event_count as f64);
 }
 
 #[cfg(test)]

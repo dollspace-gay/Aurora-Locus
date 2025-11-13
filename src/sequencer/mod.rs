@@ -29,6 +29,7 @@ pub struct SeqRow {
 #[serde(rename_all = "lowercase")]
 pub enum EventType {
     Commit,
+    Sync,
     Identity,
     Account,
 }
@@ -37,6 +38,7 @@ impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
             EventType::Commit => "commit",
+            EventType::Sync => "sync",
             EventType::Identity => "identity",
             EventType::Account => "account",
         }
@@ -47,6 +49,7 @@ impl From<String> for EventType {
     fn from(s: String) -> Self {
         match s.as_str() {
             "commit" => EventType::Commit,
+            "sync" => EventType::Sync,
             "identity" => EventType::Identity,
             "account" => EventType::Account,
             _ => EventType::Commit, // Default
@@ -64,6 +67,13 @@ pub enum SeqEvent {
         time: String,
         #[serde(flatten)]
         evt: CommitEvent,
+    },
+    #[serde(rename = "#sync")]
+    Sync {
+        seq: i64,
+        time: String,
+        #[serde(flatten)]
+        evt: SyncEvent,
     },
     #[serde(rename = "#identity")]
     Identity {

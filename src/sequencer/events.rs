@@ -36,6 +36,19 @@ pub enum OpAction {
     Delete,
 }
 
+/// Sync event - lightweight repo state sync (for account creation/activation)
+///
+/// This is a simpler alternative to CommitEvent used when there's no meaningful
+/// diff to show (e.g., account creation with empty repo, account activation after
+/// deactivation). Contains only the commit block, not all repo operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncEvent {
+    pub did: String,
+    pub rev: String,        // Revision TID
+    pub blocks: Vec<u8>,    // CAR file with only commit block
+}
+
 /// Identity event - emitted when handle changes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +100,13 @@ impl CommitEvent {
             blobs: Vec::new(),
             prev: None,
         }
+    }
+}
+
+impl SyncEvent {
+    /// Create a new sync event
+    pub fn new(did: String, rev: String, blocks: Vec<u8>) -> Self {
+        Self { did, rev, blocks }
     }
 }
 

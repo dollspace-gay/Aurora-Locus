@@ -42,7 +42,12 @@
 use crate::{
     context::AppContext,
     error::{PdsError, PdsResult},
-    sequencer::events::{AccountEvent, CommitEvent, IdentityEvent},
+    metrics::{
+        record_firehose_batch_fetch, record_firehose_connection_end,
+        record_firehose_connection_start, record_firehose_event_sent,
+        record_firehose_slow_client_disconnect,
+    },
+    sequencer::events::{AccountEvent, CommitEvent, IdentityEvent, SyncEvent},
 };
 use axum::{
     extract::{
@@ -81,6 +86,8 @@ pub struct SubscribeReposParams {
 pub enum FirehoseFrame {
     #[serde(rename = "#commit")]
     Commit(FirehoseCommit),
+    #[serde(rename = "#sync")]
+    Sync(FirehoseSync),
     #[serde(rename = "#identity")]
     Identity(FirehoseIdentity),
     #[serde(rename = "#account")]
@@ -113,6 +120,17 @@ pub struct FirehoseOp {
     pub action: String, // "create", "update", "delete"
     pub path: String,
     pub cid: Option<String>,
+}
+
+/// Sync event for firehose (lightweight repo state sync)
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FirehoseSync {
+    pub seq: i64,
+    pub did: String,
+    pub rev: String,
+    pub blocks: String, // Base64-encoded CAR bytes (commit block only)
+    pub time: chrono::DateTime<chrono::Utc>,
 }
 
 /// Identity event for firehose
@@ -283,6 +301,9 @@ async fn handle_subscription(
 }
 
 /// Produce events from sequencer and send to channel
+///
+/// Uses intelligent batching: when catching up (>100 events behind), fetches
+/// events in batches of 500. When near real-time, polls for single events.
 async fn produce_events(
     ctx: AppContext,
     mut cursor: i64,
@@ -291,41 +312,87 @@ async fn produce_events(
     let mut tick = interval(Duration::from_millis(POLL_INTERVAL_MS));
     let mut error_count = 0;
     const MAX_ERRORS: u32 = 5;
+    const BATCH_THRESHOLD: i64 = 100; // Switch to batch mode if >100 events behind
 
     loop {
         tick.tick().await;
 
-        // Get next event from sequencer
-        match ctx.sequencer.next_event(cursor).await {
-            Ok(Some(event)) => {
-                error_count = 0; // Reset error count on success
-                cursor = event.seq;
+        // Check how far behind we are
+        let current_seq = match ctx.sequencer.current_seq().await {
+            Ok(Some(seq)) => seq,
+            Ok(None) => 0,
+            Err(_) => {
+                // Can't determine current seq, use single-event mode
+                cursor + 1
+            }
+        };
 
-                // Convert to firehose frame
-                if let Some(frame) = event_to_frame(event) {
-                    // Try to send to channel (with backpressure)
-                    if tx.send(frame).await.is_err() {
-                        // Channel closed, consumer disconnected
-                        break;
+        let events_behind = current_seq - cursor;
+
+        if events_behind > BATCH_THRESHOLD {
+            // Batch mode: fetch multiple events at once
+            tracing::debug!("Catch-up mode: {} events behind, using batch fetch", events_behind);
+
+            match ctx.sequencer.next_events(cursor, Some(500)).await {
+                Ok(events) if !events.is_empty() => {
+                    error_count = 0;
+
+                    for event in events {
+                        cursor = event.seq;
+
+                        if let Some(frame) = event_to_frame(event) {
+                            if tx.send(frame).await.is_err() {
+                                // Channel closed, consumer disconnected
+                                return;
+                            }
+                        }
                     }
                 }
-            }
-            Ok(None) => {
-                // No new events, continue polling
-                error_count = 0;
-            }
-            Err(e) => {
-                // Error reading events
-                error_count += 1;
-                tracing::error!("Error reading event: {}", e);
-
-                if error_count >= MAX_ERRORS {
-                    tracing::error!("Too many errors, closing producer");
-                    break;
+                Ok(_) => {
+                    // No events, shouldn't happen in catch-up mode but handle gracefully
+                    error_count = 0;
                 }
+                Err(e) => {
+                    error_count += 1;
+                    tracing::error!("Error reading events (batch): {}", e);
 
-                // Exponential backoff
-                tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(error_count))).await;
+                    if error_count >= MAX_ERRORS {
+                        tracing::error!("Too many errors, closing producer");
+                        break;
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(error_count))).await;
+                }
+            }
+        } else {
+            // Real-time mode: single event polling
+            match ctx.sequencer.next_event(cursor).await {
+                Ok(Some(event)) => {
+                    error_count = 0;
+                    cursor = event.seq;
+
+                    if let Some(frame) = event_to_frame(event) {
+                        if tx.send(frame).await.is_err() {
+                            // Channel closed, consumer disconnected
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // No new events, continue polling
+                    error_count = 0;
+                }
+                Err(e) => {
+                    error_count += 1;
+                    tracing::error!("Error reading event: {}", e);
+
+                    if error_count >= MAX_ERRORS {
+                        tracing::error!("Too many errors, closing producer");
+                        break;
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(error_count))).await;
+                }
             }
         }
     }
@@ -356,6 +423,20 @@ fn event_to_frame(event: crate::sequencer::SeqRow) -> Option<FirehoseFrame> {
                         cid: op.cid.clone(),
                     }).collect(),
                     blobs: commit.blobs,
+                    time: event.sequenced_at,
+                }))
+            } else {
+                None
+            }
+        }
+        "sync" => {
+            // Deserialize sync event
+            if let Ok(sync) = serde_cbor::from_slice::<SyncEvent>(&event.event) {
+                Some(FirehoseFrame::Sync(FirehoseSync {
+                    seq: event.seq,
+                    did: sync.did,
+                    rev: sync.rev,
+                    blocks: general_purpose::STANDARD.encode(&sync.blocks),
                     time: event.sequenced_at,
                 }))
             } else {
