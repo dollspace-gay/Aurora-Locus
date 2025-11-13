@@ -173,6 +173,13 @@ impl RepositoryManager {
     where
         F: FnOnce(&[u8; 32]) -> Result<Vec<u8>, atproto::repo::RepoError>,
     {
+        // Validate batch size (ATProto spec: max 200 writes per commit)
+        if writes.len() > 200 {
+            return Err(PdsError::Validation(
+                "Too many writes in batch. Maximum: 200 operations per commit".to_string()
+            ));
+        }
+
         // Load current repository state
         let mut repo = self.load_repo().await?;
 
@@ -295,6 +302,13 @@ impl RepositoryManager {
         // Export repository to CAR format to get all blocks
         let car_bytes = repo.export_car()
             .map_err(|e| PdsError::Internal(format!("CAR export failed: {}", e)))?;
+
+        // Validate commit size (ATProto spec: max 2MB per commit event)
+        if car_bytes.len() > 2_000_000 {
+            return Err(PdsError::Validation(
+                "Commit too large. Maximum: 2MB per commit event".to_string()
+            ));
+        }
 
         // Store commit blocks to database
         // Update the repo_root

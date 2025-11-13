@@ -1004,6 +1004,90 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Takedown an account (remove from public view)
+    ///
+    /// Sets the takedown_ref field and revokes all active sessions and refresh tokens
+    /// in a single transaction for consistency. This ensures that a taken-down account
+    /// cannot continue to use the service.
+    ///
+    /// # Arguments
+    /// * `did` - The DID of the account to take down
+    /// * `takedown_ref` - A reference string identifying the takedown action (moderation ID, reason code, etc.)
+    ///
+    /// # Returns
+    /// * `Ok(())` if the takedown was successful
+    /// * `Err(PdsError)` if the account doesn't exist or database operation fails
+    pub async fn takedown_account(&self, did: &str, takedown_ref: &str) -> PdsResult<()> {
+        // Begin transaction
+        let mut tx = self.db.begin().await
+            .map_err(|e| PdsError::Database(e))?;
+
+        // Set takedown_ref in actor table
+        let result = sqlx::query("UPDATE actor SET takedown_ref = ?1 WHERE did = ?2")
+            .bind(takedown_ref)
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        if result.rows_affected() == 0 {
+            return Err(PdsError::NotFound(format!("Actor {} not found", did)));
+        }
+
+        // Delete all active sessions for this account
+        sqlx::query("DELETE FROM session WHERE did = ?1")
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        // Delete all refresh tokens for this account
+        sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        // Commit transaction
+        tx.commit().await
+            .map_err(|e| PdsError::Database(e))?;
+
+        tracing::info!(
+            "Account taken down: DID={}, takedown_ref={}, sessions and tokens revoked",
+            did,
+            takedown_ref
+        );
+
+        Ok(())
+    }
+
+    /// Activate an account (restore from takedown)
+    ///
+    /// Clears the takedown_ref field, making the account accessible again.
+    /// Note: This does NOT restore sessions - the user will need to log in again.
+    ///
+    /// # Arguments
+    /// * `did` - The DID of the account to activate
+    ///
+    /// # Returns
+    /// * `Ok(())` if the activation was successful
+    /// * `Err(PdsError)` if the account doesn't exist or database operation fails
+    pub async fn activate_account(&self, did: &str) -> PdsResult<()> {
+        let result = sqlx::query("UPDATE actor SET takedown_ref = NULL WHERE did = ?1")
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        if result.rows_affected() == 0 {
+            return Err(PdsError::NotFound(format!("Actor {} not found", did)));
+        }
+
+        tracing::info!("Account activated (takedown cleared): DID={}", did);
+
+        Ok(())
+    }
+
     // ==================== App Passwords ====================
 
     /// Create an app password for third-party applications
@@ -1417,6 +1501,8 @@ mod tests {
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
                     pds_url: "http://localhost:3000".to_string(),
                 },
+                jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
+                oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -1437,6 +1523,16 @@ mod tests {
             logging: LoggingConfig {
                 level: "info".to_string(),
             },
+            federation: crate::config::FederationConfig {
+                enabled: false,
+                relay_urls: vec![],
+                appview_url: None,
+                firehose_enabled: false,
+                crawl_enabled: false,
+                public_url: None,
+                auto_stream_events: false,
+            },
+            validation_mode: crate::validation::ValidationMode::Optimistic,
         });
 
         AccountManager::new(db, config)

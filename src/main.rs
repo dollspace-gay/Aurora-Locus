@@ -28,6 +28,7 @@ mod read_after_write;
 mod actor_store;  // Must come after read_after_write (uses its types)
 mod sequencer;
 mod server;
+mod service_auth;
 mod validation;
 
 use clap::Parser;

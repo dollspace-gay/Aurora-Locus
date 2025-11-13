@@ -159,9 +159,16 @@ mod tests {
             },
             authentication: AuthConfig {
                 jwt_secret: "test_secret_key_that_is_32_chars".to_string(),
-                admin_password: "test_password".to_string(),
                 repo_signing_key: "a".repeat(64), // Valid hex key
                 plc_rotation_key: "b".repeat(64), // Valid hex key
+                admin_dids: vec![],
+                oauth: OAuthConfig {
+                    client_id: "test-client".to_string(),
+                    redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
+                    pds_url: "http://localhost:3000".to_string(),
+                },
+                jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
+                oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -182,6 +189,16 @@ mod tests {
             logging: LoggingConfig {
                 level: "info".to_string(),
             },
+            federation: FederationConfig {
+                enabled: false,
+                relay_urls: vec![],
+                appview_url: None,
+                firehose_enabled: false,
+                crawl_enabled: false,
+                public_url: None,
+                auto_stream_events: false,
+            },
+            validation_mode: crate::validation::ValidationMode::Optimistic,
         }
     }
 

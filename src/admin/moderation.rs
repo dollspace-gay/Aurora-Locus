@@ -1,8 +1,10 @@
 /// Account Moderation System
+use crate::account::AccountManager;
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::sync::Arc;
 
 /// Moderation action types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,11 +67,12 @@ pub struct ModerationRecord {
 #[derive(Clone)]
 pub struct ModerationManager {
     db: SqlitePool,
+    account_manager: Arc<AccountManager>,
 }
 
 impl ModerationManager {
-    pub fn new(db: SqlitePool) -> Self {
-        Self { db }
+    pub fn new(db: SqlitePool, account_manager: Arc<AccountManager>) -> Self {
+        Self { db, account_manager }
     }
 
     /// Apply moderation action to an account
@@ -105,6 +108,16 @@ impl ModerationManager {
         .await?;
 
         let id = result.last_insert_rowid();
+
+        // Apply account-level action if it's a takedown
+        if action == ModerationAction::Takedown {
+            // Use moderation ID as takedown_ref for audit trail
+            let takedown_ref = format!("mod_{}", id);
+            if let Err(e) = self.account_manager.takedown_account(did, &takedown_ref).await {
+                tracing::error!("Failed to apply account takedown for {}: {}", did, e);
+                // Don't fail the whole operation - moderation record is already created
+            }
+        }
 
         Ok(ModerationRecord {
             id,
@@ -154,6 +167,24 @@ impl ModerationManager {
                 "Moderation record {} not found or already reversed",
                 moderation_id
             )));
+        }
+
+        // Get the action type that was reversed
+        let row = sqlx::query("SELECT action, did FROM account_moderation WHERE id = ?1")
+            .bind(moderation_id)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or_else(|| PdsError::NotFound(format!("Moderation record {} not found", moderation_id)))?;
+
+        let action_str: String = row.get("action");
+        let did: String = row.get("did");
+
+        // If reversing a takedown, activate the account
+        if action_str == "takedown" {
+            if let Err(e) = self.account_manager.activate_account(&did).await {
+                tracing::error!("Failed to activate account {}: {}", did, e);
+                // Don't fail - moderation reversal is already recorded
+            }
         }
 
         Ok(())
@@ -291,6 +322,73 @@ impl ModerationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::*;
+    use std::path::PathBuf;
+
+    fn create_test_config() -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            service: ServiceConfig {
+                hostname: "localhost".to_string(),
+                port: 2583,
+                service_did: "did:web:localhost".to_string(),
+                version: "0.1.0".to_string(),
+                blob_upload_limit: 5242880,
+            },
+            storage: StorageConfig {
+                data_directory: PathBuf::from("./data"),
+                account_db: PathBuf::from(":memory:"),
+                sequencer_db: PathBuf::from(":memory:"),
+                did_cache_db: PathBuf::from(":memory:"),
+                actor_store_directory: PathBuf::from("./data/actors"),
+                blobstore: BlobstoreConfig::Disk {
+                    location: PathBuf::from("./data/blobs"),
+                    tmp_location: PathBuf::from("./data/tmp"),
+                },
+            },
+            authentication: AuthConfig {
+                jwt_secret: "test-secret-key".to_string(),
+                repo_signing_key: "test-key".to_string(),
+                plc_rotation_key: "test-rotation-key".to_string(),
+                admin_dids: vec![],
+                oauth: OAuthConfig {
+                    client_id: "test-client".to_string(),
+                    redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
+                    pds_url: "http://localhost:3000".to_string(),
+                },
+                jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
+                oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
+            },
+            identity: IdentityConfig {
+                did_plc_url: "https://plc.directory".to_string(),
+                service_handle_domains: vec!["localhost".to_string()],
+                did_cache_stale_ttl: 3600,
+                did_cache_max_ttl: 86400,
+            },
+            email: None,
+            invites: InviteConfig {
+                required: false,
+                interval: 604800,
+                epoch: "2024-01-01T00:00:00Z".to_string(),
+            },
+            rate_limit: RateLimitConfig {
+                enabled: true,
+                global_requests_per_minute: 3000,
+            },
+            logging: LoggingConfig {
+                level: "info".to_string(),
+            },
+            federation: crate::config::FederationConfig {
+                enabled: false,
+                relay_urls: vec![],
+                appview_url: None,
+                firehose_enabled: false,
+                crawl_enabled: false,
+                public_url: None,
+                auto_stream_events: false,
+            },
+            validation_mode: crate::validation::ValidationMode::Optimistic,
+        }
+    }
 
     #[test]
     fn test_action_from_str() {
@@ -332,7 +430,11 @@ mod tests {
         .await
         .unwrap();
 
-        let manager = ModerationManager::new(db);
+        // Create minimal account manager for tests
+        let config = create_test_config();
+        let account_manager = Arc::new(crate::account::AccountManager::new(db.clone(), Arc::new(config)));
+
+        let manager = ModerationManager::new(db, account_manager);
 
         // Apply takedown
         let record = manager
@@ -387,7 +489,11 @@ mod tests {
         .await
         .unwrap();
 
-        let manager = ModerationManager::new(db);
+        // Create minimal account manager for tests
+        let config = create_test_config();
+        let account_manager = Arc::new(crate::account::AccountManager::new(db.clone(), Arc::new(config)));
+
+        let manager = ModerationManager::new(db, account_manager);
 
         // Suspend for 7 days
         manager
@@ -433,7 +539,11 @@ mod tests {
         .await
         .unwrap();
 
-        let manager = ModerationManager::new(db);
+        // Create minimal account manager for tests
+        let config = create_test_config();
+        let account_manager = Arc::new(crate::account::AccountManager::new(db.clone(), Arc::new(config)));
+
+        let manager = ModerationManager::new(db, account_manager);
 
         // Apply and reverse
         let record = manager

@@ -81,6 +81,79 @@ pub async fn update_handle(
     // Normalize handle to lowercase
     let new_handle = req.handle.to_lowercase();
 
+    // For did:plc, submit handle update to PLC directory
+    if did.starts_with("did:plc:") {
+        // Get current DID document to extract previous operation CID
+        let plc_url = &ctx.config.identity.did_plc_url;
+        let audit_endpoint = format!("{}/{}/log/audit", plc_url, did);
+
+        let http_client = reqwest::Client::new();
+        let audit_response = http_client
+            .get(&audit_endpoint)
+            .send()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to fetch PLC audit log: {}", e)))?;
+
+        if !audit_response.status().is_success() {
+            return Err(PdsError::Internal(format!(
+                "PLC directory returned error: {}",
+                audit_response.status()
+            )));
+        }
+
+        // Parse audit log to get last operation CID
+        let audit_log: serde_json::Value = audit_response.json().await
+            .map_err(|e| PdsError::Internal(format!("Failed to parse PLC audit log: {}", e)))?;
+
+        let prev_cid = if let Some(operations) = audit_log.as_array() {
+            if let Some(last_op) = operations.last() {
+                last_op.get("cid")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            } else {
+                None // Genesis operation (no previous)
+            }
+        } else {
+            return Err(PdsError::Internal("Invalid PLC audit log format".to_string()));
+        };
+
+        // Build PLC operation for handle update
+        let mut operation_builder = PlcOperationBuilder::new()
+            .did(did.clone())
+            .also_known_as(vec![format!("at://{}", new_handle)]);
+
+        if let Some(prev) = prev_cid {
+            operation_builder = operation_builder.prev(prev);
+        }
+
+        let operation = operation_builder.build()?;
+
+        // Sign the operation with rotation key
+        let signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)?;
+        let signed_operation = signer.sign_operation(operation)?;
+
+        // Submit to PLC directory
+        let submit_endpoint = format!("{}/{}", plc_url, did);
+        let submit_response = http_client
+            .post(&submit_endpoint)
+            .json(&signed_operation)
+            .send()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to submit PLC operation: {}", e)))?;
+
+        if !submit_response.status().is_success() {
+            let status = submit_response.status();
+            let error_body = submit_response.text().await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(PdsError::Internal(format!(
+                "PLC directory rejected operation {}: {}",
+                status, error_body
+            )));
+        }
+
+        tracing::info!("Successfully submitted PLC handle update for {}: {}", did, new_handle);
+    }
+
     // Update handle via identity resolver
     // This will verify the handle resolves to this DID
     ctx.identity_resolver

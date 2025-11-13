@@ -101,7 +101,7 @@ impl AppContext {
 
         // Initialize admin & moderation managers
         let admin_role_manager = Arc::new(AdminRoleManager::new(account_db.clone()));
-        let moderation_manager = Arc::new(ModerationManager::new(account_db.clone()));
+        let moderation_manager = Arc::new(ModerationManager::new(account_db.clone(), account_manager.clone()));
         let label_manager = Arc::new(LabelManager::new(
             account_db.clone(),
             config.service.service_did.clone(),

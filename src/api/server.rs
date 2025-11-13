@@ -6,15 +6,18 @@ use crate::{
         RefreshSessionRequest, RevokeAppPasswordRequest, SessionInfo, SessionResponse,
     },
     api::middleware,
+    auth::AuthContext,
     context::AppContext,
-    error::PdsResult,
+    error::{PdsError, PdsResult},
+    service_auth,
 };
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::HeaderMap,
     routing::{get, post},
     Json, Router,
 };
+use chrono::Utc;
 
 /// Build server routes
 pub fn routes() -> Router<AppContext> {
@@ -32,6 +35,7 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.server.createAppPassword", post(create_app_password))
         .route("/xrpc/com.atproto.server.listAppPasswords", get(list_app_passwords))
         .route("/xrpc/com.atproto.server.revokeAppPassword", post(revoke_app_password))
+        .route("/xrpc/com.atproto.server.getServiceAuth", get(get_service_auth))
 }
 
 /// Create account endpoint
@@ -429,4 +433,152 @@ async fn revoke_app_password(
         .await?;
 
     Ok(Json(serde_json::json!({})))
+}
+
+// Constants for service auth token expiration
+const HOUR_IN_SECONDS: i64 = 3600;
+const MINUTE_IN_SECONDS: i64 = 60;
+
+/// Request parameters for getServiceAuth
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetServiceAuthQuery {
+    /// Target service DID (audience)
+    aud: String,
+    /// Optional expiration timestamp (seconds since epoch)
+    #[serde(default)]
+    exp: Option<i64>,
+    /// Optional lexicon method the token will be used for
+    #[serde(default)]
+    lxm: Option<String>,
+}
+
+/// Response for getServiceAuth
+#[derive(serde::Serialize)]
+struct GetServiceAuthResponse {
+    token: String,
+}
+
+/// Get service auth endpoint
+///
+/// Generates a service auth JWT for authenticated server-to-server communication.
+/// This allows the user's PDS to authenticate requests to other services on behalf of the user.
+///
+/// # Authentication
+/// Requires a valid session token (Bearer token in Authorization header).
+///
+/// # Validation Rules
+/// - Token must not be expired when requested
+/// - Expiration cannot be > 1 hour in future
+/// - Method-less tokens cannot have expiration > 1 minute in future
+/// - Takendown accounts can only get tokens for account migration methods
+/// - Some methods are "protected" and cannot use service auth
+async fn get_service_auth(
+    State(ctx): State<AppContext>,
+    auth: AuthContext,
+    Query(req): Query<GetServiceAuthQuery>,
+) -> PdsResult<Json<GetServiceAuthResponse>> {
+    let now = Utc::now().timestamp();
+
+    // Validate expiration if provided
+    let exp_duration = if let Some(exp) = req.exp {
+        // Check that expiration is not in the past
+        if exp <= now {
+            return Err(PdsError::Validation(
+                "Token expiration cannot be in the past".to_string(),
+            ));
+        }
+
+        let duration = exp - now;
+
+        // Check expiration is not too far in the future
+        if duration > HOUR_IN_SECONDS {
+            return Err(PdsError::Validation(
+                format!(
+                    "Token expiration too far in future: {} seconds (max: {} seconds)",
+                    duration, HOUR_IN_SECONDS
+                )
+            ));
+        }
+
+        // Check method-less tokens have shorter expiration
+        if req.lxm.is_none() && duration > MINUTE_IN_SECONDS {
+            return Err(PdsError::Validation(
+                format!(
+                    "Tokens without a lexicon method cannot have expiration > {} seconds (requested: {} seconds)",
+                    MINUTE_IN_SECONDS, duration
+                )
+            ));
+        }
+
+        Some(duration)
+    } else {
+        None
+    };
+
+    // Check if account is taken down
+    // Takendown accounts can only get tokens for specific migration methods
+    if let Ok(is_taken_down) = ctx.moderation_manager.is_taken_down(&auth.did).await {
+        if is_taken_down {
+            // Check if this is a migration-related method
+            let is_migration_method = req.lxm.as_ref().map_or(false, |method| {
+                method.starts_with("com.atproto.server.activateAccount")
+                    || method.starts_with("com.atproto.identity.updateHandle")
+            });
+
+            if !is_migration_method {
+                return Err(PdsError::Validation(
+                    "Account is taken down. Only migration methods are allowed".to_string(),
+                ));
+            }
+        }
+    }
+
+    // Check if method is protected (cannot use service auth)
+    // Protected methods require direct user authentication
+    if let Some(ref method) = req.lxm {
+        let protected_methods: &[&str] = &[
+            "com.atproto.server.createSession",
+            "com.atproto.server.createAccount",
+            "com.atproto.server.resetPassword",
+            "com.atproto.server.deleteAccount",
+        ];
+
+        if protected_methods.iter().any(|&pm| method.starts_with(pm)) {
+            return Err(PdsError::Validation(
+                format!("Method '{}' is protected and cannot use service auth", method)
+            ));
+        }
+    }
+
+    // Get signing key from config
+    let signing_key_hex = &ctx.config.authentication.repo_signing_key;
+    let signing_key_bytes = hex::decode(signing_key_hex).map_err(|e| {
+        PdsError::Internal(format!("Failed to decode signing key: {}", e))
+    })?;
+
+    if signing_key_bytes.len() != 32 {
+        return Err(PdsError::Internal(
+            "Signing key must be exactly 32 bytes".to_string(),
+        ));
+    }
+
+    // Generate service auth JWT
+    let token = service_auth::create_service_jwt(
+        &auth.did,                           // Issuer DID (authenticated user)
+        &req.aud,                            // Audience DID (target service)
+        exp_duration,                        // Expiration duration in seconds
+        req.lxm.as_deref(),                  // Optional lexicon method
+        &signing_key_bytes,                  // Signing key
+    )?;
+
+    tracing::info!(
+        did = %auth.did,
+        aud = %req.aud,
+        lxm = ?req.lxm,
+        exp = ?req.exp,
+        "service_auth_token_generated"
+    );
+
+    Ok(Json(GetServiceAuthResponse { token }))
 }

@@ -21,7 +21,8 @@
       "Bash(bd update:*)",
       "Bash(bd dep add:*)",
       "Bash(bd dep tree:*)",
-      "Bash(./target/release/aurora-locus.exe:*)"
+      "Bash(./target/release/aurora-locus.exe:*)",
+      "Bash(cargo clippy:*)"
     ],
     "deny": [],
     "ask": []

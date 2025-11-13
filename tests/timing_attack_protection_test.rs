@@ -8,6 +8,7 @@ use aurora_locus::{
     account::{AccountManager, CreateAccountRequest},
     config::*,
     error::PdsResult,
+    validation::ValidationMode,
 };
 use sqlx::SqlitePool;
 use std::path::PathBuf;
@@ -124,6 +125,8 @@ async fn create_test_manager() -> AccountManager {
                 redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
                 pds_url: "http://localhost:3000".to_string(),
             },
+            jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
+            oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
         },
         identity: IdentityConfig {
             did_plc_url: "https://plc.directory".to_string(),
@@ -144,6 +147,16 @@ async fn create_test_manager() -> AccountManager {
         logging: LoggingConfig {
             level: "info".to_string(),
         },
+        federation: FederationConfig {
+            enabled: false,
+            relay_urls: vec![],
+            appview_url: None,
+            firehose_enabled: false,
+            crawl_enabled: false,
+            public_url: None,
+            auto_stream_events: false,
+        },
+        validation_mode: ValidationMode::Optimistic,
     });
 
     AccountManager::new(db, config)

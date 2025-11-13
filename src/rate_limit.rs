@@ -199,6 +199,7 @@ mod tests {
             authenticated_rps: 10,
             unauthenticated_rps: 5,
             admin_rps: 100,
+            cross_pds_rps: 20,
             burst_size: 5,
         };
         let limiter = RateLimiter::new(config);

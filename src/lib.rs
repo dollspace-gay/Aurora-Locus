@@ -28,6 +28,7 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod sequencer;
 pub mod validation;
+pub mod service_auth;
 
 // Re-export commonly used types for easier testing
 pub use error::{PdsError, PdsResult};

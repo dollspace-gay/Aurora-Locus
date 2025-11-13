@@ -500,10 +500,12 @@ mod tests {
 
         let result = jwk_to_decoding_key(&jwk);
         assert!(result.is_err(), "Should fail on unsupported curve");
-        assert!(
-            result.unwrap_err().to_string().contains("P-384"),
-            "Error should mention P-384"
-        );
+        if let Err(e) = result {
+            assert!(
+                e.to_string().contains("P-384"),
+                "Error should mention P-384"
+            );
+        }
     }
 
     #[test]
@@ -532,10 +534,12 @@ mod tests {
 
         let result = jwk_to_decoding_key(&jwk);
         assert!(result.is_err(), "Should fail on non-EC key type");
-        assert!(
-            result.unwrap_err().to_string().contains("RSA"),
-            "Error should mention RSA"
-        );
+        if let Err(e) = result {
+            assert!(
+                e.to_string().contains("RSA"),
+                "Error should mention RSA"
+            );
+        }
     }
 
     #[test]
