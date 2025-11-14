@@ -183,9 +183,18 @@ impl EndpointRateLimit {
 /// Configuration for per-endpoint rate limits
 #[derive(Debug, Clone, Default)]
 pub struct EndpointRateLimitConfig {
-    /// Map of endpoint paths to rate limit rules
+    /// Map of endpoint paths to rate limit rules (supports multiple limits per endpoint)
     /// Key is the full XRPC path, e.g., "/xrpc/com.atproto.server.createAccount"
-    pub endpoints: HashMap<String, EndpointRateLimit>,
+    /// Value is a vector of rate limits that ALL must pass for the request to be allowed
+    ///
+    /// Example: Login endpoint with both short-term and long-term limits:
+    /// ```ignore
+    /// config.add_limits("/xrpc/com.atproto.server.createSession", vec![
+    ///     EndpointRateLimit::new(30, 300),    // 30 per 5 minutes (burst protection)
+    ///     EndpointRateLimit::new(300, 86400), // 300 per day (sustained attack protection)
+    /// ]);
+    /// ```
+    pub endpoints: HashMap<String, Vec<EndpointRateLimit>>,
 }
 
 impl EndpointRateLimitConfig {
@@ -196,49 +205,96 @@ impl EndpointRateLimitConfig {
         }
     }
 
-    /// Add a rate limit for an endpoint
+    /// Add a single rate limit for an endpoint
+    ///
+    /// If the endpoint already has limits, this appends to the existing list.
+    /// All limits for an endpoint must pass for the request to be allowed.
     pub fn add_limit(&mut self, endpoint: &str, limit: EndpointRateLimit) {
-        self.endpoints.insert(endpoint.to_string(), limit);
+        self.endpoints
+            .entry(endpoint.to_string())
+            .or_insert_with(Vec::new)
+            .push(limit);
     }
 
-    /// Create default Bluesky-compatible configuration
+    /// Add multiple rate limits for an endpoint
+    ///
+    /// Replaces any existing limits for this endpoint.
+    /// All limits must pass for the request to be allowed.
+    ///
+    /// # Example
+    /// ```ignore
+    /// config.add_limits("/xrpc/com.atproto.server.createSession", vec![
+    ///     EndpointRateLimit::new(30, 300),    // 30 per 5 minutes (burst)
+    ///     EndpointRateLimit::new(300, 86400), // 300 per day (sustained)
+    /// ]);
+    /// ```
+    pub fn add_limits(&mut self, endpoint: &str, limits: Vec<EndpointRateLimit>) {
+        self.endpoints.insert(endpoint.to_string(), limits);
+    }
+
+    /// Create default Bluesky-compatible configuration with multi-limit protection
+    ///
+    /// Critical endpoints have multiple simultaneous limits for sophisticated abuse prevention:
+    /// - Short-term limits: Prevent burst attacks
+    /// - Long-term limits: Prevent sustained attacks
     pub fn bluesky_defaults() -> Self {
         let mut config = Self::new();
 
-        // Account creation: 100 requests per 5 minutes (300 seconds)
-        config.add_limit(
+        // Account creation: Multiple limits for comprehensive protection
+        // - 100 per 5 minutes: Prevent rapid account creation
+        // - 500 per day: Prevent sustained Sybil attacks
+        config.add_limits(
             "/xrpc/com.atproto.server.createAccount",
-            EndpointRateLimit::new(100, 300),
+            vec![
+                EndpointRateLimit::new(100, 300),   // Short-term: 100 per 5 minutes
+                EndpointRateLimit::new(500, 86400), // Long-term: 500 per day
+            ],
         );
 
-        // Login/createSession: 30 per 5 minutes (this is one of multiple limits needed)
-        config.add_limit(
+        // Login/createSession: Multiple limits for brute-force protection
+        // - 30 per 5 minutes: Prevent rapid password guessing
+        // - 300 per day: Prevent sustained brute-force attacks
+        // Note: This should be combined with identifier+IP composite keys for maximum protection
+        config.add_limits(
             "/xrpc/com.atproto.server.createSession",
-            EndpointRateLimit::new(30, 300),
+            vec![
+                EndpointRateLimit::new(30, 300),    // Short-term: 30 per 5 minutes
+                EndpointRateLimit::new(300, 86400), // Long-term: 300 per day
+            ],
         );
 
-        // Password reset: 50 per 5 minutes
-        config.add_limit(
+        // Password reset: Multiple limits to prevent abuse
+        // - 50 per 5 minutes: Prevent rapid reset attempts
+        // - 200 per day: Prevent email bombing
+        config.add_limits(
             "/xrpc/com.atproto.server.requestPasswordReset",
-            EndpointRateLimit::new(50, 300),
+            vec![
+                EndpointRateLimit::new(50, 300),    // Short-term: 50 per 5 minutes
+                EndpointRateLimit::new(200, 86400), // Long-term: 200 per day
+            ],
         );
 
-        // Email confirmation: 10 per hour
+        // Email confirmation: Single limit (less critical)
         config.add_limit(
             "/xrpc/com.atproto.server.requestEmailConfirmation",
-            EndpointRateLimit::new(10, 3600),
+            EndpointRateLimit::new(10, 3600), // 10 per hour
         );
 
-        // Blob upload: 50 per hour (prevent storage abuse)
-        config.add_limit(
+        // Blob upload: Multiple limits to prevent storage abuse
+        // - 50 per hour: Prevent rapid uploads
+        // - 500 per day: Prevent sustained storage attacks
+        config.add_limits(
             "/xrpc/com.atproto.repo.uploadBlob",
-            EndpointRateLimit::new(50, 3600),
+            vec![
+                EndpointRateLimit::new(50, 3600),   // Short-term: 50 per hour
+                EndpointRateLimit::new(500, 86400), // Long-term: 500 per day
+            ],
         );
 
-        // Account deletion: 3 per day
+        // Account deletion: Single strict limit (very sensitive operation)
         config.add_limit(
             "/xrpc/com.atproto.server.deleteAccount",
-            EndpointRateLimit::new(3, 86400),
+            EndpointRateLimit::new(3, 86400), // 3 per day
         );
 
         config
@@ -368,8 +424,9 @@ pub struct RateLimiter {
     unauthenticated: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     admin: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     cross_pds: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
-    /// Per-endpoint rate limiters
-    endpoint_limiters: Arc<HashMap<String, Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>>>,
+    /// Per-endpoint rate limiters (supports multiple simultaneous limits per endpoint)
+    /// Each endpoint can have multiple rate limiters - ALL must pass for request to be allowed
+    endpoint_limiters: Arc<HashMap<String, Vec<Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>>>>,
     /// IP-based rate limiter (keyed by IP address)
     ip_limiter: Arc<GovernorLimiter<String, DashMap<String, InMemoryState>, DefaultClock>>,
     /// Whether to trust proxy headers for IP extraction
@@ -417,14 +474,17 @@ impl RateLimiter {
         )
         .allow_burst(NonZeroU32::new(20).unwrap());
 
-        // Create per-endpoint rate limiters
+        // Create per-endpoint rate limiters (supports multiple limits per endpoint)
         let mut endpoint_limiters = HashMap::new();
-        for (path, limit) in endpoint_config.endpoints.iter() {
-            let quota = limit.to_quota();
-            endpoint_limiters.insert(
-                path.clone(),
-                Arc::new(GovernorLimiter::direct(quota)),
-            );
+        for (path, limits) in endpoint_config.endpoints.iter() {
+            let limiters: Vec<Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>> = limits
+                .iter()
+                .map(|limit| {
+                    let quota = limit.to_quota();
+                    Arc::new(GovernorLimiter::direct(quota))
+                })
+                .collect();
+            endpoint_limiters.insert(path.clone(), limiters);
         }
 
         Self {
@@ -488,15 +548,27 @@ impl RateLimiter {
 
     /// Check rate limit for a specific endpoint
     ///
-    /// Returns Ok if endpoint-specific limit allows request, or None if no endpoint-specific limit exists
+    /// If the endpoint has multiple rate limiters configured, ALL must pass for the request to be allowed.
+    /// Returns Ok if all endpoint-specific limits allow request, or None if no endpoint-specific limit exists.
+    ///
+    /// This enables sophisticated abuse prevention like:
+    /// - Short-term limit (burst protection): 30 requests per 5 minutes
+    /// - Long-term limit (sustained attack protection): 300 requests per day
     pub fn check_endpoint(&self, endpoint: &str) -> Option<PdsResult<()>> {
-        self.endpoint_limiters.get(endpoint).map(|limiter| {
-            match limiter.check() {
-                Ok(_) => Ok(()),
-                Err(_) => Err(PdsError::RateLimitExceeded {
-                    retry_after: Duration::from_secs(60), // Return 60s as retry-after for endpoint limits
-                }),
+        self.endpoint_limiters.get(endpoint).map(|limiters| {
+            // Check ALL limiters - if any fail, return error
+            for limiter in limiters.iter() {
+                match limiter.check() {
+                    Ok(_) => continue,
+                    Err(_) => {
+                        return Err(PdsError::RateLimitExceeded {
+                            retry_after: Duration::from_secs(60), // Return 60s as retry-after for endpoint limits
+                        });
+                    }
+                }
             }
+            // All limiters passed
+            Ok(())
         })
     }
 
@@ -1011,5 +1083,187 @@ mod tests {
             "/xrpc/com.atproto.repo.createRecord"
         );
         assert_eq!(key, "did:plc:user123-/xrpc/com.atproto.repo.createRecord");
+    }
+
+    // ========== Tests for Multiple Simultaneous Rate Limits ==========
+
+    #[test]
+    fn test_multiple_limits_per_endpoint() {
+        // Test that endpoints can have multiple rate limits and ALL must pass
+        let mut config = EndpointRateLimitConfig::new();
+
+        // Add two limits: tight limit (5/minute) and loose limit (20/minute)
+        config.add_limits(
+            "/xrpc/test.endpoint",
+            vec![
+                EndpointRateLimit::with_burst(5, 60, 5),   // 5 per minute with burst of 5
+                EndpointRateLimit::with_burst(20, 60, 20), // 20 per minute with burst of 20
+            ],
+        );
+
+        let limiter = RateLimiter::with_endpoint_config(RateLimitConfig::default(), config);
+
+        // First 5 requests should succeed (within both limits)
+        for i in 0..5 {
+            let result = limiter.check_endpoint("/xrpc/test.endpoint");
+            assert!(result.is_some(), "Request {} should have endpoint limit", i);
+            assert!(result.unwrap().is_ok(), "Request {} should pass both limits", i);
+        }
+
+        // 6th request should fail (exceeds first limit of 5)
+        let result = limiter.check_endpoint("/xrpc/test.endpoint");
+        assert!(result.is_some());
+        assert!(result.unwrap().is_err(), "Request 6 should fail the 5/minute limit");
+    }
+
+    #[test]
+    fn test_add_limit_appends() {
+        // Test that add_limit appends to existing limits
+        let mut config = EndpointRateLimitConfig::new();
+
+        // Add first limit
+        config.add_limit("/xrpc/test.endpoint", EndpointRateLimit::new(10, 60));
+
+        // Add second limit (should append, not replace)
+        config.add_limit("/xrpc/test.endpoint", EndpointRateLimit::new(5, 60));
+
+        // Should have 2 limits for this endpoint
+        assert_eq!(config.endpoints.get("/xrpc/test.endpoint").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_add_limits_replaces() {
+        // Test that add_limits replaces existing limits
+        let mut config = EndpointRateLimitConfig::new();
+
+        // Add initial limit
+        config.add_limit("/xrpc/test.endpoint", EndpointRateLimit::new(10, 60));
+
+        // Replace with multiple limits
+        config.add_limits(
+            "/xrpc/test.endpoint",
+            vec![
+                EndpointRateLimit::new(5, 60),
+                EndpointRateLimit::new(20, 3600),
+            ],
+        );
+
+        // Should have exactly 2 limits (not 3)
+        assert_eq!(config.endpoints.get("/xrpc/test.endpoint").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_multiple_limits_short_and_long_term() {
+        // Simulate Bluesky-style login protection with short-term and long-term limits
+        let mut config = EndpointRateLimitConfig::new();
+
+        // Short-term: 10/minute (burst protection)
+        // Long-term: 100/hour (sustained attack protection)
+        config.add_limits(
+            "/xrpc/com.atproto.server.createSession",
+            vec![
+                EndpointRateLimit::with_burst(10, 60, 10),    // 10 per minute
+                EndpointRateLimit::with_burst(100, 3600, 100), // 100 per hour
+            ],
+        );
+
+        let limiter = RateLimiter::with_endpoint_config(RateLimitConfig::default(), config);
+
+        // First 10 requests should succeed (within both limits)
+        for i in 0..10 {
+            let result = limiter.check_endpoint("/xrpc/com.atproto.server.createSession");
+            assert!(result.is_some(), "Request {} should have endpoint limit", i);
+            assert!(
+                result.unwrap().is_ok(),
+                "Request {} should pass both short-term and long-term limits",
+                i
+            );
+        }
+
+        // 11th request should fail (exceeds short-term limit of 10/minute)
+        let result = limiter.check_endpoint("/xrpc/com.atproto.server.createSession");
+        assert!(result.is_some());
+        assert!(
+            result.unwrap().is_err(),
+            "Request 11 should fail the 10/minute short-term limit"
+        );
+    }
+
+    #[test]
+    fn test_all_limits_must_pass() {
+        // Test that if ANY limit fails, the request is blocked
+        let mut config = EndpointRateLimitConfig::new();
+
+        // Two very different limits
+        config.add_limits(
+            "/xrpc/test.strict",
+            vec![
+                EndpointRateLimit::with_burst(3, 60, 3),    // Very strict: 3/minute
+                EndpointRateLimit::with_burst(1000, 60, 1000), // Very loose: 1000/minute
+            ],
+        );
+
+        let limiter = RateLimiter::with_endpoint_config(RateLimitConfig::default(), config);
+
+        // First 3 requests should succeed
+        for i in 0..3 {
+            let result = limiter.check_endpoint("/xrpc/test.strict");
+            assert!(result.unwrap().is_ok(), "Request {} should pass", i);
+        }
+
+        // 4th request should fail due to strict limit, even though loose limit would allow it
+        let result = limiter.check_endpoint("/xrpc/test.strict");
+        assert!(
+            result.unwrap().is_err(),
+            "Request 4 should fail the 3/minute limit (most restrictive)"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_with_single_limit_still_works() {
+        // Ensure backward compatibility: single limit still works
+        let mut config = EndpointRateLimitConfig::new();
+
+        config.add_limit("/xrpc/test.single", EndpointRateLimit::with_burst(5, 60, 5));
+
+        let limiter = RateLimiter::with_endpoint_config(RateLimitConfig::default(), config);
+
+        // Should work like before
+        for i in 0..5 {
+            let result = limiter.check_endpoint("/xrpc/test.single");
+            assert!(result.unwrap().is_ok(), "Request {} should pass", i);
+        }
+
+        let result = limiter.check_endpoint("/xrpc/test.single");
+        assert!(result.unwrap().is_err(), "Request 6 should fail");
+    }
+
+    #[test]
+    fn test_different_endpoints_independent_limits() {
+        // Test that different endpoints have independent limit vectors
+        let mut config = EndpointRateLimitConfig::new();
+
+        // Endpoint 1: Two limits
+        config.add_limits(
+            "/xrpc/endpoint1",
+            vec![
+                EndpointRateLimit::new(5, 60),
+                EndpointRateLimit::new(10, 60),
+            ],
+        );
+
+        // Endpoint 2: One limit
+        config.add_limit("/xrpc/endpoint2", EndpointRateLimit::new(20, 60));
+
+        let limiter = RateLimiter::with_endpoint_config(RateLimitConfig::default(), config);
+
+        // Endpoint 1 should have limits
+        assert!(limiter.check_endpoint("/xrpc/endpoint1").is_some());
+
+        // Endpoint 2 should have limits
+        assert!(limiter.check_endpoint("/xrpc/endpoint2").is_some());
+
+        // Endpoint 3 should NOT have limits
+        assert!(limiter.check_endpoint("/xrpc/endpoint3").is_none());
     }
 }
