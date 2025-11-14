@@ -264,6 +264,7 @@ dependencies = [
  "bs58",
  "chrono",
  "clap",
+ "dashmap",
  "dotenv",
  "futures",
  "futures-util",

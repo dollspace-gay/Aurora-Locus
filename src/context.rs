@@ -185,8 +185,8 @@ impl AppContext {
             relay_client.clone()
         ));
 
-        // Initialize rate limiter
-        let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig::default()));
+        // Initialize rate limiter with Bluesky-compatible endpoint limits
+        let rate_limiter = Arc::new(RateLimiter::with_bluesky_defaults(RateLimitConfig::default()));
 
         // Initialize mailer
         let mailer = Arc::new(Mailer::new(config.email.clone())?);
