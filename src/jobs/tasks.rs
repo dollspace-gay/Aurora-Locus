@@ -249,3 +249,75 @@ pub async fn process_relay_event(ctx: &AppContext, event: crate::federation::rel
 
     Ok(())
 }
+
+/// Collect aggregate metrics about PDS state
+///
+/// This job periodically queries the database to update aggregate metrics:
+/// - Total accounts
+/// - Active sessions
+/// - Total records across all repos
+/// - Per-collection record counts (would require querying all repos)
+/// - Sequencer current position
+pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
+    use sqlx::Row;
+
+    // 1. Count total accounts
+    let account_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account")
+        .fetch_one(&ctx.account_db)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+    crate::metrics::ACCOUNTS_TOTAL.set(account_count);
+
+    // 2. Count active sessions (not expired)
+    let session_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .map_err(|e| PdsError::Database(e))?;
+
+    crate::metrics::SESSIONS_ACTIVE.set(session_count);
+
+    // 3. Get current sequencer position
+    let seq_result = sqlx::query("SELECT MAX(seq) as max_seq FROM sequencer")
+        .fetch_optional(&ctx.sequencer_db)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+    if let Some(row) = seq_result {
+        if let Ok(max_seq) = row.try_get::<Option<i64>, _>("max_seq") {
+            if let Some(seq) = max_seq {
+                crate::metrics::update_sequencer_position(seq);
+            }
+        }
+    }
+
+    // 4. Count blob storage usage
+    let blob_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap_or(0);
+
+    crate::metrics::BLOB_COUNT_TOTAL.set(blob_count);
+
+    // 5. Get total blob storage size
+    let blob_size: Option<i64> = sqlx::query_scalar("SELECT SUM(size) FROM blob")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap_or(None);
+
+    if let Some(size) = blob_size {
+        crate::metrics::BLOB_STORAGE_BYTES_TOTAL.set(size);
+    }
+
+    tracing::debug!(
+        "Collected aggregate metrics: {} accounts, {} sessions, {} blobs ({} bytes)",
+        account_count,
+        session_count,
+        blob_count,
+        blob_size.unwrap_or(0)
+    );
+
+    Ok(())
+}

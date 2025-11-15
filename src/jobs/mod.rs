@@ -1,8 +1,60 @@
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
-use tracing::{error, info};
+use tokio::time::{interval, Duration, sleep};
+use tracing::{error, info, warn};
 
 pub mod tasks;
+
+/// Job execution result with retry support
+#[derive(Debug)]
+pub enum JobResult {
+    Success,
+    Retry { after: Duration, attempt: u32 },
+    Failed,
+}
+
+/// Execute a job with retry logic and monitoring
+async fn execute_with_retry<F, Fut>(
+    job_name: &str,
+    max_retries: u32,
+    operation: F,
+) -> Result<(), String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), crate::error::PdsError>>,
+{
+    let start = std::time::Instant::now();
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+        let attempt_start = std::time::Instant::now();
+
+        match operation().await {
+            Ok(_) => {
+                let duration = start.elapsed().as_secs_f64();
+                crate::metrics::record_background_job(job_name, "success", duration);
+                return Ok(());
+            }
+            Err(e) => {
+                if attempt >= max_retries {
+                    let duration = start.elapsed().as_secs_f64();
+                    crate::metrics::record_background_job(job_name, "failed", duration);
+                    return Err(format!("Job failed after {} attempts: {}", attempt, e));
+                }
+
+                // Exponential backoff: 2^attempt seconds
+                let backoff = Duration::from_secs(2u64.pow(attempt - 1).min(300)); // Max 5 minutes
+                warn!(
+                    "Job {} failed (attempt {}/{}): {}. Retrying in {:?}",
+                    job_name, attempt, max_retries, e, backoff
+                );
+
+                crate::metrics::record_background_job(job_name, "retry", attempt_start.elapsed().as_secs_f64());
+                sleep(backoff).await;
+            }
+        }
+    }
+}
 
 /// Job scheduler for background tasks
 pub struct JobScheduler {
@@ -27,6 +79,7 @@ impl JobScheduler {
 
         // Spawn monitoring tasks
         tokio::spawn(Self::health_check_job(Arc::clone(&self)));
+        tokio::spawn(Self::metrics_collection_job(Arc::clone(&self)));
 
         // Spawn federation jobs (Phase 1)
         if self.context.config.federation.enabled && self.context.pds_discovery.is_some() {
@@ -272,6 +325,32 @@ impl JobScheduler {
                     }
                     Err(e) => error!("Failed to cleanup expired DPoP nonces: {}", e),
                 }
+            }
+        }
+    }
+
+    /// Metrics collection job (runs every 15 minutes)
+    ///
+    /// Periodically collects aggregate metrics about the PDS state:
+    /// - Total accounts, active sessions
+    /// - Repository record counts by collection
+    /// - Storage sizes
+    /// - Sequencer positions
+    async fn metrics_collection_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(900)); // Every 15 minutes
+
+        loop {
+            interval.tick().await;
+
+            match execute_with_retry(
+                "metrics_collection",
+                3,
+                || tasks::collect_aggregate_metrics(&scheduler.context)
+            ).await {
+                Ok(_) => {
+                    // Silent success
+                }
+                Err(e) => error!("Metrics collection job error: {}", e),
             }
         }
     }

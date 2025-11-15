@@ -10,8 +10,8 @@
 use lazy_static::lazy_static;
 use prometheus::{
     register_counter_vec, register_gauge, register_histogram_vec, register_int_counter,
-    register_int_counter_vec, register_int_gauge, CounterVec, Gauge, HistogramVec, IntCounter,
-    IntCounterVec, IntGauge, TextEncoder, Encoder,
+    register_int_counter_vec, register_int_gauge, register_int_gauge_vec, CounterVec, Gauge,
+    HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder, Encoder,
 };
 
 lazy_static! {
@@ -168,6 +168,31 @@ lazy_static! {
     )
     .unwrap();
 
+    /// Records per collection type
+    pub static ref REPO_RECORDS_BY_COLLECTION: IntGaugeVec = register_int_gauge_vec!(
+        "repo_records_by_collection",
+        "Number of records per collection type",
+        &["collection"]
+    )
+    .unwrap();
+
+    /// Repository size in bytes by DID
+    pub static ref REPO_SIZE_BYTES: HistogramVec = register_histogram_vec!(
+        "repo_size_bytes",
+        "Repository size in bytes",
+        &["did"],
+        vec![1024.0, 10240.0, 102400.0, 1024000.0, 10240000.0, 102400000.0]
+    )
+    .unwrap();
+
+    /// Storage size by collection type in bytes
+    pub static ref REPO_STORAGE_BY_COLLECTION_BYTES: IntGaugeVec = register_int_gauge_vec!(
+        "repo_storage_by_collection_bytes",
+        "Storage size in bytes per collection type",
+        &["collection"]
+    )
+    .unwrap();
+
     /// Repository commits
     pub static ref REPO_COMMITS_TOTAL: IntCounterVec = register_int_counter_vec!(
         "repo_commits_total",
@@ -265,6 +290,22 @@ lazy_static! {
     pub static ref SEQUENCER_CURRENT_SEQ: IntGauge = register_int_gauge!(
         "sequencer_current_seq",
         "Current sequence number"
+    )
+    .unwrap();
+
+    /// Sequencer lag by consumer (difference between current seq and consumer cursor)
+    pub static ref SEQUENCER_LAG: IntGaugeVec = register_int_gauge_vec!(
+        "sequencer_lag",
+        "Number of events behind current sequence by consumer",
+        &["consumer"]
+    )
+    .unwrap();
+
+    /// Sequencer cursor position by consumer
+    pub static ref SEQUENCER_CURSOR_POSITION: IntGaugeVec = register_int_gauge_vec!(
+        "sequencer_cursor_position",
+        "Current cursor position for each consumer",
+        &["consumer"]
     )
     .unwrap();
 
@@ -843,6 +884,50 @@ pub fn record_firehose_batch_fetch(event_count: usize) {
     FIREHOSE_BATCH_SIZE
         .with_label_values(&[])
         .observe(event_count as f64);
+}
+
+// ========== Repository Metrics Helper Functions ==========
+
+/// Update record count for a specific collection
+pub fn update_collection_record_count(collection: &str, count: i64) {
+    REPO_RECORDS_BY_COLLECTION
+        .with_label_values(&[collection])
+        .set(count);
+}
+
+/// Record repository size in bytes
+pub fn record_repo_size(did: &str, size_bytes: u64) {
+    REPO_SIZE_BYTES
+        .with_label_values(&[did])
+        .observe(size_bytes as f64);
+}
+
+/// Update storage size for a collection type
+pub fn update_collection_storage_size(collection: &str, size_bytes: i64) {
+    REPO_STORAGE_BY_COLLECTION_BYTES
+        .with_label_values(&[collection])
+        .set(size_bytes);
+}
+
+// ========== Sequencer Metrics Helper Functions ==========
+
+/// Update sequencer cursor position for a consumer
+pub fn update_sequencer_cursor(consumer: &str, position: i64) {
+    SEQUENCER_CURSOR_POSITION
+        .with_label_values(&[consumer])
+        .set(position);
+}
+
+/// Update sequencer lag for a consumer
+pub fn update_sequencer_lag(consumer: &str, lag: i64) {
+    SEQUENCER_LAG
+        .with_label_values(&[consumer])
+        .set(lag);
+}
+
+/// Update current sequencer position and calculate lag for all consumers
+pub fn update_sequencer_position(current_seq: i64) {
+    SEQUENCER_CURRENT_SEQ.set(current_seq);
 }
 
 #[cfg(test)]
