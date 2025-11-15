@@ -74,3 +74,61 @@ GIT WORKFLOW (AUTO-SYNC)
     • ✓ Works seamlessly across machines and team members
     • No manual export/import needed!
   Disable with: --no-auto-flush or --no-auto-import
+
+  Rust Development Best Practices
+
+When generating Rust code, you must adhere to the highest standards of safety, legibility, and maintainability. Follow these principles rigorously.
+
+1. Safety and Security First
+
+Your primary directive is to write safe, idiomatic Rust.
+
+No Panics in Libraries: Generated library code should never panic. Operations that can fail must return a Result<T, E>. Application code may panic (e.g., unwrap(), expect()) only when a non-recoverable state is reached (e.g., configuration failure at startup).
+
+Avoid unsafe: Do not use the unsafe keyword unless it is absolutely unavoidable and explicitly requested. If unsafe is used, it must be accompanied by a // SAFETY: comment explaining exactly why the block is sound and what invariants it upholds.
+
+Handle Errors Explicitly: Always use Result<T, E> for recoverable errors and Option<T> for optional values. Use the ? operator for clean error propagation. Avoid using .unwrap() or .expect() on Option or Result types, except in tests or when a panic is the desired outcome (as noted above).
+
+Integer Overflow: Be mindful of integer overflow. Use checked arithmetic (e.g., checked_add) when appropriate.
+
+Dependencies: When suggesting dependencies, prefer well-maintained and widely-used crates.
+
+2. Code Legibility and Idioms
+
+Code must be immediately understandable and idiomatic.
+
+Formatting: All code must be formatted as if by rustfmt.
+
+Clippy Lints: Write code that adheres to standard Clippy lints. Your code should pass clippy::all and clippy::pedantic where reasonable.
+
+Naming: Follow standard Rust naming conventions:
+
+PascalCase for types (structs, enums, traits).
+
+snake_case for functions, methods, variables, and modules.
+
+UPPER_SNAKE_CASE for constants.
+
+Documentation: All public items (pub struct, pub fn, pub trait, pub enum) must have documentation comments (///). Provide clear, concise explanations and examples.
+
+Idiomatic Rust:
+
+Prefer iterators (.iter(), .map(), .filter(), etc.) over manual loops where it enhances clarity.
+
+Use match statements and pattern matching effectively.
+
+Embrace Option and Result to manage state and control flow.
+
+Use struct and enum to create strong, type-safe data models.
+
+3. Maintainability and Project Structure
+
+Generate code that is easy to test, debug, and refactor.
+
+Modularity: Group related functionality into modules. Use pub and visibility modifiers to expose a clear and intentional public API.
+
+Error Handling: For libraries, consider using thiserror to create custom error types. For applications, eyre or anyhow can be appropriate for managing error contexts.
+
+Testing: Include unit tests (#[cfg(test)]) for non-trivial logic. Demonstrate how to test the code you've written.
+
+Single Responsibility: Functions and methods should be small and focused on a single task. Avoid deep nesting and complex control flow; prefer early returns.

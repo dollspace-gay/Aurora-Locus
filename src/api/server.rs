@@ -838,18 +838,30 @@ async fn activate_account(
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
-    // Cancel account deletion/deactivation
-    ctx.account_manager.cancel_account_deletion(&validated.did).await?;
+    // Reactivate temporarily deactivated account
+    // If account is pending deletion (has delete_after set), use cancel_account_deletion instead
+    let actor = ctx.account_manager.get_actor(&validated.did).await?;
 
-    Ok(Json(serde_json::json!({
-        "message": "Account activated successfully"
-    })))
+    if actor.delete_after.is_some() {
+        // Account is pending deletion, cancel it completely
+        ctx.account_manager.cancel_account_deletion(&validated.did).await?;
+        Ok(Json(serde_json::json!({
+            "message": "Account deletion cancelled and account reactivated"
+        })))
+    } else {
+        // Account is just temporarily deactivated, reactivate it
+        ctx.account_manager.reactivate_account(&validated.did).await?;
+        Ok(Json(serde_json::json!({
+            "message": "Account reactivated successfully"
+        })))
+    }
 }
 
 /// Deactivate account endpoint
 ///
-/// Soft-deactivates an account (different from deletion).
-/// User can reactivate within grace period.
+/// Temporarily deactivates an account without initiating deletion.
+/// User can reactivate anytime via com.atproto.server.activateAccount or by logging in.
+/// This is DIFFERENT from deleteAccount which permanently deletes after grace period.
 async fn deactivate_account(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -858,13 +870,25 @@ async fn deactivate_account(
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
-    // Request deactivation (reuses delete logic with grace period)
+    // Verify password before deactivation
+    let account = ctx.account_manager.get_account(&validated.did).await?;
+    let password_hash = account.password_hash
+        .ok_or_else(|| PdsError::Authorization("No local account credentials".to_string()))?;
+
+    let valid = atproto::server_auth::PasswordHasher::verify(&req.password, &password_hash)
+        .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
+
+    if !valid {
+        return Err(PdsError::Authorization("Invalid password".to_string()));
+    }
+
+    // Temporarily deactivate account (NO deletion scheduled)
     ctx.account_manager
-        .request_account_deletion(&validated.did, &req.password)
+        .deactivate_account(&validated.did)
         .await?;
 
     Ok(Json(serde_json::json!({
-        "message": "Account deactivated. You can reactivate by logging in within 30 days."
+        "message": "Account temporarily deactivated. You can reactivate anytime by logging in or calling activateAccount."
     })))
 }
 

@@ -1039,12 +1039,16 @@ impl AccountManager {
             return Err(PdsError::Authorization("Invalid password".to_string()));
         }
 
-        // Mark account for deletion (30 day grace period)
-        let deletion_date = Utc::now() + Duration::days(30);
+        let now = Utc::now();
+        let deletion_date = now + Duration::days(30);
 
+        // Mark account for deletion (30 day grace period)
+        // Set BOTH deactivated_at (immediate suspension) and delete_after (deletion date)
+        // This combination indicates: "account is deactivated pending deletion"
         sqlx::query(
-            "UPDATE actor SET deactivated_at = ?1 WHERE did = ?2"
+            "UPDATE actor SET deactivated_at = ?1, delete_after = ?2 WHERE did = ?3"
         )
+        .bind(now)
         .bind(deletion_date)
         .bind(did)
         .execute(&self.db)
@@ -1089,13 +1093,77 @@ impl AccountManager {
 
     /// Cancel account deletion (if within grace period)
     pub async fn cancel_account_deletion(&self, did: &str) -> PdsResult<()> {
-        sqlx::query("UPDATE actor SET deactivated_at = NULL WHERE did = ?1")
+        sqlx::query("UPDATE actor SET deactivated_at = NULL, delete_after = NULL WHERE did = ?1")
             .bind(did)
             .execute(&self.db)
             .await
             .map_err(|e| PdsError::Database(e))?;
 
         tracing::info!("Account deletion cancelled for DID: {}", did);
+
+        Ok(())
+    }
+
+    /// Deactivate an account (temporary suspension)
+    ///
+    /// Sets deactivated_at to NOW without setting delete_after.
+    /// This allows users to temporarily disable their account without initiating deletion.
+    /// The account can be reactivated anytime via reactivate_account() or login.
+    ///
+    /// Differences from deletion:
+    /// - Deactivation: Temporary, reversible anytime (deactivated_at set, delete_after NULL)
+    /// - Deletion: Permanent with grace period (delete_after set to 30 days in future)
+    ///
+    /// # Arguments
+    /// * `did` - The DID of the account to deactivate
+    pub async fn deactivate_account(&self, did: &str) -> PdsResult<()> {
+        let now = Utc::now();
+
+        // Set deactivated_at to NOW (not future deletion date)
+        // Keep delete_after as NULL (this distinguishes temporary deactivation from deletion)
+        sqlx::query(
+            "UPDATE actor SET deactivated_at = ?1, delete_after = NULL WHERE did = ?2"
+        )
+        .bind(now)
+        .bind(did)
+        .execute(&self.db)
+        .await
+        .map_err(|e| PdsError::Database(e))?;
+
+        // Revoke all sessions (force logout)
+        sqlx::query("DELETE FROM session WHERE did = ?1")
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        tracing::info!("Account temporarily deactivated for DID: {}", did);
+
+        Ok(())
+    }
+
+    /// Reactivate a deactivated account
+    ///
+    /// Clears deactivated_at to restore account to active state.
+    /// User can then login normally to create new sessions.
+    ///
+    /// # Arguments
+    /// * `did` - The DID of the account to reactivate
+    pub async fn reactivate_account(&self, did: &str) -> PdsResult<()> {
+        // Clear deactivated_at to restore account
+        sqlx::query("UPDATE actor SET deactivated_at = NULL WHERE did = ?1")
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(|e| PdsError::Database(e))?;
+
+        tracing::info!("Account reactivated for DID: {}", did);
 
         Ok(())
     }
