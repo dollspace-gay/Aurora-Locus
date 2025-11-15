@@ -16,22 +16,29 @@ pub use resolver::{IdentityResolver, IdentityResolverConfig};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-/// Cached DID document entry
+/// Cached DID document entry with stale flag
+///
+/// The `stale` flag indicates whether this cached data is past its fresh TTL
+/// but still within max TTL. Stale data can be used as fallback during outages.
 #[derive(Debug, Clone)]
 pub struct CachedDidDoc {
     pub did: String,
     pub doc: String,  // JSON-encoded DID document
     pub updated_at: DateTime<Utc>,
     pub cached_at: DateTime<Utc>,
+    /// True if cached_at is past stale_ttl but within max_ttl
+    pub stale: bool,
 }
 
-/// Cached handle mapping entry
+/// Cached handle mapping entry with stale flag
 #[derive(Debug, Clone)]
 pub struct CachedHandle {
     pub handle: String,
     pub did: String,
     pub declared_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// True if updated_at is past stale_ttl but within max_ttl
+    pub stale: bool,
 }
 
 /// Handle resolution result

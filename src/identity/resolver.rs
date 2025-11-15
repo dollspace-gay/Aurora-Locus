@@ -57,14 +57,19 @@ impl IdentityResolver {
         })
     }
 
-    /// Resolve handle to DID with caching
+    /// Resolve handle to DID with two-tier caching and stale fallback
     ///
     /// Resolution order:
     /// 1. Check if handle is reserved
     /// 2. Check cache first (fast path)
+    ///    - If fresh: return immediately
+    ///    - If stale: try to refresh, use stale as fallback on failure
     /// 3. Try DNS TXT record resolution
     /// 4. Try HTTPS well-known resolution
     /// 5. Cache successful resolution
+    ///
+    /// **Graceful Degradation**: If cache is stale and fresh fetch fails,
+    /// the stale cached data is returned to maintain availability during outages.
     pub async fn resolve_handle(&self, handle: &str) -> PdsResult<String> {
         let normalized = handle.to_lowercase();
 
@@ -78,7 +83,33 @@ impl IdentityResolver {
 
         // Check cache first
         if let Some(cached) = self.cache.get_handle(&normalized).await? {
-            return Ok(cached.did);
+            // Fresh cache hit - return immediately
+            if !cached.stale {
+                return Ok(cached.did);
+            }
+
+            // Stale cache hit - try to refresh in background
+            tracing::debug!(handle = %normalized, "Cache hit but stale, attempting refresh");
+
+            // Try to fetch fresh data
+            match self.handle_resolver.resolve(&normalized).await {
+                Ok(did) => {
+                    let did_str = did.as_str().to_string();
+                    // Update cache with fresh data
+                    self.cache.cache_handle(&normalized, &did_str).await?;
+                    tracing::debug!(handle = %normalized, "Successfully refreshed stale cache");
+                    return Ok(did_str);
+                }
+                Err(e) => {
+                    // Fresh fetch failed - use stale data as fallback (graceful degradation)
+                    tracing::warn!(
+                        handle = %normalized,
+                        error = %e,
+                        "Failed to refresh stale cache, using stale data as fallback"
+                    );
+                    return Ok(cached.did);
+                }
+            }
         }
 
         // Cache miss - resolve via SDK
@@ -95,16 +126,47 @@ impl IdentityResolver {
         Ok(did_str)
     }
 
-    /// Resolve DID to DID document with caching
+    /// Resolve DID to DID document with two-tier caching and stale fallback
     ///
     /// Supports did:plc and did:web methods
+    ///
+    /// **Graceful Degradation**: If cache is stale and PLC/Web fetch fails,
+    /// the stale cached document is returned to maintain availability during outages.
     pub async fn resolve_did(&self, did: &str) -> PdsResult<DidDocument> {
         // Check cache first
         if let Some(cached) = self.cache.get_did_doc(did).await? {
             // Parse cached document
-            let doc: DidDocument = serde_json::from_str(&cached.doc)
+            let cached_doc: DidDocument = serde_json::from_str(&cached.doc)
                 .map_err(|e| PdsError::Internal(format!("Invalid cached DID document: {}", e)))?;
-            return Ok(doc);
+
+            // Fresh cache hit - return immediately
+            if !cached.stale {
+                return Ok(cached_doc);
+            }
+
+            // Stale cache hit - try to refresh
+            tracing::debug!(did = %did, "DID doc cache hit but stale, attempting refresh");
+
+            // Try to fetch fresh document
+            match self.fetch_did_document(did).await {
+                Ok(doc) => {
+                    // Update cache with fresh data
+                    let doc_json = serde_json::to_string(&doc)
+                        .map_err(|e| PdsError::Internal(format!("Failed to serialize DID document: {}", e)))?;
+                    self.cache.cache_did_doc(did, &doc_json).await?;
+                    tracing::debug!(did = %did, "Successfully refreshed stale DID doc cache");
+                    return Ok(doc);
+                }
+                Err(e) => {
+                    // Fresh fetch failed - use stale data as fallback (graceful degradation)
+                    tracing::warn!(
+                        did = %did,
+                        error = %e,
+                        "Failed to refresh stale DID doc cache, using stale data as fallback"
+                    );
+                    return Ok(cached_doc);
+                }
+            }
         }
 
         // Cache miss - fetch DID document
