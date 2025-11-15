@@ -305,7 +305,31 @@ lazy_static! {
     )
     .unwrap();
 
-    // ========== Federation/Relay Metrics (Phase 3) ==========
+    // ========== Federation/Relay Metrics (Phase 3 & Phase 5) ==========
+
+    /// Federation requests (federated search) by endpoint and status
+    pub static ref FEDERATION_REQUESTS_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "federation_requests_total",
+        "Total number of federated search requests",
+        &["endpoint", "status"]
+    )
+    .unwrap();
+
+    /// Federation request latency (federated search)
+    pub static ref FEDERATION_LATENCY_SECONDS: HistogramVec = register_histogram_vec!(
+        "federation_latency_seconds",
+        "Federation request latencies in seconds",
+        &["endpoint"],
+        vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
+    )
+    .unwrap();
+
+    /// Number of known federated PDS instances
+    pub static ref KNOWN_INSTANCES: IntGauge = register_int_gauge!(
+        "known_instances",
+        "Number of discovered federated PDS instances"
+    )
+    .unwrap();
 
     /// Relay events received by event type
     pub static ref RELAY_EVENTS_TOTAL: IntCounterVec = register_int_counter_vec!(
@@ -655,6 +679,23 @@ pub fn record_relay_publish(event_type: &str, success: bool) {
     RELAY_EVENTS_PUBLISHED_TOTAL
         .with_label_values(&[event_type, if success { "success" } else { "failure" }])
         .inc();
+}
+
+// ========== Federation Helper Functions (Phase 5) ==========
+
+/// Record a federated search request
+pub fn record_federation_request(endpoint: &str, status: &str, duration: f64) {
+    FEDERATION_REQUESTS_TOTAL
+        .with_label_values(&[endpoint, status])
+        .inc();
+    FEDERATION_LATENCY_SECONDS
+        .with_label_values(&[endpoint])
+        .observe(duration);
+}
+
+/// Update the count of known federated PDS instances
+pub fn update_known_instances(count: i64) {
+    KNOWN_INSTANCES.set(count);
 }
 
 /// Record a validation operation

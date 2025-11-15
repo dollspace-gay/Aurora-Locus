@@ -29,7 +29,9 @@
       "Bash(timeout 60 cargo check:*)",
       "Bash(timeout 120 cargo rustc:*)",
       "Bash(timeout 90 cargo check:*)",
-      "Bash(timeout 120 cargo test:*)"
+      "Bash(timeout 120 cargo test:*)",
+      "Bash(dir:*)",
+      "Bash(timeout 90 cargo test:*)"
     ],
     "deny": [],
     "ask": []
