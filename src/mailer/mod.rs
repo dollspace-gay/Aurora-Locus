@@ -1,4 +1,14 @@
 /// Email sending functionality
+pub mod notifications;
+pub mod rate_limit;
+pub mod templates;
+pub mod tracking;
+
+pub use notifications::NotificationEmail;
+pub use rate_limit::{EmailRateLimitConfig, EmailRateLimiter};
+pub use templates::{EmailTemplateManager, EmailTemplateType};
+pub use tracking::{EmailStatus, EmailTracker};
+
 use crate::{
     config::EmailConfig,
     error::{PdsError, PdsResult},
@@ -8,17 +18,24 @@ use lettre::{
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
 };
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Email mailer service
 #[derive(Clone)]
 pub struct Mailer {
     config: Option<EmailConfig>,
     transport: Option<AsyncSmtpTransport<Tokio1Executor>>,
+    template_manager: Arc<EmailTemplateManager>,
+    rate_limiter: Arc<EmailRateLimiter>,
 }
 
 impl Mailer {
     /// Create a new mailer
     pub fn new(config: Option<EmailConfig>) -> PdsResult<Self> {
+        let template_manager = Arc::new(EmailTemplateManager::new());
+        let rate_limiter = Arc::new(EmailRateLimiter::default());
+
         let transport = if let Some(ref email_config) = config {
             // Parse SMTP URL (format: smtp://username:password@host:port)
             let smtp_url = &email_config.smtp_url;
@@ -61,7 +78,12 @@ impl Mailer {
             None
         };
 
-        Ok(Self { config, transport })
+        Ok(Self {
+            config,
+            transport,
+            template_manager,
+            rate_limiter,
+        })
     }
 
     /// Send an email verification message
@@ -193,5 +215,44 @@ Aurora Locus PDS
     /// Check if email is configured
     pub fn is_configured(&self) -> bool {
         self.config.is_some()
+    }
+
+    /// Send notification email using template system
+    pub async fn send_notification(
+        &self,
+        to_email: &str,
+        notification: &NotificationEmail,
+    ) -> PdsResult<()> {
+        if self.config.is_none() {
+            tracing::warn!("Email not configured, skipping notification to {}", to_email);
+            return Ok(());
+        }
+
+        // Check rate limit
+        self.rate_limiter.check_rate_limit(to_email).await?;
+
+        // Render template
+        let (subject, body) = notification.render(&self.template_manager)?;
+
+        let config = self.config.as_ref().unwrap();
+
+        // Send email
+        self.send_email(to_email, &subject, &body, &config.from_address)
+            .await?;
+
+        // Record send for rate limiting
+        self.rate_limiter.record_send(to_email).await;
+
+        Ok(())
+    }
+
+    /// Get template manager
+    pub fn template_manager(&self) -> &EmailTemplateManager {
+        &self.template_manager
+    }
+
+    /// Get rate limiter
+    pub fn rate_limiter(&self) -> &EmailRateLimiter {
+        &self.rate_limiter
     }
 }

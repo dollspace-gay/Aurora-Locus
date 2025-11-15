@@ -292,7 +292,7 @@ impl OAuthClient {
         let result = self.try_token_exchange(code, code_verifier, token_endpoint, None).await;
 
         // If we got a use_dpop_nonce error, retry with nonce
-        if let Err(OAuthError::ServerError { ref error, ref description }) = result {
+        if let Err(OAuthError::ServerError { ref error, description: _ }) = result {
             if error == "use_dpop_nonce" {
                 // Extract nonce from description (it's in the DPoP-Nonce header, but we need to make the request to get it)
                 // Make a request to get the nonce
