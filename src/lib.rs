@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 /// Aurora Locus Library
 ///
 /// This module re-exports public modules for integration testing.

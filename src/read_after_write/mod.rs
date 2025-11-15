@@ -22,9 +22,11 @@
 //!                   → User sees their post immediately!
 //! ```
 
+pub mod cache;
 pub mod types;
 pub mod viewer;
 
+pub use cache::*;
 pub use types::*;
 pub use viewer::*;
 

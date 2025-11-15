@@ -250,6 +250,10 @@ async fn create_record(
             e
         })?;
 
+    // Invalidate read-after-write cache for this user
+    ctx.local_records_cache.invalidate_did(auth_did).await;
+    tracing::debug!("create_record: Invalidated cache for DID: {}", auth_did);
+
     tracing::info!("create_record: Successfully created record - URI: {}, CID: {}", uri, cid);
     Ok(Json(CreateRecordResponse { uri, cid }))
 }
@@ -295,6 +299,9 @@ async fn put_record(
     let (cid, _rev) = repo_mgr
         .update_record(&req.collection, &req.rkey, req.record, req.validate, signer)
         .await?;
+
+    // Invalidate read-after-write cache for this user
+    ctx.local_records_cache.invalidate_did(auth_did).await;
 
     let uri = format!("at://{}/{}/{}", auth_did, req.collection, req.rkey);
 
@@ -342,6 +349,9 @@ async fn delete_record(
     repo_mgr
         .delete_record(&req.collection, &req.rkey, signer)
         .await?;
+
+    // Invalidate read-after-write cache for this user
+    ctx.local_records_cache.invalidate_did(auth_did).await;
 
     Ok(Json(serde_json::json!({})))
 }

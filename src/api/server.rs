@@ -840,9 +840,9 @@ async fn activate_account(
 
     // Reactivate temporarily deactivated account
     // If account is pending deletion (has delete_after set), use cancel_account_deletion instead
-    let actor = ctx.account_manager.get_actor(&validated.did).await?;
+    let account = ctx.account_manager.get_account(&validated.did).await?;
 
-    if actor.delete_after.is_some() {
+    if account.delete_after.is_some() {
         // Account is pending deletion, cancel it completely
         ctx.account_manager.cancel_account_deletion(&validated.did).await?;
         Ok(Json(serde_json::json!({

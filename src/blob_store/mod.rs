@@ -5,11 +5,13 @@
 
 pub mod disk;
 pub mod models;
+pub mod quarantine;
 // Temporarily disabled due to AWS SDK build issues on Windows
 // pub mod s3;
 pub mod store;
 
 pub use models::*;
+pub use quarantine::{BlobQuarantine, QuarantineReason, QuarantineRecord};
 // pub use s3::{S3BlobBackend, S3Config};
 pub use store::{BlobStore, BlobStoreConfig};
 

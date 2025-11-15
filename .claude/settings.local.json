@@ -35,7 +35,8 @@
       "Bash(for issue in Aurora-Locus-har Aurora-Locus-2z2 Aurora-Locus-xzy Aurora-Locus-55d Aurora-Locus-9si Aurora-Locus-eay)",
       "Bash(do echo \"=== $issue ===\")",
       "Bash(done)",
-      "Bash(timeout 60 cargo rustc:*)"
+      "Bash(timeout 60 cargo rustc:*)",
+      "Bash(timeout 120 cargo check:*)"
     ],
     "deny": [],
     "ask": []

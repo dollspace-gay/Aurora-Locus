@@ -110,6 +110,7 @@ lazy_static = "1.4"
 # Image processing for thumbnails and metadata
 image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
 dashmap = "6.1.0"
+moka = { version = "0.12.11", features = ["future"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

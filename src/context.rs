@@ -21,6 +21,7 @@ use crate::{
     identity::{DidCache, IdentityResolver, IdentityResolverConfig},
     mailer::Mailer,
     rate_limit::{RateLimiter, RateLimitConfig},
+    read_after_write::LocalRecordsCache,
     sequencer::{Sequencer, SequencerConfig},
 };
 use sqlx::SqlitePool;
@@ -57,6 +58,8 @@ pub struct AppContext {
     pub rate_limiter: Arc<RateLimiter>,
     // Email mailer
     pub mailer: Arc<Mailer>,
+    // Read-after-write cache
+    pub local_records_cache: Arc<LocalRecordsCache>,
 }
 
 impl AppContext {
@@ -191,6 +194,9 @@ impl AppContext {
         // Initialize mailer
         let mailer = Arc::new(Mailer::new(config.email.clone())?);
 
+        // Initialize read-after-write cache (5s TTL, 10k entries)
+        let local_records_cache = Arc::new(LocalRecordsCache::new());
+
         Ok(Self {
             config: Arc::new(config),
             account_db,
@@ -213,6 +219,7 @@ impl AppContext {
             dpop_verifier,
             rate_limiter,
             mailer,
+            local_records_cache,
         })
     }
 

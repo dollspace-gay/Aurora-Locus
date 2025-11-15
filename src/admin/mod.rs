@@ -3,17 +3,21 @@
 /// Handles administrative functions including role management,
 /// account moderation, labeling, and invite codes.
 
-pub mod roles;
-pub mod moderation;
-pub mod labels;
+pub mod appeals;
+pub mod events;
 pub mod invites;
+pub mod labels;
+pub mod moderation;
 pub mod reports;
+pub mod roles;
 
-pub use roles::{AdminRoleManager, Role};
-pub use moderation::{ModerationAction, ModerationManager, ModerationRecord};
-pub use labels::{Label, LabelManager};
+pub use appeals::{Appeal, AppealManager, AppealStatus};
+pub use events::{ModerationEvent, ModerationEventLogger, ModerationEventType};
 pub use invites::{InviteCode, InviteCodeManager};
+pub use labels::{Label, LabelManager};
+pub use moderation::{ModerationAction, ModerationManager, ModerationRecord};
 pub use reports::{Report, ReportManager, ReportReason, ReportStatus};
+pub use roles::{AdminRoleManager, Role};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

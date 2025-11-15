@@ -1,5 +1,5 @@
 /// Background task implementations
-use crate::{context::AppContext, error::PdsResult};
+use crate::{context::AppContext, error::{PdsError, PdsResult}};
 
 /// Cleanup expired sessions
 pub async fn cleanup_expired_sessions(ctx: &AppContext) -> PdsResult<u64> {
@@ -281,7 +281,7 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
 
     // 3. Get current sequencer position
     let seq_result = sqlx::query("SELECT MAX(seq) as max_seq FROM sequencer")
-        .fetch_optional(&ctx.sequencer_db)
+        .fetch_optional(&ctx.account_db)
         .await
         .map_err(|e| PdsError::Database(e))?;
 

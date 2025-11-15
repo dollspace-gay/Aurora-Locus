@@ -154,11 +154,30 @@ where
         return Ok(build_response(status, headers, body));
     }
 
-    // Fetch local records since repo_rev
-    let local_records = ctx
-        .actor_store
-        .get_records_since_rev(user_did, &repo_rev.unwrap())
-        .await?;
+    let repo_rev_str = repo_rev.unwrap();
+
+    // Try to get from cache first
+    let local_records = if let Some(cached) = ctx.local_records_cache.get(user_did, &repo_rev_str).await {
+        tracing::debug!(
+            "Cache HIT for read-after-write: did={}, rev={}",
+            user_did, repo_rev_str
+        );
+        (*cached).clone()
+    } else {
+        // Cache MISS - fetch from database
+        tracing::debug!(
+            "Cache MISS for read-after-write: did={}, rev={}",
+            user_did, repo_rev_str
+        );
+        let records = ctx
+            .actor_store
+            .get_records_since_rev(user_did, &repo_rev_str)
+            .await?;
+
+        // Cache the result
+        ctx.local_records_cache.set(user_did, &repo_rev_str, records.clone()).await;
+        records
+    };
 
     // If no local records, just return AppView response as-is
     if local_records.count == 0 {
