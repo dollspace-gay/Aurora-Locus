@@ -36,7 +36,10 @@
       "Bash(do echo \"=== $issue ===\")",
       "Bash(done)",
       "Bash(timeout 60 cargo rustc:*)",
-      "Bash(timeout 120 cargo check:*)"
+      "Bash(timeout 120 cargo check:*)",
+      "Bash(pkill:*)",
+      "Bash(timeout 180 cargo check:*)",
+      "Bash(timeout 300 cargo build:*)"
     ],
     "deny": [],
     "ask": []

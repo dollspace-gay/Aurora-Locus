@@ -87,6 +87,10 @@ async fn main() -> PdsResult<()> {
             server::serve((*ctx).clone()).await?;
         }
 
+        Some(Commands::CreateAccount { email, handle, password, invite_code }) => {
+            cli::account::create_account(&ctx, &email, &handle, &password, invite_code.as_deref()).await?;
+        }
+
         Some(Commands::MigrateOauth { did, yes, dry_run }) => {
             if !yes && !dry_run {
                 println!("WARNING: This will revoke all active JWT sessions for {}", did);
@@ -134,6 +138,63 @@ async fn main() -> PdsResult<()> {
             println!("Successful migrations: {}", results.iter().filter(|r| r.success).count());
             println!("Skipped: {}", results.iter().filter(|r| !r.success).count());
             println!("════════════════════════════════════════════════════════\n");
+        }
+
+        Some(Commands::Backup { output, compress, all }) => {
+            cli::backup::backup_database(&ctx, &output, compress, all).await?;
+        }
+
+        Some(Commands::Restore { input, yes }) => {
+            cli::backup::restore_database(&ctx, &input, yes).await?;
+        }
+
+        Some(Commands::GenerateDidKey { format, output, private }) => {
+            cli::keygen::generate_did_key(&format, output.as_deref(), private)?;
+        }
+
+        Some(Commands::GenerateServiceToken { aud, lifetime, lxm }) => {
+            cli::service_token::generate_service_token(&ctx, &aud, lifetime, lxm.as_deref()).await?;
+        }
+
+        Some(Commands::HealthCheck { format }) => {
+            cli::health::health_check(&ctx, &format).await?;
+        }
+
+        Some(Commands::ExportMetrics { format, output }) => {
+            cli::metrics::export_metrics(&format, output.as_deref())?;
+        }
+
+        Some(Commands::PublishIdentity { dids, delay }) => {
+            cli::publish_identity::publish_identity(&ctx, dids.clone(), delay).await?;
+        }
+
+        Some(Commands::PublishIdentityFile { file, delay }) => {
+            cli::publish_identity::publish_identity_from_file(&ctx, &file, delay).await?;
+        }
+
+        Some(Commands::ValidateConfig) => {
+            cli::validate_config::validate_config(&ctx.config)?;
+        }
+
+        Some(Commands::Debug { subcommand }) => {
+            use cli::DebugCommands;
+            match subcommand {
+                DebugCommands::InspectAccount { identifier, format } => {
+                    cli::debug::inspect_account(&ctx, &identifier, &format).await?;
+                }
+                DebugCommands::InspectRepo { did, format } => {
+                    cli::debug::inspect_repo(&ctx, &did, &format).await?;
+                }
+                DebugCommands::ListSessions { did, format } => {
+                    cli::debug::list_sessions(&ctx, did.as_deref(), &format).await?;
+                }
+                DebugCommands::CheckBlobs { did, orphaned } => {
+                    cli::debug::check_blobs(&ctx, did.as_deref(), orphaned).await?;
+                }
+                DebugCommands::ExportAccount { did, output } => {
+                    cli::debug::export_account(&ctx, &did, &output).await?;
+                }
+            }
         }
     }
 
