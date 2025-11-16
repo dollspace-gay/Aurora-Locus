@@ -104,8 +104,19 @@ use std::{
     num::NonZeroU32,
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// Rate limit state information for headers
+#[derive(Debug, Clone)]
+pub struct RateLimitInfo {
+    /// Maximum requests allowed in the current window
+    pub limit: u32,
+    /// Requests remaining in the current window
+    pub remaining: u32,
+    /// Seconds until the rate limit window resets
+    pub reset_seconds: u64,
+}
 
 /// Rate limiter configuration
 #[derive(Debug, Clone)]
@@ -431,6 +442,10 @@ pub struct RateLimiter {
     ip_limiter: Arc<GovernorLimiter<String, DashMap<String, InMemoryState>, DefaultClock>>,
     /// Whether to trust proxy headers for IP extraction
     pub trust_proxy: bool,
+    /// Configuration for returning rate limit info
+    config: RateLimitConfig,
+    /// Request counts per window for state tracking (identifier -> (window_start, count))
+    request_counts: Arc<DashMap<String, (u64, u32)>>,
 }
 
 impl RateLimiter {
@@ -495,6 +510,8 @@ impl RateLimiter {
             endpoint_limiters: Arc::new(endpoint_limiters),
             ip_limiter: Arc::new(GovernorLimiter::keyed(ip_quota)),
             trust_proxy: config.trust_proxy,
+            config: config.clone(),
+            request_counts: Arc::new(DashMap::new()),
         }
     }
 
@@ -505,6 +522,7 @@ impl RateLimiter {
 
     /// Check rate limit for authenticated user
     pub fn check_authenticated(&self) -> PdsResult<()> {
+        self.track_request("global:authenticated");
         match self.authenticated.check() {
             Ok(_) => Ok(()),
             Err(_) => Err(PdsError::RateLimitExceeded {
@@ -515,6 +533,7 @@ impl RateLimiter {
 
     /// Check rate limit for unauthenticated user
     pub fn check_unauthenticated(&self) -> PdsResult<()> {
+        self.track_request("global:unauthenticated");
         match self.unauthenticated.check() {
             Ok(_) => Ok(()),
             Err(_) => Err(PdsError::RateLimitExceeded {
@@ -525,6 +544,7 @@ impl RateLimiter {
 
     /// Check rate limit for admin user
     pub fn check_admin(&self) -> PdsResult<()> {
+        self.track_request("global:admin");
         match self.admin.check() {
             Ok(_) => Ok(()),
             Err(_) => Err(PdsError::RateLimitExceeded {
@@ -538,6 +558,7 @@ impl RateLimiter {
     /// This is 10x stricter than local authenticated users to prevent abuse
     /// from federated instances.
     pub fn check_cross_pds(&self) -> PdsResult<()> {
+        self.track_request("global:cross_pds");
         match self.cross_pds.check() {
             Ok(_) => Ok(()),
             Err(_) => Err(PdsError::RateLimitExceeded {
@@ -647,6 +668,69 @@ impl RateLimiter {
     pub fn make_did_endpoint_key(did: &str, endpoint: &str) -> String {
         format!("{}-{}", did, endpoint)
     }
+
+    /// Get current timestamp in seconds
+    fn current_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Track a request for a given identifier in the current window
+    fn track_request(&self, identifier: &str) {
+        let now = Self::current_timestamp();
+        let window_start = now; // For per-second quotas, each second is a new window
+
+        self.request_counts
+            .entry(identifier.to_string())
+            .and_modify(|(win, count)| {
+                if *win == window_start {
+                    *count += 1;
+                } else {
+                    *win = window_start;
+                    *count = 1;
+                }
+            })
+            .or_insert((window_start, 1));
+    }
+
+    /// Get rate limit info for a specific limiter type
+    ///
+    /// Returns information about the rate limit (limit, remaining, reset) for use in response headers
+    pub fn get_limit_info(&self, identifier: &str, limiter_type: &str) -> RateLimitInfo {
+        let now = Self::current_timestamp();
+
+        // Get the appropriate limit based on limiter type
+        let limit = match limiter_type {
+            "authenticated" => self.config.authenticated_rps,
+            "unauthenticated" => self.config.unauthenticated_rps,
+            "admin" => self.config.admin_rps,
+            "cross_pds" => self.config.cross_pds_rps,
+            _ => self.config.unauthenticated_rps, // Default to most restrictive
+        };
+
+        // Get request count for current window
+        let (remaining, reset_seconds) = self.request_counts
+            .get(identifier)
+            .map(|entry| {
+                let (window_start, count) = *entry;
+                if window_start == now {
+                    let remaining = limit.saturating_sub(count);
+                    (remaining, 1) // Resets in 1 second (per-second quota)
+                } else {
+                    // Old window, reset happened
+                    (limit, 1)
+                }
+            })
+            .unwrap_or((limit, 1)); // No requests yet, full limit available
+
+        RateLimitInfo {
+            limit,
+            remaining,
+            reset_seconds,
+        }
+    }
 }
 
 /// Rate limiting middleware
@@ -709,22 +793,94 @@ pub async fn rate_limit_middleware(
         }
     };
 
+    // Determine limiter type for header generation
+    let limiter_type = if is_admin && has_auth_header {
+        "admin"
+    } else if has_auth_header {
+        "authenticated"
+    } else {
+        "unauthenticated"
+    };
+
+    // Get identifier for rate limit info
+    let identifier = format!("global:{}", limiter_type);
+
     // Check rate limit
     match rate_limit_result {
         Ok(_) => {
+            // Get rate limit info for headers
+            let limit_info = ctx.rate_limiter.get_limit_info(&identifier, limiter_type);
+
             // Rate limit check passed, continue to next handler
             let mut response = next.run(request).await;
 
-            // Add rate limit headers to response
+            // Add dynamic rate limit headers to response (RFC 6585 + draft-polli-ratelimit-headers)
             let headers = response.headers_mut();
-            headers.insert("X-RateLimit-Limit", "100".parse().unwrap());
-            headers.insert("X-RateLimit-Remaining", "99".parse().unwrap());
+
+            // Standard headers (draft-polli-ratelimit-headers)
+            headers.insert(
+                "RateLimit-Limit",
+                limit_info.limit.to_string().parse().unwrap(),
+            );
+            headers.insert(
+                "RateLimit-Remaining",
+                limit_info.remaining.to_string().parse().unwrap(),
+            );
+            headers.insert(
+                "RateLimit-Reset",
+                limit_info.reset_seconds.to_string().parse().unwrap(),
+            );
+
+            // Legacy headers for backward compatibility
+            headers.insert(
+                "X-RateLimit-Limit",
+                limit_info.limit.to_string().parse().unwrap(),
+            );
+            headers.insert(
+                "X-RateLimit-Remaining",
+                limit_info.remaining.to_string().parse().unwrap(),
+            );
+            headers.insert(
+                "X-RateLimit-Reset",
+                limit_info.reset_seconds.to_string().parse().unwrap(),
+            );
 
             Ok(response)
         }
-        Err(_) => {
-            // Rate limit exceeded
-            Err(StatusCode::TOO_MANY_REQUESTS)
+        Err(e) => {
+            // Rate limit exceeded - extract retry_after from error
+            let retry_after_secs = if let PdsError::RateLimitExceeded { retry_after } = &e {
+                retry_after.as_secs()
+            } else {
+                60 // Default to 60 seconds
+            };
+
+            // Create 429 response with Retry-After header
+            let mut response = Response::new(axum::body::Body::from("Too Many Requests"));
+            *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+
+            let headers = response.headers_mut();
+            headers.insert(
+                "Retry-After",
+                retry_after_secs.to_string().parse().unwrap(),
+            );
+
+            // Also include rate limit headers showing exhausted limit
+            let limit_info = ctx.rate_limiter.get_limit_info(&identifier, limiter_type);
+            headers.insert(
+                "RateLimit-Limit",
+                limit_info.limit.to_string().parse().unwrap(),
+            );
+            headers.insert(
+                "RateLimit-Remaining",
+                "0".parse().unwrap(),
+            );
+            headers.insert(
+                "RateLimit-Reset",
+                retry_after_secs.to_string().parse().unwrap(),
+            );
+
+            Ok(response)
         }
     }
 }

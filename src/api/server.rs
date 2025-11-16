@@ -54,9 +54,18 @@ pub fn routes() -> Router<AppContext> {
 /// Create account endpoint
 async fn create_account(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Json(req): Json<CreateAccountRequest>,
 ) -> PdsResult<Json<CreateAccountResponse>> {
     tracing::info!("create_account: Starting account creation for handle: {}", req.handle);
+
+    // IP-based rate limiting for account creation (100 per 5 minutes per IP)
+    // This is handled by the endpoint-specific middleware limits, but we add
+    // an additional per-IP check here for extra protection
+    if let Some(client_ip) = crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy) {
+        tracing::debug!("create_account: Checking IP-based rate limit for IP: {}", client_ip);
+        ctx.rate_limiter.check_ip(&client_ip)?;
+    }
 
     // Validate and use invite code if required
     if ctx.config.invites.required {
@@ -144,8 +153,16 @@ async fn create_account(
 /// Create session (login) endpoint
 async fn create_session(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> PdsResult<Json<SessionResponse>> {
+    // Identifier+IP rate limiting for login attempts (30 per 5min per identifier+IP)
+    // Prevents brute-force attacks on specific accounts from specific IPs
+    if let Some(client_ip) = crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy) {
+        tracing::debug!("create_session: Checking identifier+IP rate limit for {}", req.identifier);
+        ctx.rate_limiter.check_identifier_ip(&req.identifier, &client_ip)?;
+    }
+
     // Try regular password authentication first
     let (account, session) = match ctx
         .account_manager
@@ -241,6 +258,10 @@ async fn request_email_confirmation(
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
+    // Per-user rate limiting for email confirmation requests (10 per hour per DID)
+    // Prevents email spam
+    ctx.rate_limiter.check_did_endpoint(&validated.did, "/xrpc/com.atproto.server.requestEmailConfirmation")?;
+
     // Get account info to retrieve email
     let account = ctx.account_manager.get_account(&validated.did).await?;
 
@@ -302,8 +323,16 @@ struct RequestPasswordResetRequest {
 
 async fn request_password_reset(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Json(req): Json<RequestPasswordResetRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
+    // IP-based rate limiting for password reset (50 per 5 minutes per IP)
+    // Prevents email spam and denial of service
+    if let Some(client_ip) = crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy) {
+        tracing::debug!("request_password_reset: Checking IP-based rate limit for IP: {}", client_ip);
+        ctx.rate_limiter.check_ip(&client_ip)?;
+    }
+
     // Generate reset token (returns token and email address)
     let (token, email) = ctx
         .account_manager
@@ -363,6 +392,10 @@ async fn delete_account(
 ) -> PdsResult<Json<serde_json::Value>> {
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+
+    // Per-user rate limiting for account deletion (3 per day per DID)
+    // Prevents accidental deletion and abuse
+    ctx.rate_limiter.check_did_endpoint(&validated.did, "/xrpc/com.atproto.server.deleteAccount")?;
 
     // Request account deletion with password confirmation
     ctx.account_manager
