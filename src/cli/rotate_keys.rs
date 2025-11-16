@@ -4,16 +4,18 @@
 /// 1. Fetching the current signing key from the repository
 /// 2. Comparing with the current key in PLC directory
 /// 3. Updating PLC directory if keys don't match
-/// 4. Creating a new repository commit (TODO: phase 2)
-/// 5. Sequencing identity and sync events (TODO: phase 3)
+/// 4. Creating a new repository commit with the updated signing key
+/// 5. Sequencing identity events (commit events are automatically sequenced)
 
 use crate::{
+    actor_store::repository::RepositoryManager,
     context::AppContext,
     crypto::{
         plc::{PlcSigner},
         plc_client::{PlcClient, PlcClientConfig},
     },
     error::{PdsError, PdsResult},
+    sequencer::events::IdentityEvent,
 };
 use std::fs;
 use std::time::Duration;
@@ -158,18 +160,63 @@ async fn rotate_key_for_did(
         return Err(PdsError::Validation(format!("Not a did:plc identifier: {}", did)));
     }
 
-    // TODO: Get current signing key from actor store
-    // For now, we'll use the repo_signing_key from config as the desired key
+    // Get repo signing key from config
     let repo_signer = PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key)
         .map_err(|e| PdsError::Internal(format!("Invalid repo signing key: {}", e)))?;
 
     let desired_key = repo_signer.public_key_multibase();
 
-    // Check if rotation is needed and perform it
+    // Phase 1: Update PLC directory key
     let rotated = plc_client.rotate_key_if_needed(did, &desired_key, rotation_signer).await?;
 
-    // TODO: Phase 2 - Create new repository commit with updated key
-    // TODO: Phase 3 - Sequence identity and sync events
+    if !rotated {
+        // Key already up-to-date, no need to create new commit or sequence events
+        return Ok(false);
+    }
 
-    Ok(rotated)
+    // Phase 2: Create new repository commit with updated signing key
+    // This is done by applying empty writes, which creates a new commit signed with the current key
+    let repo_mgr = RepositoryManager::with_sequencer(
+        did.to_string(),
+        (*ctx.actor_store).clone(),
+        ctx.sequencer.clone(),
+    );
+
+    // Create signing function that uses the repo signer
+    let repo_signer_clone = repo_signer.clone();
+    let sign_fn = move |hash: &[u8; 32]| -> Result<Vec<u8>, atproto::repo::RepoError> {
+        Ok(repo_signer_clone.sign(hash))
+    };
+
+    // Apply empty writes to create new commit (like processWrites([]) in TypeScript)
+    let (commit_cid, rev) = repo_mgr.apply_writes(vec![], sign_fn).await
+        .map_err(|e| {
+            tracing::warn!("Failed to create commit for {}: {}", did, e);
+            e
+        })?;
+
+    tracing::info!(
+        did = %did,
+        commit_cid = %commit_cid,
+        rev = %rev,
+        "Created new repository commit with updated signing key"
+    );
+
+    // Phase 3: Sequence identity event (commit event is already sequenced by apply_writes)
+    let account = ctx.account_manager.get_account(did).await?;
+    let identity_evt = IdentityEvent::new(did.to_string(), account.handle);
+
+    ctx.sequencer.sequence_identity(identity_evt).await
+        .map_err(|e| {
+            tracing::warn!("Failed to sequence identity event for {}: {}", did, e);
+            e
+        })?;
+
+    tracing::info!(did = %did, "Sequenced identity event");
+
+    // TODO: Phase 3 continuation - Sequence sync event with commit data
+    // This would create a SyncEvent from the commit and sequence it
+    // Deferred as it requires extracting commit blocks from the CAR export
+
+    Ok(true)
 }
