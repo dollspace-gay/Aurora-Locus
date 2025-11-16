@@ -19,6 +19,7 @@ pub mod keygen;
 pub mod metrics;
 pub mod migrate_oauth;
 pub mod publish_identity;
+pub mod rotate_keys;
 pub mod service_token;
 pub mod validate_config;
 
@@ -174,6 +175,27 @@ pub enum Commands {
         /// Delay between publishes in milliseconds (default: 5)
         #[arg(short, long, default_value = "5")]
         delay: u64,
+    },
+
+    /// Rotate DID signing keys and update PLC directory
+    RotateKeys {
+        /// DIDs to rotate keys for
+        dids: Vec<String>,
+
+        /// Number of concurrent rotations (default: 10)
+        #[arg(short, long, default_value = "10")]
+        concurrency: usize,
+    },
+
+    /// Rotate keys from file (one DID per line)
+    RotateKeysFile {
+        /// File containing DIDs (one per line)
+        #[arg(short, long)]
+        file: String,
+
+        /// Number of concurrent rotations (default: 25)
+        #[arg(short, long, default_value = "25")]
+        concurrency: usize,
     },
 
     /// Validate configuration

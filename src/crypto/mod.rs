@@ -4,3 +4,4 @@
 
 pub mod keypair;
 pub mod plc;
+pub mod plc_client;

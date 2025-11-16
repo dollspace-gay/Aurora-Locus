@@ -172,6 +172,14 @@ async fn main() -> PdsResult<()> {
             cli::publish_identity::publish_identity_from_file(&ctx, &file, delay).await?;
         }
 
+        Some(Commands::RotateKeys { dids, concurrency }) => {
+            cli::rotate_keys::rotate_keys(&ctx, dids.clone(), concurrency).await?;
+        }
+
+        Some(Commands::RotateKeysFile { file, concurrency }) => {
+            cli::rotate_keys::rotate_keys_from_file(&ctx, &file, concurrency).await?;
+        }
+
         Some(Commands::ValidateConfig) => {
             cli::validate_config::validate_config(&ctx.config)?;
         }

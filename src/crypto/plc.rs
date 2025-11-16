@@ -126,6 +126,7 @@ impl PlcOperationBuilder {
 }
 
 /// PLC Signer - handles signing of PLC operations
+#[derive(Clone)]
 pub struct PlcSigner {
     signing_key: SigningKey,
 }
