@@ -128,6 +128,10 @@ pub struct InviteConfig {
 pub struct RateLimitConfig {
     pub enabled: bool,
     pub global_requests_per_minute: u32,
+    /// Enable distributed Redis-backed rate limiting for multi-instance deployments
+    pub use_redis: bool,
+    /// Redis connection URL for distributed rate limiting (e.g., redis://localhost:6379)
+    pub redis_url: Option<String>,
 }
 
 /// Logging configuration
@@ -280,6 +284,11 @@ impl ServerConfig {
             .unwrap_or_else(|_| "3000".to_string())
             .parse()
             .unwrap_or(3000);
+        let rate_limit_use_redis = env::var("PDS_RATE_LIMIT_USE_REDIS")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse()
+            .unwrap_or(false);
+        let rate_limit_redis_url = env::var("PDS_RATE_LIMIT_REDIS_URL").ok();
 
         let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
@@ -358,6 +367,8 @@ impl ServerConfig {
             rate_limit: RateLimitConfig {
                 enabled: rate_limit_enabled,
                 global_requests_per_minute: rate_limit_requests,
+                use_redis: rate_limit_use_redis,
+                redis_url: rate_limit_redis_url,
             },
             logging: LoggingConfig { level: log_level },
             federation: FederationConfig {

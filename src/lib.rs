@@ -28,6 +28,7 @@ pub mod jobs;
 pub mod mailer;
 pub mod metrics;
 pub mod rate_limit;
+pub mod rate_limit_new;  // Distributed Redis-backed rate limiting
 pub mod sequencer;
 pub mod validation;
 pub mod service_auth;
