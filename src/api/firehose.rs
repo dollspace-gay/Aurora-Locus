@@ -1,52 +1,46 @@
-/// WebSocket firehose for real-time event streaming
-///
-/// Implements com.atproto.sync.subscribeRepos with comprehensive production features:
-///
-/// # Features
-///
-/// ## Backpressure Handling
-/// - Buffered channel (100 events) prevents overwhelming slow clients
-/// - Timeout on sends (5s) detects and disconnects slow consumers
-/// - Producer-consumer pattern separates event fetching from transmission
-///
-/// ## Cursor Management
-/// - Clients can resume from any sequence number
-/// - Outdated cursor detection (max 1000 events behind)
-/// - Automatic adjustment when cursor is too old
-///
-/// ## Error Recovery
-/// - Exponential backoff on database errors (max 5 attempts)
-/// - Graceful shutdown on producer failures
-/// - Detailed error messages sent to clients before disconnect
-///
-/// ## Connection Health
-/// - Ping/pong every 30 seconds to detect dead connections
-/// - Activity tracking to optimize keepalive messages
-/// - Clean shutdown on client disconnect
-///
-/// ## Performance
-/// - Non-blocking producer polls every 100ms
-/// - Efficient CBOR event deserialization
-/// - Base64-encoded CAR blocks in JSON frames
-///
-/// # Protocol
-///
-/// Clients connect via WebSocket and receive JSON frames:
-/// - `#commit`: Repository commit with operations
-/// - `#identity`: Handle changes
-/// - `#account`: Account status changes
-/// - `#info`: Control messages (connection status, errors)
-///
-/// Each frame includes a monotonically increasing `seq` number for cursor tracking.
+//! WebSocket firehose for real-time event streaming
+//!
+//! Implements com.atproto.sync.subscribeRepos with comprehensive production features:
+//!
+//! # Features
+//!
+//! ## Backpressure Handling
+//! - Buffered channel (100 events) prevents overwhelming slow clients
+//! - Timeout on sends (5s) detects and disconnects slow consumers
+//! - Producer-consumer pattern separates event fetching from transmission
+//!
+//! ## Cursor Management
+//! - Clients can resume from any sequence number
+//! - Outdated cursor detection (max 1000 events behind)
+//! - Automatic adjustment when cursor is too old
+//!
+//! ## Error Recovery
+//! - Exponential backoff on database errors (max 5 attempts)
+//! - Graceful shutdown on producer failures
+//! - Detailed error messages sent to clients before disconnect
+//!
+//! ## Connection Health
+//! - Ping/pong every 30 seconds to detect dead connections
+//! - Activity tracking to optimize keepalive messages
+//! - Clean shutdown on client disconnect
+//!
+//! ## Performance
+//! - Non-blocking producer polls every 100ms
+//! - Efficient CBOR event deserialization
+//! - Base64-encoded CAR blocks in JSON frames
+//!
+//! # Protocol
+//!
+//! Clients connect via WebSocket and receive JSON frames:
+//! - `#commit`: Repository commit with operations
+//! - `#identity`: Handle changes
+//! - `#account`: Account status changes
+//! - `#info`: Control messages (connection status, errors)
+//!
+//! Each frame includes a monotonically increasing `seq` number for cursor tracking.
 
 use crate::{
     context::AppContext,
-    error::{PdsError, PdsResult},
-    metrics::{
-        record_firehose_batch_fetch, record_firehose_connection_end,
-        record_firehose_connection_start, record_firehose_event_sent,
-        record_firehose_slow_client_disconnect,
-    },
     sequencer::events::{AccountEvent, CommitEvent, IdentityEvent, SyncEvent},
 };
 use axum::{
@@ -259,11 +253,10 @@ async fn handle_subscription(
 
             // Send periodic pings
             _ = ping_interval.tick() => {
-                if last_activity.elapsed() > Duration::from_secs(PING_INTERVAL_SECS) {
-                    if sender.send(Message::Ping(vec![])).await.is_err() {
+                if last_activity.elapsed() > Duration::from_secs(PING_INTERVAL_SECS)
+                    && sender.send(Message::Ping(vec![])).await.is_err() {
                         break;
                     }
-                }
             }
 
             // Handle client messages

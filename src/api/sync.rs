@@ -1,12 +1,12 @@
-/// Synchronization API endpoints
-///
-/// Implements com.atproto.sync.* endpoints for federation and repository export
-///
-/// These endpoints enable:
-/// - Repository synchronization across PDSs
-/// - External crawlers and indexers
-/// - Backup and migration
-/// - ATProto spec compliance
+//! Synchronization API endpoints
+//!
+//! Implements com.atproto.sync.* endpoints for federation and repository export
+//!
+//! These endpoints enable:
+//! - Repository synchronization across PDSs
+//! - External crawlers and indexers
+//! - Backup and migration
+//! - ATProto spec compliance
 
 use crate::{
     actor_store::car,

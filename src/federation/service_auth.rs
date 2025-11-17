@@ -1,13 +1,13 @@
-/// Service Authentication for Cross-PDS Requests
-///
-/// Implements ATProto service auth specification:
-/// - Short-lived JWTs (<60 seconds) signed with user's atproto key
-/// - DID-based verification (no callback to origin PDS)
-/// - Claims: iss (user DID), aud (service DID), exp, lxm (endpoint), jti (nonce)
-///
-/// References:
-/// - https://atproto.com/specs/xrpc
-/// - https://docs.bsky.app/docs/advanced-guides/service-auth
+//! Service Authentication for Cross-PDS Requests
+//!
+//! Implements ATProto service auth specification:
+//! - Short-lived JWTs (<60 seconds) signed with user's atproto key
+//! - DID-based verification (no callback to origin PDS)
+//! - Claims: iss (user DID), aud (service DID), exp, lxm (endpoint), jti (nonce)
+//!
+//! References:
+//! - https://atproto.com/specs/xrpc
+//! - https://docs.bsky.app/docs/advanced-guides/service-auth
 
 use crate::error::{PdsError, PdsResult};
 use crate::identity::IdentityResolver;

@@ -4,3 +4,14 @@ build.log
 create_admin_account.bat
 grant_admin_final.bat
 /bluesky-pds
+
+# Rust build artifacts
+/target/
+**/target/
+*.log
+Cargo.lock
+
+# Test and temporary files
+*.tmp
+*.swp
+*~

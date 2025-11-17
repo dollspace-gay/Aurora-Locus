@@ -4,6 +4,7 @@ use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// Moderation action types
@@ -32,8 +33,12 @@ impl ModerationAction {
             ModerationAction::Restore => "restore",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> PdsResult<Self> {
+impl FromStr for ModerationAction {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "takedown" => Ok(ModerationAction::Takedown),
             "suspend" => Ok(ModerationAction::Suspend),
@@ -222,7 +227,7 @@ impl ModerationManager {
 
         Ok(actions.iter().any(|a| {
             a.action == ModerationAction::Suspend &&
-            a.expires_at.map_or(true, |exp| exp > now)
+            a.expires_at.is_none_or(|exp| exp > now)
         }))
     }
 

@@ -1,7 +1,7 @@
-/// Sequencer - Event log and firehose system
-///
-/// Provides globally ordered event stream for federation and synchronization.
-/// All repository updates are recorded in a monotonically increasing sequence.
+//! Sequencer - Event log and firehose system
+//!
+//! Provides globally ordered event stream for federation and synchronization.
+//! All repository updates are recorded in a monotonically increasing sequence.
 
 pub mod events;
 pub mod sequencer;
@@ -9,7 +9,6 @@ pub mod sequencer;
 pub use events::*;
 pub use sequencer::{Sequencer, SequencerConfig};
 
-use crate::error::PdsResult;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

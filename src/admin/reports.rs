@@ -3,6 +3,7 @@ use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
 
 /// Report reason types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,8 +28,12 @@ impl ReportReason {
             ReportReason::Other => "other",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> PdsResult<Self> {
+impl FromStr for ReportReason {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "spam" => Ok(ReportReason::Spam),
             "violation" => Ok(ReportReason::Violation),
@@ -60,8 +65,12 @@ impl ReportStatus {
             ReportStatus::Escalated => "escalated",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> PdsResult<Self> {
+impl FromStr for ReportStatus {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "open" => Ok(ReportStatus::Open),
             "acknowledged" => Ok(ReportStatus::Acknowledged),
@@ -251,10 +260,10 @@ impl ReportManager {
 
     fn parse_report(&self, row: sqlx::sqlite::SqliteRow) -> PdsResult<Report> {
         let reason_type_str: String = row.get("reason_type");
-        let reason_type = ReportReason::from_str(&reason_type_str)?;
+        let reason_type = reason_type_str.parse()?;
 
         let status_str: String = row.get("status");
-        let status = ReportStatus::from_str(&status_str)?;
+        let status = status_str.parse()?;
 
         let reported_at_str: String = row.get("reported_at");
         let reported_at = DateTime::parse_from_rfc3339(&reported_at_str)

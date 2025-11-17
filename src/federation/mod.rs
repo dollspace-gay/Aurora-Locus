@@ -1,10 +1,10 @@
-/// Federation support for multi-PDS ecosystem
-///
-/// This module enables Aurora Locus PDS to participate in a federated network:
-/// - Cross-PDS authentication via DID resolution
-/// - Discovery of other PDS instances
-/// - Federated content aggregation
-/// - Relay support for event distribution
+//! Federation support for multi-PDS ecosystem
+//!
+//! This module enables Aurora Locus PDS to participate in a federated network:
+//! - Cross-PDS authentication via DID resolution
+//! - Discovery of other PDS instances
+//! - Federated content aggregation
+//! - Relay support for event distribution
 
 pub mod authentication;
 pub mod discovery;

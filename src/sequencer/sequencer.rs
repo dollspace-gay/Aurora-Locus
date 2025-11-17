@@ -135,7 +135,7 @@ impl Sequencer {
         .bind(&now)
         .fetch_one(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         let seq: i64 = result.try_get("seq")?;
 
@@ -151,7 +151,7 @@ impl Sequencer {
         let result = sqlx::query("SELECT MAX(seq) as max_seq FROM repo_seq WHERE invalidated = 0")
             .fetch_one(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(result.try_get("max_seq").ok())
     }
@@ -170,7 +170,7 @@ impl Sequencer {
         .bind(cursor)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         if let Some(row) = result {
             Ok(Some(self.row_to_seq_row(row)?))
@@ -204,7 +204,7 @@ impl Sequencer {
         .bind(limit)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         rows.into_iter()
             .map(|row| self.row_to_seq_row(row))
@@ -244,7 +244,7 @@ impl Sequencer {
         let rows = sqlx::query(&query_str)
             .fetch_all(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         let mut events = Vec::new();
         for row in rows {
@@ -361,7 +361,7 @@ impl Sequencer {
         .bind(limit.min(self.config.max_query_limit))
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         let mut events = Vec::new();
         for row in rows {

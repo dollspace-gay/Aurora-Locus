@@ -1,7 +1,7 @@
-/// Identity Resolution System
-///
-/// Handles DID document resolution, handle resolution, and caching
-/// for efficient cross-server identity lookups.
+//! Identity Resolution System
+//!
+//! Handles DID document resolution, handle resolution, and caching
+//! for efficient cross-server identity lookups.
 
 pub mod cache;
 pub mod handle_validation;

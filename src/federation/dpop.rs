@@ -1,17 +1,17 @@
-/// DPoP (Demonstrating Proof of Possession) Support
-///
-/// Implements ATProto DPoP specification for client-to-PDS authentication:
-/// - Binds access tokens to specific client devices via public key cryptography
-/// - Prevents token theft and replay attacks
-/// - Requires clients to prove possession of private key on each request
-///
-/// DPoP Proof JWT Format:
-/// - Header: typ="dpop+jwt", alg=ES256, jwk={client's public key}
-/// - Claims: jti (nonce), htm (HTTP method), htu (HTTP URI), iat, exp
-///
-/// References:
-/// - https://datatracker.ietf.org/doc/html/rfc9449
-/// - https://atproto.com/specs/xrpc#dpop
+//! DPoP (Demonstrating Proof of Possession) Support
+//!
+//! Implements ATProto DPoP specification for client-to-PDS authentication:
+//! - Binds access tokens to specific client devices via public key cryptography
+//! - Prevents token theft and replay attacks
+//! - Requires clients to prove possession of private key on each request
+//!
+//! DPoP Proof JWT Format:
+//! - Header: typ="dpop+jwt", alg=ES256, jwk={client's public key}
+//! - Claims: jti (nonce), htm (HTTP method), htu (HTTP URI), iat, exp
+//!
+//! References:
+//! - https://datatracker.ietf.org/doc/html/rfc9449
+//! - https://atproto.com/specs/xrpc#dpop
 
 use crate::error::{PdsError, PdsResult};
 use chrono::Utc;
@@ -55,6 +55,12 @@ pub struct Jwk {
 pub struct DPopNonceStore {
     /// Active nonces mapped to expiration time
     nonces: Arc<RwLock<HashMap<String, i64>>>,
+}
+
+impl Default for DPopNonceStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DPopNonceStore {

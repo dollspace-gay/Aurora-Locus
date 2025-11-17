@@ -3,6 +3,7 @@
 use crate::{
     admin::InviteCode,
     auth::AdminAuthContext,
+    error::PdsError,
     AppContext,
 };
 use axum::{
@@ -253,8 +254,10 @@ async fn grant_role(
     use crate::admin::roles::Role;
 
     // Parse role
-    let role = Role::from_str(&req.role)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let role: Role = req
+        .role
+        .parse()
+        .map_err(|e: PdsError| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     // Grant role
     let admin_role = ctx.admin_role_manager
@@ -592,8 +595,10 @@ async fn submit_report(
     use crate::admin::reports::ReportReason;
 
     // Parse reason type
-    let reason_type = ReportReason::from_str(&req.reason_type)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let reason_type: ReportReason = req
+        .reason_type
+        .parse()
+        .map_err(|e: PdsError| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     // Submit report
     let report = ctx.report_manager
@@ -631,8 +636,10 @@ async fn update_report_status(
     use crate::admin::reports::ReportStatus;
 
     // Parse status
-    let status = ReportStatus::from_str(&req.status)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let status: ReportStatus = req
+        .status
+        .parse()
+        .map_err(|e: PdsError| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     // Update status
     ctx.report_manager
@@ -675,7 +682,8 @@ async fn list_reports(
 
     // Parse status filter if provided
     let status_filter = if let Some(status_str) = query.status {
-        Some(ReportStatus::from_str(&status_str)
+        Some(status_str
+            .parse::<ReportStatus>()
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?)
     } else {
         None

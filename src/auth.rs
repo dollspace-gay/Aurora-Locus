@@ -387,7 +387,9 @@ impl FromRequestParts<AppContext> for OAuthAuthContext {
         let token_info = validate_oauth_token(state, &access_token).await?;
 
         // Parse scopes
-        let scopes = ScopeSet::from_str(&token_info.scope)
+        let scopes = token_info
+            .scope
+            .parse::<ScopeSet>()
             .map_err(|e| PdsError::Authentication(format!("Invalid token scopes: {}", e)))?;
 
         let did = token_info.did.clone();
@@ -422,7 +424,7 @@ pub async fn validate_oauth_token(
     .bind(access_token)
     .fetch_optional(&ctx.account_db)
     .await
-    .map_err(|e| PdsError::Database(e))?
+    .map_err(PdsError::Database)?
     .ok_or_else(|| PdsError::Authentication("Invalid or expired access token".to_string()))?;
 
     // Check if token is expired

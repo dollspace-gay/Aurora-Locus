@@ -1,12 +1,13 @@
-/// Moderation Event Logging System
-///
-/// Comprehensive audit log for all moderation actions.
-/// Provides transparency, accountability, and compliance tracking.
+//! Moderation Event Logging System
+//!
+//! Comprehensive audit log for all moderation actions.
+//! Provides transparency, accountability, and compliance tracking.
 
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
 
 /// Moderation event types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,8 +56,12 @@ impl ModerationEventType {
             ModerationEventType::AppealReview => "appeal_review",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> PdsResult<Self> {
+impl FromStr for ModerationEventType {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "account_takedown" => Ok(ModerationEventType::AccountTakedown),
             "account_suspend" => Ok(ModerationEventType::AccountSuspend),
@@ -118,7 +123,7 @@ impl ModerationEventLogger {
 
         let meta_json = meta
             .as_ref()
-            .map(|m| serde_json::to_string(m))
+            .map(serde_json::to_string)
             .transpose()
             .map_err(|e| PdsError::Internal(format!("Failed to serialize meta: {}", e)))?;
 

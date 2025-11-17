@@ -1,14 +1,13 @@
-/// PLC Directory Client - Handles key rotation and DID operations
-///
-/// Provides high-level interface for interacting with the PLC directory,
-/// including fetching DID documents, comparing keys, and updating signing keys.
+//! PLC Directory Client - Handles key rotation and DID operations
+//!
+//! Provides high-level interface for interacting with the PLC directory,
+//! including fetching DID documents, comparing keys, and updating signing keys.
 
 use crate::{
-    crypto::plc::{PlcOperation, PlcOperationBuilder, PlcSigner, register_plc_did},
+    crypto::plc::{PlcOperationBuilder, PlcSigner, register_plc_did},
     error::{PdsError, PdsResult},
 };
 use atproto::did_doc::DidDocument;
-use serde_json::Value;
 
 /// PLC Directory client configuration
 #[derive(Debug, Clone)]
@@ -131,10 +130,11 @@ impl PlcClient {
         rotation_key_signer: &PlcSigner,
     ) -> PdsResult<()> {
         // Fetch current DID document to get prev CID
-        let current_doc = self.get_document(did).await?;
+        let _current_doc = self.get_document(did).await?;
 
         // Get the previous operation CID (if available from doc metadata)
         // For now, we'll leave prev as None - PLC directory can handle this
+        // TODO: Extract prev CID from _current_doc once PLC format is stable
 
         // Build verification methods JSON with the new signing key
         let verification_methods = serde_json::json!({

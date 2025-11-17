@@ -1,7 +1,7 @@
-/// Reserved handle system - prevents registration of system-level and protocol handles
-///
-/// This module maintains a list of reserved handles that cannot be registered by users.
-/// These include system names, protocol names, and common administrative handles.
+//! Reserved handle system - prevents registration of system-level and protocol handles
+//!
+//! This module maintains a list of reserved handles that cannot be registered by users.
+//! These include system names, protocol names, and common administrative handles.
 
 use std::collections::HashSet;
 use lazy_static::lazy_static;

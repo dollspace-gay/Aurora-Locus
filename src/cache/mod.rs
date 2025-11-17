@@ -1,17 +1,16 @@
-/// Redis-based caching layer for Aurora Locus PDS
-///
-/// Provides distributed caching capabilities for:
-/// - DID resolution results
-/// - Handle lookups
-/// - Session tokens
-/// - Repository metadata
-/// - Rate limit counters (for distributed rate limiting)
+//! Redis-based caching layer for Aurora Locus PDS
+//!
+//! Provides distributed caching capabilities for:
+//! - DID resolution results
+//! - Handle lookups
+//! - Session tokens
+//! - Repository metadata
+//! - Rate limit counters (for distributed rate limiting)
 
 use crate::error::{PdsError, PdsResult};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
 use serde::{de::DeserializeOwned, Serialize};
-use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 /// Cache layer configuration
@@ -174,7 +173,7 @@ impl CacheClient {
         })?;
 
         let mut conn = self.connection.clone();
-        conn.set_ex(&cache_key, json, ttl)
+        conn.set_ex::<_, _, ()>(&cache_key, json, ttl)
             .await
             .map_err(|e| {
                 warn!("Redis SET failed for {}: {}", cache_key, e);
@@ -192,7 +191,7 @@ impl CacheClient {
         debug!("Cache DELETE: {}", cache_key);
 
         let mut conn = self.connection.clone();
-        conn.del(&cache_key).await.map_err(|e| {
+        conn.del::<_, ()>(&cache_key).await.map_err(|e| {
             warn!("Redis DELETE failed for {}: {}", cache_key, e);
             PdsError::Internal(format!("Cache delete failed: {}", e))
         })?;
@@ -227,7 +226,7 @@ impl CacheClient {
 
         // Set TTL if this is a new key (count == 1)
         if count == 1 {
-            conn.expire(&cache_key, ttl_secs as i64)
+            conn.expire::<_, ()>(&cache_key, ttl_secs as i64)
                 .await
                 .map_err(|e| {
                     warn!("Redis EXPIRE failed for {}: {}", cache_key, e);

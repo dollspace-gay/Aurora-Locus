@@ -1,7 +1,7 @@
-/// Email Template System
-///
-/// Provides a flexible template system for all email types.
-/// Templates support variable substitution and HTML/plaintext variants.
+//! Email Template System
+//!
+//! Provides a flexible template system for all email types.
+//! Templates support variable substitution and HTML/plaintext variants.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

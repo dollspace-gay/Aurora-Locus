@@ -1,9 +1,9 @@
-/// CAR (Content Addressable aRchive) Export Utilities
-///
-/// This module provides functions for exporting repository data to CAR format,
-/// which is used by ATProto sync protocol endpoints.
-///
-/// Uses the `atproto::car` module from the SDK for CAR file generation.
+//! CAR (Content Addressable aRchive) Export Utilities
+//!
+//! This module provides functions for exporting repository data to CAR format,
+//! which is used by ATProto sync protocol endpoints.
+//!
+//! Uses the `atproto::car` module from the SDK for CAR file generation.
 
 use crate::{
     actor_store::ActorStore,
@@ -142,8 +142,8 @@ pub async fn export_record_to_car(
         .await?
         .ok_or_else(|| PdsError::NotFound(format!("Record not found: {}", uri)))?;
 
-    // Parse record CID
-    let record_cid = Cid::from_str(&record.cid)
+    // Parse record CID (validated but not used - record struct is sufficient)
+    let _record_cid = Cid::from_str(&record.cid)
         .map_err(|e| PdsError::Internal(format!("Invalid record CID: {}", e)))?;
 
     // Get repo root

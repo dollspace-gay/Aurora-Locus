@@ -1,7 +1,7 @@
-/// Admin and Moderation System
-///
-/// Handles administrative functions including role management,
-/// account moderation, labeling, and invite codes.
+//! Admin and Moderation System
+//!
+//! Handles administrative functions including role management,
+//! account moderation, labeling, and invite codes.
 
 pub mod appeals;
 pub mod events;

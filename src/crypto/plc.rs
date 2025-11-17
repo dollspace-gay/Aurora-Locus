@@ -1,6 +1,6 @@
-/// PLC (Public Ledger of Credentials) operation signing
-///
-/// Implements secp256k1-based signing for DID:PLC update operations
+//! PLC (Public Ledger of Credentials) operation signing
+//!
+//! Implements secp256k1-based signing for DID:PLC update operations
 
 use crate::error::{PdsError, PdsResult};
 use k256::{

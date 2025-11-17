@@ -1,21 +1,21 @@
-/// OAuth 2.1 Scope System for ATProto
-///
-/// Implements fine-grained authorization scopes mapped to ATProto lexicons.
-/// Scopes control what operations an OAuth token can perform.
-///
-/// Scope Hierarchy:
-/// - atproto:* - Full access (admin/first-party apps only)
-/// - atproto:read - Read-only access to all endpoints
-/// - atproto:write - Write access (create, update, delete)
-/// - atproto:repo.* - Repository operations
-/// - atproto:repo.create - Create records
-/// - atproto:repo.update - Update records
-/// - atproto:repo.delete - Delete records
-/// - atproto:identity.* - Identity operations
-/// - atproto:admin.* - Administrative operations (highly privileged)
-///
-/// References:
-/// - ATProto OAuth spec: https://atproto.com/specs/oauth
+//! OAuth 2.1 Scope System for ATProto
+//!
+//! Implements fine-grained authorization scopes mapped to ATProto lexicons.
+//! Scopes control what operations an OAuth token can perform.
+//!
+//! Scope Hierarchy:
+//! - atproto:* - Full access (admin/first-party apps only)
+//! - atproto:read - Read-only access to all endpoints
+//! - atproto:write - Write access (create, update, delete)
+//! - atproto:repo.* - Repository operations
+//! - atproto:repo.create - Create records
+//! - atproto:repo.update - Update records
+//! - atproto:repo.delete - Delete records
+//! - atproto:identity.* - Identity operations
+//! - atproto:admin.* - Administrative operations (highly privileged)
+//!
+//! References:
+//! - ATProto OAuth spec: https://atproto.com/specs/oauth
 
 use crate::error::{PdsError, PdsResult};
 use serde::{Deserialize, Serialize};
@@ -263,30 +263,6 @@ impl ScopeSet {
         }
     }
 
-    /// Parse scopes from space-separated string
-    ///
-    /// # Arguments
-    /// * `scope_str` - Space-separated scope string (e.g., "atproto:read atproto:write")
-    ///
-    /// # Returns
-    /// Parsed scope set
-    pub fn from_str(scope_str: &str) -> PdsResult<Self> {
-        let scopes = scope_str
-            .split_whitespace()
-            .map(|s| AtProtoScope::from_str(s))
-            .collect::<Result<HashSet<_>, _>>()?;
-
-        Ok(Self { scopes })
-    }
-
-    /// Convert scope set to space-separated string
-    pub fn to_string(&self) -> String {
-        self.scopes
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
 
     /// Check if this set contains a specific scope (including hierarchical)
     ///
@@ -354,6 +330,31 @@ impl Default for ScopeSet {
     }
 }
 
+impl FromStr for ScopeSet {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let scopes = s
+            .split_whitespace()
+            .map(AtProtoScope::from_str)
+            .collect::<Result<HashSet<_>, _>>()?;
+
+        Ok(Self { scopes })
+    }
+}
+
+impl fmt::Display for ScopeSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scope_str = self
+            .scopes
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        write!(f, "{}", scope_str)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_scope_set_parsing() {
-        let set = ScopeSet::from_str("atproto:read atproto:write").unwrap();
+        let set: ScopeSet = "atproto:read atproto:write".parse().unwrap();
         assert_eq!(set.len(), 2);
         assert!(set.has_scope(&AtProtoScope::Read));
         assert!(set.has_scope(&AtProtoScope::Write));
@@ -403,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_scope_set_hierarchical() {
-        let set = ScopeSet::from_str("atproto:write").unwrap();
+        let set: ScopeSet = "atproto:write".parse().unwrap();
 
         // Write should include create/update/delete
         assert!(set.has_scope(&AtProtoScope::RepoCreate));
@@ -416,8 +417,8 @@ mod tests {
 
     #[test]
     fn test_scope_set_intersection() {
-        let set1 = ScopeSet::from_str("atproto:read atproto:write atproto:admin.*").unwrap();
-        let set2 = ScopeSet::from_str("atproto:read atproto:repo.create").unwrap();
+        let set1: ScopeSet = "atproto:read atproto:write atproto:admin.*".parse().unwrap();
+        let set2: ScopeSet = "atproto:read atproto:repo.create".parse().unwrap();
 
         let intersection = set1.intersect(&set2);
         assert_eq!(intersection.len(), 1);
@@ -460,7 +461,6 @@ mod tests {
 /// Middleware helper functions for scope checking
 ///
 /// These functions are used to protect API endpoints with scope requirements.
-
 /// Check if the given scope string contains the required scope
 ///
 /// Used in API endpoint handlers to verify OAuth token permissions.
@@ -477,7 +477,7 @@ mod tests {
 /// require_scope(&token.scope, &AtProtoScope::RepoCreate)?;
 /// ```
 pub fn require_scope(token_scopes: &str, required: &AtProtoScope) -> PdsResult<()> {
-    let scopes = ScopeSet::from_str(token_scopes)?;
+    let scopes = token_scopes.parse::<ScopeSet>()?;
 
     if scopes.has_scope(required) {
         Ok(())
@@ -498,7 +498,7 @@ pub fn require_scope(token_scopes: &str, required: &AtProtoScope) -> PdsResult<(
 /// # Returns
 /// Ok(()) if authorized, Err(PdsError::Forbidden) otherwise
 pub fn require_any_scope(token_scopes: &str, required: &[AtProtoScope]) -> PdsResult<()> {
-    let scopes = ScopeSet::from_str(token_scopes)?;
+    let scopes = token_scopes.parse::<ScopeSet>()?;
 
     if scopes.has_any(required) {
         Ok(())
@@ -525,7 +525,7 @@ pub fn require_any_scope(token_scopes: &str, required: &[AtProtoScope]) -> PdsRe
 /// # Returns
 /// Ok(()) if authorized, Err(PdsError::Forbidden) otherwise
 pub fn require_all_scopes(token_scopes: &str, required: &[AtProtoScope]) -> PdsResult<()> {
-    let scopes = ScopeSet::from_str(token_scopes)?;
+    let scopes = token_scopes.parse::<ScopeSet>()?;
 
     if scopes.has_all(required) {
         Ok(())

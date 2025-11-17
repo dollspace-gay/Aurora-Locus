@@ -1,6 +1,6 @@
-/// Email Notification System
-///
-/// High-level interface for sending notification emails with templates.
+//! Email Notification System
+//!
+//! High-level interface for sending notification emails with templates.
 
 use super::templates::{EmailTemplateManager, EmailTemplateType};
 use crate::error::PdsResult;

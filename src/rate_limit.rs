@@ -100,7 +100,7 @@ use governor::{
 };
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr},
     num::NonZeroU32,
     str::FromStr,
     sync::Arc,
@@ -223,7 +223,7 @@ impl EndpointRateLimitConfig {
     pub fn add_limit(&mut self, endpoint: &str, limit: EndpointRateLimit) {
         self.endpoints
             .entry(endpoint.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(limit);
     }
 

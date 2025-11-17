@@ -567,7 +567,7 @@ async fn get_service_auth(
     if let Ok(is_taken_down) = ctx.moderation_manager.is_taken_down(&auth.did).await {
         if is_taken_down {
             // Check if this is a migration-related method
-            let is_migration_method = req.lxm.as_ref().map_or(false, |method| {
+            let is_migration_method = req.lxm.as_ref().is_some_and(|method| {
                 method.starts_with("com.atproto.server.activateAccount")
                     || method.starts_with("com.atproto.identity.updateHandle")
             });

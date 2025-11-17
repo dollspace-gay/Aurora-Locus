@@ -1,15 +1,14 @@
-/// Relay support for event distribution in the federation
-///
-/// Relays enable:
-/// - Real-time event streaming across PDS instances
-/// - Content synchronization
-/// - Firehose aggregation
-/// - Network-wide event distribution
+//! Relay support for event distribution in the federation
+//!
+//! Relays enable:
+//! - Real-time event streaming across PDS instances
+//! - Content synchronization
+//! - Firehose aggregation
+//! - Network-wide event distribution
 
 use crate::error::{PdsError, PdsResult};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};

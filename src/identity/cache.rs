@@ -90,7 +90,7 @@ impl DidCache {
         .bind(did)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         if let Some(row) = result {
             let did_str: String = row.try_get("did")?;
@@ -142,7 +142,7 @@ impl DidCache {
         .bind(&now)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -153,7 +153,7 @@ impl DidCache {
             .bind(did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -179,7 +179,7 @@ impl DidCache {
         .bind(&normalized)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         if let Some(row) = result {
             let handle_str: String = row.try_get("handle")?;
@@ -232,7 +232,7 @@ impl DidCache {
         .bind(&now)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -245,7 +245,7 @@ impl DidCache {
             .bind(&normalized)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -264,7 +264,7 @@ impl DidCache {
         .bind(did)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         if let Some(row) = result {
             Ok(Some(row.try_get("handle")?))
@@ -286,14 +286,14 @@ impl DidCache {
             .bind(&did_doc_cutoff)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Delete handles past max_ttl
         let handle_result = sqlx::query("DELETE FROM did_handle WHERE updated_at < ?1")
             .bind(&handle_cutoff)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         tracing::debug!(
             did_docs_deleted = did_result.rows_affected(),

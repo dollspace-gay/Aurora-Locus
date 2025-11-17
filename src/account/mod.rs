@@ -1,6 +1,6 @@
-/// Account management system
-///
-/// Handles user account creation, authentication, sessions, and related operations.
+//! Account management system
+//!
+//! Handles user account creation, authentication, sessions, and related operations.
 
 mod manager;
 

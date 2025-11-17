@@ -1,10 +1,10 @@
 #![recursion_limit = "512"]
 
-/// Aurora Locus Library
-///
-/// This module re-exports public modules for integration testing.
-///
-/// Note: This is only used for integration tests. The main binary is in main.rs.
+//! Aurora Locus Library
+//!
+//! This module re-exports public modules for integration testing.
+//!
+//! Note: This is only used for integration tests. The main binary is in main.rs.
 
 // Core modules
 pub mod error;

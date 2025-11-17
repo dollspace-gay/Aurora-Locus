@@ -14,17 +14,11 @@ use tokio::fs;
 
 /// Blob store configuration
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct BlobStoreConfig {
     pub storage: BlobStorageConfig,
 }
 
-impl Default for BlobStoreConfig {
-    fn default() -> Self {
-        Self {
-            storage: BlobStorageConfig::default(),
-        }
-    }
-}
 
 /// Main blob store manager
 #[derive(Clone)]
@@ -113,7 +107,7 @@ impl BlobStore {
         // Validate size
         let size = data.len();
         atproto::blob::validate_blob_size(size, self.config.storage.max_blob_size)
-            .map_err(|e| PdsError::Validation(e))?;
+            .map_err(PdsError::Validation)?;
 
         // Detect MIME type from data if not provided
         let mime_type = mime_type
@@ -250,7 +244,7 @@ impl BlobStore {
         // Validate size
         let size = data.len();
         atproto::blob::validate_blob_size(size, self.config.storage.max_blob_size)
-            .map_err(|e| PdsError::Validation(e))?;
+            .map_err(PdsError::Validation)?;
 
         // Detect MIME type from data if not provided
         let mime_type = mime_type
@@ -393,7 +387,7 @@ impl BlobStore {
         .bind(Utc::now())
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -432,7 +426,7 @@ impl BlobStore {
         .bind(thumbnail_cid)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -459,7 +453,7 @@ impl BlobStore {
         .bind(temp_blob.height)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -476,7 +470,7 @@ impl BlobStore {
         .bind(cid)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         if let Some(row) = result {
             Ok(Some(TempBlob {
@@ -499,7 +493,7 @@ impl BlobStore {
             .bind(cid)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -519,7 +513,7 @@ impl BlobStore {
         .bind(cutoff)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         let mut cids = Vec::new();
         for row in rows {
@@ -557,7 +551,7 @@ impl BlobStore {
         .bind(cid)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         if let Some(row) = result {
             Ok(Some(BlobMetadata {
@@ -582,7 +576,7 @@ impl BlobStore {
             .bind(cid)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -602,7 +596,7 @@ impl BlobStore {
         .bind(limit)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         let mut blobs = Vec::new();
         for row in rows {
@@ -667,7 +661,7 @@ impl BlobStore {
         let cids = query
             .fetch_all(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(cids)
     }

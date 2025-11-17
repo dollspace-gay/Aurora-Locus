@@ -133,7 +133,7 @@ impl InviteCodeManager {
             return Err(PdsError::Validation("Invite code has no uses remaining".to_string()));
         }
 
-        if let Some(expires_at_str) = row.try_get::<String, _>("expires_at").ok() {
+        if let Ok(expires_at_str) = row.try_get::<String, _>("expires_at") {
             let expires_at = DateTime::parse_from_rfc3339(&expires_at_str)
                 .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
                 .with_timezone(&Utc);

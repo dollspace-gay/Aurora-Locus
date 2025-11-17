@@ -1,7 +1,7 @@
-/// Cache for local records (read-after-write consistency)
-///
-/// This cache stores LocalRecords in memory with TTL to avoid repeated database queries.
-/// Records are invalidated after TTL expires or when explicitly invalidated on updates.
+//! Cache for local records (read-after-write consistency)
+//!
+//! This cache stores LocalRecords in memory with TTL to avoid repeated database queries.
+//! Records are invalidated after TTL expires or when explicitly invalidated on updates.
 
 use super::types::LocalRecords;
 use moka::future::Cache;

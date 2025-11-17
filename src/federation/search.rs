@@ -1,6 +1,6 @@
-/// Federated search across multiple PDS instances
-///
-/// Enables searching for content, users, and posts across the entire federation
+//! Federated search across multiple PDS instances
+//!
+//! Enables searching for content, users, and posts across the entire federation
 
 use crate::error::{PdsError, PdsResult};
 use crate::federation::discovery::{PdsDiscovery, PdsInstance};

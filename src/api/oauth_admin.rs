@@ -1,10 +1,10 @@
 /// OAuth-based admin authentication endpoints
-use crate::{error::{PdsError, PdsResult}, AppContext};
+use crate::AppContext;
 use atproto::oauth::OAuthClient;
 use axum::{
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Redirect},
+    http::StatusCode,
+    response::Redirect,
     routing::get,
     Json, Router,
 };
@@ -19,6 +19,12 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct OAuthStateStore {
     states: Arc<RwLock<HashMap<String, OAuthStateData>>>,
+}
+
+impl Default for OAuthStateStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OAuthStateStore {

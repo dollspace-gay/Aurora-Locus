@@ -3,7 +3,7 @@
 use crate::{
     context::AppContext,
     crypto::plc::PlcSigner,
-    error::{PdsError, PdsResult},
+    error::PdsResult,
 };
 use atproto::did_doc::{DidDocument, Service, VerificationMethod};
 use axum::{

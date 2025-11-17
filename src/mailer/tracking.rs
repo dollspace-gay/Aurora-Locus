@@ -1,11 +1,12 @@
-/// Email Delivery Tracking System
-///
-/// Tracks email delivery status, bounces, and provides analytics.
+//! Email Delivery Tracking System
+//!
+//! Tracks email delivery status, bounces, and provides analytics.
 
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
 
 /// Email delivery status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,8 +37,12 @@ impl EmailStatus {
             EmailStatus::Deferred => "deferred",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> PdsResult<Self> {
+impl FromStr for EmailStatus {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "queued" => Ok(EmailStatus::Queued),
             "sent" => Ok(EmailStatus::Sent),

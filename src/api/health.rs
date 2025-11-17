@@ -1,14 +1,14 @@
-/// Health check endpoints for Kubernetes liveness and readiness probes
-///
-/// Provides detailed health status including:
-/// - Database connectivity
-/// - Blob storage availability
-/// - Background job status
-/// - System resource checks
-///
-/// Supports two types of probes:
-/// - Liveness: Is the application alive? (restart if not)
-/// - Readiness: Can the application serve traffic? (remove from load balancer if not)
+//! Health check endpoints for Kubernetes liveness and readiness probes
+//!
+//! Provides detailed health status including:
+//! - Database connectivity
+//! - Blob storage availability
+//! - Background job status
+//! - System resource checks
+//!
+//! Supports two types of probes:
+//! - Liveness: Is the application alive? (restart if not)
+//! - Readiness: Can the application serve traffic? (remove from load balancer if not)
 
 use crate::{context::AppContext, error::PdsResult, jobs, metrics};
 use axum::{extract::State, http::StatusCode, response::Json, Router, routing::get};
@@ -197,7 +197,7 @@ async fn check_database_detailed(ctx: &AppContext) -> ComponentHealth {
                 error: None,
                 details: Some(serde_json::json!({
                     "type": "sqlite",
-                    "pool_size": ctx.account_db.size() as u32,
+                    "pool_size": ctx.account_db.size(),
                 })),
             }
         }

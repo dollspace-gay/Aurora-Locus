@@ -1,7 +1,7 @@
-/// Distributed rate limiting using Redis
-///
-/// This module provides distributed rate limiting capabilities using Redis,
-/// allowing multiple PDS instances to share rate limit state.
+//! Distributed rate limiting using Redis
+//!
+//! This module provides distributed rate limiting capabilities using Redis,
+//! allowing multiple PDS instances to share rate limit state.
 
 use crate::cache::CacheClient;
 use crate::error::{PdsError, PdsResult};

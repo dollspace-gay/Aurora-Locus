@@ -1,10 +1,10 @@
-/// PDS discovery for finding other instances in the federation
-///
-/// Enables automatic discovery of PDS instances through:
-/// - DNS records
-/// - Well-known endpoints
-/// - Relay server registries
-/// - Manual configuration
+//! PDS discovery for finding other instances in the federation
+//!
+//! Enables automatic discovery of PDS instances through:
+//! - DNS records
+//! - Well-known endpoints
+//! - Relay server registries
+//! - Manual configuration
 
 use crate::error::{PdsError, PdsResult};
 use reqwest::Client;

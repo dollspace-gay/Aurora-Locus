@@ -265,7 +265,7 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
     let account_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account")
         .fetch_one(&ctx.account_db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
     crate::metrics::ACCOUNTS_TOTAL.set(account_count);
 
@@ -275,7 +275,7 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
     )
     .fetch_one(&ctx.account_db)
     .await
-    .map_err(|e| PdsError::Database(e))?;
+    .map_err(PdsError::Database)?;
 
     crate::metrics::SESSIONS_ACTIVE.set(session_count);
 
@@ -283,7 +283,7 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
     let seq_result = sqlx::query("SELECT MAX(seq) as max_seq FROM sequencer")
         .fetch_optional(&ctx.account_db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
     if let Some(row) = seq_result {
         if let Ok(max_seq) = row.try_get::<Option<i64>, _>("max_seq") {

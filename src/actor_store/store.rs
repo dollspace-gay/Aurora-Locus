@@ -71,7 +71,7 @@ impl ActorStore {
                 .busy_timeout(std::time::Duration::from_secs(5)),
         )
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Create actor repository schema inline
         sqlx::query(
@@ -164,7 +164,7 @@ impl ActorStore {
                 .busy_timeout(std::time::Duration::from_secs(5)),
         )
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Add to cache
         {
@@ -206,7 +206,7 @@ impl ActorStore {
 
         let txn = pool.begin()
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(crate::actor_store::ActorTransaction::new(
             txn,
@@ -340,7 +340,7 @@ impl ActorStore {
         )
         .fetch_all(&pool)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(collections)
     }
@@ -535,8 +535,6 @@ impl ActorStore {
 
     /// Get specific blocks by CIDs
     pub async fn get_blocks_by_cids(&self, did: &str, cids: &[String]) -> PdsResult<Vec<(String, Vec<u8>)>> {
-        let pool = self.open_db(did).await?;
-
         let mut blocks = Vec::new();
         for cid in cids {
             if let Some(content) = self.get_block(did, cid).await? {

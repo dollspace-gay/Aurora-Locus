@@ -1,7 +1,7 @@
-/// Transaction support for atomic multi-record operations
-///
-/// Provides explicit transaction API similar to Bluesky's ActorStoreTransactor
-/// with Rust-native type safety and SQLx integration.
+//! Transaction support for atomic multi-record operations
+//!
+//! Provides explicit transaction API similar to Bluesky's ActorStoreTransactor
+//! with Rust-native type safety and SQLx integration.
 
 use crate::{
     actor_store::ActorStore,
@@ -95,7 +95,7 @@ impl<'a> ActorTransaction<'a> {
         .bind(chrono::Utc::now())
         .execute(&mut **txn)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -124,7 +124,7 @@ impl<'a> ActorTransaction<'a> {
         .bind(chrono::Utc::now())
         .execute(&mut **txn)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -138,7 +138,7 @@ impl<'a> ActorTransaction<'a> {
             .bind(uri)
             .execute(&mut **txn)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -158,7 +158,7 @@ impl<'a> ActorTransaction<'a> {
         .bind(&self.did)
         .execute(&mut **txn)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -174,7 +174,7 @@ impl<'a> ActorTransaction<'a> {
 
         txn.commit()
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         self.committed = true;
         Ok(())
@@ -190,7 +190,7 @@ impl<'a> ActorTransaction<'a> {
 
         txn.rollback()
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -226,7 +226,7 @@ impl<'a> ActorTransaction<'a> {
         sqlx::query(&query)
             .execute(&mut **txn)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -240,7 +240,7 @@ impl<'a> ActorTransaction<'a> {
         sqlx::query(&query)
             .execute(&mut **txn)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -254,7 +254,7 @@ impl<'a> ActorTransaction<'a> {
         sqlx::query(&query)
             .execute(&mut **txn)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(())
     }

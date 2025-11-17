@@ -26,6 +26,7 @@ mod oauth;
 mod mailer;
 mod metrics;
 mod rate_limit;
+mod rate_limit_new;  // Distributed Redis-backed rate limiting
 mod read_after_write;
 mod actor_store;  // Must come after read_after_write (uses its types)
 mod sequencer;

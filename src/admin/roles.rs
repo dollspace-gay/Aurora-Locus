@@ -3,6 +3,7 @@ use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
 
 /// Admin role levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -25,18 +26,22 @@ impl Role {
         }
     }
 
-    pub fn from_str(s: &str) -> PdsResult<Self> {
+    /// Check if this role can perform actions requiring another role
+    pub fn can_act_as(&self, required: Role) -> bool {
+        self >= &required
+    }
+}
+
+impl FromStr for Role {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "moderator" => Ok(Role::Moderator),
             "admin" => Ok(Role::Admin),
             "superadmin" => Ok(Role::SuperAdmin),
             _ => Err(PdsError::Validation(format!("Invalid role: {}", s))),
         }
-    }
-
-    /// Check if this role can perform actions requiring another role
-    pub fn can_act_as(&self, required: Role) -> bool {
-        self >= &required
     }
 }
 

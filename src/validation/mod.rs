@@ -2,36 +2,35 @@
 ///
 /// Validates records against ATProto lexicon schemas
 use crate::error::PdsError;
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 /// Validation mode determines how strictly records are validated
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ValidationMode {
     /// Strict mode - reject unknown collections
     Required,
     /// Validate known collections, warn on unknown (default)
+    #[default]
     Optimistic,
     /// No validation performed
     None,
 }
 
-impl Default for ValidationMode {
-    fn default() -> Self {
-        ValidationMode::Optimistic
-    }
-}
 
-impl ValidationMode {
-    /// Parse validation mode from string (case-insensitive)
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for ValidationMode {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "required" => Some(ValidationMode::Required),
-            "optimistic" => Some(ValidationMode::Optimistic),
-            "none" => Some(ValidationMode::None),
-            _ => None,
+            "required" => Ok(ValidationMode::Required),
+            "optimistic" => Ok(ValidationMode::Optimistic),
+            "none" => Ok(ValidationMode::None),
+            _ => Err(PdsError::Validation(format!("Invalid validation mode: {}", s))),
         }
     }
 }

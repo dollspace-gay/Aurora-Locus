@@ -441,7 +441,7 @@ async fn list_records(
         let value = rec.get("value").cloned().unwrap_or(serde_json::Value::Null);
 
         // Extract rkey from URI for cursor (format: at://did/collection/rkey)
-        if let Some(rkey) = uri.split('/').last() {
+        if let Some(rkey) = uri.split('/').next_back() {
             next_cursor = Some(rkey.to_string());
         }
 

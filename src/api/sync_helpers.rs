@@ -1,6 +1,6 @@
-/// Sync Protocol Helper Functions
-///
-/// Shared utilities for ATProto sync endpoints (com.atproto.sync.*)
+//! Sync Protocol Helper Functions
+//!
+//! Shared utilities for ATProto sync endpoints (com.atproto.sync.*)
 
 use crate::{
     account::AccountManager,

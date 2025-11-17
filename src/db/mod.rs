@@ -1,7 +1,7 @@
-/// Database layer for Aurora Locus
-///
-/// Manages database connections, migrations, and provides typed access
-/// to the account, sequencer, and DID cache databases.
+//! Database layer for Aurora Locus
+//!
+//! Manages database connections, migrations, and provides typed access
+//! to the account, sequencer, and DID cache databases.
 
 pub mod account;
 pub mod postgres;
@@ -33,12 +33,6 @@ pub async fn create_pool(path: &Path, options: DatabaseOptions) -> PdsResult<Sql
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Build connection string with pragmas
-    let connection_string = format!(
-        "sqlite://{}?mode=rwc",
-        path.to_string_lossy()
-    );
-
     let pool = SqlitePool::connect_with(
         sqlx::sqlite::SqliteConnectOptions::new()
             .filename(path)
@@ -52,7 +46,7 @@ pub async fn create_pool(path: &Path, options: DatabaseOptions) -> PdsResult<Sql
             .busy_timeout(std::time::Duration::from_secs(5)),
     )
     .await
-    .map_err(|e| PdsError::Database(e))?;
+    .map_err(PdsError::Database)?;
 
     Ok(pool)
 }
@@ -73,7 +67,7 @@ pub async fn test_connection(pool: &SqlitePool) -> PdsResult<()> {
     sqlx::query("SELECT 1")
         .execute(pool)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
     Ok(())
 }

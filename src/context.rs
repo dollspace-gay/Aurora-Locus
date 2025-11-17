@@ -20,7 +20,8 @@ use crate::{
     },
     identity::{DidCache, IdentityResolver, IdentityResolverConfig},
     mailer::Mailer,
-    rate_limit::{RateLimiter, RateLimitConfig},
+    oauth::{ClientManager, DeviceManager},
+    rate_limit::RateLimiter,
     read_after_write::LocalRecordsCache,
     sequencer::{Sequencer, SequencerConfig},
 };
@@ -42,6 +43,9 @@ pub struct AppContext {
     pub label_manager: Arc<LabelManager>,
     pub invite_manager: Arc<InviteCodeManager>,
     pub report_manager: Arc<ReportManager>,
+    // OAuth server components (for third-party app authorization)
+    pub oauth_client_manager: Arc<ClientManager>,
+    pub oauth_device_manager: Arc<DeviceManager>,
     // Sequencer for event streaming
     pub sequencer: Arc<Sequencer>,
     // Relay client for federation
@@ -113,6 +117,13 @@ impl AppContext {
         ));
         let invite_manager = Arc::new(InviteCodeManager::new(account_db.clone()));
         let report_manager = Arc::new(ReportManager::new(account_db.clone()));
+
+        // Initialize OAuth server managers
+        // For now, initialize with empty client list. In production, load from config.
+        // TODO: Add OAuth client configuration to ServerConfig
+        tracing::info!("Initializing OAuth server managers (ClientManager, DeviceManager)");
+        let oauth_client_manager = Arc::new(ClientManager::new(account_db.clone(), vec![]));
+        let oauth_device_manager = Arc::new(DeviceManager::new(account_db.clone()));
 
         // Initialize relay client first (optional - only if relay servers configured and federation enabled)
         let relay_client = if config.federation.enabled && !config.federation.relay_urls.is_empty() {
@@ -235,6 +246,8 @@ impl AppContext {
             label_manager,
             invite_manager,
             report_manager,
+            oauth_client_manager,
+            oauth_device_manager,
             sequencer,
             relay_client,
             federation_auth,

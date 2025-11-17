@@ -1,7 +1,7 @@
-/// Repository manager - integrates SDK MST with persistent storage
-///
-/// This module bridges the SDK's in-memory MST implementation with
-/// our SQLite-based persistent storage system.
+//! Repository manager - integrates SDK MST with persistent storage
+//!
+//! This module bridges the SDK's in-memory MST implementation with
+//! our SQLite-based persistent storage system.
 
 use crate::{
     actor_store::ActorStore,
@@ -122,8 +122,8 @@ impl RepositoryManager {
             // Get current repo root to know which commit we're loading
             let repo_root = self.store.get_repo_root(&self.did).await?;
 
-            // Parse the root CID
-            let root_cid_str = &repo_root.cid;
+            // Parse the root CID (TODO: use for MST reconstruction)
+            let _root_cid_str = &repo_root.cid;
 
             // For each block, we need to determine if it's a node or a leaf
             // and reconstruct the repository state
@@ -548,10 +548,10 @@ impl RepositoryManager {
     }
 
     /// Export repository to CAR file
-    pub async fn export_car(&self, since: Option<&str>) -> PdsResult<Vec<u8>> {
+    pub async fn export_car(&self, _since: Option<&str>) -> PdsResult<Vec<u8>> {
         let repo = self.load_repo().await?;
 
-        // Use SDK's CAR export
+        // Use SDK's CAR export (TODO: implement incremental export using _since parameter)
         repo.export_car()
             .map_err(|e| PdsError::Internal(format!("CAR export failed: {}", e)))
     }

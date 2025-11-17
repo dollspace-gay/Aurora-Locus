@@ -1,7 +1,7 @@
-/// PostgreSQL database support for Aurora Locus PDS
-///
-/// This module provides PostgreSQL database backend as an alternative to SQLite
-/// for production deployments requiring better scalability and concurrency.
+//! PostgreSQL database support for Aurora Locus PDS
+//!
+//! This module provides PostgreSQL database backend as an alternative to SQLite
+//! for production deployments requiring better scalability and concurrency.
 
 use crate::error::{PdsError, PdsResult};
 use sqlx::postgres::{PgPool, PgPoolOptions};

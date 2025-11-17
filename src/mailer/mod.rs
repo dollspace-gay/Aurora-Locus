@@ -18,7 +18,6 @@ use lettre::{
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Email mailer service
@@ -54,11 +53,12 @@ impl Mailer {
                         return Err(PdsError::Internal("Invalid SMTP URL format".to_string()));
                     };
 
-                    let (host, port_str) = if let Some((h, p)) = host_part.split_once(':') {
+                    let (host, _port_str) = if let Some((h, p)) = host_part.split_once(':') {
                         (h, p)
                     } else {
                         (host_part, "587") // Default SMTP submission port
                     };
+                    // TODO: Parse and use _port_str instead of hardcoded port
 
                     let creds = Credentials::new(username, password);
 

@@ -1,28 +1,28 @@
-/// OAuth 2.1 Consent Screen
-///
-/// Implements the user consent flow for OAuth authorization:
-/// - Display consent screen with requested scopes and client info
-/// - Handle user grant/deny decisions
-/// - Generate authorization code on grant
-/// - Redirect back to client with code + state or error
-///
-/// Flow:
-/// 1. User arrives at /oauth/consent?request_id=xxx (from authorize endpoint)
-/// 2. Display consent screen showing:
-///    - Client information (client_id, name, description)
-///    - Requested scopes and permissions
-///    - Grant/Deny buttons
-/// 3. User clicks Grant:
-///    - Generate one-time authorization code
-///    - Update authorization_request with code
-///    - Redirect to client redirect_uri with code + state
-/// 4. User clicks Deny:
-///    - Delete authorization_request
-///    - Redirect to client redirect_uri with error
-///
-/// References:
-/// - https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-09#section-4.1.2
-/// - https://atproto.com/specs/oauth
+//! OAuth 2.1 Consent Screen
+//!
+//! Implements the user consent flow for OAuth authorization:
+//! - Display consent screen with requested scopes and client info
+//! - Handle user grant/deny decisions
+//! - Generate authorization code on grant
+//! - Redirect back to client with code + state or error
+//!
+//! Flow:
+//! 1. User arrives at /oauth/consent?request_id=xxx (from authorize endpoint)
+//! 2. Display consent screen showing:
+//!    - Client information (client_id, name, description)
+//!    - Requested scopes and permissions
+//!    - Grant/Deny buttons
+//! 3. User clicks Grant:
+//!    - Generate one-time authorization code
+//!    - Update authorization_request with code
+//!    - Redirect to client redirect_uri with code + state
+//! 4. User clicks Deny:
+//!    - Delete authorization_request
+//!    - Redirect to client redirect_uri with error
+//!
+//! References:
+//! - https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-09#section-4.1.2
+//! - https://atproto.com/specs/oauth
 
 use crate::error::{PdsError, PdsResult};
 use crate::oauth::authorize::get_authorization_request;
@@ -74,7 +74,7 @@ pub struct DenyForm {
 /// - 400 Bad Request if request_id is invalid
 /// - 404 Not Found if request not found or expired
 pub async fn consent_screen(
-    State(ctx): State<Arc<AppContext>>,
+    State(ctx): State<AppContext>,
     Query(query): Query<ConsentQuery>,
 ) -> PdsResult<impl IntoResponse> {
     debug!("Consent screen requested for: {}", query.request_id);
@@ -239,7 +239,7 @@ pub async fn consent_screen(
 /// - 400 Bad Request if request invalid
 /// - 404 Not Found if request not found or expired
 pub async fn grant_authorization(
-    State(ctx): State<Arc<AppContext>>,
+    State(ctx): State<AppContext>,
     Form(form): Form<GrantForm>,
 ) -> PdsResult<impl IntoResponse> {
     debug!("Grant authorization for request: {}", form.request_id);
@@ -310,7 +310,7 @@ pub async fn grant_authorization(
 /// - 400 Bad Request if request invalid
 /// - 404 Not Found if request not found or expired
 pub async fn deny_authorization(
-    State(ctx): State<Arc<AppContext>>,
+    State(ctx): State<AppContext>,
     Form(form): Form<DenyForm>,
 ) -> PdsResult<impl IntoResponse> {
     debug!("Deny authorization for request: {}", form.request_id);

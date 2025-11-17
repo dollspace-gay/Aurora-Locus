@@ -1,12 +1,13 @@
-/// Moderation Appeal System
-///
-/// Allows users to appeal moderation decisions.
-/// Provides due process and oversight for moderation actions.
+//! Moderation Appeal System
+//!
+//! Allows users to appeal moderation decisions.
+//! Provides due process and oversight for moderation actions.
 
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
 
 /// Appeal status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,8 +35,12 @@ impl AppealStatus {
             AppealStatus::Escalated => "escalated",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> PdsResult<Self> {
+impl FromStr for AppealStatus {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "pending" => Ok(AppealStatus::Pending),
             "under_review" => Ok(AppealStatus::UnderReview),
@@ -335,7 +340,7 @@ impl AppealManager {
     /// Parse single database row into Appeal
     fn parse_appeal(&self, row: sqlx::sqlite::SqliteRow) -> PdsResult<Appeal> {
         let status_str: String = row.get("status");
-        let status = AppealStatus::from_str(&status_str)?;
+        let status = status_str.parse()?;
 
         let submitted_at_str: String = row.get("submitted_at");
         let submitted_at = DateTime::parse_from_rfc3339(&submitted_at_str)

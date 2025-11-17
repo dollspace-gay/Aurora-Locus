@@ -1,10 +1,10 @@
-/// Nonce Store for Replay Attack Prevention
-///
-/// Tracks JWT nonces (jti claims) to prevent replay attacks on service auth tokens.
-/// Since service auth JWTs have <60 second lifetime, we only need to track nonces
-/// for a short duration.
+//! Nonce Store for Replay Attack Prevention
+//!
+//! Tracks JWT nonces (jti claims) to prevent replay attacks on service auth tokens.
+//! Since service auth JWTs have <60 second lifetime, we only need to track nonces
+//! for a short duration.
 
-use crate::error::{PdsError, PdsResult};
+use crate::error::PdsResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -1,28 +1,28 @@
-/// OAuth 2.1 Token Endpoint
-///
-/// Implements token issuance with PKCE verification and DPoP token binding:
-/// - Authorization code grant (exchange code for tokens)
-/// - Refresh token grant (get new access token)
-/// - PKCE code_verifier verification (SHA-256)
-/// - DPoP proof extraction and verification
-/// - Token binding to DPoP thumbprint
-/// - Token storage in database
-///
-/// Flow (Authorization Code Grant):
-/// 1. Client sends POST /oauth/token with code + code_verifier
-/// 2. Server validates authorization code
-/// 3. Server verifies PKCE: SHA256(code_verifier) == code_challenge
-/// 4. Server extracts and verifies DPoP proof from header
-/// 5. Server computes JWK thumbprint for token binding
-/// 6. Server generates access_token + refresh_token
-/// 7. Server stores tokens in database bound to DPoP thumbprint
-/// 8. Server marks authorization code as used
-/// 9. Server returns tokens with token_type=DPoP
-///
-/// References:
-/// - https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-09#section-4.1.3
-/// - https://datatracker.ietf.org/doc/html/rfc7636 (PKCE)
-/// - https://datatracker.ietf.org/doc/html/rfc9449 (DPoP)
+//! OAuth 2.1 Token Endpoint
+//!
+//! Implements token issuance with PKCE verification and DPoP token binding:
+//! - Authorization code grant (exchange code for tokens)
+//! - Refresh token grant (get new access token)
+//! - PKCE code_verifier verification (SHA-256)
+//! - DPoP proof extraction and verification
+//! - Token binding to DPoP thumbprint
+//! - Token storage in database
+//!
+//! Flow (Authorization Code Grant):
+//! 1. Client sends POST /oauth/token with code + code_verifier
+//! 2. Server validates authorization code
+//! 3. Server verifies PKCE: SHA256(code_verifier) == code_challenge
+//! 4. Server extracts and verifies DPoP proof from header
+//! 5. Server computes JWK thumbprint for token binding
+//! 6. Server generates access_token + refresh_token
+//! 7. Server stores tokens in database bound to DPoP thumbprint
+//! 8. Server marks authorization code as used
+//! 9. Server returns tokens with token_type=DPoP
+//!
+//! References:
+//! - https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-09#section-4.1.3
+//! - https://datatracker.ietf.org/doc/html/rfc7636 (PKCE)
+//! - https://datatracker.ietf.org/doc/html/rfc9449 (DPoP)
 
 use crate::error::{PdsError, PdsResult};
 use crate::oauth::consent::{get_request_by_code, mark_code_as_used};
@@ -31,15 +31,14 @@ use crate::oauth::token_rotation::TokenRotationManager;
 use crate::AppContext;
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::HeaderMap,
     response::{IntoResponse, Json},
     Form,
 };
 use chrono::{Duration, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Token endpoint handler
@@ -62,7 +61,7 @@ use uuid::Uuid;
 /// - 400 Bad Request for validation errors
 /// - 401 Unauthorized for authentication errors
 pub async fn token_endpoint(
-    State(ctx): State<Arc<AppContext>>,
+    State(ctx): State<AppContext>,
     headers: HeaderMap,
     Form(request): Form<TokenRequest>,
 ) -> PdsResult<impl IntoResponse> {
@@ -160,7 +159,7 @@ async fn handle_authorization_code_grant(
     // Step 8: Store tokens in database
     let token_id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    let access_expires = now + Duration::hours(1); // 1 hour access token
+    let _access_expires = now + Duration::hours(1); // 1 hour access token (TODO: store in DB)
     let refresh_expires = now + Duration::days(90); // 90 day refresh token
 
     // Determine token type before moving dpop_thumbprint
@@ -293,7 +292,7 @@ fn verify_pkce_challenge(code_verifier: &str, code_challenge: &str) -> PdsResult
 ///
 /// # Returns
 /// JWK thumbprint if verification succeeds
-async fn extract_dpop_proof(headers: &HeaderMap, ctx: &AppContext) -> PdsResult<String> {
+async fn extract_dpop_proof(headers: &HeaderMap, _ctx: &AppContext) -> PdsResult<String> {
     // Extract DPoP header
     let dpop_header = headers
         .get("DPoP")
@@ -302,11 +301,11 @@ async fn extract_dpop_proof(headers: &HeaderMap, ctx: &AppContext) -> PdsResult<
         .map_err(|_| PdsError::Authentication("Invalid DPoP header".to_string()))?;
 
     // Verify DPoP proof
-    // TODO: Use DPopVerifier from ctx.dpop_verifier when available
+    // TODO: Use DPopVerifier from _ctx.dpop_verifier when available
     // For now, we'll implement basic verification inline
 
     // Parse JWT to extract JWK
-    use jsonwebtoken::{decode_header, Algorithm, Validation};
+    use jsonwebtoken::decode_header;
     let header = decode_header(dpop_header).map_err(|e| {
         PdsError::Authentication(format!("Invalid DPoP JWT header: {}", e))
     })?;

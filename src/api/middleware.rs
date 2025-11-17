@@ -1,7 +1,6 @@
 /// Authentication and authorization middleware
 use crate::{
     account::ValidatedSession,
-    auth::OAuthAuthContext,
     context::AppContext,
     error::{PdsError, PdsResult},
     metrics,

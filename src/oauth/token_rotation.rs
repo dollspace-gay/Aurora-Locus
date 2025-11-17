@@ -1,16 +1,16 @@
-/// Refresh Token Rotation with Replay Detection
-///
-/// Implements OAuth 2.1 refresh token rotation per RFC 6749 Section 10.4 and
-/// draft-ietf-oauth-security-topics-23 Section 4.13.
-///
-/// Security Model:
-/// 1. Each refresh generates a NEW refresh token (rotation)
-/// 2. Old refresh tokens are stored in `used_refresh_token` table
-/// 3. If a used token is presented again = REPLAY ATTACK
-/// 4. On replay detection, revoke ALL tokens for that account (breach assumption)
-///
-/// This prevents token theft - even if an attacker steals a refresh token,
-/// they can only use it once before detection triggers account-wide revocation.
+//! Refresh Token Rotation with Replay Detection
+//!
+//! Implements OAuth 2.1 refresh token rotation per RFC 6749 Section 10.4 and
+//! draft-ietf-oauth-security-topics-23 Section 4.13.
+//!
+//! Security Model:
+//! 1. Each refresh generates a NEW refresh token (rotation)
+//! 2. Old refresh tokens are stored in `used_refresh_token` table
+//! 3. If a used token is presented again = REPLAY ATTACK
+//! 4. On replay detection, revoke ALL tokens for that account (breach assumption)
+//!
+//! This prevents token theft - even if an attacker steals a refresh token,
+//! they can only use it once before detection triggers account-wide revocation.
 
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Duration, Utc};
@@ -131,7 +131,7 @@ impl TokenRotationManager {
 
         // Step 7: Calculate new expiration (access token: 1 hour, refresh: 90 days)
         let now = Utc::now();
-        let access_expires = now + Duration::hours(1);
+        let _access_expires = now + Duration::hours(1); // TODO: store access token expiration
         let refresh_expires = now + Duration::days(90);
 
         // Step 8: Update token record with new tokens

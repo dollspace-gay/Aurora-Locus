@@ -295,7 +295,7 @@ impl ServerConfig {
         // Validation mode
         let validation_mode = env::var("VALIDATION_MODE")
             .ok()
-            .and_then(|s| ValidationMode::from_str(&s))
+            .and_then(|s| s.parse().ok())
             .unwrap_or_default();
 
         // Federation configuration

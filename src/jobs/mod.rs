@@ -276,7 +276,7 @@ impl JobScheduler {
             event_count += 1;
 
             // Log progress every 100 events
-            if event_count % 100 == 0 {
+            if event_count.is_multiple_of(100) {
                 info!("Processed {} relay events", event_count);
             }
 

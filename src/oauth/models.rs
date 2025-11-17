@@ -1,6 +1,6 @@
-/// OAuth Data Models
-///
-/// Defines the core data structures for OAuth 2.1 implementation
+//! OAuth Data Models
+//!
+//! Defines the core data structures for OAuth 2.1 implementation
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

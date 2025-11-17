@@ -1,6 +1,6 @@
-/// Email Rate Limiting
-///
-/// Prevents email spam by limiting the number of emails sent to each recipient.
+//! Email Rate Limiting
+//!
+//! Prevents email spam by limiting the number of emails sent to each recipient.
 
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Duration, Utc};
@@ -52,11 +52,6 @@ impl EmailRateLimiter {
             recipient_history: Arc::new(RwLock::new(HashMap::new())),
             global_history: Arc::new(RwLock::new(Vec::new())),
         }
-    }
-
-    /// Create with default config
-    pub fn default() -> Self {
-        Self::new(EmailRateLimitConfig::default())
     }
 
     /// Check if email can be sent to recipient
@@ -216,6 +211,12 @@ impl EmailRateLimiter {
             .iter()
             .filter(|r| r.timestamp > one_hour_ago)
             .count() as u32
+    }
+}
+
+impl Default for EmailRateLimiter {
+    fn default() -> Self {
+        Self::new(EmailRateLimitConfig::default())
     }
 }
 

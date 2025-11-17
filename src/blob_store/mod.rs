@@ -1,7 +1,7 @@
-/// Blob Storage System
-///
-/// Handles binary file storage for images, videos, and other media.
-/// Supports multiple backend implementations (disk, S3, etc.)
+//! Blob Storage System
+//!
+//! Handles binary file storage for images, videos, and other media.
+//! Supports multiple backend implementations (disk, S3, etc.)
 
 pub mod disk;
 pub mod models;

@@ -9,7 +9,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 /// Request parameters for queryLabels
@@ -114,7 +114,7 @@ pub async fn query_labels(
     // Filter out expired labels
     let now = Utc::now();
     all_labels.retain(|label| {
-        label.expires_at.map_or(true, |exp| exp > now)
+        label.expires_at.is_none_or(|exp| exp > now)
     });
 
     // Sort by creation time (newest first)

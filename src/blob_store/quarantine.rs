@@ -1,12 +1,13 @@
-/// Blob Quarantine System
-///
-/// Provides blob takedown and quarantine functionality for moderation.
-/// Quarantined blobs are marked as taken down but retained for legal/compliance reasons.
+//! Blob Quarantine System
+//!
+//! Provides blob takedown and quarantine functionality for moderation.
+//! Quarantined blobs are marked as taken down but retained for legal/compliance reasons.
 
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
 
 /// Quarantine reason types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,8 +38,12 @@ impl QuarantineReason {
             QuarantineReason::Other => "other",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> PdsResult<Self> {
+impl FromStr for QuarantineReason {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "dmca" => Ok(QuarantineReason::Dmca),
             "csam" => Ok(QuarantineReason::Csam),

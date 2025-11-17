@@ -1,7 +1,7 @@
-/// AppView proxy endpoints with read-after-write consistency
-///
-/// These endpoints proxy requests to the external AppView service (e.g., Bluesky's AppView)
-/// and merge in local records that haven't been indexed yet (read-after-write consistency).
+//! AppView proxy endpoints with read-after-write consistency
+//!
+//! These endpoints proxy requests to the external AppView service (e.g., Bluesky's AppView)
+//! and merge in local records that haven't been indexed yet (read-after-write consistency).
 
 use crate::{
     auth::OAuthAuthContext,
@@ -257,7 +257,7 @@ fn merge_timeline_feed(
         .and_then(|f| f.as_array_mut())
         .ok_or_else(|| PdsError::Internal("Invalid timeline response format".to_string()))?;
 
-    let feed_vec: Vec<serde_json::Value> = feed.drain(..).collect();
+    let feed_vec: Vec<serde_json::Value> = std::mem::take(feed);
     let merged = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(
             read_after_write::format_and_insert_posts_in_feed(viewer, feed_vec, &local.posts),
@@ -279,7 +279,7 @@ fn merge_author_feed(
         .and_then(|f| f.as_array_mut())
         .ok_or_else(|| PdsError::Internal("Invalid author feed response format".to_string()))?;
 
-    let feed_vec: Vec<serde_json::Value> = feed.drain(..).collect();
+    let feed_vec: Vec<serde_json::Value> = std::mem::take(feed);
     let merged = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(
             read_after_write::format_and_insert_posts_in_feed(viewer, feed_vec, &local.posts),

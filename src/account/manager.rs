@@ -1,11 +1,11 @@
-/// Account manager implementation using runtime queries
-/// This version uses sqlx runtime query building instead of compile-time macros
-/// to avoid needing DATABASE_URL during compilation
+//! Account manager implementation using runtime queries
+//! This version uses sqlx runtime query building instead of compile-time macros
+//! to avoid needing DATABASE_URL during compilation
 
 use crate::{
     account::AppPasswordInfo,
     config::ServerConfig,
-    db::account::{Account, Actor, ActorAccount, PlcKeys, Session},
+    db::account::{ActorAccount, Session},
     error::{PdsError, PdsResult},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -75,7 +75,7 @@ impl AccountManager {
 
         // Begin transaction to insert into multiple tables atomically
         let mut tx = self.db.begin().await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Insert into actor table (public identity)
         sqlx::query(
@@ -87,7 +87,7 @@ impl AccountManager {
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Insert into account table (private auth)
         sqlx::query(
@@ -99,7 +99,7 @@ impl AccountManager {
         .bind(&password_hash)
         .execute(&mut *tx)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Insert into plc_keys table (cryptographic material)
         sqlx::query(
@@ -112,11 +112,11 @@ impl AccountManager {
         .bind(&plc_operation_cid)
         .execute(&mut *tx)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Commit transaction
         tx.commit().await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Use invite code if provided
         if let Some(code) = invite_code {
@@ -227,7 +227,7 @@ impl AccountManager {
         .bind(&app_password_name)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Store refresh token
         let refresh_token_id = Uuid::new_v4().to_string();
@@ -245,7 +245,7 @@ impl AccountManager {
         .bind(false)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(Session {
             id: session_id,
@@ -267,7 +267,7 @@ impl AccountManager {
         .bind(token)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?
+        .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::Authentication("Invalid or expired session".to_string()))?;
 
         let session_id: String = row.get("id");
@@ -293,7 +293,7 @@ impl AccountManager {
             .bind(session_id)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -313,10 +313,10 @@ impl AccountManager {
         .bind(refresh_token)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?
+        .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::Authentication("Invalid refresh token".to_string()))?;
 
-        let token_id: String = row.get("id");
+        let _token_id: String = row.get("id");
         let did: String = row.get("did");
         let expires_at: DateTime<Utc> = row.get("expires_at");
         let used: bool = row.get("used");
@@ -341,7 +341,7 @@ impl AccountManager {
                 .bind(&next_token_id)
                 .fetch_optional(&self.db)
                 .await
-                .map_err(|e| PdsError::Database(e))?;
+                .map_err(PdsError::Database)?;
 
                 if let Some(session_row) = next_row {
                     return Ok(Session {
@@ -376,7 +376,7 @@ impl AccountManager {
         .bind(false)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Update old refresh token: mark as used, set next_id, and shorten expiration to 2 hours
         let grace_period_expires = now + Duration::hours(2);
@@ -388,7 +388,7 @@ impl AccountManager {
         .bind(grace_period_expires)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Create new access token
         let new_session_id = uuid::Uuid::new_v4().to_string();
@@ -408,7 +408,7 @@ impl AccountManager {
         .bind(access_expires)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(Session {
             id: new_session_id,
@@ -436,7 +436,7 @@ impl AccountManager {
         .bind(did)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?
+        .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
 
         Ok(ActorAccount {
@@ -481,7 +481,7 @@ impl AccountManager {
         .bind(handle)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?
+        .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::NotFound("Actor not found".to_string()))?;
 
         Ok(ActorAccount {
@@ -515,7 +515,7 @@ impl AccountManager {
         .bind(email)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?
+        .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
 
         Ok(ActorAccount {
@@ -540,7 +540,7 @@ impl AccountManager {
             .bind(handle)
             .fetch_one(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(count > 0)
     }
@@ -575,7 +575,7 @@ impl AccountManager {
             .bind(did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(old_handle)
     }
@@ -586,7 +586,7 @@ impl AccountManager {
             .bind(email)
             .fetch_one(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         Ok(count > 0)
     }
@@ -603,7 +603,7 @@ impl AccountManager {
         // Generate a random 32-byte private key for PLC rotation
         let mut private_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut private_key);
-        let private_key_hex = hex::encode(&private_key);
+        let private_key_hex = hex::encode(private_key);
 
         // Create PLC signer
         let signer = PlcSigner::new(&private_key)?;
@@ -768,7 +768,7 @@ impl AccountManager {
             .bind(now)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         let sessions_deleted = sessions_result.rows_affected();
 
@@ -777,7 +777,7 @@ impl AccountManager {
             .bind(now)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         let refresh_tokens_deleted = refresh_result.rows_affected();
 
@@ -817,7 +817,7 @@ impl AccountManager {
         .bind(false)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(token)
     }
@@ -839,7 +839,7 @@ impl AccountManager {
         .bind(token)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?
+        .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::NotFound("Invalid verification token".to_string()))?;
 
         let did: String = row.try_get("did")?;
@@ -865,7 +865,7 @@ impl AccountManager {
             .bind(token)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Mark email as confirmed in account (only update email_confirmed_at)
         sqlx::query(
@@ -875,7 +875,7 @@ impl AccountManager {
         .bind(&did)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         tracing::info!("Email confirmed for DID: {}", did);
 
@@ -891,7 +891,7 @@ impl AccountManager {
             .bind(did)
             .fetch_optional(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?
+            .map_err(PdsError::Database)?
             .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
 
         let email: Option<String> = row.try_get("email")?;
@@ -939,7 +939,7 @@ impl AccountManager {
         .bind(false)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok((token, account.email.unwrap()))
     }
@@ -961,7 +961,7 @@ impl AccountManager {
         .bind(token)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?
+        .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::NotFound("Invalid reset token".to_string()))?;
 
         let did: String = row.try_get("did")?;
@@ -992,28 +992,28 @@ impl AccountManager {
             .bind(&did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Mark token as used
         sqlx::query("UPDATE email_token SET used = true WHERE token = ?1")
             .bind(token)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Invalidate all sessions for this account (security best practice)
         sqlx::query("DELETE FROM session WHERE did = ?1")
             .bind(&did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Also delete all refresh tokens
         sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
             .bind(&did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         tracing::info!("Password reset successful for DID: {}", did);
 
@@ -1053,21 +1053,21 @@ impl AccountManager {
         .bind(did)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Delete all active sessions (force logout)
         sqlx::query("DELETE FROM session WHERE did = ?1")
             .bind(did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Delete all refresh tokens
         sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
             .bind(did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         tracing::info!(
             "Account deletion requested for DID: {}, will be deleted after: {}",
@@ -1084,7 +1084,7 @@ impl AccountManager {
             .bind(did)
             .fetch_optional(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?
+            .map_err(PdsError::Database)?
             .ok_or_else(|| PdsError::NotFound("Actor not found".to_string()))?;
 
         let deactivated_at: Option<DateTime<Utc>> = row.try_get("deactivated_at")?;
@@ -1097,7 +1097,7 @@ impl AccountManager {
             .bind(did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         tracing::info!("Account deletion cancelled for DID: {}", did);
 
@@ -1128,20 +1128,20 @@ impl AccountManager {
         .bind(did)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Revoke all sessions (force logout)
         sqlx::query("DELETE FROM session WHERE did = ?1")
             .bind(did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
             .bind(did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         tracing::info!("Account temporarily deactivated for DID: {}", did);
 
@@ -1161,7 +1161,7 @@ impl AccountManager {
             .bind(did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         tracing::info!("Account reactivated for DID: {}", did);
 
@@ -1184,7 +1184,7 @@ impl AccountManager {
     pub async fn takedown_account(&self, did: &str, takedown_ref: &str) -> PdsResult<()> {
         // Begin transaction
         let mut tx = self.db.begin().await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Set takedown_ref in actor table
         let result = sqlx::query("UPDATE actor SET takedown_ref = ?1 WHERE did = ?2")
@@ -1192,7 +1192,7 @@ impl AccountManager {
             .bind(did)
             .execute(&mut *tx)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         if result.rows_affected() == 0 {
             return Err(PdsError::NotFound(format!("Actor {} not found", did)));
@@ -1203,18 +1203,18 @@ impl AccountManager {
             .bind(did)
             .execute(&mut *tx)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Delete all refresh tokens for this account
         sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
             .bind(did)
             .execute(&mut *tx)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         // Commit transaction
         tx.commit().await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         tracing::info!(
             "Account taken down: DID={}, takedown_ref={}, sessions and tokens revoked",
@@ -1241,7 +1241,7 @@ impl AccountManager {
             .bind(did)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         if result.rows_affected() == 0 {
             return Err(PdsError::NotFound(format!("Actor {} not found", did)));
@@ -1276,7 +1276,7 @@ impl AccountManager {
             .bind(name)
             .fetch_optional(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         if existing.is_some() {
             return Err(PdsError::Conflict(format!("App password '{}' already exists", name)));
@@ -1313,7 +1313,7 @@ impl AccountManager {
         .bind(privileged)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         tracing::info!("Created app password '{}' for DID: {}", name, did);
 
@@ -1329,7 +1329,7 @@ impl AccountManager {
         .bind(did)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         let mut passwords = Vec::new();
         for row in rows {
@@ -1350,7 +1350,7 @@ impl AccountManager {
             .bind(name)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         if result.rows_affected() == 0 {
             return Err(PdsError::NotFound(format!("App password '{}' not found", name)));
@@ -1362,7 +1362,7 @@ impl AccountManager {
             .bind(name)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         tracing::info!("Revoked app password '{}' for DID: {}", name, did);
 
@@ -1402,7 +1402,7 @@ impl AccountManager {
             .bind(&account.did)
             .fetch_all(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
             let mut matched_name: Option<String> = None;
             for row in rows {
@@ -1508,7 +1508,7 @@ impl AccountManager {
         .bind(&for_account)
         .execute(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         tracing::info!(
             "Created invite code {} by {} (uses: {}, for: {:?})",
@@ -1537,7 +1537,7 @@ impl AccountManager {
         .bind(code)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?
+        .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
 
         let available_uses: i32 = row.get("available_uses");
@@ -1581,7 +1581,7 @@ impl AccountManager {
         let now = Utc::now();
 
         // Begin transaction
-        let mut tx = self.db.begin().await.map_err(|e| PdsError::Database(e))?;
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
 
         // Validate code
         let row = sqlx::query(
@@ -1590,7 +1590,7 @@ impl AccountManager {
         .bind(code)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| PdsError::Database(e))?
+        .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
 
         let available_uses: i32 = row.get("available_uses");
@@ -1614,16 +1614,16 @@ impl AccountManager {
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         // Decrement available uses
         sqlx::query("UPDATE invite_code SET available_uses = available_uses - 1 WHERE code = ?1")
             .bind(code)
             .execute(&mut *tx)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
-        tx.commit().await.map_err(|e| PdsError::Database(e))?;
+        tx.commit().await.map_err(PdsError::Database)?;
 
         tracing::info!("Invite code {} used by {}", code, used_by);
 
@@ -1641,7 +1641,7 @@ impl AccountManager {
         .bind(created_by)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(rows)
     }
@@ -1657,7 +1657,7 @@ impl AccountManager {
         .bind(code)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PdsError::Database(e))?;
+        .map_err(PdsError::Database)?;
 
         Ok(rows)
     }
@@ -1669,7 +1669,7 @@ impl AccountManager {
             .bind(code)
             .fetch_optional(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?
+            .map_err(PdsError::Database)?
             .ok_or_else(|| PdsError::NotFound("Invite code not found".to_string()))?;
 
         let created_by: String = row.get("created_by");
@@ -1687,7 +1687,7 @@ impl AccountManager {
             .bind(code)
             .execute(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?;
+            .map_err(PdsError::Database)?;
 
         tracing::info!("Invite code {} disabled by {}", code, requesting_did);
 
@@ -1704,7 +1704,7 @@ impl AccountManager {
             .bind(did)
             .fetch_optional(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?
+            .map_err(PdsError::Database)?
             .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
 
         let invites_disabled: bool = row.get("invites_disabled");
@@ -1748,7 +1748,7 @@ impl AccountManager {
             .bind(limit)
             .fetch_all(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?
+            .map_err(PdsError::Database)?
         } else {
             sqlx::query(
                 "SELECT
@@ -1762,7 +1762,7 @@ impl AccountManager {
             .bind(limit)
             .fetch_all(&self.db)
             .await
-            .map_err(|e| PdsError::Database(e))?
+            .map_err(PdsError::Database)?
         };
 
         let mut accounts = Vec::new();

@@ -1,11 +1,11 @@
-/// Device Management for OAuth Multi-Device Support
-///
-/// Implements device tracking, registration, and revocation per ATProto OAuth spec.
-/// Each device represents a unique client that can maintain its own OAuth session
-/// with DPoP key binding for security.
+//! Device Management for OAuth Multi-Device Support
+//!
+//! Implements device tracking, registration, and revocation per ATProto OAuth spec.
+//! Each device represents a unique client that can maintain its own OAuth session
+//! with DPoP key binding for security.
 
 use crate::error::{PdsError, PdsResult};
-use crate::oauth::models::{AccountDevice, Device, DeviceData, DeviceInfo, DeviceListResponse};
+use crate::oauth::models::{Device, DeviceData, DeviceInfo, DeviceListResponse};
 use chrono::Utc;
 use sqlx::{Row, SqlitePool};
 use tracing::{debug, warn};

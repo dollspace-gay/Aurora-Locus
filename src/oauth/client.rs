@@ -1,11 +1,11 @@
-/// OAuth Client Management
-///
-/// Implements OAuth 2.1 client registration, validation, and authorization tracking.
-/// For Phase 1, clients are statically configured via TOML or environment variables.
-/// Future phases may support dynamic client registration per RFC 7591.
+//! OAuth Client Management
+//!
+//! Implements OAuth 2.1 client registration, validation, and authorization tracking.
+//! For Phase 1, clients are statically configured via TOML or environment variables.
+//! Future phases may support dynamic client registration per RFC 7591.
 
 use crate::error::{PdsError, PdsResult};
-use crate::oauth::models::{AuthorizedClient, AuthorizedClientInfo, ClientListResponse, OAuthClient};
+use crate::oauth::models::{AuthorizedClientInfo, ClientListResponse, OAuthClient};
 use chrono::Utc;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;

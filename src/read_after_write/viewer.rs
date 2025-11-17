@@ -143,9 +143,9 @@ impl LocalViewer {
             return Ok(None); // Invalid URI format
         }
 
-        let did = &parts[2];
-        let collection = &parts[3];
-        let rkey = &parts[4];
+        let _did = &parts[2];
+        let _collection = &parts[3];
+        let _rkey = &parts[4];
 
         // Fetch from AppView using getRecord endpoint
         let url = format!(
@@ -349,8 +349,9 @@ impl LocalViewer {
     }
 
     /// Build an image URL for a blob CID
-    fn get_image_url(&self, pattern: &str, cid: &str) -> String {
+    fn get_image_url(&self, _pattern: &str, cid: &str) -> String {
         // Pattern can be: avatar, banner, feed_thumbnail, feed_fullsize
+        // TODO: Use _pattern parameter for different image sizes
         // Format: {service_url}/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}
         format!(
             "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",

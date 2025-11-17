@@ -1,24 +1,24 @@
-/// OAuth 2.1 Authorization Endpoint
-///
-/// Implements the authorization code flow per OAuth 2.1 and ATProto spec:
-/// - PKCE (Proof Key for Code Exchange) with S256 challenge method
-/// - State parameter for CSRF protection
-/// - Client validation and redirect URI checking
-/// - Authorization request storage with expiration
-///
-/// Flow:
-/// 1. Client initiates: GET /oauth/authorize with parameters
-/// 2. Server validates parameters and client
-/// 3. If not authenticated, redirect to login
-/// 4. Store authorization request (pending consent)
-/// 5. Redirect to consent screen
-/// 6. User grants/denies
-/// 7. On grant, generate authorization code
-/// 8. Redirect back to client with code + state
-///
-/// References:
-/// - https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-09
-/// - https://atproto.com/specs/oauth
+//! OAuth 2.1 Authorization Endpoint
+//!
+//! Implements the authorization code flow per OAuth 2.1 and ATProto spec:
+//! - PKCE (Proof Key for Code Exchange) with S256 challenge method
+//! - State parameter for CSRF protection
+//! - Client validation and redirect URI checking
+//! - Authorization request storage with expiration
+//!
+//! Flow:
+//! 1. Client initiates: GET /oauth/authorize with parameters
+//! 2. Server validates parameters and client
+//! 3. If not authenticated, redirect to login
+//! 4. Store authorization request (pending consent)
+//! 5. Redirect to consent screen
+//! 6. User grants/denies
+//! 7. On grant, generate authorization code
+//! 8. Redirect back to client with code + state
+//!
+//! References:
+//! - https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-09
+//! - https://atproto.com/specs/oauth
 
 use crate::error::{PdsError, PdsResult};
 use crate::oauth::models::{AuthorizationRequest, AuthorizationRequestData, AuthorizeQuery};
@@ -51,7 +51,7 @@ use uuid::Uuid;
 /// - 302 Redirect to consent screen (if authenticated)
 /// - 400 Bad Request (invalid parameters)
 pub async fn authorize(
-    State(ctx): State<Arc<AppContext>>,
+    State(ctx): State<AppContext>,
     Query(query): Query<AuthorizeQuery>,
 ) -> PdsResult<impl IntoResponse> {
     debug!(

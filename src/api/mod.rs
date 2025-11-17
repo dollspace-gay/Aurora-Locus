@@ -9,6 +9,7 @@ pub mod identity;
 pub mod labels;
 pub mod middleware;
 pub mod oauth_admin;
+pub mod oauth_server;
 pub mod repo;
 pub mod server;
 pub mod sync;
@@ -38,4 +39,6 @@ pub fn routes() -> Router<AppContext> {
         .merge(appview::routes())  // AppView proxy with read-after-write
         // OAuth admin routes with their own state
         .merge(oauth_admin::routes(oauth_state_store))
+        // OAuth server routes (for third-party app authorization)
+        .merge(oauth_server::routes())
 }

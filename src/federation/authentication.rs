@@ -1,7 +1,7 @@
-/// Cross-PDS authentication via DID resolution
-///
-/// Enables users from other PDS instances to authenticate and interact
-/// with this PDS by resolving their DIDs and verifying signatures.
+//! Cross-PDS authentication via DID resolution
+//!
+//! Enables users from other PDS instances to authenticate and interact
+//! with this PDS by resolving their DIDs and verifying signatures.
 
 use crate::error::{PdsError, PdsResult};
 use crate::federation::ServiceAuthenticator;

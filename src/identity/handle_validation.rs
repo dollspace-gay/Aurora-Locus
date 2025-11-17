@@ -120,7 +120,7 @@ pub fn validate_handle(handle: &str, service_domains: &[String]) -> PdsResult<St
 
         if !is_service_domain {
             // External domain - validate TLD
-            if let Some(tld) = normalized.split('.').last() {
+            if let Some(tld) = normalized.split('.').next_back() {
                 if !is_valid_tld(tld) {
                     return Err(PdsError::Validation(format!(
                         "Invalid top-level domain: {}",

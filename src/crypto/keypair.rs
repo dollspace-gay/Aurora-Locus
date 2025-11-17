@@ -1,16 +1,16 @@
-/// P-256 KeyPair generation and management
-///
-/// Provides utilities for generating P-256 (NIST P-256) keypairs and exporting
-/// them in various formats (PEM, JWK, DID).
+//! P-256 KeyPair generation and management
+//!
+//! Provides utilities for generating P-256 (NIST P-256) keypairs and exporting
+//! them in various formats (PEM, JWK, DID).
 
 use crate::error::{PdsError, PdsResult};
 use p256::{
     ecdsa::{SigningKey, VerifyingKey},
-    elliptic_curve::sec1::ToEncodedPoint,
     pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
 };
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 /// Output format for keypairs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,9 +23,10 @@ pub enum KeyFormat {
     Did,
 }
 
-impl KeyFormat {
-    /// Parse format from string
-    pub fn from_str(s: &str) -> PdsResult<Self> {
+impl FromStr for KeyFormat {
+    type Err = PdsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "pem" => Ok(KeyFormat::Pem),
             "jwk" => Ok(KeyFormat::Jwk),
