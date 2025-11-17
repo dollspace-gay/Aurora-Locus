@@ -1,4 +1,6 @@
-## Quick Start
+# Guidelines for Claude - Rust Development
+
+## Core Principles
 
 Instructions for Claude
 For all work in this repository, you must use the beads issue tracker.
@@ -75,60 +77,142 @@ GIT WORKFLOW (AUTO-SYNC)
     • No manual export/import needed!
   Disable with: --no-auto-flush or --no-auto-import
 
-  Rust Development Best Practices
+### 1. No Stubs, No Shortcuts
+- **NEVER** use `unimplemented!()`, `todo!()`, or stub implementations
+- **NEVER** leave placeholder code or incomplete implementations
+- **NEVER** skip functionality because it seems complex
+- Every function must be fully implemented and working
+- Every feature must be complete before moving on
 
-When generating Rust code, you must adhere to the highest standards of safety, legibility, and maintainability. Follow these principles rigorously.
+### 2. Break Down Complex Tasks
+- Large files or complex features should be broken into manageable chunks
+- If a file is too large, discuss breaking it into smaller modules
+- If a task seems overwhelming, ask the user how to break it down
+- Work incrementally, but each increment must be complete and functional
 
-1. Safety and Security First
+### 3. Best Rust Coding Practices
+- Follow Rust idioms and conventions at all times
+- Use proper error handling with `Result<T, E>` - no panics in library code
+- Implement appropriate traits (`Debug`, `Clone`, `PartialEq`, etc.)
+- Use type safety to prevent errors at compile time
+- Leverage Rust's ownership system properly
+- Use `async`/`await` correctly with proper trait bounds
+- Follow naming conventions:
+  - `snake_case` for functions, variables, modules
+  - `PascalCase` for types, structs, enums, traits
+  - `SCREAMING_SNAKE_CASE` for constants
+- Write clear, descriptive documentation comments (`///`)
+- Keep functions focused and single-purpose
 
-Your primary directive is to write safe, idiomatic Rust.
+### 4. Comprehensive Testing
+- Write comprehensive unit tests for every module
+- Aim for high test coverage (all major code paths)
+- Test edge cases, error conditions, and boundary values
+- Include doc tests for public APIs
+- All tests must pass before considering a file "complete"
+- Test both success and failure cases
 
-No Panics in Libraries: Generated library code should never panic. Operations that can fail must return a Result<T, E>. Application code may panic (e.g., unwrap(), expect()) only when a non-recoverable state is reached (e.g., configuration failure at startup).
+### 5. Translation Accuracy
+- Translate TypeScript functionality completely and accurately
+- Maintain behavior equivalence with the original TypeScript
+- Don't add features that weren't in the original
+- Don't remove features from the original
+- Document any unavoidable differences between TS and Rust
 
-Avoid unsafe: Do not use the unsafe keyword unless it is absolutely unavoidable and explicitly requested. If unsafe is used, it must be accompanied by a // SAFETY: comment explaining exactly why the block is sound and what invariants it upholds.
+### 6. Code Quality Standards
+- No warnings from `cargo clippy`
+- No warnings from `cargo build`
+- Format code with `rustfmt` conventions
+- Clear, self-documenting code with meaningful variable names
+- Add comments for complex logic, but prefer clear code over comments
+- Keep functions reasonably sized (< 100 lines ideally)
 
-Handle Errors Explicitly: Always use Result<T, E> for recoverable errors and Option<T> for optional values. Use the ? operator for clean error propagation. Avoid using .unwrap() or .expect() on Option or Result types, except in tests or when a panic is the desired outcome (as noted above).
+### 7. Dependencies
+- Only add dependencies when necessary
+- Use well-maintained, popular crates
+- Document why each dependency is needed
+- Keep the dependency tree minimal
 
-Integer Overflow: Be mindful of integer overflow. Use checked arithmetic (e.g., checked_add) when appropriate.
+### 8. Error Handling
+- Create specific error types for each module using `thiserror`
+- Provide helpful error messages
+- Use `Result` types consistently
+- Never use `.unwrap()` in library code (only in tests)
+- Use `.expect()` only when failure is truly impossible
 
-Dependencies: When suggesting dependencies, prefer well-maintained and widely-used crates.
+### 9. Documentation
+- Every public item must have documentation comments
+- Include examples in doc comments when helpful
+- Document panics, errors, and safety considerations
+- Keep docs up to date with code changes
 
-2. Code Legibility and Idioms
+### 10. Work Process
+- Translate one file at a time completely
+- Run tests after every file
+- Ensure all tests pass before moving to next file
+- Ask for clarification if requirements are unclear
+- Discuss approach before starting large/complex files
 
-Code must be immediately understandable and idiomatic.
+## What to Do When Facing Complexity
 
-Formatting: All code must be formatted as if by rustfmt.
+**DON'T:**
+- Stub it out
+- Skip it
+- Say "we'll come back to it"
+- Implement a simplified version
 
-Clippy Lints: Write code that adheres to standard Clippy lints. Your code should pass clippy::all and clippy::pedantic where reasonable.
+**DO:**
+- Analyze the dependencies
+- Break it into smaller pieces
+- Translate dependencies first
+- Ask the user for guidance on approach
+- Propose a phased implementation plan where each phase is complete
 
-Naming: Follow standard Rust naming conventions:
+## Example of Breaking Down a Complex File
 
-PascalCase for types (structs, enums, traits).
+If `agent.ts` is 1,595 lines:
 
-snake_case for functions, methods, variables, and modules.
+**WRONG:**
+```rust
+pub struct Agent {
+    // TODO: implement this later
+}
 
-UPPER_SNAKE_CASE for constants.
+impl Agent {
+    pub fn new() -> Self {
+        unimplemented!()
+    }
+}
+```
 
-Documentation: All public items (pub struct, pub fn, pub trait, pub enum) must have documentation comments (///). Provide clear, concise explanations and examples.
+**RIGHT:**
+1. Identify dependencies (session-manager, xrpc, etc.)
+2. Translate dependencies first
+3. Break agent.ts into logical sections:
+   - Session management
+   - HTTP client integration
+   - Preferences API
+   - Labeling configuration
+   - Proxy configuration
+4. Implement each section completely
+5. Write comprehensive tests for each section
 
-Idiomatic Rust:
+## Quality Checklist Before Marking a File "Complete"
 
-Prefer iterators (.iter(), .map(), .filter(), etc.) over manual loops where it enhances clarity.
+- [ ] All functionality from original TypeScript is implemented
+- [ ] No `todo!()` or `unimplemented!()` macros
+- [ ] Comprehensive unit tests written and passing
+- [ ] Doc tests written for public APIs
+- [ ] All tests pass (`cargo test`)
+- [ ] No compiler warnings
+- [ ] No clippy warnings (run `cargo clippy`)
+- [ ] Code follows Rust best practices
+- [ ] Error handling is proper and comprehensive
+- [ ] Documentation is complete and accurate
+- [ ] Behavior matches TypeScript version
 
-Use match statements and pattern matching effectively.
+## Remember
 
-Embrace Option and Result to manage state and control flow.
+**The goal is a production-quality Rust code, not a prototype.**
 
-Use struct and enum to create strong, type-safe data models.
-
-3. Maintainability and Project Structure
-
-Generate code that is easy to test, debug, and refactor.
-
-Modularity: Group related functionality into modules. Use pub and visibility modifiers to expose a clear and intentional public API.
-
-Error Handling: For libraries, consider using thiserror to create custom error types. For applications, eyre or anyhow can be appropriate for managing error contexts.
-
-Testing: Include unit tests (#[cfg(test)]) for non-trivial logic. Demonstrate how to test the code you've written.
-
-Single Responsibility: Functions and methods should be small and focused on a single task. Avoid deep nesting and complex control flow; prefer early returns.
+Every line of code should be something you'd be proud to ship in a production system. Quality over speed. Completeness over convenience.
