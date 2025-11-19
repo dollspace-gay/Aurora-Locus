@@ -1,3 +1,6 @@
+// Allow dead_code - background tasks for future use
+#![allow(dead_code)]
+
 /// Background task implementations
 use crate::{context::AppContext, error::{PdsError, PdsResult}};
 

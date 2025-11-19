@@ -19,20 +19,14 @@ pub mod scope;
 pub mod token;
 pub mod token_rotation;
 
-pub use authorize::{authorize, cleanup_expired_requests, get_authorization_request};
+pub use authorize::authorize;
 pub use client::ClientManager;
 pub use consent::{
-    consent_screen, deny_authorization, get_request_by_code, grant_authorization,
-    mark_code_as_used,
+    consent_screen, deny_authorization, grant_authorization,
 };
 pub use device::DeviceManager;
-pub use models::{
-    AuthorizationRequest, AuthorizationRequestData, AuthorizeQuery, AuthorizedClientInfo,
-    ClientListResponse, Device, DeviceData, OAuthClient, TokenRequest, TokenResponse,
-};
 pub use scope::{
-    lexicon_to_scope, require_all_scopes, require_any_scope, require_scope, AtProtoScope,
+    require_scope, AtProtoScope,
     ScopeSet,
 };
 pub use token::token_endpoint;
-pub use token_rotation::{RotationResult, TokenRotationManager};

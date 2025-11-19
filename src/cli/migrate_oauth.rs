@@ -12,7 +12,6 @@ use crate::{
     context::AppContext,
     error::{PdsError, PdsResult},
 };
-use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// Migration result summary

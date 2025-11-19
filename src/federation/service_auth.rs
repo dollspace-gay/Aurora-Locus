@@ -1,3 +1,6 @@
+// Allow dead_code - service auth features for future use
+#![allow(dead_code)]
+
 //! Service Authentication for Cross-PDS Requests
 //!
 //! Implements ATProto service auth specification:

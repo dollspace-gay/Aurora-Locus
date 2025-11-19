@@ -1,3 +1,6 @@
+// Allow dead_code - database models for future features
+#![allow(dead_code)]
+
 /// Account database models and operations
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,6 @@
+// Allow dead_code - email tracking for future use
+#![allow(dead_code)]
+
 //! Email Delivery Tracking System
 //!
 //! Tracks email delivery status, bounces, and provides analytics.

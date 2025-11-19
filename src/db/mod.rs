@@ -13,6 +13,7 @@ use std::path::Path;
 /// Database connection options
 #[derive(Debug, Clone)]
 pub struct DatabaseOptions {
+    #[allow(dead_code)] // Future connection pool configuration
     pub max_connections: u32,
     pub enable_wal: bool,
 }

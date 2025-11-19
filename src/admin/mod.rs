@@ -1,3 +1,6 @@
+// Allow dead_code - admin audit features defined for future use
+#![allow(dead_code)]
+
 //! Admin and Moderation System
 //!
 //! Handles administrative functions including role management,
@@ -11,12 +14,10 @@ pub mod moderation;
 pub mod reports;
 pub mod roles;
 
-pub use appeals::{Appeal, AppealManager, AppealStatus};
-pub use events::{ModerationEvent, ModerationEventLogger, ModerationEventType};
 pub use invites::{InviteCode, InviteCodeManager};
-pub use labels::{Label, LabelManager};
-pub use moderation::{ModerationAction, ModerationManager, ModerationRecord};
-pub use reports::{Report, ReportManager, ReportReason, ReportStatus};
+pub use labels::LabelManager;
+pub use moderation::ModerationManager;
+pub use reports::ReportManager;
 pub use roles::{AdminRoleManager, Role};
 
 use chrono::{DateTime, Utc};

@@ -1,4 +1,7 @@
 //! Distributed rate limiting using Redis
+
+// Allow dead_code - public APIs defined for future feature completion
+#![allow(dead_code)]
 //!
 //! This module provides distributed rate limiting capabilities using Redis,
 //! allowing multiple PDS instances to share rate limit state.

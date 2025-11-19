@@ -1,3 +1,6 @@
+// Allow dead_code - read-after-write types for future use
+#![allow(dead_code)]
+
 //! Types for read-after-write consistency
 
 use serde::{Deserialize, Serialize};

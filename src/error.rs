@@ -28,6 +28,7 @@ pub enum PdsError {
 
     /// Repository errors
     #[error("Repository error: {0}")]
+    #[allow(dead_code)] // Future repository errors
     Repository(String),
 
     /// Blob storage errors
@@ -36,6 +37,7 @@ pub enum PdsError {
 
     /// DID resolution errors
     #[error("DID resolution error: {0}")]
+    #[allow(dead_code)] // Future DID resolution errors
     DidResolution(String),
 
     /// Identity resolution errors
@@ -60,6 +62,7 @@ pub enum PdsError {
 
     /// ATProto SDK errors
     #[error("ATProto error: {0}")]
+    #[allow(dead_code)] // Future ATProto errors
     AtProto(String),
 
     /// IO errors

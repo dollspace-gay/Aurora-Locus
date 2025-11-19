@@ -1,3 +1,6 @@
+// Allow dead_code - email notifications for future use
+#![allow(dead_code)]
+
 //! Email Notification System
 //!
 //! High-level interface for sending notification emails with templates.

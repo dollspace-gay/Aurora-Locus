@@ -64,6 +64,7 @@ impl BlobStore {
     }
 
     /// Generate thumbnail for an image
+    #[allow(dead_code)] // Future blob processing methods
     fn generate_thumbnail(data: &[u8], mime_type: &str, max_size: u32) -> Option<Vec<u8>> {
         // Only process images
         if !mime_type.starts_with("image/") {
@@ -161,6 +162,7 @@ impl BlobStore {
     /// Commit a staged blob to permanent storage (Phase 2 of two-phase upload)
     ///
     /// Moves blob from temp to permanent storage and creates metadata
+    #[allow(dead_code)] // Future blob commit functionality
     pub async fn commit_blob(&self, cid: &str) -> PdsResult<()> {
         let temp_path = self.get_temp_blob_path(cid);
 
@@ -240,6 +242,7 @@ impl BlobStore {
     /// Upload a blob
     ///
     /// Returns the blob metadata and reference
+    #[allow(dead_code)] // Future blob upload functionality
     pub async fn upload(&self, data: Vec<u8>, mime_type: Option<&str>, creator_did: &str) -> PdsResult<BlobRef> {
         // Validate size
         let size = data.len();
@@ -394,6 +397,7 @@ impl BlobStore {
     }
 
     /// Store blob metadata in database with full information (dimensions, thumbnail)
+    #[allow(dead_code)] // Future blob metadata storage
     async fn store_metadata_full(
         &self,
         cid: &str,
@@ -460,6 +464,7 @@ impl BlobStore {
     }
 
     /// Get temp blob metadata from database
+    #[allow(dead_code)] // Future temp blob metadata retrieval
     async fn get_temp_blob_metadata(&self, cid: &str) -> PdsResult<Option<TempBlob>> {
         let result = sqlx::query(
             r#"

@@ -1,3 +1,6 @@
+// Allow dead_code - nonce store features for future use
+#![allow(dead_code)]
+
 //! Nonce Store for Replay Attack Prevention
 //!
 //! Tracks JWT nonces (jti claims) to prevent replay attacks on service auth tokens.

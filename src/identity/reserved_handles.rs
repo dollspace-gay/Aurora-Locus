@@ -1,3 +1,6 @@
+// Allow dead_code - reserved handle checking for future use
+#![allow(dead_code)]
+
 //! Reserved handle system - prevents registration of system-level and protocol handles
 //!
 //! This module maintains a list of reserved handles that cannot be registered by users.

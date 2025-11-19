@@ -5,9 +5,8 @@ pub mod templates;
 pub mod tracking;
 
 pub use notifications::NotificationEmail;
-pub use rate_limit::{EmailRateLimitConfig, EmailRateLimiter};
-pub use templates::{EmailTemplateManager, EmailTemplateType};
-pub use tracking::{EmailStatus, EmailTracker};
+pub use rate_limit::EmailRateLimiter;
+pub use templates::EmailTemplateManager;
 
 use crate::{
     config::EmailConfig,
@@ -25,6 +24,7 @@ use std::sync::Arc;
 pub struct Mailer {
     config: Option<EmailConfig>,
     transport: Option<AsyncSmtpTransport<Tokio1Executor>>,
+    #[allow(dead_code)] // Future mailer features
     template_manager: Arc<EmailTemplateManager>,
     rate_limiter: Arc<EmailRateLimiter>,
 }
@@ -217,6 +217,8 @@ Aurora Locus PDS
         self.config.is_some()
     }
 
+    #[allow(dead_code)] // Future notification methods
+    #[allow(dead_code)] // Future notification methods
     /// Send notification email using template system
     pub async fn send_notification(
         &self,
@@ -247,11 +249,13 @@ Aurora Locus PDS
     }
 
     /// Get template manager
+    #[allow(dead_code)] // Future template access method
     pub fn template_manager(&self) -> &EmailTemplateManager {
         &self.template_manager
     }
 
     /// Get rate limiter
+    #[allow(dead_code)] // Future rate limiter access method
     pub fn rate_limiter(&self) -> &EmailRateLimiter {
         &self.rate_limiter
     }

@@ -36,6 +36,7 @@ impl DiskBlobBackend {
     }
 
     /// Ensure the directory for a blob exists
+    #[allow(dead_code)] // Future blob directory management
     async fn ensure_blob_dir(&self, cid: &str) -> PdsResult<PathBuf> {
         let blob_path = self.get_blob_path(cid);
         if let Some(parent) = blob_path.parent() {

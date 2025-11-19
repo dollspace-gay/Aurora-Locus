@@ -1,3 +1,6 @@
+// Allow dead_code - report management features for future use
+#![allow(dead_code)]
+
 /// Report Management System
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};

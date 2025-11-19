@@ -1,3 +1,6 @@
+// Allow dead_code - OAuth client management for future use
+#![allow(dead_code)]
+
 //! OAuth Client Management
 //!
 //! Implements OAuth 2.1 client registration, validation, and authorization tracking.

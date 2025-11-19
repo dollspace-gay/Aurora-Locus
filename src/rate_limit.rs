@@ -174,6 +174,7 @@ impl EndpointRateLimit {
     }
 
     /// Create a new endpoint rate limit with custom burst size
+    #[allow(dead_code)] // Future burst configuration
     pub fn with_burst(max_requests: u32, duration_secs: u64, burst_size: u32) -> Self {
         Self {
             max_requests,
@@ -451,6 +452,7 @@ pub struct RateLimiter {
     request_counts: Arc<DashMap<String, (u64, u32)>>,
 }
 
+    #[allow(dead_code)] // Future rate limit checking methods
 impl RateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
         Self::with_endpoint_config(config, EndpointRateLimitConfig::new())

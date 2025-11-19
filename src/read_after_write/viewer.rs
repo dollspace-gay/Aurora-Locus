@@ -1,3 +1,6 @@
+// Allow dead_code - local viewer for future use
+#![allow(dead_code)]
+
 //! LocalViewer for formatting local records into view objects
 
 use crate::{

@@ -48,6 +48,7 @@ impl OAuthStateStore {
 #[derive(Clone)]
 pub struct OAuthStateData {
     pub code_verifier: String,
+    #[allow(dead_code)] // Future OAuth state field
     pub handle: Option<String>,
     pub token_endpoint: String,
 }

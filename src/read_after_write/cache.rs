@@ -1,3 +1,6 @@
+// Allow dead_code - read-after-write cache for future use
+#![allow(dead_code)]
+
 //! Cache for local records (read-after-write consistency)
 //!
 //! This cache stores LocalRecords in memory with TTL to avoid repeated database queries.

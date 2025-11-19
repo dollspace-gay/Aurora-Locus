@@ -1,3 +1,6 @@
+// Allow dead_code - PDS discovery features for future use
+#![allow(dead_code)]
+
 //! PDS discovery for finding other instances in the federation
 //!
 //! Enables automatic discovery of PDS instances through:

@@ -1,3 +1,6 @@
+// Allow dead_code - PostgreSQL support for future use
+#![allow(dead_code)]
+
 //! PostgreSQL database support for Aurora Locus PDS
 //!
 //! This module provides PostgreSQL database backend as an alternative to SQLite

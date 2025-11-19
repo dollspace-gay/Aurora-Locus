@@ -105,6 +105,7 @@ impl CommitEvent {
 
 impl SyncEvent {
     /// Create a new sync event
+    #[allow(dead_code)] // Will be used when implementing sync events
     pub fn new(did: String, rev: String, blocks: Vec<u8>) -> Self {
         Self { did, rev, blocks }
     }
@@ -119,6 +120,7 @@ impl IdentityEvent {
 
 impl AccountEvent {
     /// Create a new account event
+    #[allow(dead_code)] // Will be used when implementing account events
     pub fn new(did: String, active: bool, status: Option<AccountStatus>) -> Self {
         Self { did, active, status }
     }

@@ -24,6 +24,7 @@ pub struct QueryLabelsParams {
     /// Optional limit (default: 50, max: 250)
     pub limit: Option<i64>,
     /// Optional cursor for pagination
+    #[allow(dead_code)] // Will be used for pagination in query implementation
     pub cursor: Option<String>,
 }
 

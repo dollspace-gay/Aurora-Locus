@@ -1,4 +1,7 @@
 //! OAuth Data Models
+
+// Allow dead_code - public APIs defined for future feature completion
+#![allow(dead_code)]
 //!
 //! Defines the core data structures for OAuth 2.1 implementation
 

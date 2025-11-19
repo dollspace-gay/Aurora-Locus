@@ -1,4 +1,8 @@
+// Allow dead_code for backup module - backup functionality is defined but not yet integrated
+#![allow(dead_code)]
+
 /// Automated backup scheduling and management for Aurora Locus PDS
+
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};

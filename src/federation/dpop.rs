@@ -1,4 +1,7 @@
 //! DPoP (Demonstrating Proof of Possession) Support
+
+// Allow dead_code - public APIs defined for future feature completion
+#![allow(dead_code)]
 //!
 //! Implements ATProto DPoP specification for client-to-PDS authentication:
 //! - Binds access tokens to specific client devices via public key cryptography

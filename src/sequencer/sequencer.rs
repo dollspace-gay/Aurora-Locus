@@ -20,6 +20,7 @@ pub struct SequencerConfig {
     pub max_query_limit: i64,
 
     /// Backfill time window in seconds (how far back cursors can resume)
+    #[allow(dead_code)] // Will be used for cursor expiration logic
     pub backfill_limit_secs: i64,
 }
 
@@ -43,6 +44,7 @@ pub struct Sequencer {
 
 impl Sequencer {
     /// Create a new sequencer
+    #[allow(dead_code)] // Public API for future use
     pub fn new(db: SqlitePool, config: SequencerConfig) -> Self {
         Self {
             db,
@@ -77,6 +79,7 @@ impl Sequencer {
     }
 
     /// Sequence a sync event (lightweight repo state sync for account creation/activation)
+    #[allow(dead_code)] // Will be used when implementing sync events
     pub async fn sequence_sync(&self, evt: SyncEvent) -> PdsResult<i64> {
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode sync event: {}", e)))?;
@@ -105,6 +108,7 @@ impl Sequencer {
     }
 
     /// Sequence an account event
+    #[allow(dead_code)] // Will be used when implementing account status changes
     pub async fn sequence_account(&self, evt: AccountEvent) -> PdsResult<i64> {
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode account event: {}", e)))?;
@@ -212,6 +216,7 @@ impl Sequencer {
     }
 
     /// Request events in a sequence range
+    #[allow(dead_code)] // Public API for firehose cursor-based queries
     pub async fn request_seq_range(
         &self,
         earliest_seq: Option<i64>,
@@ -277,6 +282,7 @@ impl Sequencer {
     }
 
     /// Decode event from SeqRow
+    #[allow(dead_code)] // Used by public query methods
     fn decode_event(&self, row: SeqRow) -> PdsResult<Option<SeqEvent>> {
         let time = row.sequenced_at.to_rfc3339();
         let event_type: EventType = row.event_type.into();
@@ -347,6 +353,7 @@ impl Sequencer {
     }
 
     /// Get events for a specific DID
+    #[allow(dead_code)] // Public API for DID-specific event queries
     pub async fn get_events_for_did(&self, did: &str, limit: i64) -> PdsResult<Vec<SeqEvent>> {
         let rows = sqlx::query(
             r#"

@@ -1,3 +1,6 @@
+// Allow dead_code - CAR encoding features for future use
+#![allow(dead_code)]
+
 use crate::error::{PdsError, PdsResult};
 use libipld::Cid;
 use serde_cbor;

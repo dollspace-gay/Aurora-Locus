@@ -14,18 +14,16 @@ pub mod relay;
 pub mod search;
 pub mod service_auth;
 
-pub use authentication::FederationAuthenticator;
-pub use discovery::{PdsDiscovery, PdsInstance};
-pub use dpop::{DPopNonceStore, DPopVerifier};
+pub use discovery::PdsInstance;
 pub use nonce_store::NonceStore;
 pub use relay::{RelayClient, RelayConfig};
-pub use search::FederatedSearch;
 pub use service_auth::ServiceAuthenticator;
 
 use serde::{Deserialize, Serialize};
 
 /// Federation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[allow(dead_code)] // Future federation configuration
 pub struct FederationConfig {
     /// Enable federation features
     pub enabled: bool,
@@ -68,6 +66,7 @@ impl Default for FederationConfig {
 }
 
 impl FederationConfig {
+    #[allow(dead_code)] // Future env-based config
     /// Load from environment variables
     pub fn from_env() -> Self {
         let relay_servers = std::env::var("FEDERATION_RELAY_SERVERS")

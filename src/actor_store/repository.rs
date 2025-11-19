@@ -1,3 +1,6 @@
+// Allow dead_code - repository management for future use
+#![allow(dead_code)]
+
 //! Repository manager - integrates SDK MST with persistent storage
 //!
 //! This module bridges the SDK's in-memory MST implementation with

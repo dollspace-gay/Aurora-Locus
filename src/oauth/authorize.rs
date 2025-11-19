@@ -1,3 +1,6 @@
+// Allow dead_code - OAuth authorize features for future use
+#![allow(dead_code)]
+
 //! OAuth 2.1 Authorization Endpoint
 //!
 //! Implements the authorization code flow per OAuth 2.1 and ATProto spec:

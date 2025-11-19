@@ -1,4 +1,7 @@
 //! Cross-PDS authentication via DID resolution
+
+// Allow dead_code - public APIs defined for future feature completion
+#![allow(dead_code)]
 //!
 //! Enables users from other PDS instances to authenticate and interact
 //! with this PDS by resolving their DIDs and verifying signatures.

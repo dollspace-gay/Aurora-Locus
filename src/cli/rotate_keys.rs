@@ -18,8 +18,6 @@ use crate::{
     sequencer::events::IdentityEvent,
 };
 use std::fs;
-use std::time::Duration;
-use tokio::time::sleep;
 
 /// Rotate keys for a list of DIDs
 ///
@@ -85,7 +83,7 @@ pub async fn rotate_keys(
 
     // Wait for all tasks to complete
     let mut success_count = 0;
-    let mut already_updated = 0;
+    let already_updated = 0;
     let mut error_count = 0;
 
     for task in tasks {

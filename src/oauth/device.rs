@@ -1,4 +1,7 @@
 //! Device Management for OAuth Multi-Device Support
+
+// Allow dead_code - public APIs defined for future feature completion
+#![allow(dead_code)]
 //!
 //! Implements device tracking, registration, and revocation per ATProto OAuth spec.
 //! Each device represents a unique client that can maintain its own OAuth session

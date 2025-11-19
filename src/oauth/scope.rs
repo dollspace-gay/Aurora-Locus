@@ -1,4 +1,7 @@
 //! OAuth 2.1 Scope System for ATProto
+
+// Allow dead_code - public APIs defined for future feature completion
+#![allow(dead_code)]
 //!
 //! Implements fine-grained authorization scopes mapped to ATProto lexicons.
 //! Scopes control what operations an OAuth token can perform.

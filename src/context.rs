@@ -44,7 +44,9 @@ pub struct AppContext {
     pub invite_manager: Arc<InviteCodeManager>,
     pub report_manager: Arc<ReportManager>,
     // OAuth server components (for third-party app authorization)
+    #[allow(dead_code)] // Future OAuth client management
     pub oauth_client_manager: Arc<ClientManager>,
+    #[allow(dead_code)] // Future OAuth device flow
     pub oauth_device_manager: Arc<DeviceManager>,
     // Sequencer for event streaming
     pub sequencer: Arc<Sequencer>,
@@ -57,10 +59,12 @@ pub struct AppContext {
     pub nonce_store: Option<Arc<NonceStore>>,
     // DPoP support (Phase 4)
     pub dpop_nonce_store: Option<Arc<DPopNonceStore>>,
+    #[allow(dead_code)] // Future DPoP verification
     pub dpop_verifier: Option<Arc<DPopVerifier>>,
     // Rate limiter
     pub rate_limiter: Arc<RateLimiter>,
     // Distributed rate limiter (Redis-backed, for multi-instance deployments)
+    #[allow(dead_code)] // Future distributed rate limiting
     pub distributed_rate_limiter: Option<Arc<crate::rate_limit_new::DistributedRateLimiter>>,
     // Email mailer
     pub mailer: Arc<Mailer>,

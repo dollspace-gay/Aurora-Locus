@@ -1,4 +1,7 @@
 //! Relay support for event distribution in the federation
+
+// Allow dead_code - public APIs defined for future feature completion
+#![allow(dead_code)]
 //!
 //! Relays enable:
 //! - Real-time event streaming across PDS instances

@@ -1,3 +1,6 @@
+// Allow dead_code - blob quarantine features for future use
+#![allow(dead_code)]
+
 //! Blob Quarantine System
 //!
 //! Provides blob takedown and quarantine functionality for moderation.

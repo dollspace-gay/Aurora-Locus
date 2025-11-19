@@ -1,4 +1,8 @@
+// Allow dead_code for auth module - many auth contexts are defined for future protected routes
+#![allow(dead_code)]
+
 /// Authentication extractors and utilities
+
 use crate::{
     account::ValidatedSession,
     admin::Role,

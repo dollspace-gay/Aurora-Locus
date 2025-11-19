@@ -7,6 +7,9 @@
 //! - Repository metadata
 //! - Rate limit counters (for distributed rate limiting)
 
+// Allow dead_code for cache module - cache operations are defined for future feature integration
+#![allow(dead_code)]
+
 use crate::error::{PdsError, PdsResult};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};

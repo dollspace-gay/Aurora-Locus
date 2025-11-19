@@ -7,6 +7,10 @@
 //! - Background job execution
 //! - Moderation actions
 
+// Allow dead_code for metrics module - many metrics are defined for future monitoring
+// but not yet integrated into all code paths. They will be used as features are completed.
+#![allow(dead_code)]
+
 use lazy_static::lazy_static;
 use prometheus::{
     register_gauge, register_histogram_vec, register_int_counter,

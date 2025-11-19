@@ -1,4 +1,7 @@
 //! Moderation Event Logging System
+
+// Allow dead_code - public APIs defined for future feature completion
+#![allow(dead_code)]
 //!
 //! Comprehensive audit log for all moderation actions.
 //! Provides transparency, accountability, and compliance tracking.

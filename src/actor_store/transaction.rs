@@ -1,3 +1,6 @@
+// Allow dead_code - actor transactions for future use
+#![allow(dead_code)]
+
 //! Transaction support for atomic multi-record operations
 //!
 //! Provides explicit transaction API similar to Bluesky's ActorStoreTransactor

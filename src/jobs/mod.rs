@@ -1,3 +1,6 @@
+// Allow dead_code - background jobs for future use
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use tokio::time::{interval, Duration, sleep};
 use tracing::{error, info, warn};

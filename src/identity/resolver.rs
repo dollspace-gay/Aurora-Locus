@@ -12,6 +12,7 @@ pub struct IdentityResolverConfig {
     /// User-Agent header for HTTP requests
     pub user_agent: String,
     /// Enable DNS-over-HTTPS for handle resolution
+    #[allow(dead_code)] // Future DNS-over-HTTPS support
     pub use_doh: bool,
 }
 
@@ -299,6 +300,7 @@ impl IdentityResolver {
     /// Invalidate cached signing key for a DID (force re-fetch)
     ///
     /// This should be called when identity events are received via relay,
+    #[allow(dead_code)] // Future key invalidation
     /// indicating that the DID document has changed.
     pub async fn invalidate_signing_key(&self, did: &str) -> PdsResult<()> {
         // Invalidating the DID document invalidates the signing key

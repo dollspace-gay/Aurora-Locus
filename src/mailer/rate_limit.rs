@@ -1,3 +1,6 @@
+// Allow dead_code - email rate limiting for future use
+#![allow(dead_code)]
+
 //! Email Rate Limiting
 //!
 //! Prevents email spam by limiting the number of emails sent to each recipient.

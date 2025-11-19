@@ -201,6 +201,7 @@ impl ActorStore {
     /// # Ok(())
     /// # }
     /// ```
+    #[allow(dead_code)] // Future transaction and cleanup methods
     pub async fn begin_transaction(&self, did: &str) -> PdsResult<crate::actor_store::ActorTransaction<'_>> {
         let pool = self.open_db(did).await?;
 
@@ -649,6 +650,7 @@ impl ActorStore {
     }
 
     /// Destroy an actor's repository (delete all data)
+    #[allow(dead_code)] // Future cleanup method
     pub async fn destroy(&self, did: &str) -> PdsResult<()> {
         let location = self.get_location(did);
 

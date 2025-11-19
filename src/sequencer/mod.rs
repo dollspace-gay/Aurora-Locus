@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// Event row from database
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields used for future sequencer queries
 pub struct SeqRow {
     pub seq: i64,
     pub did: String,
@@ -60,6 +61,7 @@ impl From<String> for EventType {
 /// Unified event wrapper for the firehose
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "$type")]
+#[allow(dead_code)] // Will be used for firehose event streaming
 pub enum SeqEvent {
     #[serde(rename = "#commit")]
     Commit {

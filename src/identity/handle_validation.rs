@@ -1,3 +1,6 @@
+// Allow dead_code - handle validation utilities for future use
+#![allow(dead_code)]
+
 /// Comprehensive handle validation following ATProto spec
 ///
 /// Provides strict validation for handles including:

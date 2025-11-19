@@ -1,3 +1,6 @@
+// Allow dead_code - token rotation features for future use
+#![allow(dead_code)]
+
 //! Refresh Token Rotation with Replay Detection
 //!
 //! Implements OAuth 2.1 refresh token rotation per RFC 6749 Section 10.4 and

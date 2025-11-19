@@ -12,7 +12,9 @@
       "Bash(timeout 90 cargo build --lib)",
       "Bash(cargo clean:*)",
       "Bash(rustc:*)",
-      "Bash(bd list:*)"
+      "Bash(bd list:*)",
+      "Bash(bd create \"Fix remaining 254 compile warnings (unused code)\" -p 2 -t task -d \"Address the 254 warnings from cargo build, including:\n- Unused fields in structs (e.g., SeqRow.did, SeqRow.invalidated, SequencerConfig.backfill_limit_secs)\n- Unused enum variants (e.g., SeqEvent)\n- Unused associated functions in sequencer module\n- Unused functions (verify_service_jwt, decode_multibase_key, generate_nonce)\n\nRun cargo fix and manually address any remaining warnings.\")",
+      "Bash(cargo fix:*)"
     ],
     "deny": [],
     "ask": []

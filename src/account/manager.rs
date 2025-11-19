@@ -1079,6 +1079,7 @@ impl AccountManager {
     }
 
     /// Check if account is marked for deletion
+    #[allow(dead_code)] // Future account deletion feature
     pub async fn is_account_pending_deletion(&self, did: &str) -> PdsResult<bool> {
         let row = sqlx::query("SELECT deactivated_at FROM actor WHERE did = ?1")
             .bind(did)
@@ -1663,6 +1664,7 @@ impl AccountManager {
     }
 
     /// Disable an invite code (admin/creator only)
+    #[allow(dead_code)] // Future invite management feature
     pub async fn disable_invite_code(&self, code: &str, requesting_did: &str) -> PdsResult<()> {
         // Verify requester is the creator or an admin
         let row = sqlx::query("SELECT created_by FROM invite_code WHERE code = ?1")
@@ -1698,6 +1700,7 @@ impl AccountManager {
     ///
     /// This can be called periodically (e.g., weekly) to give users new invite codes
     /// based on the configuration.
+    #[allow(dead_code)] // Future invite allocation feature
     pub async fn allocate_invite_codes(&self, did: &str, count: i32) -> PdsResult<Vec<String>> {
         // Check if invites are disabled for this account
         let row = sqlx::query("SELECT invites_disabled FROM account WHERE did = ?1")

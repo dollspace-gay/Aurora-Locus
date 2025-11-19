@@ -1,3 +1,6 @@
+// Allow dead_code - invite management features for future use
+#![allow(dead_code)]
+
 /// Invite Code Management System
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};

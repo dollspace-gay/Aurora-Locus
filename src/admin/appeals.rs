@@ -1,3 +1,6 @@
+// Allow dead_code - appeals system is defined for future moderation features
+#![allow(dead_code)]
+
 //! Moderation Appeal System
 //!
 //! Allows users to appeal moderation decisions.

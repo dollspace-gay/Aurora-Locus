@@ -257,6 +257,7 @@ pub fn create_service_jwt(
 /// # Ok(())
 /// # }
 /// ```
+#[allow(dead_code)] // Public API for future service-to-service auth
 pub async fn verify_service_jwt(
     token: &str,
     expected_aud: &str,
@@ -357,6 +358,7 @@ pub async fn verify_service_jwt(
 /// For secp256k1 keys:
 /// - Multicodec prefix: 0xe7 (secp256k1-pub)
 /// - Key bytes: 33 bytes (compressed) or 65 bytes (uncompressed)
+#[allow(dead_code)] // Used by verify_service_jwt and tests
 fn decode_multibase_key(multibase_key: &str) -> PdsResult<Vec<u8>> {
     // Check for 'z' prefix (base58btc)
     if !multibase_key.starts_with('z') {
@@ -409,6 +411,7 @@ fn decode_multibase_key(multibase_key: &str) -> PdsResult<Vec<u8>> {
 /// let nonce = generate_nonce();
 /// assert_eq!(nonce.len(), 32); // 16 bytes = 32 hex chars
 /// ```
+#[allow(dead_code)] // Public utility function for service auth
 pub fn generate_nonce() -> String {
     use rand::Rng;
     let bytes: [u8; 16] = rand::thread_rng().gen();

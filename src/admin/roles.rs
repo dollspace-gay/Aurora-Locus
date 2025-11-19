@@ -1,3 +1,6 @@
+// Allow dead_code - role management features for future use
+#![allow(dead_code)]
+
 /// Admin Role Management
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};

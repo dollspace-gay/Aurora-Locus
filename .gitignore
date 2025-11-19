@@ -15,3 +15,5 @@ Cargo.lock
 *.tmp
 *.swp
 *~
+# Beads database
+.beads/

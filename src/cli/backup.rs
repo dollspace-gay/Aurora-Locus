@@ -6,7 +6,7 @@ use crate::{context::AppContext, error::PdsResult};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use std::{
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 

@@ -1,3 +1,6 @@
+// Allow dead_code - email templates for future use
+#![allow(dead_code)]
+
 //! Email Template System
 //!
 //! Provides a flexible template system for all email types.

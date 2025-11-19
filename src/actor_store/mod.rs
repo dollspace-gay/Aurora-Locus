@@ -52,5 +52,6 @@ pub fn get_actor_location(base_dir: &Path, did: &str) -> ActorLocation {
 pub struct ActorLocation {
     pub directory: PathBuf,
     pub db_location: PathBuf,
+    #[allow(dead_code)] // Future actor location field
     pub key_location: PathBuf,
 }

@@ -9,7 +9,7 @@ use crate::{
 use axum::{
     http::{header, Method, StatusCode},
     middleware,
-    response::{IntoResponse, Json, Response},
+    response::{Json, Response},
     routing::get,
     Router,
 };

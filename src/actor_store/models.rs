@@ -1,3 +1,6 @@
+// Allow dead_code - actor store models for future use
+#![allow(dead_code)]
+
 /// Actor store database models
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
