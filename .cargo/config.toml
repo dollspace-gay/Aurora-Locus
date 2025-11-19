@@ -1,0 +1,10 @@
+# Cargo configuration for Aurora Locus
+
+# Fix for LNK1318: PDB Type Index Limit
+# Reduce debug info level to bypass the PDB size limit
+# Level 1 provides line numbers and basic debugging without full type info
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "debuginfo=1"]
+
+# Alternative: Use packed debug info (splits into multiple PDBs)
+# This requires nightly: rustflags = ["-C", "split-debuginfo=packed"]
