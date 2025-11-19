@@ -67,6 +67,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Validation
 validator = { version = "0.18", features = ["derive"] }
+unicode-segmentation = "1.11"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"] }

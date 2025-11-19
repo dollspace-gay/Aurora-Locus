@@ -6,6 +6,7 @@ use chrono::DateTime;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Type alias for collection validator functions
 type ValidatorFn = Box<dyn Fn(&Value) -> ValidationResult + Send + Sync>;
@@ -59,6 +60,35 @@ pub type ValidationResult = Result<(), Vec<ValidationError>>;
 fn validate_datetime(datetime_str: &str) -> bool {
     // Try to parse as RFC3339
     DateTime::parse_from_rfc3339(datetime_str).is_ok()
+}
+
+/// Validate text length using both byte length and grapheme count
+///
+/// ATProto validates text fields by grapheme count (user-perceived characters),
+/// not byte length. However, we also check byte length as a secondary limit.
+///
+/// # Arguments
+/// * `text` - The text to validate
+/// * `max_bytes` - Maximum byte length (UTF-8 encoded)
+/// * `max_graphemes` - Maximum grapheme count
+///
+/// # Returns
+/// * `Ok(())` if text is within limits
+/// * `Err((byte_len, grapheme_count))` if text exceeds limits
+///
+/// # Examples
+/// * `"hello"` - 5 bytes, 5 graphemes
+/// * `"👨‍👩‍👧‍👦"` - 25 bytes, 1 grapheme (family emoji)
+/// * `"café"` - 5 bytes, 4 graphemes (é is one grapheme)
+fn validate_text_length(text: &str, max_bytes: usize, max_graphemes: usize) -> Result<(), (usize, usize)> {
+    let byte_len = text.len();
+    let grapheme_count = text.graphemes(true).count();
+
+    if byte_len > max_bytes || grapheme_count > max_graphemes {
+        Err((byte_len, grapheme_count))
+    } else {
+        Ok(())
+    }
 }
 
 /// Record validator
@@ -445,20 +475,20 @@ impl RecordValidator {
                     }),
                     Some(text) => {
                         if let Some(s) = text.as_str() {
-                            // Max length: 3000 characters
-                            if s.len() > 3000 {
-                                errors.push(ValidationError {
-                                    path: "$.text".to_string(),
-                                    message: format!("Text exceeds maximum length of 3000 characters: {}", s.len()),
-                                });
-                            }
-                            // Max graphemes: 300
-                            let grapheme_count = s.chars().count();
-                            if grapheme_count > 300 {
-                                errors.push(ValidationError {
-                                    path: "$.text".to_string(),
-                                    message: format!("Text exceeds maximum of 300 graphemes: {}", grapheme_count),
-                                });
+                            // Validate using both byte length (3000) and grapheme count (300)
+                            if let Err((byte_len, grapheme_count)) = validate_text_length(s, 3000, 300) {
+                                if byte_len > 3000 {
+                                    errors.push(ValidationError {
+                                        path: "$.text".to_string(),
+                                        message: format!("Text exceeds maximum byte length of 3000: {}", byte_len),
+                                    });
+                                }
+                                if grapheme_count > 300 {
+                                    errors.push(ValidationError {
+                                        path: "$.text".to_string(),
+                                        message: format!("Text exceeds maximum of 300 graphemes: {}", grapheme_count),
+                                    });
+                                }
                             }
                         } else {
                             errors.push(ValidationError {
@@ -510,7 +540,7 @@ impl RecordValidator {
                     }
                 }
 
-                // Optional: tags (array with max 8 items, each max 640 chars/64 graphemes)
+                // Optional: tags (array with max 8 items, each max 640 bytes/64 graphemes)
                 if let Some(tags) = record.get("tags") {
                     if let Some(arr) = tags.as_array() {
                         if arr.len() > 8 {
@@ -521,17 +551,20 @@ impl RecordValidator {
                         }
                         for (i, tag) in arr.iter().enumerate() {
                             if let Some(s) = tag.as_str() {
-                                if s.len() > 640 {
-                                    errors.push(ValidationError {
-                                        path: format!("$.tags[{}]", i),
-                                        message: format!("Tag exceeds maximum length of 640 characters: {}", s.len()),
-                                    });
-                                }
-                                if s.chars().count() > 64 {
-                                    errors.push(ValidationError {
-                                        path: format!("$.tags[{}]", i),
-                                        message: format!("Tag exceeds maximum of 64 graphemes: {}", s.chars().count()),
-                                    });
+                                // Validate using both byte length (640) and grapheme count (64)
+                                if let Err((byte_len, grapheme_count)) = validate_text_length(s, 640, 64) {
+                                    if byte_len > 640 {
+                                        errors.push(ValidationError {
+                                            path: format!("$.tags[{}]", i),
+                                            message: format!("Tag exceeds maximum byte length of 640: {}", byte_len),
+                                        });
+                                    }
+                                    if grapheme_count > 64 {
+                                        errors.push(ValidationError {
+                                            path: format!("$.tags[{}]", i),
+                                            message: format!("Tag exceeds maximum of 64 graphemes: {}", grapheme_count),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -593,38 +626,44 @@ impl RecordValidator {
             Box::new(|record: &Value| {
                 let mut errors = Vec::new();
 
-                // Optional: displayName (max 640 chars, 64 graphemes)
+                // Optional: displayName (max 640 bytes, 64 graphemes)
                 if let Some(display_name) = record.get("displayName") {
                     if let Some(s) = display_name.as_str() {
-                        if s.len() > 640 {
-                            errors.push(ValidationError {
-                                path: "$.displayName".to_string(),
-                                message: format!("displayName exceeds maximum length of 640 characters: {}", s.len()),
-                            });
-                        }
-                        if s.chars().count() > 64 {
-                            errors.push(ValidationError {
-                                path: "$.displayName".to_string(),
-                                message: format!("displayName exceeds maximum of 64 graphemes: {}", s.chars().count()),
-                            });
+                        // Validate using both byte length (640) and grapheme count (64)
+                        if let Err((byte_len, grapheme_count)) = validate_text_length(s, 640, 64) {
+                            if byte_len > 640 {
+                                errors.push(ValidationError {
+                                    path: "$.displayName".to_string(),
+                                    message: format!("displayName exceeds maximum byte length of 640: {}", byte_len),
+                                });
+                            }
+                            if grapheme_count > 64 {
+                                errors.push(ValidationError {
+                                    path: "$.displayName".to_string(),
+                                    message: format!("displayName exceeds maximum of 64 graphemes: {}", grapheme_count),
+                                });
+                            }
                         }
                     }
                 }
 
-                // Optional: description (max 2560 chars, 256 graphemes)
+                // Optional: description (max 2560 bytes, 256 graphemes)
                 if let Some(description) = record.get("description") {
                     if let Some(s) = description.as_str() {
-                        if s.len() > 2560 {
-                            errors.push(ValidationError {
-                                path: "$.description".to_string(),
-                                message: format!("description exceeds maximum length of 2560 characters: {}", s.len()),
-                            });
-                        }
-                        if s.chars().count() > 256 {
-                            errors.push(ValidationError {
-                                path: "$.description".to_string(),
-                                message: format!("description exceeds maximum of 256 graphemes: {}", s.chars().count()),
-                            });
+                        // Validate using both byte length (2560) and grapheme count (256)
+                        if let Err((byte_len, grapheme_count)) = validate_text_length(s, 2560, 256) {
+                            if byte_len > 2560 {
+                                errors.push(ValidationError {
+                                    path: "$.description".to_string(),
+                                    message: format!("description exceeds maximum byte length of 2560: {}", byte_len),
+                                });
+                            }
+                            if grapheme_count > 256 {
+                                errors.push(ValidationError {
+                                    path: "$.description".to_string(),
+                                    message: format!("description exceeds maximum of 256 graphemes: {}", grapheme_count),
+                                });
+                            }
                         }
                     }
                 }
@@ -948,7 +987,7 @@ impl RecordValidator {
             Box::new(|record: &Value| {
                 let mut errors = Vec::new();
 
-                // Required: name (max 640 chars, 64 graphemes)
+                // Required: name (max 640 bytes, 64 graphemes)
                 match record.get("name") {
                     None => errors.push(ValidationError {
                         path: "$.name".to_string(),
@@ -956,17 +995,20 @@ impl RecordValidator {
                     }),
                     Some(name) => {
                         if let Some(s) = name.as_str() {
-                            if s.len() > 640 {
-                                errors.push(ValidationError {
-                                    path: "$.name".to_string(),
-                                    message: format!("name exceeds maximum length of 640 characters: {}", s.len()),
-                                });
-                            }
-                            if s.chars().count() > 64 {
-                                errors.push(ValidationError {
-                                    path: "$.name".to_string(),
-                                    message: format!("name exceeds maximum of 64 graphemes: {}", s.chars().count()),
-                                });
+                            // Validate using both byte length (640) and grapheme count (64)
+                            if let Err((byte_len, grapheme_count)) = validate_text_length(s, 640, 64) {
+                                if byte_len > 640 {
+                                    errors.push(ValidationError {
+                                        path: "$.name".to_string(),
+                                        message: format!("name exceeds maximum byte length of 640: {}", byte_len),
+                                    });
+                                }
+                                if grapheme_count > 64 {
+                                    errors.push(ValidationError {
+                                        path: "$.name".to_string(),
+                                        message: format!("name exceeds maximum of 64 graphemes: {}", grapheme_count),
+                                    });
+                                }
                             }
                         } else {
                             errors.push(ValidationError {
@@ -1000,20 +1042,23 @@ impl RecordValidator {
                     }
                 }
 
-                // Optional: description (max 3000 chars, 300 graphemes)
+                // Optional: description (max 3000 bytes, 300 graphemes)
                 if let Some(description) = record.get("description") {
                     if let Some(s) = description.as_str() {
-                        if s.len() > 3000 {
-                            errors.push(ValidationError {
-                                path: "$.description".to_string(),
-                                message: format!("description exceeds maximum length of 3000 characters: {}", s.len()),
-                            });
-                        }
-                        if s.chars().count() > 300 {
-                            errors.push(ValidationError {
-                                path: "$.description".to_string(),
-                                message: format!("description exceeds maximum of 300 graphemes: {}", s.chars().count()),
-                            });
+                        // Validate using both byte length (3000) and grapheme count (300)
+                        if let Err((byte_len, grapheme_count)) = validate_text_length(s, 3000, 300) {
+                            if byte_len > 3000 {
+                                errors.push(ValidationError {
+                                    path: "$.description".to_string(),
+                                    message: format!("description exceeds maximum byte length of 3000: {}", byte_len),
+                                });
+                            }
+                            if grapheme_count > 300 {
+                                errors.push(ValidationError {
+                                    path: "$.description".to_string(),
+                                    message: format!("description exceeds maximum of 300 graphemes: {}", grapheme_count),
+                                });
+                            }
                         }
                     }
                 }
@@ -1258,7 +1303,7 @@ impl RecordValidator {
                     }
                 }
 
-                // Required: displayName (max 240 chars, 24 graphemes)
+                // Required: displayName (max 240 bytes, 24 graphemes)
                 match record.get("displayName") {
                     None => errors.push(ValidationError {
                         path: "$.displayName".to_string(),
@@ -1266,17 +1311,20 @@ impl RecordValidator {
                     }),
                     Some(display_name) => {
                         if let Some(s) = display_name.as_str() {
-                            if s.len() > 240 {
-                                errors.push(ValidationError {
-                                    path: "$.displayName".to_string(),
-                                    message: format!("displayName exceeds maximum length of 240 characters: {}", s.len()),
-                                });
-                            }
-                            if s.chars().count() > 24 {
-                                errors.push(ValidationError {
-                                    path: "$.displayName".to_string(),
-                                    message: format!("displayName exceeds maximum of 24 graphemes: {}", s.chars().count()),
-                                });
+                            // Validate using both byte length (240) and grapheme count (24)
+                            if let Err((byte_len, grapheme_count)) = validate_text_length(s, 240, 24) {
+                                if byte_len > 240 {
+                                    errors.push(ValidationError {
+                                        path: "$.displayName".to_string(),
+                                        message: format!("displayName exceeds maximum byte length of 240: {}", byte_len),
+                                    });
+                                }
+                                if grapheme_count > 24 {
+                                    errors.push(ValidationError {
+                                        path: "$.displayName".to_string(),
+                                        message: format!("displayName exceeds maximum of 24 graphemes: {}", grapheme_count),
+                                    });
+                                }
                             }
                         } else {
                             errors.push(ValidationError {
@@ -1287,20 +1335,23 @@ impl RecordValidator {
                     }
                 }
 
-                // Optional: description (max 3000 chars, 300 graphemes)
+                // Optional: description (max 3000 bytes, 300 graphemes)
                 if let Some(description) = record.get("description") {
                     if let Some(s) = description.as_str() {
-                        if s.len() > 3000 {
-                            errors.push(ValidationError {
-                                path: "$.description".to_string(),
-                                message: format!("description exceeds maximum length of 3000 characters: {}", s.len()),
-                            });
-                        }
-                        if s.chars().count() > 300 {
-                            errors.push(ValidationError {
-                                path: "$.description".to_string(),
-                                message: format!("description exceeds maximum of 300 graphemes: {}", s.chars().count()),
-                            });
+                        // Validate using both byte length (3000) and grapheme count (300)
+                        if let Err((byte_len, grapheme_count)) = validate_text_length(s, 3000, 300) {
+                            if byte_len > 3000 {
+                                errors.push(ValidationError {
+                                    path: "$.description".to_string(),
+                                    message: format!("description exceeds maximum byte length of 3000: {}", byte_len),
+                                });
+                            }
+                            if grapheme_count > 300 {
+                                errors.push(ValidationError {
+                                    path: "$.description".to_string(),
+                                    message: format!("description exceeds maximum of 300 graphemes: {}", grapheme_count),
+                                });
+                            }
                         }
                     }
                 }
@@ -2328,5 +2379,270 @@ mod tests {
 
         let result = validator.validate("app.bsky.labeler.service", &labeler);
         assert!(result.is_err());
+    }
+
+    // Grapheme counting tests
+
+    #[test]
+    fn test_validate_text_length_ascii() {
+        // Simple ASCII text: 1 byte = 1 grapheme
+        let result = validate_text_length("hello", 10, 10);
+        assert!(result.is_ok());
+
+        let result = validate_text_length("hello world", 10, 10);
+        assert!(result.is_err());
+        if let Err((byte_len, grapheme_count)) = result {
+            assert_eq!(byte_len, 11);
+            assert_eq!(grapheme_count, 11);
+        }
+    }
+
+    #[test]
+    fn test_validate_text_length_emoji() {
+        // Single emoji: multiple bytes, 1 grapheme
+        let emoji = "👍";
+        let result = validate_text_length(emoji, 100, 1);
+        assert!(result.is_ok());
+
+        // Emoji is 4 bytes but 1 grapheme
+        let result = validate_text_length(emoji, 3, 1);
+        assert!(result.is_err());
+        if let Err((byte_len, _)) = result {
+            assert_eq!(byte_len, 4);
+        }
+    }
+
+    #[test]
+    fn test_validate_text_length_family_emoji() {
+        // Family emoji with ZWJ (Zero Width Joiner): 25 bytes, 1 grapheme
+        let family = "👨‍👩‍👧‍👦";
+        let result = validate_text_length(family, 100, 1);
+        assert!(result.is_ok());
+
+        // Should fail on grapheme count
+        let result = validate_text_length(family, 100, 0);
+        assert!(result.is_err());
+        if let Err((byte_len, grapheme_count)) = result {
+            assert!(byte_len > 20); // Family emoji is ~25 bytes
+            assert_eq!(grapheme_count, 1);
+        }
+    }
+
+    #[test]
+    fn test_validate_text_length_combining_characters() {
+        // "é" can be represented as e + combining acute accent
+        let combined = "e\u{0301}"; // e + combining acute accent = é
+        let result = validate_text_length(combined, 10, 1);
+        assert!(result.is_ok());
+
+        let result = validate_text_length(combined, 10, 0);
+        assert!(result.is_err());
+        if let Err((byte_len, grapheme_count)) = result {
+            assert_eq!(byte_len, 3); // e (1 byte) + combining accent (2 bytes)
+            assert_eq!(grapheme_count, 1); // But it's 1 grapheme
+        }
+    }
+
+    #[test]
+    fn test_validate_text_length_flag_emoji() {
+        // Flag emojis are regional indicator symbols
+        let flag = "🇺🇸"; // US flag
+        let result = validate_text_length(flag, 100, 1);
+        assert!(result.is_ok());
+
+        let result = validate_text_length(flag, 100, 0);
+        assert!(result.is_err());
+        if let Err((byte_len, grapheme_count)) = result {
+            assert_eq!(byte_len, 8); // Two regional indicators
+            assert_eq!(grapheme_count, 1); // But displayed as 1 flag
+        }
+    }
+
+    #[test]
+    fn test_validate_post_with_emoji_text() {
+        let validator = RecordValidator::new();
+
+        // A post with emoji should count graphemes correctly
+        let emoji_text = "Hello 👋 world 🌍!"; // 2 emojis, total ~13 graphemes
+        let post = json!({
+            "$type": "app.bsky.feed.post",
+            "text": emoji_text,
+            "createdAt": "2025-01-10T12:00:00Z"
+        });
+
+        let result = validator.validate("app.bsky.feed.post", &post);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_post_with_too_many_graphemes() {
+        let validator = RecordValidator::new();
+
+        // Create a string with exactly 301 simple emojis (each is 1 grapheme)
+        let emoji_text = "😀".repeat(301);
+        let post = json!({
+            "$type": "app.bsky.feed.post",
+            "text": emoji_text,
+            "createdAt": "2025-01-10T12:00:00Z"
+        });
+
+        let result = validator.validate("app.bsky.feed.post", &post);
+        assert!(result.is_err());
+
+        if let Err(errors) = result {
+            assert!(errors.iter().any(|e| {
+                e.path == "$.text" && e.message.contains("300 graphemes")
+            }));
+        }
+    }
+
+    #[test]
+    fn test_validate_post_text_exactly_300_graphemes() {
+        let validator = RecordValidator::new();
+
+        // Create a string with exactly 300 emojis
+        let emoji_text = "😀".repeat(300);
+        let post = json!({
+            "$type": "app.bsky.feed.post",
+            "text": emoji_text,
+            "createdAt": "2025-01-10T12:00:00Z"
+        });
+
+        let result = validator.validate("app.bsky.feed.post", &post);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_profile_displayname_with_emoji() {
+        let validator = RecordValidator::new();
+
+        // Display name with emoji
+        let profile = json!({
+            "$type": "app.bsky.actor.profile",
+            "displayName": "Alice 🎨 Smith",
+        });
+
+        let result = validator.validate("app.bsky.actor.profile", &profile);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_profile_displayname_too_many_graphemes() {
+        let validator = RecordValidator::new();
+
+        // Create a displayName with 65 emojis (exceeds 64 grapheme limit)
+        let long_name = "😀".repeat(65);
+        let profile = json!({
+            "$type": "app.bsky.actor.profile",
+            "displayName": long_name,
+        });
+
+        let result = validator.validate("app.bsky.actor.profile", &profile);
+        assert!(result.is_err());
+
+        if let Err(errors) = result {
+            assert!(errors.iter().any(|e| {
+                e.path == "$.displayName" && e.message.contains("64 graphemes")
+            }));
+        }
+    }
+
+    #[test]
+    fn test_validate_profile_description_with_unicode() {
+        let validator = RecordValidator::new();
+
+        // Description with various Unicode characters
+        let profile = json!({
+            "$type": "app.bsky.actor.profile",
+            "description": "I love coding! 💻 こんにちは 🌸 Café ☕",
+        });
+
+        let result = validator.validate("app.bsky.actor.profile", &profile);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_profile_description_too_many_graphemes() {
+        let validator = RecordValidator::new();
+
+        // Create a description with 257 emojis (exceeds 256 grapheme limit)
+        let long_desc = "😀".repeat(257);
+        let profile = json!({
+            "$type": "app.bsky.actor.profile",
+            "description": long_desc,
+        });
+
+        let result = validator.validate("app.bsky.actor.profile", &profile);
+        assert!(result.is_err());
+
+        if let Err(errors) = result {
+            assert!(errors.iter().any(|e| {
+                e.path == "$.description" && e.message.contains("256 graphemes")
+            }));
+        }
+    }
+
+    #[test]
+    fn test_validate_tag_with_emoji() {
+        let validator = RecordValidator::new();
+
+        let post = json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Test post",
+            "createdAt": "2025-01-10T12:00:00Z",
+            "tags": ["coding", "rust🦀", "emoji😀"]
+        });
+
+        let result = validator.validate("app.bsky.feed.post", &post);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_tag_too_many_graphemes() {
+        let validator = RecordValidator::new();
+
+        // Create a tag with 65 emojis (exceeds 64 grapheme limit)
+        let long_tag = "😀".repeat(65);
+        let post = json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Test post",
+            "createdAt": "2025-01-10T12:00:00Z",
+            "tags": [long_tag]
+        });
+
+        let result = validator.validate("app.bsky.feed.post", &post);
+        assert!(result.is_err());
+
+        if let Err(errors) = result {
+            assert!(errors.iter().any(|e| {
+                e.path == "$.tags[0]" && e.message.contains("64 graphemes")
+            }));
+        }
+    }
+
+    #[test]
+    fn test_validate_text_length_mixed_unicode() {
+        // Mix of ASCII, Latin extended, emoji, and CJK
+        let mixed = "Hello café 👋 こんにちは 世界";
+        let result = validate_text_length(mixed, 100, 20);
+        assert!(result.is_ok());
+
+        let result = validate_text_length(mixed, 100, 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_text_length_skin_tone_emoji() {
+        // Emoji with skin tone modifier: 1 grapheme but multiple code points
+        let emoji_with_tone = "👋🏽"; // Waving hand with medium skin tone
+        let result = validate_text_length(emoji_with_tone, 100, 1);
+        assert!(result.is_ok());
+
+        let result = validate_text_length(emoji_with_tone, 100, 0);
+        assert!(result.is_err());
+        if let Err((byte_len, grapheme_count)) = result {
+            assert!(byte_len > 4); // Base emoji + modifier
+            assert_eq!(grapheme_count, 1); // But displayed as 1 emoji
+        }
     }
 }
