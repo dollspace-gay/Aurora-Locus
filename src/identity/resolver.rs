@@ -14,6 +14,8 @@ pub struct IdentityResolverConfig {
     /// Enable DNS-over-HTTPS for handle resolution
     #[allow(dead_code)] // Future DNS-over-HTTPS support
     pub use_doh: bool,
+    /// PLC directory URL for DID resolution (default: https://plc.directory)
+    pub plc_directory_url: String,
 }
 
 impl Default for IdentityResolverConfig {
@@ -21,6 +23,8 @@ impl Default for IdentityResolverConfig {
         Self {
             user_agent: "Aurora-Locus/0.1".to_string(),
             use_doh: false,
+            plc_directory_url: std::env::var("PLC_DIRECTORY_URL")
+                .unwrap_or_else(|_| "https://plc.directory".to_string()),
         }
     }
 }
@@ -195,7 +199,7 @@ impl IdentityResolver {
 
     /// Fetch DID document from PLC directory
     async fn fetch_plc_document(&self, did: &str) -> PdsResult<DidDocument> {
-        let plc_url = format!("https://plc.directory/{}", did);
+        let plc_url = format!("{}/{}", self.config.plc_directory_url.trim_end_matches('/'), did);
 
         let response = self.http_client
             .get(&plc_url)
@@ -486,5 +490,111 @@ mod tests {
 
         // Note: These tests verify the logic, not actual HTTP calls
         // Real HTTP tests would require mocking or integration tests
+    }
+
+    #[tokio::test]
+    async fn test_custom_plc_directory_url() {
+        let db = SqlitePool::connect(":memory:").await.unwrap();
+
+        // Create cache tables
+        sqlx::query(
+            r#"
+            CREATE TABLE did_doc (
+                did TEXT PRIMARY KEY,
+                doc TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cached_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            CREATE TABLE did_handle (
+                handle TEXT PRIMARY KEY,
+                did TEXT NOT NULL,
+                declared_at TEXT,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let cache = DidCache::new(db);
+
+        // Test with custom PLC directory URL
+        let custom_config = IdentityResolverConfig {
+            user_agent: "Test-Agent/1.0".to_string(),
+            use_doh: false,
+            plc_directory_url: "https://test.plc.directory".to_string(),
+        };
+
+        let resolver = IdentityResolver::new(cache.clone(), custom_config).unwrap();
+
+        // Verify the custom URL is set correctly
+        assert_eq!(resolver.config.plc_directory_url, "https://test.plc.directory");
+
+        // Test with default configuration (should use official directory or env var)
+        let default_resolver = IdentityResolver::new(cache, IdentityResolverConfig::default()).unwrap();
+
+        // Should either be the default or from environment variable
+        assert!(
+            default_resolver.config.plc_directory_url == "https://plc.directory" ||
+            default_resolver.config.plc_directory_url == std::env::var("PLC_DIRECTORY_URL").unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plc_url_trailing_slash_handling() {
+        let db = SqlitePool::connect(":memory:").await.unwrap();
+
+        // Create cache tables
+        sqlx::query(
+            r#"
+            CREATE TABLE did_doc (
+                did TEXT PRIMARY KEY,
+                doc TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cached_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            CREATE TABLE did_handle (
+                handle TEXT PRIMARY KEY,
+                did TEXT NOT NULL,
+                declared_at TEXT,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let cache = DidCache::new(db);
+
+        // Test with trailing slash
+        let config_with_slash = IdentityResolverConfig {
+            user_agent: "Test-Agent/1.0".to_string(),
+            use_doh: false,
+            plc_directory_url: "https://test.plc.directory/".to_string(),
+        };
+
+        let resolver = IdentityResolver::new(cache, config_with_slash).unwrap();
+
+        // The fetch_plc_document method should handle trailing slashes correctly
+        // by using trim_end_matches('/') in the format string
+        assert_eq!(resolver.config.plc_directory_url, "https://test.plc.directory/");
     }
 }

@@ -107,7 +107,11 @@ impl AppContext {
         // Initialize identity resolver
         // Note: Using account_db for now; could be separate database in future
         let did_cache = DidCache::new(account_db.clone());
-        let identity_config = IdentityResolverConfig::default();
+        let identity_config = IdentityResolverConfig {
+            user_agent: format!("Aurora-Locus/{}", config.service.version),
+            use_doh: false,
+            plc_directory_url: config.identity.did_plc_url.clone(),
+        };
         let identity_resolver = Arc::new(
             IdentityResolver::new(did_cache, identity_config)?
         );
