@@ -10,7 +10,8 @@
       "Bash(grep:*)",
       "Bash(cargo build:*)",
       "Bash(timeout 90 cargo build --lib)",
-      "Bash(cargo clean:*)"
+      "Bash(cargo clean:*)",
+      "Bash(rustc:*)"
     ],
     "deny": [],
     "ask": []

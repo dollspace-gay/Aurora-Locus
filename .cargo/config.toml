@@ -1,5 +1,3 @@
-# Cargo configuration for Aurora Locus
-
-# Fix for LNK1318: PDB Type Index Limit
+# For 64-bit Windows
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "split-debuginfo=unpacked"]
+rustflags = ["-C", "split-debuginfo=packed"]
