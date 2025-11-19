@@ -1,3 +1,4 @@
 # For 64-bit Windows
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "split-debuginfo=packed"]
+linker = "rust-lld"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
