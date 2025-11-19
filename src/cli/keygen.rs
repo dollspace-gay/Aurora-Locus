@@ -4,6 +4,7 @@
 
 use crate::{crypto::keypair::{KeyFormat, KeyPair}, error::PdsResult};
 use std::fs;
+use std::str::FromStr;
 
 /// Generate a DID keypair
 pub fn generate_did_key(

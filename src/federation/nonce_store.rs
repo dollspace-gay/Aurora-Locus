@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 /// Nonce entry with expiration
 #[derive(Debug, Clone)]
 struct NonceEntry {
+    #[allow(dead_code)] // Kept for debugging, only expires_at is checked
     recorded_at: Instant,
     expires_at: Instant,
 }

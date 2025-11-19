@@ -107,6 +107,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// Type alias for endpoint rate limiters (multiple limiters per endpoint)
+type EndpointLimiters = Arc<HashMap<String, Vec<Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>>>>;
+
 /// Rate limit state information for headers
 #[derive(Debug, Clone)]
 pub struct RateLimitInfo {
@@ -437,7 +440,7 @@ pub struct RateLimiter {
     cross_pds: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     /// Per-endpoint rate limiters (supports multiple simultaneous limits per endpoint)
     /// Each endpoint can have multiple rate limiters - ALL must pass for request to be allowed
-    endpoint_limiters: Arc<HashMap<String, Vec<Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>>>>,
+    endpoint_limiters: EndpointLimiters,
     /// IP-based rate limiter (keyed by IP address)
     ip_limiter: Arc<GovernorLimiter<String, DashMap<String, InMemoryState>, DefaultClock>>,
     /// Whether to trust proxy headers for IP extraction

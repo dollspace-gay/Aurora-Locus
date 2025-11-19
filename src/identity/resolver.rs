@@ -30,6 +30,7 @@ pub struct IdentityResolver {
     cache: DidCache,
     handle_resolver: Arc<HandleResolver>,
     http_client: reqwest::Client,
+    #[allow(dead_code)] // Kept for future configuration needs
     config: IdentityResolverConfig,
 }
 

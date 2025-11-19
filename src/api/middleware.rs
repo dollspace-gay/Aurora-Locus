@@ -20,13 +20,7 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get("authorization")
         .and_then(|h| h.to_str().ok())
-        .and_then(|s| {
-            if s.starts_with("Bearer ") {
-                Some(s[7..].to_string())
-            } else {
-                None
-            }
-        })
+        .and_then(|s| s.strip_prefix("Bearer ").map(|t| t.to_string()))
 }
 
 /// Authenticate request and add session to extensions

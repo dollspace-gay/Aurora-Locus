@@ -112,23 +112,25 @@ async fn create_account(
     tracing::info!("create_account: Repository initialized successfully");
 
     // Generate and send email verification token if email was provided
-    if email.is_some() && ctx.mailer.is_configured() {
-        match ctx.account_manager.generate_email_verification_token(&account.did).await {
-            Ok(token) => {
-                // Send verification email
-                let base_url = ctx.service_url();
-                if let Err(e) = ctx.mailer.send_verification_email(
-                    email.as_ref().unwrap(),
-                    account.handle.as_deref().unwrap_or("unknown"),
-                    &token,
-                    &base_url
-                ).await {
-                    tracing::warn!("Failed to send verification email: {}", e);
-                    // Don't fail account creation if email fails
+    if let Some(email_val) = &email {
+        if ctx.mailer.is_configured() {
+            match ctx.account_manager.generate_email_verification_token(&account.did).await {
+                Ok(token) => {
+                    // Send verification email
+                    let base_url = ctx.service_url();
+                    if let Err(e) = ctx.mailer.send_verification_email(
+                        email_val,
+                        account.handle.as_deref().unwrap_or("unknown"),
+                        &token,
+                        &base_url
+                    ).await {
+                        tracing::warn!("Failed to send verification email: {}", e);
+                        // Don't fail account creation if email fails
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to generate verification token: {}", e);
+                Err(e) => {
+                    tracing::warn!("Failed to generate verification token: {}", e);
+                }
             }
         }
     }

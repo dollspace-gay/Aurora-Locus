@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 pub struct FederationAuthenticator {
     identity_resolver: Arc<IdentityResolver>,
     http_client: Client,
+    #[allow(dead_code)] // TODO: Implement token caching
     cache_ttl: u64,
     /// Service authenticator for Phase 4 (DID-based JWT verification)
     pub authenticator: Arc<ServiceAuthenticator>,

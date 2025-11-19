@@ -116,8 +116,10 @@ async fn get_invite_codes(
 #[derive(Debug, Deserialize)]
 struct ListInviteCodesQuery {
     #[serde(default)]
+    #[allow(dead_code)] // TODO: Implement pagination
     limit: Option<i64>,
     #[serde(default)]
+    #[allow(dead_code)] // TODO: Implement pagination
     cursor: Option<String>,
 }
 
@@ -361,19 +363,19 @@ async fn takedown_account(
     auth: AdminAuthContext,
     Json(req): Json<TakedownAccountRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::admin::moderation::ModerationAction;
+    use crate::admin::moderation::{ApplyActionParams, ModerationAction};
 
     // Apply takedown action
     let record = ctx.moderation_manager
-        .apply_action(
-            &req.did,
-            ModerationAction::Takedown,
-            &req.reason,
-            &auth.did,
-            None,
-            None,
-            req.notes.clone(),
-        )
+        .apply_action(ApplyActionParams {
+            did: &req.did,
+            action: ModerationAction::Takedown,
+            reason: &req.reason,
+            moderated_by: &auth.did,
+            expires_in: None,
+            report_id: None,
+            notes: req.notes.clone(),
+        })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -406,21 +408,21 @@ async fn suspend_account(
     auth: AdminAuthContext,
     Json(req): Json<SuspendAccountRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::admin::moderation::ModerationAction;
+    use crate::admin::moderation::{ApplyActionParams, ModerationAction};
 
     let expires_in = req.duration_days.map(Duration::days);
 
     // Apply suspension
     let record = ctx.moderation_manager
-        .apply_action(
-            &req.did,
-            ModerationAction::Suspend,
-            &req.reason,
-            &auth.did,
+        .apply_action(ApplyActionParams {
+            did: &req.did,
+            action: ModerationAction::Suspend,
+            reason: &req.reason,
+            moderated_by: &auth.did,
             expires_in,
-            None,
-            req.notes.clone(),
-        )
+            report_id: None,
+            notes: req.notes.clone(),
+        })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -745,7 +747,7 @@ async fn update_subject_status(
     auth: AdminAuthContext,
     Json(req): Json<UpdateSubjectStatusRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::admin::moderation::ModerationAction;
+    use crate::admin::moderation::{ApplyActionParams, ModerationAction};
 
     // Extract DID from subject (handle both DID and AT-URI)
     let did = if req.subject.starts_with("did:") {
@@ -782,15 +784,15 @@ async fn update_subject_status(
     let reason = format!("Admin action: {}", req.action);
 
     ctx.moderation_manager
-        .apply_action(
-            &did,
+        .apply_action(ApplyActionParams {
+            did: &did,
             action,
-            &reason,
-            &auth.did,
-            duration,
-            None,
-            None,
-        )
+            reason: &reason,
+            moderated_by: &auth.did,
+            expires_in: duration,
+            report_id: None,
+            notes: None,
+        })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

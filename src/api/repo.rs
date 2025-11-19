@@ -38,6 +38,7 @@ struct CreateRecordRequest {
     validate: Option<bool>,
     record: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_commit: Option<String>,
 }
 
@@ -60,8 +61,10 @@ struct PutRecordRequest {
     validate: Option<bool>,
     record: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_record: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_commit: Option<String>,
 }
 
@@ -81,8 +84,10 @@ struct DeleteRecordRequest {
     collection: String,
     rkey: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_record: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_commit: Option<String>,
 }
 
@@ -94,6 +99,7 @@ struct GetRecordQuery {
     collection: String,
     rkey: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // TODO: Implement CID-specific record retrieval
     cid: Option<String>,
 }
 
@@ -119,6 +125,7 @@ struct ListRecordsQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // TODO: Implement reverse ordering
     reverse: Option<bool>,
 }
 
@@ -170,9 +177,11 @@ struct DescribeRepoResponse {
 struct ApplyWritesRequest {
     repo: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // TODO: Implement record validation
     validate: Option<bool>,
     writes: Vec<WriteOp>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_commit: Option<String>,
 }
 

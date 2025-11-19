@@ -18,10 +18,10 @@ pub use repository::WriteOpAction;
 pub use store::{ActorStore, ActorStoreConfig};
 pub use transaction::ActorTransaction;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Get the storage location for a user's actor store
-pub fn get_actor_location(base_dir: &PathBuf, did: &str) -> ActorLocation {
+pub fn get_actor_location(base_dir: &Path, did: &str) -> ActorLocation {
     // Hash the DID to get directory sharding (first 2 chars of hash)
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

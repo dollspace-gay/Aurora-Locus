@@ -29,7 +29,6 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use sqlx::Row;
-use std::sync::Arc;
 use tracing::{debug, warn};
 use uuid::Uuid;
 

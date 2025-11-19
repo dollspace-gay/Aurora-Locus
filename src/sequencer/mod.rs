@@ -4,6 +4,7 @@
 //! All repository updates are recorded in a monotonically increasing sequence.
 
 pub mod events;
+#[allow(clippy::module_inception)] // Intentional: sequencer module contains Sequencer type
 pub mod sequencer;
 
 pub use events::*;

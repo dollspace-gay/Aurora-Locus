@@ -68,6 +68,17 @@ pub struct ModerationRecord {
     pub notes: Option<String>,
 }
 
+/// Parameters for applying a moderation action
+pub struct ApplyActionParams<'a> {
+    pub did: &'a str,
+    pub action: ModerationAction,
+    pub reason: &'a str,
+    pub moderated_by: &'a str,
+    pub expires_in: Option<Duration>,
+    pub report_id: Option<i64>,
+    pub notes: Option<String>,
+}
+
 /// Moderation manager
 #[derive(Clone)]
 pub struct ModerationManager {
@@ -81,16 +92,17 @@ impl ModerationManager {
     }
 
     /// Apply moderation action to an account
-    pub async fn apply_action(
-        &self,
-        did: &str,
-        action: ModerationAction,
-        reason: &str,
-        moderated_by: &str,
-        expires_in: Option<Duration>,
-        report_id: Option<i64>,
-        notes: Option<String>,
-    ) -> PdsResult<ModerationRecord> {
+    pub async fn apply_action(&self, params: ApplyActionParams<'_>) -> PdsResult<ModerationRecord> {
+        let ApplyActionParams {
+            did,
+            action,
+            reason,
+            moderated_by,
+            expires_in,
+            report_id,
+            notes,
+        } = params;
+
         let now = Utc::now();
         let expires_at = expires_in.map(|d| now + d);
 
@@ -443,15 +455,15 @@ mod tests {
 
         // Apply takedown
         let record = manager
-            .apply_action(
-                "did:plc:spam123",
-                ModerationAction::Takedown,
-                "Spam content",
-                "did:plc:admin",
-                None,
-                None,
-                Some("Automated detection".to_string()),
-            )
+            .apply_action(ApplyActionParams {
+                did: "did:plc:spam123",
+                action: ModerationAction::Takedown,
+                reason: "Spam content",
+                moderated_by: "did:plc:admin",
+                expires_in: None,
+                report_id: None,
+                notes: Some("Automated detection".to_string()),
+            })
             .await
             .unwrap();
 
@@ -502,15 +514,15 @@ mod tests {
 
         // Suspend for 7 days
         manager
-            .apply_action(
-                "did:plc:bad123",
-                ModerationAction::Suspend,
-                "Repeated violations",
-                "did:plc:admin",
-                Some(Duration::days(7)),
-                None,
-                None,
-            )
+            .apply_action(ApplyActionParams {
+                did: "did:plc:bad123",
+                action: ModerationAction::Suspend,
+                reason: "Repeated violations",
+                moderated_by: "did:plc:admin",
+                expires_in: Some(Duration::days(7)),
+                report_id: None,
+                notes: None,
+            })
             .await
             .unwrap();
 
@@ -552,15 +564,15 @@ mod tests {
 
         // Apply and reverse
         let record = manager
-            .apply_action(
-                "did:plc:false",
-                ModerationAction::Takedown,
-                "Mistake",
-                "did:plc:admin",
-                None,
-                None,
-                None,
-            )
+            .apply_action(ApplyActionParams {
+                did: "did:plc:false",
+                action: ModerationAction::Takedown,
+                reason: "Mistake",
+                moderated_by: "did:plc:admin",
+                expires_in: None,
+                report_id: None,
+                notes: None,
+            })
             .await
             .unwrap();
 

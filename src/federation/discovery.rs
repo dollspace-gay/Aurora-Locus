@@ -114,10 +114,10 @@ impl PdsDiscovery {
         let instances: Vec<PdsInstance> = relay_response
             .repos
             .into_iter()
-            .filter_map(|repo| {
+            .map(|repo| {
                 // Extract PDS URL from repo DID
                 // In practice, would resolve DID to get PDS endpoint
-                Some(PdsInstance {
+                PdsInstance {
                     did: repo.did,
                     url: String::new(), // Would be filled by DID resolution
                     name: None,
@@ -125,7 +125,7 @@ impl PdsDiscovery {
                     user_count: None,
                     last_seen: Some(chrono::Utc::now().timestamp()),
                     features: vec![],
-                })
+                }
             })
             .collect();
 
@@ -230,6 +230,7 @@ impl PdsDiscovery {
 struct RelayResponse {
     repos: Vec<RepoEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // TODO: Implement pagination for relay discovery
     cursor: Option<String>,
 }
 

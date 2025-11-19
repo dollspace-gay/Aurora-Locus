@@ -286,10 +286,8 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
         .map_err(PdsError::Database)?;
 
     if let Some(row) = seq_result {
-        if let Ok(max_seq) = row.try_get::<Option<i64>, _>("max_seq") {
-            if let Some(seq) = max_seq {
-                crate::metrics::update_sequencer_position(seq);
-            }
+        if let Ok(Some(seq)) = row.try_get::<Option<i64>, _>("max_seq") {
+            crate::metrics::update_sequencer_position(seq);
         }
     }
 

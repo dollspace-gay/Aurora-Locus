@@ -333,7 +333,9 @@ struct TokenRecord {
     client_id: String,
     scope: String,
     expires_at: DateTime<Utc>,
+    #[allow(dead_code)] // Stored in DB for audit trail
     created_at: DateTime<Utc>,
+    #[allow(dead_code)] // Stored in DB for audit trail
     updated_at: DateTime<Utc>,
 }
 

@@ -35,7 +35,6 @@ use axum::{
 use chrono::Utc;
 use serde::Deserialize;
 use sqlx::Row;
-use std::sync::Arc;
 use tracing::{debug, warn};
 use uuid::Uuid;
 

@@ -7,6 +7,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
 
+/// Type alias for collection validator functions
+type ValidatorFn = Box<dyn Fn(&Value) -> ValidationResult + Send + Sync>;
+
 /// Validation mode determines how strictly records are validated
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -63,7 +66,7 @@ pub struct RecordValidator {
     /// Validation mode
     mode: ValidationMode,
     /// Collection-specific validators
-    validators: HashMap<String, Box<dyn Fn(&Value) -> ValidationResult + Send + Sync>>,
+    validators: HashMap<String, ValidatorFn>,
 }
 
 impl RecordValidator {

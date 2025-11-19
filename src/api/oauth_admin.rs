@@ -179,6 +179,7 @@ struct OAuthCallbackParams {
 }
 
 /// Response for successful OAuth login
+#[allow(dead_code)] // TODO: Implement OAuth login endpoint
 #[derive(Serialize)]
 struct OAuthLoginResponse {
     access_token: String,

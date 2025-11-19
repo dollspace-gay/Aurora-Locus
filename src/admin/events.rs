@@ -94,6 +94,17 @@ pub struct ModerationEvent {
     pub meta: Option<serde_json::Value>,
 }
 
+/// Parameters for logging a moderation event
+pub struct LogEventParams<'a> {
+    pub event_type: ModerationEventType,
+    pub actor_did: &'a str,
+    pub subject_did: Option<&'a str>,
+    pub subject_uri: Option<&'a str>,
+    pub subject_cid: Option<&'a str>,
+    pub details: serde_json::Value,
+    pub meta: Option<serde_json::Value>,
+}
+
 /// Moderation event logger
 #[derive(Clone)]
 pub struct ModerationEventLogger {
@@ -106,16 +117,17 @@ impl ModerationEventLogger {
     }
 
     /// Log a moderation event
-    pub async fn log_event(
-        &self,
-        event_type: ModerationEventType,
-        actor_did: &str,
-        subject_did: Option<&str>,
-        subject_uri: Option<&str>,
-        subject_cid: Option<&str>,
-        details: serde_json::Value,
-        meta: Option<serde_json::Value>,
-    ) -> PdsResult<ModerationEvent> {
+    pub async fn log_event(&self, params: LogEventParams<'_>) -> PdsResult<ModerationEvent> {
+        let LogEventParams {
+            event_type,
+            actor_did,
+            subject_did,
+            subject_uri,
+            subject_cid,
+            details,
+            meta,
+        } = params;
+
         let now = Utc::now();
 
         let details_json = serde_json::to_string(&details)
@@ -337,15 +349,15 @@ mod tests {
         });
 
         let event = logger
-            .log_event(
-                ModerationEventType::AccountTakedown,
-                "did:plc:admin",
-                Some("did:plc:spammer"),
-                None,
-                None,
-                details.clone(),
-                None,
-            )
+            .log_event(LogEventParams {
+                event_type: ModerationEventType::AccountTakedown,
+                actor_did: "did:plc:admin",
+                subject_did: Some("did:plc:spammer"),
+                subject_uri: None,
+                subject_cid: None,
+                details: details.clone(),
+                meta: None,
+            })
             .await
             .unwrap();
 

@@ -26,6 +26,7 @@ pub struct FederatedSearch {
     http_client: Client,
     discovery: Arc<PdsDiscovery>,
     max_concurrent: usize,
+    #[allow(dead_code)] // Configured into http_client during construction
     timeout_secs: u64,
     /// Circuit breaker state per PDS instance (DID -> state)
     circuit_breakers: Arc<RwLock<HashMap<String, CircuitState>>>,

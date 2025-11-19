@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "Bash(else echo \"File not found\")",
-      "Bash(fi)"
+      "Bash(fi)",
+      "Bash(cargo clippy:*)",
+      "Bash(bd close:*)",
+      "Bash(bd ready:*)",
+      "Bash(bd update:*)",
+      "Bash(grep:*)",
+      "Bash(cargo build:*)",
+      "Bash(timeout 90 cargo build --lib)",
+      "Bash(cargo clean:*)"
     ],
     "deny": [],
     "ask": []

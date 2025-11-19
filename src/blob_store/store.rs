@@ -372,6 +372,7 @@ impl BlobStore {
     }
 
     /// Store blob metadata in database (basic version without dimensions)
+    #[allow(dead_code)] // Simplified version, use store_metadata_full for full metadata
     async fn store_metadata(&self, cid: &str, mime_type: &str, size: i64, creator_did: &str) -> PdsResult<()> {
         sqlx::query(
             r#"
