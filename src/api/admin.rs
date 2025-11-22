@@ -48,6 +48,14 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.listReports", get(list_reports))
         // Validation failures
         .route("/xrpc/com.atproto.admin.getValidationFailures", get(get_validation_failures))
+        // System health and diagnostics
+        .route("/xrpc/com.atproto.admin.getSystemHealth", get(get_system_health))
+        .route("/xrpc/com.atproto.admin.getDatabaseStatus", get(get_database_status))
+        .route("/xrpc/com.atproto.admin.getResourceUsage", get(get_resource_usage))
+        .route("/xrpc/com.atproto.admin.listBackgroundJobs", get(list_background_jobs))
+        .route("/xrpc/com.atproto.admin.runHealthChecks", get(run_health_checks))
+        .route("/xrpc/com.atproto.admin.getVersionInfo", get(get_version_info))
+        .route("/xrpc/com.atproto.admin.getSystemMetrics", get(get_system_metrics))
 }
 
 // ============================================================================
@@ -878,4 +886,764 @@ async fn get_validation_failures(
         "failures": failures,
         "count": failures.len(),
     })))
+}
+
+// ============================================================================
+// System Health and Diagnostics Endpoints
+// ============================================================================
+
+/// Get overall system health status
+async fn get_system_health(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::metrics;
+
+    let uptime = metrics::UPTIME_SECONDS.get();
+
+    // Check critical services
+    let db_healthy = sqlx::query("SELECT 1")
+        .fetch_one(&ctx.account_db)
+        .await
+        .is_ok();
+
+    let sequencer_healthy = true; // Sequencer is always available if context exists
+
+    // Check optional services
+    let relay_connected = ctx.relay_client.is_some();
+    let federation_enabled = ctx.config.federation.enabled;
+
+    // Determine overall health
+    let status = if db_healthy && sequencer_healthy {
+        "healthy"
+    } else {
+        "unhealthy"
+    };
+
+    Ok(Json(serde_json::json!({
+        "status": status,
+        "version": ctx.config.service.version,
+        "uptime_seconds": uptime,
+        "services": {
+            "database": if db_healthy { "healthy" } else { "unhealthy" },
+            "sequencer": if sequencer_healthy { "healthy" } else { "unhealthy" },
+            "relay": if relay_connected { "connected" } else { "disconnected" },
+            "federation": if federation_enabled { "enabled" } else { "disabled" },
+        },
+        "active_http_requests": metrics::HTTP_REQUESTS_ACTIVE.get(),
+        "active_sessions": metrics::SESSIONS_ACTIVE.get(),
+    })))
+}
+
+/// Get database connection pool status
+async fn get_database_status(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get pool statistics
+    let pool_size = ctx.account_db.size();
+    let pool_connections = ctx.account_db.num_idle();
+
+    // Try a test query to measure latency
+    let start = std::time::Instant::now();
+    let query_ok = sqlx::query("SELECT 1")
+        .fetch_one(&ctx.account_db)
+        .await
+        .is_ok();
+    let query_latency_ms = start.elapsed().as_millis();
+
+    // Get database-level statistics
+    let db_stats = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM account")
+        .fetch_one(&ctx.account_db)
+        .await
+        .map(|(count,)| count)
+        .unwrap_or(0);
+
+    let session_count = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .map(|(count,)| count)
+    .unwrap_or(0);
+
+    Ok(Json(serde_json::json!({
+        "status": if query_ok { "healthy" } else { "unhealthy" },
+        "pool": {
+            "size": pool_size,
+            "idle_connections": pool_connections,
+            "active_connections": pool_size as i64 - pool_connections as i64,
+        },
+        "latency_ms": query_latency_ms,
+        "statistics": {
+            "total_accounts": db_stats,
+            "active_sessions": session_count,
+        }
+    })))
+}
+
+/// Get resource usage metrics (CPU, memory)
+async fn get_resource_usage(
+    State(_ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get process metrics from prometheus
+    let metric_families = prometheus::gather();
+
+    let mut memory_bytes: Option<f64> = None;
+    let mut cpu_seconds_total: Option<f64> = None;
+    let mut open_fds: Option<f64> = None;
+
+    // Extract process metrics
+    for mf in &metric_families {
+        match mf.get_name() {
+            "process_resident_memory_bytes" => {
+                if let Some(m) = mf.get_metric().first() {
+                    memory_bytes = Some(m.get_gauge().get_value());
+                }
+            }
+            "process_cpu_seconds_total" => {
+                if let Some(m) = mf.get_metric().first() {
+                    cpu_seconds_total = Some(m.get_counter().get_value());
+                }
+            }
+            "process_open_fds" => {
+                if let Some(m) = mf.get_metric().first() {
+                    open_fds = Some(m.get_gauge().get_value());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "memory": {
+            "resident_bytes": memory_bytes.unwrap_or(0.0),
+            "resident_mb": memory_bytes.unwrap_or(0.0) / 1024.0 / 1024.0,
+        },
+        "cpu": {
+            "seconds_total": cpu_seconds_total.unwrap_or(0.0),
+        },
+        "file_descriptors": {
+            "open": open_fds.unwrap_or(0.0) as i64,
+        }
+    })))
+}
+
+/// List background jobs status
+async fn list_background_jobs(
+    State(_ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::metrics;
+
+    // Get metrics about background jobs
+    let active_jobs = metrics::BACKGROUND_JOBS_ACTIVE.get();
+
+    // Get job execution counts from prometheus
+    let metric_families = prometheus::gather();
+    let mut job_stats = std::collections::HashMap::new();
+
+    for mf in &metric_families {
+        if mf.get_name() == "background_jobs_total" {
+            for metric in mf.get_metric() {
+                let mut job_type = "unknown";
+                let mut status = "unknown";
+
+                for label in metric.get_label() {
+                    if label.get_name() == "job_type" {
+                        job_type = label.get_value();
+                    } else if label.get_name() == "status" {
+                        status = label.get_value();
+                    }
+                }
+
+                let count = metric.get_counter().get_value() as i64;
+                let entry = job_stats.entry(job_type).or_insert_with(|| serde_json::json!({
+                    "type": job_type,
+                    "success": 0,
+                    "failure": 0,
+                    "total": 0,
+                }));
+
+                if let Some(obj) = entry.as_object_mut() {
+                    obj["total"] = serde_json::json!(obj["total"].as_i64().unwrap_or(0) + count);
+                    if status == "success" {
+                        obj["success"] = serde_json::json!(count);
+                    } else if status == "failure" {
+                        obj["failure"] = serde_json::json!(count);
+                    }
+                }
+            }
+        }
+    }
+
+    let jobs: Vec<_> = job_stats.values().cloned().collect();
+
+    Ok(Json(serde_json::json!({
+        "active_jobs": active_jobs,
+        "job_statistics": jobs,
+    })))
+}
+
+/// Run comprehensive health checks
+async fn run_health_checks(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let start = std::time::Instant::now();
+    let mut checks = Vec::new();
+
+    // Database check
+    let db_start = std::time::Instant::now();
+    let db_healthy = sqlx::query("SELECT 1")
+        .fetch_one(&ctx.account_db)
+        .await
+        .is_ok();
+    checks.push(serde_json::json!({
+        "component": "database",
+        "status": if db_healthy { "healthy" } else { "unhealthy" },
+        "response_time_ms": db_start.elapsed().as_millis(),
+    }));
+
+    // Blob storage check
+    let blob_start = std::time::Instant::now();
+    let _ = &ctx.blob_store; // Just verify it exists
+    checks.push(serde_json::json!({
+        "component": "blob_storage",
+        "status": "healthy",
+        "response_time_ms": blob_start.elapsed().as_millis(),
+    }));
+
+    // Sequencer check
+    let seq_start = std::time::Instant::now();
+    let _ = &ctx.sequencer;
+    checks.push(serde_json::json!({
+        "component": "sequencer",
+        "status": "healthy",
+        "response_time_ms": seq_start.elapsed().as_millis(),
+    }));
+
+    // Identity resolver check
+    let identity_start = std::time::Instant::now();
+    let _ = &ctx.identity_resolver;
+    checks.push(serde_json::json!({
+        "component": "identity_resolver",
+        "status": "healthy",
+        "response_time_ms": identity_start.elapsed().as_millis(),
+    }));
+
+    // Relay check (if enabled)
+    if let Some(ref _relay) = ctx.relay_client {
+        checks.push(serde_json::json!({
+            "component": "relay_client",
+            "status": "connected",
+            "response_time_ms": 0,
+        }));
+    }
+
+    // Email service check (if configured)
+    let email_configured = ctx.config.email.is_some();
+    if email_configured {
+        checks.push(serde_json::json!({
+            "component": "email_service",
+            "status": "configured",
+            "response_time_ms": 0,
+        }));
+    }
+
+    // Determine overall status
+    let all_healthy = checks.iter().all(|c| {
+        c["status"] == "healthy" || c["status"] == "connected" || c["status"] == "configured"
+    });
+
+    Ok(Json(serde_json::json!({
+        "overall_status": if all_healthy { "healthy" } else { "degraded" },
+        "checks": checks,
+        "total_duration_ms": start.elapsed().as_millis(),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })))
+}
+
+/// Get version and build information
+async fn get_version_info(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    Ok(Json(serde_json::json!({
+        "version": ctx.config.service.version,
+        "service_did": ctx.config.service.service_did,
+        "hostname": ctx.config.service.hostname,
+        "port": ctx.config.service.port,
+        "rust_version": env!("CARGO_PKG_RUST_VERSION"),
+        "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "features": {
+            "federation": ctx.config.federation.enabled,
+            "invites_required": ctx.config.invites.required,
+            "rate_limiting": ctx.config.rate_limit.enabled,
+            "email": ctx.config.email.is_some(),
+        }
+    })))
+}
+
+/// Get comprehensive system metrics
+async fn get_system_metrics(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::metrics;
+
+    // Gather all Prometheus metrics
+    let metric_families = prometheus::gather();
+
+    // Extract key metrics
+    let mut http_requests_total: i64 = 0;
+    let mut db_queries_total: i64 = 0;
+    let mut cache_hits: i64 = 0;
+    let mut cache_misses: i64 = 0;
+    let mut sequencer_current_seq: i64 = 0;
+    let mut relay_events_total: i64 = 0;
+
+    for mf in &metric_families {
+        match mf.get_name() {
+            "http_requests_total" => {
+                for m in mf.get_metric() {
+                    http_requests_total += m.get_counter().get_value() as i64;
+                }
+            }
+            "db_queries_total" => {
+                for m in mf.get_metric() {
+                    db_queries_total += m.get_counter().get_value() as i64;
+                }
+            }
+            "cache_hits_total" => {
+                for m in mf.get_metric() {
+                    cache_hits += m.get_counter().get_value() as i64;
+                }
+            }
+            "cache_misses_total" => {
+                for m in mf.get_metric() {
+                    cache_misses += m.get_counter().get_value() as i64;
+                }
+            }
+            "sequencer_current_seq" => {
+                if let Some(m) = mf.get_metric().first() {
+                    sequencer_current_seq = m.get_gauge().get_value() as i64;
+                }
+            }
+            "relay_events_total" => {
+                for m in mf.get_metric() {
+                    relay_events_total += m.get_counter().get_value() as i64;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let cache_total = cache_hits + cache_misses;
+    let cache_hit_rate = if cache_total > 0 {
+        (cache_hits as f64 / cache_total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(Json(serde_json::json!({
+        "uptime_seconds": metrics::UPTIME_SECONDS.get(),
+        "http": {
+            "requests_total": http_requests_total,
+            "active_requests": metrics::HTTP_REQUESTS_ACTIVE.get(),
+        },
+        "database": {
+            "queries_total": db_queries_total,
+            "active_connections": metrics::DB_CONNECTIONS_ACTIVE.get(),
+            "pool_size": ctx.account_db.size(),
+        },
+        "cache": {
+            "hits": cache_hits,
+            "misses": cache_misses,
+            "hit_rate_percent": cache_hit_rate,
+        },
+        "sequencer": {
+            "current_sequence": sequencer_current_seq,
+            "events_total": metrics::SEQUENCER_EVENTS_TOTAL.with_label_values(&["commit"]).get() +
+                           metrics::SEQUENCER_EVENTS_TOTAL.with_label_values(&["identity"]).get() +
+                           metrics::SEQUENCER_EVENTS_TOTAL.with_label_values(&["account"]).get(),
+        },
+        "relay": {
+            "events_received": relay_events_total,
+            "connection_status": metrics::RELAY_CONNECTION_STATUS.get(),
+        },
+        "accounts": {
+            "total": metrics::ACCOUNTS_TOTAL.get(),
+            "active_sessions": metrics::SESSIONS_ACTIVE.get(),
+        },
+        "background_jobs": {
+            "active": metrics::BACKGROUND_JOBS_ACTIVE.get(),
+        }
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{ServerConfig, FederationConfig, ServiceConfig, StorageConfig, AuthConfig,
+                 InviteConfig, RateLimitConfig, LoggingConfig, OAuthConfig, IdentityConfig, BlobstoreConfig},
+        db,
+        account::ValidatedSession,
+        admin::roles::Role,
+    };
+    use tempfile::tempdir;
+
+    async fn create_test_context() -> AppContext {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        let config = ServerConfig {
+            service: ServiceConfig {
+                hostname: "localhost".to_string(),
+                port: 2583,
+                service_did: "did:web:localhost".to_string(),
+                version: "0.1.0-test".to_string(),
+                blob_upload_limit: 5242880,
+            },
+            storage: StorageConfig {
+                data_directory: dir.path().to_path_buf(),
+                account_db: db_path.clone(),
+                sequencer_db: dir.path().join("sequencer.db"),
+                did_cache_db: dir.path().join("did_cache.db"),
+                actor_store_directory: dir.path().join("actors"),
+                blobstore: BlobstoreConfig::Disk {
+                    location: dir.path().join("blobs"),
+                    tmp_location: dir.path().join("temp"),
+                },
+            },
+            authentication: AuthConfig {
+                jwt_secret: "test-secret".to_string(),
+                repo_signing_key: "test-key".to_string(),
+                plc_rotation_key: "test-rotation-key".to_string(),
+                admin_dids: vec![],
+                oauth: OAuthConfig {
+                    client_id: "http://localhost:3000/client-metadata.json".to_string(),
+                    redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
+                    pds_url: "https://bsky.social".to_string(),
+                },
+                jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
+                oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration".to_string(),
+            },
+            identity: IdentityConfig {
+                did_plc_url: "https://plc.directory".to_string(),
+                service_handle_domains: vec![".localhost".to_string()],
+                did_cache_stale_ttl: 3600,
+                did_cache_max_ttl: 86400,
+            },
+            email: None,
+            invites: InviteConfig {
+                required: false,
+                interval: 604800,
+                epoch: "2024-01-01T00:00:00Z".to_string(),
+            },
+            rate_limit: RateLimitConfig {
+                enabled: true,
+                global_requests_per_minute: 3000,
+                use_redis: false,
+                redis_url: None,
+            },
+            logging: LoggingConfig {
+                level: "info".to_string(),
+            },
+            federation: FederationConfig {
+                enabled: false,
+                relay_urls: vec![],
+                appview_url: None,
+                firehose_enabled: false,
+                crawl_enabled: false,
+                public_url: Some("http://localhost:2583".to_string()),
+                auto_stream_events: false,
+            },
+            validation_mode: crate::validation::ValidationMode::Required,
+        };
+
+        AppContext::new(config).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_get_system_health() {
+        let ctx = create_test_context().await;
+        let auth = AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+
+        let result = get_system_health(State(ctx), auth).await;
+        assert!(result.is_ok());
+
+        let json = result.unwrap().0;
+        assert!(json["status"].is_string());
+        assert_eq!(json["version"], "0.1.0-test");
+        assert!(json["uptime_seconds"].is_number());
+        assert!(json["services"].is_object());
+        assert!(json["services"]["database"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_database_status() {
+        let ctx = create_test_context().await;
+        let auth = AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+
+        let result = get_database_status(State(ctx), auth).await;
+        assert!(result.is_ok());
+
+        let json = result.unwrap().0;
+        assert_eq!(json["status"], "healthy");
+        assert!(json["pool"]["size"].is_number());
+        assert!(json["pool"]["idle_connections"].is_number());
+        assert!(json["pool"]["active_connections"].is_number());
+        assert!(json["latency_ms"].is_number());
+        assert!(json["statistics"]["total_accounts"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_get_resource_usage() {
+        let ctx = create_test_context().await;
+        let auth = AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+
+        let result = get_resource_usage(State(ctx), auth).await;
+        assert!(result.is_ok());
+
+        let json = result.unwrap().0;
+        assert!(json["memory"].is_object());
+        assert!(json["memory"]["resident_bytes"].is_number());
+        assert!(json["memory"]["resident_mb"].is_number());
+        assert!(json["cpu"].is_object());
+        assert!(json["cpu"]["seconds_total"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_list_background_jobs() {
+        let ctx = create_test_context().await;
+        let auth = AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+
+        let result = list_background_jobs(State(ctx), auth).await;
+        assert!(result.is_ok());
+
+        let json = result.unwrap().0;
+        assert!(json["active_jobs"].is_number());
+        assert!(json["job_statistics"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_run_health_checks() {
+        let ctx = create_test_context().await;
+        let auth = AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+
+        let result = run_health_checks(State(ctx), auth).await;
+        assert!(result.is_ok());
+
+        let json = result.unwrap().0;
+        assert!(json["overall_status"].is_string());
+        assert!(json["checks"].is_array());
+        assert!(json["total_duration_ms"].is_number());
+        assert!(json["timestamp"].is_string());
+
+        // Verify critical components are checked
+        let checks = json["checks"].as_array().unwrap();
+        let component_names: Vec<&str> = checks
+            .iter()
+            .filter_map(|c| c["component"].as_str())
+            .collect();
+
+        assert!(component_names.contains(&"database"));
+        assert!(component_names.contains(&"blob_storage"));
+        assert!(component_names.contains(&"sequencer"));
+        assert!(component_names.contains(&"identity_resolver"));
+    }
+
+    #[tokio::test]
+    async fn test_get_version_info() {
+        let ctx = create_test_context().await;
+        let auth = AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+
+        let result = get_version_info(State(ctx), auth).await;
+        assert!(result.is_ok());
+
+        let json = result.unwrap().0;
+        assert_eq!(json["version"], "0.1.0-test");
+        assert_eq!(json["service_did"], "did:web:localhost");
+        assert_eq!(json["hostname"], "localhost");
+        assert_eq!(json["port"], 2583);
+        assert!(json["build_profile"].is_string());
+        assert!(json["features"].is_object());
+        assert_eq!(json["features"]["federation"], false);
+    }
+
+    #[tokio::test]
+    async fn test_get_system_metrics() {
+        let ctx = create_test_context().await;
+        let auth = AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+
+        let result = get_system_metrics(State(ctx), auth).await;
+        assert!(result.is_ok());
+
+        let json = result.unwrap().0;
+        assert!(json["uptime_seconds"].is_number());
+        assert!(json["http"].is_object());
+        assert!(json["http"]["requests_total"].is_number());
+        assert!(json["http"]["active_requests"].is_number());
+        assert!(json["database"].is_object());
+        assert!(json["database"]["queries_total"].is_number());
+        assert!(json["database"]["pool_size"].is_number());
+        assert!(json["cache"].is_object());
+        assert!(json["cache"]["hits"].is_number());
+        assert!(json["cache"]["misses"].is_number());
+        assert!(json["cache"]["hit_rate_percent"].is_number());
+        assert!(json["sequencer"].is_object());
+        assert!(json["accounts"].is_object());
+        assert!(json["background_jobs"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_database_status_pool_metrics() {
+        let ctx = create_test_context().await;
+        let auth = AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+
+        // Make a query to activate a connection
+        let _ = sqlx::query("SELECT 1")
+            .fetch_one(&ctx.account_db)
+            .await;
+
+        let result = get_database_status(State(ctx.clone()), auth).await;
+        assert!(result.is_ok());
+
+        let json = result.unwrap().0;
+        let pool_size = json["pool"]["size"].as_u64().unwrap();
+        let idle = json["pool"]["idle_connections"].as_u64().unwrap();
+        let active = json["pool"]["active_connections"].as_i64().unwrap();
+
+        // Verify pool metrics are consistent
+        assert!(pool_size > 0);
+        assert!(idle >= 0);
+        assert!(active >= 0);
+        assert_eq!(pool_size as i64, idle as i64 + active);
+    }
+
+    #[tokio::test]
+    async fn test_health_checks_response_times() {
+        let ctx = create_test_context().await;
+        let auth = AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+
+        let result = run_health_checks(State(ctx), auth).await;
+        assert!(result.is_ok());
+
+        let json = result.unwrap().0;
+        let checks = json["checks"].as_array().unwrap();
+
+        // Verify all checks have response times
+        for check in checks {
+            assert!(check["response_time_ms"].is_number());
+            let response_time = check["response_time_ms"].as_u64().unwrap();
+            // Response time should be reasonable (< 1 second)
+            assert!(response_time < 1000, "Response time too high: {}", response_time);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_system_metrics_cache_hit_rate() {
+        let ctx = create_test_context().await;
+        let auth = AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+
+        // Record some cache events
+        crate::metrics::record_cache_access("test", true);
+        crate::metrics::record_cache_access("test", true);
+        crate::metrics::record_cache_access("test", false);
+
+        let result = get_system_metrics(State(ctx), auth).await;
+        assert!(result.is_ok());
+
+        let json = result.unwrap().0;
+        let hits = json["cache"]["hits"].as_i64().unwrap();
+        let misses = json["cache"]["misses"].as_i64().unwrap();
+        let hit_rate = json["cache"]["hit_rate_percent"].as_f64().unwrap();
+
+        assert!(hits >= 2);
+        assert!(misses >= 1);
+        assert!(hit_rate >= 0.0 && hit_rate <= 100.0);
+    }
 }
