@@ -1964,7 +1964,6 @@ mod tests {
     use crate::{
         config::{ServerConfig, FederationConfig, ServiceConfig, StorageConfig, AuthConfig,
                  InviteConfig, RateLimitConfig, LoggingConfig, OAuthConfig, IdentityConfig, BlobstoreConfig},
-        db,
         account::ValidatedSession,
         admin::roles::Role,
     };
@@ -2258,8 +2257,7 @@ mod tests {
 
         // Verify pool metrics are consistent
         assert!(pool_size > 0);
-        assert!(idle >= 0);
-        assert!(active >= 0);
+        // idle and active are unsigned, so always >= 0
         assert_eq!(pool_size as i64, idle as i64 + active);
     }
 

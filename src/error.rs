@@ -82,6 +82,34 @@ pub enum PdsError {
     AccountSuspended(String),
 }
 
+/// Manual PartialEq implementation for PdsError
+/// Note: Database and Io variants cannot be truly compared due to underlying types
+impl PartialEq for PdsError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (PdsError::Authentication(a), PdsError::Authentication(b)) => a == b,
+            (PdsError::Authorization(a), PdsError::Authorization(b)) => a == b,
+            (PdsError::Validation(a), PdsError::Validation(b)) => a == b,
+            (PdsError::Repository(a), PdsError::Repository(b)) => a == b,
+            (PdsError::BlobStorage(a), PdsError::BlobStorage(b)) => a == b,
+            (PdsError::DidResolution(a), PdsError::DidResolution(b)) => a == b,
+            (PdsError::IdentityResolution(a), PdsError::IdentityResolution(b)) => a == b,
+            (PdsError::RateLimitExceeded { retry_after: a }, PdsError::RateLimitExceeded { retry_after: b }) => a == b,
+            (PdsError::NotFound(a), PdsError::NotFound(b)) => a == b,
+            (PdsError::Conflict(a), PdsError::Conflict(b)) => a == b,
+            (PdsError::Internal(a), PdsError::Internal(b)) => a == b,
+            (PdsError::AtProto(a), PdsError::AtProto(b)) => a == b,
+            (PdsError::Jwt(a), PdsError::Jwt(b)) => a == b,
+            (PdsError::AccountTakenDown(a), PdsError::AccountTakenDown(b)) => a == b,
+            (PdsError::AccountSuspended(a), PdsError::AccountSuspended(b)) => a == b,
+            // Database and Io errors cannot be compared, so we use error message comparison
+            (PdsError::Database(a), PdsError::Database(b)) => a.to_string() == b.to_string(),
+            (PdsError::Io(a), PdsError::Io(b)) => a.to_string() == b.to_string(),
+            _ => false,
+        }
+    }
+}
+
 /// XRPC error response format
 #[derive(Debug, Serialize, Deserialize)]
 pub struct XrpcErrorResponse {

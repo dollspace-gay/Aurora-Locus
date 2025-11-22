@@ -478,14 +478,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_did_web_url_parsing() {
-        let resolver = create_test_resolver().await;
+        let _resolver = create_test_resolver().await;
 
         // Simple did:web should map to .well-known
-        let did_simple = "did:web:example.com";
+        let _did_simple = "did:web:example.com";
         // Would fetch: https://example.com/.well-known/did.json
 
         // Path-based did:web
-        let did_path = "did:web:example.com:user:alice";
+        let _did_path = "did:web:example.com:user:alice";
         // Would fetch: https://example.com/user/alice/did.json
 
         // Note: These tests verify the logic, not actual HTTP calls

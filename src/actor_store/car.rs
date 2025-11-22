@@ -186,6 +186,7 @@ mod tests {
     use crate::actor_store::ActorStoreConfig;
     use tempfile::tempdir;
 
+    #[allow(dead_code)] // Helper function for future tests
     async fn create_test_store() -> ActorStore {
         let temp_dir = tempdir().unwrap();
         let config = ActorStoreConfig {

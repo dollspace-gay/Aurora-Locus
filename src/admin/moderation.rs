@@ -390,6 +390,8 @@ mod tests {
             rate_limit: RateLimitConfig {
                 enabled: true,
                 global_requests_per_minute: 3000,
+                redis_url: None,
+                use_redis: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

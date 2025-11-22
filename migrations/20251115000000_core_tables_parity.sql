@@ -193,20 +193,22 @@ CREATE TABLE IF NOT EXISTS account_moderation (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     did TEXT NOT NULL,
     action TEXT NOT NULL,        -- 'suspend', 'flag', 'takendown', etc.
-    created_by TEXT NOT NULL,    -- Admin DID
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    moderated_by TEXT NOT NULL,  -- Admin DID
+    moderated_at DATETIME NOT NULL DEFAULT (datetime('now')),
     expires_at DATETIME,
     reason TEXT,
     notes TEXT,
     reversed BOOLEAN NOT NULL DEFAULT 0,
     reversed_at DATETIME,
     reversed_by TEXT,
+    reversal_reason TEXT,
+    report_id INTEGER,
     FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS account_moderation_did_idx ON account_moderation(did);
 CREATE INDEX IF NOT EXISTS account_moderation_action_idx ON account_moderation(action);
-CREATE INDEX IF NOT EXISTS account_moderation_created_at_idx ON account_moderation(created_at);
+CREATE INDEX IF NOT EXISTS account_moderation_moderated_at_idx ON account_moderation(moderated_at);
 CREATE INDEX IF NOT EXISTS account_moderation_expires_at_idx ON account_moderation(expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS account_moderation_reversed_idx ON account_moderation(reversed);
 

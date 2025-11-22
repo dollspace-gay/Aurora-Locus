@@ -2010,18 +2010,18 @@ mod tests {
 
     #[test]
     fn test_validation_mode_from_str() {
-        assert_eq!(ValidationMode::from_str("required"), Some(ValidationMode::Required));
-        assert_eq!(ValidationMode::from_str("Required"), Some(ValidationMode::Required));
-        assert_eq!(ValidationMode::from_str("REQUIRED"), Some(ValidationMode::Required));
+        assert_eq!(ValidationMode::from_str("required"), Ok(ValidationMode::Required));
+        assert_eq!(ValidationMode::from_str("Required"), Ok(ValidationMode::Required));
+        assert_eq!(ValidationMode::from_str("REQUIRED"), Ok(ValidationMode::Required));
 
-        assert_eq!(ValidationMode::from_str("optimistic"), Some(ValidationMode::Optimistic));
-        assert_eq!(ValidationMode::from_str("Optimistic"), Some(ValidationMode::Optimistic));
+        assert_eq!(ValidationMode::from_str("optimistic"), Ok(ValidationMode::Optimistic));
+        assert_eq!(ValidationMode::from_str("Optimistic"), Ok(ValidationMode::Optimistic));
 
-        assert_eq!(ValidationMode::from_str("none"), Some(ValidationMode::None));
-        assert_eq!(ValidationMode::from_str("None"), Some(ValidationMode::None));
+        assert_eq!(ValidationMode::from_str("none"), Ok(ValidationMode::None));
+        assert_eq!(ValidationMode::from_str("None"), Ok(ValidationMode::None));
 
-        assert_eq!(ValidationMode::from_str("invalid"), None);
-        assert_eq!(ValidationMode::from_str(""), None);
+        assert!(ValidationMode::from_str("invalid").is_err());
+        assert!(ValidationMode::from_str("").is_err());
     }
 
     #[test]

@@ -992,7 +992,8 @@ mod tests {
         assert!(config.endpoints.contains_key("/xrpc/com.atproto.server.createSession"));
 
         // Check specific limits
-        let create_account_limit = config.endpoints.get("/xrpc/com.atproto.server.createAccount").unwrap();
+        let create_account_limits = config.endpoints.get("/xrpc/com.atproto.server.createAccount").unwrap();
+        let create_account_limit = &create_account_limits[0];
         assert_eq!(create_account_limit.max_requests, 100);
         assert_eq!(create_account_limit.duration_secs, 300); // 5 minutes
     }

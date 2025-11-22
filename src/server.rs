@@ -40,9 +40,8 @@ pub fn build_router(ctx: AppContext) -> Router {
     Router::new()
         // Metrics endpoint (no middleware)
         .route("/metrics", get(metrics_handler))
-        // Server description endpoint
-        .route("/xrpc/com.atproto.server.describeServer", get(describe_server))
         // API routes (Phase 2) - merge before with_state
+        // Note: describeServer route is registered in api/server.rs
         .merge(crate::api::routes())
         // Provide state - converts Router<AppContext> to Router<()>
         .with_state(ctx.clone())
@@ -66,21 +65,6 @@ async fn metrics_handler() -> Response {
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
         .body(metrics_text.into())
         .unwrap()
-}
-
-/// Server description handler (com.atproto.server.describeServer)
-async fn describe_server(
-    axum::extract::State(ctx): axum::extract::State<AppContext>,
-) -> Json<serde_json::Value> {
-    Json(json!({
-        "did": ctx.service_did(),
-        "availableUserDomains": ctx.config.identity.service_handle_domains,
-        "inviteCodeRequired": ctx.config.invites.required,
-        "links": {
-            "privacyPolicy": null,
-            "termsOfService": null
-        }
-    }))
 }
 
 /// 404 handler

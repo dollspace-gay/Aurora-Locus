@@ -1926,6 +1926,8 @@ mod tests {
             rate_limit: RateLimitConfig {
                 enabled: true,
                 global_requests_per_minute: 3000,
+                redis_url: None,
+                use_redis: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -2444,7 +2446,7 @@ mod tests {
         let manager = setup_test_db().await;
 
         // Create two accounts
-        let account1 = manager
+        let _account1 = manager
             .create_account("alice".to_string(), None, "password123".to_string(), None)
             .await
             .unwrap();

@@ -625,141 +625,227 @@ main() {
     print_success "Data directories created"
     echo ""
 
-    # Initialize database - migrations run automatically on first startup
-    print_header "Preparing Database"
+    # Initialize database with inline SQL
+    print_header "Initializing Database"
 
     if [ ! -f "data/account.sqlite" ]; then
-        print_info "Creating empty database file..."
-        print_info "Database schema and OAuth tables will be created automatically on first startup via sqlx migrations"
-
-        # Create empty database file - migrations will populate it
+        print_info "Creating database with core tables..."
         sqlite3 data/account.sqlite << 'EOSQL'
--- Account management tables
+-- Core account table
 CREATE TABLE IF NOT EXISTS account (
     did TEXT PRIMARY KEY NOT NULL,
     handle TEXT UNIQUE NOT NULL,
     email TEXT UNIQUE,
     password_hash TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
     email_confirmed BOOLEAN NOT NULL DEFAULT 0,
     email_confirmed_at DATETIME,
     deactivated_at DATETIME,
-    taken_down BOOLEAN NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'active',
-    plc_rotation_key TEXT,
-    plc_rotation_key_public TEXT,
-    plc_last_operation_cid TEXT
+    takedown_ref TEXT,
+    status TEXT NOT NULL DEFAULT 'active'
 );
-CREATE INDEX idx_account_handle ON account(handle);
-CREATE INDEX idx_account_email ON account(email) WHERE email IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_account_plc_rotation_key ON account(plc_rotation_key_public);
-CREATE INDEX IF NOT EXISTS idx_account_status ON account(status);
+CREATE INDEX IF NOT EXISTS account_handle_idx ON account(handle);
+CREATE INDEX IF NOT EXISTS account_email_idx ON account(email) WHERE email IS NOT NULL;
+CREATE INDEX IF NOT EXISTS account_status_idx ON account(status);
 
--- Sessions table
+-- Actor table (for handle/DID mapping)
+CREATE TABLE IF NOT EXISTS actor (
+    did TEXT PRIMARY KEY NOT NULL,
+    handle TEXT UNIQUE NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    takedown_ref TEXT,
+    FOREIGN KEY (did) REFERENCES account(did) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS actor_handle_idx ON actor(handle);
+
+-- Session table
 CREATE TABLE IF NOT EXISTS session (
     id TEXT PRIMARY KEY NOT NULL,
     did TEXT NOT NULL,
     access_token TEXT UNIQUE NOT NULL,
     refresh_token TEXT UNIQUE NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
     expires_at DATETIME NOT NULL,
     app_password_name TEXT,
-    FOREIGN KEY (did) REFERENCES account(did) ON DELETE CASCADE
+    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
 );
-CREATE INDEX idx_session_did ON session(did);
-CREATE INDEX idx_session_access_token ON session(access_token);
-CREATE INDEX idx_session_refresh_token ON session(refresh_token);
-CREATE INDEX idx_session_expires_at ON session(expires_at);
+CREATE INDEX IF NOT EXISTS session_did_idx ON session(did);
+CREATE INDEX IF NOT EXISTS session_access_token_idx ON session(access_token);
+CREATE INDEX IF NOT EXISTS session_refresh_token_idx ON session(refresh_token);
+CREATE INDEX IF NOT EXISTS session_expires_at_idx ON session(expires_at);
 
--- Refresh tokens table
+-- Refresh token table
 CREATE TABLE IF NOT EXISTS refresh_token (
     id TEXT PRIMARY KEY NOT NULL,
     did TEXT NOT NULL,
     token TEXT UNIQUE NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
     expires_at DATETIME NOT NULL,
     used BOOLEAN NOT NULL DEFAULT 0,
     used_at DATETIME,
-    FOREIGN KEY (did) REFERENCES account(did) ON DELETE CASCADE
+    next_id TEXT,
+    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
 );
-CREATE INDEX idx_refresh_token_did ON refresh_token(did);
-CREATE INDEX idx_refresh_token_token ON refresh_token(token);
-CREATE INDEX idx_refresh_token_expires_at ON refresh_token(expires_at);
+CREATE INDEX IF NOT EXISTS refresh_token_did_idx ON refresh_token(did);
+CREATE INDEX IF NOT EXISTS refresh_token_token_idx ON refresh_token(token);
+CREATE INDEX IF NOT EXISTS refresh_token_expires_at_idx ON refresh_token(expires_at);
+CREATE INDEX IF NOT EXISTS refresh_token_used_idx ON refresh_token(used);
 
--- Email tokens (for confirmation and password reset)
+-- Email token table
 CREATE TABLE IF NOT EXISTS email_token (
     token TEXT PRIMARY KEY NOT NULL,
     did TEXT NOT NULL,
     purpose TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
     expires_at DATETIME NOT NULL,
     used BOOLEAN NOT NULL DEFAULT 0,
-    FOREIGN KEY (did) REFERENCES account(did) ON DELETE CASCADE
+    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
 );
-CREATE INDEX idx_email_token_did ON email_token(did);
-CREATE INDEX idx_email_token_expires_at ON email_token(expires_at);
+CREATE INDEX IF NOT EXISTS email_token_did_idx ON email_token(did);
+CREATE INDEX IF NOT EXISTS email_token_purpose_idx ON email_token(purpose);
+CREATE INDEX IF NOT EXISTS email_token_expires_at_idx ON email_token(expires_at);
+CREATE INDEX IF NOT EXISTS email_token_used_idx ON email_token(used);
 
--- App passwords
+-- App password table
 CREATE TABLE IF NOT EXISTS app_password (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     did TEXT NOT NULL,
     name TEXT NOT NULL,
     password_hash TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_used_at DATETIME,
     privileged BOOLEAN NOT NULL DEFAULT 0,
-    PRIMARY KEY (did, name),
-    FOREIGN KEY (did) REFERENCES account(did) ON DELETE CASCADE
+    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE,
+    UNIQUE(did, name)
 );
-CREATE INDEX idx_app_password_did ON app_password(did);
+CREATE INDEX IF NOT EXISTS app_password_did_idx ON app_password(did);
+CREATE INDEX IF NOT EXISTS app_password_last_used_idx ON app_password(last_used_at);
 
--- Invite codes
-CREATE TABLE IF NOT EXISTS invite_code (
-    code TEXT PRIMARY KEY NOT NULL,
-    available INTEGER NOT NULL,
-    uses INTEGER NOT NULL DEFAULT 0,
-    disabled BOOLEAN NOT NULL DEFAULT 0,
-    created_by TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    for_account TEXT,
-    expires_at DATETIME,
-    note TEXT
+-- Repository root table
+CREATE TABLE IF NOT EXISTS repo_root (
+    did TEXT PRIMARY KEY NOT NULL,
+    cid TEXT NOT NULL,
+    rev TEXT NOT NULL,
+    indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
 );
-CREATE INDEX idx_invite_code_created_by ON invite_code(created_by);
+CREATE INDEX IF NOT EXISTS repo_root_cid_idx ON repo_root(cid);
+CREATE INDEX IF NOT EXISTS repo_root_indexed_at_idx ON repo_root(indexed_at);
 
--- Invite code usage tracking
-CREATE TABLE IF NOT EXISTS invite_code_use (
-    code TEXT NOT NULL,
-    used_by TEXT NOT NULL,
-    used_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (code, used_by)
+-- Record table
+CREATE TABLE IF NOT EXISTS record (
+    uri TEXT PRIMARY KEY NOT NULL,
+    cid TEXT NOT NULL,
+    collection TEXT NOT NULL,
+    rkey TEXT NOT NULL,
+    repo_rev TEXT NOT NULL,
+    indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    takedown_ref TEXT,
+    FOREIGN KEY (uri) REFERENCES record(uri) ON DELETE CASCADE
 );
-CREATE INDEX idx_invite_code_use_used_by ON invite_code_use(used_by);
+CREATE INDEX IF NOT EXISTS record_collection_idx ON record(collection);
+CREATE INDEX IF NOT EXISTS record_rkey_idx ON record(rkey);
+CREATE INDEX IF NOT EXISTS record_cid_idx ON record(cid);
+CREATE INDEX IF NOT EXISTS record_indexed_at_idx ON record(indexed_at);
+CREATE INDEX IF NOT EXISTS record_takedown_idx ON record(takedown_ref) WHERE takedown_ref IS NOT NULL;
 
--- Admin roles and permissions (with id column for Rust code compatibility)
-CREATE TABLE IF NOT EXISTS admin_roles (
+-- Repo block table
+CREATE TABLE IF NOT EXISTS repo_block (
+    cid TEXT PRIMARY KEY NOT NULL,
+    content BLOB NOT NULL,
+    indexed_at DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS repo_block_indexed_at_idx ON repo_block(indexed_at);
+
+-- Repo sequence table
+CREATE TABLE IF NOT EXISTS repo_seq (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    did TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event TEXT NOT NULL,
+    invalidated BOOLEAN NOT NULL DEFAULT 0,
+    sequenced_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS repo_seq_did_idx ON repo_seq(did);
+CREATE INDEX IF NOT EXISTS repo_seq_event_type_idx ON repo_seq(event_type);
+CREATE INDEX IF NOT EXISTS repo_seq_sequenced_at_idx ON repo_seq(sequenced_at);
+CREATE INDEX IF NOT EXISTS repo_seq_invalidated_idx ON repo_seq(invalidated);
+
+-- Blob metadata table
+CREATE TABLE IF NOT EXISTS blob_metadata (
+    cid TEXT PRIMARY KEY NOT NULL,
+    mime_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    creator_did TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    width INTEGER,
+    height INTEGER,
+    thumbnail_cid TEXT,
+    FOREIGN KEY (creator_did) REFERENCES actor(did) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS blob_metadata_creator_did_idx ON blob_metadata(creator_did);
+CREATE INDEX IF NOT EXISTS blob_metadata_mime_type_idx ON blob_metadata(mime_type);
+CREATE INDEX IF NOT EXISTS blob_metadata_created_at_idx ON blob_metadata(created_at);
+
+-- Temporary blob metadata table
+CREATE TABLE IF NOT EXISTS temp_blob_metadata (
+    cid TEXT PRIMARY KEY NOT NULL,
+    mime_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    creator_did TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    width INTEGER,
+    height INTEGER,
+    FOREIGN KEY (creator_did) REFERENCES actor(did) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS temp_blob_metadata_creator_did_idx ON temp_blob_metadata(creator_did);
+CREATE INDEX IF NOT EXISTS temp_blob_metadata_created_at_idx ON temp_blob_metadata(created_at);
+
+-- Account moderation table
+CREATE TABLE IF NOT EXISTS account_moderation (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    did TEXT NOT NULL UNIQUE,
-    role TEXT NOT NULL CHECK(role IN ('superadmin', 'admin', 'moderator')),
-    granted_by TEXT,
-    granted_at TEXT NOT NULL,
-    revoked INTEGER NOT NULL DEFAULT 0,
-    revoked_at TEXT,
-    revoked_by TEXT,
-    notes TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_admin_role_did ON admin_roles(did);
-
--- Admin audit log
-CREATE TABLE IF NOT EXISTS admin_audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    admin_did TEXT NOT NULL,
+    did TEXT NOT NULL,
     action TEXT NOT NULL,
-    subject_did TEXT,
-    details TEXT,
-    timestamp TEXT NOT NULL,
-    ip_address TEXT
+    moderated_by TEXT NOT NULL,
+    moderated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    expires_at DATETIME,
+    reason TEXT,
+    notes TEXT,
+    reversed BOOLEAN NOT NULL DEFAULT 0,
+    reversed_at DATETIME,
+    reversed_by TEXT,
+    reversal_reason TEXT,
+    report_id INTEGER,
+    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS account_moderation_did_idx ON account_moderation(did);
+CREATE INDEX IF NOT EXISTS account_moderation_action_idx ON account_moderation(action);
+CREATE INDEX IF NOT EXISTS account_moderation_moderated_at_idx ON account_moderation(moderated_at);
+CREATE INDEX IF NOT EXISTS account_moderation_expires_at_idx ON account_moderation(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS account_moderation_reversed_idx ON account_moderation(reversed);
 
--- User reports
+-- Label table
+CREATE TABLE IF NOT EXISTS label (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uri TEXT NOT NULL,
+    cid TEXT,
+    val TEXT NOT NULL,
+    neg BOOLEAN NOT NULL DEFAULT 0,
+    src TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    created_by TEXT,
+    expires_at DATETIME
+);
+CREATE INDEX IF NOT EXISTS label_uri_idx ON label(uri);
+CREATE INDEX IF NOT EXISTS label_cid_idx ON label(cid) WHERE cid IS NOT NULL;
+CREATE INDEX IF NOT EXISTS label_val_idx ON label(val);
+CREATE INDEX IF NOT EXISTS label_src_idx ON label(src);
+CREATE INDEX IF NOT EXISTS label_created_at_idx ON label(created_at);
+CREATE INDEX IF NOT EXISTS label_expires_at_idx ON label(expires_at) WHERE expires_at IS NOT NULL;
+
+-- Report table
 CREATE TABLE IF NOT EXISTS report (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     subject_did TEXT,
@@ -768,53 +854,128 @@ CREATE TABLE IF NOT EXISTS report (
     reason_type TEXT NOT NULL,
     reason TEXT,
     reported_by TEXT NOT NULL,
-    reported_at TEXT NOT NULL,
+    reported_at DATETIME NOT NULL DEFAULT (datetime('now')),
     status TEXT NOT NULL DEFAULT 'open',
-    reviewed_by TEXT,
-    reviewed_at TEXT,
-    resolution TEXT
+    resolved_by TEXT,
+    resolved_at DATETIME,
+    resolution_notes TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_report_status ON report(status);
-CREATE INDEX IF NOT EXISTS idx_report_subject_did ON report(subject_did);
-CREATE INDEX IF NOT EXISTS idx_report_subject_uri ON report(subject_uri);
-CREATE INDEX IF NOT EXISTS idx_report_reported_by ON report(reported_by);
+CREATE INDEX IF NOT EXISTS report_subject_did_idx ON report(subject_did) WHERE subject_did IS NOT NULL;
+CREATE INDEX IF NOT EXISTS report_subject_uri_idx ON report(subject_uri) WHERE subject_uri IS NOT NULL;
+CREATE INDEX IF NOT EXISTS report_reason_type_idx ON report(reason_type);
+CREATE INDEX IF NOT EXISTS report_reported_by_idx ON report(reported_by);
+CREATE INDEX IF NOT EXISTS report_reported_at_idx ON report(reported_at);
+CREATE INDEX IF NOT EXISTS report_status_idx ON report(status);
 
--- Account moderation actions
-CREATE TABLE IF NOT EXISTS account_moderation (
+-- Admin roles table
+CREATE TABLE IF NOT EXISTS admin_roles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     did TEXT NOT NULL,
-    action TEXT NOT NULL CHECK(action IN ('suspend', 'takedown', 'flag', 'warn')),
-    reason TEXT,
-    moderated_by TEXT,
-    moderated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    expires_at DATETIME,
-    reversed INTEGER NOT NULL DEFAULT 0,
-    reversed_at DATETIME,
-    reversed_by TEXT,
-    reversal_reason TEXT,
-    report_id INTEGER,
-    notes TEXT
+    role TEXT NOT NULL,
+    granted_by TEXT NOT NULL,
+    granted_at DATETIME NOT NULL,
+    revoked BOOLEAN NOT NULL DEFAULT 0,
+    revoked_at DATETIME,
+    revoked_by TEXT,
+    notes TEXT,
+    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE,
+    UNIQUE(did, role)
 );
-CREATE INDEX IF NOT EXISTS idx_account_moderation_did ON account_moderation(did);
-CREATE INDEX IF NOT EXISTS idx_account_moderation_expires ON account_moderation(expires_at);
-CREATE INDEX IF NOT EXISTS idx_account_moderation_reversed ON account_moderation(reversed);
-CREATE INDEX IF NOT EXISTS idx_account_moderation_action ON account_moderation(action);
+CREATE INDEX IF NOT EXISTS admin_roles_did_idx ON admin_roles(did);
+CREATE INDEX IF NOT EXISTS admin_roles_role_idx ON admin_roles(role);
+CREATE INDEX IF NOT EXISTS admin_roles_revoked_idx ON admin_roles(revoked);
 
--- Content labels
-CREATE TABLE IF NOT EXISTS content_labels (
+-- Admin audit log table
+CREATE TABLE IF NOT EXISTS admin_audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    uri TEXT NOT NULL,
-    cid TEXT,
-    val TEXT NOT NULL,
-    neg INTEGER NOT NULL DEFAULT 0,
-    src TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    admin_did TEXT NOT NULL,
+    action TEXT NOT NULL,
+    subject_did TEXT,
+    subject_uri TEXT,
+    details TEXT,
+    timestamp DATETIME NOT NULL DEFAULT (datetime('now')),
+    ip_address TEXT,
+    FOREIGN KEY (admin_did) REFERENCES actor(did) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS admin_audit_log_admin_did_idx ON admin_audit_log(admin_did);
+CREATE INDEX IF NOT EXISTS admin_audit_log_action_idx ON admin_audit_log(action);
+CREATE INDEX IF NOT EXISTS admin_audit_log_timestamp_idx ON admin_audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS admin_audit_log_subject_did_idx ON admin_audit_log(subject_did) WHERE subject_did IS NOT NULL;
+
+-- Lexicon failure table
+CREATE TABLE IF NOT EXISTS lexicon_failure (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection TEXT NOT NULL,
+    record_uri TEXT NOT NULL,
+    validation_errors TEXT NOT NULL,
+    detected_at DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS lexicon_failure_collection_idx ON lexicon_failure(collection);
+CREATE INDEX IF NOT EXISTS lexicon_failure_record_uri_idx ON lexicon_failure(record_uri);
+CREATE INDEX IF NOT EXISTS lexicon_failure_detected_at_idx ON lexicon_failure(detected_at);
+
+-- Invite code table
+CREATE TABLE IF NOT EXISTS invite_code (
+    code TEXT PRIMARY KEY NOT NULL,
+    available_uses INTEGER NOT NULL DEFAULT 1,
+    disabled BOOLEAN NOT NULL DEFAULT 0,
+    for_account TEXT,
+    created_by TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
     expires_at DATETIME
 );
-CREATE INDEX IF NOT EXISTS idx_content_labels_uri ON content_labels(uri);
-CREATE INDEX IF NOT EXISTS idx_content_labels_src ON content_labels(src);
-CREATE INDEX IF NOT EXISTS idx_content_labels_val ON content_labels(val);
+CREATE INDEX IF NOT EXISTS invite_code_disabled_idx ON invite_code(disabled);
+CREATE INDEX IF NOT EXISTS invite_code_for_account_idx ON invite_code(for_account) WHERE for_account IS NOT NULL;
 
+-- Invite code use table
+CREATE TABLE IF NOT EXISTS invite_code_use (
+    code TEXT NOT NULL,
+    used_by TEXT NOT NULL,
+    used_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (code) REFERENCES invite_code(code) ON DELETE CASCADE,
+    PRIMARY KEY (code, used_by)
+);
+CREATE INDEX IF NOT EXISTS invite_code_use_code_idx ON invite_code_use(code);
+CREATE INDEX IF NOT EXISTS invite_code_use_used_by_idx ON invite_code_use(used_by);
+CREATE UNIQUE INDEX IF NOT EXISTS invite_code_use_unique_idx ON invite_code_use(code, used_by);
+
+-- Sequencer config table
+CREATE TABLE IF NOT EXISTS sequencer_config (
+    key TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL,
+    updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+
+-- PLC keys table
+CREATE TABLE IF NOT EXISTS plc_keys (
+    did TEXT PRIMARY KEY NOT NULL,
+    rotation_key_public TEXT NOT NULL,
+    rotation_key_type TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS plc_keys_did_idx ON plc_keys(did);
+
+-- NOTE: All tables created. sqlx will handle remaining migrations automatically.
+EOSQL
+
+        if [ "$ADMIN_DID" != "__PLACEHOLDER_ADMIN_DID__" ] && [ -n "$ADMIN_DID" ]; then
+            # Use RFC3339 format for timestamp (e.g., 2025-10-24T18:41:11+00:00)
+            TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S+00:00")
+            sqlite3 data/account.sqlite "INSERT INTO admin_roles (did, role, granted_by, granted_at, revoked) VALUES ('$ADMIN_DID', 'superadmin', 'installer', '$TIMESTAMP', 0);"
+            print_success "Database initialized - Admin DID $ADMIN_DID added as superadmin"
+        else
+            print_success "Database initialized with core tables"
+        fi
+        print_info "OAuth tables (device, authorization_request, token, etc.) will be created automatically on first startup"
+    else
+        print_info "Database already exists - OAuth tables will be added automatically if missing"
+    fi
+
+    # Initialize DID cache database
+    if [ ! -f "data/did_cache.sqlite" ]; then
+        print_info "Creating DID cache database..."
+        sqlite3 data/did_cache.sqlite << 'EOSQL'
 -- DID document cache
 CREATE TABLE IF NOT EXISTS did_doc (
     did TEXT PRIMARY KEY,
@@ -834,55 +995,7 @@ CREATE TABLE IF NOT EXISTS did_handle (
 CREATE INDEX IF NOT EXISTS idx_did_handle_did ON did_handle(did);
 CREATE INDEX IF NOT EXISTS idx_did_handle_updated_at ON did_handle(updated_at);
 
--- Blob metadata (permanent blobs)
-CREATE TABLE IF NOT EXISTS blob_metadata (
-    cid TEXT PRIMARY KEY,
-    mime_type TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    creator_did TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    width INTEGER,
-    height INTEGER,
-    alt_text TEXT,
-    thumbnail_cid TEXT,
-    FOREIGN KEY (creator_did) REFERENCES account(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_blob_creator ON blob_metadata(creator_did);
-CREATE INDEX IF NOT EXISTS idx_blob_created_at ON blob_metadata(created_at);
-CREATE INDEX IF NOT EXISTS idx_blob_thumbnail ON blob_metadata(thumbnail_cid);
-
--- Temporary blob metadata (two-phase upload)
-CREATE TABLE IF NOT EXISTS temp_blob_metadata (
-    cid TEXT PRIMARY KEY,
-    mime_type TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    creator_did TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    width INTEGER,
-    height INTEGER,
-    FOREIGN KEY (creator_did) REFERENCES account(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_temp_blob_creator ON temp_blob_metadata(creator_did);
-CREATE INDEX IF NOT EXISTS idx_temp_blob_created_at ON temp_blob_metadata(created_at);
-
--- Sequencer event log (federation)
-CREATE TABLE IF NOT EXISTS repo_seq (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    did TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    event BLOB NOT NULL,
-    invalidated INTEGER NOT NULL DEFAULT 0,
-    sequenced_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_repo_seq_did ON repo_seq(did);
-CREATE INDEX IF NOT EXISTS idx_repo_seq_event_type ON repo_seq(event_type);
-CREATE INDEX IF NOT EXISTS idx_repo_seq_sequenced_at ON repo_seq(sequenced_at);
-CREATE INDEX IF NOT EXISTS idx_repo_seq_seq_invalidated ON repo_seq(seq, invalidated);
-
--- Migration tracking table for sqlx
--- NOTE: OAuth tables (device, account_device, authorization_request, token,
--- used_refresh_token, authorized_client, lexicon) will be created automatically
--- on first startup via migrations/20250105000000_oauth_tables.sql
+-- Migration tracking for DID cache database
 CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     version BIGINT PRIMARY KEY NOT NULL,
     description TEXT NOT NULL,
@@ -892,31 +1005,13 @@ CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     execution_time BIGINT NOT NULL
 );
 INSERT OR IGNORE INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
-VALUES
-    (20250101000001, 'init_account', CURRENT_TIMESTAMP, 1, X'00', 0),
-    (20250103000001, 'blob_metadata', CURRENT_TIMESTAMP, 1, X'00', 0),
-    (20250104000001, 'sequencer', CURRENT_TIMESTAMP, 1, X'00', 0),
-    (20250105000001, 'did_cache', CURRENT_TIMESTAMP, 1, X'00', 0),
-    (20250106000001, 'admin_moderation', CURRENT_TIMESTAMP, 1, X'00', 0),
-    (20250107000001, 'blob_metadata_extensions', CURRENT_TIMESTAMP, 1, X'00', 0),
-    (20250108000001, 'temp_blob_table', CURRENT_TIMESTAMP, 1, X'00', 0),
-    (20250109000001, 'plc_keys', CURRENT_TIMESTAMP, 1, X'00', 0);
-
--- OAuth tables migration will be applied automatically on first startup
+VALUES (20251122000000, 'did_cache_tables', CURRENT_TIMESTAMP, 1, X'00', 0);
 EOSQL
-
-        if [ "$ADMIN_DID" != "__PLACEHOLDER_ADMIN_DID__" ] && [ -n "$ADMIN_DID" ]; then
-            # Use RFC3339 format for timestamp (e.g., 2025-10-24T18:41:11+00:00)
-            TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S+00:00")
-            sqlite3 data/account.sqlite "INSERT INTO admin_roles (did, role, granted_by, granted_at, revoked) VALUES ('$ADMIN_DID', 'superadmin', 'installer', '$TIMESTAMP', 0);"
-            print_success "Database initialized - Admin DID $ADMIN_DID added as superadmin"
-        else
-            print_success "Database initialized with core tables"
-        fi
-        print_info "OAuth tables (device, authorization_request, token, etc.) will be created automatically on first startup"
+        print_success "DID cache database initialized"
     else
-        print_info "Database already exists - OAuth tables will be added automatically if missing"
+        print_info "DID cache database already exists"
     fi
+
     echo ""
 
     print_header "Configuration Complete"

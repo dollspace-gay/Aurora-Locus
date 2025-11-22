@@ -10,12 +10,9 @@
 -- Refresh Token Grace Period
 -- ====================================================================
 
--- Add nextId field to refresh_token for grace period support
--- This allows a 2-hour grace period where old tokens remain valid
-ALTER TABLE refresh_token ADD COLUMN next_id TEXT DEFAULT NULL;
-
--- Create index for nextId lookups
-CREATE INDEX IF NOT EXISTS refresh_token_next_id_idx ON refresh_token(next_id) WHERE next_id IS NOT NULL;
+-- NOTE: The refresh_token table is created in migration 20251115000000_core_tables_parity.sql
+-- with the next_id column already included, so no changes are needed here.
+-- The index for next_id will be created in that migration as well.
 
 -- ====================================================================
 -- Invite Code System

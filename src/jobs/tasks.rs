@@ -283,7 +283,7 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
     crate::metrics::SESSIONS_ACTIVE.set(session_count);
 
     // 3. Get current sequencer position
-    let seq_result = sqlx::query("SELECT MAX(seq) as max_seq FROM sequencer")
+    let seq_result = sqlx::query("SELECT MAX(seq) as max_seq FROM repo_seq")
         .fetch_optional(&ctx.account_db)
         .await
         .map_err(PdsError::Database)?;
@@ -295,7 +295,7 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
     }
 
     // 4. Count blob storage usage
-    let blob_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob")
+    let blob_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob_metadata")
         .fetch_one(&ctx.account_db)
         .await
         .unwrap_or(0);
@@ -303,7 +303,7 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
     crate::metrics::BLOB_COUNT_TOTAL.set(blob_count);
 
     // 5. Get total blob storage size
-    let blob_size: Option<i64> = sqlx::query_scalar("SELECT SUM(size) FROM blob")
+    let blob_size: Option<i64> = sqlx::query_scalar("SELECT SUM(size) FROM blob_metadata")
         .fetch_one(&ctx.account_db)
         .await
         .unwrap_or(None);
