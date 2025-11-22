@@ -56,6 +56,14 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.runHealthChecks", get(run_health_checks))
         .route("/xrpc/com.atproto.admin.getVersionInfo", get(get_version_info))
         .route("/xrpc/com.atproto.admin.getSystemMetrics", get(get_system_metrics))
+        // Blob storage management
+        .route("/xrpc/com.atproto.admin.getBlobStatistics", get(get_blob_statistics))
+        .route("/xrpc/com.atproto.admin.listBlobs", get(list_blobs))
+        .route("/xrpc/com.atproto.admin.deleteBlob", post(delete_blob))
+        .route("/xrpc/com.atproto.admin.quarantineBlob", post(quarantine_blob))
+        .route("/xrpc/com.atproto.admin.restoreBlob", post(restore_blob))
+        .route("/xrpc/com.atproto.admin.runBlobGC", post(run_blob_gc))
+        .route("/xrpc/com.atproto.admin.getBlobQuotas", get(get_blob_quotas))
 }
 
 // ============================================================================
@@ -1280,6 +1288,345 @@ async fn get_system_metrics(
         "background_jobs": {
             "active": metrics::BACKGROUND_JOBS_ACTIVE.get(),
         }
+    })))
+}
+
+// ============================================================================
+// Blob Storage Management Endpoints
+// ============================================================================
+
+/// Query parameters for listBlobs endpoint
+#[derive(Deserialize)]
+struct ListBlobsQuery {
+    did: Option<String>,
+    #[serde(default = "default_blob_limit")]
+    limit: i64,
+    cursor: Option<String>,
+}
+
+fn default_blob_limit() -> i64 {
+    100
+}
+
+/// Get blob storage statistics
+async fn get_blob_statistics(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get total blob count and size
+    let stats = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM blob_metadata"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let (total_count, total_size) = stats;
+
+    // Get orphaned temp blobs count
+    let orphaned_temp = ctx.blob_store.list_orphaned_temp_blobs(24).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let orphaned_count = orphaned_temp.len() as i64;
+
+    // Get blob count by MIME type
+    let mime_stats = sqlx::query_as::<_, (String, i64)>(
+        "SELECT mime_type, COUNT(*) as count FROM blob_metadata GROUP BY mime_type ORDER BY count DESC LIMIT 10"
+    )
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mime_distribution: Vec<serde_json::Value> = mime_stats.iter()
+        .map(|(mime_type, count)| serde_json::json!({
+            "mime_type": mime_type,
+            "count": count
+        }))
+        .collect();
+
+    // Get top users by blob count
+    let top_users = sqlx::query_as::<_, (String, i64, i64)>(
+        "SELECT creator_did, COUNT(*) as count, SUM(size) as total_size FROM blob_metadata GROUP BY creator_did ORDER BY count DESC LIMIT 10"
+    )
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let user_stats: Vec<serde_json::Value> = top_users.iter()
+        .map(|(did, count, size)| serde_json::json!({
+            "did": did,
+            "blob_count": count,
+            "total_size": size
+        }))
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "total_blobs": total_count,
+        "total_size_bytes": total_size,
+        "total_size_mb": total_size as f64 / 1024.0 / 1024.0,
+        "orphaned_temp_blobs": orphaned_count,
+        "mime_type_distribution": mime_distribution,
+        "top_users_by_blob_count": user_stats,
+    })))
+}
+
+/// List blobs with optional filtering
+async fn list_blobs(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(params): Query<ListBlobsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = params.limit.min(500); // Cap at 500
+
+    let blobs = if let Some(did) = params.did {
+        // List blobs for specific DID
+        ctx.blob_store.list_for_user(&did, limit).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        // List all blobs with cursor pagination
+        let query = if let Some(cursor) = params.cursor {
+            sqlx::query(
+                r#"
+                SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
+                FROM blob_metadata
+                WHERE cid > ?1
+                ORDER BY cid ASC
+                LIMIT ?2
+                "#
+            )
+            .bind(cursor)
+            .bind(limit)
+        } else {
+            sqlx::query(
+                r#"
+                SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
+                FROM blob_metadata
+                ORDER BY cid ASC
+                LIMIT ?1
+                "#
+            )
+            .bind(limit)
+        };
+
+        let rows = query.fetch_all(&ctx.account_db).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let mut blobs = Vec::new();
+        for row in rows {
+            use sqlx::Row;
+            blobs.push(crate::blob_store::BlobMetadata {
+                cid: row.try_get("cid").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                mime_type: row.try_get("mime_type").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                size: row.try_get("size").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                creator_did: row.try_get("creator_did").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                created_at: row.try_get("created_at").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                width: row.try_get("width").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                height: row.try_get("height").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                alt_text: row.try_get("alt_text").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                thumbnail_cid: row.try_get("thumbnail_cid").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            });
+        }
+        blobs
+    };
+
+    let next_cursor = blobs.last().map(|b| b.cid.clone());
+
+    Ok(Json(serde_json::json!({
+        "blobs": blobs,
+        "cursor": next_cursor,
+    })))
+}
+
+/// Request body for deleteBlob endpoint
+#[derive(Deserialize)]
+struct DeleteBlobRequest {
+    cid: String,
+}
+
+/// Delete a specific blob
+async fn delete_blob(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Json(req): Json<DeleteBlobRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Check if blob exists
+    let metadata = ctx.blob_store.get_metadata(&req.cid).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if metadata.is_none() {
+        return Err((StatusCode::NOT_FOUND, format!("Blob not found: {}", req.cid)));
+    }
+
+    // Delete blob
+    ctx.blob_store.delete(&req.cid).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "cid": req.cid,
+        "message": "Blob deleted successfully"
+    })))
+}
+
+/// Request body for quarantineBlob endpoint
+#[derive(Deserialize)]
+struct QuarantineBlobRequest {
+    cid: String,
+    reason: String,
+    details: Option<String>,
+    legal_reference: Option<String>,
+}
+
+/// Quarantine a blob (mark as taken down)
+async fn quarantine_blob(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<QuarantineBlobRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::blob_store::quarantine::{BlobQuarantine, QuarantineReason};
+    use std::str::FromStr;
+
+    // Parse quarantine reason
+    let reason = QuarantineReason::from_str(&req.reason)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // Create quarantine manager
+    let quarantine = BlobQuarantine::new(ctx.account_db.clone());
+
+    // Quarantine the blob
+    let record = quarantine.quarantine_blob(
+        &req.cid,
+        reason,
+        req.details.as_deref(),
+        &auth.did,
+        req.legal_reference.as_deref(),
+    ).await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "cid": record.cid,
+        "reason": record.reason,
+        "quarantined_by": record.quarantined_by,
+        "quarantined_at": record.quarantined_at,
+    })))
+}
+
+/// Request body for restoreBlob endpoint
+#[derive(Deserialize)]
+struct RestoreBlobRequest {
+    cid: String,
+}
+
+/// Restore a quarantined blob
+async fn restore_blob(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RestoreBlobRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::blob_store::quarantine::BlobQuarantine;
+
+    // Create quarantine manager
+    let quarantine = BlobQuarantine::new(ctx.account_db.clone());
+
+    // Restore the blob
+    quarantine.restore_blob(&req.cid, &auth.did).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "cid": req.cid,
+        "restored_by": auth.did,
+        "message": "Blob restored successfully"
+    })))
+}
+
+/// Request body for runBlobGC endpoint
+#[derive(Deserialize)]
+struct RunBlobGCRequest {
+    #[serde(default = "default_gc_ttl")]
+    orphaned_ttl_hours: i64,
+    dry_run: Option<bool>,
+}
+
+fn default_gc_ttl() -> i64 {
+    24
+}
+
+/// Run blob garbage collection
+async fn run_blob_gc(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Json(req): Json<RunBlobGCRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let dry_run = req.dry_run.unwrap_or(false);
+
+    // List orphaned temp blobs
+    let orphaned = ctx.blob_store.list_orphaned_temp_blobs(req.orphaned_ttl_hours).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut deleted_count = 0;
+    let mut errors = Vec::new();
+
+    if !dry_run {
+        // Delete each orphaned blob
+        for cid in &orphaned {
+            match ctx.blob_store.delete_temp_blob(cid).await {
+                Ok(_) => {
+                    deleted_count += 1;
+                    tracing::info!("Deleted orphaned temp blob: {}", cid);
+                }
+                Err(e) => {
+                    errors.push(format!("Failed to delete {}: {}", cid, e));
+                    tracing::warn!("Failed to delete orphaned temp blob {}: {}", cid, e);
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "dry_run": dry_run,
+        "orphaned_found": orphaned.len(),
+        "deleted": deleted_count,
+        "errors": errors,
+    })))
+}
+
+/// Get blob quotas per account
+async fn get_blob_quotas(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get storage usage per user
+    let usage = sqlx::query_as::<_, (String, i64, i64)>(
+        r#"
+        SELECT creator_did, COUNT(*) as blob_count, SUM(size) as total_size
+        FROM blob_metadata
+        GROUP BY creator_did
+        ORDER BY total_size DESC
+        LIMIT 100
+        "#
+    )
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let quotas: Vec<serde_json::Value> = usage.iter()
+        .map(|(did, count, size)| serde_json::json!({
+            "did": did,
+            "blob_count": count,
+            "total_size_bytes": size,
+            "total_size_mb": *size as f64 / 1024.0 / 1024.0,
+            // For now, no hard quotas enforced, just reporting usage
+            "quota_bytes": null,
+            "quota_mb": null,
+            "usage_percent": null,
+        }))
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "quotas": quotas,
+        "total_users": quotas.len(),
     })))
 }
 
