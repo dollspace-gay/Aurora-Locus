@@ -64,6 +64,13 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.restoreBlob", post(restore_blob))
         .route("/xrpc/com.atproto.admin.runBlobGC", post(run_blob_gc))
         .route("/xrpc/com.atproto.admin.getBlobQuotas", get(get_blob_quotas))
+        // Sequencer management
+        .route("/xrpc/com.atproto.admin.getSequencerStatus", get(get_sequencer_status))
+        .route("/xrpc/com.atproto.admin.pauseSequencer", post(pause_sequencer))
+        .route("/xrpc/com.atproto.admin.resumeSequencer", post(resume_sequencer))
+        .route("/xrpc/com.atproto.admin.listRecentEvents", get(list_recent_events))
+        .route("/xrpc/com.atproto.admin.resetSequencerCursor", post(reset_sequencer_cursor))
+        .route("/xrpc/com.atproto.admin.rebuildSequencer", post(rebuild_sequencer))
 }
 
 // ============================================================================
@@ -1628,6 +1635,327 @@ async fn get_blob_quotas(
         "quotas": quotas,
         "total_users": quotas.len(),
     })))
+}
+
+// ============================================================================
+// Sequencer Management Endpoints
+// ============================================================================
+
+/// Get sequencer status and statistics
+async fn get_sequencer_status(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get current sequence number
+    let current_seq = ctx.sequencer.current_seq().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .unwrap_or(0);
+
+    // Get total event count
+    let total_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repo_seq WHERE invalidated = 0"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Get event counts by type
+    let event_counts = sqlx::query_as::<_, (String, i64)>(
+        "SELECT event_type, COUNT(*) as count FROM repo_seq WHERE invalidated = 0 GROUP BY event_type"
+    )
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut events_by_type = serde_json::Map::new();
+    for (event_type, count) in event_counts {
+        events_by_type.insert(event_type, serde_json::json!(count));
+    }
+
+    // Get first and last event timestamps
+    let first_event: Option<String> = sqlx::query_scalar(
+        "SELECT sequenced_at FROM repo_seq WHERE invalidated = 0 ORDER BY seq ASC LIMIT 1"
+    )
+    .fetch_optional(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let last_event: Option<String> = sqlx::query_scalar(
+        "SELECT sequenced_at FROM repo_seq WHERE invalidated = 0 ORDER BY seq DESC LIMIT 1"
+    )
+    .fetch_optional(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Check if sequencer is paused (using a config table)
+    let is_paused: bool = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT value FROM sequencer_config WHERE key = 'paused'), '0') = '1'"
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(false);
+
+    Ok(Json(serde_json::json!({
+        "status": if is_paused { "paused" } else { "running" },
+        "current_seq": current_seq,
+        "total_events": total_events,
+        "events_by_type": events_by_type,
+        "first_event_at": first_event,
+        "last_event_at": last_event,
+        "paused": is_paused,
+    })))
+}
+
+/// Query parameters for listRecentEvents endpoint
+#[derive(Deserialize)]
+struct ListRecentEventsQuery {
+    #[serde(default = "default_recent_events_limit")]
+    limit: i64,
+    cursor: Option<i64>,
+    event_type: Option<String>,
+}
+
+fn default_recent_events_limit() -> i64 {
+    50
+}
+
+/// List recent events from the sequencer
+async fn list_recent_events(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(params): Query<ListRecentEventsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = params.limit.min(500); // Cap at 500
+
+    // Build query based on filters
+    let mut query = String::from(
+        "SELECT seq, did, event_type, sequenced_at FROM repo_seq WHERE invalidated = 0"
+    );
+
+    // Add cursor filter
+    if let Some(cursor) = params.cursor {
+        query.push_str(&format!(" AND seq < {}", cursor));
+    }
+
+    // Add event type filter
+    if let Some(ref event_type) = params.event_type {
+        query.push_str(&format!(" AND event_type = '{}'", event_type));
+    }
+
+    query.push_str(&format!(" ORDER BY seq DESC LIMIT {}", limit));
+
+    let rows = sqlx::query(&query)
+        .fetch_all(&ctx.account_db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        use sqlx::Row;
+        events.push(serde_json::json!({
+            "seq": row.try_get::<i64, _>("seq").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            "did": row.try_get::<String, _>("did").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            "event_type": row.try_get::<String, _>("event_type").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            "sequenced_at": row.try_get::<String, _>("sequenced_at").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        }));
+    }
+
+    let next_cursor = events.last().and_then(|e| e.get("seq")).and_then(|s| s.as_i64());
+
+    Ok(Json(serde_json::json!({
+        "events": events,
+        "cursor": next_cursor,
+    })))
+}
+
+/// Pause sequencer event streaming
+async fn pause_sequencer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Set paused flag in database
+    sqlx::query(
+        "INSERT OR REPLACE INTO sequencer_config (key, value) VALUES ('paused', '1')"
+    )
+    .execute(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "sequencer.pause", None, None, None)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "status": "paused",
+        "message": "Sequencer event streaming paused"
+    })))
+}
+
+/// Resume sequencer event streaming
+async fn resume_sequencer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Set paused flag to false in database
+    sqlx::query(
+        "INSERT OR REPLACE INTO sequencer_config (key, value) VALUES ('paused', '0')"
+    )
+    .execute(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "sequencer.resume", None, None, None)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "status": "running",
+        "message": "Sequencer event streaming resumed"
+    })))
+}
+
+/// Request body for resetSequencerCursor endpoint
+#[derive(Deserialize)]
+struct ResetSequencerCursorRequest {
+    #[serde(default)]
+    target_seq: Option<i64>,
+}
+
+/// Reset sequencer cursor position
+async fn reset_sequencer_cursor(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<ResetSequencerCursorRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let target = req.target_seq.unwrap_or(0);
+
+    // Validate target sequence exists if specified
+    if target > 0 {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM repo_seq WHERE seq = ?1)"
+        )
+        .bind(target)
+        .fetch_one(&ctx.account_db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        if !exists {
+            return Err((StatusCode::BAD_REQUEST, format!("Sequence {} not found", target)));
+        }
+    }
+
+    // Store cursor position
+    sqlx::query(
+        "INSERT OR REPLACE INTO sequencer_config (key, value) VALUES ('cursor_position', ?1)"
+    )
+    .bind(target.to_string())
+    .execute(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(&auth.did, "sequencer.reset_cursor", None, Some(&target.to_string()), None)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "cursor_position": target,
+        "message": format!("Sequencer cursor reset to {}", target)
+    })))
+}
+
+/// Request body for rebuildSequencer endpoint
+#[derive(Deserialize)]
+struct RebuildSequencerRequest {
+    #[serde(default)]
+    verify_only: bool,
+}
+
+/// Rebuild or verify sequencer integrity
+async fn rebuild_sequencer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RebuildSequencerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify sequence integrity
+    let gaps = sqlx::query_as::<_, (i64, i64)>(
+        r#"
+        SELECT seq, seq - LAG(seq, 1, 0) OVER (ORDER BY seq) as gap
+        FROM repo_seq
+        WHERE invalidated = 0
+        HAVING gap > 1
+        LIMIT 10
+        "#
+    )
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let has_gaps = !gaps.is_empty();
+
+    // Check for duplicate sequences
+    let duplicates: Vec<i64> = sqlx::query_scalar(
+        r#"
+        SELECT seq FROM repo_seq
+        WHERE invalidated = 0
+        GROUP BY seq
+        HAVING COUNT(*) > 1
+        LIMIT 10
+        "#
+    )
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let has_duplicates = !duplicates.is_empty();
+
+    let integrity_ok = !has_gaps && !has_duplicates;
+
+    if req.verify_only {
+        // Log verification action
+        let _ = ctx.admin_role_manager
+            .log_action(&auth.did, "sequencer.verify", None, Some(if integrity_ok { "passed" } else { "failed" }), None)
+            .await;
+
+        Ok(Json(serde_json::json!({
+            "success": true,
+            "verify_only": true,
+            "integrity_ok": integrity_ok,
+            "has_gaps": has_gaps,
+            "has_duplicates": has_duplicates,
+            "gaps": gaps.iter().map(|(seq, gap)| serde_json::json!({
+                "seq": seq,
+                "gap_size": gap
+            })).collect::<Vec<_>>(),
+            "duplicate_sequences": duplicates,
+        })))
+    } else {
+        // For now, rebuild is just verification
+        // In a full implementation, this would:
+        // 1. Backup current sequence table
+        // 2. Rebuild sequence numbers from scratch
+        // 3. Update all references
+        // This is a destructive operation and should be done carefully
+
+        // Log rebuild action
+        let _ = ctx.admin_role_manager
+            .log_action(&auth.did, "sequencer.rebuild", None, Some("verify_only"), None)
+            .await;
+
+        Ok(Json(serde_json::json!({
+            "success": true,
+            "verify_only": false,
+            "integrity_ok": integrity_ok,
+            "message": "Sequencer verification complete. Full rebuild not yet implemented.",
+            "has_gaps": has_gaps,
+            "has_duplicates": has_duplicates,
+        })))
+    }
 }
 
 #[cfg(test)]
