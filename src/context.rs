@@ -104,9 +104,39 @@ impl AppContext {
         let blob_store_config = BlobStoreConfig::default();
         let blob_store = Arc::new(BlobStore::new(blob_store_config, account_db.clone())?);
 
-        // Initialize identity resolver
-        // Note: Using account_db for now; could be separate database in future
-        let did_cache = DidCache::new(account_db.clone());
+        // Initialize identity cache database with WAL mode enabled
+        // WAL mode provides better read concurrency - reads don't block during cache writes
+        let did_cache_db = db::create_pool(
+            &config.storage.did_cache_db,
+            db::DatabaseOptions {
+                max_connections: 10,
+                enable_wal: true, // Enable WAL mode for concurrent reads during writes
+            }
+        ).await?;
+
+        // Run migrations for identity cache
+        db::run_migrations(&did_cache_db).await?;
+
+        // Configure WAL checkpoint settings for optimal performance
+        // autocheckpoint=1000 pages (~4MB with default 4KB page size)
+        sqlx::query("PRAGMA wal_autocheckpoint = 1000")
+            .execute(&did_cache_db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        // Set synchronous=NORMAL for better write performance while maintaining durability
+        // NORMAL is safe with WAL mode and provides good balance of performance/safety
+        sqlx::query("PRAGMA synchronous = NORMAL")
+            .execute(&did_cache_db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        // Initialize identity resolver with separate WAL-enabled cache database
+        let did_cache = DidCache::new(did_cache_db)
+            .with_did_doc_ttls(
+                chrono::Duration::seconds(config.identity.did_cache_stale_ttl as i64),
+                chrono::Duration::seconds(config.identity.did_cache_max_ttl as i64)
+            );
         let identity_config = IdentityResolverConfig {
             user_agent: format!("Aurora-Locus/{}", config.service.version),
             use_doh: false,

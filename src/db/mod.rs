@@ -72,3 +72,149 @@ pub async fn test_connection(pool: &SqlitePool) -> PdsResult<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_wal_mode_enabled() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Create pool with WAL enabled
+        let pool = create_pool(&db_path, DatabaseOptions {
+            max_connections: 5,
+            enable_wal: true,
+        }).await.unwrap();
+
+        // Query the journal mode to verify WAL is enabled
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(journal_mode.to_lowercase(), "wal", "WAL mode should be enabled");
+
+        // Verify foreign keys are enabled
+        let foreign_keys: i32 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(foreign_keys, 1, "Foreign keys should be enabled");
+    }
+
+    #[tokio::test]
+    async fn test_wal_mode_disabled() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_no_wal.db");
+
+        // Create pool with WAL disabled
+        let pool = create_pool(&db_path, DatabaseOptions {
+            max_connections: 5,
+            enable_wal: false,
+        }).await.unwrap();
+
+        // Query the journal mode to verify WAL is NOT enabled
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(journal_mode.to_lowercase(), "delete", "DELETE mode should be used when WAL is disabled");
+    }
+
+    #[tokio::test]
+    async fn test_wal_checkpoint_configuration() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_checkpoint.db");
+
+        // Create pool with WAL enabled
+        let pool = create_pool(&db_path, DatabaseOptions {
+            max_connections: 5,
+            enable_wal: true,
+        }).await.unwrap();
+
+        // Set checkpoint configuration
+        sqlx::query("PRAGMA wal_autocheckpoint = 1000")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Verify checkpoint is set
+        let checkpoint: i32 = sqlx::query_scalar("PRAGMA wal_autocheckpoint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(checkpoint, 1000, "WAL autocheckpoint should be set to 1000 pages");
+
+        // Set synchronous mode
+        sqlx::query("PRAGMA synchronous = NORMAL")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Verify synchronous mode
+        let sync_mode: i32 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // NORMAL = 1, FULL = 2
+        assert_eq!(sync_mode, 1, "Synchronous should be set to NORMAL (1)");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads_with_wal() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_concurrent.db");
+
+        // Create pool with WAL enabled
+        let pool = create_pool(&db_path, DatabaseOptions {
+            max_connections: 10,
+            enable_wal: true,
+        }).await.unwrap();
+
+        // Create a test table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS test_cache (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            "#
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Insert test data
+        sqlx::query("INSERT INTO test_cache (key, value) VALUES ('test', 'data')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Spawn multiple concurrent reads
+        let mut handles = vec![];
+        for i in 0..10 {
+            let pool_clone = pool.clone();
+            let handle = tokio::spawn(async move {
+                let result: String = sqlx::query_scalar("SELECT value FROM test_cache WHERE key = 'test'")
+                    .fetch_one(&pool_clone)
+                    .await
+                    .unwrap();
+                assert_eq!(result, "data");
+                i
+            });
+            handles.push(handle);
+        }
+
+        // All reads should succeed concurrently
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+}

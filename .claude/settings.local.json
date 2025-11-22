@@ -22,7 +22,8 @@
       "Bash(dir:*)",
       "Bash(cargo check:*)",
       "Bash(Select-String -Pattern \"error\\[|warning:|Finished|Checking aurora-locus\")",
-      "Bash(Select-Object -Last 20)"
+      "Bash(Select-Object -Last 20)",
+      "Bash(bd create:*)"
     ],
     "deny": [],
     "ask": []
