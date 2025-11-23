@@ -56,7 +56,8 @@
       "Bash(bash test_admin_endpoints.sh:*)",
       "Bash(bash test_sequencer_endpoints.sh:*)",
       "Bash(task kill //F //PID 15080)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "Bash(Select-Object -Last 30)"
     ],
     "deny": [],
     "ask": []

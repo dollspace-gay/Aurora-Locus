@@ -90,16 +90,33 @@ async fn handle_authorization_code_grant(
     headers: HeaderMap,
     request: TokenRequest,
 ) -> PdsResult<Json<TokenResponse>> {
+    let start_time = std::time::Instant::now();
+
     // Step 1: Validate required parameters
     let code = request.code.as_ref().ok_or_else(|| {
+        crate::metrics::record_oauth_token_exchange(
+            "authorization_code",
+            "missing_code",
+            start_time.elapsed().as_secs_f64(),
+        );
         PdsError::Validation("code is required for authorization_code grant".to_string())
     })?;
 
     let code_verifier = request.code_verifier.as_ref().ok_or_else(|| {
+        crate::metrics::record_oauth_token_exchange(
+            "authorization_code",
+            "missing_verifier",
+            start_time.elapsed().as_secs_f64(),
+        );
         PdsError::Validation("code_verifier is required for authorization_code grant".to_string())
     })?;
 
     let redirect_uri = request.redirect_uri.as_ref().ok_or_else(|| {
+        crate::metrics::record_oauth_token_exchange(
+            "authorization_code",
+            "missing_redirect_uri",
+            start_time.elapsed().as_secs_f64(),
+        );
         PdsError::Validation("redirect_uri is required for authorization_code grant".to_string())
     })?;
 
@@ -114,6 +131,11 @@ async fn handle_authorization_code_grant(
             "Client ID mismatch: expected {}, got {}",
             auth_request.client_id, request.client_id
         );
+        crate::metrics::record_oauth_token_exchange(
+            "authorization_code",
+            "client_mismatch",
+            start_time.elapsed().as_secs_f64(),
+        );
         return Err(PdsError::Authentication("Invalid client".to_string()));
     }
 
@@ -123,13 +145,26 @@ async fn handle_authorization_code_grant(
             "Redirect URI mismatch: expected {}, got {}",
             auth_request.redirect_uri, redirect_uri
         );
+        crate::metrics::record_oauth_token_exchange(
+            "authorization_code",
+            "redirect_uri_mismatch",
+            start_time.elapsed().as_secs_f64(),
+        );
         return Err(PdsError::Authentication(
             "Invalid redirect_uri".to_string(),
         ));
     }
 
     // Step 5: Verify PKCE code_verifier
-    verify_pkce_challenge(code_verifier, &auth_request.code_challenge)?;
+    if let Err(e) = verify_pkce_challenge(code_verifier, &auth_request.code_challenge) {
+        crate::metrics::record_oauth_pkce_failure("verification_failed");
+        crate::metrics::record_oauth_token_exchange(
+            "authorization_code",
+            "pkce_failed",
+            start_time.elapsed().as_secs_f64(),
+        );
+        return Err(e);
+    }
 
     debug!("✓ PKCE verification successful");
 
@@ -145,6 +180,7 @@ async fn handle_authorization_code_grant(
             // For now, we'll allow tokens without DPoP (development mode)
             // In production, this should return an error
             warn!("DPoP verification failed (allowing for development): {}", e);
+            crate::metrics::record_oauth_dpop_failure("verification_failed");
             None
         }
     };
@@ -199,6 +235,13 @@ async fn handle_authorization_code_grant(
         "Bearer"
     };
 
+    // Record successful token exchange metrics
+    crate::metrics::record_oauth_token_exchange(
+        "authorization_code",
+        "success",
+        start_time.elapsed().as_secs_f64(),
+    );
+
     Ok(Json(TokenResponse {
         access_token,
         refresh_token,
@@ -217,8 +260,15 @@ async fn handle_refresh_token_grant(
     _headers: HeaderMap,
     request: TokenRequest,
 ) -> PdsResult<Json<TokenResponse>> {
+    let start_time = std::time::Instant::now();
+
     // Step 1: Validate required parameters
     let refresh_token = request.refresh_token.as_ref().ok_or_else(|| {
+        crate::metrics::record_oauth_token_exchange(
+            "refresh_token",
+            "missing_refresh_token",
+            start_time.elapsed().as_secs_f64(),
+        );
         PdsError::Validation("refresh_token is required for refresh_token grant".to_string())
     })?;
 
@@ -226,9 +276,31 @@ async fn handle_refresh_token_grant(
 
     // Step 2: Use TokenRotationManager to rotate the token
     let rotation_manager = TokenRotationManager::new(ctx.account_db.clone());
-    let result = rotation_manager
+    let result = match rotation_manager
         .rotate_token(refresh_token, &request.client_id)
-        .await?;
+        .await
+    {
+        Ok(res) => {
+            // Record successful token rotation
+            crate::metrics::record_oauth_token_rotation("success");
+            crate::metrics::record_oauth_token_exchange(
+                "refresh_token",
+                "success",
+                start_time.elapsed().as_secs_f64(),
+            );
+            res
+        }
+        Err(e) => {
+            // Record failed token rotation
+            crate::metrics::record_oauth_token_rotation("failure");
+            crate::metrics::record_oauth_token_exchange(
+                "refresh_token",
+                "rotation_failed",
+                start_time.elapsed().as_secs_f64(),
+            );
+            return Err(e);
+        }
+    };
 
     // Step 3: Return token response
     // TokenRotationManager already returns RotationResult which matches TokenResponse

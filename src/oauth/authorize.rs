@@ -56,6 +56,9 @@ pub async fn authorize(
     State(ctx): State<AppContext>,
     Query(query): Query<AuthorizeQuery>,
 ) -> PdsResult<impl IntoResponse> {
+    let start_time = std::time::Instant::now();
+    let client_id = query.client_id.clone();
+
     debug!(
         "OAuth authorization request: client_id={}, scope={}",
         query.client_id, query.scope
@@ -64,6 +67,11 @@ pub async fn authorize(
     // Step 1: Validate response_type (must be 'code')
     if query.response_type != "code" {
         warn!("Invalid response_type: {}", query.response_type);
+        crate::metrics::record_oauth_authorization(
+            &client_id,
+            "invalid_response_type",
+            start_time.elapsed().as_secs_f64(),
+        );
         return Err(PdsError::Validation(format!(
             "Unsupported response_type: {} (expected 'code')",
             query.response_type
@@ -76,6 +84,12 @@ pub async fn authorize(
             "Invalid code_challenge_method: {}",
             query.code_challenge_method
         );
+        crate::metrics::record_oauth_authorization(
+            &client_id,
+            "invalid_challenge_method",
+            start_time.elapsed().as_secs_f64(),
+        );
+        crate::metrics::record_oauth_pkce_failure("invalid_method");
         return Err(PdsError::Validation(format!(
             "Unsupported code_challenge_method: {} (expected 'S256')",
             query.code_challenge_method
@@ -84,6 +98,12 @@ pub async fn authorize(
 
     // Step 3: Validate code_challenge (must not be empty)
     if query.code_challenge.is_empty() {
+        crate::metrics::record_oauth_authorization(
+            &client_id,
+            "missing_challenge",
+            start_time.elapsed().as_secs_f64(),
+        );
+        crate::metrics::record_oauth_pkce_failure("missing_challenge");
         return Err(PdsError::Validation(
             "code_challenge is required".to_string(),
         ));
@@ -91,11 +111,21 @@ pub async fn authorize(
 
     // Step 4: Validate client_id (must not be empty)
     if query.client_id.is_empty() {
+        crate::metrics::record_oauth_authorization(
+            "unknown",
+            "missing_client_id",
+            start_time.elapsed().as_secs_f64(),
+        );
         return Err(PdsError::Validation("client_id is required".to_string()));
     }
 
     // Step 5: Validate redirect_uri (must not be empty and must be valid URL)
     if query.redirect_uri.is_empty() {
+        crate::metrics::record_oauth_authorization(
+            &client_id,
+            "missing_redirect_uri",
+            start_time.elapsed().as_secs_f64(),
+        );
         return Err(PdsError::Validation(
             "redirect_uri is required".to_string(),
         ));
@@ -107,6 +137,11 @@ pub async fn authorize(
             "Invalid redirect_uri: {} - error: {}",
             query.redirect_uri, e
         );
+        crate::metrics::record_oauth_authorization(
+            &client_id,
+            "invalid_redirect_uri",
+            start_time.elapsed().as_secs_f64(),
+        );
         return Err(PdsError::Validation(format!(
             "Invalid redirect_uri: {}",
             query.redirect_uri
@@ -115,6 +150,11 @@ pub async fn authorize(
 
     // Step 6: Validate scope (must not be empty)
     if query.scope.is_empty() {
+        crate::metrics::record_oauth_authorization(
+            &client_id,
+            "missing_scope",
+            start_time.elapsed().as_secs_f64(),
+        );
         return Err(PdsError::Validation("scope is required".to_string()));
     }
 
@@ -152,6 +192,18 @@ pub async fn authorize(
         "Created authorization request: request_id={}, did={}",
         request_id, user_did
     );
+
+    // Record successful authorization metrics
+    crate::metrics::record_oauth_authorization(
+        &query.client_id,
+        "success",
+        start_time.elapsed().as_secs_f64(),
+    );
+
+    // Record scope grants
+    for scope in query.scope.split_whitespace() {
+        crate::metrics::record_oauth_scope_grant(scope, true);
+    }
 
     // Step 12: Redirect to consent screen
     // Pass request_id so consent screen can retrieve the request details
