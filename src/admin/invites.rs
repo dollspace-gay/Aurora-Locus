@@ -136,12 +136,14 @@ impl InviteCodeManager {
             return Err(PdsError::Validation("Invite code has no uses remaining".to_string()));
         }
 
-        if let Ok(expires_at_str) = row.try_get::<String, _>("expires_at") {
-            let expires_at = DateTime::parse_from_rfc3339(&expires_at_str)
-                .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
-                .with_timezone(&Utc);
-            if expires_at < now {
-                return Err(PdsError::Validation("Invite code has expired".to_string()));
+        if let Ok(Some(expires_at_str)) = row.try_get::<Option<String>, _>("expires_at") {
+            if !expires_at_str.is_empty() {
+                let expires_at = DateTime::parse_from_rfc3339(&expires_at_str)
+                    .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
+                    .with_timezone(&Utc);
+                if expires_at < now {
+                    return Err(PdsError::Validation("Invite code has expired".to_string()));
+                }
             }
         }
 
@@ -238,6 +240,73 @@ impl InviteCodeManager {
         } else {
             Ok(None)
         }
+    }
+
+    /// Get the invite code that was used to create an account
+    ///
+    /// Returns the invite code that was used when creating the specified account,
+    /// or None if the account wasn't created with an invite code.
+    pub async fn get_invite_for_account(&self, did: &str) -> PdsResult<Option<InviteCode>> {
+        // First, find the invite code that was used by this account
+        let use_row = sqlx::query(
+            r#"
+            SELECT code FROM invite_code_use WHERE used_by = ?
+            "#,
+        )
+        .bind(did)
+        .fetch_optional(&self.db)
+        .await?;
+
+        if let Some(use_row) = use_row {
+            let code: String = use_row.get("code");
+            self.get_code(&code).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get all invite codes created by a specific account
+    ///
+    /// Returns all invite codes that were created by the specified DID.
+    pub async fn get_codes_created_by(&self, did: &str) -> PdsResult<Vec<InviteCode>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account
+            FROM invite_code
+            WHERE created_by = ?
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(did)
+        .fetch_all(&self.db)
+        .await?;
+
+        let mut codes = Vec::new();
+        for row in rows {
+            let created_at_str: String = row.get("created_at");
+            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+                .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
+                .with_timezone(&Utc);
+
+            let expires_at = row
+                .try_get::<String, _>("expires_at")
+                .ok()
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+
+            codes.push(InviteCode {
+                code: row.get("code"),
+                available: row.get("available"),
+                disabled: row.get("disabled"),
+                created_by: row.get("created_by"),
+                created_at,
+                expires_at,
+                note: row.get("note"),
+                for_account: row.get("for_account"),
+            });
+        }
+
+        Ok(codes)
     }
 
     /// List all invite codes

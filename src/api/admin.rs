@@ -23,6 +23,7 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
         .route("/xrpc/com.atproto.admin.listAccounts", get(get_users)) // Alias for frontend compatibility
         .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
+        .route("/xrpc/com.atproto.admin.getAccountInfos", get(get_account_infos))
         .route("/xrpc/com.atproto.admin.updateSubjectStatus", post(update_subject_status))
         .route("/xrpc/com.atproto.admin.getSubjectStatus", get(get_subject_status))
         // Invite codes
@@ -754,6 +755,153 @@ async fn get_account(
         "email_confirmed": account.email_confirmed_at.is_some(),
         "takedown": account.takedown_ref.is_some(),
     })))
+}
+
+#[derive(Deserialize)]
+struct GetAccountInfosQuery {
+    /// Comma-separated list of DIDs to look up
+    dids: String,
+}
+
+/// Account info for batch responses
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountInfo {
+    did: String,
+    handle: Option<String>,
+    email: Option<String>,
+    indexed_at: String,
+    email_confirmed_at: Option<String>,
+    invited_by: Option<InviteCodeInfo>,
+    invites: Vec<InviteCodeInfo>,
+    invites_disabled: bool,
+    invite_note: Option<String>,
+    deactivated_at: Option<String>,
+    threat_signatures: Vec<ThreatSignature>,
+}
+
+/// Invite code info embedded in account info
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InviteCodeInfo {
+    code: String,
+    available: i32,
+    disabled: bool,
+    for_account: String,
+    created_by: String,
+    created_at: String,
+    uses: Vec<InviteCodeUse>,
+}
+
+/// Record of invite code usage
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InviteCodeUse {
+    used_by: String,
+    used_at: String,
+}
+
+/// Threat signature (for future anti-spam/abuse detection)
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreatSignature {
+    property: String,
+    value: String,
+}
+
+/// Response for getAccountInfos
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetAccountInfosResponse {
+    infos: Vec<AccountInfo>,
+}
+
+/// Get multiple account details in batch
+///
+/// Batch lookup of multiple account details by DIDs.
+/// Returns information for all found accounts (missing DIDs are silently skipped).
+async fn get_account_infos(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<GetAccountInfosQuery>,
+) -> Result<Json<GetAccountInfosResponse>, (StatusCode, String)> {
+    // Parse the comma-separated DIDs
+    let dids: Vec<&str> = query.dids.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+
+    if dids.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "No DIDs provided".to_string()));
+    }
+
+    // Limit batch size to prevent abuse
+    const MAX_BATCH_SIZE: usize = 100;
+    if dids.len() > MAX_BATCH_SIZE {
+        return Err((StatusCode::BAD_REQUEST, format!("Too many DIDs (max {})", MAX_BATCH_SIZE)));
+    }
+
+    let mut infos = Vec::new();
+
+    for did in dids {
+        // Skip invalid DID formats
+        if !did.starts_with("did:") {
+            continue;
+        }
+
+        // Try to get account, skip if not found
+        let account = match ctx.account_manager.get_account(did).await {
+            Ok(acc) => acc,
+            Err(_) => continue,
+        };
+
+        // Get invite code that was used to create this account (if any)
+        let invited_by = ctx.invite_manager
+            .get_invite_for_account(did)
+            .await
+            .ok()
+            .flatten()
+            .map(|inv| InviteCodeInfo {
+                code: inv.code.clone(),
+                available: inv.available,
+                disabled: inv.disabled,
+                for_account: inv.for_account.clone().unwrap_or_default(),
+                created_by: inv.created_by.clone(),
+                created_at: inv.created_at.to_rfc3339(),
+                uses: vec![], // We don't track individual uses in the invite lookup
+            });
+
+        // Get invite codes created by this account
+        let account_invites = ctx.invite_manager
+            .get_codes_created_by(did)
+            .await
+            .unwrap_or_default();
+
+        let invites: Vec<InviteCodeInfo> = account_invites.into_iter().map(|inv| {
+            InviteCodeInfo {
+                code: inv.code.clone(),
+                available: inv.available,
+                disabled: inv.disabled,
+                for_account: inv.for_account.clone().unwrap_or_default(),
+                created_by: inv.created_by.clone(),
+                created_at: inv.created_at.to_rfc3339(),
+                uses: vec![], // Uses would need separate query
+            }
+        }).collect();
+
+        infos.push(AccountInfo {
+            did: account.did.clone(),
+            handle: account.handle.clone(),
+            email: account.email.clone(),
+            indexed_at: account.created_at.to_rfc3339(),
+            email_confirmed_at: account.email_confirmed_at.map(|dt| dt.to_rfc3339()),
+            invited_by,
+            invites,
+            invites_disabled: account.invites_disabled.unwrap_or(false),
+            invite_note: None, // Not tracked currently
+            deactivated_at: account.deactivated_at.map(|dt| dt.to_rfc3339()),
+            threat_signatures: vec![], // Not implemented yet
+        });
+    }
+
+    Ok(Json(GetAccountInfosResponse { infos }))
 }
 
 #[derive(Deserialize)]
