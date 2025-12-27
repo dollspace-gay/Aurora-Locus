@@ -24,6 +24,7 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.listAccounts", get(get_users)) // Alias for frontend compatibility
         .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
         .route("/xrpc/com.atproto.admin.updateSubjectStatus", post(update_subject_status))
+        .route("/xrpc/com.atproto.admin.getSubjectStatus", get(get_subject_status))
         // Invite codes
         .route("/xrpc/com.atproto.admin.createInviteCode", post(create_invite_code))
         .route("/xrpc/com.atproto.admin.getInviteCodes", get(get_invite_codes))
@@ -824,6 +825,164 @@ async fn update_subject_status(
         "did": did,
         "action": req.action,
     })))
+}
+
+#[derive(Deserialize)]
+struct GetSubjectStatusQuery {
+    /// The DID or AT-URI of the subject to query
+    #[serde(default)]
+    did: Option<String>,
+    /// The AT-URI of the subject (alternative to did for record-level status)
+    #[serde(default)]
+    uri: Option<String>,
+    /// The CID of the blob (for blob-level status)
+    #[serde(default)]
+    blob: Option<String>,
+}
+
+/// Subject status response matching ATProto spec
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubjectStatusResponse {
+    subject: SubjectRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    takedown: Option<StatusAttr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deactivated: Option<StatusAttr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suspended: Option<StatusAttr>,
+}
+
+/// Reference to the subject (repo, record, or blob)
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubjectRef {
+    #[serde(rename = "$type")]
+    type_field: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    did: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cid: Option<String>,
+}
+
+/// Status attribute with applied flag and optional reference
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusAttr {
+    applied: bool,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    ref_field: Option<String>,
+}
+
+/// Get subject status (takedown/deactivation status of account or record)
+///
+/// This endpoint returns the current moderation status of a subject,
+/// including whether it's been taken down, deactivated, or suspended.
+async fn get_subject_status(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<GetSubjectStatusQuery>,
+) -> Result<Json<SubjectStatusResponse>, (StatusCode, String)> {
+    // Determine subject type and extract DID
+    let (subject_type, did, uri) = if let Some(ref did_str) = query.did {
+        // Direct DID query - repo subject
+        if !did_str.starts_with("did:") {
+            return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
+        }
+        ("com.atproto.admin.defs#repoRef", did_str.clone(), None)
+    } else if let Some(ref uri_str) = query.uri {
+        // AT-URI query - record subject
+        if !uri_str.starts_with("at://") {
+            return Err((StatusCode::BAD_REQUEST, "Invalid AT-URI format".to_string()));
+        }
+        // Extract DID from AT-URI
+        let did = uri_str
+            .trim_start_matches("at://")
+            .split('/')
+            .next()
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid AT-URI format".to_string()))?
+            .to_string();
+        if !did.starts_with("did:") {
+            return Err((StatusCode::BAD_REQUEST, "AT-URI must contain a DID".to_string()));
+        }
+        ("com.atproto.repo.strongRef", did, Some(uri_str.clone()))
+    } else if let Some(ref _blob_cid) = query.blob {
+        // Blob query - not yet implemented
+        return Err((StatusCode::NOT_IMPLEMENTED, "Blob status queries not yet implemented".to_string()));
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Must provide did, uri, or blob parameter".to_string()));
+    };
+
+    // Get account info from account manager
+    let account = ctx.account_manager
+        .get_account(&did)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                (StatusCode::NOT_FOUND, format!("Subject not found: {}", did))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+
+    // Check moderation status
+    let is_suspended = ctx.moderation_manager
+        .is_suspended(&did)
+        .await
+        .unwrap_or(false);
+
+    // Build response
+    let subject = SubjectRef {
+        type_field: subject_type.to_string(),
+        did: if query.did.is_some() { Some(did.clone()) } else { None },
+        uri,
+        cid: None,
+    };
+
+    let takedown = if account.takedown_ref.is_some() {
+        Some(StatusAttr {
+            applied: true,
+            ref_field: account.takedown_ref.clone(),
+        })
+    } else {
+        Some(StatusAttr {
+            applied: false,
+            ref_field: None,
+        })
+    };
+
+    let deactivated = if account.deactivated_at.is_some() {
+        Some(StatusAttr {
+            applied: true,
+            ref_field: account.deactivated_at.map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339()),
+        })
+    } else {
+        Some(StatusAttr {
+            applied: false,
+            ref_field: None,
+        })
+    };
+
+    let suspended = if is_suspended {
+        Some(StatusAttr {
+            applied: true,
+            ref_field: None,
+        })
+    } else {
+        Some(StatusAttr {
+            applied: false,
+            ref_field: None,
+        })
+    };
+
+    Ok(Json(SubjectStatusResponse {
+        subject,
+        takedown,
+        deactivated,
+        suspended,
+    }))
 }
 
 #[derive(Deserialize)]

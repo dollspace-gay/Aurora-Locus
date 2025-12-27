@@ -8,6 +8,7 @@ pub mod health;
 pub mod identity;
 pub mod labels;
 pub mod middleware;
+pub mod moderation;
 pub mod oauth_admin;
 pub mod oauth_server;
 pub mod repo;
@@ -34,6 +35,7 @@ pub fn routes() -> Router<AppContext> {
         .merge(sync::routes())
         .merge(firehose::routes())
         .merge(labels::routes())
+        .merge(moderation::routes())
         .merge(health::routes())
         .merge(federation::routes())
         .merge(appview::routes())  // AppView proxy with read-after-write

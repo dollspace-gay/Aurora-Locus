@@ -2,11 +2,9 @@
 //!
 //! Implements secp256k1-based signing for DID:PLC update operations
 
+use crate::crypto::secp256k1::Secp256k1KeyPair;
 use crate::error::{PdsError, PdsResult};
-use k256::{
-    ecdsa::{signature::Signer, Signature, SigningKey},
-    SecretKey,
-};
+use k256::ecdsa::{signature::Signer, Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -126,27 +124,18 @@ impl PlcOperationBuilder {
 }
 
 /// PLC Signer - handles signing of PLC operations
+///
+/// Wraps a `Secp256k1KeyPair` to provide PLC-specific signing operations.
 #[derive(Clone)]
 pub struct PlcSigner {
-    signing_key: SigningKey,
+    keypair: Secp256k1KeyPair,
 }
 
 impl PlcSigner {
     /// Create a new PLC signer from a private key (32 bytes)
     pub fn new(private_key: &[u8]) -> PdsResult<Self> {
-        if private_key.len() != 32 {
-            return Err(PdsError::Validation(
-                "Private key must be exactly 32 bytes".to_string(),
-            ));
-        }
-
-        let secret_key = SecretKey::from_slice(private_key).map_err(|e| {
-            PdsError::Internal(format!("Invalid private key: {}", e))
-        })?;
-
-        let signing_key = SigningKey::from(secret_key);
-
-        Ok(Self { signing_key })
+        let keypair = Secp256k1KeyPair::from_bytes(private_key)?;
+        Ok(Self { keypair })
     }
 
     /// Create a signer from hex-encoded private key
@@ -162,8 +151,7 @@ impl PlcSigner {
     ///
     /// Returns a 64-byte signature
     pub fn sign(&self, data: &[u8]) -> Vec<u8> {
-        use k256::ecdsa::signature::Signer;
-        let signature: k256::ecdsa::Signature = self.signing_key.sign(data);
+        let signature: k256::ecdsa::Signature = self.keypair.signing_key().sign(data);
         signature.to_bytes().to_vec()
     }
 
@@ -186,7 +174,7 @@ impl PlcSigner {
         let hash = hasher.finalize();
 
         // Sign the hash
-        let signature: Signature = self.signing_key.sign(&hash);
+        let signature: Signature = self.keypair.signing_key().sign(&hash);
 
         // Encode signature as hex
         let sig_hex = hex::encode(signature.to_bytes());
@@ -199,33 +187,25 @@ impl PlcSigner {
 
     /// Get the public key in compressed form (33 bytes, hex-encoded)
     pub fn public_key_hex(&self) -> String {
-        let verifying_key = self.signing_key.verifying_key();
-        let public_key_bytes = verifying_key.to_encoded_point(true); // Compressed form
-        hex::encode(public_key_bytes.as_bytes())
+        self.keypair.public_key_hex()
     }
 
     /// Get the public key in multibase format (for DID documents)
     /// Returns base58btc encoding with 'z' prefix
     pub fn public_key_multibase(&self) -> String {
-        let verifying_key = self.signing_key.verifying_key();
-        let public_key_bytes = verifying_key.to_encoded_point(true); // Compressed
-        let compressed_bytes = public_key_bytes.as_bytes();
-
-        // Encode as base58btc with multibase 'z' prefix
-        let encoded = bs58::encode(compressed_bytes).into_string();
-        format!("z{}", encoded)
+        self.keypair.public_key_multibase()
     }
 
     /// Get the public key as a did:key identifier
     pub fn public_key_did_key(&self) -> String {
-        format!("did:key:{}", self.public_key_multibase())
+        self.keypair.did()
     }
 
     /// Get the verifying key (public key)
     ///
     /// Returns the ECDSA verifying key associated with this signer's private key
     pub fn verifying_key(&self) -> k256::ecdsa::VerifyingKey {
-        *self.signing_key.verifying_key()
+        self.keypair.verifying_key()
     }
 }
 

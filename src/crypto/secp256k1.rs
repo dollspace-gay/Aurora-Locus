@@ -11,6 +11,7 @@ use k256::{
 use rand::rngs::OsRng;
 
 /// Secp256k1 KeyPair for signing operations
+#[derive(Clone)]
 pub struct Secp256k1KeyPair {
     signing_key: SigningKey,
 }
