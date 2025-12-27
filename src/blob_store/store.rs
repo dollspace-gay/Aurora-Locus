@@ -622,6 +622,110 @@ impl BlobStore {
         Ok(blobs)
     }
 
+    /// List blobs that are referenced by records but not yet uploaded
+    ///
+    /// Returns blob CIDs and their record URIs for blobs that exist in
+    /// record_blob but not in blob_metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `did` - The DID to check missing blobs for
+    /// * `limit` - Maximum number of results to return
+    /// * `cursor` - Optional cursor for pagination (blob_cid to start after)
+    ///
+    /// # Returns
+    ///
+    /// Vec of (blob_cid, record_uri) tuples
+    pub async fn list_missing_blobs(
+        &self,
+        did: &str,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> PdsResult<Vec<(String, String)>> {
+        // Find blobs referenced in records that don't exist in blob storage
+        // record_blob tracks references, blob_metadata tracks actual blobs
+        let query = if let Some(cursor) = cursor {
+            sqlx::query(
+                r#"
+                SELECT rb.blob_cid, rb.record_uri
+                FROM record_blob rb
+                LEFT JOIN blob_metadata bm ON rb.blob_cid = bm.cid
+                WHERE rb.record_uri LIKE ?1
+                  AND bm.cid IS NULL
+                  AND rb.blob_cid > ?2
+                ORDER BY rb.blob_cid ASC
+                LIMIT ?3
+                "#
+            )
+            .bind(format!("at://{}/%", did))
+            .bind(cursor)
+            .bind(limit)
+        } else {
+            sqlx::query(
+                r#"
+                SELECT rb.blob_cid, rb.record_uri
+                FROM record_blob rb
+                LEFT JOIN blob_metadata bm ON rb.blob_cid = bm.cid
+                WHERE rb.record_uri LIKE ?1
+                  AND bm.cid IS NULL
+                ORDER BY rb.blob_cid ASC
+                LIMIT ?2
+                "#
+            )
+            .bind(format!("at://{}/%", did))
+            .bind(limit)
+        };
+
+        let rows = query
+            .fetch_all(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push((
+                row.try_get::<String, _>("blob_cid")?,
+                row.try_get::<String, _>("record_uri")?,
+            ));
+        }
+
+        Ok(results)
+    }
+
+    /// Track a blob reference from a record
+    ///
+    /// Called when a record is created/updated that contains blob references.
+    pub async fn track_blob_reference(&self, blob_cid: &str, record_uri: &str) -> PdsResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO record_blob (blob_cid, record_uri, indexed_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(blob_cid, record_uri) DO NOTHING
+            "#
+        )
+        .bind(blob_cid)
+        .bind(record_uri)
+        .bind(Utc::now())
+        .execute(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        Ok(())
+    }
+
+    /// Remove blob references for a record
+    ///
+    /// Called when a record is deleted.
+    pub async fn remove_record_blob_references(&self, record_uri: &str) -> PdsResult<()> {
+        sqlx::query("DELETE FROM record_blob WHERE record_uri = ?1")
+            .bind(record_uri)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        Ok(())
+    }
+
     /// List blob CIDs for sync protocol (com.atproto.sync.listBlobs)
     ///
     /// Returns just the CID strings for a DID with cursor-based pagination.

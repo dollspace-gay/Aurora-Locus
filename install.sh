@@ -750,6 +750,17 @@ CREATE INDEX IF NOT EXISTS record_cid_idx ON record(cid);
 CREATE INDEX IF NOT EXISTS record_indexed_at_idx ON record(indexed_at);
 CREATE INDEX IF NOT EXISTS record_takedown_idx ON record(takedown_ref) WHERE takedown_ref IS NOT NULL;
 
+-- Record-blob association table (tracks which blobs are referenced by which records)
+CREATE TABLE IF NOT EXISTS record_blob (
+    blob_cid TEXT NOT NULL,
+    record_uri TEXT NOT NULL,
+    indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (blob_cid, record_uri)
+);
+CREATE INDEX IF NOT EXISTS record_blob_cid_idx ON record_blob(blob_cid);
+CREATE INDEX IF NOT EXISTS record_blob_uri_idx ON record_blob(record_uri);
+CREATE INDEX IF NOT EXISTS record_blob_indexed_at_idx ON record_blob(indexed_at);
+
 -- Repo block table
 CREATE TABLE IF NOT EXISTS repo_block (
     cid TEXT PRIMARY KEY NOT NULL,

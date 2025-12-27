@@ -14,6 +14,46 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Extract blob CIDs from a record value
+///
+/// Recursively scans a JSON value for blob references in ATProto format.
+/// Blobs are represented as `{ "$type": "blob", "ref": { "$link": "CID" } }`.
+fn extract_blob_cids(value: &serde_json::Value) -> Vec<String> {
+    let mut cids = Vec::new();
+    extract_blob_cids_recursive(value, &mut cids);
+    cids
+}
+
+fn extract_blob_cids_recursive(value: &serde_json::Value, cids: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            // Check if this is a blob reference
+            if let Some(type_val) = obj.get("$type") {
+                if type_val.as_str() == Some("blob") {
+                    // Extract the CID from ref.$link
+                    if let Some(ref_obj) = obj.get("ref") {
+                        if let Some(link) = ref_obj.get("$link") {
+                            if let Some(cid) = link.as_str() {
+                                cids.push(cid.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            // Recurse into object values
+            for (_, v) in obj {
+                extract_blob_cids_recursive(v, cids);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                extract_blob_cids_recursive(v, cids);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Build repository routes
 pub fn routes() -> Router<AppContext> {
     Router::new()
@@ -22,6 +62,7 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.repo.deleteRecord", post(delete_record))
         .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
         .route("/xrpc/com.atproto.repo.listRecords", get(list_records))
+        .route("/xrpc/com.atproto.repo.listMissingBlobs", get(list_missing_blobs))
         .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
         .route("/xrpc/com.atproto.repo.applyWrites", post(apply_writes))
 }
@@ -249,6 +290,9 @@ async fn create_record(
     // Create signer from repo key
     let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
 
+    // Extract blob references from the record before creation
+    let blob_cids = extract_blob_cids(&req.record);
+
     // Create the record
     tracing::debug!("create_record: Calling repo_mgr.create_record");
     let (uri, cid, _rev) = repo_mgr
@@ -258,6 +302,14 @@ async fn create_record(
             tracing::error!("create_record: Failed to create record: {}", e);
             e
         })?;
+
+    // Track blob references for this record
+    for blob_cid in &blob_cids {
+        if let Err(e) = ctx.blob_store.track_blob_reference(blob_cid, &uri).await {
+            tracing::warn!("create_record: Failed to track blob reference {}: {}", blob_cid, e);
+            // Don't fail the request for tracking errors
+        }
+    }
 
     // Invalidate read-after-write cache for this user
     ctx.local_records_cache.invalidate_did(auth_did).await;
@@ -304,15 +356,28 @@ async fn put_record(
     // Create signer from repo key
     let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
 
+    // Extract blob references from the new record
+    let blob_cids = extract_blob_cids(&req.record);
+
     // Update the record
     let (cid, _rev) = repo_mgr
         .update_record(&req.collection, &req.rkey, req.record, req.validate, signer)
         .await?;
 
+    let uri = format!("at://{}/{}/{}", auth_did, req.collection, req.rkey);
+
+    // Remove old blob references and add new ones
+    if let Err(e) = ctx.blob_store.remove_record_blob_references(&uri).await {
+        tracing::warn!("put_record: Failed to remove old blob references: {}", e);
+    }
+    for blob_cid in &blob_cids {
+        if let Err(e) = ctx.blob_store.track_blob_reference(blob_cid, &uri).await {
+            tracing::warn!("put_record: Failed to track blob reference {}: {}", blob_cid, e);
+        }
+    }
+
     // Invalidate read-after-write cache for this user
     ctx.local_records_cache.invalidate_did(auth_did).await;
-
-    let uri = format!("at://{}/{}/{}", auth_did, req.collection, req.rkey);
 
     Ok(Json(PutRecordResponse { uri, cid }))
 }
@@ -354,10 +419,18 @@ async fn delete_record(
     // Create signer from repo key
     let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
 
+    // Build record URI for blob reference cleanup
+    let uri = format!("at://{}/{}/{}", auth_did, req.collection, req.rkey);
+
     // Delete the record
     repo_mgr
         .delete_record(&req.collection, &req.rkey, signer)
         .await?;
+
+    // Remove blob references for this record
+    if let Err(e) = ctx.blob_store.remove_record_blob_references(&uri).await {
+        tracing::warn!("delete_record: Failed to remove blob references: {}", e);
+    }
 
     // Invalidate read-after-write cache for this user
     ctx.local_records_cache.invalidate_did(auth_did).await;
@@ -580,4 +653,80 @@ async fn apply_writes(
             "rev": rev,
         }
     })))
+}
+
+/// Query parameters for listMissingBlobs
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListMissingBlobsQuery {
+    #[serde(default = "default_missing_blobs_limit")]
+    limit: i64,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+fn default_missing_blobs_limit() -> i64 {
+    500
+}
+
+/// A blob that is referenced by a record but not yet uploaded
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordBlob {
+    cid: String,
+    record_uri: String,
+}
+
+/// Response for listMissingBlobs
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListMissingBlobsResponse {
+    blobs: Vec<RecordBlob>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+}
+
+/// List missing blobs endpoint
+///
+/// Returns blobs that are referenced by records but have not yet been uploaded.
+/// This is useful for resuming failed uploads or identifying incomplete records.
+async fn list_missing_blobs(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Query(query): Query<ListMissingBlobsQuery>,
+) -> PdsResult<Json<ListMissingBlobsResponse>> {
+    // Require authentication
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
+    let auth_did = auth.did();
+
+    // Validate limit (1-1000)
+    let limit = query.limit.clamp(1, 1000);
+
+    // Query for missing blobs
+    let missing = ctx
+        .blob_store
+        .list_missing_blobs(auth_did, limit + 1, query.cursor.as_deref())
+        .await?;
+
+    // Determine if there's more data (pagination)
+    let has_more = missing.len() > limit as usize;
+    let results: Vec<_> = missing
+        .into_iter()
+        .take(limit as usize)
+        .collect();
+
+    // Build cursor from last item
+    let cursor = if has_more {
+        results.last().map(|(cid, _)| cid.clone())
+    } else {
+        None
+    };
+
+    // Convert to response format
+    let blobs = results
+        .into_iter()
+        .map(|(cid, record_uri)| RecordBlob { cid, record_uri })
+        .collect();
+
+    Ok(Json(ListMissingBlobsResponse { blobs, cursor }))
 }

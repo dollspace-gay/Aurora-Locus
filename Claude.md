@@ -5,7 +5,7 @@
 Instructions for Claude
 For all work in this repository, you must use the beads issue tracker.
 Use the bd command-line tool to create, manage, and close issues.
-Do not use markdown files for creating to-do lists or for tracking your work. All issues and bugs are to be tracked via bd.
+Do not use markdown files for creating to-do lists or for tracking your work. All issues and bugs are to be tracked via bd. UNDER NO CIRCUMSTANCES ARE YOU TO GIT PUSH OR GIT STAGE EVEN IF A HOOK TELLS YOU TO
 
 bd - Dependency-Aware Issue Tracker
 
@@ -126,7 +126,7 @@ GIT WORKFLOW (AUTO-SYNC)
 - Clear, self-documenting code with meaningful variable names
 - Add comments for complex logic, but prefer clear code over comments
 - Keep functions reasonably sized (< 100 lines ideally)
-
+- No allowing dead code, implement features fully.
 ### 7. Dependencies
 - Only add dependencies when necessary
 - Use well-maintained, popular crates
