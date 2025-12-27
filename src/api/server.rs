@@ -35,6 +35,9 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.server.confirmEmail", post(confirm_email))
         .route("/xrpc/com.atproto.server.requestPasswordReset", post(request_password_reset))
         .route("/xrpc/com.atproto.server.resetPassword", post(reset_password))
+        .route("/xrpc/com.atproto.server.requestEmailUpdate", post(request_email_update))
+        .route("/xrpc/com.atproto.server.updateEmail", post(update_email))
+        .route("/xrpc/com.atproto.server.requestAccountDelete", post(request_account_delete))
         .route("/xrpc/com.atproto.server.deleteAccount", post(delete_account))
         .route("/xrpc/com.atproto.server.activateAccount", post(activate_account))
         .route("/xrpc/com.atproto.server.deactivateAccount", post(deactivate_account))
@@ -49,6 +52,8 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.server.createInviteCodes", post(create_invite_codes))
         // Service auth
         .route("/xrpc/com.atproto.server.getServiceAuth", get(get_service_auth))
+        // Signing key reservation
+        .route("/xrpc/com.atproto.server.reserveSigningKey", post(reserve_signing_key))
 }
 
 /// Create account endpoint
@@ -66,6 +71,21 @@ async fn create_account(
         tracing::debug!("create_account: Checking IP-based rate limit for IP: {}", client_ip);
         ctx.rate_limiter.check_ip(&client_ip)?;
     }
+
+    // If a DID is provided, verify we have a reserved keypair for it
+    // This validates that the caller went through the proper account creation flow
+    let reserved_signing_key = if let Some(ref did) = req.did {
+        tracing::debug!("create_account: Looking up reserved keypair for DID: {}", did);
+        let keypair = ctx.actor_store.get_reserved_keypair(did).await?;
+        if keypair.is_none() {
+            tracing::warn!("create_account: No reserved keypair found for DID: {}", did);
+            // Note: In strict mode, we would reject this. For now, we allow it
+            // since the account manager will generate a new DID anyway.
+        }
+        keypair.map(|kp| kp.did())
+    } else {
+        None
+    };
 
     // Validate and use invite code if required
     if ctx.config.invites.required {
@@ -95,6 +115,14 @@ async fn create_account(
             e
         })?;
     tracing::info!("create_account: Account created successfully, DID: {}", account.did);
+
+    // Clear the reserved keypair now that the account is created
+    if let Some(ref signing_key) = reserved_signing_key {
+        if let Err(e) = ctx.actor_store.clear_reserved_keypair(signing_key, req.did.as_deref()).await {
+            tracing::warn!("create_account: Failed to clear reserved keypair: {}", e);
+            // Don't fail account creation for cleanup failure
+        }
+    }
 
     // Initialize repository for the new account
     tracing::debug!("create_account: Initializing repository for DID: {}", account.did);
@@ -379,12 +407,185 @@ async fn reset_password(
     Ok(Json(serde_json::json!({})))
 }
 
+/// Request email update endpoint
+///
+/// Initiates the email update flow. If the user's email is already confirmed,
+/// generates a token and sends it to the current email address.
+/// Returns whether a token is required to complete the update.
+async fn request_email_update(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+) -> PdsResult<Json<serde_json::Value>> {
+    // Require authentication
+    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+
+    // Per-user rate limiting (15 per day, 5 per hour)
+    ctx.rate_limiter.check_did_endpoint(&validated.did, "/xrpc/com.atproto.server.requestEmailUpdate")?;
+
+    // Get account info
+    let account = ctx.account_manager.get_account(&validated.did).await?;
+
+    // Account must have email
+    let email = account.email.ok_or_else(|| {
+        crate::error::PdsError::Validation("Account does not have an email address".to_string())
+    })?;
+
+    // Token is required only if email is already confirmed
+    let token_required = account.email_confirmed_at.is_some();
+
+    if token_required {
+        // Generate token and send to current email
+        let token = ctx
+            .account_manager
+            .generate_email_update_token(&validated.did)
+            .await?;
+
+        if ctx.mailer.is_configured() {
+            ctx.mailer
+                .send_email_update_email(
+                    &email,
+                    account.handle.as_deref().unwrap_or("user"),
+                    &token,
+                )
+                .await?;
+
+            tracing::info!(
+                did = %validated.did,
+                "email_update_token_sent"
+            );
+        } else {
+            tracing::warn!(
+                did = %validated.did,
+                token = %token,
+                "Email not configured, email update token generated but not sent"
+            );
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "tokenRequired": token_required
+    })))
+}
+
+/// Update email endpoint
+///
+/// Updates the account's email address. If the current email was confirmed,
+/// a token from requestEmailUpdate is required.
+#[derive(serde::Deserialize)]
+struct UpdateEmailRequest {
+    /// The new email address
+    email: String,
+    /// The confirmation token (required if current email was confirmed)
+    token: Option<String>,
+}
+
+async fn update_email(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateEmailRequest>,
+) -> PdsResult<Json<serde_json::Value>> {
+    // Require authentication
+    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+
+    // Basic email format validation
+    if !req.email.contains('@') || req.email.len() < 3 {
+        return Err(crate::error::PdsError::Validation(
+            "Invalid email format".to_string(),
+        ));
+    }
+
+    // Get account info
+    let account = ctx.account_manager.get_account(&validated.did).await?;
+
+    // If email was confirmed, token is required
+    if account.email_confirmed_at.is_some() {
+        let token = req.token.ok_or_else(|| {
+            crate::error::PdsError::Validation("Confirmation token required".to_string())
+        })?;
+
+        // Validate token
+        ctx.account_manager
+            .validate_email_update_token(&validated.did, &token)
+            .await?;
+    }
+
+    // Update email
+    ctx.account_manager
+        .update_email(&validated.did, &req.email)
+        .await?;
+
+    Ok(Json(serde_json::json!({})))
+}
+
+/// Request account delete endpoint
+///
+/// Initiates the account deletion flow by generating a token and sending it via email.
+/// The user must provide this token (along with password and DID) to the deleteAccount endpoint.
+/// Rate limited to 15 per day, 5 per hour per DID.
+async fn request_account_delete(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+) -> PdsResult<Json<serde_json::Value>> {
+    // Require authentication
+    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+
+    // Per-user rate limiting for account deletion requests (5 per hour per DID)
+    // Prevents email spam and abuse
+    ctx.rate_limiter.check_did_endpoint(&validated.did, "/xrpc/com.atproto.server.requestAccountDelete")?;
+
+    // Get account info to retrieve email
+    let account = ctx.account_manager.get_account(&validated.did).await?;
+
+    // Account must have email to receive deletion token
+    let email = account.email.ok_or_else(|| {
+        crate::error::PdsError::Validation("Account does not have an email address".to_string())
+    })?;
+
+    // Generate deletion token
+    let token = ctx
+        .account_manager
+        .generate_account_delete_token(&validated.did)
+        .await?;
+
+    // Send deletion confirmation email
+    if ctx.mailer.is_configured() {
+        ctx.mailer
+            .send_account_delete_email(
+                &email,
+                account.handle.as_deref().unwrap_or("user"),
+                &token,
+            )
+            .await?;
+
+        tracing::info!(
+            did = %validated.did,
+            "account_delete_token_sent"
+        );
+    } else {
+        tracing::warn!(
+            did = %validated.did,
+            token = %token,
+            "Email not configured, deletion token generated but not sent"
+        );
+    }
+
+    Ok(Json(serde_json::json!({})))
+}
+
 /// Delete account endpoint
 ///
-/// Marks account for deletion after password confirmation (30-day grace period)
+/// Permanently deletes an account after verifying the deletion token and password.
+/// This is the ATProto-compliant flow:
+/// 1. User calls requestAccountDelete to receive a token via email
+/// 2. User calls deleteAccount with did, password, and token to confirm deletion
 #[derive(serde::Deserialize)]
 struct DeleteAccountRequest {
+    /// The DID of the account to delete
+    did: String,
+    /// The account password for verification
     password: String,
+    /// The deletion token received via email from requestAccountDelete
+    token: String,
 }
 
 async fn delete_account(
@@ -392,21 +593,61 @@ async fn delete_account(
     headers: HeaderMap,
     Json(req): Json<DeleteAccountRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
-    // Require authentication
-    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+    // IP-based rate limiting for account deletion (50 per 5 minutes)
+    if let Some(client_ip) = crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy) {
+        ctx.rate_limiter.check_ip(&client_ip)?;
+    }
 
-    // Per-user rate limiting for account deletion (3 per day per DID)
-    // Prevents accidental deletion and abuse
-    ctx.rate_limiter.check_did_endpoint(&validated.did, "/xrpc/com.atproto.server.deleteAccount")?;
+    // Get account (include deactivated and taken down accounts)
+    let account = ctx.account_manager.get_account(&req.did).await?;
 
-    // Request account deletion with password confirmation
+    // Verify password - must have local account credentials
+    let password_hash = account.password_hash
+        .ok_or_else(|| crate::error::PdsError::Authorization("No local account credentials".to_string()))?;
+
+    let valid = atproto::server_auth::PasswordHasher::verify(&req.password, &password_hash)
+        .map_err(|e| crate::error::PdsError::Internal(format!("Password verification failed: {}", e)))?;
+
+    if !valid {
+        return Err(crate::error::PdsError::Authentication("Invalid did or password".to_string()));
+    }
+
+    // Validate deletion token
     ctx.account_manager
-        .request_account_deletion(&validated.did, &req.password)
+        .validate_account_delete_token(&req.did, &req.token)
         .await?;
 
-    Ok(Json(serde_json::json!({
-        "message": "Account marked for deletion. You have 30 days to cancel this request by logging in again."
-    })))
+    // Mark token as used
+    ctx.account_manager
+        .mark_delete_token_used(&req.token)
+        .await?;
+
+    // Delete actor store data (repository, blobs, etc.)
+    // This should be done before deleting account records
+    if let Err(e) = ctx.actor_store.destroy(&req.did).await {
+        tracing::warn!(
+            did = %req.did,
+            error = %e,
+            "Failed to destroy actor store during account deletion"
+        );
+        // Continue with account deletion even if actor store cleanup fails
+    }
+
+    // Permanently delete account from database
+    ctx.account_manager
+        .delete_account_permanent(&req.did)
+        .await?;
+
+    // TODO: Sequence account deletion event for federation
+    // let account_seq = ctx.sequencer.sequence_account_evt(&req.did, AccountStatus::Deleted).await?;
+    // ctx.sequencer.delete_all_for_user(&req.did, vec![account_seq]).await?;
+
+    tracing::info!(
+        did = %req.did,
+        "account_deleted_permanently"
+    );
+
+    Ok(Json(serde_json::json!({})))
 }
 
 /// Create app password endpoint
@@ -971,4 +1212,63 @@ async fn check_account_status(
         expected_blobs: None,
         imported_blobs: None,
     }))
+}
+
+/// Request for reserveSigningKey
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReserveSigningKeyRequest {
+    /// The DID to reserve the signing key for (optional)
+    /// If provided and a key was already reserved for this DID, returns the existing key's DID
+    #[serde(default)]
+    did: Option<String>,
+}
+
+/// Response for reserveSigningKey
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReserveSigningKeyResponse {
+    /// The did:key identifier of the reserved signing key
+    signing_key: String,
+}
+
+/// Reserve signing key endpoint
+///
+/// Reserves a secp256k1 signing keypair for account creation.
+/// If a DID is provided and a key was already reserved for it, returns the existing key's did:key.
+/// Otherwise, creates a new keypair and returns its did:key identifier.
+///
+/// This endpoint does not require authentication - it is called during account creation
+/// before the account exists.
+async fn reserve_signing_key(
+    State(ctx): State<AppContext>,
+    Json(req): Json<ReserveSigningKeyRequest>,
+) -> PdsResult<Json<ReserveSigningKeyResponse>> {
+    tracing::debug!(
+        did = ?req.did,
+        "reserve_signing_key: Reserving signing key"
+    );
+
+    // Validate DID format if provided
+    if let Some(ref did) = req.did {
+        if !did.starts_with("did:") {
+            return Err(PdsError::Validation(
+                "Invalid DID format".to_string()
+            ));
+        }
+    }
+
+    // Reserve or retrieve keypair
+    let signing_key = ctx
+        .actor_store
+        .reserve_keypair(req.did.as_deref())
+        .await?;
+
+    tracing::info!(
+        signing_key = %signing_key,
+        did = ?req.did,
+        "reserve_signing_key: Signing key reserved"
+    );
+
+    Ok(Json(ReserveSigningKeyResponse { signing_key }))
 }

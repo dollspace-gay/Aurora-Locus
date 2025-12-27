@@ -1020,60 +1020,268 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Request account deletion (soft delete with grace period)
+    /// Generate account deletion token
     ///
-    /// Marks account for deletion after verifying password
-    /// Actual deletion happens after grace period via background job
-    pub async fn request_account_deletion(&self, did: &str, password: &str) -> PdsResult<()> {
-        // Get account
-        let account = self.get_account(did).await?;
+    /// Creates a deletion confirmation token that expires in 1 hour.
+    /// This token is sent via email and must be provided to complete deletion.
+    pub async fn generate_account_delete_token(&self, did: &str) -> PdsResult<String> {
+        let token = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let expires_at = now + Duration::hours(1); // Deletion tokens expire in 1 hour
 
-        // Verify password - must have local account credentials
-        let password_hash = account.password_hash
-            .ok_or_else(|| PdsError::Authorization("No local account credentials".to_string()))?;
+        sqlx::query(
+            r#"
+            INSERT INTO email_token (token, did, purpose, created_at, expires_at, used)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+        )
+        .bind(&token)
+        .bind(did)
+        .bind("delete_account")
+        .bind(now)
+        .bind(expires_at)
+        .bind(false)
+        .execute(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
 
-        let valid = atproto::server_auth::PasswordHasher::verify(password, &password_hash)
-            .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
+        Ok(token)
+    }
 
-        if !valid {
-            return Err(PdsError::Authorization("Invalid password".to_string()));
+    /// Validate account deletion token
+    ///
+    /// Checks if the provided token is valid for account deletion.
+    /// Returns the DID associated with the token if valid.
+    /// Does NOT mark the token as used - that happens during actual deletion.
+    pub async fn validate_account_delete_token(&self, did: &str, token: &str) -> PdsResult<()> {
+        let now = Utc::now();
+
+        // Get token info
+        let row = sqlx::query(
+            r#"
+            SELECT token, did, purpose, expires_at, used
+            FROM email_token
+            WHERE token = ?1 AND purpose = 'delete_account'
+            "#,
+        )
+        .bind(token)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?
+        .ok_or_else(|| PdsError::Validation("Invalid deletion token".to_string()))?;
+
+        let token_did: String = row.try_get("did")?;
+        let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+        let used: bool = row.try_get("used")?;
+
+        // Verify token is for the correct DID
+        if token_did != did {
+            return Err(PdsError::Validation("Token does not match account".to_string()));
         }
 
-        let now = Utc::now();
-        let deletion_date = now + Duration::days(30);
+        // Check if already used
+        if used {
+            return Err(PdsError::Validation(
+                "Deletion token has already been used".to_string(),
+            ));
+        }
 
-        // Mark account for deletion (30 day grace period)
-        // Set BOTH deactivated_at (immediate suspension) and delete_after (deletion date)
-        // This combination indicates: "account is deactivated pending deletion"
+        // Check expiration
+        if now > expires_at {
+            return Err(PdsError::Validation(
+                "Deletion token has expired".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Mark account deletion token as used
+    ///
+    /// Called after successful account deletion to prevent token reuse.
+    pub async fn mark_delete_token_used(&self, token: &str) -> PdsResult<()> {
+        sqlx::query("UPDATE email_token SET used = true WHERE token = ?1")
+            .bind(token)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        Ok(())
+    }
+
+    /// Generate email update token
+    ///
+    /// Creates an email update confirmation token that expires in 1 hour.
+    /// This token is sent to the current email and must be provided to complete email update.
+    pub async fn generate_email_update_token(&self, did: &str) -> PdsResult<String> {
+        let token = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let expires_at = now + Duration::hours(1);
+
         sqlx::query(
-            "UPDATE actor SET deactivated_at = ?1, delete_after = ?2 WHERE did = ?3"
+            r#"
+            INSERT INTO email_token (token, did, purpose, created_at, expires_at, used)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
         )
+        .bind(&token)
+        .bind(did)
+        .bind("update_email")
         .bind(now)
-        .bind(deletion_date)
+        .bind(expires_at)
+        .bind(false)
+        .execute(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        Ok(token)
+    }
+
+    /// Validate email update token
+    ///
+    /// Checks if the provided token is valid for email update.
+    /// Marks the token as used upon successful validation.
+    pub async fn validate_email_update_token(&self, did: &str, token: &str) -> PdsResult<()> {
+        let now = Utc::now();
+
+        let row = sqlx::query(
+            r#"
+            SELECT token, did, purpose, expires_at, used
+            FROM email_token
+            WHERE token = ?1 AND purpose = 'update_email'
+            "#,
+        )
+        .bind(token)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?
+        .ok_or_else(|| PdsError::Validation("Invalid email update token".to_string()))?;
+
+        let token_did: String = row.try_get("did")?;
+        let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+        let used: bool = row.try_get("used")?;
+
+        if token_did != did {
+            return Err(PdsError::Validation("Token does not match account".to_string()));
+        }
+
+        if used {
+            return Err(PdsError::Validation(
+                "Email update token has already been used".to_string(),
+            ));
+        }
+
+        if now > expires_at {
+            return Err(PdsError::Validation(
+                "Email update token has expired".to_string(),
+            ));
+        }
+
+        // Mark token as used
+        sqlx::query("UPDATE email_token SET used = true WHERE token = ?1")
+            .bind(token)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        Ok(())
+    }
+
+    /// Update account email address
+    ///
+    /// Updates the email address for an account.
+    /// Returns an error if the email is already in use by another account.
+    pub async fn update_email(&self, did: &str, new_email: &str) -> PdsResult<()> {
+        // Check if email is already in use by another account
+        let existing = sqlx::query(
+            "SELECT did FROM account WHERE email = ?1 AND did != ?2"
+        )
+        .bind(new_email)
+        .bind(did)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        if existing.is_some() {
+            return Err(PdsError::Validation(
+                "This email address is already in use".to_string(),
+            ));
+        }
+
+        // Update email and clear email confirmation
+        sqlx::query(
+            "UPDATE account SET email = ?1, email_confirmed_at = NULL WHERE did = ?2"
+        )
+        .bind(new_email)
         .bind(did)
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
 
-        // Delete all active sessions (force logout)
+        tracing::info!(
+            did = %did,
+            new_email = %new_email,
+            "account_email_updated"
+        );
+
+        Ok(())
+    }
+
+    /// Delete account permanently
+    ///
+    /// Permanently removes the account from the database.
+    /// This should only be called after token validation.
+    pub async fn delete_account_permanent(&self, did: &str) -> PdsResult<()> {
+        // Begin transaction
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+
+        // Delete from all related tables
         sqlx::query("DELETE FROM session WHERE did = ?1")
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
-        // Delete all refresh tokens
         sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
-        tracing::info!(
-            "Account deletion requested for DID: {}, will be deleted after: {}",
-            did,
-            deletion_date
-        );
+        sqlx::query("DELETE FROM app_password WHERE did = ?1")
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .map_err(PdsError::Database)?;
+
+        sqlx::query("DELETE FROM email_token WHERE did = ?1")
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .map_err(PdsError::Database)?;
+
+        sqlx::query("DELETE FROM plc_keys WHERE did = ?1")
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .map_err(PdsError::Database)?;
+
+        sqlx::query("DELETE FROM account WHERE did = ?1")
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .map_err(PdsError::Database)?;
+
+        sqlx::query("DELETE FROM actor WHERE did = ?1")
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .map_err(PdsError::Database)?;
+
+        // Commit transaction
+        tx.commit().await.map_err(PdsError::Database)?;
+
+        tracing::info!("Account permanently deleted: DID={}", did);
 
         Ok(())
     }
@@ -1910,6 +2118,7 @@ mod tests {
                 },
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
+                oauth_features: Default::default(),
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),

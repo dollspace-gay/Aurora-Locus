@@ -1,6 +1,7 @@
 /// Actor Store Manager - Handles per-user repository databases
 use crate::{
     actor_store::{get_actor_location, models::*, ActorLocation},
+    crypto::Secp256k1KeyPair,
     error::{PdsError, PdsResult},
     read_after_write::{LocalRecords, RecordDescript},
 };
@@ -663,6 +664,126 @@ impl ActorStore {
         // Delete directory
         if location.directory.exists() {
             tokio::fs::remove_dir_all(&location.directory).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get the reserved keys directory path
+    fn reserved_key_dir(&self) -> PathBuf {
+        self.config.base_directory.join("reserved_keys")
+    }
+
+    /// Reserve a signing keypair for account creation
+    ///
+    /// If a DID is provided and a keypair already exists for it, returns the existing keypair's DID.
+    /// Otherwise, creates a new secp256k1 keypair and stores it in the reserved keys directory.
+    ///
+    /// Returns the did:key identifier of the reserved keypair.
+    pub async fn reserve_keypair(&self, did: Option<&str>) -> PdsResult<String> {
+        let reserved_dir = self.reserved_key_dir();
+
+        // If DID is provided, check if we already have a reserved key for it
+        if let Some(did) = did {
+            // Validate the path component for security
+            Self::assert_safe_path_part(did)?;
+
+            let key_path = reserved_dir.join(did);
+            if let Some(keypair) = self.load_reserved_keypair(&key_path).await? {
+                return Ok(keypair.did());
+            }
+        }
+
+        // Generate a new keypair
+        let keypair = Secp256k1KeyPair::generate();
+        let key_did = keypair.did();
+
+        // Determine where to store the key
+        let key_path = if let Some(did) = did {
+            reserved_dir.join(did)
+        } else {
+            reserved_dir.join(&key_did)
+        };
+
+        // Ensure reserved keys directory exists
+        tokio::fs::create_dir_all(&reserved_dir).await?;
+
+        // Write the private key bytes
+        tokio::fs::write(&key_path, keypair.to_bytes()).await?;
+
+        tracing::debug!(
+            key_did = %key_did,
+            path = %key_path.display(),
+            "Reserved signing keypair"
+        );
+
+        Ok(key_did)
+    }
+
+    /// Get a previously reserved keypair
+    ///
+    /// The identifier can be either a did:key or a did:plc that was used when reserving.
+    pub async fn get_reserved_keypair(&self, identifier: &str) -> PdsResult<Option<Secp256k1KeyPair>> {
+        Self::assert_safe_path_part(identifier)?;
+
+        let key_path = self.reserved_key_dir().join(identifier);
+        self.load_reserved_keypair(&key_path).await
+    }
+
+    /// Clear a reserved keypair after use
+    ///
+    /// Called after account creation to remove the reserved key from temporary storage.
+    pub async fn clear_reserved_keypair(&self, key_did: &str, did: Option<&str>) -> PdsResult<()> {
+        Self::assert_safe_path_part(key_did)?;
+
+        let key_path = self.reserved_key_dir().join(key_did);
+        if key_path.exists() {
+            tokio::fs::remove_file(&key_path).await?;
+        }
+
+        // Also remove by DID if provided
+        if let Some(did) = did {
+            Self::assert_safe_path_part(did)?;
+            let did_path = self.reserved_key_dir().join(did);
+            if did_path.exists() {
+                tokio::fs::remove_file(&did_path).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load a reserved keypair from a file path
+    async fn load_reserved_keypair(&self, path: &PathBuf) -> PdsResult<Option<Secp256k1KeyPair>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let private_key = tokio::fs::read(path).await?;
+        let keypair = Secp256k1KeyPair::from_bytes(&private_key)?;
+        Ok(Some(keypair))
+    }
+
+    /// Validate that a path component is safe (no directory traversal)
+    fn assert_safe_path_part(part: &str) -> PdsResult<()> {
+        // Check for path traversal attempts
+        if part.contains('/') || part.contains('\\') || part.starts_with('.') || part.contains("..") {
+            return Err(PdsError::Validation(format!(
+                "Unsafe path component: {}",
+                part
+            )));
+        }
+
+        // Normalize and compare
+        let normalized = std::path::Path::new(part)
+            .file_name()
+            .and_then(|f| f.to_str());
+
+        if normalized != Some(part) {
+            return Err(PdsError::Validation(format!(
+                "Path component failed normalization: {}",
+                part
+            )));
         }
 
         Ok(())

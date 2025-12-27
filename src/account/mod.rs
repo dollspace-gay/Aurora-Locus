@@ -10,11 +10,19 @@ use serde::{Deserialize, Serialize};
 
 /// Account creation request
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateAccountRequest {
     pub handle: String,
     pub email: Option<String>,
     pub password: String,
+    #[serde(default)]
     pub invite_code: Option<String>,
+    /// Pre-created DID (if user already created their DID via PLC)
+    #[serde(default)]
+    pub did: Option<String>,
+    /// Recovery key (did:key format) for the account
+    #[serde(default)]
+    pub recovery_key: Option<String>,
 }
 
 /// Account creation response

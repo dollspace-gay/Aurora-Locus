@@ -178,6 +178,106 @@ Aurora Locus PDS
         .await
     }
 
+    /// Send an account deletion confirmation email
+    ///
+    /// This email contains a token that must be used to confirm account deletion.
+    /// The token expires in 1 hour.
+    pub async fn send_account_delete_email(
+        &self,
+        to_email: &str,
+        handle: &str,
+        token: &str,
+    ) -> PdsResult<()> {
+        if self.config.is_none() {
+            tracing::warn!("Email not configured, skipping account delete email to {}", to_email);
+            return Ok(());
+        }
+
+        let config = self.config.as_ref().unwrap();
+
+        let body = format!(
+            r#"
+Hello {},
+
+We received a request to permanently delete your account on our AT Protocol Personal Data Server.
+
+To confirm this deletion, use the following confirmation code:
+
+{}
+
+This code will expire in 1 hour.
+
+WARNING: Account deletion is permanent and cannot be undone. All your data, including:
+- Your profile and posts
+- Your followers and following lists
+- Your preferences and settings
+- All associated blobs and media
+
+will be permanently removed.
+
+If you did not request this deletion, please ignore this email and consider changing your password immediately for security.
+
+Best regards,
+Aurora Locus PDS
+"#,
+            handle, token
+        );
+
+        self.send_email(
+            to_email,
+            "Confirm account deletion",
+            &body,
+            &config.from_address,
+        )
+        .await
+    }
+
+    /// Send an email update confirmation email
+    ///
+    /// This email contains a token that must be used to confirm email address change.
+    /// The token expires in 1 hour.
+    pub async fn send_email_update_email(
+        &self,
+        to_email: &str,
+        handle: &str,
+        token: &str,
+    ) -> PdsResult<()> {
+        if self.config.is_none() {
+            tracing::warn!("Email not configured, skipping email update email to {}", to_email);
+            return Ok(());
+        }
+
+        let config = self.config.as_ref().unwrap();
+
+        let body = format!(
+            r#"
+Hello {},
+
+We received a request to change the email address associated with your account on our AT Protocol Personal Data Server.
+
+To authorize this email change, use the following confirmation code:
+
+{}
+
+This code will expire in 1 hour.
+
+If you did not request this change, please ignore this email and consider changing your password immediately for security.
+
+Best regards,
+Aurora Locus PDS
+"#,
+            handle, token
+        );
+
+        self.send_email(
+            to_email,
+            "Confirm email address change",
+            &body,
+            &config.from_address,
+        )
+        .await
+    }
+
     /// Send a generic email
     async fn send_email(
         &self,
