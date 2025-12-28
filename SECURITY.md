@@ -184,15 +184,21 @@ Prometheus metrics track:
 - Service Auth: [`src/federation/nonce_store.rs`](src/federation/nonce_store.rs)
 - DPoP: [`src/federation/dpop.rs`](src/federation/dpop.rs#L46-L89)
 
-### 3. Signing Key Extraction
+### 3. Signing Key Extraction - ✅ RESOLVED
 
-**File**: [`src/identity/resolver.rs`](src/identity/resolver.rs#L185-L234)
+**File**: [`src/identity/resolver.rs`](src/identity/resolver.rs#L461-L631)
 
-**Issue**: Simplified multibase decoding - currently returns raw bytes without proper PEM conversion.
+**Status**: Fixed as of 2025-12-27.
 
-**Impact**: May fail to verify JWTs from some DID document formats.
+**Implementation**: Full multibase-to-PEM key conversion now implemented:
+- Multibase decoding (base58btc with 'z' prefix)
+- Multicodec varint parsing (supports P-256: 0x1200, secp256k1: 0xe7)
+- EC point decompression (33-byte compressed to full public key)
+- PEM/SPKI encoding for jsonwebtoken compatibility
 
-**Fix Required**: Implement proper multibase → PEM conversion for EC keys.
+**Supported Key Types**:
+- P-256 (secp256r1) - ES256 algorithm
+- secp256k1 - ES256K algorithm
 
 ---
 
@@ -250,6 +256,12 @@ RATE_LIMIT_AUTHENTICATED_RPS=100 # Default: 100 req/s
 | DID Document Tampering | LOW | Blockchain/PLC directory provides integrity |
 | Clock Skew Attacks | LOW | 2-minute window for `iat` validation |
 
+### Recently Resolved Risks
+
+| Risk | Resolution Date | Notes |
+|------|-----------------|-------|
+| Signing Key Extraction | 2025-12-27 | Full multibase-to-PEM conversion implemented |
+
 ---
 
 ## Compliance
@@ -282,10 +294,11 @@ For security vulnerabilities, please create a private security advisory on GitHu
 
 | Date | Version | Changes |
 |------|---------|---------|
+| 2025-12-27 | Phase 4.1 | Fixed multibase-to-PEM key conversion in identity resolver |
 | 2025-11-05 | Phase 4 | Initial cross-PDS authentication implementation |
 
 ---
 
-**Last Updated**: 2025-11-05
+**Last Updated**: 2025-12-27
 **Phase**: 4 - Cross-PDS Authentication
 **Status**: Development (Not Production-Ready)

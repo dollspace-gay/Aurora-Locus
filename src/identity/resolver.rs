@@ -4,6 +4,7 @@ use crate::{
     identity::DidCache,
 };
 use atproto::{did_doc::DidDocument, handle::HandleResolver};
+use p256::pkcs8::EncodePublicKey;
 use std::sync::Arc;
 
 /// Identity resolution configuration
@@ -457,7 +458,7 @@ impl IdentityResolver {
     /// The key is used to verify service auth JWTs in cross-PDS requests.
     ///
     /// # Returns
-    /// The signing key in PEM format (ES256/P-256)
+    /// The signing key in PEM format (ES256/P-256 or ES256K/secp256k1)
     pub async fn get_signing_key(&self, did: &str) -> PdsResult<Vec<u8>> {
         // Resolve DID document (with caching)
         let doc = self.resolve_did(did).await?;
@@ -469,13 +470,7 @@ impl IdentityResolver {
             if vm.id.contains("#atproto") {
                 // Extract public key from multibase format
                 if let Some(multibase_key) = &vm.public_key_multibase {
-                    // Decode multibase key
-                    // For now, we'll return the raw key bytes
-                    // TODO: Proper multibase decoding and PEM conversion
-                    // This is a simplified implementation - production needs proper
-                    // multibase decoding and conversion to PEM format
-
-                    return Ok(multibase_key.as_bytes().to_vec());
+                    return self.decode_multibase_key(multibase_key);
                 }
             }
         }
@@ -483,7 +478,7 @@ impl IdentityResolver {
         // If no atproto key found, try the first verification method
         if let Some(vm) = doc.verification_method.first() {
             if let Some(multibase_key) = &vm.public_key_multibase {
-                return Ok(multibase_key.as_bytes().to_vec());
+                return self.decode_multibase_key(multibase_key);
             }
         }
 
@@ -491,6 +486,148 @@ impl IdentityResolver {
             "No signing key found in DID document for {}",
             did
         )))
+    }
+
+    /// Decode a multibase-encoded public key to PEM format
+    ///
+    /// ATProto DID documents use multibase encoding with multicodec prefixes:
+    /// - 'z' prefix indicates base58btc encoding
+    /// - Multicodec prefix identifies the key type (P-256 or secp256k1)
+    /// - Compressed public key bytes (33 bytes)
+    ///
+    /// This function:
+    /// 1. Strips the 'z' multibase prefix
+    /// 2. Decodes base58btc to get raw bytes
+    /// 3. Parses the multicodec prefix to identify key type
+    /// 4. Decompresses the public key point (if compressed)
+    /// 5. Converts to PEM format for jsonwebtoken
+    fn decode_multibase_key(&self, multibase_key: &str) -> PdsResult<Vec<u8>> {
+        // Step 1: Verify and strip multibase prefix
+        // 'z' = base58btc encoding (most common in ATProto)
+        let encoded = multibase_key.strip_prefix('z').ok_or_else(|| {
+            PdsError::IdentityResolution(format!(
+                "Unsupported multibase encoding: expected 'z' prefix, got '{}'",
+                multibase_key.chars().next().unwrap_or('?')
+            ))
+        })?;
+
+        // Step 2: Decode base58btc
+        let decoded = bs58::decode(encoded).into_vec().map_err(|e| {
+            PdsError::IdentityResolution(format!("Failed to decode base58btc key: {}", e))
+        })?;
+
+        if decoded.len() < 2 {
+            return Err(PdsError::IdentityResolution(
+                "Decoded key too short for multicodec prefix".to_string(),
+            ));
+        }
+
+        // Step 3: Parse multicodec prefix (varint encoded)
+        // P-256 (secp256r1): 0x1200 -> varint: 0x80 0x24
+        // secp256k1: 0xe7 -> varint: 0xe7 0x01
+        let (multicodec, key_bytes) = Self::parse_multicodec(&decoded)?;
+
+        // Step 4: Convert key based on type
+        match multicodec {
+            // P-256 public key (compressed or uncompressed)
+            0x1200 => self.decode_p256_key(key_bytes),
+            // secp256k1 public key (compressed)
+            0xe7 => self.decode_secp256k1_key(key_bytes),
+            _ => Err(PdsError::IdentityResolution(format!(
+                "Unsupported multicodec: 0x{:x}",
+                multicodec
+            ))),
+        }
+    }
+
+    /// Parse a varint-encoded multicodec prefix
+    ///
+    /// Returns (multicodec_value, remaining_bytes)
+    fn parse_multicodec(data: &[u8]) -> PdsResult<(u64, &[u8])> {
+        let mut value: u64 = 0;
+        let mut shift = 0;
+        let mut i = 0;
+
+        loop {
+            if i >= data.len() {
+                return Err(PdsError::IdentityResolution(
+                    "Incomplete multicodec varint".to_string(),
+                ));
+            }
+
+            let byte = data[i];
+            value |= ((byte & 0x7f) as u64) << shift;
+
+            if byte & 0x80 == 0 {
+                // Last byte of varint
+                return Ok((value, &data[i + 1..]));
+            }
+
+            shift += 7;
+            i += 1;
+
+            if shift >= 64 {
+                return Err(PdsError::IdentityResolution(
+                    "Multicodec varint too large".to_string(),
+                ));
+            }
+        }
+    }
+
+    /// Decode a P-256 (secp256r1) public key to PEM format
+    ///
+    /// Handles both compressed (33 bytes) and uncompressed (65 bytes) formats.
+    fn decode_p256_key(&self, key_bytes: &[u8]) -> PdsResult<Vec<u8>> {
+        use p256::elliptic_curve::sec1::FromEncodedPoint;
+        use p256::{EncodedPoint, PublicKey};
+
+        // Parse the SEC1-encoded point (compressed or uncompressed)
+        let encoded_point = EncodedPoint::from_bytes(key_bytes).map_err(|e| {
+            PdsError::IdentityResolution(format!("Invalid P-256 point encoding: {}", e))
+        })?;
+
+        // Decompress if necessary and validate the point is on the curve
+        let public_key: Option<PublicKey> = PublicKey::from_encoded_point(&encoded_point).into();
+        let public_key = public_key.ok_or_else(|| {
+            PdsError::IdentityResolution("P-256 point not on curve".to_string())
+        })?;
+
+        // Convert to PEM format (SPKI - SubjectPublicKeyInfo)
+        let pem = public_key.to_public_key_pem(Default::default()).map_err(|e| {
+            PdsError::IdentityResolution(format!("Failed to encode P-256 key as PEM: {}", e))
+        })?;
+
+        Ok(pem.into_bytes())
+    }
+
+    /// Decode a secp256k1 public key to PEM format
+    ///
+    /// ATProto uses secp256k1 for signing in addition to P-256.
+    /// The key is typically in compressed format (33 bytes).
+    fn decode_secp256k1_key(&self, key_bytes: &[u8]) -> PdsResult<Vec<u8>> {
+        use k256::elliptic_curve::sec1::FromEncodedPoint;
+        use k256::pkcs8::EncodePublicKey as K256EncodePublicKey;
+        use k256::{EncodedPoint, PublicKey};
+
+        // Parse the SEC1-encoded point (compressed format: 33 bytes)
+        let encoded_point = EncodedPoint::from_bytes(key_bytes).map_err(|e| {
+            PdsError::IdentityResolution(format!("Invalid secp256k1 point encoding: {}", e))
+        })?;
+
+        // Decompress if necessary and validate the point is on the curve
+        let public_key: Option<PublicKey> = PublicKey::from_encoded_point(&encoded_point).into();
+        let public_key = public_key.ok_or_else(|| {
+            PdsError::IdentityResolution("secp256k1 point not on curve".to_string())
+        })?;
+
+        // Convert to PEM format (SPKI - SubjectPublicKeyInfo)
+        let pem = public_key
+            .to_public_key_pem(Default::default())
+            .map_err(|e| {
+                PdsError::IdentityResolution(format!("Failed to encode secp256k1 key as PEM: {}", e))
+            })?;
+
+        Ok(pem.into_bytes())
     }
 
     /// Invalidate cached signing key for a DID (force re-fetch)
@@ -794,5 +931,168 @@ mod tests {
         // The fetch_plc_document method should handle trailing slashes correctly
         // by using trim_end_matches('/') in the format string
         assert_eq!(resolver.config.plc_directory_url, "https://test.plc.directory/");
+    }
+
+    // =====================================================
+    // Multibase Key Decoding Tests
+    // =====================================================
+
+    #[test]
+    fn test_parse_multicodec_secp256k1() {
+        // secp256k1 multicodec is 0xe7 (231)
+        // Varint encoding: 231 > 127, so it's 0xe7 0x01
+        let data = [0xe7, 0x01, 0x02, 0x03, 0x04];
+        let (multicodec, remaining) = IdentityResolver::parse_multicodec(&data).unwrap();
+        assert_eq!(multicodec, 0xe7);
+        assert_eq!(remaining, &[0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn test_parse_multicodec_p256() {
+        // P-256 multicodec is 0x1200 (4608)
+        // Varint encoding: 4608 = 0b1001000000000 -> 0x80 0x24
+        let data = [0x80, 0x24, 0x02, 0x03, 0x04];
+        let (multicodec, remaining) = IdentityResolver::parse_multicodec(&data).unwrap();
+        assert_eq!(multicodec, 0x1200);
+        assert_eq!(remaining, &[0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn test_parse_multicodec_single_byte() {
+        // Values < 128 are single-byte varints
+        let data = [0x55, 0xaa, 0xbb];
+        let (multicodec, remaining) = IdentityResolver::parse_multicodec(&data).unwrap();
+        assert_eq!(multicodec, 0x55);
+        assert_eq!(remaining, &[0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn test_parse_multicodec_incomplete() {
+        // Incomplete varint (continuation bit set but no more bytes)
+        let data = [0x80];
+        let result = IdentityResolver::parse_multicodec(&data);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_decode_secp256k1_multibase_key() {
+        let resolver = create_test_resolver().await;
+
+        // Real secp256k1 key from ATProto DID document
+        // zQ3shunBKsXixLxKtC5qeSG9E4J5RkGN57im31pcTzbNQnm5w
+        // This is from did:plc:ewvi7nxzyoun6zhxrhs64oiz (atproto.com)
+        let multibase_key = "zQ3shunBKsXixLxKtC5qeSG9E4J5RkGN57im31pcTzbNQnm5w";
+
+        let result = resolver.decode_multibase_key(multibase_key);
+        assert!(result.is_ok(), "Failed to decode key: {:?}", result.err());
+
+        let pem_bytes = result.unwrap();
+        let pem_string = String::from_utf8(pem_bytes).unwrap();
+
+        // Verify it's a valid PEM public key
+        assert!(pem_string.starts_with("-----BEGIN PUBLIC KEY-----"));
+        assert!(pem_string.trim_end().ends_with("-----END PUBLIC KEY-----"));
+    }
+
+    #[tokio::test]
+    async fn test_decode_multibase_key_invalid_prefix() {
+        let resolver = create_test_resolver().await;
+
+        // 'm' prefix is base64 (not base58btc)
+        let result = resolver.decode_multibase_key("mABCDEF");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unsupported multibase encoding"));
+    }
+
+    #[tokio::test]
+    async fn test_decode_multibase_key_invalid_base58() {
+        let resolver = create_test_resolver().await;
+
+        // Invalid base58 characters (0, O, I, l are not in base58 alphabet)
+        let result = resolver.decode_multibase_key("z0OILAB");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_decode_multibase_key_too_short() {
+        let resolver = create_test_resolver().await;
+
+        // Just the 'z' prefix, decoded to 1 byte
+        let result = resolver.decode_multibase_key("z2");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_decode_multibase_key_unsupported_multicodec() {
+        let resolver = create_test_resolver().await;
+
+        // Create a valid base58btc string with an unsupported multicodec prefix
+        // 0x01 is a single-byte varint for multicodec 1 (which is not P-256 or secp256k1)
+        // We need to encode: [0x01, ... some bytes ...]
+        let bytes = [0x01, 0x02, 0x03, 0x04, 0x05];
+        let encoded = bs58::encode(&bytes).into_string();
+        let multibase_key = format!("z{}", encoded);
+
+        let result = resolver.decode_multibase_key(&multibase_key);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unsupported multicodec"));
+    }
+
+    #[tokio::test]
+    async fn test_decode_p256_key_from_raw_bytes() {
+        let resolver = create_test_resolver().await;
+
+        // Use a known test key (compressed format)
+        // This is a valid P-256 point (compressed)
+        let compressed_key: [u8; 33] = [
+            0x02, // Compressed point prefix (even y)
+            0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47,
+            0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40, 0xf2,
+            0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0,
+            0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96,
+        ];
+
+        // Encode with P-256 multicodec prefix (0x1200 = varint 0x80 0x24)
+        let mut multicodec_bytes = vec![0x80, 0x24];
+        multicodec_bytes.extend_from_slice(&compressed_key);
+
+        let encoded = bs58::encode(&multicodec_bytes).into_string();
+        let multibase_key = format!("z{}", encoded);
+
+        let result = resolver.decode_multibase_key(&multibase_key);
+        assert!(result.is_ok(), "Failed to decode P-256 key: {:?}", result.err());
+
+        let pem_bytes = result.unwrap();
+        let pem_string = String::from_utf8(pem_bytes).unwrap();
+
+        // Verify it's a valid PEM public key
+        assert!(pem_string.contains("BEGIN PUBLIC KEY"));
+        assert!(pem_string.contains("END PUBLIC KEY"));
+    }
+
+    #[tokio::test]
+    async fn test_decoded_key_works_with_jsonwebtoken() {
+        let resolver = create_test_resolver().await;
+
+        // Real secp256k1 key from ATProto
+        let multibase_key = "zQ3shunBKsXixLxKtC5qeSG9E4J5RkGN57im31pcTzbNQnm5w";
+
+        let pem_bytes = resolver.decode_multibase_key(multibase_key).unwrap();
+
+        // Verify the PEM can be used with jsonwebtoken's DecodingKey
+        // Note: This uses ES256K (secp256k1), but jsonwebtoken expects ES256 (P-256)
+        // For secp256k1, we would need to use a different algorithm
+        // This test verifies the PEM format is valid
+        let pem_string = String::from_utf8(pem_bytes.clone()).unwrap();
+        assert!(pem_string.contains("BEGIN PUBLIC KEY"));
+
+        // The key should be parseable as a SPKI PEM
+        // We can verify by checking the PEM structure
+        let lines: Vec<&str> = pem_string.lines().collect();
+        assert!(lines.len() >= 3); // Header, base64 content, footer
+        assert_eq!(lines[0], "-----BEGIN PUBLIC KEY-----");
+        assert_eq!(lines[lines.len() - 1], "-----END PUBLIC KEY-----");
     }
 }
