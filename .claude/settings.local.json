@@ -58,7 +58,10 @@
       "Bash(task kill //F //PID 15080)",
       "Bash(tee:*)",
       "Bash(Select-Object -Last 30)",
-      "Bash(bd dep add:*)"
+      "Bash(bd dep add:*)",
+      "Bash(chainlink help:*)",
+      "Bash(chainlink list:*)",
+      "Bash(chainlink update:*)"
     ],
     "deny": [],
     "ask": []

@@ -1227,6 +1227,50 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Update account password (admin operation)
+    ///
+    /// Updates the password for an account. This is an admin operation that
+    /// bypasses the normal password reset flow. All sessions are invalidated
+    /// as a security measure.
+    pub async fn update_password(&self, did: &str, new_password: &str) -> PdsResult<()> {
+        // Hash new password
+        let password_hash = atproto::server_auth::PasswordHasher::hash(new_password)
+            .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
+
+        // Update password in database
+        let result = sqlx::query("UPDATE account SET password_hash = ?1 WHERE did = ?2")
+            .bind(&password_hash)
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        if result.rows_affected() == 0 {
+            return Err(PdsError::NotFound(format!("Account not found: {}", did)));
+        }
+
+        // Invalidate all sessions for this account (security best practice)
+        sqlx::query("DELETE FROM session WHERE did = ?1")
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        // Also delete all refresh tokens
+        sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        tracing::info!(
+            did = %did,
+            "account_password_updated_by_admin"
+        );
+
+        Ok(())
+    }
+
     /// Delete account permanently
     ///
     /// Permanently removes the account from the database.
