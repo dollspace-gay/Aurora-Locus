@@ -137,17 +137,23 @@ pub struct RateLimitConfig {
     /// Trust proxy headers (X-Forwarded-For, X-Real-IP) for IP extraction
     /// Set to true if behind a reverse proxy/load balancer
     pub trust_proxy: bool,
+    /// Requests per second for handle resolution (outbound HTTP/DNS)
+    pub handle_resolution_rps: u32,
+    /// Requests per second for DID resolution (outbound HTTP to PLC directory)
+    pub did_resolution_rps: u32,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            authenticated_rps: 100,      // 100 req/sec for authenticated
-            unauthenticated_rps: 10,     // 10 req/sec for unauthenticated
-            admin_rps: 1000,             // 1000 req/sec for admins
-            cross_pds_rps: 10,           // 10 req/sec for cross-PDS (10x stricter than local)
-            burst_size: 50,              // Allow bursts up to 50 requests
-            trust_proxy: false,          // Default to false for security (don't trust proxy headers)
+            authenticated_rps: 100,        // 100 req/sec for authenticated
+            unauthenticated_rps: 10,       // 10 req/sec for unauthenticated
+            admin_rps: 1000,               // 1000 req/sec for admins
+            cross_pds_rps: 10,             // 10 req/sec for cross-PDS (10x stricter than local)
+            burst_size: 50,                // Allow bursts up to 50 requests
+            trust_proxy: false,            // Default to false for security (don't trust proxy headers)
+            handle_resolution_rps: 50,     // 50 req/sec for handle resolution (protect outbound)
+            did_resolution_rps: 50,        // 50 req/sec for DID resolution (protect outbound)
         }
     }
 }
@@ -450,6 +456,14 @@ pub struct RateLimiter {
     config: RateLimitConfig,
     /// Request counts per window for state tracking (identifier -> (window_start, count))
     request_counts: Arc<DashMap<String, (u64, u32)>>,
+    /// Handle resolution rate limiter (protects outbound HTTP/DNS requests)
+    handle_resolution: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+    /// DID resolution rate limiter (protects outbound HTTP to PLC directory)
+    did_resolution: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+    /// Per-handle rate limiter (keyed by handle being resolved)
+    handle_key_limiter: Arc<GovernorLimiter<String, DashMap<String, InMemoryState>, DefaultClock>>,
+    /// Per-DID rate limiter (keyed by DID being resolved)
+    did_key_limiter: Arc<GovernorLimiter<String, DashMap<String, InMemoryState>, DefaultClock>>,
 }
 
     #[allow(dead_code)] // Future rate limit checking methods
@@ -494,6 +508,31 @@ impl RateLimiter {
         )
         .allow_burst(NonZeroU32::new(20).unwrap());
 
+        // Identity resolution rate limiters (protect outbound requests)
+        let handle_resolution_quota = Quota::per_second(
+            NonZeroU32::new(config.handle_resolution_rps)
+                .unwrap_or(NonZeroU32::new(50).unwrap()),
+        )
+        .allow_burst(NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::new(50).unwrap()));
+
+        let did_resolution_quota = Quota::per_second(
+            NonZeroU32::new(config.did_resolution_rps)
+                .unwrap_or(NonZeroU32::new(50).unwrap()),
+        )
+        .allow_burst(NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::new(50).unwrap()));
+
+        // Per-handle/per-DID keyed limiters (5 requests per second per key, burst of 10)
+        // This prevents enumeration attacks on specific handles/DIDs
+        let handle_key_quota = Quota::per_second(
+            NonZeroU32::new(5).unwrap(),
+        )
+        .allow_burst(NonZeroU32::new(10).unwrap());
+
+        let did_key_quota = Quota::per_second(
+            NonZeroU32::new(5).unwrap(),
+        )
+        .allow_burst(NonZeroU32::new(10).unwrap());
+
         // Create per-endpoint rate limiters (supports multiple limits per endpoint)
         let mut endpoint_limiters = HashMap::new();
         for (path, limits) in endpoint_config.endpoints.iter() {
@@ -517,6 +556,10 @@ impl RateLimiter {
             trust_proxy: config.trust_proxy,
             config: config.clone(),
             request_counts: Arc::new(DashMap::new()),
+            handle_resolution: Arc::new(GovernorLimiter::direct(handle_resolution_quota)),
+            did_resolution: Arc::new(GovernorLimiter::direct(did_resolution_quota)),
+            handle_key_limiter: Arc::new(GovernorLimiter::keyed(handle_key_quota)),
+            did_key_limiter: Arc::new(GovernorLimiter::keyed(did_key_quota)),
         }
     }
 
@@ -570,6 +613,80 @@ impl RateLimiter {
                 retry_after: std::time::Duration::from_secs(1),
             }),
         }
+    }
+
+    /// Check rate limit for handle resolution (outbound HTTP/DNS requests)
+    ///
+    /// This protects against:
+    /// 1. Using the PDS as a proxy for handle enumeration
+    /// 2. DDoS amplification attacks via handle resolution
+    /// 3. Excessive outbound requests that could get the PDS blocked
+    ///
+    /// Uses both global limit and per-handle keyed limit to prevent
+    /// both aggregate abuse and targeted enumeration.
+    pub fn check_handle_resolution(&self, handle: &str) -> PdsResult<()> {
+        self.track_request("identity:handle_resolution");
+
+        // Check global handle resolution limit
+        match self.handle_resolution.check() {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(PdsError::RateLimitExceeded {
+                    retry_after: std::time::Duration::from_secs(1),
+                });
+            }
+        }
+
+        // Check per-handle limit (prevents targeted enumeration)
+        let handle_key = handle.to_lowercase();
+        match self.handle_key_limiter.check_key(&handle_key) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(PdsError::RateLimitExceeded {
+                retry_after: std::time::Duration::from_secs(5),
+            }),
+        }
+    }
+
+    /// Check rate limit for DID resolution (outbound HTTP to PLC directory)
+    ///
+    /// This protects against:
+    /// 1. Using the PDS as a proxy for DID enumeration
+    /// 2. DDoS amplification attacks via DID resolution
+    /// 3. Excessive load on the PLC directory
+    ///
+    /// Uses both global limit and per-DID keyed limit to prevent
+    /// both aggregate abuse and targeted enumeration.
+    pub fn check_did_resolution(&self, did: &str) -> PdsResult<()> {
+        self.track_request("identity:did_resolution");
+
+        // Check global DID resolution limit
+        match self.did_resolution.check() {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(PdsError::RateLimitExceeded {
+                    retry_after: std::time::Duration::from_secs(1),
+                });
+            }
+        }
+
+        // Check per-DID limit (prevents targeted enumeration)
+        match self.did_key_limiter.check_key(&did.to_string()) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(PdsError::RateLimitExceeded {
+                retry_after: std::time::Duration::from_secs(5),
+            }),
+        }
+    }
+
+    /// Check rate limit for signing key extraction
+    ///
+    /// This is a combined check for DID resolution (since keys come from DID docs)
+    /// with an additional identifier for tracking key-specific requests.
+    pub fn check_signing_key_resolution(&self, did: &str) -> PdsResult<()> {
+        self.track_request("identity:signing_key");
+
+        // Use DID resolution limits since signing keys come from DID documents
+        self.check_did_resolution(did)
     }
 
     /// Check rate limit for a specific endpoint
@@ -735,6 +852,69 @@ impl RateLimiter {
             remaining,
             reset_seconds,
         }
+    }
+
+    /// Get the current rate limit configuration
+    ///
+    /// Returns the configuration used to create this rate limiter.
+    /// Useful for admin endpoints to view current settings.
+    pub fn get_config(&self) -> &RateLimitConfig {
+        &self.config
+    }
+
+    /// Get the list of endpoints with custom rate limits
+    ///
+    /// Returns endpoints that have per-endpoint rate limiting configured.
+    pub fn get_endpoint_limits(&self) -> Vec<(String, Vec<(u32, u64)>)> {
+        // We can't directly access the original EndpointRateLimit config,
+        // but we can report which endpoints have custom limits
+        self.endpoint_limiters
+            .keys()
+            .map(|k| {
+                // We don't have the original config, but we know the endpoint has limits
+                // Return placeholder values - the actual limits are in the governor limiters
+                (k.clone(), vec![(0, 0)]) // Placeholder indicating custom limits exist
+            })
+            .collect()
+    }
+
+    /// Get all endpoints with custom rate limits
+    pub fn get_rate_limited_endpoints(&self) -> Vec<String> {
+        self.endpoint_limiters.keys().cloned().collect()
+    }
+
+    /// Get current request count statistics
+    ///
+    /// Returns a snapshot of request counts per identifier for the current window.
+    pub fn get_request_counts(&self) -> Vec<(String, u32)> {
+        let now = Self::current_timestamp();
+        self.request_counts
+            .iter()
+            .filter_map(|entry| {
+                let (window_start, count) = *entry.value();
+                // Only return counts from the current window (within last second)
+                if now.saturating_sub(window_start) < 5 {
+                    Some((entry.key().clone(), count))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get the total number of tracked request identifiers
+    pub fn get_tracked_identifiers_count(&self) -> usize {
+        self.request_counts.len()
+    }
+
+    /// Clear old request count entries (older than 60 seconds)
+    ///
+    /// This is useful for memory management in long-running servers.
+    pub fn cleanup_old_counts(&self) {
+        let now = Self::current_timestamp();
+        self.request_counts.retain(|_, (window_start, _)| {
+            now.saturating_sub(*window_start) < 60
+        });
     }
 }
 
@@ -914,6 +1094,7 @@ mod tests {
             cross_pds_rps: 20,
             burst_size: 5,
             trust_proxy: false,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(config);
 
@@ -1427,5 +1608,144 @@ mod tests {
 
         // Endpoint 3 should NOT have limits
         assert!(limiter.check_endpoint("/xrpc/endpoint3").is_none());
+    }
+
+    // ========== Tests for Identity Resolution Rate Limiting ==========
+
+    #[test]
+    fn test_handle_resolution_rate_limiting() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+
+        // First request should succeed
+        let result = limiter.check_handle_resolution("alice.bsky.social");
+        assert!(result.is_ok(), "First handle resolution should pass");
+
+        // Different handle should also succeed (different key)
+        let result = limiter.check_handle_resolution("bob.bsky.social");
+        assert!(result.is_ok(), "Different handle should pass");
+    }
+
+    #[test]
+    fn test_handle_resolution_per_handle_limit() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+        let handle = "targeted.handle";
+
+        // First several requests should succeed
+        for i in 0..10 {
+            let result = limiter.check_handle_resolution(handle);
+            assert!(result.is_ok(), "Request {} for same handle should pass", i);
+        }
+
+        // After burst limit (10), should be rate limited
+        let result = limiter.check_handle_resolution(handle);
+        assert!(result.is_err(), "Request after burst should be rate limited");
+
+        // But different handle should still work
+        let result = limiter.check_handle_resolution("other.handle");
+        assert!(result.is_ok(), "Different handle should still pass");
+    }
+
+    #[test]
+    fn test_did_resolution_rate_limiting() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+
+        // First request should succeed
+        let result = limiter.check_did_resolution("did:plc:user123");
+        assert!(result.is_ok(), "First DID resolution should pass");
+
+        // Different DID should also succeed (different key)
+        let result = limiter.check_did_resolution("did:plc:user456");
+        assert!(result.is_ok(), "Different DID should pass");
+    }
+
+    #[test]
+    fn test_did_resolution_per_did_limit() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+        let did = "did:plc:targeted";
+
+        // First several requests should succeed
+        for i in 0..10 {
+            let result = limiter.check_did_resolution(did);
+            assert!(result.is_ok(), "Request {} for same DID should pass", i);
+        }
+
+        // After burst limit (10), should be rate limited
+        let result = limiter.check_did_resolution(did);
+        assert!(result.is_err(), "Request after burst should be rate limited");
+
+        // But different DID should still work
+        let result = limiter.check_did_resolution("did:plc:other");
+        assert!(result.is_ok(), "Different DID should still pass");
+    }
+
+    #[test]
+    fn test_signing_key_resolution_uses_did_limits() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+        let did = "did:plc:keytest";
+
+        // First request should succeed
+        let result = limiter.check_signing_key_resolution(did);
+        assert!(result.is_ok(), "First signing key resolution should pass");
+
+        // Should share limits with DID resolution
+        // Exhaust the per-DID limit
+        for _ in 0..9 {
+            let _ = limiter.check_signing_key_resolution(did);
+        }
+
+        // Both should now be rate limited for this DID
+        let result = limiter.check_did_resolution(did);
+        assert!(result.is_err(), "DID resolution should be rate limited after signing key exhausts limit");
+    }
+
+    #[test]
+    fn test_handle_case_insensitive() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+
+        // Check handle in lowercase
+        for _ in 0..10 {
+            let _ = limiter.check_handle_resolution("alice.bsky.social");
+        }
+
+        // Same handle in different case should be rate limited (normalized to lowercase)
+        let result = limiter.check_handle_resolution("ALICE.BSKY.SOCIAL");
+        assert!(result.is_err(), "Uppercase handle should share limit with lowercase");
+    }
+
+    #[test]
+    fn test_identity_resolution_config() {
+        let config = RateLimitConfig {
+            handle_resolution_rps: 100,
+            did_resolution_rps: 75,
+            ..Default::default()
+        };
+
+        let limiter = RateLimiter::new(config);
+
+        // Should be able to make multiple requests with higher global limit
+        // Note: per-handle limit is still 5 rps with burst of 10, so use different handles
+        for i in 0..50 {
+            let handle = format!("handle{}.bsky.social", i);
+            assert!(limiter.check_handle_resolution(&handle).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_global_vs_per_key_limits() {
+        // Test that global and per-key limits work independently
+        let config = RateLimitConfig::default();
+        let limiter = RateLimiter::new(config);
+
+        // Per-key limit is 5 rps with burst of 10
+        // Exhaust the per-handle limit for one handle
+        for _ in 0..10 {
+            let _ = limiter.check_handle_resolution("exhausted.handle");
+        }
+
+        // This handle is exhausted
+        assert!(limiter.check_handle_resolution("exhausted.handle").is_err());
+
+        // But other handles should still work (global limit not exhausted)
+        assert!(limiter.check_handle_resolution("fresh.handle").is_ok());
     }
 }

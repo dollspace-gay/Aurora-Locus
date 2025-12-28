@@ -159,20 +159,21 @@ Prometheus metrics track:
 
 ## Known Limitations
 
-### 1. DPoP JWK Parsing (⚠️ **PRODUCTION BLOCKER**)
+### 1. DPoP JWK Parsing - ✅ RESOLVED
 
-**File**: [`src/federation/dpop.rs`](src/federation/dpop.rs#L242-L256)
+**File**: [`src/federation/dpop.rs`](src/federation/dpop.rs#L265-L362)
 
-**Issue**: The `jwk_to_decoding_key()` function uses a placeholder implementation that doesn't properly parse EC public keys from JWK format.
+**Status**: Fixed. Full JWK-to-DecodingKey conversion implemented.
 
-**Impact**: DPoP verification will fail for actual client requests.
+**Implementation**: The `jwk_to_decoding_key()` function now properly:
+- Validates JWK kty (EC) and crv (P-256) fields
+- Decodes base64url x/y coordinates
+- Validates coordinate lengths (32 bytes each for P-256)
+- Constructs uncompressed SEC1 point format (0x04 || x || y)
+- Parses with p256 crate and validates point is on curve
+- Converts to SPKI DER then PEM for jsonwebtoken compatibility
 
-**Fix Required**:
-```rust
-// TODO: Replace placeholder with proper JWK parsing
-// Option 1: Use jsonwebtoken-jwk crate
-// Option 2: Manually parse JWK x/y coordinates to EC public key
-```
+**Tests**: Comprehensive test coverage including valid keys, missing fields, unsupported curves, invalid base64, wrong key types.
 
 ### 2. Nonce Store Scalability
 
@@ -251,7 +252,6 @@ RATE_LIMIT_AUTHENTICATED_RPS=100 # Default: 100 req/s
 
 | Risk | Severity | Notes |
 |------|----------|-------|
-| DPoP Key Parsing | HIGH | Production blocker - see Known Limitations #1 |
 | Nonce Store Loss (Restart) | MEDIUM | In-memory store - switch to Redis for production |
 | DID Document Tampering | LOW | Blockchain/PLC directory provides integrity |
 | Clock Skew Attacks | LOW | 2-minute window for `iat` validation |
@@ -261,6 +261,7 @@ RATE_LIMIT_AUTHENTICATED_RPS=100 # Default: 100 req/s
 | Risk | Resolution Date | Notes |
 |------|-----------------|-------|
 | Signing Key Extraction | 2025-12-27 | Full multibase-to-PEM conversion implemented |
+| DPoP Key Parsing | 2025-12-27 | JWK-to-EC key conversion fully implemented |
 
 ---
 
@@ -270,7 +271,7 @@ RATE_LIMIT_AUTHENTICATED_RPS=100 # Default: 100 req/s
 
 - ✅ Service Auth JWT format (ES256, <60s, DID-based)
 - ✅ DPoP proof structure (RFC 9449)
-- ⚠️ JWK handling (placeholder - needs proper EC key parsing)
+- ✅ JWK handling (full EC key parsing implemented)
 - ✅ Nonce-based replay prevention
 - ✅ No callback to origin PDS
 
@@ -294,6 +295,7 @@ For security vulnerabilities, please create a private security advisory on GitHu
 
 | Date | Version | Changes |
 |------|---------|---------|
+| 2025-12-27 | Phase 4.2 | Verified DPoP JWK parsing is complete, updated docs |
 | 2025-12-27 | Phase 4.1 | Fixed multibase-to-PEM key conversion in identity resolver |
 | 2025-11-05 | Phase 4 | Initial cross-PDS authentication implementation |
 

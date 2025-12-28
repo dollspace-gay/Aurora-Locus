@@ -125,6 +125,11 @@ impl DPopNonceStore {
 
         Ok(removed)
     }
+
+    /// Get the number of active nonces
+    pub async fn count(&self) -> usize {
+        self.nonces.read().await.len()
+    }
 }
 
 /// DPoP verifier

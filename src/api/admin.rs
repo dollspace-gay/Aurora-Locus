@@ -84,6 +84,17 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.listRecentEvents", get(list_recent_events))
         .route("/xrpc/com.atproto.admin.resetSequencerCursor", post(reset_sequencer_cursor))
         .route("/xrpc/com.atproto.admin.rebuildSequencer", post(rebuild_sequencer))
+        // Rate limiting management
+        .route("/xrpc/com.atproto.admin.getRateLimitConfig", get(get_rate_limit_config))
+        .route("/xrpc/com.atproto.admin.getRateLimitStatus", get(get_rate_limit_status))
+        .route("/xrpc/com.atproto.admin.cleanupRateLimitState", post(cleanup_rate_limit_state))
+        // Federation and relay management
+        .route("/xrpc/com.atproto.admin.getFederationStatus", get(get_federation_status))
+        .route("/xrpc/com.atproto.admin.getRelayConfig", get(get_relay_config))
+        .route("/xrpc/com.atproto.admin.listKnownInstances", get(list_known_instances))
+        .route("/xrpc/com.atproto.admin.triggerPdsDiscovery", post(trigger_pds_discovery))
+        .route("/xrpc/com.atproto.admin.getNonceStoreStatus", get(get_nonce_store_status))
+        .route("/xrpc/com.atproto.admin.cleanupNonceStores", post(cleanup_nonce_stores))
 }
 
 // ============================================================================
@@ -2694,6 +2705,479 @@ async fn rebuild_sequencer(
             "has_duplicates": has_duplicates,
         })))
     }
+}
+
+// ============================================================================
+// Rate Limiting Management Endpoints
+// ============================================================================
+
+/// Response for getRateLimitConfig endpoint
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitConfigResponse {
+    /// Requests per second for authenticated users
+    authenticated_rps: u32,
+    /// Requests per second for unauthenticated users
+    unauthenticated_rps: u32,
+    /// Requests per second for admin users
+    admin_rps: u32,
+    /// Requests per second for cross-PDS authenticated users
+    cross_pds_rps: u32,
+    /// Burst size for rate limiting
+    burst_size: u32,
+    /// Whether proxy headers are trusted for IP extraction
+    trust_proxy: bool,
+    /// Requests per second for handle resolution
+    handle_resolution_rps: u32,
+    /// Requests per second for DID resolution
+    did_resolution_rps: u32,
+    /// Endpoints with custom rate limits
+    custom_endpoints: Vec<String>,
+}
+
+/// Get current rate limit configuration
+///
+/// Returns the current rate limiting settings including global limits,
+/// per-type limits, and endpoints with custom rate limits.
+async fn get_rate_limit_config(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<RateLimitConfigResponse>, (StatusCode, String)> {
+    let config = ctx.rate_limiter.get_config();
+    let custom_endpoints = ctx.rate_limiter.get_rate_limited_endpoints();
+
+    Ok(Json(RateLimitConfigResponse {
+        authenticated_rps: config.authenticated_rps,
+        unauthenticated_rps: config.unauthenticated_rps,
+        admin_rps: config.admin_rps,
+        cross_pds_rps: config.cross_pds_rps,
+        burst_size: config.burst_size,
+        trust_proxy: config.trust_proxy,
+        handle_resolution_rps: config.handle_resolution_rps,
+        did_resolution_rps: config.did_resolution_rps,
+        custom_endpoints,
+    }))
+}
+
+/// Rate limit statistics per category
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitCategoryStats {
+    category: String,
+    recent_requests: u32,
+}
+
+/// Response for getRateLimitStatus endpoint
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitStatusResponse {
+    /// Total tracked request identifiers
+    tracked_identifiers: usize,
+    /// Recent request counts by category
+    recent_activity: Vec<RateLimitCategoryStats>,
+    /// Endpoints with custom rate limits
+    rate_limited_endpoints: Vec<String>,
+    /// Server uptime information
+    status: String,
+}
+
+/// Get current rate limiting status
+///
+/// Returns real-time statistics about rate limiting including
+/// current request counts and tracked identifiers.
+async fn get_rate_limit_status(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<RateLimitStatusResponse>, (StatusCode, String)> {
+    let tracked_identifiers = ctx.rate_limiter.get_tracked_identifiers_count();
+    let request_counts = ctx.rate_limiter.get_request_counts();
+    let rate_limited_endpoints = ctx.rate_limiter.get_rate_limited_endpoints();
+
+    // Aggregate request counts by category
+    let mut category_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for (key, count) in request_counts {
+        // Extract category from key (e.g., "global:authenticated" -> "authenticated")
+        let category = if key.contains(':') {
+            key.split(':').last().unwrap_or(&key).to_string()
+        } else {
+            key
+        };
+        *category_counts.entry(category).or_insert(0) += count;
+    }
+
+    let recent_activity: Vec<RateLimitCategoryStats> = category_counts
+        .into_iter()
+        .map(|(category, recent_requests)| RateLimitCategoryStats {
+            category,
+            recent_requests,
+        })
+        .collect();
+
+    Ok(Json(RateLimitStatusResponse {
+        tracked_identifiers,
+        recent_activity,
+        rate_limited_endpoints,
+        status: "operational".to_string(),
+    }))
+}
+
+/// Request body for cleanupRateLimitState endpoint
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupRateLimitRequest {
+    /// Force cleanup even if not necessary
+    #[serde(default)]
+    force: bool,
+}
+
+/// Cleanup old rate limit tracking state
+///
+/// Clears expired rate limit tracking entries to free memory.
+/// This is normally done automatically but can be triggered manually.
+async fn cleanup_rate_limit_state(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<CleanupRateLimitRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let before_count = ctx.rate_limiter.get_tracked_identifiers_count();
+
+    ctx.rate_limiter.cleanup_old_counts();
+
+    let after_count = ctx.rate_limiter.get_tracked_identifiers_count();
+    let cleaned_count = before_count.saturating_sub(after_count);
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(
+            &auth.did,
+            "rate_limit.cleanup",
+            None,
+            Some(&format!("cleaned {} entries", cleaned_count)),
+            if req.force { Some("forced") } else { None },
+        )
+        .await;
+
+    tracing::info!(
+        "Admin {} triggered rate limit cleanup: {} entries removed",
+        auth.did,
+        cleaned_count
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "before_count": before_count,
+        "after_count": after_count,
+        "cleaned_count": cleaned_count,
+        "forced": req.force,
+    })))
+}
+
+// ============================================================================
+// Federation and Relay Management Endpoints
+// ============================================================================
+
+/// Response for getFederationStatus endpoint
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FederationStatusResponse {
+    /// Whether federation is enabled
+    enabled: bool,
+    /// Service DID for this PDS
+    service_did: String,
+    /// Number of configured relay servers
+    relay_count: usize,
+    /// Whether relay client is connected
+    relay_connected: bool,
+    /// Whether PDS discovery is enabled
+    discovery_enabled: bool,
+    /// Whether federated search is enabled
+    search_enabled: bool,
+    /// Number of known PDS instances
+    known_instances: usize,
+    /// Status message
+    status: String,
+}
+
+/// Get federation status
+///
+/// Returns the current federation configuration and connection status.
+async fn get_federation_status(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<FederationStatusResponse>, (StatusCode, String)> {
+    let relay_connected = ctx.relay_client.is_some();
+    let discovery_enabled = ctx.pds_discovery.is_some();
+    let search_enabled = ctx.federated_search.is_some();
+
+    // Get count of known instances if discovery is enabled
+    let known_instances = if let Some(ref discovery) = ctx.pds_discovery {
+        discovery.get_known_instances().await.len()
+    } else {
+        0
+    };
+
+    // Get config info
+    let federation_config = &ctx.config.federation;
+
+    let status = if !federation_config.enabled {
+        "disabled".to_string()
+    } else if relay_connected {
+        "connected".to_string()
+    } else {
+        "enabled_disconnected".to_string()
+    };
+
+    Ok(Json(FederationStatusResponse {
+        enabled: federation_config.enabled,
+        service_did: ctx.config.service.service_did.clone(),
+        relay_count: federation_config.relay_urls.len(),
+        relay_connected,
+        discovery_enabled,
+        search_enabled,
+        known_instances,
+        status,
+    }))
+}
+
+/// Relay server info
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayServerInfo {
+    url: String,
+    status: String,
+}
+
+/// Response for getRelayConfig endpoint
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayConfigResponse {
+    /// Configured relay servers
+    servers: Vec<RelayServerInfo>,
+    /// Reconnect interval in seconds
+    reconnect_interval: u64,
+    /// Buffer size for events
+    buffer_size: usize,
+    /// Whether compression is enabled
+    compression_enabled: bool,
+    /// Overall relay status
+    status: String,
+}
+
+/// Get relay configuration
+///
+/// Returns the current relay client configuration and server list.
+async fn get_relay_config(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<RelayConfigResponse>, (StatusCode, String)> {
+    let federation_config = &ctx.config.federation;
+    let has_relay = ctx.relay_client.is_some();
+
+    let servers: Vec<RelayServerInfo> = federation_config.relay_urls
+        .iter()
+        .map(|url: &String| RelayServerInfo {
+            url: url.clone(),
+            status: if has_relay { "configured".to_string() } else { "disabled".to_string() },
+        })
+        .collect();
+
+    let status = if !federation_config.enabled {
+        "disabled".to_string()
+    } else if servers.is_empty() {
+        "no_servers".to_string()
+    } else if has_relay {
+        "active".to_string()
+    } else {
+        "inactive".to_string()
+    };
+
+    Ok(Json(RelayConfigResponse {
+        servers,
+        reconnect_interval: 5, // Default from RelayConfig
+        buffer_size: 1000,     // Default from RelayConfig
+        compression_enabled: true,
+        status,
+    }))
+}
+
+/// Known PDS instance info
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KnownInstanceInfo {
+    did: String,
+    url: String,
+    name: Option<String>,
+    open_registrations: bool,
+    user_count: Option<i64>,
+    last_seen: Option<i64>,
+}
+
+/// Response for listKnownInstances endpoint
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListKnownInstancesResponse {
+    instances: Vec<KnownInstanceInfo>,
+    total: usize,
+}
+
+/// List known PDS instances
+///
+/// Returns all PDS instances discovered through relay servers.
+async fn list_known_instances(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<ListKnownInstancesResponse>, (StatusCode, String)> {
+    let instances: Vec<KnownInstanceInfo> = if let Some(ref discovery) = ctx.pds_discovery {
+        discovery.get_known_instances().await
+            .into_iter()
+            .map(|inst| KnownInstanceInfo {
+                did: inst.did,
+                url: inst.url,
+                name: inst.name,
+                open_registrations: inst.open_registrations,
+                user_count: inst.user_count,
+                last_seen: inst.last_seen,
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let total = instances.len();
+    Ok(Json(ListKnownInstancesResponse { instances, total }))
+}
+
+/// Trigger PDS discovery
+///
+/// Initiates discovery of PDS instances from configured relay servers.
+async fn trigger_pds_discovery(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if let Some(ref discovery) = ctx.pds_discovery {
+        match discovery.discover_from_relays().await {
+            Ok(instances) => {
+                // Log action
+                let _ = ctx.admin_role_manager
+                    .log_action(
+                        &auth.did,
+                        "federation.discover",
+                        None,
+                        Some(&format!("discovered {} instances", instances.len())),
+                        None,
+                    )
+                    .await;
+
+                tracing::info!(
+                    "Admin {} triggered PDS discovery: {} instances found",
+                    auth.did,
+                    instances.len()
+                );
+
+                Ok(Json(serde_json::json!({
+                    "success": true,
+                    "discovered_count": instances.len(),
+                    "message": format!("Discovered {} PDS instances", instances.len()),
+                })))
+            }
+            Err(e) => {
+                tracing::warn!("PDS discovery failed: {}", e);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Discovery failed: {}", e)))
+            }
+        }
+    } else {
+        Err((StatusCode::BAD_REQUEST, "Federation discovery is not enabled".to_string()))
+    }
+}
+
+/// Get nonce store status (service auth nonces)
+///
+/// Returns statistics about the service authentication nonce store.
+async fn get_nonce_store_status(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let service_auth_enabled = ctx.nonce_store.is_some();
+    let dpop_enabled = ctx.dpop_nonce_store.is_some();
+
+    // Get nonce counts if available
+    let service_auth_count = if let Some(ref store) = ctx.nonce_store {
+        store.count().await
+    } else {
+        0
+    };
+
+    let dpop_count = if let Some(ref store) = ctx.dpop_nonce_store {
+        store.count().await
+    } else {
+        0
+    };
+
+    Ok(Json(serde_json::json!({
+        "service_auth": {
+            "enabled": service_auth_enabled,
+            "active_nonces": service_auth_count,
+        },
+        "dpop": {
+            "enabled": dpop_enabled,
+            "active_nonces": dpop_count,
+        },
+        "status": if service_auth_enabled || dpop_enabled { "active" } else { "disabled" },
+    })))
+}
+
+/// Cleanup nonce stores
+///
+/// Triggers cleanup of expired nonces in both service auth and DPoP stores.
+async fn cleanup_nonce_stores(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut cleaned_service_auth = 0;
+    let mut cleaned_dpop = 0;
+
+    // Cleanup service auth nonces
+    if let Some(ref store) = ctx.nonce_store {
+        if let Ok(removed) = store.cleanup_expired().await {
+            cleaned_service_auth = removed;
+        }
+    }
+
+    // Cleanup DPoP nonces
+    if let Some(ref store) = ctx.dpop_nonce_store {
+        if let Ok(removed) = store.cleanup_expired().await {
+            cleaned_dpop = removed;
+        }
+    }
+
+    let total_cleaned = cleaned_service_auth + cleaned_dpop;
+
+    // Log action
+    let _ = ctx.admin_role_manager
+        .log_action(
+            &auth.did,
+            "federation.nonce_cleanup",
+            None,
+            Some(&format!("cleaned {} nonces", total_cleaned)),
+            None,
+        )
+        .await;
+
+    tracing::info!(
+        "Admin {} triggered nonce cleanup: {} service auth, {} DPoP",
+        auth.did,
+        cleaned_service_auth,
+        cleaned_dpop
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "cleaned": {
+            "service_auth": cleaned_service_auth,
+            "dpop": cleaned_dpop,
+            "total": total_cleaned,
+        },
+    })))
 }
 
 #[cfg(test)]
