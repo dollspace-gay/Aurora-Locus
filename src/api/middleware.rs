@@ -1,7 +1,7 @@
 // Allow dead_code for middleware - many auth/logging helpers are defined for future routes
 #![allow(dead_code)]
 
-/// Authentication and authorization middleware
+//! Authentication and authorization middleware
 
 use crate::{
     account::ValidatedSession,

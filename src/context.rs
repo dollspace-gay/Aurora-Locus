@@ -141,6 +141,9 @@ impl AppContext {
             user_agent: format!("Aurora-Locus/{}", config.service.version),
             use_doh: false,
             plc_directory_url: config.identity.did_plc_url.clone(),
+            max_retries: 3,
+            retry_base_delay_ms: 100,
+            retry_max_delay_ms: 5000,
         };
         let identity_resolver = Arc::new(
             IdentityResolver::new(did_cache, identity_config)?

@@ -1,7 +1,4 @@
-// Allow dead_code - identity cache features for future use
-#![allow(dead_code)]
-
-/// DID Cache - Database layer for caching DID documents and handle mappings
+//! DID Cache - Database layer for caching DID documents and handle mappings
 use crate::{
     error::{PdsError, PdsResult},
     identity::{CachedDidDoc, CachedHandle},

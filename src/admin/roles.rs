@@ -283,6 +283,87 @@ impl AdminRoleManager {
 
         Ok(())
     }
+
+    /// Get audit log entries with optional filters
+    ///
+    /// Returns audit log entries, optionally filtered by admin DID or action type.
+    /// Results are ordered by timestamp descending (most recent first).
+    pub async fn get_audit_logs(
+        &self,
+        admin_did: Option<&str>,
+        action: Option<&str>,
+        subject_did: Option<&str>,
+        limit: i64,
+        cursor: Option<i64>,
+    ) -> PdsResult<Vec<super::AuditLogEntry>> {
+        // Build query with optional filters
+        let mut query = String::from(
+            "SELECT id, admin_did, action, subject_did, details, timestamp, ip_address
+             FROM admin_audit_log WHERE 1=1"
+        );
+
+        if admin_did.is_some() {
+            query.push_str(" AND admin_did = ?");
+        }
+        if action.is_some() {
+            query.push_str(" AND action = ?");
+        }
+        if subject_did.is_some() {
+            query.push_str(" AND subject_did = ?");
+        }
+        if cursor.is_some() {
+            query.push_str(" AND id < ?");
+        }
+
+        query.push_str(" ORDER BY id DESC LIMIT ?");
+
+        // Execute with dynamic binding
+        let mut q = sqlx::query(&query);
+
+        if let Some(did) = admin_did {
+            q = q.bind(did);
+        }
+        if let Some(act) = action {
+            q = q.bind(act);
+        }
+        if let Some(subj) = subject_did {
+            q = q.bind(subj);
+        }
+        if let Some(cur) = cursor {
+            q = q.bind(cur);
+        }
+        q = q.bind(limit);
+
+        let rows = q.fetch_all(&self.db).await?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            let timestamp_str: String = row.get("timestamp");
+            let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+                .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
+                .with_timezone(&Utc);
+
+            entries.push(super::AuditLogEntry {
+                id: row.get("id"),
+                admin_did: row.get("admin_did"),
+                action: row.get("action"),
+                subject_did: row.get("subject_did"),
+                details: row.get("details"),
+                timestamp,
+                ip_address: row.get("ip_address"),
+            });
+        }
+
+        Ok(entries)
+    }
+
+    /// Get count of audit log entries
+    pub async fn get_audit_log_count(&self) -> PdsResult<i64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_audit_log")
+            .fetch_one(&self.db)
+            .await?;
+        Ok(count)
+    }
 }
 
 #[cfg(test)]

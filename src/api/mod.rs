@@ -15,6 +15,7 @@ pub mod repo;
 pub mod server;
 pub mod sync;
 pub mod sync_helpers;
+pub mod temp;
 pub mod well_known;
 
 use crate::context::AppContext;
@@ -38,6 +39,7 @@ pub fn routes() -> Router<AppContext> {
         .merge(moderation::routes())
         .merge(health::routes())
         .merge(federation::routes())
+        .merge(temp::routes())
         .merge(appview::routes())  // AppView proxy with read-after-write
         // OAuth admin routes with their own state
         .merge(oauth_admin::routes(oauth_state_store))

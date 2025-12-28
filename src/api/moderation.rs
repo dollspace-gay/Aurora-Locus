@@ -214,8 +214,8 @@ fn map_ozone_reason(ozone_reason: &str) -> String {
 
 /// Extract DID from an AT URI (at://did:plc:xxx/collection/rkey)
 fn extract_did_from_uri(uri: &str) -> Option<String> {
-    if uri.starts_with("at://") {
-        let parts: Vec<&str> = uri[5..].split('/').collect();
+    if let Some(stripped) = uri.strip_prefix("at://") {
+        let parts: Vec<&str> = stripped.split('/').collect();
         if !parts.is_empty() && parts[0].starts_with("did:") {
             return Some(parts[0].to_string());
         }

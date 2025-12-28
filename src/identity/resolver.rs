@@ -16,6 +16,12 @@ pub struct IdentityResolverConfig {
     pub use_doh: bool,
     /// PLC directory URL for DID resolution (default: https://plc.directory)
     pub plc_directory_url: String,
+    /// Maximum number of retry attempts for HTTP requests
+    pub max_retries: u32,
+    /// Base delay for exponential backoff in milliseconds
+    pub retry_base_delay_ms: u64,
+    /// Maximum delay between retries in milliseconds
+    pub retry_max_delay_ms: u64,
 }
 
 impl Default for IdentityResolverConfig {
@@ -25,6 +31,9 @@ impl Default for IdentityResolverConfig {
             use_doh: false,
             plc_directory_url: std::env::var("PLC_DIRECTORY_URL")
                 .unwrap_or_else(|_| "https://plc.directory".to_string()),
+            max_retries: 3,
+            retry_base_delay_ms: 100,
+            retry_max_delay_ms: 5000,
         }
     }
 }
@@ -91,11 +100,23 @@ impl IdentityResolver {
         if let Some(cached) = self.cache.get_handle(&normalized).await? {
             // Fresh cache hit - return immediately
             if !cached.stale {
+                tracing::trace!(
+                    handle = %cached.handle,
+                    did = %cached.did,
+                    updated_at = %cached.updated_at,
+                    declared_at = ?cached.declared_at,
+                    "Fresh handle cache hit"
+                );
                 return Ok(cached.did);
             }
 
             // Stale cache hit - try to refresh in background
-            tracing::debug!(handle = %normalized, "Cache hit but stale, attempting refresh");
+            tracing::debug!(
+                handle = %cached.handle,
+                did = %cached.did,
+                updated_at = %cached.updated_at,
+                "Cache hit but stale, attempting refresh"
+            );
 
             // Try to fetch fresh data
             match self.handle_resolver.resolve(&normalized).await {
@@ -147,11 +168,22 @@ impl IdentityResolver {
 
             // Fresh cache hit - return immediately
             if !cached.stale {
+                tracing::trace!(
+                    did = %cached.did,
+                    updated_at = %cached.updated_at,
+                    cached_at = %cached.cached_at,
+                    "Fresh DID doc cache hit"
+                );
                 return Ok(cached_doc);
             }
 
             // Stale cache hit - try to refresh
-            tracing::debug!(did = %did, "DID doc cache hit but stale, attempting refresh");
+            tracing::debug!(
+                did = %cached.did,
+                updated_at = %cached.updated_at,
+                cached_at = %cached.cached_at,
+                "DID doc cache hit but stale, attempting refresh"
+            );
 
             // Try to fetch fresh document
             match self.fetch_did_document(did).await {
@@ -197,31 +229,138 @@ impl IdentityResolver {
         }
     }
 
-    /// Fetch DID document from PLC directory
-    async fn fetch_plc_document(&self, did: &str) -> PdsResult<DidDocument> {
-        let plc_url = format!("{}/{}", self.config.plc_directory_url.trim_end_matches('/'), did);
-
-        let response = self.http_client
-            .get(&plc_url)
-            .send()
-            .await
-            .map_err(|e| PdsError::IdentityResolution(format!("Failed to fetch PLC document: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(PdsError::IdentityResolution(
-                format!("PLC directory returned error: {}", response.status())
-            ));
+    /// Check if an HTTP error is retryable
+    ///
+    /// Retryable errors include:
+    /// - Network/connection errors
+    /// - 5xx server errors (except 501 Not Implemented)
+    /// - 429 Too Many Requests
+    /// - Request timeout
+    fn is_retryable_error(error: &reqwest::Error) -> bool {
+        if error.is_timeout() || error.is_connect() || error.is_request() {
+            return true;
         }
-
-        let doc: DidDocument = response
-            .json()
-            .await
-            .map_err(|e| PdsError::IdentityResolution(format!("Invalid PLC document: {}", e)))?;
-
-        Ok(doc)
+        if let Some(status) = error.status() {
+            return status.as_u16() == 429
+                || (status.is_server_error() && status.as_u16() != 501);
+        }
+        false
     }
 
-    /// Fetch DID document from did:web
+    /// Check if an HTTP status code is retryable
+    fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+        status.as_u16() == 429
+            || (status.is_server_error() && status.as_u16() != 501)
+    }
+
+    /// Calculate delay for retry attempt using exponential backoff with jitter
+    fn calculate_retry_delay(&self, attempt: u32) -> std::time::Duration {
+        let base_delay = self.config.retry_base_delay_ms;
+        let max_delay = self.config.retry_max_delay_ms;
+
+        // Exponential backoff: base * 2^attempt
+        let delay_ms = base_delay.saturating_mul(1u64 << attempt);
+        let capped_delay = delay_ms.min(max_delay);
+
+        // Add jitter (±25% of delay)
+        let jitter_range = capped_delay / 4;
+        let jitter = if jitter_range > 0 {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            // Simple deterministic jitter based on current time
+            let mut hasher = DefaultHasher::new();
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .hash(&mut hasher);
+            (hasher.finish() % (jitter_range * 2)) as i64 - jitter_range as i64
+        } else {
+            0
+        };
+
+        let final_delay = (capped_delay as i64 + jitter).max(0) as u64;
+        std::time::Duration::from_millis(final_delay)
+    }
+
+    /// Fetch DID document from PLC directory with retry logic
+    async fn fetch_plc_document(&self, did: &str) -> PdsResult<DidDocument> {
+        let plc_url = format!("{}/{}", self.config.plc_directory_url.trim_end_matches('/'), did);
+        let max_retries = self.config.max_retries;
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let delay = self.calculate_retry_delay(attempt - 1);
+                tracing::debug!(
+                    did = %did,
+                    attempt = attempt,
+                    delay_ms = delay.as_millis(),
+                    "Retrying PLC document fetch"
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            match self.http_client.get(&plc_url).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        let doc: DidDocument = response
+                            .json()
+                            .await
+                            .map_err(|e| PdsError::IdentityResolution(format!("Invalid PLC document: {}", e)))?;
+
+                        if attempt > 0 {
+                            tracing::info!(
+                                did = %did,
+                                attempts = attempt + 1,
+                                "PLC document fetch succeeded after retries"
+                            );
+                        }
+                        return Ok(doc);
+                    }
+
+                    let status = response.status();
+                    if Self::is_retryable_status(status) && attempt < max_retries {
+                        tracing::warn!(
+                            did = %did,
+                            status = %status,
+                            attempt = attempt,
+                            "PLC directory returned retryable error"
+                        );
+                        last_error = Some(PdsError::IdentityResolution(
+                            format!("PLC directory returned error: {}", status)
+                        ));
+                        continue;
+                    }
+
+                    return Err(PdsError::IdentityResolution(
+                        format!("PLC directory returned error: {}", status)
+                    ));
+                }
+                Err(e) => {
+                    if Self::is_retryable_error(&e) && attempt < max_retries {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            attempt = attempt,
+                            "Retryable error fetching PLC document"
+                        );
+                        last_error = Some(PdsError::IdentityResolution(format!("Failed to fetch PLC document: {}", e)));
+                        continue;
+                    }
+                    return Err(PdsError::IdentityResolution(format!("Failed to fetch PLC document: {}", e)));
+                }
+            }
+        }
+
+        // All retries exhausted
+        Err(last_error.unwrap_or_else(|| PdsError::IdentityResolution(
+            format!("Failed to fetch PLC document after {} retries", max_retries)
+        )))
+    }
+
+    /// Fetch DID document from did:web with retry logic
     async fn fetch_web_document(&self, did: &str) -> PdsResult<DidDocument> {
         // did:web:example.com -> https://example.com/.well-known/did.json
         // did:web:example.com:user:alice -> https://example.com/user/alice/did.json
@@ -239,24 +378,77 @@ impl IdentityResolver {
             format!("https://{}/{}/did.json", domain, path)
         };
 
-        let response = self.http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| PdsError::IdentityResolution(format!("Failed to fetch did:web document: {}", e)))?;
+        let max_retries = self.config.max_retries;
+        let mut last_error = None;
 
-        if !response.status().is_success() {
-            return Err(PdsError::IdentityResolution(
-                format!("did:web server returned error: {}", response.status())
-            ));
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let delay = self.calculate_retry_delay(attempt - 1);
+                tracing::debug!(
+                    did = %did,
+                    attempt = attempt,
+                    delay_ms = delay.as_millis(),
+                    "Retrying did:web document fetch"
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            match self.http_client.get(&url).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        let doc: DidDocument = response
+                            .json()
+                            .await
+                            .map_err(|e| PdsError::IdentityResolution(format!("Invalid did:web document: {}", e)))?;
+
+                        if attempt > 0 {
+                            tracing::info!(
+                                did = %did,
+                                attempts = attempt + 1,
+                                "did:web document fetch succeeded after retries"
+                            );
+                        }
+                        return Ok(doc);
+                    }
+
+                    let status = response.status();
+                    if Self::is_retryable_status(status) && attempt < max_retries {
+                        tracing::warn!(
+                            did = %did,
+                            status = %status,
+                            attempt = attempt,
+                            "did:web server returned retryable error"
+                        );
+                        last_error = Some(PdsError::IdentityResolution(
+                            format!("did:web server returned error: {}", status)
+                        ));
+                        continue;
+                    }
+
+                    return Err(PdsError::IdentityResolution(
+                        format!("did:web server returned error: {}", status)
+                    ));
+                }
+                Err(e) => {
+                    if Self::is_retryable_error(&e) && attempt < max_retries {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            attempt = attempt,
+                            "Retryable error fetching did:web document"
+                        );
+                        last_error = Some(PdsError::IdentityResolution(format!("Failed to fetch did:web document: {}", e)));
+                        continue;
+                    }
+                    return Err(PdsError::IdentityResolution(format!("Failed to fetch did:web document: {}", e)));
+                }
+            }
         }
 
-        let doc: DidDocument = response
-            .json()
-            .await
-            .map_err(|e| PdsError::IdentityResolution(format!("Invalid did:web document: {}", e)))?;
-
-        Ok(doc)
+        // All retries exhausted
+        Err(last_error.unwrap_or_else(|| PdsError::IdentityResolution(
+            format!("Failed to fetch did:web document after {} retries", max_retries)
+        )))
     }
 
     /// Get atproto signing key from DID document (for Phase 4: Service Auth)
@@ -532,6 +724,9 @@ mod tests {
             user_agent: "Test-Agent/1.0".to_string(),
             use_doh: false,
             plc_directory_url: "https://test.plc.directory".to_string(),
+            max_retries: 3,
+            retry_base_delay_ms: 100,
+            retry_max_delay_ms: 5000,
         };
 
         let resolver = IdentityResolver::new(cache.clone(), custom_config).unwrap();
@@ -589,6 +784,9 @@ mod tests {
             user_agent: "Test-Agent/1.0".to_string(),
             use_doh: false,
             plc_directory_url: "https://test.plc.directory/".to_string(),
+            max_retries: 3,
+            retry_base_delay_ms: 100,
+            retry_max_delay_ms: 5000,
         };
 
         let resolver = IdentityResolver::new(cache, config_with_slash).unwrap();

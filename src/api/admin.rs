@@ -31,10 +31,17 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.getInviteCodes", get(get_invite_codes))
         .route("/xrpc/com.atproto.admin.listInviteCodes", get(list_invite_codes))
         .route("/xrpc/com.atproto.admin.disableInviteCode", post(disable_invite_code))
+        .route("/xrpc/com.atproto.admin.enableAccountInvites", post(enable_account_invites))
+        .route("/xrpc/com.atproto.admin.disableAccountInvites", post(disable_account_invites))
         // Role management
         .route("/xrpc/com.atproto.admin.grantRole", post(grant_role))
         .route("/xrpc/com.atproto.admin.revokeRole", post(revoke_role))
         .route("/xrpc/com.atproto.admin.listRoles", get(list_roles))
+        // Account management
+        .route("/xrpc/com.atproto.admin.updateAccountEmail", post(update_account_email))
+        .route("/xrpc/com.atproto.admin.updateAccountHandle", post(update_account_handle))
+        .route("/xrpc/com.atproto.admin.updateAccountPassword", post(update_account_password))
+        .route("/xrpc/com.atproto.admin.deleteAccount", post(admin_delete_account))
         // Account moderation
         .route("/xrpc/com.atproto.admin.takedownAccount", post(takedown_account))
         .route("/xrpc/com.atproto.admin.suspendAccount", post(suspend_account))
@@ -48,6 +55,10 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.submitReport", post(submit_report))
         .route("/xrpc/com.atproto.admin.updateReportStatus", post(update_report_status))
         .route("/xrpc/com.atproto.admin.listReports", get(list_reports))
+        // Email
+        .route("/xrpc/com.atproto.admin.sendEmail", post(send_email))
+        // Audit logs
+        .route("/xrpc/com.atproto.admin.getAuditLog", get(get_audit_log))
         // Validation failures
         .route("/xrpc/com.atproto.admin.getValidationFailures", get(get_validation_failures))
         // System health and diagnostics
@@ -368,6 +379,175 @@ async fn list_roles(
             "roles": assignments,
         })))
     }
+}
+
+// ============================================================================
+// Account Management Endpoints
+// ============================================================================
+
+#[derive(Deserialize)]
+struct UpdateAccountEmailRequest {
+    /// Account DID
+    did: String,
+    /// New email address
+    email: String,
+}
+
+/// Update account email address
+async fn update_account_email(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Json(req): Json<UpdateAccountEmailRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Validate DID format
+    if !req.did.starts_with("did:") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
+    }
+
+    // Validate email format (basic check)
+    if !req.email.contains('@') || req.email.len() < 5 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid email format".to_string()));
+    }
+
+    ctx.account_manager
+        .update_email(&req.did, &req.email)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+            } else if matches!(e, PdsError::Validation(_)) {
+                (StatusCode::CONFLICT, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "did": req.did,
+        "email": req.email
+    })))
+}
+
+#[derive(Deserialize)]
+struct UpdateAccountHandleRequest {
+    /// Account DID
+    did: String,
+    /// New handle
+    handle: String,
+}
+
+/// Update account handle
+async fn update_account_handle(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Json(req): Json<UpdateAccountHandleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Validate DID format
+    if !req.did.starts_with("did:") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
+    }
+
+    // Validate handle format (basic check)
+    if req.handle.is_empty() || req.handle.len() > 253 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid handle format".to_string()));
+    }
+
+    let new_handle = ctx.account_manager
+        .update_handle(&req.did, &req.handle)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+            } else if matches!(e, PdsError::Validation(_)) {
+                (StatusCode::CONFLICT, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "did": req.did,
+        "handle": new_handle
+    })))
+}
+
+#[derive(Deserialize)]
+struct UpdateAccountPasswordRequest {
+    /// Account DID
+    did: String,
+    /// New password
+    password: String,
+}
+
+/// Update account password (admin override)
+async fn update_account_password(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Json(req): Json<UpdateAccountPasswordRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Validate DID format
+    if !req.did.starts_with("did:") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
+    }
+
+    // Validate password (minimum length)
+    if req.password.len() < 8 {
+        return Err((StatusCode::BAD_REQUEST, "Password must be at least 8 characters".to_string()));
+    }
+
+    ctx.account_manager
+        .update_password(&req.did, &req.password)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "did": req.did,
+        "message": "Password updated. All sessions have been invalidated."
+    })))
+}
+
+#[derive(Deserialize)]
+struct DeleteAccountRequest {
+    /// Account DID
+    did: String,
+}
+
+/// Delete account permanently (admin operation)
+async fn admin_delete_account(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Json(req): Json<DeleteAccountRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Validate DID format
+    if !req.did.starts_with("did:") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
+    }
+
+    ctx.account_manager
+        .delete_account_permanent(&req.did)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "did": req.did,
+        "message": "Account permanently deleted"
+    })))
 }
 
 // ============================================================================
@@ -725,6 +905,193 @@ async fn list_reports(
     Ok(Json(serde_json::json!({
         "reports": reports,
     })))
+}
+
+// ============================================================================
+// Email Endpoints
+// ============================================================================
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendEmailRequest {
+    /// DID of the recipient
+    recipient_did: String,
+    /// Email subject
+    subject: String,
+    /// Email body content
+    content: String,
+    /// Optional sender DID for record-keeping
+    #[serde(default)]
+    sender_did: Option<String>,
+    /// Optional comment for audit log
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+/// Send email response per ATProto spec
+#[derive(serde::Serialize)]
+struct SendEmailResponse {
+    sent: bool,
+}
+
+/// Send an email to a user
+///
+/// Allows admins to send emails to users for moderation notices,
+/// warnings, or other administrative purposes.
+async fn send_email(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SendEmailRequest>,
+) -> Result<Json<SendEmailResponse>, (StatusCode, String)> {
+    // Get the recipient account to find their email
+    let account = ctx.account_manager
+        .get_account(&req.recipient_did)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("Account not found: {}", e)))?;
+
+    // Check if account has email
+    let to_email = account.email
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Account has no email address".to_string()))?;
+
+    // Send the email
+    ctx.mailer
+        .send_admin_email(&to_email, &req.subject, &req.content)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send email: {}", e)))?;
+
+    // Log the action
+    let sender = req.sender_did.as_deref().unwrap_or(&auth.did);
+    let _ = ctx.admin_role_manager
+        .log_action(
+            sender,
+            "email.send",
+            Some(&req.recipient_did),
+            req.comment.as_deref(),
+            Some(&req.subject),
+        )
+        .await;
+
+    tracing::info!(
+        "Admin {} sent email to {} ({}): {}",
+        auth.did,
+        req.recipient_did,
+        to_email,
+        req.subject
+    );
+
+    Ok(Json(SendEmailResponse { sent: true }))
+}
+
+// ============================================================================
+// Audit Log Endpoints
+// ============================================================================
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetAuditLogQuery {
+    /// Filter by admin DID
+    #[serde(default)]
+    admin_did: Option<String>,
+    /// Filter by action type (e.g., "account.takedown", "label.apply")
+    #[serde(default)]
+    action: Option<String>,
+    /// Filter by subject DID
+    #[serde(default)]
+    subject_did: Option<String>,
+    /// Maximum number of entries to return (default 50, max 100)
+    #[serde(default)]
+    limit: Option<i64>,
+    /// Cursor for pagination (ID of last entry from previous page)
+    #[serde(default)]
+    cursor: Option<i64>,
+}
+
+/// Audit log entry response
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditLogEntryResponse {
+    id: i64,
+    admin_did: String,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_did: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+    timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip_address: Option<String>,
+}
+
+/// Audit log response
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetAuditLogResponse {
+    entries: Vec<AuditLogEntryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<i64>,
+    total_count: i64,
+}
+
+/// Get audit log entries
+///
+/// Returns a paginated list of admin action audit log entries.
+/// Can be filtered by admin DID, action type, or subject DID.
+async fn get_audit_log(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<GetAuditLogQuery>,
+) -> Result<Json<GetAuditLogResponse>, (StatusCode, String)> {
+    // Clamp limit to reasonable range
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+
+    // Get audit log entries
+    let entries = ctx.admin_role_manager
+        .get_audit_logs(
+            query.admin_did.as_deref(),
+            query.action.as_deref(),
+            query.subject_did.as_deref(),
+            limit + 1, // Fetch one extra to check if there are more
+            query.cursor,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Get total count
+    let total_count = ctx.admin_role_manager
+        .get_audit_log_count()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Check if there are more entries
+    let has_more = entries.len() as i64 > limit;
+    let entries: Vec<_> = entries.into_iter().take(limit as usize).collect();
+
+    // Get cursor for next page
+    let next_cursor = if has_more {
+        entries.last().map(|e| e.id)
+    } else {
+        None
+    };
+
+    // Convert to response format
+    let response_entries: Vec<AuditLogEntryResponse> = entries
+        .into_iter()
+        .map(|e| AuditLogEntryResponse {
+            id: e.id,
+            admin_did: e.admin_did,
+            action: e.action,
+            subject_did: e.subject_did,
+            details: e.details,
+            timestamp: e.timestamp.to_rfc3339(),
+            ip_address: e.ip_address,
+        })
+        .collect();
+
+    Ok(Json(GetAuditLogResponse {
+        entries: response_entries,
+        cursor: next_cursor,
+        total_count,
+    }))
 }
 
 // ============================================================================
@@ -1178,6 +1545,70 @@ async fn disable_invite_code(
     Ok(Json(serde_json::json!({
         "success": true,
         "code": req.code,
+    })))
+}
+
+#[derive(Deserialize)]
+struct AccountInvitesRequest {
+    /// Account DID
+    did: String,
+}
+
+/// Enable invite code creation for an account
+async fn enable_account_invites(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Json(req): Json<AccountInvitesRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Validate DID format
+    if !req.did.starts_with("did:") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
+    }
+
+    ctx.account_manager
+        .enable_account_invites(&req.did)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "did": req.did,
+        "invitesEnabled": true
+    })))
+}
+
+/// Disable invite code creation for an account
+async fn disable_account_invites(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Json(req): Json<AccountInvitesRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Validate DID format
+    if !req.did.starts_with("did:") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
+    }
+
+    ctx.account_manager
+        .disable_account_invites(&req.did)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "did": req.did,
+        "invitesEnabled": false
     })))
 }
 

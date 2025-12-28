@@ -317,8 +317,24 @@ Aurora Locus PDS
         self.config.is_some()
     }
 
-    #[allow(dead_code)] // Future notification methods
-    #[allow(dead_code)] // Future notification methods
+    /// Send an admin email (for moderation notices, warnings, etc.)
+    ///
+    /// This is a public method for sending custom emails from admin actions.
+    /// It bypasses templates and rate limiting for admin use.
+    pub async fn send_admin_email(
+        &self,
+        to_email: &str,
+        subject: &str,
+        content: &str,
+    ) -> PdsResult<()> {
+        if self.config.is_none() {
+            return Err(PdsError::Internal("Email not configured".to_string()));
+        }
+
+        let config = self.config.as_ref().unwrap();
+        self.send_email(to_email, subject, content, &config.from_address).await
+    }
+
     /// Send notification email using template system
     pub async fn send_notification(
         &self,

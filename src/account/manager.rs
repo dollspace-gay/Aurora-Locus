@@ -1952,6 +1952,42 @@ impl AccountManager {
     ///
     /// This can be called periodically (e.g., weekly) to give users new invite codes
     /// based on the configuration.
+    /// Enable invite code creation for an account
+    ///
+    /// Allows the account to create and use invite codes.
+    pub async fn enable_account_invites(&self, did: &str) -> PdsResult<()> {
+        let result = sqlx::query("UPDATE account SET invites_disabled = 0 WHERE did = ?1")
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        if result.rows_affected() == 0 {
+            return Err(PdsError::NotFound(format!("Account not found: {}", did)));
+        }
+
+        tracing::info!(did = %did, "account_invites_enabled");
+        Ok(())
+    }
+
+    /// Disable invite code creation for an account
+    ///
+    /// Prevents the account from creating new invite codes.
+    pub async fn disable_account_invites(&self, did: &str) -> PdsResult<()> {
+        let result = sqlx::query("UPDATE account SET invites_disabled = 1 WHERE did = ?1")
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        if result.rows_affected() == 0 {
+            return Err(PdsError::NotFound(format!("Account not found: {}", did)));
+        }
+
+        tracing::info!(did = %did, "account_invites_disabled");
+        Ok(())
+    }
+
     #[allow(dead_code)] // Future invite allocation feature
     pub async fn allocate_invite_codes(&self, did: &str, count: i32) -> PdsResult<Vec<String>> {
         // Check if invites are disabled for this account
@@ -2039,6 +2075,38 @@ impl AccountManager {
         }
 
         Ok(accounts)
+    }
+
+    /// Get a user's position in the signup queue
+    ///
+    /// Returns the number of deactivated accounts created before this account,
+    /// which represents their position in the queue.
+    /// Returns None if the account is not found or is not deactivated.
+    pub async fn get_signup_queue_position(&self, did: &str) -> PdsResult<i64> {
+        // Get the account's creation time
+        let account = self.get_account(did).await?;
+
+        // If account is not deactivated, they're not in queue
+        if account.deactivated_at.is_none() {
+            return Err(PdsError::NotFound("Account is not in signup queue".to_string()));
+        }
+
+        // Count how many deactivated accounts were created before this one
+        // (excluding accounts with takedowns, which are moderation actions not queue)
+        let position: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM actor
+             WHERE deactivated_at IS NOT NULL
+             AND takedown_ref IS NULL
+             AND created_at < (SELECT created_at FROM actor WHERE did = ?1)
+             AND did != ?1"
+        )
+        .bind(did)
+        .fetch_one(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        // Position is 1-indexed (first in queue = position 1)
+        Ok(position + 1)
     }
 }
 

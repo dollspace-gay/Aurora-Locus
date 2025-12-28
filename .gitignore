@@ -17,3 +17,4 @@ Cargo.lock
 *~
 # Beads database
 .beads/
+.chainlink/

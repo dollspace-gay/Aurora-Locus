@@ -22,9 +22,44 @@ use std::sync::Arc;
 /// Build AppView proxy routes
 pub fn routes() -> Router<AppContext> {
     Router::new()
+        // Feed endpoints with read-after-write
         .route("/xrpc/app.bsky.feed.getTimeline", get(get_timeline))
         .route("/xrpc/app.bsky.feed.getAuthorFeed", get(get_author_feed))
+        // Profile endpoint with read-after-write
         .route("/xrpc/app.bsky.actor.getProfile", get(get_profile))
+        // Feed endpoints (simple proxy)
+        .route("/xrpc/app.bsky.feed.getPosts", get(get_posts))
+        .route("/xrpc/app.bsky.feed.getPostThread", get(get_post_thread))
+        .route("/xrpc/app.bsky.feed.getLikes", get(get_likes))
+        .route("/xrpc/app.bsky.feed.getRepostedBy", get(get_reposted_by))
+        .route("/xrpc/app.bsky.feed.getQuotes", get(get_quotes))
+        .route("/xrpc/app.bsky.feed.getFeedGenerator", get(get_feed_generator))
+        .route("/xrpc/app.bsky.feed.getFeedGenerators", get(get_feed_generators))
+        .route("/xrpc/app.bsky.feed.getActorFeeds", get(get_actor_feeds))
+        .route("/xrpc/app.bsky.feed.getSuggestedFeeds", get(get_suggested_feeds))
+        .route("/xrpc/app.bsky.feed.getFeed", get(get_feed))
+        .route("/xrpc/app.bsky.feed.getListFeed", get(get_list_feed))
+        .route("/xrpc/app.bsky.feed.searchPosts", get(search_posts))
+        // Actor endpoints (simple proxy)
+        .route("/xrpc/app.bsky.actor.getProfiles", get(get_profiles))
+        .route("/xrpc/app.bsky.actor.searchActors", get(search_actors))
+        .route("/xrpc/app.bsky.actor.searchActorsTypeahead", get(search_actors_typeahead))
+        .route("/xrpc/app.bsky.actor.getSuggestions", get(get_suggestions))
+        .route("/xrpc/app.bsky.actor.getPreferences", get(get_preferences))
+        // Graph endpoints (simple proxy)
+        .route("/xrpc/app.bsky.graph.getFollowers", get(get_followers))
+        .route("/xrpc/app.bsky.graph.getFollows", get(get_follows))
+        .route("/xrpc/app.bsky.graph.getBlocks", get(get_blocks))
+        .route("/xrpc/app.bsky.graph.getMutes", get(get_mutes))
+        .route("/xrpc/app.bsky.graph.getLists", get(get_lists))
+        .route("/xrpc/app.bsky.graph.getList", get(get_list))
+        .route("/xrpc/app.bsky.graph.getListMembers", get(get_list_members))
+        .route("/xrpc/app.bsky.graph.getListMemberships", get(get_list_memberships))
+        // Notification endpoints (simple proxy)
+        .route("/xrpc/app.bsky.notification.listNotifications", get(list_notifications))
+        .route("/xrpc/app.bsky.notification.getUnreadCount", get(get_unread_count))
+        // Labeler endpoints (simple proxy)
+        .route("/xrpc/app.bsky.labeler.getServices", get(get_labeler_services))
 }
 
 /// Get user's timeline with read-after-write consistency
@@ -360,4 +395,329 @@ pub struct AuthorFeedParams {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProfileParams {
     pub actor: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GetPostsParams {
+    pub uris: String, // Comma-separated URIs
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostThreadParams {
+    pub uri: String,
+    pub depth: Option<i32>,
+    pub parent_height: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UriCursorParams {
+    pub uri: String,
+    pub limit: Option<i32>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ActorCursorParams {
+    pub actor: String,
+    pub limit: Option<i32>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CursorLimitParams {
+    pub limit: Option<i32>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FeedUriParams {
+    pub feed: String,
+    pub limit: Option<i32>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ListUriParams {
+    pub list: String,
+    pub limit: Option<i32>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SearchParams {
+    pub q: String,
+    pub limit: Option<i32>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ProfilesParams {
+    pub actors: String, // Comma-separated actors
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TypeaheadParams {
+    pub q: String,
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LabelerServicesParams {
+    pub dids: String, // Comma-separated DIDs
+    pub detailed: Option<bool>,
+}
+
+// ============================================================================
+// Simple Proxy Handlers (no read-after-write needed)
+// ============================================================================
+
+/// Get posts by URI
+async fn get_posts(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<GetPostsParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getPosts", params).await
+}
+
+/// Get post thread
+async fn get_post_thread(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<PostThreadParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getPostThread", params).await
+}
+
+/// Get users who liked a post
+async fn get_likes(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<UriCursorParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getLikes", params).await
+}
+
+/// Get users who reposted a post
+async fn get_reposted_by(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<UriCursorParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getRepostedBy", params).await
+}
+
+/// Get quotes of a post
+async fn get_quotes(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<UriCursorParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getQuotes", params).await
+}
+
+/// Get feed generator info
+async fn get_feed_generator(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<FeedUriParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getFeedGenerator", params).await
+}
+
+/// Get multiple feed generators
+async fn get_feed_generators(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<serde_json::Value>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getFeedGenerators", params).await
+}
+
+/// Get feeds created by an actor
+async fn get_actor_feeds(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<ActorCursorParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getActorFeeds", params).await
+}
+
+/// Get suggested feeds
+async fn get_suggested_feeds(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<CursorLimitParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getSuggestedFeeds", params).await
+}
+
+/// Get a custom feed
+async fn get_feed(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<FeedUriParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getFeed", params).await
+}
+
+/// Get feed for a list
+async fn get_list_feed(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<ListUriParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.getListFeed", params).await
+}
+
+/// Search posts
+async fn search_posts(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<SearchParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.feed.searchPosts", params).await
+}
+
+/// Get multiple profiles
+async fn get_profiles(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<ProfilesParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.actor.getProfiles", params).await
+}
+
+/// Search actors
+async fn search_actors(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<SearchParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.actor.searchActors", params).await
+}
+
+/// Search actors typeahead
+async fn search_actors_typeahead(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<TypeaheadParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.actor.searchActorsTypeahead", params).await
+}
+
+/// Get suggested accounts to follow
+async fn get_suggestions(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<CursorLimitParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.actor.getSuggestions", params).await
+}
+
+/// Get user preferences
+async fn get_preferences(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.actor.getPreferences", serde_json::json!({})).await
+}
+
+/// Get followers
+async fn get_followers(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<ActorCursorParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.graph.getFollowers", params).await
+}
+
+/// Get follows
+async fn get_follows(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<ActorCursorParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.graph.getFollows", params).await
+}
+
+/// Get blocked accounts
+async fn get_blocks(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<CursorLimitParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.graph.getBlocks", params).await
+}
+
+/// Get muted accounts
+async fn get_mutes(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<CursorLimitParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.graph.getMutes", params).await
+}
+
+/// Get lists created by an actor
+async fn get_lists(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<ActorCursorParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.graph.getLists", params).await
+}
+
+/// Get list info
+async fn get_list(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<ListUriParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.graph.getList", params).await
+}
+
+/// Get list members
+async fn get_list_members(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<ListUriParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.graph.getListMembers", params).await
+}
+
+/// Get lists an actor is a member of
+async fn get_list_memberships(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<ActorCursorParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.graph.getListMemberships", params).await
+}
+
+/// List notifications
+async fn list_notifications(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<CursorLimitParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.notification.listNotifications", params).await
+}
+
+/// Get unread notification count
+async fn get_unread_count(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.notification.getUnreadCount", serde_json::json!({})).await
+}
+
+/// Get labeler services
+async fn get_labeler_services(
+    State(ctx): State<AppContext>,
+    _auth: OAuthAuthContext,
+    Query(params): Query<LabelerServicesParams>,
+) -> PdsResult<Response> {
+    proxy_to_appview(&ctx, "app.bsky.labeler.getServices", params).await
 }

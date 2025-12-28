@@ -13,7 +13,6 @@ pub use handle_validation::validate_handle;
 pub use resolver::{IdentityResolver, IdentityResolverConfig};
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
 
 /// Cached DID document entry with stale flag
 ///
@@ -21,12 +20,13 @@ use serde::Serialize;
 /// but still within max TTL. Stale data can be used as fallback during outages.
 #[derive(Debug, Clone)]
 pub struct CachedDidDoc {
-    #[allow(dead_code)] // Future DID tracking
+    /// The DID this document belongs to
     pub did: String,
-    pub doc: String,  // JSON-encoded DID document
-    #[allow(dead_code)] // Future cache timestamp tracking
+    /// JSON-encoded DID document
+    pub doc: String,
+    /// When the DID document was last updated at source
     pub updated_at: DateTime<Utc>,
-    #[allow(dead_code)] // Future cache timestamp tracking
+    /// When this entry was cached locally
     pub cached_at: DateTime<Utc>,
     /// True if cached_at is past stale_ttl but within max_ttl
     pub stale: bool,
@@ -35,29 +35,14 @@ pub struct CachedDidDoc {
 /// Cached handle mapping entry with stale flag
 #[derive(Debug, Clone)]
 pub struct CachedHandle {
-    #[allow(dead_code)] // Future handle tracking
+    /// The handle that was resolved
     pub handle: String,
+    /// The DID the handle resolves to
     pub did: String,
-    #[allow(dead_code)] // Future timestamp tracking
+    /// When the handle was declared in the DID document (if available)
     pub declared_at: Option<DateTime<Utc>>,
-    #[allow(dead_code)] // Future timestamp tracking
+    /// When this cache entry was last updated
     pub updated_at: DateTime<Utc>,
     /// True if updated_at is past stale_ttl but within max_ttl
     pub stale: bool,
-}
-
-/// Handle resolution result
-    #[allow(dead_code)] // Future handle resolution result
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HandleResolutionResult {
-    pub did: String,
-}
-    #[allow(dead_code)] // Future DID doc resolution result
-
-/// DID document resolution result
-#[derive(Debug, Clone, Serialize)]
-pub struct DidDocResolutionResult {
-    pub did: String,
-    pub doc: serde_json::Value,
 }
