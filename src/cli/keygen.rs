@@ -1,6 +1,6 @@
-/// DID Key Generation CLI Command
-///
-/// Provides command-line tools for generating P-256 keypairs in various formats.
+//! DID Key Generation CLI Command
+//!
+//! Provides command-line tools for generating P-256 keypairs in various formats.
 
 use crate::{crypto::keypair::{KeyFormat, KeyPair}, error::PdsResult};
 use std::fs;

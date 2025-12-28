@@ -1,9 +1,9 @@
 #![recursion_limit = "512"]
 
-/// Aurora Locus - ATProto Personal Data Server
-///
-/// A Rust implementation of an ATProto PDS, providing personal data storage
-/// and federation capabilities for the AT Protocol network.
+//! Aurora Locus - ATProto Personal Data Server
+//!
+//! A Rust implementation of an ATProto PDS, providing personal data storage
+//! and federation capabilities for the AT Protocol network.
 
 mod account;
 mod admin;

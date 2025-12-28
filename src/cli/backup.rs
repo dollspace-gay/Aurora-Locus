@@ -1,6 +1,6 @@
-/// Database Backup and Restore CLI Commands
-///
-/// Provides command-line tools for backing up and restoring SQLite databases.
+//! Database Backup and Restore CLI Commands
+//!
+//! Provides command-line tools for backing up and restoring SQLite databases.
 
 use crate::{context::AppContext, error::PdsResult};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};

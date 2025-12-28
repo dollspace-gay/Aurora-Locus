@@ -1,15 +1,15 @@
-/// CLI commands for Aurora Locus administration
-///
-/// Provides command-line tools for server administration, including:
-/// - Account creation
-/// - OAuth migration (JWT to OAuth 2.1)
-/// - Database backup and restore
-/// - DID key generation
-/// - Service token generation
-/// - Health checks
-/// - Metrics export
-/// - Configuration validation
-/// - Debug utilities
+//! CLI commands for Aurora Locus administration
+//!
+//! Provides command-line tools for server administration, including:
+//! - Account creation
+//! - OAuth migration (JWT to OAuth 2.1)
+//! - Database backup and restore
+//! - DID key generation
+//! - Service token generation
+//! - Health checks
+//! - Metrics export
+//! - Configuration validation
+//! - Debug utilities
 
 pub mod account;
 pub mod backup;

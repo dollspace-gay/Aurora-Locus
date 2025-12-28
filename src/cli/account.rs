@@ -1,6 +1,6 @@
-/// Account Management CLI Commands
-///
-/// Provides command-line tools for account creation and management.
+//! Account Management CLI Commands
+//!
+//! Provides command-line tools for account creation and management.
 
 use crate::{
     context::AppContext,

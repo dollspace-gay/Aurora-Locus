@@ -336,6 +336,7 @@ Aurora Locus PDS
     }
 
     /// Send notification email using template system
+    #[allow(dead_code)] // Public API for templated notifications
     pub async fn send_notification(
         &self,
         to_email: &str,

@@ -1,6 +1,6 @@
-/// Service Token Generation CLI Command
-///
-/// Provides command-line tools for generating service authentication JWT tokens.
+//! Service Token Generation CLI Command
+//!
+//! Provides command-line tools for generating service authentication JWT tokens.
 
 use crate::{context::AppContext, error::PdsResult, service_auth::create_service_jwt};
 

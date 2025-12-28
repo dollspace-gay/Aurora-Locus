@@ -696,7 +696,7 @@ pub async fn jwt_deprecation_headers(
 ) -> Response {
     // Check if JWT auth was used (stored in request extensions by AuthContext)
     let is_jwt = req.extensions().get::<crate::auth::AuthMethod>()
-        .map(|method| matches!(method, crate::auth::AuthMethod::JWT))
+        .map(|method| matches!(method, crate::auth::AuthMethod::Jwt))
         .unwrap_or(false);
 
     // Run the request handler

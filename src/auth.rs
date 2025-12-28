@@ -24,7 +24,7 @@ pub enum AuthMethod {
     /// OAuth 2.1 token (modern)
     OAuth,
     /// Legacy JWT session token
-    JWT,
+    Jwt,
 }
 
 /// Authenticated context - extracts and validates session from request
@@ -89,12 +89,12 @@ impl FromRequestParts<AppContext> for AuthContext {
                 crate::metrics::record_oauth_token_exchange("jwt_fallback", "success", duration);
 
                 // Store auth method in extensions for middleware
-                parts.extensions.insert(AuthMethod::JWT);
+                parts.extensions.insert(AuthMethod::Jwt);
 
                 Ok(AuthContext {
                     did,
                     session,
-                    auth_method: AuthMethod::JWT,
+                    auth_method: AuthMethod::Jwt,
                 })
             }
         }
@@ -158,12 +158,12 @@ impl FromRequestParts<AppContext> for OptionalAuthContext {
                             crate::metrics::record_oauth_token_exchange("jwt_fallback_optional", "success", duration);
 
                             // Store auth method in extensions for middleware
-                            parts.extensions.insert(AuthMethod::JWT);
+                            parts.extensions.insert(AuthMethod::Jwt);
 
                             Some(AuthContext {
                                 did,
                                 session,
-                                auth_method: AuthMethod::JWT,
+                                auth_method: AuthMethod::Jwt,
                             })
                         }
                         Err(_) => None,

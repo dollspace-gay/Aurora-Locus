@@ -1,6 +1,6 @@
-/// Health Check CLI Command
-///
-/// Provides command-line tools for checking server health status.
+//! Health Check CLI Command
+//!
+//! Provides command-line tools for checking server health status.
 
 use crate::{context::AppContext, error::PdsResult};
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,7 @@ pub async fn health_check(ctx: &AppContext, format: &str) -> PdsResult<()> {
             })?;
             println!("{}", json);
         }
-        "text" | _ => {
+        _ => {
             print_text_health(&result);
         }
     }

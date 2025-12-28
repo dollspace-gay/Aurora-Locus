@@ -1,6 +1,6 @@
-/// Configuration Validation CLI Command
-///
-/// Provides comprehensive configuration validation with security and production readiness checks.
+//! Configuration Validation CLI Command
+//!
+//! Provides comprehensive configuration validation with security and production readiness checks.
 
 use crate::config::{BlobstoreConfig, ServerConfig};
 use crate::error::PdsResult;
@@ -314,7 +314,7 @@ fn validate_auth_config(config: &ServerConfig, issues: &mut Vec<ValidationIssue>
     }
 
     // Check for weak/default secrets
-    let weak_secrets = vec![
+    let weak_secrets = [
         "change_me",
         "secret",
         "password",
@@ -534,13 +534,13 @@ fn validate_federation_config(config: &ServerConfig, issues: &mut Vec<Validation
         }
 
         // Check public URL
-        if config.federation.crawl_enabled || config.federation.firehose_enabled {
-            if config.federation.public_url.is_none() {
-                issues.push(ValidationIssue::error(
-                    "Federation",
-                    "Crawl or firehose enabled but no public URL configured".to_string(),
-                ));
-            }
+        if (config.federation.crawl_enabled || config.federation.firehose_enabled)
+            && config.federation.public_url.is_none()
+        {
+            issues.push(ValidationIssue::error(
+                "Federation",
+                "Crawl or firehose enabled but no public URL configured".to_string(),
+            ));
         }
 
         // Check AppView URL if provided

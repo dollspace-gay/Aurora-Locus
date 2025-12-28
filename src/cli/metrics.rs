@@ -1,6 +1,6 @@
-/// Metrics Export CLI Command
-///
-/// Provides command-line tools for exporting server metrics in Prometheus or JSON format.
+//! Metrics Export CLI Command
+//!
+//! Provides command-line tools for exporting server metrics in Prometheus or JSON format.
 
 use crate::error::PdsResult;
 use prometheus::{Encoder, TextEncoder};

@@ -1,6 +1,6 @@
-/// Debug Utilities CLI Commands
-///
-/// Provides debugging and inspection tools for troubleshooting server issues.
+//! Debug Utilities CLI Commands
+//!
+//! Provides debugging and inspection tools for troubleshooting server issues.
 
 use crate::context::AppContext;
 use crate::error::PdsResult;

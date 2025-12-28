@@ -55,6 +55,7 @@ impl DidCache {
     }
 
     /// Set custom TTLs for handles
+    #[allow(dead_code)] // Public API for cache configuration
     pub fn with_handle_ttls(mut self, stale_ttl: Duration, max_ttl: Duration) -> Self {
         self.handle_stale_ttl = stale_ttl;
         self.handle_max_ttl = max_ttl;
@@ -62,6 +63,7 @@ impl DidCache {
     }
 
     /// Set custom TTLs for all cache types (backward compatibility)
+    #[allow(dead_code)] // Deprecated but kept for backward compatibility
     #[deprecated(note = "Use with_did_doc_ttls() and with_handle_ttls() for two-tier TTL")]
     pub fn with_ttls(mut self, did_doc_ttl: Duration, handle_ttl: Duration) -> Self {
         self.did_doc_stale_ttl = did_doc_ttl;

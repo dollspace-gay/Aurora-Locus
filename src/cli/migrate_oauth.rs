@@ -1,11 +1,11 @@
-/// OAuth Migration Tool
-///
-/// Helps users migrate from legacy JWT sessions to OAuth 2.1 authentication.
-/// This tool:
-/// 1. Revokes all existing JWT sessions for the user
-/// 2. Generates an OAuth authorization URL for re-authentication
-/// 3. Optionally registers user devices for OAuth
-/// 4. Provides migration status and rollback support
+//! OAuth Migration Tool
+//!
+//! Helps users migrate from legacy JWT sessions to OAuth 2.1 authentication.
+//! This tool:
+//! 1. Revokes all existing JWT sessions for the user
+//! 2. Generates an OAuth authorization URL for re-authentication
+//! 3. Optionally registers user devices for OAuth
+//! 4. Provides migration status and rollback support
 
 use crate::{
     config::ServerConfig,
@@ -85,7 +85,7 @@ async fn count_user_sessions(
     .bind(did)
     .fetch_one(&ctx.account_db)
     .await
-    .map_err(|e| PdsError::Database(e))?;
+    .map_err(PdsError::Database)?;
 
     Ok(count as usize)
 }
@@ -101,7 +101,7 @@ async fn revoke_all_sessions(
     .bind(did)
     .execute(&ctx.account_db)
     .await
-    .map_err(|e| PdsError::Database(e))?;
+    .map_err(PdsError::Database)?;
 
     Ok(result.rows_affected() as usize)
 }
@@ -143,7 +143,7 @@ pub async fn bulk_migrate_users(
     )
     .fetch_all(&ctx.account_db)
     .await
-    .map_err(|e| PdsError::Database(e))?;
+    .map_err(PdsError::Database)?;
 
     info!("Found {} users with active JWT sessions", dids.len());
 

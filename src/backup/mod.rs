@@ -1,7 +1,7 @@
 // Allow dead_code for backup module - backup functionality is defined but not yet integrated
 #![allow(dead_code)]
 
-/// Automated backup scheduling and management for Aurora Locus PDS
+//! Automated backup scheduling and management for Aurora Locus PDS
 
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Duration, Utc};
@@ -238,7 +238,7 @@ pub fn list_backups(backup_dir: &Path) -> PdsResult<Vec<BackupMetadata>> {
                                 .as_str()
                                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                                 .map(|dt| dt.with_timezone(&Utc))
-                                .unwrap_or_else(|| Utc::now());
+                                .unwrap_or_else(Utc::now);
 
                             let size_bytes = get_dir_size(&path).unwrap_or(0);
 

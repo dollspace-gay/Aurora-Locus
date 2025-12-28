@@ -1,11 +1,11 @@
-/// Rotate DID signing keys and update PLC directory
-///
-/// This command rotates signing keys for DID:PLC identifiers by:
-/// 1. Fetching the current signing key from the repository
-/// 2. Comparing with the current key in PLC directory
-/// 3. Updating PLC directory if keys don't match
-/// 4. Creating a new repository commit with the updated signing key
-/// 5. Sequencing identity events (commit events are automatically sequenced)
+//! Rotate DID signing keys and update PLC directory
+//!
+//! This command rotates signing keys for DID:PLC identifiers by:
+//! 1. Fetching the current signing key from the repository
+//! 2. Comparing with the current key in PLC directory
+//! 3. Updating PLC directory if keys don't match
+//! 4. Creating a new repository commit with the updated signing key
+//! 5. Sequencing identity events (commit events are automatically sequenced)
 
 use crate::{
     actor_store::repository::RepositoryManager,

@@ -1,11 +1,11 @@
-/// Publish identity events to sequencer
-///
-/// Used to manually trigger identity event publishing, typically needed when:
-/// - Handles have changed
-/// - DID documents have been updated
-/// - Identity information needs to be re-broadcast to the network
-///
-/// Supports both single DIDs and bulk publishing from files.
+//! Publish identity events to sequencer
+//!
+//! Used to manually trigger identity event publishing, typically needed when:
+//! - Handles have changed
+//! - DID documents have been updated
+//! - Identity information needs to be re-broadcast to the network
+//!
+//! Supports both single DIDs and bulk publishing from files.
 
 use crate::{
     context::AppContext,
