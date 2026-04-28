@@ -46,9 +46,11 @@ pub async fn purge_deleted_accounts(ctx: &AppContext) -> PdsResult<u64> {
     // Find accounts marked for deletion where grace period has expired
     let rows = sqlx::query(
         r#"
-        SELECT did, handle
-        FROM account
-        WHERE deactivated_at IS NOT NULL AND deactivated_at < ?1
+        SELECT a.did, a.handle
+        FROM actor a
+        WHERE a.deactivated_at IS NOT NULL
+          AND a.delete_after IS NOT NULL
+          AND a.delete_after < ?1
         "#,
     )
     .bind(now)
