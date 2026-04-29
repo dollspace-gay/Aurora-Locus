@@ -8,6 +8,35 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
+/// Parse a timestamp string from the database, tolerating both RFC3339
+/// (e.g., "2026-04-28T20:13:42.777Z") and SQLite native DATETIME format
+/// (e.g., "2026-04-28 20:13:42").
+///
+/// SQLite's `datetime('now')` produces space-separated timestamps without a
+/// timezone designator, which is not RFC3339. This helper accepts both forms
+/// to avoid coupling to a specific timestamp format at the SQL layer.
+fn parse_timestamp_lenient(s: &str) -> PdsResult<DateTime<Utc>> {
+    // Try RFC3339 first (the strictly-correct format)
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    // Fall back to SQLite's native format: "YYYY-MM-DD HH:MM:SS"
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(DateTime::from_naive_utc_and_offset(naive, Utc));
+    }
+
+    // Also accept the variant with subsecond precision: "YYYY-MM-DD HH:MM:SS.fff"
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Ok(DateTime::from_naive_utc_and_offset(naive, Utc));
+    }
+
+    Err(PdsError::Internal(format!(
+        "Could not parse timestamp '{}' as RFC3339 or SQLite DATETIME",
+        s
+    )))
+}
+
 /// Admin role levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -175,15 +204,12 @@ impl AdminRoleManager {
             let role = Role::from_str(&role_str)?;
 
             let granted_at_str: String = row.get("granted_at");
-            let granted_at = DateTime::parse_from_rfc3339(&granted_at_str)
-                .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
-                .with_timezone(&Utc);
+            let granted_at = parse_timestamp_lenient(&granted_at_str)?;
 
             let revoked_at = row
                 .try_get::<String, _>("revoked_at")
                 .ok()
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
+                .and_then(|s| parse_timestamp_lenient(&s).ok());
 
             Ok(Some(AdminRole {
                 id: row.get("id"),

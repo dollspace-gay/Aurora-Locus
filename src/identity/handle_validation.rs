@@ -31,12 +31,11 @@ const VALID_TLDS: &[&str] = &[
 const EXPLICIT_SLURS: &[&str] = &[
     // Placeholder - actual slurs omitted for code readability
     // In production, load from external config or use a proper filtering library
-    "admin",      // Reserved system names
-    "root",
-    "administrator",
-    "moderator",
-    "system",
-    "official",
+    //
+    // System names (admin, root, administrator, moderator, system, official)
+    // were previously included here but caused false positives via substring
+    // matching. They are now handled exclusively by reserved_handles.rs which
+    // does exact-match checks at the appropriate granularity.
 ];
 
 /// Validate a handle according to ATProto specification

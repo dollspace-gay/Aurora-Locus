@@ -246,9 +246,24 @@ async fn get_users(
 
     let limit = params.limit.unwrap_or(50).min(100);
 
+    // Status is computed from actor state:
+    //   takedown_ref present -> 'taken_down'
+    //   deactivated_at present -> 'deactivated'
+    //   otherwise -> 'active'
+    let status_expr = "CASE \
+        WHEN a.takedown_ref IS NOT NULL THEN 'taken_down' \
+        WHEN a.deactivated_at IS NOT NULL THEN 'deactivated' \
+        ELSE 'active' END";
+
     let users: Vec<serde_json::Value> = if let Some(cursor) = params.cursor {
         sqlx::query_as::<_, (String, String, Option<String>, String, String)>(
-            "SELECT did, handle, email, created_at, status FROM account WHERE did > ? ORDER BY did LIMIT ?"
+            &format!(
+                "SELECT a.did, a.handle, ac.email, a.created_at, {} as status \
+                 FROM actor a \
+                 LEFT JOIN account ac ON a.did = ac.did \
+                 WHERE a.did > ? ORDER BY a.did LIMIT ?",
+                status_expr
+            )
         )
         .bind(cursor)
         .bind(limit)
@@ -257,7 +272,13 @@ async fn get_users(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
         sqlx::query_as::<_, (String, String, Option<String>, String, String)>(
-            "SELECT did, handle, email, created_at, status FROM account ORDER BY did LIMIT ?"
+            &format!(
+                "SELECT a.did, a.handle, ac.email, a.created_at, {} as status \
+                 FROM actor a \
+                 LEFT JOIN account ac ON a.did = ac.did \
+                 ORDER BY a.did LIMIT ?",
+                status_expr
+            )
         )
         .bind(limit)
         .fetch_all(&ctx.account_db)

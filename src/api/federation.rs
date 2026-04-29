@@ -26,15 +26,8 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/com.aurora.federation.refreshDiscovery",
             post(refresh_discovery),
         )
-        // Phase 2: Federated search endpoints
-        .route(
-            "/xrpc/app.bsky.actor.searchActors",
-            get(search_actors),
-        )
-        .route(
-            "/xrpc/app.bsky.feed.searchPosts",
-            get(search_posts),
-        )
+        // Phase 2: Federated search (dead code, see commit message)
+        // Routes deferred to avoid collision with appview proxy.
         .route(
             "/xrpc/com.aurora.federation.aggregateTimeline",
             get(aggregate_timeline),
