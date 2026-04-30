@@ -1,0 +1,11 @@
+{
+  "uuid": "1f64e5b9-7cdf-45fe-b3ea-e78437ec5d21",
+  "display_id": 8,
+  "title": "Implement Signer wrapper around k256 PLC key",
+  "status": "open",
+  "priority": "high",
+  "parent_uuid": "597e753b-fabe-4315-b77e-a6e46020c923",
+  "created_by": "vW4n",
+  "created_at": "2026-04-30T22:00:40.506836811Z",
+  "updated_at": "2026-04-30T22:00:40.506836811Z"
+}
