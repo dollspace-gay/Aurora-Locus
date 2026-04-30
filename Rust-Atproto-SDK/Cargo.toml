@@ -60,7 +60,7 @@ rand = "0.8"                                      # Random generation for code v
 
 # DPoP (Demonstrating Proof of Possession) support
 rsa = { version = "0.9", features = ["sha2"] }    # RSA key generation and signing
-jsonwebtoken = "9.2"                              # JWT creation and signing for DPoP
+jsonwebtoken = "10.3"                              # JWT creation and signing for DPoP
 uuid = { version = "1.6", features = ["v4"] }     # Unique identifiers for DPoP jti
 
 # URL building
