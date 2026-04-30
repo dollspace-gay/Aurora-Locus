@@ -1,0 +1,10 @@
+{
+  "uuid": "48338dcc-a152-45e9-9b12-2ce13cb443c8",
+  "issue_uuid": "0481f761-2b65-4274-b6ab-ae70eea742a8",
+  "author": "vW4n",
+  "content": "create_repo_signer now returns PdsResult<Arc<dyn proto_blue::crypto::Signer>>. Four call sites updated with '?' propagation.",
+  "created_at": "2026-04-30T22:20:18.185057090Z",
+  "kind": "result",
+  "signed_by": "SHA256:FE0u9OWnwKx5uvLuSiKuHnl7pLtr4oXeEOi3s6yPOZY",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg31dKNoRTmx2sQF5ORSg1RnlKJqTXtDbr2pcYw8kivkkAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6/G/GmVqK5yH7Yy+AuBeJ8PJBmTFiOLzZBH0OL1fEU7yrOLfv4rHEmO7odmxl81OOobMFVoU36qyfUUna4SVAQ=="
+}
