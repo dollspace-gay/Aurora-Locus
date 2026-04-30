@@ -1,0 +1,10 @@
+{
+  "uuid": "d85ce606-55cb-4c2b-9606-f96c38c991a5",
+  "issue_uuid": "f43dd5ca-de76-46a8-aabf-4d5333f0e9a6",
+  "author": "vW4n",
+  "content": "Replace path = './Rust-Atproto-SDK' with proto-blue 0.2.6 from crates.io. Default features ('full') give us xrpc, ws, identity, oauth, api on top of syntax/crypto/lex_data/lex_cbor/lex_json/common/lexicon/repo. Keep libipld+serde_cbor for now since downstream code still uses libipld::Cid in some places — will phase out as repository.rs migration progresses.",
+  "created_at": "2026-04-30T22:02:21.049812615Z",
+  "kind": "plan",
+  "signed_by": "SHA256:FE0u9OWnwKx5uvLuSiKuHnl7pLtr4oXeEOi3s6yPOZY",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg31dKNoRTmx2sQF5ORSg1RnlKJqTXtDbr2pcYw8kivkkAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAzEM9p9TT+Ut76DcHKljv2ugySQ23io7EY95mheuZfVKnI8cmNnspPzkm2FZtIAHps4+RkYE2sBqHLlG9MM01AA=="
+}
