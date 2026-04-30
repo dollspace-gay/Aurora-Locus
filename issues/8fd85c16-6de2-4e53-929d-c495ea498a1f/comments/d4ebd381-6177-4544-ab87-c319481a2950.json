@@ -1,0 +1,10 @@
+{
+  "uuid": "d4ebd381-6177-4544-ab87-c319481a2950",
+  "issue_uuid": "8fd85c16-6de2-4e53-929d-c495ea498a1f",
+  "author": "vW4n",
+  "content": "Argon2id PasswordHasher is server-side and not in proto-blue (a client SDK). Vendor as src/auth/password.rs — minimal struct with hash() and verify() static methods, plus tests. Use thiserror for the AuthError variant we need (PasswordHashError).",
+  "created_at": "2026-04-30T22:02:50.142820562Z",
+  "kind": "plan",
+  "signed_by": "SHA256:FE0u9OWnwKx5uvLuSiKuHnl7pLtr4oXeEOi3s6yPOZY",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg31dKNoRTmx2sQF5ORSg1RnlKJqTXtDbr2pcYw8kivkkAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAyI7+FbloWiucReUlz/d7e06BsdHFDZcWHgSm3ulA3cK5No1zoV675u3QIjUW5qhrMpvySmUHwItKdQWHfRgFDQ=="
+}
