@@ -1,0 +1,10 @@
+{
+  "uuid": "597e753b-fabe-4315-b77e-a6e46020c923",
+  "display_id": 1,
+  "title": "Migrate from embedded Rust-Atproto-SDK to proto-blue crate",
+  "status": "open",
+  "priority": "high",
+  "created_by": "vW4n",
+  "created_at": "2026-04-30T21:56:18.496072519Z",
+  "updated_at": "2026-04-30T21:56:18.496072519Z"
+}
