@@ -2,10 +2,11 @@
   "uuid": "0481f761-2b65-4274-b6ab-ae70eea742a8",
   "display_id": 10,
   "title": "Update api/repo.rs callers and signer plumbing",
-  "status": "open",
+  "status": "closed",
   "priority": "high",
   "parent_uuid": "597e753b-fabe-4315-b77e-a6e46020c923",
   "created_by": "vW4n",
   "created_at": "2026-04-30T22:00:41.302620255Z",
-  "updated_at": "2026-04-30T22:00:41.302620255Z"
+  "updated_at": "2026-04-30T22:20:23.854882396Z",
+  "closed_at": "2026-04-30T22:20:23.854882396Z"
 }
