@@ -6,16 +6,12 @@
     "1": {
       "agent_id": "vW4n",
       "claimed_at": "2026-04-30T21:56:33.005544424Z"
-    },
-    "10": {
-      "agent_id": "vW4n",
-      "claimed_at": "2026-04-30T22:19:07.596710387Z"
     }
   },
   "issues": {},
   "watermark": {
-    "timestamp": "2026-04-30T22:19:07.596710387Z",
+    "timestamp": "2026-04-30T22:20:25.245037375Z",
     "agent_id": "vW4n",
-    "agent_seq": 18
+    "agent_seq": 19
   }
 }
