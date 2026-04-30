@@ -1,0 +1,4 @@
+# Crosslink trusted signers
+# Format: <principal> <key-type> <base64-key> [comment]
+# approved by doll at 2026-04-30 21:54:50 UTC
+vW4n@crosslink ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN9XSjaEU5sdrEBeTkUoNUZ5Siak17Q269qXGMPJIr5J crosslink-agent:vW4n@dollspace
