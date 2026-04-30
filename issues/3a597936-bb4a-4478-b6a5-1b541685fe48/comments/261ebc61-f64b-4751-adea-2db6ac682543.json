@@ -1,0 +1,10 @@
+{
+  "uuid": "261ebc61-f64b-4751-adea-2db6ac682543",
+  "issue_uuid": "3a597936-bb4a-4478-b6a5-1b541685fe48",
+  "author": "vW4n",
+  "content": "actor_store/car.rs uses CarWriter::with_roots()/write_block()/finish(). proto-blue exposes free fns: blocks_to_car(root, &BlockMap) and read_car(data) -> (Vec<Cid>, BlockMap). Need to convert (cid_str, bytes) tuples into BlockMap entries, parse strings into proto_blue::lex_data::Cid via from_string, and rewrite the export_repo_to_car/blocks_to_car/export_record_to_car helpers. Also update the existing test that uses CarReader to use read_car.",
+  "created_at": "2026-04-30T22:10:39.115850777Z",
+  "kind": "plan",
+  "signed_by": "SHA256:FE0u9OWnwKx5uvLuSiKuHnl7pLtr4oXeEOi3s6yPOZY",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg31dKNoRTmx2sQF5ORSg1RnlKJqTXtDbr2pcYw8kivkkAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAjHwI1xO5vIF61zu/D3osBztTWnSzmQSigKdvkufHA3ocoBijwwikZQjvfrSScM1oK1x1vRxKKi0DP9ujHGFzAw=="
+}
