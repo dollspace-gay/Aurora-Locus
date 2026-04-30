@@ -1,0 +1,10 @@
+{
+  "uuid": "d2af41e5-28b2-447e-a8bc-040cb82adc99",
+  "issue_uuid": "f43dd5ca-de76-46a8-aabf-4d5333f0e9a6",
+  "author": "vW4n",
+  "content": "Cargo.toml updated: proto-blue 0.2.6 + argon2 0.5 added; path dep removed.",
+  "created_at": "2026-04-30T22:02:35.073486435Z",
+  "kind": "result",
+  "signed_by": "SHA256:FE0u9OWnwKx5uvLuSiKuHnl7pLtr4oXeEOi3s6yPOZY",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg31dKNoRTmx2sQF5ORSg1RnlKJqTXtDbr2pcYw8kivkkAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVUGDD4vr3vzImpbD0QCeek3zGU6zSNflCXNut+Qqkt6sjMgRi2Xjz8pKxZ8abfbxH6e7CBAMyc8Ga8e8e4nJDg=="
+}
