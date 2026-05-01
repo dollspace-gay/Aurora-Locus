@@ -380,6 +380,9 @@ fn build_blob_store_config(config: &ServerConfig) -> PdsResult<BlobStoreConfig> 
             access_key_id,
             secret_access_key,
             endpoint,
+            prefix,
+            force_path_style,
+            upload_timeout_ms,
         } => (
             BlobBackendType::S3 {
                 bucket: bucket.clone(),
@@ -387,9 +390,9 @@ fn build_blob_store_config(config: &ServerConfig) -> PdsResult<BlobStoreConfig> 
                 endpoint: endpoint.clone(),
                 access_key_id: access_key_id.clone(),
                 secret_access_key: secret_access_key.clone(),
-                // The s3 module's default key prefix; Phase 3 (#73) may
-                // make this configurable for parity with bsky-PDS.
-                prefix: "blobs/".to_string(),
+                prefix: prefix.clone(),
+                force_path_style: *force_path_style,
+                upload_timeout_ms: *upload_timeout_ms,
             },
             // S3 backend doesn't need a local temp dir for blob bodies,
             // but the wrapper's other code paths still expect one.

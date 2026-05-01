@@ -77,17 +77,21 @@ pub enum BlobBackendType {
     Disk { location: PathBuf },
 
     /// Store blobs in S3-compatible storage. Phase 2 (#72) added the
-    /// credential and prefix fields needed to actually instantiate
-    /// `S3BlobBackend`; the variant is now constructed at runtime from
-    /// `ServerConfig.storage.blobstore`.
+    /// credential and prefix fields; Phase 3 (#73) added `force_path_style`
+    /// and `upload_timeout_ms` for parity with bsky-PDS env-var conventions.
     S3 {
         bucket: String,
         region: String,
         endpoint: Option<String>,
         access_key_id: String,
         secret_access_key: String,
-        /// S3 object key prefix (default `"blobs/"` matches the
-        /// pre-existing `S3Config::default()`).
+        /// S3 object key prefix (default `"blobs/"`).
         prefix: String,
+        /// Path-style addressing toggle (default `false`; set `true` for
+        /// MinIO and other S3-compatible providers without virtual-host
+        /// support).
+        force_path_style: bool,
+        /// Upload operation timeout in milliseconds (default `20000`).
+        upload_timeout_ms: u64,
     },
 }

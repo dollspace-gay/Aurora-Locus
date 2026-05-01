@@ -55,7 +55,24 @@ pub enum BlobstoreConfig {
         access_key_id: String,
         secret_access_key: String,
         endpoint: Option<String>,
+        /// Object key prefix (Aurora extension; default `"blobs/"`).
+        #[serde(default = "default_s3_prefix")]
+        prefix: String,
+        /// Path-style addressing toggle (default `false`).
+        #[serde(default)]
+        force_path_style: bool,
+        /// Upload operation timeout in milliseconds (default `20000`).
+        #[serde(default = "default_s3_upload_timeout_ms")]
+        upload_timeout_ms: u64,
     },
+}
+
+fn default_s3_prefix() -> String {
+    "blobs/".to_string()
+}
+
+fn default_s3_upload_timeout_ms() -> u64 {
+    20_000
 }
 
 impl BlobstoreConfig {
@@ -75,8 +92,8 @@ impl BlobstoreConfig {
     /// - No S3 bucket → Disk variant, defaulting `location` to
     ///   `data_directory/blobs` and `tmp_location` to `data_directory/temp`
     ///   when the disk env vars are unset.
-    // Eight Option<String> args matches the eight env vars this constructor
-    // demultiplexes; collapsing into a struct would obscure the call site.
+    // Arg count mirrors the env-var fan-in for this constructor; collapsing
+    // into a struct would obscure the call-site mapping.
     #[allow(clippy::too_many_arguments)]
     pub fn from_env_values(
         data_directory: &Path,
@@ -85,6 +102,9 @@ impl BlobstoreConfig {
         s3_endpoint: Option<String>,
         s3_access_key_id: Option<String>,
         s3_secret_access_key: Option<String>,
+        s3_prefix: Option<String>,
+        s3_force_path_style: Option<String>,
+        s3_upload_timeout_ms: Option<String>,
         disk_location: Option<String>,
         disk_tmp_location: Option<String>,
     ) -> PdsResult<Self> {
@@ -98,6 +118,29 @@ impl BlobstoreConfig {
         }
 
         if let Some(bucket) = s3_bucket {
+            // Parse force_path_style: accept "true"/"false"/"1"/"0"
+            // case-insensitively. Default false on missing or unrecognised
+            // (rejecting unrecognised would be more strict but operators
+            // typo-prone; bsky-PDS treats anything-not-true as false).
+            let force_path_style = match s3_force_path_style.as_deref() {
+                None => false,
+                Some(v) => matches!(v.to_ascii_lowercase().as_str(), "true" | "1"),
+            };
+
+            // Parse upload_timeout_ms: required to be a valid u64 if set;
+            // unparseable input is an error rather than a silent default
+            // since timeouts are operator-meaningful.
+            let upload_timeout_ms = match s3_upload_timeout_ms {
+                None => 20_000,
+                Some(v) => v.parse::<u64>().map_err(|_| {
+                    PdsError::Validation(format!(
+                        "PDS_BLOBSTORE_S3_UPLOAD_TIMEOUT_MS must be a non-negative \
+                         integer (got: {:?})",
+                        v
+                    ))
+                })?,
+            };
+
             return Ok(BlobstoreConfig::S3 {
                 bucket,
                 region: s3_region.unwrap_or_else(|| "us-east-1".to_string()),
@@ -116,6 +159,9 @@ impl BlobstoreConfig {
                     )
                 })?,
                 endpoint: s3_endpoint,
+                prefix: s3_prefix.unwrap_or_else(default_s3_prefix),
+                force_path_style,
+                upload_timeout_ms,
             });
         }
 
@@ -375,6 +421,9 @@ impl ServerConfig {
             env::var("PDS_BLOBSTORE_S3_ENDPOINT").ok(),
             env::var("PDS_BLOBSTORE_S3_ACCESS_KEY_ID").ok(),
             env::var("PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY").ok(),
+            env::var("PDS_BLOBSTORE_S3_PREFIX").ok(),
+            env::var("PDS_BLOBSTORE_S3_FORCE_PATH_STYLE").ok(),
+            env::var("PDS_BLOBSTORE_S3_UPLOAD_TIMEOUT_MS").ok(),
             env::var("PDS_BLOBSTORE_DISK_LOCATION").ok(),
             env::var("PDS_BLOBSTORE_DISK_TMP_LOCATION").ok(),
         )?;
@@ -578,13 +627,7 @@ mod blobstore_tests {
     fn from_env_values_defaults_to_disk_when_nothing_set() {
         let cfg = BlobstoreConfig::from_env_values(
             &data_dir(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None, None, None, None, None, None, None,
         )
         .unwrap();
         match cfg {
@@ -603,11 +646,7 @@ mod blobstore_tests {
     fn from_env_values_disk_only_uses_provided_location() {
         let cfg = BlobstoreConfig::from_env_values(
             &data_dir(),
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None, None, None, None, None,
             Some("/var/blobs".to_string()),
             None,
         )
@@ -629,8 +668,8 @@ mod blobstore_tests {
             Some("https://s3.eu-west-1.amazonaws.com".to_string()),
             Some("AKIAEXAMPLE".to_string()),
             Some("secret-example".to_string()),
-            None,
-            None,
+            None, None, None,
+            None, None,
         )
         .unwrap();
         match cfg {
@@ -640,6 +679,9 @@ mod blobstore_tests {
                 endpoint,
                 access_key_id,
                 secret_access_key,
+                prefix,
+                force_path_style,
+                upload_timeout_ms,
             } => {
                 assert_eq!(bucket, "my-bucket");
                 assert_eq!(region, "eu-west-1");
@@ -649,6 +691,10 @@ mod blobstore_tests {
                 );
                 assert_eq!(access_key_id, "AKIAEXAMPLE");
                 assert_eq!(secret_access_key, "secret-example");
+                // Phase 3 defaults populate when env vars are unset.
+                assert_eq!(prefix, "blobs/");
+                assert!(!force_path_style);
+                assert_eq!(upload_timeout_ms, 20_000);
             }
             _ => panic!("expected S3 variant"),
         }
@@ -659,12 +705,11 @@ mod blobstore_tests {
         let cfg = BlobstoreConfig::from_env_values(
             &data_dir(),
             Some("b".to_string()),
-            None,
-            None,
+            None, None,
             Some("k".to_string()),
             Some("s".to_string()),
-            None,
-            None,
+            None, None, None,
+            None, None,
         )
         .unwrap();
         match cfg {
@@ -678,10 +723,10 @@ mod blobstore_tests {
         let err = BlobstoreConfig::from_env_values(
             &data_dir(),
             Some("bucket".to_string()),
-            None,
-            None,
+            None, None,
             Some("k".to_string()),
             Some("s".to_string()),
+            None, None, None,
             Some("/var/blobs".to_string()),
             None,
         )
@@ -697,12 +742,10 @@ mod blobstore_tests {
         let err = BlobstoreConfig::from_env_values(
             &data_dir(),
             Some("bucket".to_string()),
-            None,
-            None,
-            None,
+            None, None, None,
             Some("s".to_string()),
-            None,
-            None,
+            None, None, None,
+            None, None,
         )
         .expect_err("S3 bucket without access key should be rejected");
         assert!(err.to_string().contains("PDS_BLOBSTORE_S3_ACCESS_KEY_ID"));
@@ -713,16 +756,93 @@ mod blobstore_tests {
         let err = BlobstoreConfig::from_env_values(
             &data_dir(),
             Some("bucket".to_string()),
-            None,
-            None,
+            None, None,
             Some("k".to_string()),
             None,
-            None,
-            None,
+            None, None, None,
+            None, None,
         )
         .expect_err("S3 bucket without secret key should be rejected");
         assert!(err
             .to_string()
             .contains("PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY"));
+    }
+
+    // ---- Phase 3 (#73): force_path_style, upload_timeout_ms, prefix ------
+
+    /// Helper for Phase 3 tests — base S3 config minus the three Phase 3
+    /// fields, returns the S3 variant. Spreads each test out into the
+    /// specific knob it targets without duplicating boilerplate.
+    fn s3_with_phase3(
+        prefix: Option<String>,
+        force_path_style: Option<String>,
+        upload_timeout_ms: Option<String>,
+    ) -> PdsResult<BlobstoreConfig> {
+        BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("bucket".to_string()),
+            None, None,
+            Some("k".to_string()),
+            Some("s".to_string()),
+            prefix,
+            force_path_style,
+            upload_timeout_ms,
+            None, None,
+        )
+    }
+
+    #[test]
+    fn from_env_values_force_path_style_true_strings() {
+        for v in &["true", "TRUE", "True", "1"] {
+            let cfg = s3_with_phase3(None, Some(v.to_string()), None).unwrap();
+            match cfg {
+                BlobstoreConfig::S3 { force_path_style, .. } => {
+                    assert!(force_path_style, "value {:?} should parse as true", v);
+                }
+                _ => panic!("expected S3"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_values_force_path_style_false_strings() {
+        for v in &["false", "FALSE", "0", "no", ""] {
+            let cfg = s3_with_phase3(None, Some(v.to_string()), None).unwrap();
+            match cfg {
+                BlobstoreConfig::S3 { force_path_style, .. } => {
+                    assert!(!force_path_style, "value {:?} should parse as false", v);
+                }
+                _ => panic!("expected S3"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_values_upload_timeout_ms_explicit() {
+        let cfg = s3_with_phase3(None, None, Some("5000".to_string())).unwrap();
+        match cfg {
+            BlobstoreConfig::S3 { upload_timeout_ms, .. } => {
+                assert_eq!(upload_timeout_ms, 5000);
+            }
+            _ => panic!("expected S3"),
+        }
+    }
+
+    #[test]
+    fn from_env_values_rejects_unparseable_upload_timeout_ms() {
+        let err = s3_with_phase3(None, None, Some("not-a-number".to_string()))
+            .expect_err("non-integer timeout should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("PDS_BLOBSTORE_S3_UPLOAD_TIMEOUT_MS"));
+        assert!(msg.contains("non-negative integer"));
+    }
+
+    #[test]
+    fn from_env_values_prefix_explicit() {
+        let cfg = s3_with_phase3(Some("custom/".to_string()), None, None).unwrap();
+        match cfg {
+            BlobstoreConfig::S3 { prefix, .. } => assert_eq!(prefix, "custom/"),
+            _ => panic!("expected S3"),
+        }
     }
 }

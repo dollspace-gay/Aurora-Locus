@@ -43,6 +43,8 @@ impl BlobStore {
                 access_key_id,
                 secret_access_key,
                 prefix,
+                force_path_style,
+                upload_timeout_ms,
             } => Arc::new(
                 S3BlobBackend::new(S3Config {
                     bucket: bucket.clone(),
@@ -51,6 +53,8 @@ impl BlobStore {
                     access_key_id: access_key_id.clone(),
                     secret_access_key: secret_access_key.clone(),
                     prefix: prefix.clone(),
+                    force_path_style: *force_path_style,
+                    upload_timeout_ms: *upload_timeout_ms,
                 })
                 .await?,
             ),
