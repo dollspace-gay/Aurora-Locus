@@ -4163,9 +4163,25 @@ mod tests {
             StorageConfig,
         },
     };
+    use std::sync::OnceLock;
     use tempfile::tempdir;
 
+    /// Serialises the filesystem-heavy portion of test setup.
+    ///
+    /// Without this, `cargo test --lib` would race 25+ parallel `tempdir()`
+    /// plus `SqlitePool::connect` plus migration runs against each other and
+    /// produce sporadic `SQLITE_CANTOPEN` (code 14) errors on first runs,
+    /// especially under WSL2's drvfs where this crate's primary checkout
+    /// lives. Holding the lock through `AppContext::new` is cheap and the
+    /// test bodies still execute in parallel once setup completes.
+    /// Tracked under chainlink #68.
+    fn fixture_setup_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     async fn create_test_context() -> AppContext {
+        let _guard = fixture_setup_lock().lock().await;
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
 
