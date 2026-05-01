@@ -766,7 +766,7 @@ async fn update_account_email(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
     Json(req): Json<UpdateAccountEmailRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<StatusCode, (StatusCode, String)> {
     let canonical_did =
         resolve_account_or_did(&ctx, req.account.as_deref(), req.did.as_deref()).await?;
 
@@ -790,11 +790,7 @@ async fn update_account_email(
             }
         })?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": canonical_did,
-        "email": req.email
-    })))
+    Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
@@ -810,7 +806,7 @@ async fn update_account_handle(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
     Json(req): Json<UpdateAccountHandleRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<StatusCode, (StatusCode, String)> {
     // Validate DID format
     if !req.did.starts_with("did:") {
         return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
@@ -821,8 +817,7 @@ async fn update_account_handle(
         return Err((StatusCode::BAD_REQUEST, "Invalid handle format".to_string()));
     }
 
-    let new_handle = ctx
-        .account_manager
+    ctx.account_manager
         .update_handle(&req.did, &req.handle)
         .await
         .map_err(|e| {
@@ -838,11 +833,7 @@ async fn update_account_handle(
             }
         })?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": req.did,
-        "handle": new_handle
-    })))
+    Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
@@ -858,7 +849,7 @@ async fn update_account_password(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
     Json(req): Json<UpdateAccountPasswordRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<StatusCode, (StatusCode, String)> {
     // Validate DID format
     if !req.did.starts_with("did:") {
         return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
@@ -886,11 +877,7 @@ async fn update_account_password(
             }
         })?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": req.did,
-        "message": "Password updated. All sessions have been invalidated."
-    })))
+    Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
@@ -904,7 +891,7 @@ async fn admin_delete_account(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
     Json(req): Json<DeleteAccountRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<StatusCode, (StatusCode, String)> {
     // Validate DID format
     if !req.did.starts_with("did:") {
         return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
@@ -924,11 +911,7 @@ async fn admin_delete_account(
             }
         })?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": req.did,
-        "message": "Account permanently deleted"
-    })))
+    Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
@@ -2422,7 +2405,7 @@ async fn enable_account_invites(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<AccountInvitesRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<StatusCode, (StatusCode, String)> {
     let canonical_did =
         resolve_account_or_did(&ctx, req.account.as_deref(), req.did.as_deref()).await?;
 
@@ -2452,11 +2435,7 @@ async fn enable_account_invites(
         )
         .await;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": canonical_did,
-        "invitesEnabled": true
-    })))
+    Ok(StatusCode::OK)
 }
 
 /// Disable invite code creation for an account
@@ -2464,7 +2443,7 @@ async fn disable_account_invites(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<AccountInvitesRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<StatusCode, (StatusCode, String)> {
     let canonical_did =
         resolve_account_or_did(&ctx, req.account.as_deref(), req.did.as_deref()).await?;
 
@@ -2493,11 +2472,7 @@ async fn disable_account_invites(
         )
         .await;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": canonical_did,
-        "invitesEnabled": false
-    })))
+    Ok(StatusCode::OK)
 }
 
 // ============================================================================
@@ -4994,6 +4969,18 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
+    /// Helper: returns whether `account.invites_disabled` is set for a DID.
+    async fn account_invites_disabled(ctx: &AppContext, did: &str) -> bool {
+        use sqlx::Row;
+        let row: i64 = sqlx::query("SELECT invites_disabled FROM account WHERE did = ?")
+            .bind(did)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+            .get(0);
+        row != 0
+    }
+
     #[tokio::test]
     async fn test_disable_account_invites_with_account_field_did_form() {
         let ctx = create_test_context().await;
@@ -5004,13 +4991,13 @@ mod tests {
             did: None,
             note: None,
         };
-        let resp = disable_account_invites(State(ctx), admin_test_auth(), Json(req))
+        let status = disable_account_invites(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
-            .unwrap()
-            .0;
-        assert_eq!(resp["success"], true);
-        assert_eq!(resp["did"], "did:plc:foo");
-        assert_eq!(resp["invitesEnabled"], false);
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        // Side-effect verification: the canonical DID's row had its flag
+        // flipped (this also verifies the resolver pointed at the right row).
+        assert!(account_invites_disabled(&ctx, "did:plc:foo").await);
     }
 
     #[tokio::test]
@@ -5023,11 +5010,12 @@ mod tests {
             did: None,
             note: None,
         };
-        let resp = disable_account_invites(State(ctx), admin_test_auth(), Json(req))
+        let status = disable_account_invites(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
-            .unwrap()
-            .0;
-        assert_eq!(resp["did"], "did:plc:bar");
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        // Verifies the resolver mapped handle "bar.test" to "did:plc:bar".
+        assert!(account_invites_disabled(&ctx, "did:plc:bar").await);
     }
 
     #[tokio::test]
@@ -5040,11 +5028,11 @@ mod tests {
             did: Some("did:plc:baz".to_string()),
             note: None,
         };
-        let resp = disable_account_invites(State(ctx), admin_test_auth(), Json(req))
+        let status = disable_account_invites(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
-            .unwrap()
-            .0;
-        assert_eq!(resp["did"], "did:plc:baz");
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(account_invites_disabled(&ctx, "did:plc:baz").await);
     }
 
     #[tokio::test]
@@ -5121,12 +5109,23 @@ mod tests {
             did: None,
             note: Some("Reinstated after appeal".to_string()),
         };
-        let resp = enable_account_invites(State(ctx), admin_test_auth(), Json(req))
+        let status = enable_account_invites(State(ctx.clone()), admin_test_auth(), Json(req))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        // Resolver mapped handle correctly and the underlying DB op flipped.
+        assert!(!account_invites_disabled(&ctx, "did:plc:enabled").await);
+    }
+
+    /// Helper: read the current email column for a DID.
+    async fn account_email(ctx: &AppContext, did: &str) -> Option<String> {
+        use sqlx::Row;
+        sqlx::query("SELECT email FROM account WHERE did = ?")
+            .bind(did)
+            .fetch_one(&ctx.account_db)
             .await
             .unwrap()
-            .0;
-        assert_eq!(resp["did"], "did:plc:enabled");
-        assert_eq!(resp["invitesEnabled"], true);
+            .get(0)
     }
 
     #[tokio::test]
@@ -5139,12 +5138,14 @@ mod tests {
             did: None,
             email: "new@example.com".to_string(),
         };
-        let resp = update_account_email(State(ctx), admin_test_auth(), Json(req))
+        let status = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
-            .unwrap()
-            .0;
-        assert_eq!(resp["did"], "did:plc:emailtest");
-        assert_eq!(resp["email"], "new@example.com");
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            account_email(&ctx, "did:plc:emailtest").await.as_deref(),
+            Some("new@example.com")
+        );
     }
 
     #[tokio::test]
@@ -5157,11 +5158,14 @@ mod tests {
             did: Some("did:plc:legacyemail".to_string()),
             email: "back@compat.com".to_string(),
         };
-        let resp = update_account_email(State(ctx), admin_test_auth(), Json(req))
+        let status = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
-            .unwrap()
-            .0;
-        assert_eq!(resp["did"], "did:plc:legacyemail");
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            account_email(&ctx, "did:plc:legacyemail").await.as_deref(),
+            Some("back@compat.com")
+        );
     }
 
     // ---- Phase 1.8: sendEmail required-field flips ----------------------
