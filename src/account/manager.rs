@@ -481,6 +481,26 @@ impl AccountManager {
         self.get_account_by_email(identifier).await
     }
 
+    /// Resolve an at-identifier (handle or DID) to a canonical DID.
+    ///
+    /// DID-form input is returned as-is without any DB lookup (the caller
+    /// usually wants to perform the actual DB operation against a DID
+    /// regardless of whether the account exists locally — e.g., a takedown
+    /// of a federated DID).
+    ///
+    /// Handle-form input is resolved via local actor-table lookup. External
+    /// handle resolution (DNS / .well-known) is *not* performed: admin
+    /// endpoints operate on the local PDS's accounts, so a handle that
+    /// doesn't match any local actor returns `PdsError::NotFound`.
+    pub async fn resolve_at_identifier_to_did(&self, identifier: &str) -> PdsResult<String> {
+        if identifier.starts_with("did:") {
+            return Ok(identifier.to_string());
+        }
+        self.get_account_by_handle(identifier)
+            .await
+            .map(|acc| acc.did)
+    }
+
     /// Get account by handle
     ///
     /// Joins actor and account tables to get complete actor information.

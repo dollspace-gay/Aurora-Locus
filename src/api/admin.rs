@@ -590,10 +590,71 @@ async fn list_roles(
 // Account Management Endpoints
 // ============================================================================
 
+/// Resolve the spec's `account` (at-identifier) field and Aurora's legacy
+/// `did` field down to a canonical DID. Established by Phase 1.7 (chainlink
+/// #62) and reused across the deprecation-alias rollout.
+///
+/// Behavior:
+/// - exactly-one validation: providing both or neither returns 400
+/// - `account`: if DID-form, returned as-is; if handle-form, resolved via
+///   the local actor table (no external DNS/.well-known resolution, which
+///   would be wrong for admin operations on local users)
+/// - `did` (legacy): DID-form only, retains the historical behavior
+///
+/// Note: spec for `disableAccountInvites` and `enableAccountInvites` declares
+/// `account` as `format=did`, while `updateAccountEmail` declares it as
+/// `format=at-identifier`. This helper uniformly accepts either form on the
+/// `account` field — spec-compliant clients that only ever pass DID still
+/// work; operators that pass handles to the invites endpoints get a more
+/// permissive (non-rejecting) experience than strict spec.
+async fn resolve_account_or_did(
+    ctx: &AppContext,
+    account: Option<&str>,
+    did: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    match (account, did) {
+        (Some(_), Some(_)) => Err((
+            StatusCode::BAD_REQUEST,
+            "Provide exactly one of `account` or `did` (legacy)".to_string(),
+        )),
+        (None, None) => Err((
+            StatusCode::BAD_REQUEST,
+            "Missing required field: `account`".to_string(),
+        )),
+        (Some(at_id), None) => ctx
+            .account_manager
+            .resolve_at_identifier_to_did(at_id)
+            .await
+            .map_err(|e| {
+                if matches!(e, PdsError::NotFound(_)) {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("Account not found for identifier: {}", at_id),
+                    )
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                }
+            }),
+        (None, Some(did_str)) => {
+            if !did_str.starts_with("did:") {
+                return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
+            }
+            Ok(did_str.to_string())
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct UpdateAccountEmailRequest {
-    /// Account DID
-    did: String,
+    /// Account at-identifier (handle or DID) per the lexicon. Required if
+    /// the legacy `did` field is not provided.
+    #[serde(default)]
+    account: Option<String>,
+    /// DEPRECATED: legacy `did` field retained for back-compat. Use
+    /// `account` instead. Continues to accept DID-form only. To be
+    /// removed in a later minor version.
+    #[serde(default)]
+    did: Option<String>,
     /// New email address
     email: String,
 }
@@ -604,24 +665,21 @@ async fn update_account_email(
     _auth: AdminAuthContext,
     Json(req): Json<UpdateAccountEmailRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Validate DID format
-    if !req.did.starts_with("did:") {
-        return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
-    }
+    let canonical_did =
+        resolve_account_or_did(&ctx, req.account.as_deref(), req.did.as_deref()).await?;
 
-    // Validate email format (basic check)
     if !req.email.contains('@') || req.email.len() < 5 {
         return Err((StatusCode::BAD_REQUEST, "Invalid email format".to_string()));
     }
 
     ctx.account_manager
-        .update_email(&req.did, &req.email)
+        .update_email(&canonical_did, &req.email)
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
                 (
                     StatusCode::NOT_FOUND,
-                    format!("Account not found: {}", req.did),
+                    format!("Account not found: {}", canonical_did),
                 )
             } else if matches!(e, PdsError::Validation(_)) {
                 (StatusCode::CONFLICT, e.to_string())
@@ -632,7 +690,7 @@ async fn update_account_email(
 
     Ok(Json(serde_json::json!({
         "success": true,
-        "did": req.did,
+        "did": canonical_did,
         "email": req.email
     })))
 }
@@ -2218,38 +2276,59 @@ async fn disable_invite_codes(
 
 #[derive(Deserialize)]
 struct AccountInvitesRequest {
-    /// Account DID
-    did: String,
+    /// Account at-identifier (handle or DID) per the lexicon. Required if
+    /// the legacy `did` field is not provided.
+    #[serde(default)]
+    account: Option<String>,
+    /// DEPRECATED: legacy `did` field retained for back-compat. Use
+    /// `account` instead. Continues to accept DID-form only. To be
+    /// removed in a later minor version.
+    #[serde(default)]
+    did: Option<String>,
+    /// Optional reason for the invites change (per lexicon). Persisted to
+    /// the admin audit log.
+    #[serde(default)]
+    note: Option<String>,
 }
 
 /// Enable invite code creation for an account
 async fn enable_account_invites(
     State(ctx): State<AppContext>,
-    _auth: AdminAuthContext,
+    auth: AdminAuthContext,
     Json(req): Json<AccountInvitesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Validate DID format
-    if !req.did.starts_with("did:") {
-        return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
-    }
+    let canonical_did =
+        resolve_account_or_did(&ctx, req.account.as_deref(), req.did.as_deref()).await?;
 
     ctx.account_manager
-        .enable_account_invites(&req.did)
+        .enable_account_invites(&canonical_did)
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
                 (
                     StatusCode::NOT_FOUND,
-                    format!("Account not found: {}", req.did),
+                    format!("Account not found: {}", canonical_did),
                 )
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
 
+    // Best-effort audit log entry; failure here shouldn't fail the operation.
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "account.invites.enable",
+            Some(&canonical_did),
+            req.note.as_deref(),
+            None,
+        )
+        .await;
+
     Ok(Json(serde_json::json!({
         "success": true,
-        "did": req.did,
+        "did": canonical_did,
         "invitesEnabled": true
     })))
 }
@@ -2257,31 +2336,40 @@ async fn enable_account_invites(
 /// Disable invite code creation for an account
 async fn disable_account_invites(
     State(ctx): State<AppContext>,
-    _auth: AdminAuthContext,
+    auth: AdminAuthContext,
     Json(req): Json<AccountInvitesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Validate DID format
-    if !req.did.starts_with("did:") {
-        return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
-    }
+    let canonical_did =
+        resolve_account_or_did(&ctx, req.account.as_deref(), req.did.as_deref()).await?;
 
     ctx.account_manager
-        .disable_account_invites(&req.did)
+        .disable_account_invites(&canonical_did)
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
                 (
                     StatusCode::NOT_FOUND,
-                    format!("Account not found: {}", req.did),
+                    format!("Account not found: {}", canonical_did),
                 )
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
 
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "account.invites.disable",
+            Some(&canonical_did),
+            req.note.as_deref(),
+            None,
+        )
+        .await;
+
     Ok(Json(serde_json::json!({
         "success": true,
-        "did": req.did,
+        "did": canonical_did,
         "invitesEnabled": false
     })))
 }
@@ -4700,6 +4788,252 @@ mod tests {
         .unwrap()
         .0;
         assert!(resp.accounts.is_empty());
+    }
+
+    // ---- Phase 1.7: account/did deprecation-alias rollout ---------------
+
+    #[tokio::test]
+    async fn test_resolve_helper_rejects_both_fields() {
+        let ctx = create_test_context().await;
+        let result = resolve_account_or_did(
+            &ctx,
+            Some("did:plc:foo"),
+            Some("did:plc:foo"),
+        )
+        .await;
+        let err = result.expect_err("both fields should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_helper_rejects_neither_field() {
+        let ctx = create_test_context().await;
+        let result = resolve_account_or_did(&ctx, None, None).await;
+        let err = result.expect_err("missing both should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("Missing"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_helper_did_form_account_returns_as_is() {
+        let ctx = create_test_context().await;
+        let did = resolve_account_or_did(&ctx, Some("did:plc:abcd"), None)
+            .await
+            .unwrap();
+        assert_eq!(did, "did:plc:abcd");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_helper_handle_form_account_resolves_via_db() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:alice", "alice.test", Some("alice@x")).await;
+
+        let did = resolve_account_or_did(&ctx, Some("alice.test"), None)
+            .await
+            .unwrap();
+        assert_eq!(did, "did:plc:alice");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_helper_legacy_did_field_works() {
+        let ctx = create_test_context().await;
+        let did = resolve_account_or_did(&ctx, None, Some("did:plc:legacy"))
+            .await
+            .unwrap();
+        assert_eq!(did, "did:plc:legacy");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_helper_legacy_did_field_rejects_handle_form() {
+        let ctx = create_test_context().await;
+        let result = resolve_account_or_did(&ctx, None, Some("not-a-did")).await;
+        let err = result.expect_err("legacy did field should reject non-DID");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_disable_account_invites_with_account_field_did_form() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:foo", "foo.test", Some("f@x")).await;
+
+        let req = AccountInvitesRequest {
+            account: Some("did:plc:foo".to_string()),
+            did: None,
+            note: None,
+        };
+        let resp = disable_account_invites(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["did"], "did:plc:foo");
+        assert_eq!(resp["invitesEnabled"], false);
+    }
+
+    #[tokio::test]
+    async fn test_disable_account_invites_with_account_field_handle_form() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:bar", "bar.test", Some("b@x")).await;
+
+        let req = AccountInvitesRequest {
+            account: Some("bar.test".to_string()),
+            did: None,
+            note: None,
+        };
+        let resp = disable_account_invites(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp["did"], "did:plc:bar");
+    }
+
+    #[tokio::test]
+    async fn test_disable_account_invites_with_legacy_did_field() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:baz", "baz.test", None).await;
+
+        let req = AccountInvitesRequest {
+            account: None,
+            did: Some("did:plc:baz".to_string()),
+            note: None,
+        };
+        let resp = disable_account_invites(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp["did"], "did:plc:baz");
+    }
+
+    #[tokio::test]
+    async fn test_disable_account_invites_rejects_both_fields() {
+        let ctx = create_test_context().await;
+        let req = AccountInvitesRequest {
+            account: Some("did:plc:x".to_string()),
+            did: Some("did:plc:x".to_string()),
+            note: None,
+        };
+        let err = disable_account_invites(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("both fields should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_disable_account_invites_rejects_neither_field() {
+        let ctx = create_test_context().await;
+        let req = AccountInvitesRequest {
+            account: None,
+            did: None,
+            note: None,
+        };
+        let err = disable_account_invites(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("missing both fields should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_disable_account_invites_propagates_note_to_audit_log() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:noted", "noted.test", None).await;
+
+        let req = AccountInvitesRequest {
+            account: Some("did:plc:noted".to_string()),
+            did: None,
+            note: Some("Spam ring cleanup 2026-Q2".to_string()),
+        };
+        let _ = disable_account_invites(State(ctx.clone()), admin_test_auth(), Json(req))
+            .await
+            .unwrap();
+
+        // Verify the audit log captured the note in the details column.
+        let row: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT action, subject_did, details FROM admin_audit_log
+             WHERE action = 'account.invites.disable' AND subject_did = ?",
+        )
+        .bind("did:plc:noted")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "account.invites.disable");
+        assert_eq!(row.1, "did:plc:noted");
+        assert_eq!(row.2.as_deref(), Some("Spam ring cleanup 2026-Q2"));
+    }
+
+    #[tokio::test]
+    async fn test_enable_account_invites_happy_path_uses_same_pattern() {
+        // enableAccountInvites and disableAccountInvites share AccountInvitesRequest;
+        // exercising one happy path here (in addition to the disable suite above)
+        // confirms the symmetric handler registers and routes correctly.
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:enabled", "enabled.test", None).await;
+        // Start in the disabled state so re-enabling is a real change.
+        ctx.account_manager
+            .disable_account_invites("did:plc:enabled")
+            .await
+            .unwrap();
+
+        let req = AccountInvitesRequest {
+            account: Some("enabled.test".to_string()),
+            did: None,
+            note: Some("Reinstated after appeal".to_string()),
+        };
+        let resp = enable_account_invites(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp["did"], "did:plc:enabled");
+        assert_eq!(resp["invitesEnabled"], true);
+    }
+
+    #[tokio::test]
+    async fn test_update_account_email_with_account_handle_form() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:emailtest", "email.test", Some("old@x.com")).await;
+
+        let req = UpdateAccountEmailRequest {
+            account: Some("email.test".to_string()),
+            did: None,
+            email: "new@example.com".to_string(),
+        };
+        let resp = update_account_email(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp["did"], "did:plc:emailtest");
+        assert_eq!(resp["email"], "new@example.com");
+    }
+
+    #[tokio::test]
+    async fn test_update_account_email_with_legacy_did() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:legacyemail", "legacyemail.test", None).await;
+
+        let req = UpdateAccountEmailRequest {
+            account: None,
+            did: Some("did:plc:legacyemail".to_string()),
+            email: "back@compat.com".to_string(),
+        };
+        let resp = update_account_email(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp["did"], "did:plc:legacyemail");
+    }
+
+    #[tokio::test]
+    async fn test_update_account_email_rejects_both_fields() {
+        let ctx = create_test_context().await;
+        let req = UpdateAccountEmailRequest {
+            account: Some("did:plc:x".to_string()),
+            did: Some("did:plc:x".to_string()),
+            email: "x@y.com".to_string(),
+        };
+        let err = update_account_email(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("both fields should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
