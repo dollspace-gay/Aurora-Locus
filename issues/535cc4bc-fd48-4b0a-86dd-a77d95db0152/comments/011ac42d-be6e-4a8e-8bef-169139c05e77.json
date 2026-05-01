@@ -1,0 +1,10 @@
+{
+  "uuid": "011ac42d-be6e-4a8e-8bef-169139c05e77",
+  "issue_uuid": "535cc4bc-fd48-4b0a-86dd-a77d95db0152",
+  "author": "vW4n",
+  "content": "cargo update + bumps: tower 0.4->0.5, tower-http 0.5->0.6, validator 0.18->0.20, tokio-tungstenite 0.24->0.27, prometheus 0.13->0.14. Skipped breaking deps (axum 0.8, redis 1.x, rand 0.10, reqwest 0.13, governor 0.10, sqlx 0.9-alpha). Dropped libipld + dead src/car/ encoder; prometheus 0.14 API breakage fixed (.get_value()->.value(), .has_*()->.is_some()). cargo fmt + clippy --lib --bins clean (zero warnings). Pre-existing federated-search dead code annotated with module-level allow.",
+  "created_at": "2026-05-01T00:49:20.784828158Z",
+  "kind": "result",
+  "signed_by": "SHA256:FE0u9OWnwKx5uvLuSiKuHnl7pLtr4oXeEOi3s6yPOZY",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg31dKNoRTmx2sQF5ORSg1RnlKJqTXtDbr2pcYw8kivkkAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPBytMpX4swK8c/0xMQGRwPX+gXzLFoGMmGK1vO/bWJB4iXvnWAq+7pXB7ZypOjm/ttJbe7EpMI5m923TRpZfCw=="
+}
