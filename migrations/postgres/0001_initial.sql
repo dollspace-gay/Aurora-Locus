@@ -2,22 +2,36 @@
 -- Migration 0001
 --
 -- Translation of migrations/0001_initial.sql per
--- POSTGRES_BACKEND_ASSESSMENT.md §3 (chainlink #74, Phase 1).
+-- POSTGRES_BACKEND_ASSESSMENT.md §3. Originally landed in chainlink
+-- #74 (Phase 1) with DATETIME → TIMESTAMPTZ; amended in #76 sub-phase
+-- 3a triage to TEXT for all timestamp columns (see below).
 --
 -- Type translation summary:
 --   SQLite                                 -> Postgres
 --   ----------------------------------     -----------------------------
 --   TEXT                                   TEXT
---   DATETIME                               TIMESTAMPTZ
+--   DATETIME                               TEXT          (see note below)
 --   INTEGER PRIMARY KEY AUTOINCREMENT      BIGSERIAL PRIMARY KEY
 --   INTEGER (count / FK)                   INTEGER (or BIGINT for FK→BIGSERIAL)
 --   INTEGER NOT NULL DEFAULT 0/1 (boolean) BOOLEAN NOT NULL DEFAULT false/true
 --   BLOB                                   BYTEA
 --
--- TEXT columns that store ISO timestamps in the SQLite source are kept
--- as TEXT here per the 1:1 schema parity rule (§3.5). Migrating them to
--- TIMESTAMPTZ would be a query-layer behaviour change because the
--- existing handlers bind RFC3339 strings; that's a Phase 3 concern.
+-- TIMESTAMP HANDLING (chainlink #76 amendment):
+-- All timestamp columns are TEXT, not TIMESTAMPTZ. Rationale: sqlx's
+-- `Any` driver — which Aurora-Locus uses to abstract the SQLite/Postgres
+-- backend choice — has a deliberately small type-compatibility set that
+-- excludes chrono types. Binding a `chrono::DateTime<Utc>` to an
+-- `AnyPool` query is unsupported. The codebase therefore binds RFC3339
+-- strings everywhere; uniform TEXT columns make that pattern work
+-- consistently across both backends.
+--
+-- Trade-off: this gives up Postgres-native TIMESTAMPTZ features
+-- (timezone-aware comparisons, binary representation, native indexing).
+-- Aurora's query patterns are not currently exercising these features
+-- (existing comparisons are lexicographic on RFC3339 strings, which
+-- sort correctly within a single timezone). If/when the query layer
+-- starts needing native timestamp semantics, this is the migration to
+-- revisit.
 --
 -- Partial-index predicates that compared boolean-as-integer (`= 0` /
 -- `= 1`) are rewritten using `NOT col` / `col` for proper Postgres
@@ -30,10 +44,10 @@
 CREATE TABLE actor (
     did              TEXT PRIMARY KEY,
     handle           TEXT UNIQUE NOT NULL,
-    created_at       TIMESTAMPTZ NOT NULL,
+    created_at       TEXT NOT NULL,
     takedown_ref     TEXT,
-    deactivated_at   TIMESTAMPTZ,
-    delete_after     TIMESTAMPTZ
+    deactivated_at   TEXT,
+    delete_after     TEXT
 );
 
 CREATE INDEX idx_actor_handle ON actor(handle);
@@ -42,7 +56,7 @@ CREATE TABLE account (
     did                 TEXT PRIMARY KEY,
     email               TEXT UNIQUE,
     password_hash       TEXT NOT NULL,
-    email_confirmed_at  TIMESTAMPTZ,
+    email_confirmed_at  TEXT,
     invites_disabled    BOOLEAN NOT NULL DEFAULT false,
     FOREIGN KEY (did) REFERENCES actor(did)
 );
@@ -66,8 +80,8 @@ CREATE TABLE session (
     did                  TEXT NOT NULL,
     access_token         TEXT UNIQUE NOT NULL,
     refresh_token        TEXT UNIQUE NOT NULL,
-    created_at           TIMESTAMPTZ NOT NULL,
-    expires_at           TIMESTAMPTZ NOT NULL,
+    created_at           TEXT NOT NULL,
+    expires_at           TEXT NOT NULL,
     app_password_name    TEXT,
     FOREIGN KEY (did) REFERENCES actor(did)
 );
@@ -79,10 +93,10 @@ CREATE TABLE refresh_token (
     id           TEXT PRIMARY KEY,
     did          TEXT NOT NULL,
     token        TEXT UNIQUE NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL,
-    expires_at   TIMESTAMPTZ NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
     used         BOOLEAN NOT NULL DEFAULT false,
-    used_at      TIMESTAMPTZ,
+    used_at      TEXT,
     next_id      TEXT,
     FOREIGN KEY (did) REFERENCES actor(did)
 );
@@ -93,7 +107,7 @@ CREATE TABLE app_password (
     did             TEXT NOT NULL,
     name            TEXT NOT NULL,
     password_hash   TEXT NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL,
+    created_at      TEXT NOT NULL,
     privileged      BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (did, name),
     FOREIGN KEY (did) REFERENCES actor(did)
@@ -107,8 +121,8 @@ CREATE TABLE email_token (
     token        TEXT PRIMARY KEY,
     did          TEXT NOT NULL,
     purpose      TEXT NOT NULL,  -- 'confirm_email', 'reset_password', 'delete_account'
-    created_at   TIMESTAMPTZ NOT NULL,
-    expires_at   TIMESTAMPTZ NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
     used         BOOLEAN NOT NULL DEFAULT false
 );
 
@@ -176,7 +190,7 @@ CREATE TABLE blob_metadata (
     mime_type        TEXT NOT NULL,
     size             INTEGER NOT NULL,
     creator_did      TEXT NOT NULL,
-    created_at       TIMESTAMPTZ NOT NULL,
+    created_at       TEXT NOT NULL,
     width            INTEGER,
     height           INTEGER,
     alt_text         TEXT,
@@ -190,7 +204,7 @@ CREATE TABLE temp_blob_metadata (
     mime_type        TEXT NOT NULL,
     size             INTEGER NOT NULL,
     creator_did      TEXT NOT NULL,
-    created_at       TIMESTAMPTZ NOT NULL,
+    created_at       TEXT NOT NULL,
     width            INTEGER,
     height           INTEGER
 );
@@ -216,7 +230,7 @@ CREATE INDEX idx_blob_quarantine_cid ON blob_quarantine(cid);
 CREATE TABLE record_blob (
     blob_cid     TEXT NOT NULL,
     record_uri   TEXT NOT NULL,
-    indexed_at   TIMESTAMPTZ NOT NULL,
+    indexed_at   TEXT NOT NULL,
     PRIMARY KEY (blob_cid, record_uri)
 );
 
@@ -403,9 +417,9 @@ CREATE TABLE device (
     session_id          TEXT NOT NULL,
     user_agent          TEXT,
     ip_address          TEXT,
-    last_seen_at        TIMESTAMPTZ,
+    last_seen_at        TEXT,
     dpop_public_key     TEXT,
-    created_at          TIMESTAMPTZ NOT NULL
+    created_at          TEXT NOT NULL
 );
 
 CREATE INDEX idx_device_session ON device(session_id);
@@ -414,10 +428,10 @@ CREATE TABLE account_device (
     id                BIGSERIAL PRIMARY KEY,
     did               TEXT NOT NULL,
     device_id         TEXT NOT NULL,
-    authorized_at     TIMESTAMPTZ NOT NULL,
+    authorized_at     TEXT NOT NULL,
     device_name       TEXT,
     is_active         BOOLEAN NOT NULL DEFAULT true,
-    revoked_at        TIMESTAMPTZ,
+    revoked_at        TEXT,
     FOREIGN KEY (device_id) REFERENCES device(id)
 );
 
@@ -438,8 +452,8 @@ CREATE TABLE authorization_request (
     state                   TEXT,
     authorization_code      TEXT,
     code_used               BOOLEAN NOT NULL DEFAULT false,
-    created_at              TIMESTAMPTZ NOT NULL,
-    expires_at              TIMESTAMPTZ NOT NULL
+    created_at              TEXT NOT NULL,
+    expires_at              TEXT NOT NULL
 );
 
 CREATE INDEX idx_auth_request_code ON authorization_request(authorization_code) WHERE authorization_code IS NOT NULL;
@@ -450,8 +464,8 @@ CREATE TABLE authorized_client (
     did                      TEXT NOT NULL,
     client_id                TEXT NOT NULL,
     scope                    TEXT NOT NULL,
-    first_authorized_at      TIMESTAMPTZ NOT NULL,
-    last_used_at             TIMESTAMPTZ NOT NULL,
+    first_authorized_at      TEXT NOT NULL,
+    last_used_at             TEXT NOT NULL,
     is_active                BOOLEAN NOT NULL DEFAULT true,
     UNIQUE (did, client_id)
 );
@@ -468,13 +482,13 @@ CREATE TABLE token (
     client_id                 TEXT NOT NULL,
     current_refresh_token     TEXT,
     scope                     TEXT NOT NULL,
-    created_at                TIMESTAMPTZ NOT NULL,
-    updated_at                TIMESTAMPTZ NOT NULL,
-    expires_at                TIMESTAMPTZ NOT NULL,
+    created_at                TEXT NOT NULL,
+    updated_at                TEXT NOT NULL,
+    expires_at                TEXT NOT NULL,
     dpop_thumbprint           TEXT,
     device_id                 TEXT,
     revoked                   BOOLEAN NOT NULL DEFAULT false,
-    revoked_at                TIMESTAMPTZ
+    revoked_at                TEXT
 );
 
 CREATE INDEX idx_token_did ON token(did) WHERE NOT revoked;
@@ -485,7 +499,7 @@ CREATE TABLE used_refresh_token (
     refresh_token    TEXT PRIMARY KEY,
     token_id         TEXT NOT NULL,
     did              TEXT NOT NULL,
-    used_at          TIMESTAMPTZ NOT NULL
+    used_at          TEXT NOT NULL
 );
 
 CREATE INDEX idx_used_refresh_did ON used_refresh_token(did);
