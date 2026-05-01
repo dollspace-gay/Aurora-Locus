@@ -1,0 +1,10 @@
+{
+  "uuid": "4dca27e1-8112-4567-afad-cc6d530d0430",
+  "issue_uuid": "3537e5da-2b7b-4773-9f15-33dd753f2b5c",
+  "author": "vW4n",
+  "content": "Commit the bundled proto-blue migration (issues #1-#12), dep refresh (#13), and test fixes (#14) as one logical change. Build is clean, full test suite (905 tests) passes, clippy --all-targets is warning-free, fmt clean.",
+  "created_at": "2026-05-01T01:29:54.791147153Z",
+  "kind": "plan",
+  "signed_by": "SHA256:FE0u9OWnwKx5uvLuSiKuHnl7pLtr4oXeEOi3s6yPOZY",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg31dKNoRTmx2sQF5ORSg1RnlKJqTXtDbr2pcYw8kivkkAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABADiOcWq5jN+R31UBuSpIFVqgyOJ/jJ0vn8YLNiA5RydVRJdvsyP0hBnaWYTy3mMyjXDD/BCbUahXNA7d0+mtgDA=="
+}
