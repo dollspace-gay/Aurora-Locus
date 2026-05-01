@@ -1,0 +1,10 @@
+{
+  "uuid": "1c16c507-d284-48a6-9693-108b34b0e833",
+  "issue_uuid": "29d0d653-c1a1-4d63-ac9c-ddcc999bd5c4",
+  "author": "vW4n",
+  "content": "Migration approach: switching the lib commit-signer trait from FnOnce closures to proto_blue::crypto::Signer plus a SqliteRepoStorage adapter that block_on's into our async ActorStore; vendoring PasswordHasher+blob mime helpers locally; landing the rest of proto-blue piece by piece per subissue.",
+  "created_at": "2026-05-01T01:29:18.009110032Z",
+  "kind": "plan",
+  "signed_by": "SHA256:FE0u9OWnwKx5uvLuSiKuHnl7pLtr4oXeEOi3s6yPOZY",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg31dKNoRTmx2sQF5ORSg1RnlKJqTXtDbr2pcYw8kivkkAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfpGoGuAMS/5JIaoZ3jHsQ62W9/9/JlnMk73dcWxr0L5Q1U1ootZC2rHMqwCbz3biIwL1y/kUMa6gSoD+JXCFDg=="
+}
