@@ -1,6 +1,11 @@
 /// Admin API Endpoints
 /// Implements com.atproto.admin.* endpoints for server administration
-use crate::{admin::InviteCode, auth::AdminAuthContext, error::PdsError, AppContext};
+use crate::{
+    admin::InviteCode,
+    auth::AdminAuthContext,
+    error::{PdsError, PdsResult},
+    AppContext,
+};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -18,6 +23,10 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
         .route("/xrpc/com.atproto.admin.listAccounts", get(get_users)) // Alias for frontend compatibility
         .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
+        .route(
+            "/xrpc/com.atproto.admin.getAccountInfo",
+            get(get_account_info),
+        )
         .route(
             "/xrpc/com.atproto.admin.getAccountInfos",
             get(get_account_infos),
@@ -1648,6 +1657,69 @@ struct GetAccountInfosResponse {
     infos: Vec<AccountInfo>,
 }
 
+/// Build an `AccountInfo` (lexicon `accountView`) for a single DID.
+///
+/// Shared helper for `get_account_info` (singular) and `get_account_infos`
+/// (plural). Returns `PdsError::NotFound` when the account does not exist;
+/// callers map that to 404 / `RepoNotFound` for the singular endpoint or to
+/// silent skip for the plural endpoint.
+///
+/// Future shape fixes tracked in chainlink #64 (Phase 1.9 — getAccountInfos
+/// param encoding + handle field) will land in this single helper and
+/// propagate to both endpoints simultaneously.
+async fn build_account_info(ctx: &AppContext, did: &str) -> PdsResult<AccountInfo> {
+    let account = ctx.account_manager.get_account(did).await?;
+
+    let invited_by = ctx
+        .invite_manager
+        .get_invite_for_account(did)
+        .await
+        .ok()
+        .flatten()
+        .map(|inv| InviteCodeInfo {
+            code: inv.code.clone(),
+            available: inv.available,
+            disabled: inv.disabled,
+            for_account: inv.for_account.clone().unwrap_or_default(),
+            created_by: inv.created_by.clone(),
+            created_at: inv.created_at.to_rfc3339(),
+            uses: vec![],
+        });
+
+    let account_invites = ctx
+        .invite_manager
+        .get_codes_created_by(did)
+        .await
+        .unwrap_or_default();
+
+    let invites: Vec<InviteCodeInfo> = account_invites
+        .into_iter()
+        .map(|inv| InviteCodeInfo {
+            code: inv.code.clone(),
+            available: inv.available,
+            disabled: inv.disabled,
+            for_account: inv.for_account.clone().unwrap_or_default(),
+            created_by: inv.created_by.clone(),
+            created_at: inv.created_at.to_rfc3339(),
+            uses: vec![],
+        })
+        .collect();
+
+    Ok(AccountInfo {
+        did: account.did.clone(),
+        handle: account.handle.clone(),
+        email: account.email.clone(),
+        indexed_at: account.created_at.to_rfc3339(),
+        email_confirmed_at: account.email_confirmed_at.map(|dt| dt.to_rfc3339()),
+        invited_by,
+        invites,
+        invites_disabled: account.invites_disabled.unwrap_or(false),
+        invite_note: None,
+        deactivated_at: account.deactivated_at.map(|dt| dt.to_rfc3339()),
+        threat_signatures: vec![],
+    })
+}
+
 /// Get multiple account details in batch
 ///
 /// Batch lookup of multiple account details by DIDs.
@@ -1679,74 +1751,56 @@ async fn get_account_infos(
     }
 
     let mut infos = Vec::new();
-
     for did in dids {
-        // Skip invalid DID formats
         if !did.starts_with("did:") {
             continue;
         }
-
-        // Try to get account, skip if not found
-        let account = match ctx.account_manager.get_account(did).await {
-            Ok(acc) => acc,
-            Err(_) => continue,
-        };
-
-        // Get invite code that was used to create this account (if any)
-        let invited_by = ctx
-            .invite_manager
-            .get_invite_for_account(did)
-            .await
-            .ok()
-            .flatten()
-            .map(|inv| InviteCodeInfo {
-                code: inv.code.clone(),
-                available: inv.available,
-                disabled: inv.disabled,
-                for_account: inv.for_account.clone().unwrap_or_default(),
-                created_by: inv.created_by.clone(),
-                created_at: inv.created_at.to_rfc3339(),
-                uses: vec![], // We don't track individual uses in the invite lookup
-            });
-
-        // Get invite codes created by this account
-        let account_invites = ctx
-            .invite_manager
-            .get_codes_created_by(did)
-            .await
-            .unwrap_or_default();
-
-        let invites: Vec<InviteCodeInfo> = account_invites
-            .into_iter()
-            .map(|inv| {
-                InviteCodeInfo {
-                    code: inv.code.clone(),
-                    available: inv.available,
-                    disabled: inv.disabled,
-                    for_account: inv.for_account.clone().unwrap_or_default(),
-                    created_by: inv.created_by.clone(),
-                    created_at: inv.created_at.to_rfc3339(),
-                    uses: vec![], // Uses would need separate query
-                }
-            })
-            .collect();
-
-        infos.push(AccountInfo {
-            did: account.did.clone(),
-            handle: account.handle.clone(),
-            email: account.email.clone(),
-            indexed_at: account.created_at.to_rfc3339(),
-            email_confirmed_at: account.email_confirmed_at.map(|dt| dt.to_rfc3339()),
-            invited_by,
-            invites,
-            invites_disabled: account.invites_disabled.unwrap_or(false),
-            invite_note: None, // Not tracked currently
-            deactivated_at: account.deactivated_at.map(|dt| dt.to_rfc3339()),
-            threat_signatures: vec![], // Not implemented yet
-        });
+        if let Ok(info) = build_account_info(&ctx, did).await {
+            infos.push(info);
+        }
     }
 
     Ok(Json(GetAccountInfosResponse { infos }))
+}
+
+#[derive(Deserialize)]
+struct GetAccountInfoQuery {
+    /// DID of the account to look up
+    did: String,
+}
+
+/// Get details about a single account (lexicon `com.atproto.admin.getAccountInfo`).
+///
+/// Thin wrapper around the same `build_account_info` helper used by
+/// `get_account_infos`. The `accountView` shape is shared so future fixes
+/// from chainlink #64 (Phase 1.9) propagate to both endpoints at once.
+async fn get_account_info(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<GetAccountInfoQuery>,
+) -> Result<Json<AccountInfo>, axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    if !query.did.starts_with("did:") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "did must be a DID identifier".to_string(),
+        )
+            .into_response());
+    }
+
+    match build_account_info(&ctx, &query.did).await {
+        Ok(info) => Ok(Json(info)),
+        Err(PdsError::NotFound(_)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "RepoNotFound",
+                "message": format!("Account not found: {}", query.did),
+            })),
+        )
+            .into_response()),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -4250,5 +4304,44 @@ mod tests {
         }
         // Otherwise we hit a downstream failure (network, NOT_FOUND from
         // PLC, etc.) — which is expected and confirms strict-mode passed.
+    }
+
+    #[tokio::test]
+    async fn test_get_account_info_rejects_non_did_input() {
+        let ctx = create_test_context().await;
+        let query = GetAccountInfoQuery {
+            did: "not-a-did".to_string(),
+        };
+
+        let result = get_account_info(State(ctx), admin_test_auth(), Query(query)).await;
+        let resp = match result {
+            Err(r) => r,
+            Ok(_) => panic!("non-DID input should be rejected"),
+        };
+        let (status, body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("DID"));
+    }
+
+    #[tokio::test]
+    async fn test_get_account_info_returns_repo_not_found_for_missing_account() {
+        let ctx = create_test_context().await;
+        let query = GetAccountInfoQuery {
+            did: "did:plc:nonexistentaccount0000".to_string(),
+        };
+
+        let result = get_account_info(State(ctx), admin_test_auth(), Query(query)).await;
+        let resp = match result {
+            Err(r) => r,
+            Ok(_) => panic!("missing account should return RepoNotFound"),
+        };
+        let (status, body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
+        assert_eq!(parsed["error"], "RepoNotFound");
+        assert!(parsed["message"]
+            .as_str()
+            .unwrap()
+            .contains("did:plc:nonexistentaccount0000"));
     }
 }
