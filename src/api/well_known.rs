@@ -153,6 +153,7 @@ mod tests {
                     tmp_location: PathBuf::from("./data/temp"),
                 },
             },
+            database: Default::default(),
             authentication: AuthConfig {
                 jwt_secret: "test_secret_key_that_is_32_chars".to_string(),
                 repo_signing_key: "a".repeat(64), // Valid hex key

@@ -10,6 +10,12 @@ use std::path::{Path, PathBuf};
 pub struct ServerConfig {
     pub service: ServiceConfig,
     pub storage: StorageConfig,
+    /// Shared-database backend selection (per
+    /// POSTGRES_BACKEND_ASSESSMENT.md §6 Phase 2 / chainlink #75).
+    /// Per-actor `ActorStore` always uses SQLite; this only controls
+    /// `account_db` and `did_cache_db`.
+    #[serde(default)]
+    pub database: DatabaseConfig,
     pub authentication: AuthConfig,
     pub identity: IdentityConfig,
     pub email: Option<EmailConfig>,
@@ -18,6 +24,164 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
     pub federation: FederationConfig,
     pub validation_mode: ValidationMode,
+}
+
+/// Shared-database backend selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseBackend {
+    /// SQLite (default; suitable for hobbyist and development deployments).
+    #[default]
+    Sqlite,
+    /// PostgreSQL (production deployments requiring better concurrency).
+    Postgres,
+}
+
+/// Database configuration shared by `account_db` and `did_cache_db`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    #[serde(default)]
+    pub backend: DatabaseBackend,
+    /// Connection URL: file path for SQLite, `postgres://` URL for Postgres.
+    /// When unset for SQLite, the per-database file paths in
+    /// `StorageConfig` are used (preserving the legacy default).
+    pub url: Option<String>,
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout_secs: u64,
+    pub idle_timeout_secs: Option<u64>,
+    pub max_lifetime_secs: Option<u64>,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            backend: DatabaseBackend::Sqlite,
+            url: None,
+            // Defaults per POSTGRES_BACKEND_ASSESSMENT.md §9.3.
+            max_connections: 25,
+            min_connections: 5,
+            acquire_timeout_secs: 30,
+            idle_timeout_secs: None,
+            max_lifetime_secs: None,
+        }
+    }
+}
+
+impl DatabaseConfig {
+    /// Construct from explicit option-typed env-var values. Pure function
+    /// over `Option<String>` inputs so tests can exercise validation
+    /// without manipulating process-global env. Mirrors the pattern used
+    /// by `BlobstoreConfig::from_env_values`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_env_values(
+        backend: Option<String>,
+        url: Option<String>,
+        max_connections: Option<String>,
+        min_connections: Option<String>,
+        acquire_timeout_secs: Option<String>,
+        idle_timeout_secs: Option<String>,
+        max_lifetime_secs: Option<String>,
+    ) -> PdsResult<Self> {
+        let backend = match backend.as_deref().map(str::to_ascii_lowercase) {
+            None => DatabaseBackend::Sqlite,
+            Some(s) if s == "sqlite" => DatabaseBackend::Sqlite,
+            Some(s) if s == "postgres" || s == "postgresql" => DatabaseBackend::Postgres,
+            Some(other) => {
+                return Err(PdsError::Validation(format!(
+                    "PDS_DB_BACKEND must be 'sqlite' or 'postgres' (got: {:?})",
+                    other
+                )));
+            }
+        };
+
+        if backend == DatabaseBackend::Postgres {
+            let u = url.as_deref().unwrap_or("");
+            if u.is_empty() {
+                return Err(PdsError::Validation(
+                    "PDS_DB_URL is required when PDS_DB_BACKEND=postgres".to_string(),
+                ));
+            }
+            if !u.starts_with("postgres://") && !u.starts_with("postgresql://") {
+                return Err(PdsError::Validation(
+                    "PDS_DB_URL must start with 'postgres://' or 'postgresql://' \
+                     when PDS_DB_BACKEND=postgres"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let max_connections = parse_u32_env("PDS_DB_MAX_CONNECTIONS", max_connections, 25)?;
+        let min_connections = parse_u32_env("PDS_DB_MIN_CONNECTIONS", min_connections, 5)?;
+        let acquire_timeout_secs =
+            parse_u64_env("PDS_DB_ACQUIRE_TIMEOUT_SECS", acquire_timeout_secs, 30)?;
+        let idle_timeout_secs = parse_u64_env_opt("PDS_DB_IDLE_TIMEOUT_SECS", idle_timeout_secs)?;
+        let max_lifetime_secs = parse_u64_env_opt("PDS_DB_MAX_LIFETIME_SECS", max_lifetime_secs)?;
+
+        if max_connections == 0 {
+            return Err(PdsError::Validation(
+                "PDS_DB_MAX_CONNECTIONS must be greater than 0".to_string(),
+            ));
+        }
+        if min_connections > max_connections {
+            return Err(PdsError::Validation(format!(
+                "PDS_DB_MIN_CONNECTIONS ({}) must not exceed PDS_DB_MAX_CONNECTIONS ({})",
+                min_connections, max_connections
+            )));
+        }
+        if acquire_timeout_secs == 0 {
+            return Err(PdsError::Validation(
+                "PDS_DB_ACQUIRE_TIMEOUT_SECS must be greater than 0".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            backend,
+            url,
+            max_connections,
+            min_connections,
+            acquire_timeout_secs,
+            idle_timeout_secs,
+            max_lifetime_secs,
+        })
+    }
+}
+
+fn parse_u32_env(name: &str, raw: Option<String>, default: u32) -> PdsResult<u32> {
+    match raw {
+        None => Ok(default),
+        Some(v) => v.parse::<u32>().map_err(|_| {
+            PdsError::Validation(format!(
+                "{name} must be a non-negative integer (got: {:?})",
+                v
+            ))
+        }),
+    }
+}
+
+fn parse_u64_env(name: &str, raw: Option<String>, default: u64) -> PdsResult<u64> {
+    match raw {
+        None => Ok(default),
+        Some(v) => v.parse::<u64>().map_err(|_| {
+            PdsError::Validation(format!(
+                "{name} must be a non-negative integer (got: {:?})",
+                v
+            ))
+        }),
+    }
+}
+
+fn parse_u64_env_opt(name: &str, raw: Option<String>) -> PdsResult<Option<u64>> {
+    match raw {
+        None => Ok(None),
+        Some(v) if v.is_empty() => Ok(None),
+        Some(v) => v.parse::<u64>().map(Some).map_err(|_| {
+            PdsError::Validation(format!(
+                "{name} must be a non-negative integer (got: {:?})",
+                v
+            ))
+        }),
+    }
 }
 
 /// Service-level configuration
@@ -535,6 +699,16 @@ impl ServerConfig {
             .parse()
             .unwrap_or(false);
 
+        let database = DatabaseConfig::from_env_values(
+            env::var("PDS_DB_BACKEND").ok(),
+            env::var("PDS_DB_URL").ok(),
+            env::var("PDS_DB_MAX_CONNECTIONS").ok(),
+            env::var("PDS_DB_MIN_CONNECTIONS").ok(),
+            env::var("PDS_DB_ACQUIRE_TIMEOUT_SECS").ok(),
+            env::var("PDS_DB_IDLE_TIMEOUT_SECS").ok(),
+            env::var("PDS_DB_MAX_LIFETIME_SECS").ok(),
+        )?;
+
         Ok(ServerConfig {
             service: ServiceConfig {
                 hostname,
@@ -551,6 +725,7 @@ impl ServerConfig {
                 actor_store_directory,
                 blobstore,
             },
+            database,
             authentication: AuthConfig {
                 jwt_secret,
                 repo_signing_key,
@@ -612,6 +787,183 @@ impl ServerConfig {
         // Admin password removed - OAuth uses DID-based authentication
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod database_tests {
+    use super::*;
+
+    #[test]
+    fn from_env_values_defaults_to_sqlite() {
+        let cfg = DatabaseConfig::from_env_values(None, None, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(cfg.backend, DatabaseBackend::Sqlite);
+        assert!(cfg.url.is_none());
+        assert_eq!(cfg.max_connections, 25);
+        assert_eq!(cfg.min_connections, 5);
+        assert_eq!(cfg.acquire_timeout_secs, 30);
+        assert!(cfg.idle_timeout_secs.is_none());
+        assert!(cfg.max_lifetime_secs.is_none());
+    }
+
+    #[test]
+    fn from_env_values_postgres_with_url() {
+        let cfg = DatabaseConfig::from_env_values(
+            Some("postgres".to_string()),
+            Some("postgres://user:pw@localhost/aurora".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.backend, DatabaseBackend::Postgres);
+        assert_eq!(
+            cfg.url.as_deref(),
+            Some("postgres://user:pw@localhost/aurora")
+        );
+    }
+
+    #[test]
+    fn from_env_values_postgres_accepts_postgresql_scheme() {
+        let cfg = DatabaseConfig::from_env_values(
+            Some("postgresql".to_string()),
+            Some("postgresql://localhost/aurora".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.backend, DatabaseBackend::Postgres);
+    }
+
+    #[test]
+    fn from_env_values_postgres_without_url_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            Some("postgres".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("postgres without URL should be rejected");
+        assert!(err.to_string().contains("PDS_DB_URL is required"));
+    }
+
+    #[test]
+    fn from_env_values_postgres_with_wrong_scheme_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            Some("postgres".to_string()),
+            Some("mysql://localhost/aurora".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("non-postgres URL should be rejected");
+        assert!(err.to_string().contains("postgres://"));
+    }
+
+    #[test]
+    fn from_env_values_invalid_backend_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            Some("mysql".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("unknown backend should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("sqlite"));
+        assert!(msg.contains("postgres"));
+    }
+
+    #[test]
+    fn from_env_values_min_exceeds_max_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            None,
+            None,
+            Some("10".to_string()),
+            Some("20".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect_err("min > max should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("MIN_CONNECTIONS"));
+        assert!(msg.contains("MAX_CONNECTIONS"));
+    }
+
+    #[test]
+    fn from_env_values_zero_max_connections_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            None,
+            None,
+            Some("0".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("max=0 should be rejected");
+        assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn from_env_values_zero_acquire_timeout_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            Some("0".to_string()),
+            None,
+            None,
+        )
+        .expect_err("acquire timeout=0 should be rejected");
+        assert!(err.to_string().contains("ACQUIRE_TIMEOUT_SECS"));
+    }
+
+    #[test]
+    fn from_env_values_non_numeric_timeout_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            Some("not-a-number".to_string()),
+            None,
+            None,
+        )
+        .expect_err("non-integer timeout should be rejected");
+        assert!(err.to_string().contains("non-negative integer"));
+    }
+
+    #[test]
+    fn from_env_values_optional_timeouts_parse() {
+        let cfg = DatabaseConfig::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("60".to_string()),
+            Some("3600".to_string()),
+        )
+        .unwrap();
+        assert_eq!(cfg.idle_timeout_secs, Some(60));
+        assert_eq!(cfg.max_lifetime_secs, Some(3600));
     }
 }
 

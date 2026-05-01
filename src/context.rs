@@ -74,6 +74,25 @@ impl AppContext {
         // Validate configuration
         config.validate()?;
 
+        // Phase 2 (chainlink #75) added DatabaseConfig with backend
+        // selection, but Phase 3 (#76) has not yet refactored the 16
+        // shared-DB consumer modules from SqlitePool to AnyPool. Until
+        // that lands, only SQLite is constructible at runtime — reject
+        // Postgres explicitly so operators get a clear error rather
+        // than a build-time mismatch deeper in the stack.
+        if matches!(
+            config.database.backend,
+            crate::config::DatabaseBackend::Postgres
+        ) {
+            return Err(PdsError::Validation(
+                "PDS_DB_BACKEND=postgres is not yet wired into the runtime; \
+                 the dispatch layer is in place but per-file refactoring \
+                 (Postgres workstream Phase 3, chainlink #76) must land \
+                 first. Use PDS_DB_BACKEND=sqlite (or unset it) for now."
+                    .to_string(),
+            ));
+        }
+
         // Create data directories if they don't exist
         Self::ensure_directories(&config).await?;
 

@@ -4461,6 +4461,7 @@ mod tests {
                     tmp_location: dir.path().join("temp"),
                 },
             },
+            database: Default::default(),
             authentication: AuthConfig {
                 // Config validation requires JWT secrets >= 32 chars.
                 jwt_secret: "test-secret-key-for-admin-tests-32-chars".to_string(),

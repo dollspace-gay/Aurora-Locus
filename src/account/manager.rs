@@ -2291,6 +2291,7 @@ mod tests {
                     tmp_location: PathBuf::from("./data/tmp"),
                 },
             },
+            database: Default::default(),
             authentication: AuthConfig {
                 jwt_secret: "test-secret-key-for-testing-only".to_string(),
                 repo_signing_key: "test-key".to_string(),
