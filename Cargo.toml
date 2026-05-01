@@ -15,7 +15,7 @@ argon2 = { version = "0.5", features = ["std"] }
 
 # HTTP Server
 axum = { version = "0.7", features = ["tokio", "ws"] }
-axum-extra = { version = "0.9", features = ["typed-header"] }
+axum-extra = { version = "0.9", features = ["typed-header", "query"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors", "compression-gzip"] }
 futures = "0.3"

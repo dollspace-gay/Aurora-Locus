@@ -1683,16 +1683,24 @@ async fn get_account(
 
 #[derive(Deserialize)]
 struct GetAccountInfosQuery {
-    /// Comma-separated list of DIDs to look up
-    dids: String,
+    /// DIDs to look up. Decoded from repeated `?dids=...&dids=...` query
+    /// parameters via `axum_extra::extract::Query`. Phase 1.9 (#64) replaced
+    /// the legacy comma-separated single-string encoding with the
+    /// lexicon-conformant repeated-param form; behavior change is documented
+    /// in the commit that introduced this struct.
+    dids: Vec<String>,
 }
 
-/// Account info for batch responses
+/// Account info for batch responses (lexicon `com.atproto.admin.defs#accountView`).
+///
+/// `handle` is required per the lexicon. Phase 1.9 (#64) flipped it from
+/// `Option<String>` to `String`; the underlying `actor.handle` column is
+/// `NOT NULL` in the schema, so the backing data is always present.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountInfo {
     did: String,
-    handle: Option<String>,
+    handle: String,
     email: Option<String>,
     indexed_at: String,
     email_confirmed_at: Option<String>,
@@ -1790,7 +1798,10 @@ async fn build_account_info(ctx: &AppContext, did: &str) -> PdsResult<AccountInf
 
     Ok(AccountInfo {
         did: account.did.clone(),
-        handle: account.handle.clone(),
+        // `actor.handle` is NOT NULL in schema; the Option on ActorAccount is
+        // Rust-side defensiveness. Default to empty string only as a
+        // belt-and-suspenders fallback for a row that violates the invariant.
+        handle: account.handle.clone().unwrap_or_default(),
         email: account.email.clone(),
         indexed_at: account.created_at.to_rfc3339(),
         email_confirmed_at: account.email_confirmed_at.map(|dt| dt.to_rfc3339()),
@@ -1805,28 +1816,24 @@ async fn build_account_info(ctx: &AppContext, did: &str) -> PdsResult<AccountInf
 
 /// Get multiple account details in batch
 ///
-/// Batch lookup of multiple account details by DIDs.
-/// Returns information for all found accounts (missing DIDs are silently skipped).
+/// Batch lookup of multiple account details by DIDs. Accepts repeated
+/// `?dids=...&dids=...` query parameters per the lexicon. Returns information
+/// for all found accounts (missing DIDs are silently skipped). Uses
+/// `axum_extra::extract::Query` rather than the default `axum::extract::Query`
+/// because the latter's `serde_urlencoded` backend collapses repeated keys
+/// to the last value.
 async fn get_account_infos(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
-    Query(query): Query<GetAccountInfosQuery>,
+    axum_extra::extract::Query(query): axum_extra::extract::Query<GetAccountInfosQuery>,
 ) -> Result<Json<GetAccountInfosResponse>, (StatusCode, String)> {
-    // Parse the comma-separated DIDs
-    let dids: Vec<&str> = query
-        .dids
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if dids.is_empty() {
+    if query.dids.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "No DIDs provided".to_string()));
     }
 
     // Limit batch size to prevent abuse
     const MAX_BATCH_SIZE: usize = 100;
-    if dids.len() > MAX_BATCH_SIZE {
+    if query.dids.len() > MAX_BATCH_SIZE {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("Too many DIDs (max {})", MAX_BATCH_SIZE),
@@ -1834,7 +1841,7 @@ async fn get_account_infos(
     }
 
     let mut infos = Vec::new();
-    for did in dids {
+    for did in &query.dids {
         if !did.starts_with("did:") {
             continue;
         }
@@ -5123,6 +5130,135 @@ mod tests {
             .await
             .expect_err("missing recipient should 404");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // ---- Phase 1.9: getAccountInfos param encoding + handle field --------
+
+    #[tokio::test]
+    async fn test_get_account_infos_repeated_query_params_returns_both() {
+        use axum_extra::extract::Query as ExtraQuery;
+
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:one", "one.test", Some("one@x")).await;
+        seed_test_account(&ctx, "did:plc:two", "two.test", Some("two@x")).await;
+
+        // Simulate axum-extra's parsing of `?dids=did:plc:one&dids=did:plc:two`.
+        let query = GetAccountInfosQuery {
+            dids: vec!["did:plc:one".to_string(), "did:plc:two".to_string()],
+        };
+        let resp = get_account_infos(State(ctx), admin_test_auth(), ExtraQuery(query))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.infos.len(), 2);
+        // Order matches input order; handle is now required (String, not Option).
+        assert_eq!(resp.infos[0].did, "did:plc:one");
+        assert_eq!(resp.infos[0].handle, "one.test");
+        assert_eq!(resp.infos[1].did, "did:plc:two");
+        assert_eq!(resp.infos[1].handle, "two.test");
+    }
+
+    #[tokio::test]
+    async fn test_get_account_infos_silently_skips_missing_dids() {
+        use axum_extra::extract::Query as ExtraQuery;
+
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:exists", "exists.test", Some("e@x")).await;
+
+        let query = GetAccountInfosQuery {
+            dids: vec![
+                "did:plc:exists".to_string(),
+                "did:plc:doesnotexist".to_string(),
+                "not-a-did-at-all".to_string(),
+            ],
+        };
+        let resp = get_account_infos(State(ctx), admin_test_auth(), ExtraQuery(query))
+            .await
+            .unwrap()
+            .0;
+        // Existing skip-on-error behavior preserved: only the present account
+        // appears, and the malformed entry is filtered before lookup.
+        assert_eq!(resp.infos.len(), 1);
+        assert_eq!(resp.infos[0].did, "did:plc:exists");
+    }
+
+    #[tokio::test]
+    async fn test_get_account_infos_empty_array_400() {
+        use axum_extra::extract::Query as ExtraQuery;
+
+        let ctx = create_test_context().await;
+        let query = GetAccountInfosQuery { dids: vec![] };
+        let result = get_account_infos(State(ctx), admin_test_auth(), ExtraQuery(query)).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("empty dids array should return 400"),
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_account_info_handle_is_required_in_response_shape() {
+        // Verify the serialized accountView has handle as a string, not as
+        // null or missing. Spec marks handle as required.
+        let info = AccountInfo {
+            did: "did:plc:foo".to_string(),
+            handle: "foo.test".to_string(),
+            email: None,
+            indexed_at: "2026-01-01T00:00:00Z".to_string(),
+            email_confirmed_at: None,
+            invited_by: None,
+            invites: vec![],
+            invites_disabled: false,
+            invite_note: None,
+            deactivated_at: None,
+            threat_signatures: vec![],
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        // Must be a string, not null and not missing.
+        assert!(json.get("handle").unwrap().is_string());
+        assert_eq!(json["handle"], "foo.test");
+    }
+
+    #[tokio::test]
+    async fn test_get_account_info_singular_returns_required_handle() {
+        // The shared AccountInfo struct propagates to the singular endpoint
+        // too — handle is required there as well.
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:single", "single.test", Some("s@x")).await;
+
+        let resp = get_account_info(
+            State(ctx),
+            admin_test_auth(),
+            Query(GetAccountInfoQuery {
+                did: "did:plc:single".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.handle, "single.test");
+    }
+
+    #[tokio::test]
+    async fn test_search_accounts_returns_required_handle() {
+        // Same propagation check for the searchAccounts endpoint.
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:srch", "srch.test", Some("s@x")).await;
+
+        let resp = search_accounts(
+            State(ctx),
+            admin_test_auth(),
+            Query(SearchAccountsQuery {
+                email: Some("s@x".to_string()),
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.accounts.len(), 1);
+        assert_eq!(resp.accounts[0].handle, "srch.test");
     }
 
     #[tokio::test]
