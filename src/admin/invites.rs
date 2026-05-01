@@ -207,6 +207,42 @@ impl InviteCodeManager {
         Ok(())
     }
 
+    /// Atomically disable a batch of invite codes and/or all codes issued for
+    /// a set of accounts. All updates run inside a single SQLite transaction;
+    /// either every update commits or none do.
+    ///
+    /// Codes or account DIDs that don't match any rows are silently skipped:
+    /// the semantic is "ensure these are disabled," and a missing code is
+    /// already vacuously disabled. Empty inputs are a no-op.
+    pub async fn disable_codes_batch(
+        &self,
+        codes: &[String],
+        accounts: &[String],
+    ) -> PdsResult<()> {
+        if codes.is_empty() && accounts.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.db.begin().await?;
+
+        for code in codes {
+            sqlx::query("UPDATE invite_code SET disabled = 1 WHERE code = ?")
+                .bind(code)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        for did in accounts {
+            sqlx::query("UPDATE invite_code SET disabled = 1 WHERE for_account = ?")
+                .bind(did)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Get invite code details
     pub async fn get_code(&self, code: &str) -> PdsResult<Option<InviteCode>> {
         let row = sqlx::query(

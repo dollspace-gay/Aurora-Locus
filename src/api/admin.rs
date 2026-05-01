@@ -57,6 +57,10 @@ pub fn routes() -> Router<AppContext> {
             post(disable_invite_code),
         )
         .route(
+            "/xrpc/com.atproto.admin.disableInviteCodes",
+            post(disable_invite_codes),
+        )
+        .route(
             "/xrpc/com.atproto.admin.enableAccountInvites",
             post(enable_account_invites),
         )
@@ -2095,6 +2099,37 @@ async fn disable_invite_code(
         "success": true,
         "code": req.code,
     })))
+}
+
+#[derive(Deserialize)]
+struct DisableInviteCodesRequest {
+    /// Specific invite codes to disable. Missing codes are silently skipped.
+    #[serde(default)]
+    codes: Vec<String>,
+    /// Account DIDs whose issued invite codes should all be disabled.
+    /// Matches `invite_code.for_account` (the intended recipient).
+    #[serde(default)]
+    accounts: Vec<String>,
+}
+
+/// Disable a batch of invite codes and/or all codes issued for a set of
+/// accounts (lexicon `com.atproto.admin.disableInviteCodes`).
+///
+/// Updates run in a single SQLite transaction so a moderator working through
+/// a spam ring gets all-or-nothing semantics rather than a partial commit.
+/// Empty `codes` and `accounts` is a successful no-op per the lexicon (both
+/// fields are optional with no `required` array).
+async fn disable_invite_codes(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Json(req): Json<DisableInviteCodesRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    ctx.invite_manager
+        .disable_codes_batch(&req.codes, &req.accounts)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
@@ -4343,5 +4378,119 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("did:plc:nonexistentaccount0000"));
+    }
+
+    #[tokio::test]
+    async fn test_disable_invite_codes_empty_input_is_noop() {
+        let ctx = create_test_context().await;
+        let req = DisableInviteCodesRequest {
+            codes: vec![],
+            accounts: vec![],
+        };
+
+        let result = disable_invite_codes(State(ctx), admin_test_auth(), Json(req)).await;
+        assert_eq!(result.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_disable_invite_codes_disables_specific_codes_atomically() {
+        let ctx = create_test_context().await;
+
+        // Seed two invite codes via the existing manager API.
+        let code_a = ctx
+            .invite_manager
+            .create_invite("did:plc:creator", 5, None, None, None)
+            .await
+            .unwrap();
+        let code_b = ctx
+            .invite_manager
+            .create_invite("did:plc:creator", 5, None, None, None)
+            .await
+            .unwrap();
+        assert!(!code_a.disabled && !code_b.disabled);
+
+        let req = DisableInviteCodesRequest {
+            codes: vec![code_a.code.clone(), code_b.code.clone()],
+            accounts: vec![],
+        };
+        let result = disable_invite_codes(State(ctx.clone()), admin_test_auth(), Json(req)).await;
+        assert_eq!(result.unwrap(), StatusCode::OK);
+
+        // Verify both codes are disabled in the database.
+        let a_after = ctx
+            .invite_manager
+            .get_code(&code_a.code)
+            .await
+            .unwrap()
+            .unwrap();
+        let b_after = ctx
+            .invite_manager
+            .get_code(&code_b.code)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(a_after.disabled);
+        assert!(b_after.disabled);
+    }
+
+    #[tokio::test]
+    async fn test_disable_invite_codes_disables_codes_by_account() {
+        let ctx = create_test_context().await;
+        let target_did = "did:plc:targetaccount";
+
+        // One code issued *for* the target account, one not.
+        let issued_for_target = ctx
+            .invite_manager
+            .create_invite(
+                "did:plc:creator",
+                5,
+                None,
+                None,
+                Some(target_did.to_string()),
+            )
+            .await
+            .unwrap();
+        let unrelated = ctx
+            .invite_manager
+            .create_invite("did:plc:creator", 5, None, None, None)
+            .await
+            .unwrap();
+
+        let req = DisableInviteCodesRequest {
+            codes: vec![],
+            accounts: vec![target_did.to_string()],
+        };
+        let result = disable_invite_codes(State(ctx.clone()), admin_test_auth(), Json(req)).await;
+        assert_eq!(result.unwrap(), StatusCode::OK);
+
+        let target_after = ctx
+            .invite_manager
+            .get_code(&issued_for_target.code)
+            .await
+            .unwrap()
+            .unwrap();
+        let unrelated_after = ctx
+            .invite_manager
+            .get_code(&unrelated.code)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(target_after.disabled);
+        assert!(!unrelated_after.disabled);
+    }
+
+    #[tokio::test]
+    async fn test_disable_invite_codes_silently_skips_missing_codes() {
+        let ctx = create_test_context().await;
+
+        // Submit codes that don't exist; should succeed (the codes are
+        // vacuously disabled). Distinct from the singular endpoint, which
+        // returns NotFound for unknown codes.
+        let req = DisableInviteCodesRequest {
+            codes: vec!["aurora-nonexistent-code-1".to_string()],
+            accounts: vec!["did:plc:noaccount".to_string()],
+        };
+        let result = disable_invite_codes(State(ctx), admin_test_auth(), Json(req)).await;
+        assert_eq!(result.unwrap(), StatusCode::OK);
     }
 }
