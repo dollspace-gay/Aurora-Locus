@@ -293,38 +293,126 @@ async fn create_invite_code(
 
 #[derive(Debug, Deserialize)]
 struct GetInviteCodesQuery {
+    /// `recent` (default) or `usage` per the lexicon's knownValues.
     #[serde(default)]
-    include_disabled: bool,
+    sort: Option<String>,
+    /// Page size, 1-500, default 100 per the lexicon.
+    #[serde(default)]
+    limit: Option<i64>,
+    /// Opaque cursor produced by a previous response.
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
 struct GetInviteCodesResponse {
     codes: Vec<InviteCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
 }
 
-/// Get all invite codes
+/// Encode a typed cursor as base64url-no-pad JSON.
+fn encode_invite_cursor(cursor: &crate::admin::invites::InviteCursor) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let json = serde_json::to_vec(cursor).expect("cursor enum is JSON-serialisable");
+    URL_SAFE_NO_PAD.encode(json)
+}
+
+/// Decode a base64url-no-pad cursor, returning a 400 with `InvalidRequest`
+/// shape if the cursor is malformed or the decoded sort doesn't match the
+/// request's sort.
+fn decode_invite_cursor(
+    raw: &str,
+    expected_sort: crate::admin::invites::InviteSortKey,
+) -> Result<crate::admin::invites::InviteCursor, (StatusCode, String)> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let json = URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Malformed cursor".to_string()))?;
+    let cursor: crate::admin::invites::InviteCursor = serde_json::from_slice(&json)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Malformed cursor".to_string()))?;
+    if cursor.sort_key() != expected_sort {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "cursor was issued for a different sort ordering".to_string(),
+        ));
+    }
+    Ok(cursor)
+}
+
+/// Build a paginated invite-code response from a `Vec<(InviteCode, i64)>`
+/// returned by the manager. Trims to `limit` and emits a cursor if more
+/// results were available.
+fn paginated_invite_response(
+    mut rows: Vec<(InviteCode, i64)>,
+    sort: crate::admin::invites::InviteSortKey,
+    limit: i64,
+) -> (Vec<InviteCode>, Option<String>) {
+    use crate::admin::invites::InviteCursor;
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let next_cursor = if has_more {
+        rows.last().map(|(code, use_count)| {
+            let cur = match sort {
+                crate::admin::invites::InviteSortKey::Recent => InviteCursor::Recent {
+                    after_created_at: code.created_at.to_rfc3339(),
+                    after_code: code.code.clone(),
+                },
+                crate::admin::invites::InviteSortKey::Usage => InviteCursor::Usage {
+                    after_use_count: *use_count,
+                    after_code: code.code.clone(),
+                },
+            };
+            encode_invite_cursor(&cur)
+        })
+    } else {
+        None
+    };
+    (rows.into_iter().map(|(c, _)| c).collect(), next_cursor)
+}
+
+/// Get an admin view of invite codes (lexicon `com.atproto.admin.getInviteCodes`).
+///
+/// Phase 1.10 (#65) wired up the lexicon's sort/limit/cursor parameters
+/// and removed the legacy `includeDisabled` parameter. Disabled-only
+/// filtering relocates to a `tools.aurora.ops.*` endpoint per the
+/// assessment doc Phase 2.
 async fn get_invite_codes(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
     Query(query): Query<GetInviteCodesQuery>,
 ) -> Result<Json<GetInviteCodesResponse>, (StatusCode, String)> {
-    // Get all invite codes
-    let codes = ctx
+    let sort = crate::admin::invites::InviteSortKey::from_param(query.sort.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and 500".to_string(),
+        ));
+    }
+    let cursor = match query.cursor.as_deref() {
+        Some(raw) => Some(decode_invite_cursor(raw, sort)?),
+        None => None,
+    };
+
+    let rows = ctx
         .invite_manager
-        .list_codes(query.include_disabled)
+        .list_codes_paginated(sort, cursor.as_ref(), limit + 1)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(GetInviteCodesResponse { codes }))
+    let (codes, cursor) = paginated_invite_response(rows, sort, limit);
+    Ok(Json(GetInviteCodesResponse { codes, cursor }))
 }
 
 #[derive(Debug, Deserialize)]
 struct ListInviteCodesQuery {
     #[serde(default)]
-    #[allow(dead_code)] // TODO: Implement pagination
+    sort: Option<String>,
+    #[serde(default)]
     limit: Option<i64>,
     #[serde(default)]
-    #[allow(dead_code)] // TODO: Implement pagination
     cursor: Option<String>,
 }
 
@@ -335,23 +423,37 @@ struct ListInviteCodesResponse {
     cursor: Option<String>,
 }
 
-/// List invite codes (ATProto standard endpoint)
+/// List invite codes (Aurora-Locus surface paralleling `getInviteCodes`).
+///
+/// Phase 1.10 (#65) wired the limit/cursor params that were previously
+/// accepted-and-ignored. Reuses `getInviteCodes`'s pagination machinery.
 async fn list_invite_codes(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
-    Query(_query): Query<ListInviteCodesQuery>,
+    Query(query): Query<ListInviteCodesQuery>,
 ) -> Result<Json<ListInviteCodesResponse>, (StatusCode, String)> {
-    // Get all invite codes (ignore cursor for now, return all)
-    let codes = ctx
+    let sort = crate::admin::invites::InviteSortKey::from_param(query.sort.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and 500".to_string(),
+        ));
+    }
+    let cursor = match query.cursor.as_deref() {
+        Some(raw) => Some(decode_invite_cursor(raw, sort)?),
+        None => None,
+    };
+
+    let rows = ctx
         .invite_manager
-        .list_codes(false) // Don't include disabled by default
+        .list_codes_paginated(sort, cursor.as_ref(), limit + 1)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(ListInviteCodesResponse {
-        codes,
-        cursor: None,
-    }))
+    let (codes, cursor) = paginated_invite_response(rows, sort, limit);
+    Ok(Json(ListInviteCodesResponse { codes, cursor }))
 }
 
 /// Get server statistics
@@ -5130,6 +5232,281 @@ mod tests {
             .await
             .expect_err("missing recipient should 404");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // ---- Phase 1.10: invite-code pagination -------------------------------
+
+    /// Helper that creates `n` invite codes with a small delay between each
+    /// so they have distinct `created_at` timestamps. Returns codes in
+    /// creation order (oldest first).
+    async fn seed_invite_codes(ctx: &AppContext, n: usize) -> Vec<crate::admin::InviteCode> {
+        let mut codes = Vec::with_capacity(n);
+        for i in 0..n {
+            let c = ctx
+                .invite_manager
+                .create_invite("did:plc:creator", 5, None, Some(format!("seed {i}")), None)
+                .await
+                .unwrap();
+            codes.push(c);
+            // SQLite chrono RFC3339 strings are millisecond-resolution; a
+            // tiny sleep keeps timestamps strictly distinct so the cursor
+            // tuple boundary doesn't get ambiguous in tests.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        codes
+    }
+
+    #[tokio::test]
+    async fn test_get_invite_codes_sort_recent_returns_newest_first() {
+        let ctx = create_test_context().await;
+        let seeded = seed_invite_codes(&ctx, 3).await;
+
+        let resp = get_invite_codes(
+            State(ctx),
+            admin_test_auth(),
+            Query(GetInviteCodesQuery {
+                sort: Some("recent".to_string()),
+                limit: None,
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.codes.len(), 3);
+        // Newest-first: reverse of seed order.
+        assert_eq!(resp.codes[0].code, seeded[2].code);
+        assert_eq!(resp.codes[1].code, seeded[1].code);
+        assert_eq!(resp.codes[2].code, seeded[0].code);
+        assert!(resp.cursor.is_none()); // 3 codes, no more pages
+    }
+
+    #[tokio::test]
+    async fn test_get_invite_codes_sort_usage_orders_by_use_count() {
+        let ctx = create_test_context().await;
+        let seeded = seed_invite_codes(&ctx, 3).await;
+        // Record uses: seeded[0] used twice, seeded[1] used once, seeded[2] zero.
+        for (idx, count) in [2u32, 1, 0].iter().enumerate() {
+            for _ in 0..*count {
+                sqlx::query(
+                    "INSERT INTO invite_code_use (code, used_by, used_at) VALUES (?, ?, ?)",
+                )
+                .bind(&seeded[idx].code)
+                .bind("did:plc:user")
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&ctx.account_db)
+                .await
+                .unwrap();
+            }
+        }
+
+        let resp = get_invite_codes(
+            State(ctx),
+            admin_test_auth(),
+            Query(GetInviteCodesQuery {
+                sort: Some("usage".to_string()),
+                limit: None,
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.codes.len(), 3);
+        // Most-used first.
+        assert_eq!(resp.codes[0].code, seeded[0].code); // 2 uses
+        assert_eq!(resp.codes[1].code, seeded[1].code); // 1 use
+        assert_eq!(resp.codes[2].code, seeded[2].code); // 0 uses
+    }
+
+    #[tokio::test]
+    async fn test_get_invite_codes_paginates_with_cursor_recent() {
+        let ctx = create_test_context().await;
+        let seeded = seed_invite_codes(&ctx, 5).await;
+
+        // Page 1 of 2 with a cursor.
+        let page1 = get_invite_codes(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Query(GetInviteCodesQuery {
+                sort: Some("recent".to_string()),
+                limit: Some(2),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page1.codes.len(), 2);
+        assert_eq!(page1.codes[0].code, seeded[4].code); // newest
+        assert_eq!(page1.codes[1].code, seeded[3].code);
+        let cursor1 = page1.cursor.expect("more results, cursor expected");
+
+        // Page 2.
+        let page2 = get_invite_codes(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Query(GetInviteCodesQuery {
+                sort: Some("recent".to_string()),
+                limit: Some(2),
+                cursor: Some(cursor1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page2.codes.len(), 2);
+        assert_eq!(page2.codes[0].code, seeded[2].code);
+        assert_eq!(page2.codes[1].code, seeded[1].code);
+        let cursor2 = page2.cursor.expect("one more page expected");
+
+        // Page 3 finishes the set.
+        let page3 = get_invite_codes(
+            State(ctx),
+            admin_test_auth(),
+            Query(GetInviteCodesQuery {
+                sort: Some("recent".to_string()),
+                limit: Some(2),
+                cursor: Some(cursor2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page3.codes.len(), 1);
+        assert_eq!(page3.codes[0].code, seeded[0].code); // oldest
+        assert!(page3.cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_invite_codes_rejects_out_of_range_limit() {
+        let ctx = create_test_context().await;
+        let result = get_invite_codes(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Query(GetInviteCodesQuery {
+                sort: None,
+                limit: Some(0),
+                cursor: None,
+            }),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("limit=0 should be rejected"),
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let result = get_invite_codes(
+            State(ctx),
+            admin_test_auth(),
+            Query(GetInviteCodesQuery {
+                sort: None,
+                limit: Some(501),
+                cursor: None,
+            }),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("limit=501 should be rejected"),
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_invite_codes_rejects_invalid_sort() {
+        let ctx = create_test_context().await;
+        let result = get_invite_codes(
+            State(ctx),
+            admin_test_auth(),
+            Query(GetInviteCodesQuery {
+                sort: Some("alphabetical".to_string()),
+                limit: None,
+                cursor: None,
+            }),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("invalid sort should be rejected"),
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("recent") && err.1.contains("usage"));
+    }
+
+    #[tokio::test]
+    async fn test_get_invite_codes_rejects_cursor_with_mismatched_sort() {
+        let ctx = create_test_context().await;
+        let _ = seed_invite_codes(&ctx, 3).await;
+
+        // Get a cursor for sort=recent.
+        let page1 = get_invite_codes(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Query(GetInviteCodesQuery {
+                sort: Some("recent".to_string()),
+                limit: Some(1),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let recent_cursor = page1.cursor.unwrap();
+
+        // Replay the same cursor on sort=usage; should be rejected.
+        let result = get_invite_codes(
+            State(ctx),
+            admin_test_auth(),
+            Query(GetInviteCodesQuery {
+                sort: Some("usage".to_string()),
+                limit: Some(1),
+                cursor: Some(recent_cursor),
+            }),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("mismatched sort+cursor should be rejected"),
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_list_invite_codes_paginates_too() {
+        let ctx = create_test_context().await;
+        let _ = seed_invite_codes(&ctx, 3).await;
+
+        let page1 = list_invite_codes(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Query(ListInviteCodesQuery {
+                sort: None,
+                limit: Some(2),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page1.codes.len(), 2);
+        let cursor = page1.cursor.expect("more results expected");
+
+        let page2 = list_invite_codes(
+            State(ctx),
+            admin_test_auth(),
+            Query(ListInviteCodesQuery {
+                sort: None,
+                limit: Some(2),
+                cursor: Some(cursor),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page2.codes.len(), 1);
+        assert!(page2.cursor.is_none());
     }
 
     // ---- Phase 1.9: getAccountInfos param encoding + handle field --------

@@ -30,6 +30,59 @@ where
     }
 }
 
+/// Sort ordering for paginated invite-code listings
+/// (lexicon `com.atproto.admin.getInviteCodes` parameter `sort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteSortKey {
+    /// `sort=recent` (default): order by `created_at` descending.
+    Recent,
+    /// `sort=usage`: order by total uses descending.
+    Usage,
+}
+
+impl InviteSortKey {
+    /// Parse the lexicon's `sort` query parameter. The lexicon declares
+    /// `knownValues = ["recent", "usage"]` with `default = "recent"`.
+    pub fn from_param(s: Option<&str>) -> Result<Self, String> {
+        match s {
+            None | Some("recent") => Ok(Self::Recent),
+            Some("usage") => Ok(Self::Usage),
+            Some(other) => Err(format!(
+                "invalid sort value '{other}' (expected 'recent' or 'usage')"
+            )),
+        }
+    }
+}
+
+/// Decoded pagination cursor for `list_codes_paginated`. The on-the-wire
+/// form is base64url-encoded JSON tagged with `sort` so the cursor's
+/// ordering can be validated against the request's `sort` parameter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "sort", rename_all = "snake_case")]
+pub enum InviteCursor {
+    Recent {
+        /// `created_at` of the last row returned in the previous page,
+        /// serialised as RFC3339 to keep the cursor printable / debuggable
+        /// when base64-decoded by an operator.
+        after_created_at: String,
+        after_code: String,
+    },
+    Usage {
+        after_use_count: i64,
+        after_code: String,
+    },
+}
+
+impl InviteCursor {
+    /// Which sort ordering this cursor was generated for.
+    pub fn sort_key(&self) -> InviteSortKey {
+        match self {
+            Self::Recent { .. } => InviteSortKey::Recent,
+            Self::Usage { .. } => InviteSortKey::Usage,
+        }
+    }
+}
+
 /// Invite code
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteCode {
@@ -348,6 +401,174 @@ impl InviteCodeManager {
         }
 
         Ok(codes)
+    }
+
+    /// Paginated invite-code listing (Phase 1.10 / chainlink #65).
+    ///
+    /// Supports the lexicon's two sort orderings:
+    /// - `Recent`: by `created_at` descending (matches `sort=recent` default).
+    /// - `Usage`: by total use count from `invite_code_use` descending,
+    ///   computed via LEFT JOIN + GROUP BY on the use table.
+    ///
+    /// Cursor pagination uses a tuple of (sort-field-value, code) so the
+    /// page boundary is unique even when many rows share a `created_at`
+    /// timestamp or use count. The cursor's `sort` discriminant must match
+    /// the request's `sort` parameter; the handler is responsible for that
+    /// check before invoking this method.
+    ///
+    /// Includes disabled codes in the result. The legacy `includeDisabled`
+    /// filter on `getInviteCodes` was removed in Phase 1.10 (not in spec);
+    /// disabled-only filtering will relocate to a `tools.aurora.ops.*`
+    /// endpoint per ADMIN_MODERATION_ASSESSMENT.md Phase 2.
+    ///
+    /// Returns a `Vec<(InviteCode, use_count)>`. The tuple's `i64` is the
+    /// number of rows in `invite_code_use` for that code; callers building
+    /// the next cursor for `Usage` sort need it to seal the page boundary.
+    pub async fn list_codes_paginated(
+        &self,
+        sort: InviteSortKey,
+        cursor: Option<&InviteCursor>,
+        limit: i64,
+    ) -> PdsResult<Vec<(InviteCode, i64)>> {
+        // Validate cursor/sort compatibility upstream of the SQL so we
+        // don't fall through to a query that uses the wrong cursor variant.
+        if let Some(c) = cursor {
+            if c.sort_key() != sort {
+                return Err(PdsError::Validation(
+                    "cursor was issued for a different sort ordering".to_string(),
+                ));
+            }
+        }
+
+        match sort {
+            InviteSortKey::Recent => self.list_recent(cursor, limit).await,
+            InviteSortKey::Usage => self.list_by_usage(cursor, limit).await,
+        }
+    }
+
+    async fn list_recent(
+        &self,
+        cursor: Option<&InviteCursor>,
+        limit: i64,
+    ) -> PdsResult<Vec<(InviteCode, i64)>> {
+        // Tuple comparison via the portable `(a < ?) OR (a = ? AND b < ?)`
+        // form — SQLite supports row-value comparisons since 3.15 but the
+        // disjunction is friendlier to the query planner and EXPLAIN.
+        let base = "SELECT ic.code, ic.available, ic.disabled, ic.created_by,
+                          ic.created_at, ic.expires_at, ic.note, ic.for_account,
+                          (SELECT COUNT(*) FROM invite_code_use icu WHERE icu.code = ic.code) AS use_count
+                   FROM invite_code ic";
+        let rows = if let Some(InviteCursor::Recent {
+            after_created_at,
+            after_code,
+        }) = cursor
+        {
+            let sql = format!(
+                "{base}
+                 WHERE ic.created_at < ?
+                    OR (ic.created_at = ? AND ic.code < ?)
+                 ORDER BY ic.created_at DESC, ic.code DESC
+                 LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(after_created_at)
+                .bind(after_created_at)
+                .bind(after_code)
+                .bind(limit)
+                .fetch_all(&self.db)
+                .await?
+        } else {
+            let sql = format!(
+                "{base}
+                 ORDER BY ic.created_at DESC, ic.code DESC
+                 LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(limit)
+                .fetch_all(&self.db)
+                .await?
+        };
+
+        Self::rows_to_codes_with_count(rows)
+    }
+
+    async fn list_by_usage(
+        &self,
+        cursor: Option<&InviteCursor>,
+        limit: i64,
+    ) -> PdsResult<Vec<(InviteCode, i64)>> {
+        // `use_count` is the aggregate from invite_code_use. We compute it
+        // via a correlated subquery rather than GROUP BY so cursor filtering
+        // can sit cleanly in WHERE rather than HAVING.
+        let base = "SELECT ic.code, ic.available, ic.disabled, ic.created_by,
+                          ic.created_at, ic.expires_at, ic.note, ic.for_account,
+                          (SELECT COUNT(*) FROM invite_code_use icu WHERE icu.code = ic.code) AS use_count
+                   FROM invite_code ic";
+        let rows = if let Some(InviteCursor::Usage {
+            after_use_count,
+            after_code,
+        }) = cursor
+        {
+            let sql = format!(
+                "{base}
+                 WHERE (SELECT COUNT(*) FROM invite_code_use icu WHERE icu.code = ic.code) < ?
+                    OR ((SELECT COUNT(*) FROM invite_code_use icu WHERE icu.code = ic.code) = ?
+                        AND ic.code < ?)
+                 ORDER BY use_count DESC, ic.code DESC
+                 LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(after_use_count)
+                .bind(after_use_count)
+                .bind(after_code)
+                .bind(limit)
+                .fetch_all(&self.db)
+                .await?
+        } else {
+            let sql = format!(
+                "{base}
+                 ORDER BY use_count DESC, ic.code DESC
+                 LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(limit)
+                .fetch_all(&self.db)
+                .await?
+        };
+
+        Self::rows_to_codes_with_count(rows)
+    }
+
+    fn rows_to_codes_with_count(
+        rows: Vec<sqlx::sqlite::SqliteRow>,
+    ) -> PdsResult<Vec<(InviteCode, i64)>> {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let created_at_str: String = row.get("created_at");
+            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+                .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
+                .with_timezone(&Utc);
+            let expires_at = row
+                .try_get::<String, _>("expires_at")
+                .ok()
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            let use_count: i64 = row.get("use_count");
+            out.push((
+                InviteCode {
+                    code: row.get("code"),
+                    available: row.get("available"),
+                    disabled: row.get("disabled"),
+                    created_by: row.get("created_by"),
+                    created_at,
+                    expires_at,
+                    note: row.get("note"),
+                    for_account: row.get("for_account"),
+                },
+                use_count,
+            ));
+        }
+        Ok(out)
     }
 
     /// List all invite codes
