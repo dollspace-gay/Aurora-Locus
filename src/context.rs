@@ -126,33 +126,60 @@ impl AppContext {
         let blob_store =
             Arc::new(BlobStore::new(blob_store_config, account_db.clone()).await?);
 
-        // Initialize identity cache database with WAL mode enabled
-        // WAL mode provides better read concurrency - reads don't block during cache writes
-        let did_cache_db = db::create_pool(
+        // Initialize identity cache database with WAL mode enabled.
+        // WAL mode provides better read concurrency. The legacy SqlitePool
+        // is used for one-time setup (migrations, PRAGMAs) because it
+        // exposes SqliteConnectOptions; DidCache itself now holds an
+        // AnyPool (Phase 3 / chainlink #76) so we re-open the same
+        // SQLite file as an AnyPool after the setup pool has run. The
+        // dual-pool bridge lifts at the end of sub-phase 3b when
+        // AppContext fully flips to AnyPool.
+        let did_cache_db_setup = db::create_pool(
             &config.storage.did_cache_db,
             db::DatabaseOptions {
                 max_connections: 10,
-                enable_wal: true, // Enable WAL mode for concurrent reads during writes
+                enable_wal: true,
             },
         )
         .await?;
 
         // Run migrations for identity cache
-        db::run_migrations(&did_cache_db).await?;
+        db::run_migrations(&did_cache_db_setup).await?;
 
         // Configure WAL checkpoint settings for optimal performance
         // autocheckpoint=1000 pages (~4MB with default 4KB page size)
         sqlx::query("PRAGMA wal_autocheckpoint = 1000")
-            .execute(&did_cache_db)
+            .execute(&did_cache_db_setup)
             .await
             .map_err(PdsError::Database)?;
 
         // Set synchronous=NORMAL for better write performance while maintaining durability
         // NORMAL is safe with WAL mode and provides good balance of performance/safety
         sqlx::query("PRAGMA synchronous = NORMAL")
-            .execute(&did_cache_db)
+            .execute(&did_cache_db_setup)
             .await
             .map_err(PdsError::Database)?;
+
+        drop(did_cache_db_setup);
+
+        // Open the AnyPool for DidCache against the same SQLite file.
+        // The setup pool above already established WAL mode (persistent
+        // across opens for SQLite).
+        let did_cache_db = {
+            use std::sync::Once;
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(sqlx::any::install_default_drivers);
+            let path = config
+                .storage
+                .did_cache_db
+                .to_str()
+                .ok_or_else(|| {
+                    PdsError::Validation("did_cache_db path must be valid UTF-8".to_string())
+                })?;
+            sqlx::AnyPool::connect(&format!("sqlite://{}?mode=rwc", path))
+                .await
+                .map_err(PdsError::Database)?
+        };
 
         // Initialize identity resolver with separate WAL-enabled cache database
         let did_cache = DidCache::new(did_cache_db).with_did_doc_ttls(
