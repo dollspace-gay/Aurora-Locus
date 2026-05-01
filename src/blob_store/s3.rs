@@ -1,4 +1,13 @@
-/// S3-compatible blob storage backend
+//! S3-compatible blob storage backend.
+//!
+//! Phase 1 (chainlink #71) re-enabled this module after it was disabled
+//! behind a "Windows build issues" comment. Phase 2 (#72) will wire S3
+//! configuration through `AppContext` and actually construct
+//! `S3BlobBackend` at runtime; until then the dead-code lints would fire
+//! because nothing constructs `S3Config` or calls `S3BlobBackend::new`.
+//! The module-level allow is scoped to this file and lifts in Phase 2.
+#![allow(dead_code)]
+
 use crate::blob_store::BlobBackend;
 use crate::error::{PdsError, PdsResult};
 use async_trait::async_trait;
@@ -73,7 +82,7 @@ impl S3BlobBackend {
         );
 
         // Build AWS config
-        let mut aws_config = aws_config::defaults(BehaviorVersion::latest())
+        let aws_config = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(config.region.clone()))
             .credentials_provider(credentials)
             .load()
@@ -276,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_get_key_sharding() {
-        let config = S3Config {
+        let _config = S3Config {
             bucket: "test-bucket".to_string(),
             ..Default::default()
         };

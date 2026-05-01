@@ -53,10 +53,10 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 # Random generation
 rand = "0.8"
 
-# Blob storage (S3) - Temporarily disabled due to Windows build issues
-# aws-sdk-s3 = "1"
-# aws-config = "1"
-# aws-credential-types = "1"
+# Blob storage (S3)
+aws-sdk-s3 = "1"
+aws-config = "1"
+aws-credential-types = "1"
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }

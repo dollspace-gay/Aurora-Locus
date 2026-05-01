@@ -7,12 +7,14 @@ pub mod disk;
 pub mod mime;
 pub mod models;
 pub mod quarantine;
-// Temporarily disabled due to AWS SDK build issues on Windows
-// pub mod s3;
+pub mod s3;
 pub mod store;
 
 pub use models::*;
-// pub use s3::{S3BlobBackend, S3Config};
+// Phase 2 (#72) will wire AppContext to construct S3BlobBackend; until
+// then the re-export is unused at bin-scope. The allow lifts in Phase 2.
+#[allow(unused_imports)]
+pub use s3::{S3BlobBackend, S3Config};
 pub use store::{BlobStore, BlobStoreConfig};
 
 use crate::error::PdsResult;
@@ -74,7 +76,9 @@ pub enum BlobBackendType {
     /// Store blobs on local disk
     Disk { location: PathBuf },
 
-    /// Store blobs in S3-compatible storage
+    /// Store blobs in S3-compatible storage.
+    /// Phase 2 (#72) will construct this variant from configuration; until
+    /// then the dead-code lint fires. Allow lifts in Phase 2.
     #[allow(dead_code)]
     S3 {
         bucket: String,
