@@ -33,17 +33,29 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/app.bsky.feed.getLikes", get(get_likes))
         .route("/xrpc/app.bsky.feed.getRepostedBy", get(get_reposted_by))
         .route("/xrpc/app.bsky.feed.getQuotes", get(get_quotes))
-        .route("/xrpc/app.bsky.feed.getFeedGenerator", get(get_feed_generator))
-        .route("/xrpc/app.bsky.feed.getFeedGenerators", get(get_feed_generators))
+        .route(
+            "/xrpc/app.bsky.feed.getFeedGenerator",
+            get(get_feed_generator),
+        )
+        .route(
+            "/xrpc/app.bsky.feed.getFeedGenerators",
+            get(get_feed_generators),
+        )
         .route("/xrpc/app.bsky.feed.getActorFeeds", get(get_actor_feeds))
-        .route("/xrpc/app.bsky.feed.getSuggestedFeeds", get(get_suggested_feeds))
+        .route(
+            "/xrpc/app.bsky.feed.getSuggestedFeeds",
+            get(get_suggested_feeds),
+        )
         .route("/xrpc/app.bsky.feed.getFeed", get(get_feed))
         .route("/xrpc/app.bsky.feed.getListFeed", get(get_list_feed))
         .route("/xrpc/app.bsky.feed.searchPosts", get(search_posts))
         // Actor endpoints (simple proxy)
         .route("/xrpc/app.bsky.actor.getProfiles", get(get_profiles))
         .route("/xrpc/app.bsky.actor.searchActors", get(search_actors))
-        .route("/xrpc/app.bsky.actor.searchActorsTypeahead", get(search_actors_typeahead))
+        .route(
+            "/xrpc/app.bsky.actor.searchActorsTypeahead",
+            get(search_actors_typeahead),
+        )
         .route("/xrpc/app.bsky.actor.getSuggestions", get(get_suggestions))
         .route("/xrpc/app.bsky.actor.getPreferences", get(get_preferences))
         // Graph endpoints (simple proxy)
@@ -54,12 +66,24 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/app.bsky.graph.getLists", get(get_lists))
         .route("/xrpc/app.bsky.graph.getList", get(get_list))
         .route("/xrpc/app.bsky.graph.getListMembers", get(get_list_members))
-        .route("/xrpc/app.bsky.graph.getListMemberships", get(get_list_memberships))
+        .route(
+            "/xrpc/app.bsky.graph.getListMemberships",
+            get(get_list_memberships),
+        )
         // Notification endpoints (simple proxy)
-        .route("/xrpc/app.bsky.notification.listNotifications", get(list_notifications))
-        .route("/xrpc/app.bsky.notification.getUnreadCount", get(get_unread_count))
+        .route(
+            "/xrpc/app.bsky.notification.listNotifications",
+            get(list_notifications),
+        )
+        .route(
+            "/xrpc/app.bsky.notification.getUnreadCount",
+            get(get_unread_count),
+        )
         // Labeler endpoints (simple proxy)
-        .route("/xrpc/app.bsky.labeler.getServices", get(get_labeler_services))
+        .route(
+            "/xrpc/app.bsky.labeler.getServices",
+            get(get_labeler_services),
+        )
 }
 
 /// Get user's timeline with read-after-write consistency
@@ -132,7 +156,11 @@ async fn proxy_with_read_after_write<P, F>(
 ) -> PdsResult<Response>
 where
     P: Serialize,
-    F: FnOnce(serde_json::Value, &LocalViewer, read_after_write::LocalRecords) -> PdsResult<serde_json::Value>,
+    F: FnOnce(
+        serde_json::Value,
+        &LocalViewer,
+        read_after_write::LocalRecords,
+    ) -> PdsResult<serde_json::Value>,
 {
     // Get AppView URL from config
     let appview_url = ctx
@@ -192,27 +220,32 @@ where
     let repo_rev_str = repo_rev.unwrap();
 
     // Try to get from cache first
-    let local_records = if let Some(cached) = ctx.local_records_cache.get(user_did, &repo_rev_str).await {
-        tracing::debug!(
-            "Cache HIT for read-after-write: did={}, rev={}",
-            user_did, repo_rev_str
-        );
-        (*cached).clone()
-    } else {
-        // Cache MISS - fetch from database
-        tracing::debug!(
-            "Cache MISS for read-after-write: did={}, rev={}",
-            user_did, repo_rev_str
-        );
-        let records = ctx
-            .actor_store
-            .get_records_since_rev(user_did, &repo_rev_str)
-            .await?;
+    let local_records =
+        if let Some(cached) = ctx.local_records_cache.get(user_did, &repo_rev_str).await {
+            tracing::debug!(
+                "Cache HIT for read-after-write: did={}, rev={}",
+                user_did,
+                repo_rev_str
+            );
+            (*cached).clone()
+        } else {
+            // Cache MISS - fetch from database
+            tracing::debug!(
+                "Cache MISS for read-after-write: did={}, rev={}",
+                user_did,
+                repo_rev_str
+            );
+            let records = ctx
+                .actor_store
+                .get_records_since_rev(user_did, &repo_rev_str)
+                .await?;
 
-        // Cache the result
-        ctx.local_records_cache.set(user_did, &repo_rev_str, records.clone()).await;
-        records
-    };
+            // Cache the result
+            ctx.local_records_cache
+                .set(user_did, &repo_rev_str, records.clone())
+                .await;
+            records
+        };
 
     // If no local records, just return AppView response as-is
     if local_records.count == 0 {
@@ -354,11 +387,7 @@ fn merge_profile(
 }
 
 /// Build HTTP response from status, headers, and body
-fn build_response(
-    status: StatusCode,
-    headers: HeaderMap,
-    body: serde_json::Value,
-) -> Response {
+fn build_response(status: StatusCode, headers: HeaderMap, body: serde_json::Value) -> Response {
     let mut response = Json(body).into_response();
     *response.status_mut() = status;
 
@@ -710,7 +739,12 @@ async fn get_unread_count(
     State(ctx): State<AppContext>,
     _auth: OAuthAuthContext,
 ) -> PdsResult<Response> {
-    proxy_to_appview(&ctx, "app.bsky.notification.getUnreadCount", serde_json::json!({})).await
+    proxy_to_appview(
+        &ctx,
+        "app.bsky.notification.getUnreadCount",
+        serde_json::json!({}),
+    )
+    .await
 }
 
 /// Get labeler services

@@ -62,7 +62,10 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.repo.deleteRecord", post(delete_record))
         .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
         .route("/xrpc/com.atproto.repo.listRecords", get(list_records))
-        .route("/xrpc/com.atproto.repo.listMissingBlobs", get(list_missing_blobs))
+        .route(
+            "/xrpc/com.atproto.repo.listMissingBlobs",
+            get(list_missing_blobs),
+        )
         .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
         .route("/xrpc/com.atproto.repo.applyWrites", post(apply_writes))
 }
@@ -226,17 +229,22 @@ struct ApplyWritesRequest {
     swap_commit: Option<String>,
 }
 
-/// Creates a proper signing function using the repository's stored private key
+/// Build the proto-blue Signer that the repository manager uses to sign
+/// commits.
 ///
-/// Uses PlcSigner with the repo_signing_key from configuration to sign repository commits
+/// Wraps the configured hex-encoded secp256k1 repo signing key in a
+/// `RepoSigner` and hands it back as `Arc<dyn Signer>`. Failure here
+/// means the configured key is malformed — surface it as a 500-class
+/// internal error so operators see it in logs rather than getting a
+/// generic auth failure.
 fn create_repo_signer(
     repo_key_hex: &str,
-) -> impl Fn(&[u8; 32]) -> Result<Vec<u8>, atproto::repo::RepoError> + '_ {
-    move |hash: &[u8; 32]| {
-        let signer = crate::crypto::plc::PlcSigner::from_hex(repo_key_hex)
-            .map_err(|e| atproto::repo::RepoError::Signing(format!("Failed to create signer: {}", e)))?;
-        Ok(signer.sign(hash))
-    }
+) -> PdsResult<std::sync::Arc<dyn proto_blue::crypto::Signer>> {
+    let key_bytes = hex::decode(repo_key_hex)
+        .map_err(|e| PdsError::Internal(format!("Invalid hex in repo_signing_key: {}", e)))?;
+    let signer = crate::crypto::proto_blue_signer::RepoSigner::from_bytes(&key_bytes)
+        .map_err(|e| PdsError::Internal(format!("Failed to create repo signer: {}", e)))?;
+    Ok(std::sync::Arc::new(signer))
 }
 
 /// Create a new record
@@ -248,7 +256,8 @@ async fn create_record(
     tracing::info!("create_record: Starting for collection: {}", req.collection);
 
     // Require authentication (OAuth, local, or cross-PDS) - Phase 6
-    let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await
+    let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone())
+        .await
         .map_err(|e| {
             tracing::error!("create_record: Auth failed: {}", e);
             e
@@ -261,7 +270,13 @@ async fn create_record(
     tracing::debug!(
         "create_record: Authenticated as DID: {}, auth_type: {}",
         auth_did,
-        if auth.is_oauth() { "oauth" } else if auth.is_local() { "local" } else { "cross_pds" }
+        if auth.is_oauth() {
+            "oauth"
+        } else if auth.is_local() {
+            "local"
+        } else {
+            "cross_pds"
+        }
     );
 
     // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
@@ -272,7 +287,11 @@ async fn create_record(
 
     // Verify repo matches authenticated user
     if req.repo != auth_did {
-        tracing::error!("create_record: Repo mismatch - req: {}, auth: {}", req.repo, auth_did);
+        tracing::error!(
+            "create_record: Repo mismatch - req: {}, auth: {}",
+            req.repo,
+            auth_did
+        );
         return Err(PdsError::Authorization(
             "Cannot create record in another user's repo".to_string(),
         ));
@@ -288,7 +307,7 @@ async fn create_record(
     );
 
     // Create signer from repo key
-    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
+    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
 
     // Extract blob references from the record before creation
     let blob_cids = extract_blob_cids(&req.record);
@@ -296,7 +315,13 @@ async fn create_record(
     // Create the record
     tracing::debug!("create_record: Calling repo_mgr.create_record");
     let (uri, cid, _rev) = repo_mgr
-        .create_record(&req.collection, req.rkey.as_deref(), req.record, req.validate, signer)
+        .create_record(
+            &req.collection,
+            req.rkey.as_deref(),
+            req.record,
+            req.validate,
+            signer,
+        )
         .await
         .map_err(|e| {
             tracing::error!("create_record: Failed to create record: {}", e);
@@ -306,7 +331,11 @@ async fn create_record(
     // Track blob references for this record
     for blob_cid in &blob_cids {
         if let Err(e) = ctx.blob_store.track_blob_reference(blob_cid, &uri).await {
-            tracing::warn!("create_record: Failed to track blob reference {}: {}", blob_cid, e);
+            tracing::warn!(
+                "create_record: Failed to track blob reference {}: {}",
+                blob_cid,
+                e
+            );
             // Don't fail the request for tracking errors
         }
     }
@@ -315,7 +344,11 @@ async fn create_record(
     ctx.local_records_cache.invalidate_did(auth_did).await;
     tracing::debug!("create_record: Invalidated cache for DID: {}", auth_did);
 
-    tracing::info!("create_record: Successfully created record - URI: {}, CID: {}", uri, cid);
+    tracing::info!(
+        "create_record: Successfully created record - URI: {}, CID: {}",
+        uri,
+        cid
+    );
     Ok(Json(CreateRecordResponse { uri, cid }))
 }
 
@@ -354,7 +387,7 @@ async fn put_record(
     );
 
     // Create signer from repo key
-    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
+    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
 
     // Extract blob references from the new record
     let blob_cids = extract_blob_cids(&req.record);
@@ -372,7 +405,11 @@ async fn put_record(
     }
     for blob_cid in &blob_cids {
         if let Err(e) = ctx.blob_store.track_blob_reference(blob_cid, &uri).await {
-            tracing::warn!("put_record: Failed to track blob reference {}: {}", blob_cid, e);
+            tracing::warn!(
+                "put_record: Failed to track blob reference {}: {}",
+                blob_cid,
+                e
+            );
         }
     }
 
@@ -417,7 +454,7 @@ async fn delete_record(
     );
 
     // Create signer from repo key
-    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
+    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
 
     // Build record URI for blob reference cleanup
     let uri = format!("at://{}/{}/{}", auth_did, req.collection, req.rkey);
@@ -466,10 +503,16 @@ async fn get_record(
                 .unwrap_or("unknown")
                 .to_string();
 
-            let record_value = value.get("value").cloned().unwrap_or(serde_json::Value::Null);
+            let record_value = value
+                .get("value")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
 
             // Fetch labels for this record
-            let labels = ctx.label_manager.get_labels(&uri).await
+            let labels = ctx
+                .label_manager
+                .get_labels(&uri)
+                .await
                 .ok()
                 .map(|lbls| lbls.into_iter().map(LabelView::from).collect());
 
@@ -518,8 +561,16 @@ async fn list_records(
     let mut next_cursor: Option<String> = None;
 
     for rec in records_to_return {
-        let uri = rec.get("uri").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let cid = rec.get("cid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let uri = rec
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let cid = rec
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let value = rec.get("value").cloned().unwrap_or(serde_json::Value::Null);
 
         // Extract rkey from URI for cursor (format: at://did/collection/rkey)
@@ -528,7 +579,10 @@ async fn list_records(
         }
 
         // Fetch labels for this record
-        let labels = ctx.label_manager.get_labels(&uri).await
+        let labels = ctx
+            .label_manager
+            .get_labels(&uri)
+            .await
             .ok()
             .map(|lbls| lbls.into_iter().map(LabelView::from).collect());
 
@@ -562,19 +616,30 @@ async fn describe_repo(
     );
 
     // Get description with account manager and identity resolver
-    let desc = repo_mgr.describe_repo(
-        Some(&ctx.account_manager),
-        Some(&ctx.identity_resolver),
-    ).await?;
+    let desc = repo_mgr
+        .describe_repo(Some(&ctx.account_manager), Some(&ctx.identity_resolver))
+        .await?;
 
     Ok(Json(DescribeRepoResponse {
-        did: desc.get("did").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        handle: desc.get("handle").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        did: desc
+            .get("did")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        handle: desc
+            .get("handle")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         did_doc: desc.get("didDoc").cloned(),
         collections: desc
             .get("collections")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default(),
         handle_is_correct: desc
             .get("handleIsCorrect")
@@ -634,12 +699,10 @@ async fn apply_writes(
     );
 
     // Create signer from repo key
-    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key);
+    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
 
     // Apply batch atomically (includes validation)
-    let (commit_cid, rev) = repo_mgr
-        .apply_batch_writes(prepared, signer)
-        .await?;
+    let (commit_cid, rev) = repo_mgr.apply_batch_writes(prepared, signer).await?;
 
     tracing::info!(
         "Successfully committed batch for {} (rev: {})",
@@ -710,10 +773,7 @@ async fn list_missing_blobs(
 
     // Determine if there's more data (pagination)
     let has_more = missing.len() > limit as usize;
-    let results: Vec<_> = missing
-        .into_iter()
-        .take(limit as usize)
-        .collect();
+    let results: Vec<_> = missing.into_iter().take(limit as usize).collect();
 
     // Build cursor from last item
     let cursor = if has_more {

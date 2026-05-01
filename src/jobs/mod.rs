@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use tokio::time::{interval, Duration, sleep};
+use tokio::time::{interval, sleep, Duration};
 use tracing::{error, info, warn};
 
 pub mod tasks;
@@ -52,7 +52,11 @@ where
                     job_name, attempt, max_retries, e, backoff
                 );
 
-                crate::metrics::record_background_job(job_name, "retry", attempt_start.elapsed().as_secs_f64());
+                crate::metrics::record_background_job(
+                    job_name,
+                    "retry",
+                    attempt_start.elapsed().as_secs_f64(),
+                );
                 sleep(backoff).await;
             }
         }
@@ -122,7 +126,10 @@ impl JobScheduler {
             match tasks::cleanup_expired_sessions(&scheduler.context).await {
                 Ok(count) => {
                     if count > 0 {
-                        info!("Cleaned up {} expired tokens (sessions + refresh tokens)", count);
+                        info!(
+                            "Cleaned up {} expired tokens (sessions + refresh tokens)",
+                            count
+                        );
                     } else {
                         info!("Session cleanup: no expired tokens found");
                     }
@@ -345,11 +352,11 @@ impl JobScheduler {
         loop {
             interval.tick().await;
 
-            match execute_with_retry(
-                "metrics_collection",
-                3,
-                || tasks::collect_aggregate_metrics(&scheduler.context)
-            ).await {
+            match execute_with_retry("metrics_collection", 3, || {
+                tasks::collect_aggregate_metrics(&scheduler.context)
+            })
+            .await
+            {
                 Ok(_) => {
                     // Silent success
                 }

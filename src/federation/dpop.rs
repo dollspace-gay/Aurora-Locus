@@ -48,10 +48,10 @@ pub struct DPopClaims {
 /// JWK (JSON Web Key) representation from DPoP proof header
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Jwk {
-    pub kty: String,        // Key type (e.g., "EC")
-    pub crv: String,        // Curve (e.g., "P-256")
-    pub x: String,          // X coordinate (base64url)
-    pub y: String,          // Y coordinate (base64url)
+    pub kty: String, // Key type (e.g., "EC")
+    pub crv: String, // Curve (e.g., "P-256")
+    pub x: String,   // X coordinate (base64url)
+    pub y: String,   // Y coordinate (base64url)
 }
 
 /// DPoP nonce generator and tracker
@@ -186,9 +186,8 @@ impl DPopVerifier {
         })?;
 
         // Convert JWK to DecodingKey
-        let jwk_json = serde_json::to_value(&jwk).map_err(|e| {
-            PdsError::Internal(format!("Failed to serialize JWK: {}", e))
-        })?;
+        let jwk_json = serde_json::to_value(&jwk)
+            .map_err(|e| PdsError::Internal(format!("Failed to serialize JWK: {}", e)))?;
 
         let decoding_key = jwk_to_decoding_key(&jwk_json)?;
 
@@ -197,8 +196,8 @@ impl DPopVerifier {
         validation.validate_exp = true;
         validation.leeway = 0; // Strict expiration
 
-        let token_data = decode::<DPopClaims>(dpop_proof, &decoding_key, &validation).map_err(
-            |e| {
+        let token_data =
+            decode::<DPopClaims>(dpop_proof, &decoding_key, &validation).map_err(|e| {
                 warn!("DPoP proof verification failed: {}", e);
                 match e.kind() {
                     jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
@@ -206,8 +205,7 @@ impl DPopVerifier {
                     }
                     _ => PdsError::Authentication(format!("DPoP proof invalid: {}", e)),
                 }
-            },
-        )?;
+            })?;
 
         let claims = token_data.claims;
 
@@ -237,7 +235,11 @@ impl DPopVerifier {
         }
 
         // Validate and consume nonce
-        if !self.nonce_store.check_and_consume_nonce(&claims.jti).await? {
+        if !self
+            .nonce_store
+            .check_and_consume_nonce(&claims.jti)
+            .await?
+        {
             warn!("DPoP proof nonce invalid or already used: {}", claims.jti);
             return Err(PdsError::Authentication(
                 "DPoP proof nonce invalid or expired".to_string(),
@@ -269,21 +271,21 @@ impl DPopVerifier {
 /// ```
 fn jwk_to_decoding_key(jwk: &Value) -> PdsResult<DecodingKey> {
     // Extract JWK parameters
-    let kty = jwk["kty"].as_str().ok_or_else(|| {
-        PdsError::Authentication("JWK missing 'kty' field".to_string())
-    })?;
+    let kty = jwk["kty"]
+        .as_str()
+        .ok_or_else(|| PdsError::Authentication("JWK missing 'kty' field".to_string()))?;
 
-    let crv = jwk["crv"].as_str().ok_or_else(|| {
-        PdsError::Authentication("JWK missing 'crv' field".to_string())
-    })?;
+    let crv = jwk["crv"]
+        .as_str()
+        .ok_or_else(|| PdsError::Authentication("JWK missing 'crv' field".to_string()))?;
 
-    let x = jwk["x"].as_str().ok_or_else(|| {
-        PdsError::Authentication("JWK missing 'x' field".to_string())
-    })?;
+    let x = jwk["x"]
+        .as_str()
+        .ok_or_else(|| PdsError::Authentication("JWK missing 'x' field".to_string()))?;
 
-    let y = jwk["y"].as_str().ok_or_else(|| {
-        PdsError::Authentication("JWK missing 'y' field".to_string())
-    })?;
+    let y = jwk["y"]
+        .as_str()
+        .ok_or_else(|| PdsError::Authentication("JWK missing 'y' field".to_string()))?;
 
     // Validate key type and curve
     if kty != "EC" {
@@ -304,13 +306,13 @@ fn jwk_to_decoding_key(jwk: &Value) -> PdsResult<DecodingKey> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
-    let x_bytes = URL_SAFE_NO_PAD.decode(x).map_err(|e| {
-        PdsError::Authentication(format!("Invalid JWK x coordinate: {}", e))
-    })?;
+    let x_bytes = URL_SAFE_NO_PAD
+        .decode(x)
+        .map_err(|e| PdsError::Authentication(format!("Invalid JWK x coordinate: {}", e)))?;
 
-    let y_bytes = URL_SAFE_NO_PAD.decode(y).map_err(|e| {
-        PdsError::Authentication(format!("Invalid JWK y coordinate: {}", e))
-    })?;
+    let y_bytes = URL_SAFE_NO_PAD
+        .decode(y)
+        .map_err(|e| PdsError::Authentication(format!("Invalid JWK y coordinate: {}", e)))?;
 
     // Validate coordinate lengths (P-256 uses 32-byte coordinates)
     if x_bytes.len() != 32 {
@@ -338,21 +340,19 @@ fn jwk_to_decoding_key(jwk: &Value) -> PdsResult<DecodingKey> {
     use p256::ecdsa::VerifyingKey;
     use p256::EncodedPoint;
 
-    let encoded_point = EncodedPoint::from_bytes(&public_key_bytes).map_err(|e| {
-        PdsError::Authentication(format!("Invalid EC point encoding: {}", e))
-    })?;
+    let encoded_point = EncodedPoint::from_bytes(&public_key_bytes)
+        .map_err(|e| PdsError::Authentication(format!("Invalid EC point encoding: {}", e)))?;
 
-    let verifying_key = VerifyingKey::from_encoded_point(&encoded_point).map_err(|e| {
-        PdsError::Authentication(format!("Invalid P-256 public key: {}", e))
-    })?;
+    let verifying_key = VerifyingKey::from_encoded_point(&encoded_point)
+        .map_err(|e| PdsError::Authentication(format!("Invalid P-256 public key: {}", e)))?;
 
     // Convert to SPKI (SubjectPublicKeyInfo) DER format
     // This is the standard format for public keys in X.509/PKCS#8
     use p256::pkcs8::EncodePublicKey;
 
-    let public_key_der = verifying_key.to_public_key_der().map_err(|e| {
-        PdsError::Internal(format!("Failed to encode public key to DER: {}", e))
-    })?;
+    let public_key_der = verifying_key
+        .to_public_key_der()
+        .map_err(|e| PdsError::Internal(format!("Failed to encode public key to DER: {}", e)))?;
 
     // Convert DER to PEM format for jsonwebtoken
     let public_key_pem = format!(
@@ -361,9 +361,8 @@ fn jwk_to_decoding_key(jwk: &Value) -> PdsResult<DecodingKey> {
     );
 
     // Create DecodingKey from EC PEM
-    DecodingKey::from_ec_pem(public_key_pem.as_bytes()).map_err(|e| {
-        PdsError::Internal(format!("Failed to create DecodingKey from PEM: {}", e))
-    })
+    DecodingKey::from_ec_pem(public_key_pem.as_bytes())
+        .map_err(|e| PdsError::Internal(format!("Failed to create DecodingKey from PEM: {}", e)))
 }
 
 /// Compute JWK thumbprint (SHA-256 hash)
@@ -372,21 +371,21 @@ fn jwk_to_decoding_key(jwk: &Value) -> PdsResult<DecodingKey> {
 /// Reference: RFC 7638
 fn compute_jwk_thumbprint(jwk: &Value) -> PdsResult<String> {
     // Extract required fields in canonical order: kty, crv, x, y (for EC keys)
-    let kty = jwk["kty"].as_str().ok_or_else(|| {
-        PdsError::Internal("JWK missing kty field".to_string())
-    })?;
+    let kty = jwk["kty"]
+        .as_str()
+        .ok_or_else(|| PdsError::Internal("JWK missing kty field".to_string()))?;
 
-    let crv = jwk["crv"].as_str().ok_or_else(|| {
-        PdsError::Internal("JWK missing crv field".to_string())
-    })?;
+    let crv = jwk["crv"]
+        .as_str()
+        .ok_or_else(|| PdsError::Internal("JWK missing crv field".to_string()))?;
 
-    let x = jwk["x"].as_str().ok_or_else(|| {
-        PdsError::Internal("JWK missing x field".to_string())
-    })?;
+    let x = jwk["x"]
+        .as_str()
+        .ok_or_else(|| PdsError::Internal("JWK missing x field".to_string()))?;
 
-    let y = jwk["y"].as_str().ok_or_else(|| {
-        PdsError::Internal("JWK missing y field".to_string())
-    })?;
+    let y = jwk["y"]
+        .as_str()
+        .ok_or_else(|| PdsError::Internal("JWK missing y field".to_string()))?;
 
     // Create canonical JSON (RFC 7638 requires specific ordering and no whitespace)
     let canonical = format!(
@@ -444,7 +443,10 @@ mod tests {
         assert!(!valid);
 
         // Try invalid nonce (should fail)
-        let valid = store.check_and_consume_nonce("invalid-nonce").await.unwrap();
+        let valid = store
+            .check_and_consume_nonce("invalid-nonce")
+            .await
+            .unwrap();
         assert!(!valid);
     }
 
@@ -549,10 +551,7 @@ mod tests {
         let result = jwk_to_decoding_key(&jwk);
         assert!(result.is_err(), "Should fail on non-EC key type");
         if let Err(e) = result {
-            assert!(
-                e.to_string().contains("RSA"),
-                "Error should mention RSA"
-            );
+            assert!(e.to_string().contains("RSA"), "Error should mention RSA");
         }
     }
 

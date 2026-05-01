@@ -19,10 +19,8 @@ const MIN_HANDLE_LENGTH: usize = 3;
 /// Valid top-level domains (TLDs) - subset of common TLDs
 /// In production, this should be the full IANA TLD list
 const VALID_TLDS: &[&str] = &[
-    "com", "net", "org", "edu", "gov", "mil", "int",
-    "io", "ai", "dev", "app", "tech", "xyz", "me",
-    "co", "uk", "us", "ca", "de", "fr", "jp", "cn",
-    "au", "br", "in", "ru", "it", "es", "nl", "se",
+    "com", "net", "org", "edu", "gov", "mil", "int", "io", "ai", "dev", "app", "tech", "xyz", "me",
+    "co", "uk", "us", "ca", "de", "fr", "jp", "cn", "au", "br", "in", "ru", "it", "es", "nl", "se",
     "social", "online", "site", "website", "space",
 ];
 
@@ -72,9 +70,7 @@ pub fn validate_handle(handle: &str, service_domains: &[String]) -> PdsResult<St
 
     // Step 3: Check for uppercase (must be lowercase)
     if handle != normalized {
-        return Err(PdsError::Validation(
-            "Handle must be lowercase".to_string(),
-        ));
+        return Err(PdsError::Validation("Handle must be lowercase".to_string()));
     }
 
     // Step 4: Check character set (alphanumeric, hyphens, dots only)
@@ -244,8 +240,14 @@ mod tests {
 
     #[test]
     fn test_slur_detection() {
-        assert!(has_explicit_slur("admin"));
-        assert!(has_explicit_slur("system-user"));
+        // The EXPLICIT_SLURS list intentionally no longer contains system
+        // names (admin/system/root/etc.) — commit 13fa34f moved those to
+        // reserved_handles.rs where they're matched exactly instead of by
+        // substring. So `admin` / `system-user` correctly return `false`
+        // from has_explicit_slur today; reserving them is the
+        // reserved_handles module's job.
+        assert!(!has_explicit_slur("admin"));
+        assert!(!has_explicit_slur("system-user"));
         assert!(!has_explicit_slur("alice"));
         assert!(!has_explicit_slur("bob123"));
     }

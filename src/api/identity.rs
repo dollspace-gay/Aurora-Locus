@@ -67,7 +67,11 @@ pub async fn update_handle(
     }
 
     // Basic handle validation (lowercase, alphanumeric + dots/hyphens)
-    if !req.handle.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-') {
+    if !req
+        .handle
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '-')
+    {
         return Err(PdsError::Validation(
             "Handle contains invalid characters".to_string(),
         ));
@@ -75,7 +79,9 @@ pub async fn update_handle(
 
     // Check handle length (max 253 chars for DNS compatibility)
     if req.handle.len() > 253 {
-        return Err(PdsError::Validation("Handle too long (max 253 characters)".to_string()));
+        return Err(PdsError::Validation(
+            "Handle too long (max 253 characters)".to_string(),
+        ));
     }
 
     // Normalize handle to lowercase
@@ -102,19 +108,24 @@ pub async fn update_handle(
         }
 
         // Parse audit log to get last operation CID
-        let audit_log: serde_json::Value = audit_response.json().await
+        let audit_log: serde_json::Value = audit_response
+            .json()
+            .await
             .map_err(|e| PdsError::Internal(format!("Failed to parse PLC audit log: {}", e)))?;
 
         let prev_cid = if let Some(operations) = audit_log.as_array() {
             if let Some(last_op) = operations.last() {
-                last_op.get("cid")
+                last_op
+                    .get("cid")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             } else {
                 None // Genesis operation (no previous)
             }
         } else {
-            return Err(PdsError::Internal("Invalid PLC audit log format".to_string()));
+            return Err(PdsError::Internal(
+                "Invalid PLC audit log format".to_string(),
+            ));
         };
 
         // Build PLC operation for handle update
@@ -143,7 +154,9 @@ pub async fn update_handle(
 
         if !submit_response.status().is_success() {
             let status = submit_response.status();
-            let error_body = submit_response.text().await
+            let error_body = submit_response
+                .text()
+                .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(PdsError::Internal(format!(
                 "PLC directory rejected operation {}: {}",
@@ -151,7 +164,11 @@ pub async fn update_handle(
             )));
         }
 
-        tracing::info!("Successfully submitted PLC handle update for {}: {}", did, new_handle);
+        tracing::info!(
+            "Successfully submitted PLC handle update for {}: {}",
+            did,
+            new_handle
+        );
     }
 
     // Update handle via identity resolver
@@ -161,21 +178,15 @@ pub async fn update_handle(
         .await?;
 
     // Update account table with new handle
-    let old_handle = ctx.account_manager
-        .update_handle(&did, &new_handle)
-        .await?;
+    let old_handle = ctx.account_manager.update_handle(&did, &new_handle).await?;
 
     // Invalidate old handle in cache (force re-resolution)
-    ctx.identity_resolver
-        .invalidate_handle(&old_handle)
-        .await?;
+    ctx.identity_resolver.invalidate_handle(&old_handle).await?;
 
     // Emit identity event to sequencer for firehose consumers
     use crate::sequencer::events::IdentityEvent;
     let identity_event = IdentityEvent::new(did.clone(), Some(new_handle.clone()));
-    ctx.sequencer
-        .sequence_identity(identity_event)
-        .await?;
+    ctx.sequencer.sequence_identity(identity_event).await?;
 
     Ok(Json(()))
 }
@@ -317,8 +328,7 @@ pub async fn sign_plc_operation(
     // In production, extract prev CID from DID doc metadata
 
     // Build PLC operation
-    let mut builder = PlcOperationBuilder::new()
-        .did(did.clone());
+    let mut builder = PlcOperationBuilder::new().did(did.clone());
 
     // Add previous operation CID if available
     if let Some(token) = req.token {
@@ -338,9 +348,8 @@ pub async fn sign_plc_operation(
 
     // Add verification methods
     if let Some(verification_methods) = req.verification_methods {
-        let vm_json = serde_json::to_value(verification_methods).map_err(|e| {
-            PdsError::Validation(format!("Invalid verification methods: {}", e))
-        })?;
+        let vm_json = serde_json::to_value(verification_methods)
+            .map_err(|e| PdsError::Validation(format!("Invalid verification methods: {}", e)))?;
         builder = builder.verification_methods(vm_json);
     }
 
@@ -356,9 +365,8 @@ pub async fn sign_plc_operation(
     let signed_operation = signer.sign_operation(operation)?;
 
     // Convert to JSON value
-    let operation_json = serde_json::to_value(&signed_operation).map_err(|e| {
-        PdsError::Internal(format!("Failed to serialize operation: {}", e))
-    })?;
+    let operation_json = serde_json::to_value(&signed_operation)
+        .map_err(|e| PdsError::Internal(format!("Failed to serialize operation: {}", e)))?;
 
     Ok(Json(SignPlcOperationResponse {
         operation: operation_json,
@@ -394,20 +402,26 @@ pub async fn submit_plc_operation(
 
     // Check that operation contains required fields
     if !operation.is_object() {
-        return Err(PdsError::Validation("Operation must be a JSON object".to_string()));
+        return Err(PdsError::Validation(
+            "Operation must be a JSON object".to_string(),
+        ));
     }
 
     let obj = operation.as_object().unwrap();
 
     // Validate required fields
-    if !obj.contains_key("type") || obj.get("type").and_then(|v| v.as_str()) != Some("plc_operation") {
+    if !obj.contains_key("type")
+        || obj.get("type").and_then(|v| v.as_str()) != Some("plc_operation")
+    {
         return Err(PdsError::Validation(
             "Operation must have type=plc_operation".to_string(),
         ));
     }
 
     if !obj.contains_key("did") {
-        return Err(PdsError::Validation("Operation must contain 'did'".to_string()));
+        return Err(PdsError::Validation(
+            "Operation must contain 'did'".to_string(),
+        ));
     }
 
     if !obj.contains_key("sig") {
@@ -441,7 +455,10 @@ pub async fn submit_plc_operation(
     // Check response status
     if !response.status().is_success() {
         let status = response.status();
-        let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
         return Err(PdsError::Internal(format!(
             "PLC directory returned error {}: {}",
             status, error_body
@@ -499,9 +516,10 @@ pub async fn request_plc_operation_signature(
     }
 
     // Parse response to extract token (last operation CID)
-    let audit_log: serde_json::Value = response.json().await.map_err(|e| {
-        PdsError::Internal(format!("Failed to parse PLC response: {}", e))
-    })?;
+    let audit_log: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| PdsError::Internal(format!("Failed to parse PLC response: {}", e)))?;
 
     // Extract the last operation CID as token
     let token = if let Some(operations) = audit_log.as_array() {
@@ -509,9 +527,7 @@ pub async fn request_plc_operation_signature(
             if let Some(cid) = last_op.get("cid").and_then(|v| v.as_str()) {
                 cid.to_string()
             } else {
-                return Err(PdsError::Internal(
-                    "PLC audit log missing CID".to_string(),
-                ));
+                return Err(PdsError::Internal("PLC audit log missing CID".to_string()));
             }
         } else {
             // No previous operations, return empty token (genesis operation)
@@ -562,12 +578,20 @@ mod tests {
     #[test]
     fn test_handle_validation() {
         // Valid handles
-        assert!("alice.bsky.social".chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-'));
-        assert!("bob-test.com".chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-'));
+        assert!("alice.bsky.social"
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '-'));
+        assert!("bob-test.com"
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '-'));
 
         // Invalid handles
-        assert!(!"alice@test.com".chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-'));
-        assert!(!"alice test".chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-'));
+        assert!(!"alice@test.com"
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '-'));
+        assert!(!"alice test"
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '-'));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 /// Federation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[allow(dead_code)] // Future federation configuration
+#[allow(dead_code)] // Future federation configuration
 pub struct FederationConfig {
     /// Enable federation features
     pub enabled: bool,
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn test_federation_config_default() {
         let config = FederationConfig::default();
-        assert_eq!(config.enabled, false);
+        assert!(!config.enabled);
         assert_eq!(config.max_concurrent_requests, 10);
         assert_eq!(config.request_timeout, 30);
     }
@@ -117,10 +117,13 @@ mod tests {
     fn test_federation_config_from_env() {
         std::env::set_var("FEDERATION_ENABLED", "true");
         std::env::set_var("PDS_SERVICE_DID", "did:plc:test123");
-        std::env::set_var("FEDERATION_RELAY_SERVERS", "https://relay1.com,https://relay2.com");
+        std::env::set_var(
+            "FEDERATION_RELAY_SERVERS",
+            "https://relay1.com,https://relay2.com",
+        );
 
         let config = FederationConfig::from_env();
-        assert_eq!(config.enabled, true);
+        assert!(config.enabled);
         assert_eq!(config.service_did, "did:plc:test123");
         assert_eq!(config.relay_servers.len(), 2);
 

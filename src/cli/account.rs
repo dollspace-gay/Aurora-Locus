@@ -2,10 +2,7 @@
 //!
 //! Provides command-line tools for account creation and management.
 
-use crate::{
-    context::AppContext,
-    error::PdsResult,
-};
+use crate::{context::AppContext, error::PdsResult};
 
 /// Create a new account via CLI
 pub async fn create_account(
@@ -55,8 +52,12 @@ pub async fn create_account(
     }
     println!("════════════════════════════════════════════════════════\n");
 
-    // Generate and send verification email if email is configured
-    if ctx.mailer.is_configured() && account.email.is_some() {
+    // Generate and send verification email if email is configured.
+    if let Some(email_addr) = account
+        .email
+        .as_deref()
+        .filter(|_| ctx.mailer.is_configured())
+    {
         println!("📧 Generating email verification token...");
 
         let token = ctx
@@ -69,14 +70,14 @@ pub async fn create_account(
         println!("📤 Sending verification email...");
         ctx.mailer
             .send_verification_email(
-                account.email.as_ref().unwrap(),
+                email_addr,
                 account.handle.as_deref().unwrap_or(&account.did),
                 &token,
                 &base_url,
             )
             .await?;
 
-        println!("✓ Verification email sent to {}", account.email.as_ref().unwrap());
+        println!("✓ Verification email sent to {}", email_addr);
         println!("\n⚠️  Please check your email to verify your account.");
     } else if !ctx.mailer.is_configured() {
         println!("⚠️  Email not configured - verification email not sent");

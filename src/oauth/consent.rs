@@ -276,9 +276,8 @@ pub async fn grant_authorization(
     );
 
     // Build redirect URL with code + state
-    let mut redirect_url = url::Url::parse(&request.redirect_uri).map_err(|e| {
-        PdsError::Internal(format!("Invalid redirect_uri in request: {}", e))
-    })?;
+    let mut redirect_url = url::Url::parse(&request.redirect_uri)
+        .map_err(|e| PdsError::Internal(format!("Invalid redirect_uri in request: {}", e)))?;
 
     // Add code parameter
     redirect_url
@@ -329,15 +328,17 @@ pub async fn deny_authorization(
     .await?;
 
     if result.rows_affected() == 0 {
-        warn!("Authorization request not found for deletion: {}", form.request_id);
+        warn!(
+            "Authorization request not found for deletion: {}",
+            form.request_id
+        );
     }
 
     debug!("Deleted authorization request: {}", form.request_id);
 
     // Build redirect URL with error
-    let mut redirect_url = url::Url::parse(&request.redirect_uri).map_err(|e| {
-        PdsError::Internal(format!("Invalid redirect_uri in request: {}", e))
-    })?;
+    let mut redirect_url = url::Url::parse(&request.redirect_uri)
+        .map_err(|e| PdsError::Internal(format!("Invalid redirect_uri in request: {}", e)))?;
 
     // Add error parameter (per OAuth 2.1 spec)
     redirect_url
@@ -389,7 +390,10 @@ pub async fn mark_code_as_used(ctx: &AppContext, authorization_code: &str) -> Pd
         ));
     }
 
-    debug!("Marked authorization code as used: {}", &authorization_code[..8]);
+    debug!(
+        "Marked authorization code as used: {}",
+        &authorization_code[..8]
+    );
 
     Ok(())
 }

@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 pub struct CommitEvent {
     pub rebase: bool,
     pub too_big: bool,
-    pub repo: String,       // DID
-    pub commit: String,     // CID of commit
-    pub rev: String,        // Revision TID
+    pub repo: String,          // DID
+    pub commit: String,        // CID of commit
+    pub rev: String,           // Revision TID
     pub since: Option<String>, // Previous commit CID
-    pub blocks: Vec<u8>,    // CAR file bytes
+    pub blocks: Vec<u8>,       // CAR file bytes
     pub ops: Vec<CommitOp>,
     pub blobs: Vec<String>, // CIDs of blobs (deprecated but included)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,7 +23,7 @@ pub struct CommitEvent {
 #[serde(rename_all = "camelCase")]
 pub struct CommitOp {
     pub action: OpAction,
-    pub path: String,       // collection/rkey
+    pub path: String,        // collection/rkey
     pub cid: Option<String>, // CID of record (null for delete)
 }
 
@@ -45,8 +45,8 @@ pub enum OpAction {
 #[serde(rename_all = "camelCase")]
 pub struct SyncEvent {
     pub did: String,
-    pub rev: String,        // Revision TID
-    pub blocks: Vec<u8>,    // CAR file with only commit block
+    pub rev: String,     // Revision TID
+    pub blocks: Vec<u8>, // CAR file with only commit block
 }
 
 /// Identity event - emitted when handle changes
@@ -122,6 +122,10 @@ impl AccountEvent {
     /// Create a new account event
     #[allow(dead_code)] // Will be used when implementing account events
     pub fn new(did: String, active: bool, status: Option<AccountStatus>) -> Self {
-        Self { did, active, status }
+        Self {
+            did,
+            active,
+            status,
+        }
     }
 }

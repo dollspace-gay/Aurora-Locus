@@ -40,7 +40,7 @@ pub fn routes() -> Router<AppContext> {
         .merge(health::routes())
         .merge(federation::routes())
         .merge(temp::routes())
-        .merge(appview::routes())  // AppView proxy with read-after-write
+        .merge(appview::routes()) // AppView proxy with read-after-write
         // OAuth admin routes with their own state
         .merge(oauth_admin::routes(oauth_state_store))
         // OAuth server routes (for third-party app authorization)

@@ -1,11 +1,6 @@
 /// Admin API Endpoints
 /// Implements com.atproto.admin.* endpoints for server administration
-use crate::{
-    admin::InviteCode,
-    auth::AdminAuthContext,
-    error::PdsError,
-    AppContext,
-};
+use crate::{admin::InviteCode, auth::AdminAuthContext, error::PdsError, AppContext};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -23,78 +18,213 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
         .route("/xrpc/com.atproto.admin.listAccounts", get(get_users)) // Alias for frontend compatibility
         .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
-        .route("/xrpc/com.atproto.admin.getAccountInfos", get(get_account_infos))
-        .route("/xrpc/com.atproto.admin.updateSubjectStatus", post(update_subject_status))
-        .route("/xrpc/com.atproto.admin.getSubjectStatus", get(get_subject_status))
+        .route(
+            "/xrpc/com.atproto.admin.getAccountInfos",
+            get(get_account_infos),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.updateSubjectStatus",
+            post(update_subject_status),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getSubjectStatus",
+            get(get_subject_status),
+        )
         // Invite codes
-        .route("/xrpc/com.atproto.admin.createInviteCode", post(create_invite_code))
-        .route("/xrpc/com.atproto.admin.getInviteCodes", get(get_invite_codes))
-        .route("/xrpc/com.atproto.admin.listInviteCodes", get(list_invite_codes))
-        .route("/xrpc/com.atproto.admin.disableInviteCode", post(disable_invite_code))
-        .route("/xrpc/com.atproto.admin.enableAccountInvites", post(enable_account_invites))
-        .route("/xrpc/com.atproto.admin.disableAccountInvites", post(disable_account_invites))
+        .route(
+            "/xrpc/com.atproto.admin.createInviteCode",
+            post(create_invite_code),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getInviteCodes",
+            get(get_invite_codes),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.listInviteCodes",
+            get(list_invite_codes),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.disableInviteCode",
+            post(disable_invite_code),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.enableAccountInvites",
+            post(enable_account_invites),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.disableAccountInvites",
+            post(disable_account_invites),
+        )
         // Role management
         .route("/xrpc/com.atproto.admin.grantRole", post(grant_role))
         .route("/xrpc/com.atproto.admin.revokeRole", post(revoke_role))
         .route("/xrpc/com.atproto.admin.listRoles", get(list_roles))
         // Account management
-        .route("/xrpc/com.atproto.admin.updateAccountEmail", post(update_account_email))
-        .route("/xrpc/com.atproto.admin.updateAccountHandle", post(update_account_handle))
-        .route("/xrpc/com.atproto.admin.updateAccountPassword", post(update_account_password))
-        .route("/xrpc/com.atproto.admin.deleteAccount", post(admin_delete_account))
+        .route(
+            "/xrpc/com.atproto.admin.updateAccountEmail",
+            post(update_account_email),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.updateAccountHandle",
+            post(update_account_handle),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.updateAccountPassword",
+            post(update_account_password),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.deleteAccount",
+            post(admin_delete_account),
+        )
         // Account moderation
-        .route("/xrpc/com.atproto.admin.takedownAccount", post(takedown_account))
-        .route("/xrpc/com.atproto.admin.suspendAccount", post(suspend_account))
-        .route("/xrpc/com.atproto.admin.restoreAccount", post(restore_account))
-        .route("/xrpc/com.atproto.admin.getModerationHistory", get(get_moderation_history))
-        .route("/xrpc/com.atproto.admin.getModerationQueue", get(get_moderation_queue))
+        .route(
+            "/xrpc/com.atproto.admin.takedownAccount",
+            post(takedown_account),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.suspendAccount",
+            post(suspend_account),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.restoreAccount",
+            post(restore_account),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getModerationHistory",
+            get(get_moderation_history),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getModerationQueue",
+            get(get_moderation_queue),
+        )
         // Labels
         .route("/xrpc/com.atproto.admin.applyLabel", post(apply_label))
         .route("/xrpc/com.atproto.admin.removeLabel", post(remove_label))
         // Reports
         .route("/xrpc/com.atproto.admin.submitReport", post(submit_report))
-        .route("/xrpc/com.atproto.admin.updateReportStatus", post(update_report_status))
+        .route(
+            "/xrpc/com.atproto.admin.updateReportStatus",
+            post(update_report_status),
+        )
         .route("/xrpc/com.atproto.admin.listReports", get(list_reports))
         // Email
         .route("/xrpc/com.atproto.admin.sendEmail", post(send_email))
         // Audit logs
         .route("/xrpc/com.atproto.admin.getAuditLog", get(get_audit_log))
         // Validation failures
-        .route("/xrpc/com.atproto.admin.getValidationFailures", get(get_validation_failures))
+        .route(
+            "/xrpc/com.atproto.admin.getValidationFailures",
+            get(get_validation_failures),
+        )
         // System health and diagnostics
-        .route("/xrpc/com.atproto.admin.getSystemHealth", get(get_system_health))
-        .route("/xrpc/com.atproto.admin.getDatabaseStatus", get(get_database_status))
-        .route("/xrpc/com.atproto.admin.getResourceUsage", get(get_resource_usage))
-        .route("/xrpc/com.atproto.admin.listBackgroundJobs", get(list_background_jobs))
-        .route("/xrpc/com.atproto.admin.runHealthChecks", get(run_health_checks))
-        .route("/xrpc/com.atproto.admin.getVersionInfo", get(get_version_info))
-        .route("/xrpc/com.atproto.admin.getSystemMetrics", get(get_system_metrics))
+        .route(
+            "/xrpc/com.atproto.admin.getSystemHealth",
+            get(get_system_health),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getDatabaseStatus",
+            get(get_database_status),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getResourceUsage",
+            get(get_resource_usage),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.listBackgroundJobs",
+            get(list_background_jobs),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.runHealthChecks",
+            get(run_health_checks),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getVersionInfo",
+            get(get_version_info),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getSystemMetrics",
+            get(get_system_metrics),
+        )
         // Blob storage management
-        .route("/xrpc/com.atproto.admin.getBlobStatistics", get(get_blob_statistics))
+        .route(
+            "/xrpc/com.atproto.admin.getBlobStatistics",
+            get(get_blob_statistics),
+        )
         .route("/xrpc/com.atproto.admin.listBlobs", get(list_blobs))
         .route("/xrpc/com.atproto.admin.deleteBlob", post(delete_blob))
-        .route("/xrpc/com.atproto.admin.quarantineBlob", post(quarantine_blob))
+        .route(
+            "/xrpc/com.atproto.admin.quarantineBlob",
+            post(quarantine_blob),
+        )
         .route("/xrpc/com.atproto.admin.restoreBlob", post(restore_blob))
         .route("/xrpc/com.atproto.admin.runBlobGC", post(run_blob_gc))
-        .route("/xrpc/com.atproto.admin.getBlobQuotas", get(get_blob_quotas))
+        .route(
+            "/xrpc/com.atproto.admin.getBlobQuotas",
+            get(get_blob_quotas),
+        )
         // Sequencer management
-        .route("/xrpc/com.atproto.admin.getSequencerStatus", get(get_sequencer_status))
-        .route("/xrpc/com.atproto.admin.pauseSequencer", post(pause_sequencer))
-        .route("/xrpc/com.atproto.admin.resumeSequencer", post(resume_sequencer))
-        .route("/xrpc/com.atproto.admin.listRecentEvents", get(list_recent_events))
-        .route("/xrpc/com.atproto.admin.resetSequencerCursor", post(reset_sequencer_cursor))
-        .route("/xrpc/com.atproto.admin.rebuildSequencer", post(rebuild_sequencer))
+        .route(
+            "/xrpc/com.atproto.admin.getSequencerStatus",
+            get(get_sequencer_status),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.pauseSequencer",
+            post(pause_sequencer),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.resumeSequencer",
+            post(resume_sequencer),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.listRecentEvents",
+            get(list_recent_events),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.resetSequencerCursor",
+            post(reset_sequencer_cursor),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.rebuildSequencer",
+            post(rebuild_sequencer),
+        )
         // Rate limiting management
-        .route("/xrpc/com.atproto.admin.getRateLimitConfig", get(get_rate_limit_config))
-        .route("/xrpc/com.atproto.admin.getRateLimitStatus", get(get_rate_limit_status))
-        .route("/xrpc/com.atproto.admin.cleanupRateLimitState", post(cleanup_rate_limit_state))
+        .route(
+            "/xrpc/com.atproto.admin.getRateLimitConfig",
+            get(get_rate_limit_config),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getRateLimitStatus",
+            get(get_rate_limit_status),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.cleanupRateLimitState",
+            post(cleanup_rate_limit_state),
+        )
         // Federation and relay management
-        .route("/xrpc/com.atproto.admin.getFederationStatus", get(get_federation_status))
-        .route("/xrpc/com.atproto.admin.getRelayConfig", get(get_relay_config))
-        .route("/xrpc/com.atproto.admin.listKnownInstances", get(list_known_instances))
-        .route("/xrpc/com.atproto.admin.triggerPdsDiscovery", post(trigger_pds_discovery))
-        .route("/xrpc/com.atproto.admin.getNonceStoreStatus", get(get_nonce_store_status))
-        .route("/xrpc/com.atproto.admin.cleanupNonceStores", post(cleanup_nonce_stores))
+        .route(
+            "/xrpc/com.atproto.admin.getFederationStatus",
+            get(get_federation_status),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getRelayConfig",
+            get(get_relay_config),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.listKnownInstances",
+            get(list_known_instances),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.triggerPdsDiscovery",
+            post(trigger_pds_discovery),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getNonceStoreStatus",
+            get(get_nonce_store_status),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.cleanupNonceStores",
+            post(cleanup_nonce_stores),
+        )
 }
 
 // ============================================================================
@@ -121,12 +251,19 @@ async fn create_invite_code(
 
     let code = ctx
         .invite_manager
-        .create_invite(&auth.did, uses, expires_in, req.note.clone(), req.for_account.clone())
+        .create_invite(
+            &auth.did,
+            uses,
+            expires_in,
+            req.note.clone(),
+            req.for_account.clone(),
+        )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log the action
-    let _ = ctx.admin_role_manager
+    let _ = ctx
+        .admin_role_manager
         .log_action(&auth.did, "invite.create", None, Some(&code.code), None)
         .await;
 
@@ -190,7 +327,10 @@ async fn list_invite_codes(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(ListInviteCodesResponse { codes, cursor: None }))
+    Ok(Json(ListInviteCodesResponse {
+        codes,
+        cursor: None,
+    }))
 }
 
 /// Get server statistics
@@ -198,7 +338,6 @@ async fn get_stats(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-
     // Get statistics from database
     let total_users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account")
         .fetch_one(&ctx.account_db)
@@ -209,19 +348,17 @@ async fn get_stats(
     // Set to 0 for now, can be improved later
     let total_posts: i64 = 0;
 
-    let active_sessions: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')"
-    )
-    .fetch_one(&ctx.account_db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let active_sessions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')")
+            .fetch_one(&ctx.account_db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let pending_reports: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM report WHERE status = 'open'"
-    )
-    .fetch_one(&ctx.account_db)
-    .await
-    .unwrap_or(0);
+    let pending_reports: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM report WHERE status = 'open'")
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap_or(0);
 
     Ok(Json(serde_json::json!({
         "totalUsers": total_users,
@@ -243,7 +380,6 @@ async fn get_users(
     _auth: AdminAuthContext,
     Query(params): Query<GetUsersParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-
     let limit = params.limit.unwrap_or(50).min(100);
 
     // Status is computed from actor state:
@@ -256,30 +392,26 @@ async fn get_users(
         ELSE 'active' END";
 
     let users: Vec<serde_json::Value> = if let Some(cursor) = params.cursor {
-        sqlx::query_as::<_, (String, String, Option<String>, String, String)>(
-            &format!(
-                "SELECT a.did, a.handle, ac.email, a.created_at, {} as status \
+        sqlx::query_as::<_, (String, String, Option<String>, String, String)>(&format!(
+            "SELECT a.did, a.handle, ac.email, a.created_at, {} as status \
                  FROM actor a \
                  LEFT JOIN account ac ON a.did = ac.did \
                  WHERE a.did > ? ORDER BY a.did LIMIT ?",
-                status_expr
-            )
-        )
+            status_expr
+        ))
         .bind(cursor)
         .bind(limit)
         .fetch_all(&ctx.account_db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
-        sqlx::query_as::<_, (String, String, Option<String>, String, String)>(
-            &format!(
-                "SELECT a.did, a.handle, ac.email, a.created_at, {} as status \
+        sqlx::query_as::<_, (String, String, Option<String>, String, String)>(&format!(
+            "SELECT a.did, a.handle, ac.email, a.created_at, {} as status \
                  FROM actor a \
                  LEFT JOIN account ac ON a.did = ac.did \
                  ORDER BY a.did LIMIT ?",
-                status_expr
-            )
-        )
+            status_expr
+        ))
         .bind(limit)
         .fetch_all(&ctx.account_db)
         .await
@@ -297,7 +429,10 @@ async fn get_users(
     })
     .collect();
 
-    let cursor = users.last().and_then(|u| u.get("did")).and_then(|d| d.as_str());
+    let cursor = users
+        .last()
+        .and_then(|u| u.get("did"))
+        .and_then(|d| d.as_str());
 
     Ok(Json(serde_json::json!({
         "users": users,
@@ -330,14 +465,22 @@ async fn grant_role(
         .map_err(|e: PdsError| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     // Grant role
-    let admin_role = ctx.admin_role_manager
+    let admin_role = ctx
+        .admin_role_manager
         .grant_role(&req.did, role, &auth.did, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
-        .log_action(&auth.did, "role.grant", Some(&req.did), Some(&req.role), None)
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "role.grant",
+            Some(&req.did),
+            Some(&req.role),
+            None,
+        )
         .await;
 
     Ok(Json(serde_json::json!({
@@ -368,8 +511,15 @@ async fn revoke_role(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
-        .log_action(&auth.did, "role.revoke", Some(&req.did), req.reason.as_deref(), None)
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "role.revoke",
+            Some(&req.did),
+            req.reason.as_deref(),
+            None,
+        )
         .await;
 
     Ok(Json(serde_json::json!({
@@ -391,7 +541,8 @@ async fn list_roles(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if let Some(did) = query.did {
         // Get role for specific user
-        let role_record = ctx.admin_role_manager
+        let role_record = ctx
+            .admin_role_manager
             .get_role(&did)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -402,7 +553,8 @@ async fn list_roles(
         })))
     } else {
         // List all active role assignments
-        let assignments = ctx.admin_role_manager
+        let assignments = ctx
+            .admin_role_manager
             .list_active_roles()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -446,7 +598,10 @@ async fn update_account_email(
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
-                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Account not found: {}", req.did),
+                )
             } else if matches!(e, PdsError::Validation(_)) {
                 (StatusCode::CONFLICT, e.to_string())
             } else {
@@ -485,12 +640,16 @@ async fn update_account_handle(
         return Err((StatusCode::BAD_REQUEST, "Invalid handle format".to_string()));
     }
 
-    let new_handle = ctx.account_manager
+    let new_handle = ctx
+        .account_manager
         .update_handle(&req.did, &req.handle)
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
-                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Account not found: {}", req.did),
+                )
             } else if matches!(e, PdsError::Validation(_)) {
                 (StatusCode::CONFLICT, e.to_string())
             } else {
@@ -526,7 +685,10 @@ async fn update_account_password(
 
     // Validate password (minimum length)
     if req.password.len() < 8 {
-        return Err((StatusCode::BAD_REQUEST, "Password must be at least 8 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Password must be at least 8 characters".to_string(),
+        ));
     }
 
     ctx.account_manager
@@ -534,7 +696,10 @@ async fn update_account_password(
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
-                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Account not found: {}", req.did),
+                )
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
@@ -569,7 +734,10 @@ async fn admin_delete_account(
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
-                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Account not found: {}", req.did),
+                )
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
@@ -603,7 +771,8 @@ async fn takedown_account(
     use crate::admin::moderation::{ApplyActionParams, ModerationAction};
 
     // Apply takedown action
-    let record = ctx.moderation_manager
+    let record = ctx
+        .moderation_manager
         .apply_action(ApplyActionParams {
             did: &req.did,
             action: ModerationAction::Takedown,
@@ -617,8 +786,15 @@ async fn takedown_account(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
-        .log_action(&auth.did, "account.takedown", Some(&req.did), Some(&req.reason), None)
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "account.takedown",
+            Some(&req.did),
+            Some(&req.reason),
+            None,
+        )
         .await;
 
     Ok(Json(serde_json::json!({
@@ -650,7 +826,8 @@ async fn suspend_account(
     let expires_in = req.duration_days.map(Duration::days);
 
     // Apply suspension
-    let record = ctx.moderation_manager
+    let record = ctx
+        .moderation_manager
         .apply_action(ApplyActionParams {
             did: &req.did,
             action: ModerationAction::Suspend,
@@ -664,8 +841,15 @@ async fn suspend_account(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
-        .log_action(&auth.did, "account.suspend", Some(&req.did), Some(&req.reason), None)
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "account.suspend",
+            Some(&req.did),
+            Some(&req.reason),
+            None,
+        )
         .await;
 
     Ok(Json(serde_json::json!({
@@ -697,8 +881,15 @@ async fn restore_account(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
-        .log_action(&auth.did, "account.restore", Some(&req.did), Some(&req.reason), None)
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "account.restore",
+            Some(&req.did),
+            Some(&req.reason),
+            None,
+        )
         .await;
 
     Ok(Json(serde_json::json!({
@@ -718,7 +909,8 @@ async fn get_moderation_history(
     _auth: AdminAuthContext,
     Query(query): Query<GetModerationHistoryQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let history = ctx.moderation_manager
+    let history = ctx
+        .moderation_manager
         .get_history(&query.did)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -751,7 +943,8 @@ async fn apply_label(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let expires_in = req.expires_days.map(Duration::days);
 
-    let label = ctx.label_manager
+    let label = ctx
+        .label_manager
         .apply_label(
             &req.uri,
             req.cid.as_deref(),
@@ -763,8 +956,15 @@ async fn apply_label(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
-        .log_action(&auth.did, "label.apply", None, Some(&req.val), Some(&req.uri))
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "label.apply",
+            None,
+            Some(&req.val),
+            Some(&req.uri),
+        )
         .await;
 
     Ok(Json(serde_json::json!({
@@ -787,19 +987,22 @@ async fn remove_label(
     auth: AdminAuthContext,
     Json(req): Json<RemoveLabelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let label = ctx.label_manager
-        .remove_label(
-            &req.uri,
-            req.cid.as_deref(),
-            &req.val,
-            &auth.did,
-        )
+    let label = ctx
+        .label_manager
+        .remove_label(&req.uri, req.cid.as_deref(), &req.val, &auth.did)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
-        .log_action(&auth.did, "label.remove", None, Some(&req.val), Some(&req.uri))
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "label.remove",
+            None,
+            Some(&req.val),
+            Some(&req.uri),
+        )
         .await;
 
     Ok(Json(serde_json::json!({
@@ -840,7 +1043,8 @@ async fn submit_report(
         .map_err(|e: PdsError| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     // Submit report
-    let report = ctx.report_manager
+    let report = ctx
+        .report_manager
         .submit_report(
             req.subject_did.as_deref(),
             req.subject_uri.as_deref(),
@@ -882,17 +1086,13 @@ async fn update_report_status(
 
     // Update status
     ctx.report_manager
-        .update_status(
-            req.report_id,
-            status,
-            &auth.did,
-            req.resolution.as_deref(),
-        )
+        .update_status(req.report_id, status, &auth.did, req.resolution.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
+    let _ = ctx
+        .admin_role_manager
         .log_action(&auth.did, "report.update", None, Some(&req.status), None)
         .await;
 
@@ -921,15 +1121,18 @@ async fn list_reports(
 
     // Parse status filter if provided
     let status_filter = if let Some(status_str) = query.status {
-        Some(status_str
-            .parse::<ReportStatus>()
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?)
+        Some(
+            status_str
+                .parse::<ReportStatus>()
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
+        )
     } else {
         None
     };
 
     // List reports
-    let reports = ctx.report_manager
+    let reports = ctx
+        .report_manager
         .list_reports(status_filter, query.limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -976,24 +1179,35 @@ async fn send_email(
     Json(req): Json<SendEmailRequest>,
 ) -> Result<Json<SendEmailResponse>, (StatusCode, String)> {
     // Get the recipient account to find their email
-    let account = ctx.account_manager
+    let account = ctx
+        .account_manager
         .get_account(&req.recipient_did)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("Account not found: {}", e)))?;
 
     // Check if account has email
-    let to_email = account.email
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Account has no email address".to_string()))?;
+    let to_email = account.email.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Account has no email address".to_string(),
+        )
+    })?;
 
     // Send the email
     ctx.mailer
         .send_admin_email(&to_email, &req.subject, &req.content)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send email: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to send email: {}", e),
+            )
+        })?;
 
     // Log the action
     let sender = req.sender_did.as_deref().unwrap_or(&auth.did);
-    let _ = ctx.admin_role_manager
+    let _ = ctx
+        .admin_role_manager
         .log_action(
             sender,
             "email.send",
@@ -1077,7 +1291,8 @@ async fn get_audit_log(
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
 
     // Get audit log entries
-    let entries = ctx.admin_role_manager
+    let entries = ctx
+        .admin_role_manager
         .get_audit_logs(
             query.admin_did.as_deref(),
             query.action.as_deref(),
@@ -1089,7 +1304,8 @@ async fn get_audit_log(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Get total count
-    let total_count = ctx.admin_role_manager
+    let total_count = ctx
+        .admin_role_manager
         .get_audit_log_count()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1141,7 +1357,8 @@ async fn get_account(
     _auth: AdminAuthContext,
     Query(query): Query<GetAccountQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let account = ctx.account_manager
+    let account = ctx
+        .account_manager
         .get_account(&query.did)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("Account not found: {}", e)))?;
@@ -1225,7 +1442,12 @@ async fn get_account_infos(
     Query(query): Query<GetAccountInfosQuery>,
 ) -> Result<Json<GetAccountInfosResponse>, (StatusCode, String)> {
     // Parse the comma-separated DIDs
-    let dids: Vec<&str> = query.dids.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let dids: Vec<&str> = query
+        .dids
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     if dids.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "No DIDs provided".to_string()));
@@ -1234,7 +1456,10 @@ async fn get_account_infos(
     // Limit batch size to prevent abuse
     const MAX_BATCH_SIZE: usize = 100;
     if dids.len() > MAX_BATCH_SIZE {
-        return Err((StatusCode::BAD_REQUEST, format!("Too many DIDs (max {})", MAX_BATCH_SIZE)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Too many DIDs (max {})", MAX_BATCH_SIZE),
+        ));
     }
 
     let mut infos = Vec::new();
@@ -1252,7 +1477,8 @@ async fn get_account_infos(
         };
 
         // Get invite code that was used to create this account (if any)
-        let invited_by = ctx.invite_manager
+        let invited_by = ctx
+            .invite_manager
             .get_invite_for_account(did)
             .await
             .ok()
@@ -1268,22 +1494,26 @@ async fn get_account_infos(
             });
 
         // Get invite codes created by this account
-        let account_invites = ctx.invite_manager
+        let account_invites = ctx
+            .invite_manager
             .get_codes_created_by(did)
             .await
             .unwrap_or_default();
 
-        let invites: Vec<InviteCodeInfo> = account_invites.into_iter().map(|inv| {
-            InviteCodeInfo {
-                code: inv.code.clone(),
-                available: inv.available,
-                disabled: inv.disabled,
-                for_account: inv.for_account.clone().unwrap_or_default(),
-                created_by: inv.created_by.clone(),
-                created_at: inv.created_at.to_rfc3339(),
-                uses: vec![], // Uses would need separate query
-            }
-        }).collect();
+        let invites: Vec<InviteCodeInfo> = account_invites
+            .into_iter()
+            .map(|inv| {
+                InviteCodeInfo {
+                    code: inv.code.clone(),
+                    available: inv.available,
+                    disabled: inv.disabled,
+                    for_account: inv.for_account.clone().unwrap_or_default(),
+                    created_by: inv.created_by.clone(),
+                    created_at: inv.created_at.to_rfc3339(),
+                    uses: vec![], // Uses would need separate query
+                }
+            })
+            .collect();
 
         infos.push(AccountInfo {
             did: account.did.clone(),
@@ -1332,7 +1562,10 @@ async fn update_subject_status(
             .unwrap_or("")
             .to_string()
     } else {
-        return Err((StatusCode::BAD_REQUEST, "Invalid subject format".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid subject format".to_string(),
+        ));
     };
 
     let action = match req.action.as_str() {
@@ -1452,30 +1685,37 @@ async fn get_subject_status(
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid AT-URI format".to_string()))?
             .to_string();
         if !did.starts_with("did:") {
-            return Err((StatusCode::BAD_REQUEST, "AT-URI must contain a DID".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "AT-URI must contain a DID".to_string(),
+            ));
         }
         ("com.atproto.repo.strongRef", did, Some(uri_str.clone()))
     } else if let Some(ref _blob_cid) = query.blob {
         // Blob query - not yet implemented
-        return Err((StatusCode::NOT_IMPLEMENTED, "Blob status queries not yet implemented".to_string()));
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "Blob status queries not yet implemented".to_string(),
+        ));
     } else {
-        return Err((StatusCode::BAD_REQUEST, "Must provide did, uri, or blob parameter".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Must provide did, uri, or blob parameter".to_string(),
+        ));
     };
 
     // Get account info from account manager
-    let account = ctx.account_manager
-        .get_account(&did)
-        .await
-        .map_err(|e| {
-            if matches!(e, PdsError::NotFound(_)) {
-                (StatusCode::NOT_FOUND, format!("Subject not found: {}", did))
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            }
-        })?;
+    let account = ctx.account_manager.get_account(&did).await.map_err(|e| {
+        if matches!(e, PdsError::NotFound(_)) {
+            (StatusCode::NOT_FOUND, format!("Subject not found: {}", did))
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    })?;
 
     // Check moderation status
-    let is_suspended = ctx.moderation_manager
+    let is_suspended = ctx
+        .moderation_manager
         .is_suspended(&did)
         .await
         .unwrap_or(false);
@@ -1483,7 +1723,11 @@ async fn get_subject_status(
     // Build response
     let subject = SubjectRef {
         type_field: subject_type.to_string(),
-        did: if query.did.is_some() { Some(did.clone()) } else { None },
+        did: if query.did.is_some() {
+            Some(did.clone())
+        } else {
+            None
+        },
         uri,
         cid: None,
     };
@@ -1503,7 +1747,9 @@ async fn get_subject_status(
     let deactivated = if account.deactivated_at.is_some() {
         Some(StatusAttr {
             applied: true,
-            ref_field: account.deactivated_at.map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339()),
+            ref_field: account
+                .deactivated_at
+                .map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339()),
         })
     } else {
         Some(StatusAttr {
@@ -1547,7 +1793,8 @@ async fn get_moderation_queue(
     use crate::admin::reports::ReportStatus;
 
     // Get open reports as the moderation queue
-    let reports = ctx.report_manager
+    let reports = ctx
+        .report_manager
         .list_reports(Some(ReportStatus::Open), query.limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1602,7 +1849,10 @@ async fn enable_account_invites(
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
-                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Account not found: {}", req.did),
+                )
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
@@ -1631,7 +1881,10 @@ async fn disable_account_invites(
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
-                (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Account not found: {}", req.did),
+                )
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
@@ -1745,7 +1998,7 @@ async fn get_database_status(
         .unwrap_or(0);
 
     let session_count = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')"
+        "SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')",
     )
     .fetch_one(&ctx.account_db)
     .await
@@ -1781,20 +2034,20 @@ async fn get_resource_usage(
 
     // Extract process metrics
     for mf in &metric_families {
-        match mf.get_name() {
+        match mf.name() {
             "process_resident_memory_bytes" => {
                 if let Some(m) = mf.get_metric().first() {
-                    memory_bytes = Some(m.get_gauge().get_value());
+                    memory_bytes = Some(m.get_gauge().value());
                 }
             }
             "process_cpu_seconds_total" => {
                 if let Some(m) = mf.get_metric().first() {
-                    cpu_seconds_total = Some(m.get_counter().get_value());
+                    cpu_seconds_total = Some(m.get_counter().value());
                 }
             }
             "process_open_fds" => {
                 if let Some(m) = mf.get_metric().first() {
-                    open_fds = Some(m.get_gauge().get_value());
+                    open_fds = Some(m.get_gauge().value());
                 }
             }
             _ => {}
@@ -1830,26 +2083,28 @@ async fn list_background_jobs(
     let mut job_stats = std::collections::HashMap::new();
 
     for mf in &metric_families {
-        if mf.get_name() == "background_jobs_total" {
+        if mf.name() == "background_jobs_total" {
             for metric in mf.get_metric() {
                 let mut job_type = "unknown";
                 let mut status = "unknown";
 
                 for label in metric.get_label() {
-                    if label.get_name() == "job_type" {
-                        job_type = label.get_value();
-                    } else if label.get_name() == "status" {
-                        status = label.get_value();
+                    if label.name() == "job_type" {
+                        job_type = label.value();
+                    } else if label.name() == "status" {
+                        status = label.value();
                     }
                 }
 
-                let count = metric.get_counter().get_value() as i64;
-                let entry = job_stats.entry(job_type).or_insert_with(|| serde_json::json!({
-                    "type": job_type,
-                    "success": 0,
-                    "failure": 0,
-                    "total": 0,
-                }));
+                let count = metric.get_counter().value() as i64;
+                let entry = job_stats.entry(job_type).or_insert_with(|| {
+                    serde_json::json!({
+                        "type": job_type,
+                        "success": 0,
+                        "failure": 0,
+                        "total": 0,
+                    })
+                });
 
                 if let Some(obj) = entry.as_object_mut() {
                     obj["total"] = serde_json::json!(obj["total"].as_i64().unwrap_or(0) + count);
@@ -1990,35 +2245,35 @@ async fn get_system_metrics(
     let mut relay_events_total: i64 = 0;
 
     for mf in &metric_families {
-        match mf.get_name() {
+        match mf.name() {
             "http_requests_total" => {
                 for m in mf.get_metric() {
-                    http_requests_total += m.get_counter().get_value() as i64;
+                    http_requests_total += m.get_counter().value() as i64;
                 }
             }
             "db_queries_total" => {
                 for m in mf.get_metric() {
-                    db_queries_total += m.get_counter().get_value() as i64;
+                    db_queries_total += m.get_counter().value() as i64;
                 }
             }
             "cache_hits_total" => {
                 for m in mf.get_metric() {
-                    cache_hits += m.get_counter().get_value() as i64;
+                    cache_hits += m.get_counter().value() as i64;
                 }
             }
             "cache_misses_total" => {
                 for m in mf.get_metric() {
-                    cache_misses += m.get_counter().get_value() as i64;
+                    cache_misses += m.get_counter().value() as i64;
                 }
             }
             "sequencer_current_seq" => {
                 if let Some(m) = mf.get_metric().first() {
-                    sequencer_current_seq = m.get_gauge().get_value() as i64;
+                    sequencer_current_seq = m.get_gauge().value() as i64;
                 }
             }
             "relay_events_total" => {
                 for m in mf.get_metric() {
-                    relay_events_total += m.get_counter().get_value() as i64;
+                    relay_events_total += m.get_counter().value() as i64;
                 }
             }
             _ => {}
@@ -2092,7 +2347,7 @@ async fn get_blob_statistics(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Get total blob count and size
     let stats = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM blob_metadata"
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM blob_metadata",
     )
     .fetch_one(&ctx.account_db)
     .await
@@ -2101,7 +2356,10 @@ async fn get_blob_statistics(
     let (total_count, total_size) = stats;
 
     // Get orphaned temp blobs count
-    let orphaned_temp = ctx.blob_store.list_orphaned_temp_blobs(24).await
+    let orphaned_temp = ctx
+        .blob_store
+        .list_orphaned_temp_blobs(24)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let orphaned_count = orphaned_temp.len() as i64;
 
@@ -2113,11 +2371,14 @@ async fn get_blob_statistics(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mime_distribution: Vec<serde_json::Value> = mime_stats.iter()
-        .map(|(mime_type, count)| serde_json::json!({
-            "mime_type": mime_type,
-            "count": count
-        }))
+    let mime_distribution: Vec<serde_json::Value> = mime_stats
+        .iter()
+        .map(|(mime_type, count)| {
+            serde_json::json!({
+                "mime_type": mime_type,
+                "count": count
+            })
+        })
         .collect();
 
     // Get top users by blob count
@@ -2128,12 +2389,15 @@ async fn get_blob_statistics(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let user_stats: Vec<serde_json::Value> = top_users.iter()
-        .map(|(did, count, size)| serde_json::json!({
-            "did": did,
-            "blob_count": count,
-            "total_size": size
-        }))
+    let user_stats: Vec<serde_json::Value> = top_users
+        .iter()
+        .map(|(did, count, size)| {
+            serde_json::json!({
+                "did": did,
+                "blob_count": count,
+                "total_size": size
+            })
+        })
         .collect();
 
     Ok(Json(serde_json::json!({
@@ -2156,7 +2420,9 @@ async fn list_blobs(
 
     let blobs = if let Some(did) = params.did {
         // List blobs for specific DID
-        ctx.blob_store.list_for_user(&did, limit).await
+        ctx.blob_store
+            .list_for_user(&did, limit)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
         // List all blobs with cursor pagination
@@ -2184,22 +2450,42 @@ async fn list_blobs(
             .bind(limit)
         };
 
-        let rows = query.fetch_all(&ctx.account_db).await
+        let rows = query
+            .fetch_all(&ctx.account_db)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let mut blobs = Vec::new();
         for row in rows {
             use sqlx::Row;
             blobs.push(crate::blob_store::BlobMetadata {
-                cid: row.try_get("cid").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-                mime_type: row.try_get("mime_type").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-                size: row.try_get("size").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-                creator_did: row.try_get("creator_did").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-                created_at: row.try_get("created_at").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-                width: row.try_get("width").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-                height: row.try_get("height").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-                alt_text: row.try_get("alt_text").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-                thumbnail_cid: row.try_get("thumbnail_cid").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                cid: row
+                    .try_get("cid")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                mime_type: row
+                    .try_get("mime_type")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                size: row
+                    .try_get("size")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                creator_did: row
+                    .try_get("creator_did")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                created_at: row
+                    .try_get("created_at")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                width: row
+                    .try_get("width")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                height: row
+                    .try_get("height")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                alt_text: row
+                    .try_get("alt_text")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                thumbnail_cid: row
+                    .try_get("thumbnail_cid")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
             });
         }
         blobs
@@ -2226,15 +2512,23 @@ async fn delete_blob(
     Json(req): Json<DeleteBlobRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Check if blob exists
-    let metadata = ctx.blob_store.get_metadata(&req.cid).await
+    let metadata = ctx
+        .blob_store
+        .get_metadata(&req.cid)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if metadata.is_none() {
-        return Err((StatusCode::NOT_FOUND, format!("Blob not found: {}", req.cid)));
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Blob not found: {}", req.cid),
+        ));
     }
 
     // Delete blob
-    ctx.blob_store.delete(&req.cid).await
+    ctx.blob_store
+        .delete(&req.cid)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
@@ -2270,14 +2564,16 @@ async fn quarantine_blob(
     let quarantine = BlobQuarantine::new(ctx.account_db.clone());
 
     // Quarantine the blob
-    let record = quarantine.quarantine_blob(
-        &req.cid,
-        reason,
-        req.details.as_deref(),
-        &auth.did,
-        req.legal_reference.as_deref(),
-    ).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let record = quarantine
+        .quarantine_blob(
+            &req.cid,
+            reason,
+            req.details.as_deref(),
+            &auth.did,
+            req.legal_reference.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -2306,7 +2602,9 @@ async fn restore_blob(
     let quarantine = BlobQuarantine::new(ctx.account_db.clone());
 
     // Restore the blob
-    quarantine.restore_blob(&req.cid, &auth.did).await
+    quarantine
+        .restore_blob(&req.cid, &auth.did)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
@@ -2338,7 +2636,10 @@ async fn run_blob_gc(
     let dry_run = req.dry_run.unwrap_or(false);
 
     // List orphaned temp blobs
-    let orphaned = ctx.blob_store.list_orphaned_temp_blobs(req.orphaned_ttl_hours).await
+    let orphaned = ctx
+        .blob_store
+        .list_orphaned_temp_blobs(req.orphaned_ttl_hours)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut deleted_count = 0;
@@ -2382,23 +2683,26 @@ async fn get_blob_quotas(
         GROUP BY creator_did
         ORDER BY total_size DESC
         LIMIT 100
-        "#
+        "#,
     )
     .fetch_all(&ctx.account_db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let quotas: Vec<serde_json::Value> = usage.iter()
-        .map(|(did, count, size)| serde_json::json!({
-            "did": did,
-            "blob_count": count,
-            "total_size_bytes": size,
-            "total_size_mb": *size as f64 / 1024.0 / 1024.0,
-            // For now, no hard quotas enforced, just reporting usage
-            "quota_bytes": null,
-            "quota_mb": null,
-            "usage_percent": null,
-        }))
+    let quotas: Vec<serde_json::Value> = usage
+        .iter()
+        .map(|(did, count, size)| {
+            serde_json::json!({
+                "did": did,
+                "blob_count": count,
+                "total_size_bytes": size,
+                "total_size_mb": *size as f64 / 1024.0 / 1024.0,
+                // For now, no hard quotas enforced, just reporting usage
+                "quota_bytes": null,
+                "quota_mb": null,
+                "usage_percent": null,
+            })
+        })
         .collect();
 
     Ok(Json(serde_json::json!({
@@ -2417,17 +2721,19 @@ async fn get_sequencer_status(
     _auth: AdminAuthContext,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Get current sequence number
-    let current_seq = ctx.sequencer.current_seq().await
+    let current_seq = ctx
+        .sequencer
+        .current_seq()
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .unwrap_or(0);
 
     // Get total event count
-    let total_events: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repo_seq WHERE invalidated = 0"
-    )
-    .fetch_one(&ctx.account_db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let total_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM repo_seq WHERE invalidated = 0")
+            .fetch_one(&ctx.account_db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Get event counts by type
     let event_counts = sqlx::query_as::<_, (String, i64)>(
@@ -2444,14 +2750,14 @@ async fn get_sequencer_status(
 
     // Get first and last event timestamps
     let first_event: Option<String> = sqlx::query_scalar(
-        "SELECT sequenced_at FROM repo_seq WHERE invalidated = 0 ORDER BY seq ASC LIMIT 1"
+        "SELECT sequenced_at FROM repo_seq WHERE invalidated = 0 ORDER BY seq ASC LIMIT 1",
     )
     .fetch_optional(&ctx.account_db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let last_event: Option<String> = sqlx::query_scalar(
-        "SELECT sequenced_at FROM repo_seq WHERE invalidated = 0 ORDER BY seq DESC LIMIT 1"
+        "SELECT sequenced_at FROM repo_seq WHERE invalidated = 0 ORDER BY seq DESC LIMIT 1",
     )
     .fetch_optional(&ctx.account_db)
     .await
@@ -2459,7 +2765,7 @@ async fn get_sequencer_status(
 
     // Check if sequencer is paused (using a config table)
     let is_paused: bool = sqlx::query_scalar(
-        "SELECT COALESCE((SELECT value FROM sequencer_config WHERE key = 'paused'), '0') = '1'"
+        "SELECT COALESCE((SELECT value FROM sequencer_config WHERE key = 'paused'), '0') = '1'",
     )
     .fetch_one(&ctx.account_db)
     .await
@@ -2499,7 +2805,7 @@ async fn list_recent_events(
 
     // Build query based on filters
     let mut query = String::from(
-        "SELECT seq, did, event_type, sequenced_at FROM repo_seq WHERE invalidated = 0"
+        "SELECT seq, did, event_type, sequenced_at FROM repo_seq WHERE invalidated = 0",
     );
 
     // Add cursor filter
@@ -2530,7 +2836,10 @@ async fn list_recent_events(
         }));
     }
 
-    let next_cursor = events.last().and_then(|e| e.get("seq")).and_then(|s| s.as_i64());
+    let next_cursor = events
+        .last()
+        .and_then(|e| e.get("seq"))
+        .and_then(|s| s.as_i64());
 
     Ok(Json(serde_json::json!({
         "events": events,
@@ -2544,15 +2853,14 @@ async fn pause_sequencer(
     auth: AdminAuthContext,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Set paused flag in database
-    sqlx::query(
-        "INSERT OR REPLACE INTO sequencer_config (key, value) VALUES ('paused', '1')"
-    )
-    .execute(&ctx.account_db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query("INSERT OR REPLACE INTO sequencer_config (key, value) VALUES ('paused', '1')")
+        .execute(&ctx.account_db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
+    let _ = ctx
+        .admin_role_manager
         .log_action(&auth.did, "sequencer.pause", None, None, None)
         .await;
 
@@ -2569,15 +2877,14 @@ async fn resume_sequencer(
     auth: AdminAuthContext,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Set paused flag to false in database
-    sqlx::query(
-        "INSERT OR REPLACE INTO sequencer_config (key, value) VALUES ('paused', '0')"
-    )
-    .execute(&ctx.account_db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query("INSERT OR REPLACE INTO sequencer_config (key, value) VALUES ('paused', '0')")
+        .execute(&ctx.account_db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
+    let _ = ctx
+        .admin_role_manager
         .log_action(&auth.did, "sequencer.resume", None, None, None)
         .await;
 
@@ -2605,22 +2912,24 @@ async fn reset_sequencer_cursor(
 
     // Validate target sequence exists if specified
     if target > 0 {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM repo_seq WHERE seq = ?1)"
-        )
-        .bind(target)
-        .fetch_one(&ctx.account_db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repo_seq WHERE seq = ?1)")
+                .bind(target)
+                .fetch_one(&ctx.account_db)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         if !exists {
-            return Err((StatusCode::BAD_REQUEST, format!("Sequence {} not found", target)));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Sequence {} not found", target),
+            ));
         }
     }
 
     // Store cursor position
     sqlx::query(
-        "INSERT OR REPLACE INTO sequencer_config (key, value) VALUES ('cursor_position', ?1)"
+        "INSERT OR REPLACE INTO sequencer_config (key, value) VALUES ('cursor_position', ?1)",
     )
     .bind(target.to_string())
     .execute(&ctx.account_db)
@@ -2628,8 +2937,15 @@ async fn reset_sequencer_cursor(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Log action
-    let _ = ctx.admin_role_manager
-        .log_action(&auth.did, "sequencer.reset_cursor", None, Some(&target.to_string()), None)
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "sequencer.reset_cursor",
+            None,
+            Some(&target.to_string()),
+            None,
+        )
         .await;
 
     Ok(Json(serde_json::json!({
@@ -2660,7 +2976,7 @@ async fn rebuild_sequencer(
         WHERE invalidated = 0
         HAVING gap > 1
         LIMIT 10
-        "#
+        "#,
     )
     .fetch_all(&ctx.account_db)
     .await
@@ -2676,7 +2992,7 @@ async fn rebuild_sequencer(
         GROUP BY seq
         HAVING COUNT(*) > 1
         LIMIT 10
-        "#
+        "#,
     )
     .fetch_all(&ctx.account_db)
     .await
@@ -2688,8 +3004,15 @@ async fn rebuild_sequencer(
 
     if req.verify_only {
         // Log verification action
-        let _ = ctx.admin_role_manager
-            .log_action(&auth.did, "sequencer.verify", None, Some(if integrity_ok { "passed" } else { "failed" }), None)
+        let _ = ctx
+            .admin_role_manager
+            .log_action(
+                &auth.did,
+                "sequencer.verify",
+                None,
+                Some(if integrity_ok { "passed" } else { "failed" }),
+                None,
+            )
             .await;
 
         Ok(Json(serde_json::json!({
@@ -2713,8 +3036,15 @@ async fn rebuild_sequencer(
         // This is a destructive operation and should be done carefully
 
         // Log rebuild action
-        let _ = ctx.admin_role_manager
-            .log_action(&auth.did, "sequencer.rebuild", None, Some("verify_only"), None)
+        let _ = ctx
+            .admin_role_manager
+            .log_action(
+                &auth.did,
+                "sequencer.rebuild",
+                None,
+                Some("verify_only"),
+                None,
+            )
             .await;
 
         Ok(Json(serde_json::json!({
@@ -2815,11 +3145,12 @@ async fn get_rate_limit_status(
     let rate_limited_endpoints = ctx.rate_limiter.get_rate_limited_endpoints();
 
     // Aggregate request counts by category
-    let mut category_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut category_counts: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     for (key, count) in request_counts {
         // Extract category from key (e.g., "global:authenticated" -> "authenticated")
         let category = if key.contains(':') {
-            key.split(':').last().unwrap_or(&key).to_string()
+            key.split(':').next_back().unwrap_or(&key).to_string()
         } else {
             key
         };
@@ -2868,7 +3199,8 @@ async fn cleanup_rate_limit_state(
     let cleaned_count = before_count.saturating_sub(after_count);
 
     // Log action
-    let _ = ctx.admin_role_manager
+    let _ = ctx
+        .admin_role_manager
         .log_action(
             &auth.did,
             "rate_limit.cleanup",
@@ -2994,11 +3326,16 @@ async fn get_relay_config(
     let federation_config = &ctx.config.federation;
     let has_relay = ctx.relay_client.is_some();
 
-    let servers: Vec<RelayServerInfo> = federation_config.relay_urls
+    let servers: Vec<RelayServerInfo> = federation_config
+        .relay_urls
         .iter()
         .map(|url: &String| RelayServerInfo {
             url: url.clone(),
-            status: if has_relay { "configured".to_string() } else { "disabled".to_string() },
+            status: if has_relay {
+                "configured".to_string()
+            } else {
+                "disabled".to_string()
+            },
         })
         .collect();
 
@@ -3049,7 +3386,9 @@ async fn list_known_instances(
     _auth: AdminAuthContext,
 ) -> Result<Json<ListKnownInstancesResponse>, (StatusCode, String)> {
     let instances: Vec<KnownInstanceInfo> = if let Some(ref discovery) = ctx.pds_discovery {
-        discovery.get_known_instances().await
+        discovery
+            .get_known_instances()
+            .await
             .into_iter()
             .map(|inst| KnownInstanceInfo {
                 did: inst.did,
@@ -3079,7 +3418,8 @@ async fn trigger_pds_discovery(
         match discovery.discover_from_relays().await {
             Ok(instances) => {
                 // Log action
-                let _ = ctx.admin_role_manager
+                let _ = ctx
+                    .admin_role_manager
                     .log_action(
                         &auth.did,
                         "federation.discover",
@@ -3103,11 +3443,17 @@ async fn trigger_pds_discovery(
             }
             Err(e) => {
                 tracing::warn!("PDS discovery failed: {}", e);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Discovery failed: {}", e)))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Discovery failed: {}", e),
+                ))
             }
         }
     } else {
-        Err((StatusCode::BAD_REQUEST, "Federation discovery is not enabled".to_string()))
+        Err((
+            StatusCode::BAD_REQUEST,
+            "Federation discovery is not enabled".to_string(),
+        ))
     }
 }
 
@@ -3174,7 +3520,8 @@ async fn cleanup_nonce_stores(
     let total_cleaned = cleaned_service_auth + cleaned_dpop;
 
     // Log action
-    let _ = ctx.admin_role_manager
+    let _ = ctx
+        .admin_role_manager
         .log_action(
             &auth.did,
             "federation.nonce_cleanup",
@@ -3205,10 +3552,13 @@ async fn cleanup_nonce_stores(
 mod tests {
     use super::*;
     use crate::{
-        config::{ServerConfig, FederationConfig, ServiceConfig, StorageConfig, AuthConfig,
-                 InviteConfig, RateLimitConfig, LoggingConfig, OAuthConfig, IdentityConfig, BlobstoreConfig},
         account::ValidatedSession,
         admin::roles::Role,
+        config::{
+            AuthConfig, BlobstoreConfig, FederationConfig, IdentityConfig, InviteConfig,
+            LoggingConfig, OAuthConfig, RateLimitConfig, ServerConfig, ServiceConfig,
+            StorageConfig,
+        },
     };
     use tempfile::tempdir;
 
@@ -3236,7 +3586,8 @@ mod tests {
                 },
             },
             authentication: AuthConfig {
-                jwt_secret: "test-secret".to_string(),
+                // Config validation requires JWT secrets >= 32 chars.
+                jwt_secret: "test-secret-key-for-admin-tests-32-chars".to_string(),
                 repo_signing_key: "test-key".to_string(),
                 plc_rotation_key: "test-rotation-key".to_string(),
                 admin_dids: vec![],
@@ -3246,7 +3597,8 @@ mod tests {
                     pds_url: "https://bsky.social".to_string(),
                 },
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
-                oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration".to_string(),
+                oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration"
+                    .to_string(),
                 oauth_features: Default::default(),
             },
             identity: IdentityConfig {
@@ -3487,9 +3839,7 @@ mod tests {
         };
 
         // Make a query to activate a connection
-        let _ = sqlx::query("SELECT 1")
-            .fetch_one(&ctx.account_db)
-            .await;
+        let _ = sqlx::query("SELECT 1").fetch_one(&ctx.account_db).await;
 
         let result = get_database_status(State(ctx.clone()), auth).await;
         assert!(result.is_ok());
@@ -3529,7 +3879,11 @@ mod tests {
             assert!(check["response_time_ms"].is_number());
             let response_time = check["response_time_ms"].as_u64().unwrap();
             // Response time should be reasonable (< 1 second)
-            assert!(response_time < 1000, "Response time too high: {}", response_time);
+            assert!(
+                response_time < 1000,
+                "Response time too high: {}",
+                response_time
+            );
         }
     }
 
@@ -3561,6 +3915,6 @@ mod tests {
 
         assert!(hits >= 2);
         assert!(misses >= 1);
-        assert!(hit_rate >= 0.0 && hit_rate <= 100.0);
+        assert!((0.0..=100.0).contains(&hit_rate));
     }
 }

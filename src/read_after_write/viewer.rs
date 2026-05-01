@@ -101,7 +101,10 @@ impl LocalViewer {
     }
 
     /// Format a post record into a PostView
-    pub async fn get_post(&self, descript: &RecordDescript) -> PdsResult<Option<serde_json::Value>> {
+    pub async fn get_post(
+        &self,
+        descript: &RecordDescript,
+    ) -> PdsResult<Option<serde_json::Value>> {
         let author = match self.get_profile_basic().await? {
             Some(a) => a,
             None => return Ok(None),
@@ -121,7 +124,7 @@ impl LocalViewer {
             record: descript.record.clone(),
             embed,
             indexed_at: descript.indexed_at.clone(),
-            like_count: 0,    // Presumed 0 for new posts
+            like_count: 0, // Presumed 0 for new posts
             reply_count: 0,
             repost_count: 0,
             quote_count: 0,
@@ -178,10 +181,7 @@ impl LocalViewer {
 
     /// Format a post embed (images, external links, quotes, etc.)
     fn format_post_embed(&self, embed: &serde_json::Value) -> PdsResult<Option<serde_json::Value>> {
-        let embed_type = embed
-            .get("$type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let embed_type = embed.get("$type").and_then(|v| v.as_str()).unwrap_or("");
 
         match embed_type {
             "app.bsky.embed.images" => self.format_images_embed(embed),
@@ -196,8 +196,7 @@ impl LocalViewer {
 
                 // Try to fetch from AppView (blocking call)
                 let quoted_post = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(self.fetch_post_from_appview(uri))
+                    tokio::runtime::Handle::current().block_on(self.fetch_post_from_appview(uri))
                 });
 
                 match quoted_post {
@@ -251,8 +250,7 @@ impl LocalViewer {
                     .unwrap_or("");
 
                 let quoted_post = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(self.fetch_post_from_appview(uri))
+                    tokio::runtime::Handle::current().block_on(self.fetch_post_from_appview(uri))
                 });
 
                 let record = match quoted_post {
@@ -282,7 +280,10 @@ impl LocalViewer {
     }
 
     /// Format an images embed
-    fn format_images_embed(&self, embed: &serde_json::Value) -> PdsResult<Option<serde_json::Value>> {
+    fn format_images_embed(
+        &self,
+        embed: &serde_json::Value,
+    ) -> PdsResult<Option<serde_json::Value>> {
         let images = embed.get("images").and_then(|v| v.as_array());
 
         if let Some(img_array) = images {
@@ -311,7 +312,10 @@ impl LocalViewer {
     }
 
     /// Format an external link embed
-    fn format_external_embed(&self, embed: &serde_json::Value) -> PdsResult<Option<serde_json::Value>> {
+    fn format_external_embed(
+        &self,
+        embed: &serde_json::Value,
+    ) -> PdsResult<Option<serde_json::Value>> {
         // If any required field is missing, return None rather than an error
         let external = match embed.get("external") {
             Some(e) => e,
@@ -378,8 +382,9 @@ impl LocalViewer {
         match self.actor_store.get_block(&self.did, &record.cid).await {
             Ok(Some(content)) => {
                 // Decode CBOR to JSON
-                let value: serde_json::Value = serde_cbor::from_slice(&content)
-                    .map_err(|e| PdsError::Internal(format!("Failed to decode profile CBOR: {}", e)))?;
+                let value: serde_json::Value = serde_cbor::from_slice(&content).map_err(|e| {
+                    PdsError::Internal(format!("Failed to decode profile CBOR: {}", e))
+                })?;
                 Ok(Some(value))
             }
             Ok(None) => Ok(None),

@@ -25,9 +25,12 @@ use std::sync::Arc;
 /// # async fn example(store: ActorStore) -> Result<(), Box<dyn std::error::Error>> {
 /// let mut txn = store.begin_transaction("did:plc:alice").await?;
 ///
-/// // All operations within transaction
-/// txn.execute("INSERT INTO record ...").await?;
-/// txn.execute("UPDATE repo_root ...").await?;
+/// // All operations within transaction. `execute(...)` returns a sqlx
+/// // `Query` builder; you bind parameters and run it through the
+/// // dedicated helpers (`insert_block`, `update_repo_root`, etc.) or
+/// // drop down to raw queries via the typed wrappers below.
+/// txn.insert_block("bafy...", b"data").await?;
+/// txn.update_repo_root("bafy...", "rev0").await?;
 ///
 /// // Commit the transaction
 /// txn.commit().await?;
@@ -66,32 +69,39 @@ impl<'a> ActorTransaction<'a> {
         &self.did
     }
 
-    /// Execute a raw SQL query within this transaction
+    /// Build a raw `sqlx::Query` bound to this transaction.
+    ///
+    /// The returned `Query` is just the builder — no connection has been
+    /// borrowed yet, and the caller can chain `.bind(...)` then dispatch
+    /// it via the typed wrappers (`insert_block`, `update_repo_root`,
+    /// etc.) or run the SQL directly using `sqlx`'s usual API.
     ///
     /// # Example
     /// ```no_run
     /// # use aurora_locus::actor_store::{ActorStore, ActorTransaction};
     /// # async fn example(mut txn: ActorTransaction<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    /// txn.execute("UPDATE repo_root SET rev = ?1 WHERE did = ?2")
-    ///     .bind("abc123")
-    ///     .bind(txn.did())
-    ///     .execute()
-    ///     .await?;
+    /// // Prefer the typed wrappers for the common cases:
+    /// txn.update_repo_root("abc123", "rev0").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn execute<'b>(&mut self, query: &'b str) -> sqlx::query::Query<'b, Sqlite, sqlx::sqlite::SqliteArguments<'b>> {
+    pub fn execute<'b>(
+        &mut self,
+        query: &'b str,
+    ) -> sqlx::query::Query<'b, Sqlite, sqlx::sqlite::SqliteArguments<'b>> {
         sqlx::query(query)
     }
 
     /// Insert a block into the repository within this transaction
     pub async fn insert_block(&mut self, cid: &str, content: &[u8]) -> PdsResult<()> {
-        let txn = self.txn.as_mut()
+        let txn = self
+            .txn
+            .as_mut()
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
         sqlx::query(
             "INSERT OR REPLACE INTO repo_block (cid, content, indexed_at)
-             VALUES (?1, ?2, ?3)"
+             VALUES (?1, ?2, ?3)",
         )
         .bind(cid)
         .bind(content)
@@ -112,12 +122,14 @@ impl<'a> ActorTransaction<'a> {
         rkey: &str,
         repo_rev: Option<&str>,
     ) -> PdsResult<()> {
-        let txn = self.txn.as_mut()
+        let txn = self
+            .txn
+            .as_mut()
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
         sqlx::query(
             "INSERT OR REPLACE INTO record (uri, cid, collection, rkey, repo_rev, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(uri)
         .bind(cid)
@@ -134,7 +146,9 @@ impl<'a> ActorTransaction<'a> {
 
     /// Delete a record from the repository within this transaction
     pub async fn delete_record(&mut self, uri: &str) -> PdsResult<()> {
-        let txn = self.txn.as_mut()
+        let txn = self
+            .txn
+            .as_mut()
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
         sqlx::query("DELETE FROM record WHERE uri = ?1")
@@ -146,19 +160,29 @@ impl<'a> ActorTransaction<'a> {
         Ok(())
     }
 
-    /// Update the repository root within this transaction
+    /// Upsert the repository root within this transaction.
+    ///
+    /// Mirrors `ActorStore::update_repo_root` — handles both the
+    /// initial-commit (no row) and subsequent-commit (row exists) cases
+    /// idempotently.
     pub async fn update_repo_root(&mut self, cid: &str, rev: &str) -> PdsResult<()> {
-        let txn = self.txn.as_mut()
+        let txn = self
+            .txn
+            .as_mut()
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
         sqlx::query(
-            "UPDATE repo_root SET cid = ?1, rev = ?2, indexed_at = ?3
-             WHERE did = ?4"
+            "INSERT INTO repo_root (did, cid, rev, indexed_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(did) DO UPDATE SET
+                 cid = excluded.cid,
+                 rev = excluded.rev,
+                 indexed_at = excluded.indexed_at",
         )
+        .bind(&self.did)
         .bind(cid)
         .bind(rev)
         .bind(chrono::Utc::now())
-        .bind(&self.did)
         .execute(&mut **txn)
         .await
         .map_err(PdsError::Database)?;
@@ -172,12 +196,12 @@ impl<'a> ActorTransaction<'a> {
     /// If this is not called, the transaction will automatically roll back
     /// when dropped.
     pub async fn commit(mut self) -> PdsResult<()> {
-        let txn = self.txn.take()
+        let txn = self
+            .txn
+            .take()
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
-        txn.commit()
-            .await
-            .map_err(PdsError::Database)?;
+        txn.commit().await.map_err(PdsError::Database)?;
 
         self.committed = true;
         Ok(())
@@ -188,12 +212,12 @@ impl<'a> ActorTransaction<'a> {
     /// This is optional - transactions automatically roll back when dropped
     /// if not committed.
     pub async fn rollback(mut self) -> PdsResult<()> {
-        let txn = self.txn.take()
+        let txn = self
+            .txn
+            .take()
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
-        txn.rollback()
-            .await
-            .map_err(PdsError::Database)?;
+        txn.rollback().await.map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -210,9 +234,9 @@ impl<'a> ActorTransaction<'a> {
     /// # async fn example(mut txn: ActorTransaction<'_>) -> Result<(), Box<dyn std::error::Error>> {
     /// txn.savepoint("before_risky_operation").await?;
     ///
-    /// // Try something risky
-    /// if let Err(e) = txn.execute("INSERT ...").await {
-    ///     // Roll back to savepoint
+    /// // Try something risky.
+    /// if let Err(_e) = txn.insert_block("bafy...", b"data").await {
+    ///     // Roll back to savepoint without aborting the whole transaction.
     ///     txn.rollback_to_savepoint("before_risky_operation").await?;
     /// }
     ///
@@ -222,7 +246,9 @@ impl<'a> ActorTransaction<'a> {
     /// # }
     /// ```
     pub async fn savepoint(&mut self, name: &str) -> PdsResult<()> {
-        let txn = self.txn.as_mut()
+        let txn = self
+            .txn
+            .as_mut()
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
         let query = format!("SAVEPOINT {}", name);
@@ -236,7 +262,9 @@ impl<'a> ActorTransaction<'a> {
 
     /// Roll back to a previously created savepoint
     pub async fn rollback_to_savepoint(&mut self, name: &str) -> PdsResult<()> {
-        let txn = self.txn.as_mut()
+        let txn = self
+            .txn
+            .as_mut()
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
         let query = format!("ROLLBACK TO SAVEPOINT {}", name);
@@ -250,7 +278,9 @@ impl<'a> ActorTransaction<'a> {
 
     /// Release a savepoint (commit it)
     pub async fn release_savepoint(&mut self, name: &str) -> PdsResult<()> {
-        let txn = self.txn.as_mut()
+        let txn = self
+            .txn
+            .as_mut()
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
         let query = format!("RELEASE SAVEPOINT {}", name);
@@ -285,7 +315,14 @@ mod tests {
     use crate::actor_store::{ActorStore, ActorStoreConfig};
     use tempfile::TempDir;
 
-    /// Create a test actor store with a temporary directory
+    /// Create a test actor store with a temporary directory.
+    ///
+    /// `ActorStore::create` no longer seeds a placeholder `repo_root`
+    /// row (the real first commit fills it in via `update_repo_root` on
+    /// the proto-blue commit path). The transaction tests below assert
+    /// roll-back/rollback semantics against an existing row, so we
+    /// upsert a sentinel here to preserve their intent without coupling
+    /// them to the live commit machinery.
     async fn create_test_store() -> (ActorStore, TempDir, String) {
         let temp_dir = TempDir::new().unwrap();
         let config = ActorStoreConfig {
@@ -296,8 +333,11 @@ mod tests {
         let store = ActorStore::new(config);
         let did = "did:plc:test123";
 
-        // Create actor repository
         store.create(did).await.unwrap();
+        store
+            .update_repo_root(did, "bafy_initial_placeholder_cid", "3jzfcijpj2z2a")
+            .await
+            .unwrap();
 
         (store, temp_dir, did.to_string())
     }
@@ -386,8 +426,12 @@ mod tests {
         let uri1 = format!("at://{}/app.bsky.feed.post/record1", did);
         let uri2 = format!("at://{}/app.bsky.feed.post/record2", did);
 
-        txn.insert_record(&uri1, "cid1", "app.bsky.feed.post", "record1", Some("rev1")).await.unwrap();
-        txn.insert_record(&uri2, "cid2", "app.bsky.feed.post", "record2", Some("rev1")).await.unwrap();
+        txn.insert_record(&uri1, "cid1", "app.bsky.feed.post", "record1", Some("rev1"))
+            .await
+            .unwrap();
+        txn.insert_record(&uri2, "cid2", "app.bsky.feed.post", "record2", Some("rev1"))
+            .await
+            .unwrap();
 
         // Update root
         txn.update_repo_root("cid3", "rev1").await.unwrap();
@@ -450,7 +494,9 @@ mod tests {
 
         // Start transaction 1
         let mut txn1 = store.begin_transaction(&did).await.unwrap();
-        txn1.insert_block("cid_isolated", b"content_isolated").await.unwrap();
+        txn1.insert_block("cid_isolated", b"content_isolated")
+            .await
+            .unwrap();
 
         // While txn1 is open, try to read from another connection
         let block = store.get_block(&did, "cid_isolated").await.unwrap();
@@ -473,8 +519,18 @@ mod tests {
 
         {
             let mut txn = store.begin_transaction(&did).await.unwrap();
-            txn.insert_block("cid_delete_test", b"content").await.unwrap();
-            txn.insert_record(&uri, "cid_delete_test", "app.bsky.feed.post", "test123", None).await.unwrap();
+            txn.insert_block("cid_delete_test", b"content")
+                .await
+                .unwrap();
+            txn.insert_record(
+                &uri,
+                "cid_delete_test",
+                "app.bsky.feed.post",
+                "test123",
+                None,
+            )
+            .await
+            .unwrap();
             txn.commit().await.unwrap();
         }
 

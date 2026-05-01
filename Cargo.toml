@@ -7,14 +7,17 @@ description = "ATProto Personal Data Server implementation in Rust"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Use parent SDK for ATProto functionality
-atproto = { path = "./Rust-Atproto-SDK" }
+# AT Protocol SDK (published crate, replaces the previously vendored ./Rust-Atproto-SDK)
+proto-blue = "0.2.6"
+
+# Argon2id password hashing (vendored from the old SDK's server_auth module)
+argon2 = { version = "0.5", features = ["std"] }
 
 # HTTP Server
 axum = { version = "0.7", features = ["tokio", "ws"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["fs", "trace", "cors", "compression-gzip"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace", "cors", "compression-gzip"] }
 futures = "0.3"
 
 # Database
@@ -60,27 +63,30 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2.5"
 base64 = "0.22"
-jsonwebtoken = "10"
+# jsonwebtoken 10 requires picking a crypto provider feature explicitly —
+# pre-10 defaulted to `rust_crypto` automatically.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 
 # Validation
-validator = { version = "0.18", features = ["derive"] }
+validator = { version = "0.20", features = ["derive"] }
 unicode-segmentation = "1.11"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"] }
 
 # WebSocket for relay support
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.27"
 futures-util = "0.3"
 
 # URL encoding for search
 urlencoding = "2.1"
 
-# IPLD for content addressing
-libipld = "0.16"
+# Sequencer/firehose event payloads are still serialised with serde_cbor;
+# IPLD itself now lives in proto-blue (proto_blue::lex_data::Cid +
+# proto_blue::lex_cbor for DAG-CBOR), so no top-level libipld dep is needed.
 serde_cbor = "0.11"
 
 # Async trait for blob storage
@@ -105,7 +111,7 @@ bs58 = "0.5"
 base32 = "0.5"
 
 # Metrics and telemetry
-prometheus = { version = "0.13", features = ["process"] }
+prometheus = { version = "0.14", features = ["process"] }
 lazy_static = "1.4"
 
 # Image processing for thumbnails and metadata

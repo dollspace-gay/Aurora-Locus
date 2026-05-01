@@ -31,9 +31,8 @@ impl Secp256k1KeyPair {
             ));
         }
 
-        let secret_key = SecretKey::from_slice(private_key).map_err(|e| {
-            PdsError::Internal(format!("Invalid private key: {}", e))
-        })?;
+        let secret_key = SecretKey::from_slice(private_key)
+            .map_err(|e| PdsError::Internal(format!("Invalid private key: {}", e)))?;
 
         let signing_key = SigningKey::from(secret_key);
         Ok(Self { signing_key })

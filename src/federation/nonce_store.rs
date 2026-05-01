@@ -184,21 +184,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_removes_only_expired() {
-        let store = NonceStore::with_retention(2); // 2 second retention
+        // 4-second retention. Spacing nonce-1 and nonce-2 by 3 seconds
+        // and waiting another 2 seconds before cleanup leaves nonce-1 at
+        // age ~5s (expired) and nonce-2 at age ~2s (well under retention).
+        // The previous values (2s retention, 0.5s gap, 2s wait) put both
+        // nonces past the boundary on slower CI machines.
+        let store = NonceStore::with_retention(4);
 
-        // Add nonces at different times
         store.check_and_record("nonce-1").await.unwrap();
-
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_secs(3)).await;
         store.check_and_record("nonce-2").await.unwrap();
 
-        sleep(Duration::from_secs(2)).await; // nonce-1 should be expired, nonce-2 still valid
+        sleep(Duration::from_secs(2)).await;
 
         let removed = store.cleanup_expired().await.unwrap();
         assert_eq!(removed, 1);
-
-        // nonce-1 should be removable (expired)
-        // nonce-2 should still be there
         assert_eq!(store.count().await, 1);
     }
 }

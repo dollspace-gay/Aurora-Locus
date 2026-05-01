@@ -44,7 +44,10 @@ impl FromStr for ReportReason {
             "sexual" => Ok(ReportReason::Sexual),
             "rude" => Ok(ReportReason::Rude),
             "other" => Ok(ReportReason::Other),
-            _ => Err(PdsError::Validation(format!("Invalid report reason: {}", s))),
+            _ => Err(PdsError::Validation(format!(
+                "Invalid report reason: {}",
+                s
+            ))),
         }
     }
 }
@@ -79,7 +82,10 @@ impl FromStr for ReportStatus {
             "acknowledged" => Ok(ReportStatus::Acknowledged),
             "resolved" => Ok(ReportStatus::Resolved),
             "escalated" => Ok(ReportStatus::Escalated),
-            _ => Err(PdsError::Validation(format!("Invalid report status: {}", s))),
+            _ => Err(PdsError::Validation(format!(
+                "Invalid report status: {}",
+                s
+            ))),
         }
     }
 }
@@ -192,7 +198,10 @@ impl ReportManager {
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(PdsError::NotFound(format!("Report {} not found", report_id)));
+            return Err(PdsError::NotFound(format!(
+                "Report {} not found",
+                report_id
+            )));
         }
 
         Ok(())

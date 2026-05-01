@@ -2,22 +2,16 @@
 ///
 /// Temporary/experimental ATProto endpoints. These are subject to change
 /// and may be deprecated in future versions of the protocol.
-use crate::{
-    auth::AuthContext,
-    context::AppContext,
-};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::get,
-    Json, Router,
-};
+use crate::{auth::AuthContext, context::AppContext};
+use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use serde::Serialize;
 
 /// Build temp routes
 pub fn routes() -> Router<AppContext> {
-    Router::new()
-        .route("/xrpc/com.atproto.temp.checkSignupQueue", get(check_signup_queue))
+    Router::new().route(
+        "/xrpc/com.atproto.temp.checkSignupQueue",
+        get(check_signup_queue),
+    )
 }
 
 // ============================================================================
@@ -53,7 +47,8 @@ async fn check_signup_queue(
     auth: AuthContext,
 ) -> Result<Json<CheckSignupQueueResponse>, (StatusCode, String)> {
     // Get the account to check activation status
-    let account = ctx.account_manager
+    let account = ctx
+        .account_manager
         .get_account(&auth.did)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("Account not found: {}", e)))?;
@@ -66,7 +61,8 @@ async fn check_signup_queue(
     if in_queue {
         // Account is still in the signup queue
         // Get queue position by counting how many deactivated accounts were created before this one
-        let place_in_queue = ctx.account_manager
+        let place_in_queue = ctx
+            .account_manager
             .get_signup_queue_position(&auth.did)
             .await
             .ok();

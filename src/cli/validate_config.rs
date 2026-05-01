@@ -114,7 +114,11 @@ pub fn validate_config(config: &ServerConfig) -> PdsResult<()> {
         println!("   No issues found.");
     } else if errors.is_empty() {
         println!("✅ Configuration is valid!");
-        println!("   {} warnings, {} info messages", warnings.len(), infos.len());
+        println!(
+            "   {} warnings, {} info messages",
+            warnings.len(),
+            infos.len()
+        );
     } else {
         println!("❌ Configuration has {} errors", errors.len());
         println!("   Please fix the errors above before starting the server.");
@@ -191,7 +195,10 @@ fn validate_storage_config(config: &ServerConfig, issues: &mut Vec<ValidationIss
     } else if !data_dir.is_dir() {
         issues.push(ValidationIssue::error(
             "Storage",
-            format!("Data directory path is not a directory: {}", data_dir.display()),
+            format!(
+                "Data directory path is not a directory: {}",
+                data_dir.display()
+            ),
         ));
     }
 
@@ -205,23 +212,35 @@ fn validate_storage_config(config: &ServerConfig, issues: &mut Vec<ValidationIss
     if !actor_dir.exists() {
         issues.push(ValidationIssue::info(
             "Storage",
-            format!("Actor store directory will be created: {}", actor_dir.display()),
+            format!(
+                "Actor store directory will be created: {}",
+                actor_dir.display()
+            ),
         ));
     }
 
     // Check blobstore configuration
     match &config.storage.blobstore {
-        BlobstoreConfig::Disk { location, tmp_location } => {
+        BlobstoreConfig::Disk {
+            location,
+            tmp_location,
+        } => {
             if !location.exists() {
                 issues.push(ValidationIssue::info(
                     "Blobstore",
-                    format!("Blob storage directory will be created: {}", location.display()),
+                    format!(
+                        "Blob storage directory will be created: {}",
+                        location.display()
+                    ),
                 ));
             }
             if !tmp_location.exists() {
                 issues.push(ValidationIssue::info(
                     "Blobstore",
-                    format!("Temp storage directory will be created: {}", tmp_location.display()),
+                    format!(
+                        "Temp storage directory will be created: {}",
+                        tmp_location.display()
+                    ),
                 ));
             }
         }
@@ -274,7 +293,11 @@ fn check_db_path(path: &Path, name: &str, issues: &mut Vec<ValidationIssue>) {
         if !parent.exists() {
             issues.push(ValidationIssue::warning(
                 "Storage",
-                format!("{} parent directory does not exist: {}", name, parent.display()),
+                format!(
+                    "{} parent directory does not exist: {}",
+                    name,
+                    parent.display()
+                ),
             ));
         }
     }
@@ -405,7 +428,11 @@ fn validate_auth_config(config: &ServerConfig, issues: &mut Vec<ValidationIssue>
 
     // OAuth configuration validation
     if !config.authentication.oauth.client_id.starts_with("http://")
-        && !config.authentication.oauth.client_id.starts_with("https://")
+        && !config
+            .authentication
+            .oauth
+            .client_id
+            .starts_with("https://")
     {
         issues.push(ValidationIssue::warning(
             "OAuth",
@@ -413,8 +440,16 @@ fn validate_auth_config(config: &ServerConfig, issues: &mut Vec<ValidationIssue>
         ));
     }
 
-    if !config.authentication.oauth.redirect_uri.starts_with("http://")
-        && !config.authentication.oauth.redirect_uri.starts_with("https://")
+    if !config
+        .authentication
+        .oauth
+        .redirect_uri
+        .starts_with("http://")
+        && !config
+            .authentication
+            .oauth
+            .redirect_uri
+            .starts_with("https://")
     {
         issues.push(ValidationIssue::error(
             "OAuth",
@@ -422,7 +457,12 @@ fn validate_auth_config(config: &ServerConfig, issues: &mut Vec<ValidationIssue>
         ));
     }
 
-    if config.authentication.oauth.redirect_uri.starts_with("http://") {
+    if config
+        .authentication
+        .oauth
+        .redirect_uri
+        .starts_with("http://")
+    {
         issues.push(ValidationIssue::warning(
             "OAuth",
             "OAuth redirect URI uses HTTP - should use HTTPS in production".to_string(),
@@ -574,7 +614,9 @@ fn check_production_readiness(config: &ServerConfig, issues: &mut Vec<Validation
     }
 
     // Check logging level
-    if config.logging.level.to_lowercase() == "trace" || config.logging.level.to_lowercase() == "debug" {
+    if config.logging.level.to_lowercase() == "trace"
+        || config.logging.level.to_lowercase() == "debug"
+    {
         issues.push(ValidationIssue::warning(
             "Production",
             format!(

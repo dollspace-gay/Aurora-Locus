@@ -1,183 +1,109 @@
 //! CAR (Content Addressable aRchive) Export Utilities
 //!
-//! This module provides functions for exporting repository data to CAR format,
-//! which is used by ATProto sync protocol endpoints.
-//!
-//! Uses the `atproto::car` module from the SDK for CAR file generation.
+//! Wraps `proto_blue::repo::car` with the (cid_string, bytes) shape this
+//! crate uses for blocks coming out of the SQLite blockstore.
 
 use crate::{
     actor_store::ActorStore,
     error::{PdsError, PdsResult},
 };
-use atproto::car::{CarWriter, CarError};
-use libipld::cid::Cid;
+use proto_blue::lex_data::Cid;
+use proto_blue::repo::{block_map::BlockMap, car as pb_car, error::RepoError};
 use std::str::FromStr;
 
-/// Export all repository blocks as CAR bytes
+/// Build a `BlockMap` from the (cid_string, bytes) pairs emitted by
+/// `ActorStore::get_all_blocks` etc.
+fn blocks_to_block_map(blocks: Vec<(String, Vec<u8>)>) -> PdsResult<BlockMap> {
+    let mut map = BlockMap::new();
+    for (cid_str, data) in blocks {
+        let cid = Cid::from_str(&cid_str)
+            .map_err(|e| PdsError::Internal(format!("Invalid block CID {}: {}", cid_str, e)))?;
+        map.set(cid, data);
+    }
+    Ok(map)
+}
+
+/// Map a proto-blue `RepoError` from the CAR layer onto `PdsError`.
+fn repo_err(err: RepoError) -> PdsError {
+    PdsError::Internal(format!("CAR export error: {}", err))
+}
+
+/// Export every block in a repository as a single CAR file.
 ///
-/// This creates a complete CAR file containing all blocks from a repository.
-/// The root CID is set to the current repo root.
-///
-/// # Arguments
-///
-/// * `store` - The actor store
-/// * `did` - The DID of the repository
-/// * `since` - Optional revision to export incrementally (not yet implemented)
-///
-/// # Returns
-///
-/// CAR file as bytes
+/// The CAR's root is the current commit CID for this DID.
 pub async fn export_repo_to_car(
     store: &ActorStore,
     did: &str,
     since: Option<&str>,
 ) -> PdsResult<Vec<u8>> {
-    // Get repo root for CAR header
     let repo_root = store.get_repo_root(did).await?;
-
-    // Parse root CID
     let root_cid = Cid::from_str(&repo_root.cid)
         .map_err(|e| PdsError::Internal(format!("Invalid root CID: {}", e)))?;
 
-    // Get all blocks
-    let blocks = if since.is_some() {
-        // TODO: Implement incremental export
-        // For now, just export everything
-        tracing::warn!("Incremental CAR export (since={:?}) not yet implemented, exporting full repo", since);
-        store.get_all_blocks(did).await?
-    } else {
-        store.get_all_blocks(did).await?
-    };
-
-    // Create CAR writer with root CID
-    let mut car_writer = CarWriter::with_roots(Vec::new(), vec![root_cid]);
-
-    // Write all blocks to CAR
-    for (cid_str, block_data) in blocks {
-        let cid = Cid::from_str(&cid_str)
-            .map_err(|e| PdsError::Internal(format!("Invalid block CID {}: {}", cid_str, e)))?;
-
-        car_writer
-            .write_block(&cid, &block_data)
-            .map_err(car_error_to_pds_error)?;
+    if since.is_some() {
+        // Incremental export not yet implemented — fall through to a full export
+        // and warn so operators can see when this path is hit.
+        tracing::warn!(
+            "Incremental CAR export (since={:?}) not yet implemented, exporting full repo",
+            since
+        );
     }
 
-    // Finish and get bytes
-    let car_bytes = car_writer
-        .finish()
-        .map_err(car_error_to_pds_error)?;
+    let blocks = store.get_all_blocks(did).await?;
+    let block_map = blocks_to_block_map(blocks)?;
 
-    Ok(car_bytes)
+    pb_car::blocks_to_car(Some(&root_cid), &block_map).map_err(repo_err)
 }
 
-/// Export specific blocks as CAR bytes
-///
-/// # Arguments
-///
-/// * `blocks` - List of (CID string, block data) tuples
-/// * `root` - Optional root CID string (if None, no root is set)
-///
-/// # Returns
-///
-/// CAR file as bytes
+/// Pack an arbitrary set of (cid, bytes) blocks as a CAR file with an
+/// optional root CID.
 pub async fn blocks_to_car(
     blocks: Vec<(String, Vec<u8>)>,
     root: Option<&str>,
 ) -> PdsResult<Vec<u8>> {
-    // Parse root CID if provided
-    let roots = if let Some(root_str) = root {
-        let root_cid = Cid::from_str(root_str)
-            .map_err(|e| PdsError::Internal(format!("Invalid root CID: {}", e)))?;
-        vec![root_cid]
-    } else {
-        vec![]
+    let root_cid = match root {
+        Some(r) => Some(
+            Cid::from_str(r).map_err(|e| PdsError::Internal(format!("Invalid root CID: {}", e)))?,
+        ),
+        None => None,
     };
 
-    // Create CAR writer
-    let mut car_writer = CarWriter::with_roots(Vec::new(), roots);
-
-    // Write all blocks to CAR
-    for (cid_str, block_data) in blocks {
-        let cid = Cid::from_str(&cid_str)
-            .map_err(|e| PdsError::Internal(format!("Invalid block CID {}: {}", cid_str, e)))?;
-
-        car_writer
-            .write_block(&cid, &block_data)
-            .map_err(car_error_to_pds_error)?;
-    }
-
-    // Finish and get bytes
-    let car_bytes = car_writer
-        .finish()
-        .map_err(car_error_to_pds_error)?;
-
-    Ok(car_bytes)
+    let block_map = blocks_to_block_map(blocks)?;
+    pb_car::blocks_to_car(root_cid.as_ref(), &block_map).map_err(repo_err)
 }
 
-/// Export a single record as CAR bytes
+/// Export a single record as a CAR file.
 ///
-/// This exports the blocks needed to reconstruct a specific record.
-/// Currently exports all repo blocks (TODO: optimize to only export record-specific blocks).
-///
-/// # Arguments
-///
-/// * `store` - The actor store
-/// * `did` - The DID of the repository
-/// * `collection` - The record collection
-/// * `rkey` - The record key
-///
-/// # Returns
-///
-/// CAR file as bytes containing the record
+/// Currently emits the full repo's blocks alongside the record CID — the
+/// tradeoff is that consumers can verify the proof chain back to the
+/// signed commit, at the cost of redundant bytes when only one record was
+/// requested. A trimmed proof-set export is a follow-up optimisation.
 pub async fn export_record_to_car(
     store: &ActorStore,
     did: &str,
     collection: &str,
     rkey: &str,
 ) -> PdsResult<Vec<u8>> {
-    // Get record to verify it exists
     let uri = format!("at://{}/{}/{}", did, collection, rkey);
     let record = store
         .get_record(did, &uri)
         .await?
         .ok_or_else(|| PdsError::NotFound(format!("Record not found: {}", uri)))?;
 
-    // Parse record CID (validated but not used - record struct is sufficient)
-    let _record_cid = Cid::from_str(&record.cid)
+    // Validate that the recorded CID is well-formed even though we don't pass
+    // it to the CAR encoder directly — corrupt metadata is worth surfacing
+    // here rather than silently exporting a broken archive.
+    Cid::from_str(&record.cid)
         .map_err(|e| PdsError::Internal(format!("Invalid record CID: {}", e)))?;
 
-    // Get repo root
     let repo_root = store.get_repo_root(did).await?;
     let root_cid = Cid::from_str(&repo_root.cid)
         .map_err(|e| PdsError::Internal(format!("Invalid root CID: {}", e)))?;
 
-    // Create CAR writer with root CID
-    let mut car_writer = CarWriter::with_roots(Vec::new(), vec![root_cid]);
-
-    // TODO: Optimize this to only export blocks needed for this specific record
-    // For now, export all blocks (this is safe but inefficient)
     let blocks = store.get_all_blocks(did).await?;
+    let block_map = blocks_to_block_map(blocks)?;
 
-    for (cid_str, block_data) in blocks {
-        let cid = Cid::from_str(&cid_str)
-            .map_err(|e| PdsError::Internal(format!("Invalid block CID {}: {}", cid_str, e)))?;
-
-        car_writer
-            .write_block(&cid, &block_data)
-            .map_err(car_error_to_pds_error)?;
-    }
-
-    // Finish and get bytes
-    let car_bytes = car_writer
-        .finish()
-        .map_err(car_error_to_pds_error)?;
-
-    Ok(car_bytes)
-}
-
-/// Convert CarError to PdsError
-fn car_error_to_pds_error(err: CarError) -> PdsError {
-    PdsError::Internal(format!("CAR export error: {}", err))
+    pb_car::blocks_to_car(Some(&root_cid), &block_map).map_err(repo_err)
 }
 
 #[cfg(test)]
@@ -197,50 +123,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_blocks_to_car() {
-        // Create test blocks
-        let block1 = (
-            "bafyreihk5ztsfapt6g2cnxbxgbxb7dltipq5pufb4jtwmqrxrxqaygceyq".to_string(),
-            b"test block 1".to_vec(),
-        );
-        let block2 = (
-            "bafyreia5vwvxmrwdjvg2otlawfdzqrkjq3gkcl7t56krvsvfundhwmhwru".to_string(),
-            b"test block 2".to_vec(),
-        );
+    async fn test_blocks_to_car_round_trips_via_proto_blue() {
+        // Build two blocks with hash-correct CIDs so read_car (which verifies)
+        // is happy.
+        let payload1 = b"test block 1".to_vec();
+        let payload2 = b"test block 2".to_vec();
+        let cid1 = Cid::for_raw(&payload1);
+        let cid2 = Cid::for_raw(&payload2);
 
-        let blocks = vec![block1, block2];
+        let blocks = vec![
+            (cid1.to_string(), payload1.clone()),
+            (cid2.to_string(), payload2.clone()),
+        ];
 
-        // Export to CAR
         let car_bytes = blocks_to_car(blocks, None).await.unwrap();
+        assert!(car_bytes.len() > 16);
 
-        // Verify CAR file is not empty
-        assert!(!car_bytes.is_empty());
-        assert!(car_bytes.len() > 50); // Should have header + 2 blocks
+        let (roots, decoded) = pb_car::read_car(&car_bytes).unwrap();
+        assert!(roots.is_empty());
+        assert_eq!(decoded.get(&cid1).unwrap(), &payload1[..]);
+        assert_eq!(decoded.get(&cid2).unwrap(), &payload2[..]);
     }
 
     #[tokio::test]
     async fn test_blocks_to_car_with_root() {
-        let root = "bafyreihk5ztsfapt6g2cnxbxgbxb7dltipq5pufb4jtwmqrxrxqaygceyq";
-        let block1 = (
-            root.to_string(),
-            b"root block".to_vec(),
-        );
+        let payload = b"root block".to_vec();
+        let cid = Cid::for_raw(&payload);
+        let cid_str = cid.to_string();
 
-        let blocks = vec![block1];
+        let blocks = vec![(cid_str.clone(), payload.clone())];
+        let car_bytes = blocks_to_car(blocks, Some(&cid_str)).await.unwrap();
 
-        // Export to CAR with root
-        let car_bytes = blocks_to_car(blocks, Some(root)).await.unwrap();
-
-        // Verify CAR file is not empty
-        assert!(!car_bytes.is_empty());
-
-        // Read back using SDK's CarReader to verify
-        use atproto::car::CarReader;
-        let reader = CarReader::new(&car_bytes[..]).unwrap();
-
-        // Verify root is set
-        assert_eq!(reader.roots().len(), 1);
-        assert_eq!(reader.roots()[0].to_string(), root);
+        let (roots, decoded) = pb_car::read_car(&car_bytes).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].to_string(), cid_str);
+        assert_eq!(decoded.get(&cid).unwrap(), &payload[..]);
     }
 
     #[tokio::test]
@@ -248,7 +165,6 @@ mod tests {
         let invalid_block = ("invalid-cid".to_string(), b"data".to_vec());
         let result = blocks_to_car(vec![invalid_block], None).await;
 
-        // Should error with invalid CID
         assert!(result.is_err());
         match result {
             Err(PdsError::Internal(msg)) => {

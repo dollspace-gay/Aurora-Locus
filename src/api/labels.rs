@@ -1,9 +1,5 @@
 /// com.atproto.label.* endpoints
-use crate::{
-    admin::labels::Label,
-    context::AppContext,
-    error::PdsResult,
-};
+use crate::{admin::labels::Label, context::AppContext, error::PdsResult};
 use axum::{
     extract::{Query, State},
     routing::get,
@@ -78,10 +74,9 @@ impl From<Label> for LabelView {
             src: label.src,
             created_at: label.created_at.to_rfc3339(),
             exp: label.expires_at.map(|dt| dt.to_rfc3339()),
-            sig: label.sig.map(|bytes| base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                bytes
-            )),
+            sig: label.sig.map(|bytes| {
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+            }),
         }
     }
 }
@@ -104,7 +99,8 @@ pub async fn query_labels(
         let filtered_labels: Vec<Label> = if params.sources.is_empty() {
             labels
         } else {
-            labels.into_iter()
+            labels
+                .into_iter()
                 .filter(|label| params.sources.contains(&label.src))
                 .collect()
         };
@@ -114,12 +110,11 @@ pub async fn query_labels(
 
     // Filter out expired labels
     let now = Utc::now();
-    all_labels.retain(|label| {
-        label.expires_at.is_none_or(|exp| exp > now)
-    });
+    all_labels.retain(|label| label.expires_at.is_none_or(|exp| exp > now));
 
-    // Sort by creation time (newest first)
-    all_labels.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    // Sort by creation time (newest first) — sort_by_key with Reverse beats
+    // sort_by here per clippy.
+    all_labels.sort_by_key(|label| std::cmp::Reverse(label.created_at));
 
     // Apply limit and pagination
     let total = all_labels.len();
@@ -141,8 +136,7 @@ pub async fn query_labels(
 
 /// Build labels API routes
 pub fn routes() -> Router<AppContext> {
-    Router::new()
-        .route("/xrpc/com.atproto.label.queryLabels", get(query_labels))
+    Router::new().route("/xrpc/com.atproto.label.queryLabels", get(query_labels))
 }
 
 #[cfg(test)]
@@ -173,7 +167,8 @@ mod tests {
 
     #[test]
     fn test_query_params_deserialization() {
-        let json = r#"{"uriPatterns":["at://did:plc:test/*"],"sources":["did:plc:labeler"],"limit":100}"#;
+        let json =
+            r#"{"uriPatterns":["at://did:plc:test/*"],"sources":["did:plc:labeler"],"limit":100}"#;
         let params: QueryLabelsParams = serde_json::from_str(json).unwrap();
 
         assert_eq!(params.uri_patterns.len(), 1);

@@ -84,10 +84,7 @@ impl ServiceAuthenticator {
             .get_signing_key(user_did)
             .await
             .map_err(|e| {
-                PdsError::Internal(format!(
-                    "Failed to get signing key for {}: {}",
-                    user_did, e
-                ))
+                PdsError::Internal(format!("Failed to get signing key for {}: {}", user_did, e))
             })?;
 
         // Create JWT claims
@@ -163,10 +160,7 @@ impl ServiceAuthenticator {
             .await
             .map_err(|e| {
                 warn!("Failed to resolve signing key for {}: {}", issuer_did, e);
-                PdsError::Authentication(format!(
-                    "Could not verify issuer DID: {}",
-                    issuer_did
-                ))
+                PdsError::Authentication(format!("Could not verify issuer DID: {}", issuer_did))
             })?;
 
         // Verify JWT signature with issuer's public key
@@ -178,8 +172,8 @@ impl ServiceAuthenticator {
         validation.leeway = 0; // Strict expiration (no grace period)
         validation.validate_exp = true;
 
-        let token_data = decode::<ServiceAuthClaims>(token, &decoding_key, &validation)
-            .map_err(|e| {
+        let token_data =
+            decode::<ServiceAuthClaims>(token, &decoding_key, &validation).map_err(|e| {
                 warn!("JWT verification failed: {}", e);
                 match e.kind() {
                     jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
@@ -252,7 +246,9 @@ impl ServiceAuthenticator {
 
         if !nonce_is_new {
             warn!("Replay attack detected: nonce {} already used", claims.jti);
-            return Err(PdsError::Authentication("Replay attack detected".to_string()));
+            return Err(PdsError::Authentication(
+                "Replay attack detected".to_string(),
+            ));
         }
 
         Ok(claims)

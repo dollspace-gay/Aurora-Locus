@@ -278,7 +278,10 @@ impl ModerationEventLogger {
     }
 
     /// Parse database rows into ModerationEvent objects
-    async fn parse_events(&self, rows: Vec<sqlx::sqlite::SqliteRow>) -> PdsResult<Vec<ModerationEvent>> {
+    async fn parse_events(
+        &self,
+        rows: Vec<sqlx::sqlite::SqliteRow>,
+    ) -> PdsResult<Vec<ModerationEvent>> {
         let mut events = Vec::new();
 
         for row in rows {

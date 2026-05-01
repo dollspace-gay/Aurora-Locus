@@ -84,10 +84,15 @@ mod tests {
         let db_path = dir.path().join("test.db");
 
         // Create pool with WAL enabled
-        let pool = create_pool(&db_path, DatabaseOptions {
-            max_connections: 5,
-            enable_wal: true,
-        }).await.unwrap();
+        let pool = create_pool(
+            &db_path,
+            DatabaseOptions {
+                max_connections: 5,
+                enable_wal: true,
+            },
+        )
+        .await
+        .unwrap();
 
         // Query the journal mode to verify WAL is enabled
         let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -95,7 +100,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(journal_mode.to_lowercase(), "wal", "WAL mode should be enabled");
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "wal",
+            "WAL mode should be enabled"
+        );
 
         // Verify foreign keys are enabled
         let foreign_keys: i32 = sqlx::query_scalar("PRAGMA foreign_keys")
@@ -112,10 +121,15 @@ mod tests {
         let db_path = dir.path().join("test_no_wal.db");
 
         // Create pool with WAL disabled
-        let pool = create_pool(&db_path, DatabaseOptions {
-            max_connections: 5,
-            enable_wal: false,
-        }).await.unwrap();
+        let pool = create_pool(
+            &db_path,
+            DatabaseOptions {
+                max_connections: 5,
+                enable_wal: false,
+            },
+        )
+        .await
+        .unwrap();
 
         // Query the journal mode to verify WAL is NOT enabled
         let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -123,7 +137,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(journal_mode.to_lowercase(), "delete", "DELETE mode should be used when WAL is disabled");
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "delete",
+            "DELETE mode should be used when WAL is disabled"
+        );
     }
 
     #[tokio::test]
@@ -132,10 +150,15 @@ mod tests {
         let db_path = dir.path().join("test_checkpoint.db");
 
         // Create pool with WAL enabled
-        let pool = create_pool(&db_path, DatabaseOptions {
-            max_connections: 5,
-            enable_wal: true,
-        }).await.unwrap();
+        let pool = create_pool(
+            &db_path,
+            DatabaseOptions {
+                max_connections: 5,
+                enable_wal: true,
+            },
+        )
+        .await
+        .unwrap();
 
         // Set checkpoint configuration
         sqlx::query("PRAGMA wal_autocheckpoint = 1000")
@@ -149,17 +172,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(checkpoint, 1000, "WAL autocheckpoint should be set to 1000 pages");
+        assert_eq!(
+            checkpoint, 1000,
+            "WAL autocheckpoint should be set to 1000 pages"
+        );
 
-        // Set synchronous mode
+        // `PRAGMA synchronous` is a per-connection setting in SQLite —
+        // setting it on the pool affects only the connection that ran
+        // the query, and the read-back may come from a different one.
+        // Acquire and reuse a single connection so the assertion is
+        // actually meaningful.
+        let mut conn = pool.acquire().await.unwrap();
         sqlx::query("PRAGMA synchronous = NORMAL")
-            .execute(&pool)
+            .execute(&mut *conn)
             .await
             .unwrap();
 
-        // Verify synchronous mode
         let sync_mode: i32 = sqlx::query_scalar("PRAGMA synchronous")
-            .fetch_one(&pool)
+            .fetch_one(&mut *conn)
             .await
             .unwrap();
 
@@ -173,10 +203,15 @@ mod tests {
         let db_path = dir.path().join("test_concurrent.db");
 
         // Create pool with WAL enabled
-        let pool = create_pool(&db_path, DatabaseOptions {
-            max_connections: 10,
-            enable_wal: true,
-        }).await.unwrap();
+        let pool = create_pool(
+            &db_path,
+            DatabaseOptions {
+                max_connections: 10,
+                enable_wal: true,
+            },
+        )
+        .await
+        .unwrap();
 
         // Create a test table
         sqlx::query(
@@ -185,7 +220,7 @@ mod tests {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
-            "#
+            "#,
         )
         .execute(&pool)
         .await
@@ -202,10 +237,11 @@ mod tests {
         for i in 0..10 {
             let pool_clone = pool.clone();
             let handle = tokio::spawn(async move {
-                let result: String = sqlx::query_scalar("SELECT value FROM test_cache WHERE key = 'test'")
-                    .fetch_one(&pool_clone)
-                    .await
-                    .unwrap();
+                let result: String =
+                    sqlx::query_scalar("SELECT value FROM test_cache WHERE key = 'test'")
+                        .fetch_one(&pool_clone)
+                        .await
+                        .unwrap();
                 assert_eq!(result, "data");
                 i
             });

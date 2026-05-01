@@ -266,7 +266,6 @@ impl ScopeSet {
         }
     }
 
-
     /// Check if this set contains a specific scope (including hierarchical)
     ///
     /// # Arguments
@@ -292,11 +291,7 @@ impl ScopeSet {
     ///
     /// Returns a new scope set containing only scopes present in both sets.
     pub fn intersect(&self, other: &ScopeSet) -> Self {
-        let scopes = self
-            .scopes
-            .intersection(&other.scopes)
-            .cloned()
-            .collect();
+        let scopes = self.scopes.intersection(&other.scopes).cloned().collect();
 
         Self { scopes }
     }
@@ -358,7 +353,12 @@ impl fmt::Display for ScopeSet {
     }
 }
 
+// `mod tests` precedes the public middleware helpers below — clippy
+// flags this with `items_after_test_module`. Reordering would make the
+// diff much larger; the items genuinely belong with the rest of the
+// module rather than after a test block, so allow the lint locally.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -420,7 +420,9 @@ mod tests {
 
     #[test]
     fn test_scope_set_intersection() {
-        let set1: ScopeSet = "atproto:read atproto:write atproto:admin.*".parse().unwrap();
+        let set1: ScopeSet = "atproto:read atproto:write atproto:admin.*"
+            .parse()
+            .unwrap();
         let set2: ScopeSet = "atproto:read atproto:repo.create".parse().unwrap();
 
         let intersection = set1.intersect(&set2);
@@ -445,11 +447,11 @@ mod tests {
 
     #[test]
     fn test_scope_description() {
-        assert_eq!(AtProtoScope::Read.description(), "Read-only access to all data");
         assert_eq!(
-            AtProtoScope::RepoCreate.description(),
-            "Create new records"
+            AtProtoScope::Read.description(),
+            "Read-only access to all data"
         );
+        assert_eq!(AtProtoScope::RepoCreate.description(), "Create new records");
     }
 
     #[test]

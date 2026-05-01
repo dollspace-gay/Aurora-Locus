@@ -426,8 +426,8 @@ mod tests {
         .unwrap();
 
         // Create cache with short TTLs: stale=1s, max=10s
-        let cache = DidCache::new(db)
-            .with_did_doc_ttls(Duration::seconds(1), Duration::seconds(10));
+        let cache =
+            DidCache::new(db).with_did_doc_ttls(Duration::seconds(1), Duration::seconds(10));
 
         let did = "did:plc:staletest";
         let doc = r#"{"id":"did:plc:staletest"}"#;
@@ -478,8 +478,7 @@ mod tests {
         .unwrap();
 
         // Create cache with short TTLs: stale=1s, max=5s
-        let cache = DidCache::new(db)
-            .with_handle_ttls(Duration::seconds(1), Duration::seconds(5));
+        let cache = DidCache::new(db).with_handle_ttls(Duration::seconds(1), Duration::seconds(5));
 
         let handle = "stale.test";
         let did = "did:plc:stalehandle";
@@ -514,7 +513,9 @@ mod tests {
     async fn test_cleanup_preserves_stale_entries() {
         let db = SqlitePool::connect(":memory:").await.unwrap();
 
-        // Create tables
+        // `cleanup_expired` deletes from BOTH `did_doc` and `did_handle`,
+        // so both tables must exist or the call panics. The original
+        // setup only created `did_doc`.
         sqlx::query(
             r#"
             CREATE TABLE did_doc (
@@ -522,7 +523,12 @@ mod tests {
                 doc TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 cached_at TEXT NOT NULL
-            )
+            );
+            CREATE TABLE did_handle (
+                handle TEXT PRIMARY KEY,
+                did TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             "#,
         )
         .execute(&db)
@@ -530,8 +536,8 @@ mod tests {
         .unwrap();
 
         // Create cache: stale=1s, max=10s
-        let cache = DidCache::new(db)
-            .with_did_doc_ttls(Duration::seconds(1), Duration::seconds(10));
+        let cache =
+            DidCache::new(db).with_did_doc_ttls(Duration::seconds(1), Duration::seconds(10));
 
         let did = "did:plc:cleanuptest";
         let doc = r#"{"id":"did:plc:cleanuptest"}"#;

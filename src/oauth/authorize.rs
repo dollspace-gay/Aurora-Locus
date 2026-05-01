@@ -126,9 +126,7 @@ pub async fn authorize(
             "missing_redirect_uri",
             start_time.elapsed().as_secs_f64(),
         );
-        return Err(PdsError::Validation(
-            "redirect_uri is required".to_string(),
-        ));
+        return Err(PdsError::Validation("redirect_uri is required".to_string()));
     }
 
     // Validate redirect_uri is a valid URL

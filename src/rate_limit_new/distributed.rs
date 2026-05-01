@@ -212,8 +212,16 @@ impl SlidingWindowLimiter {
         // 4. Check if count exceeds max_requests
 
         // For now, use a simpler approach with a counter
-        let key = format!("{}:{}:{}", identifier, window_start / self.window_seconds, self.window_seconds);
-        let count = self.cache.increment(category, &key, self.window_seconds).await?;
+        let key = format!(
+            "{}:{}:{}",
+            identifier,
+            window_start / self.window_seconds,
+            self.window_seconds
+        );
+        let count = self
+            .cache
+            .increment(category, &key, self.window_seconds)
+            .await?;
 
         if count > self.max_requests as i64 {
             warn!("Rate limit exceeded for {} (sliding window)", identifier);

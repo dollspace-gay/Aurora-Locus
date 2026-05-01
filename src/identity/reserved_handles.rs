@@ -6,8 +6,8 @@
 //! This module maintains a list of reserved handles that cannot be registered by users.
 //! These include system names, protocol names, and common administrative handles.
 
-use std::collections::HashSet;
 use lazy_static::lazy_static;
+use std::collections::HashSet;
 
 lazy_static! {
     /// Static set of reserved handles
@@ -280,7 +280,10 @@ mod tests {
     #[test]
     fn test_reserved_count() {
         let count = reserved_count();
-        assert!(count > 100, "Should have substantial list of reserved handles");
+        assert!(
+            count > 100,
+            "Should have substantial list of reserved handles"
+        );
     }
 
     #[test]

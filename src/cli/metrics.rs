@@ -61,11 +61,9 @@ pub fn export_metrics(format: &str, output: Option<&str>) -> PdsResult<()> {
 fn export_prometheus(metric_families: &[prometheus::proto::MetricFamily]) -> PdsResult<String> {
     let encoder = TextEncoder::new();
     let mut buffer = Vec::new();
-    encoder
-        .encode(metric_families, &mut buffer)
-        .map_err(|e| {
-            crate::error::PdsError::Internal(format!("Failed to encode metrics: {}", e))
-        })?;
+    encoder.encode(metric_families, &mut buffer).map_err(|e| {
+        crate::error::PdsError::Internal(format!("Failed to encode metrics: {}", e))
+    })?;
     String::from_utf8(buffer).map_err(|e| {
         crate::error::PdsError::Internal(format!("Failed to convert metrics to string: {}", e))
     })
@@ -81,27 +79,27 @@ fn export_json(metric_families: &[prometheus::proto::MetricFamily]) -> PdsResult
         for m in mf.get_metric() {
             let mut labels = std::collections::HashMap::new();
             for label in m.get_label() {
-                labels.insert(
-                    label.get_name().to_string(),
-                    label.get_value().to_string(),
-                );
+                labels.insert(label.name().to_string(), label.value().to_string());
             }
 
-            let value = if m.has_counter() {
-                m.get_counter().get_value()
-            } else if m.has_gauge() {
-                m.get_gauge().get_value()
-            } else if m.has_histogram() {
-                m.get_histogram().get_sample_count() as f64
-            } else if m.has_summary() {
-                m.get_summary().get_sample_count() as f64
+            // prometheus 0.14 dropped the `has_counter()` / `has_gauge()` /
+            // ... methods on `Metric` — the fields are public `MessageField`s
+            // (effectively `Option<Box<T>>`), so we probe `.is_some()` directly.
+            let value = if m.counter.is_some() {
+                m.get_counter().value()
+            } else if m.gauge.is_some() {
+                m.get_gauge().value()
+            } else if m.histogram.is_some() {
+                m.get_histogram().sample_count() as f64
+            } else if m.summary.is_some() {
+                m.get_summary().sample_count() as f64
             } else {
                 0.0
             };
 
             metrics.push(json!({
-                "name": mf.get_name(),
-                "help": mf.get_help(),
+                "name": mf.name(),
+                "help": mf.help(),
                 "type": metric_type,
                 "labels": labels,
                 "value": value,

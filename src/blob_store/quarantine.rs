@@ -54,7 +54,10 @@ impl FromStr for QuarantineReason {
             "legal" => Ok(QuarantineReason::Legal),
             "malware" => Ok(QuarantineReason::Malware),
             "other" => Ok(QuarantineReason::Other),
-            _ => Err(PdsError::Validation(format!("Invalid quarantine reason: {}", s))),
+            _ => Err(PdsError::Validation(format!(
+                "Invalid quarantine reason: {}",
+                s
+            ))),
         }
     }
 }
@@ -98,7 +101,10 @@ impl BlobQuarantine {
         // Check if already quarantined
         let existing = self.is_quarantined(cid).await?;
         if existing {
-            return Err(PdsError::Conflict(format!("Blob {} is already quarantined", cid)));
+            return Err(PdsError::Conflict(format!(
+                "Blob {} is already quarantined",
+                cid
+            )));
         }
 
         let result = sqlx::query(
@@ -143,11 +149,7 @@ impl BlobQuarantine {
     }
 
     /// Restore a quarantined blob
-    pub async fn restore_blob(
-        &self,
-        cid: &str,
-        restored_by: &str,
-    ) -> PdsResult<()> {
+    pub async fn restore_blob(&self, cid: &str, restored_by: &str) -> PdsResult<()> {
         let now = Utc::now();
 
         let result = sqlx::query(
@@ -184,7 +186,7 @@ impl BlobQuarantine {
     /// Check if blob is quarantined
     pub async fn is_quarantined(&self, cid: &str) -> PdsResult<bool> {
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM blob_quarantine WHERE cid = ?1 AND restored_at IS NULL"
+            "SELECT COUNT(*) FROM blob_quarantine WHERE cid = ?1 AND restored_at IS NULL",
         )
         .bind(cid)
         .fetch_one(&self.db)
@@ -337,7 +339,7 @@ mod tests {
 
         // Insert test blob
         sqlx::query(
-            "INSERT INTO blob (cid, did, size, mime_type, created_at) VALUES (?, ?, ?, ?, ?)"
+            "INSERT INTO blob (cid, did, size, mime_type, created_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind("bafytest123")
         .bind("did:plc:alice")

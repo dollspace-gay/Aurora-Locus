@@ -106,6 +106,6 @@ pub struct ValidationFailureRecord {
     pub id: i64,
     pub collection: String,
     pub record_uri: String,
-    pub validation_errors: String,  // JSON string
+    pub validation_errors: String, // JSON string
     pub created_at: String,
 }

@@ -33,7 +33,7 @@ pub use viewer::*;
 use crate::error::PdsResult;
 
 /// Extract the `atproto-repo-rev` header from response headers
-    #[allow(dead_code)] // Future read-after-write utilities
+#[allow(dead_code)] // Future read-after-write utilities
 pub fn get_repo_rev(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get("atproto-repo-rev")
@@ -44,7 +44,7 @@ pub fn get_repo_rev(headers: &axum::http::HeaderMap) -> Option<String> {
 /// Calculate the lag (in milliseconds) between local writes and AppView indexing
 ///
 /// Returns the age of the oldest local record (how long ago it was created).
-    #[allow(dead_code)] // Future lag calculation
+#[allow(dead_code)] // Future lag calculation
 /// This indicates how far behind the AppView is.
 pub fn get_local_lag(local: &LocalRecords) -> Option<u64> {
     let mut oldest: Option<&str> = None;

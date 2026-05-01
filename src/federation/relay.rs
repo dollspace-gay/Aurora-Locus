@@ -10,12 +10,12 @@
 //! - Network-wide event distribution
 
 use crate::error::{PdsError, PdsResult};
+use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
-use futures_util::{SinkExt, StreamExt};
 
 /// Relay configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,12 +85,18 @@ impl RelayClient {
     }
 
     /// Connect to a relay server and stream events
-    async fn connect_to_relay(relay_url: String, tx: mpsc::Sender<RelayEvent>, reconnect_interval: u64) {
+    async fn connect_to_relay(
+        relay_url: String,
+        tx: mpsc::Sender<RelayEvent>,
+        reconnect_interval: u64,
+    ) {
         loop {
             info!("Connecting to relay: {}", relay_url);
 
             // Convert HTTP URL to WebSocket URL
-            let ws_url = relay_url.replace("https://", "wss://").replace("http://", "ws://");
+            let ws_url = relay_url
+                .replace("https://", "wss://")
+                .replace("http://", "ws://");
             let ws_url = format!("{}/xrpc/com.atproto.sync.subscribeRepos", ws_url);
 
             match connect_async(&ws_url).await {
@@ -172,7 +178,10 @@ impl RelayClient {
 
     /// Publish event to relay servers
     pub async fn publish_event(&self, event: &RelayEvent) -> PdsResult<()> {
-        debug!("Publishing event to {} relay servers", self.config.servers.len());
+        debug!(
+            "Publishing event to {} relay servers",
+            self.config.servers.len()
+        );
 
         for relay_url in &self.config.servers {
             let url = format!("{}/xrpc/com.atproto.repo.uploadBlob", relay_url);
@@ -216,7 +225,9 @@ impl RelayClient {
             }
         }
 
-        Err(PdsError::NotFound("Repository not found on any relay".to_string()))
+        Err(PdsError::NotFound(
+            "Repository not found on any relay".to_string(),
+        ))
     }
 }
 
@@ -249,7 +260,7 @@ mod tests {
         let config = RelayConfig::default();
         assert_eq!(config.reconnect_interval, 5);
         assert_eq!(config.buffer_size, 1000);
-        assert_eq!(config.enable_compression, true);
+        assert!(config.enable_compression);
     }
 
     #[test]

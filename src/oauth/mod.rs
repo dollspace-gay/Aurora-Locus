@@ -21,12 +21,15 @@ pub mod token_rotation;
 
 pub use authorize::authorize;
 pub use client::ClientManager;
-pub use consent::{
-    consent_screen, deny_authorization, grant_authorization,
-};
+pub use consent::{consent_screen, deny_authorization, grant_authorization};
 pub use device::DeviceManager;
+// Re-exports surface scope helpers at the canonical `oauth::` path. Some
+// of them (lexicon_to_scope / require_all_scopes / require_any_scope) are
+// only consumed by integration tests today; rust's unused_imports lint
+// fires for pub-use of unused-internally items in lib-only builds, so
+// silence it here. Removing the allow once a non-test caller appears.
+#[allow(unused_imports)]
 pub use scope::{
-    require_scope, AtProtoScope,
-    ScopeSet,
+    lexicon_to_scope, require_all_scopes, require_any_scope, require_scope, AtProtoScope, ScopeSet,
 };
 pub use token::token_endpoint;

@@ -50,7 +50,10 @@ impl FromStr for AppealStatus {
             "approved" => Ok(AppealStatus::Approved),
             "denied" => Ok(AppealStatus::Denied),
             "escalated" => Ok(AppealStatus::Escalated),
-            _ => Err(PdsError::Validation(format!("Invalid appeal status: {}", s))),
+            _ => Err(PdsError::Validation(format!(
+                "Invalid appeal status: {}",
+                s
+            ))),
         }
     }
 }
@@ -191,7 +194,10 @@ impl AppealManager {
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(PdsError::NotFound(format!("Appeal {} not found", appeal_id)));
+            return Err(PdsError::NotFound(format!(
+                "Appeal {} not found",
+                appeal_id
+            )));
         }
 
         tracing::info!(
@@ -429,7 +435,11 @@ mod tests {
 
         // Approve appeal
         manager
-            .approve_appeal(appeal.id, "did:plc:admin", "Appeal granted, action reversed")
+            .approve_appeal(
+                appeal.id,
+                "did:plc:admin",
+                "Appeal granted, action reversed",
+            )
             .await
             .unwrap();
 
@@ -474,27 +484,13 @@ mod tests {
 
         // Submit first appeal
         manager
-            .submit_appeal(
-                Some(123),
-                None,
-                None,
-                "did:plc:user",
-                "First appeal",
-                None,
-            )
+            .submit_appeal(Some(123), None, None, "did:plc:user", "First appeal", None)
             .await
             .unwrap();
 
         // Try to submit duplicate appeal
         let result = manager
-            .submit_appeal(
-                Some(123),
-                None,
-                None,
-                "did:plc:user",
-                "Second appeal",
-                None,
-            )
+            .submit_appeal(Some(123), None, None, "did:plc:user", "Second appeal", None)
             .await;
 
         assert!(result.is_err());

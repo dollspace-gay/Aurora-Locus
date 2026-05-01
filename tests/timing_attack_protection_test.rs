@@ -1,99 +1,27 @@
-/// Test timing attack protection in login functions
-///
-/// This test verifies that both valid and invalid login attempts
-/// take at least 350ms to complete, preventing timing-based
-/// username enumeration attacks.
+//! Test timing attack protection in login functions.
+//!
+//! This test verifies that both valid and invalid login attempts
+//! take at least 350ms to complete, preventing timing-based
+//! username enumeration attacks.
 
-use aurora_locus::{
-    account::{AccountManager, CreateAccountRequest},
-    config::*,
-    error::PdsResult,
-    validation::ValidationMode,
-};
+use aurora_locus::{account::AccountManager, config::*, validation::ValidationMode};
 use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 async fn create_test_manager() -> AccountManager {
-    // Create in-memory database
+    // Spin up the real schema in :memory: so the test stays in lock-step
+    // with the production layout. The previous hand-rolled CREATE TABLE
+    // statements drifted (e.g. they pre-dated the actor/account schema
+    // split landed in commit 87783e3) and silently broke every time the
+    // schema evolved. Using `sqlx::migrate!` means the tests rebuild
+    // automatically when migrations are added.
     let db = SqlitePool::connect(":memory:").await.unwrap();
-
-    // Create tables
-    sqlx::query(
-        r#"
-        CREATE TABLE account (
-            did TEXT PRIMARY KEY,
-            handle TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE,
-            password_hash TEXT NOT NULL,
-            created_at DATETIME NOT NULL,
-            email_confirmed BOOLEAN NOT NULL DEFAULT 0,
-            email_confirmed_at DATETIME,
-            deactivated_at DATETIME,
-            taken_down BOOLEAN NOT NULL DEFAULT 0,
-            plc_rotation_key TEXT,
-            plc_rotation_key_public TEXT,
-            plc_last_operation_cid TEXT
-        )
-        "#,
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE session (
-            id TEXT PRIMARY KEY,
-            did TEXT NOT NULL,
-            access_token TEXT UNIQUE NOT NULL,
-            refresh_token TEXT UNIQUE NOT NULL,
-            created_at DATETIME NOT NULL,
-            expires_at DATETIME NOT NULL,
-            app_password_name TEXT,
-            FOREIGN KEY (did) REFERENCES account(did)
-        )
-        "#,
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE refresh_token (
-            id TEXT PRIMARY KEY,
-            did TEXT NOT NULL,
-            token TEXT UNIQUE NOT NULL,
-            created_at DATETIME NOT NULL,
-            expires_at DATETIME NOT NULL,
-            used BOOLEAN NOT NULL DEFAULT 0,
-            used_at DATETIME,
-            FOREIGN KEY (did) REFERENCES account(did)
-        )
-        "#,
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE app_password (
-            did TEXT NOT NULL,
-            name TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at DATETIME NOT NULL,
-            privileged BOOLEAN NOT NULL DEFAULT 0,
-            PRIMARY KEY (did, name),
-            FOREIGN KEY (did) REFERENCES account(did)
-        )
-        "#,
-    )
-    .execute(&db)
-    .await
-    .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&db)
+        .await
+        .expect("test schema migrations failed");
 
     // Create minimal test configuration
     let config = Arc::new(ServerConfig {
@@ -127,6 +55,7 @@ async fn create_test_manager() -> AccountManager {
             },
             jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
             oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
+            oauth_features: Default::default(),
         },
         identity: IdentityConfig {
             did_plc_url: "https://plc.directory".to_string(),
@@ -143,6 +72,8 @@ async fn create_test_manager() -> AccountManager {
         rate_limit: RateLimitConfig {
             enabled: true,
             global_requests_per_minute: 3000,
+            redis_url: None,
+            use_redis: false,
         },
         logging: LoggingConfig {
             level: "info".to_string(),
@@ -168,7 +99,9 @@ async fn test_login_timing_protection_invalid_user() {
 
     // Attempt to login with non-existent user
     let start = Instant::now();
-    let result = manager.login("nonexistent@example.com", "password123").await;
+    let result = manager
+        .login("nonexistent@example.com", "password123")
+        .await;
     let elapsed = start.elapsed();
 
     // Should fail
@@ -362,12 +295,8 @@ async fn test_timing_consistency_between_valid_and_invalid() {
     assert!(avg_invalid >= 350);
     assert!(avg_wrong >= 350);
 
-    // The difference should be small (within 50ms tolerance)
-    let difference = if avg_invalid > avg_wrong {
-        avg_invalid - avg_wrong
-    } else {
-        avg_wrong - avg_invalid
-    };
+    // The difference should be small (within 50ms tolerance).
+    let difference = avg_invalid.abs_diff(avg_wrong);
 
     println!("Timing difference: {}ms", difference);
 

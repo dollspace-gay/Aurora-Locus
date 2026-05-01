@@ -117,16 +117,14 @@ impl TokenRotationManager {
 
         // Step 4: Check if token is expired
         if token_record.expires_at < Utc::now() {
-            return Err(PdsError::Authentication("Refresh token expired".to_string()));
+            return Err(PdsError::Authentication(
+                "Refresh token expired".to_string(),
+            ));
         }
 
         // Step 5: Mark old token as used
-        self.store_used_token(
-            refresh_token,
-            &token_record.token_id,
-            &token_record.did,
-        )
-        .await?;
+        self.store_used_token(refresh_token, &token_record.token_id, &token_record.did)
+            .await?;
 
         // Step 6: Generate new tokens
         let new_access_token = format!("at_{}", Uuid::new_v4().to_string().replace("-", ""));

@@ -70,7 +70,9 @@ impl Mailer {
                     return Err(PdsError::Internal("Invalid SMTP URL format".to_string()));
                 }
             } else {
-                return Err(PdsError::Internal("SMTP URL must start with smtp://".to_string()));
+                return Err(PdsError::Internal(
+                    "SMTP URL must start with smtp://".to_string(),
+                ));
             };
 
             Some(transport)
@@ -95,7 +97,10 @@ impl Mailer {
         base_url: &str,
     ) -> PdsResult<()> {
         if self.config.is_none() {
-            tracing::warn!("Email not configured, skipping verification email to {}", to_email);
+            tracing::warn!(
+                "Email not configured, skipping verification email to {}",
+                to_email
+            );
             return Ok(());
         }
 
@@ -140,7 +145,10 @@ Aurora Locus PDS
         base_url: &str,
     ) -> PdsResult<()> {
         if self.config.is_none() {
-            tracing::warn!("Email not configured, skipping password reset email to {}", to_email);
+            tracing::warn!(
+                "Email not configured, skipping password reset email to {}",
+                to_email
+            );
             return Ok(());
         }
 
@@ -169,13 +177,8 @@ Aurora Locus PDS
             handle, reset_url
         );
 
-        self.send_email(
-            to_email,
-            "Reset your password",
-            &body,
-            &config.from_address,
-        )
-        .await
+        self.send_email(to_email, "Reset your password", &body, &config.from_address)
+            .await
     }
 
     /// Send an account deletion confirmation email
@@ -189,7 +192,10 @@ Aurora Locus PDS
         token: &str,
     ) -> PdsResult<()> {
         if self.config.is_none() {
-            tracing::warn!("Email not configured, skipping account delete email to {}", to_email);
+            tracing::warn!(
+                "Email not configured, skipping account delete email to {}",
+                to_email
+            );
             return Ok(());
         }
 
@@ -243,7 +249,10 @@ Aurora Locus PDS
         token: &str,
     ) -> PdsResult<()> {
         if self.config.is_none() {
-            tracing::warn!("Email not configured, skipping email update email to {}", to_email);
+            tracing::warn!(
+                "Email not configured, skipping email update email to {}",
+                to_email
+            );
             return Ok(());
         }
 
@@ -279,21 +288,16 @@ Aurora Locus PDS
     }
 
     /// Send a generic email
-    async fn send_email(
-        &self,
-        to: &str,
-        subject: &str,
-        body: &str,
-        from: &str,
-    ) -> PdsResult<()> {
+    async fn send_email(&self, to: &str, subject: &str, body: &str, from: &str) -> PdsResult<()> {
         if let Some(transport) = &self.transport {
             let email = Message::builder()
-                .from(from.parse().map_err(|e| {
-                    PdsError::Internal(format!("Invalid from address: {}", e))
-                })?)
-                .to(to.parse().map_err(|e| {
-                    PdsError::Internal(format!("Invalid to address: {}", e))
-                })?)
+                .from(
+                    from.parse()
+                        .map_err(|e| PdsError::Internal(format!("Invalid from address: {}", e)))?,
+                )
+                .to(to
+                    .parse()
+                    .map_err(|e| PdsError::Internal(format!("Invalid to address: {}", e)))?)
                 .subject(subject)
                 .header(ContentType::TEXT_PLAIN)
                 .body(body.to_string())
@@ -332,7 +336,8 @@ Aurora Locus PDS
         }
 
         let config = self.config.as_ref().unwrap();
-        self.send_email(to_email, subject, content, &config.from_address).await
+        self.send_email(to_email, subject, content, &config.from_address)
+            .await
     }
 
     /// Send notification email using template system
@@ -343,7 +348,10 @@ Aurora Locus PDS
         notification: &NotificationEmail,
     ) -> PdsResult<()> {
         if self.config.is_none() {
-            tracing::warn!("Email not configured, skipping notification to {}", to_email);
+            tracing::warn!(
+                "Email not configured, skipping notification to {}",
+                to_email
+            );
             return Ok(());
         }
 

@@ -178,7 +178,10 @@ impl AdminRoleManager {
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(PdsError::NotFound(format!("No active role found for {}", did)));
+            return Err(PdsError::NotFound(format!(
+                "No active role found for {}",
+                did
+            )));
         }
 
         Ok(())
@@ -325,7 +328,7 @@ impl AdminRoleManager {
         // Build query with optional filters
         let mut query = String::from(
             "SELECT id, admin_did, action, subject_did, details, timestamp, ip_address
-             FROM admin_audit_log WHERE 1=1"
+             FROM admin_audit_log WHERE 1=1",
         );
 
         if admin_did.is_some() {
@@ -482,7 +485,10 @@ mod tests {
         assert_eq!(retrieved.role, Role::Admin);
 
         // Check role
-        assert!(manager.has_role("did:plc:alice", Role::Admin).await.unwrap());
+        assert!(manager
+            .has_role("did:plc:alice", Role::Admin)
+            .await
+            .unwrap());
         assert!(manager
             .has_role("did:plc:alice", Role::Moderator)
             .await
@@ -542,7 +548,11 @@ mod tests {
             .unwrap();
 
         manager
-            .revoke_role("did:plc:bob", "did:plc:admin", Some("No longer needed".to_string()))
+            .revoke_role(
+                "did:plc:bob",
+                "did:plc:admin",
+                Some("No longer needed".to_string()),
+            )
             .await
             .unwrap();
 

@@ -11,7 +11,7 @@ use crate::{
     actor_store::repository::RepositoryManager,
     context::AppContext,
     crypto::{
-        plc::{PlcSigner},
+        plc::PlcSigner,
         plc_client::{PlcClient, PlcClientConfig},
     },
     error::{PdsError, PdsResult},
@@ -25,16 +25,16 @@ use std::fs;
 /// * `ctx` - Application context
 /// * `dids` - List of DIDs to rotate keys for
 /// * `concurrency` - Number of concurrent rotations (default: 10)
-pub async fn rotate_keys(
-    ctx: &AppContext,
-    dids: Vec<String>,
-    concurrency: usize,
-) -> PdsResult<()> {
+pub async fn rotate_keys(ctx: &AppContext, dids: Vec<String>, concurrency: usize) -> PdsResult<()> {
     if dids.is_empty() {
         return Err(PdsError::Validation("No DIDs provided".to_string()));
     }
 
-    println!("Rotating keys for {} DID(s) with concurrency {}...\n", dids.len(), concurrency);
+    println!(
+        "Rotating keys for {} DID(s) with concurrency {}...\n",
+        dids.len(),
+        concurrency
+    );
 
     // Create PLC client
     let plc_config = PlcClientConfig {
@@ -67,12 +67,23 @@ pub async fn rotate_keys(
                     if rotated {
                         println!("[{}/{}] ✓ Rotated key for {}", idx + 1, total, did);
                     } else {
-                        println!("[{}/{}] ○ Key already up-to-date for {}", idx + 1, total, did);
+                        println!(
+                            "[{}/{}] ○ Key already up-to-date for {}",
+                            idx + 1,
+                            total,
+                            did
+                        );
                     }
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("[{}/{}] ✗ Failed to rotate key for {}: {}", idx + 1, total, did, e);
+                    eprintln!(
+                        "[{}/{}] ✗ Failed to rotate key for {}: {}",
+                        idx + 1,
+                        total,
+                        did,
+                        e
+                    );
                     Err(e)
                 }
             }
@@ -138,7 +149,9 @@ pub async fn rotate_keys_from_file(
         .collect();
 
     if dids.is_empty() {
-        return Err(PdsError::Validation("No valid did:plc DIDs found in file".to_string()));
+        return Err(PdsError::Validation(
+            "No valid did:plc DIDs found in file".to_string(),
+        ));
     }
 
     rotate_keys(ctx, dids, concurrency).await
@@ -155,7 +168,10 @@ async fn rotate_key_for_did(
 ) -> PdsResult<bool> {
     // Validate DID format
     if !did.starts_with("did:plc:") {
-        return Err(PdsError::Validation(format!("Not a did:plc identifier: {}", did)));
+        return Err(PdsError::Validation(format!(
+            "Not a did:plc identifier: {}",
+            did
+        )));
     }
 
     // Get repo signing key from config
@@ -165,29 +181,41 @@ async fn rotate_key_for_did(
     let desired_key = repo_signer.public_key_multibase();
 
     // Phase 1: Update PLC directory key
-    let rotated = plc_client.rotate_key_if_needed(did, &desired_key, rotation_signer).await?;
+    let rotated = plc_client
+        .rotate_key_if_needed(did, &desired_key, rotation_signer)
+        .await?;
 
     if !rotated {
         // Key already up-to-date, no need to create new commit or sequence events
         return Ok(false);
     }
 
-    // Phase 2: Create new repository commit with updated signing key
-    // This is done by applying empty writes, which creates a new commit signed with the current key
+    // Phase 2: Create new repository commit with updated signing key.
+    //
+    // Apply an empty write set so proto-blue produces a fresh signed commit
+    // over the unchanged MST — equivalent to `processWrites([])` in TS. This
+    // advances the commit chain so downstream sync observers see the
+    // rotation event.
     let repo_mgr = RepositoryManager::with_sequencer(
         did.to_string(),
         (*ctx.actor_store).clone(),
         ctx.sequencer.clone(),
     );
 
-    // Create signing function that uses the repo signer
-    let repo_signer_clone = repo_signer.clone();
-    let sign_fn = move |hash: &[u8; 32]| -> Result<Vec<u8>, atproto::repo::RepoError> {
-        Ok(repo_signer_clone.sign(hash))
+    // Wrap the existing PlcSigner's underlying secp256k1 key in a
+    // proto-blue `Signer`. Re-deriving from the configured hex avoids
+    // exposing PlcSigner's internals to the proto-blue surface.
+    let repo_signer_pb: std::sync::Arc<dyn proto_blue::crypto::Signer> = {
+        let key_bytes = hex::decode(&ctx.config.authentication.repo_signing_key)
+            .map_err(|e| PdsError::Internal(format!("Invalid hex repo signing key: {}", e)))?;
+        let s = crate::crypto::proto_blue_signer::RepoSigner::from_bytes(&key_bytes)
+            .map_err(|e| PdsError::Internal(format!("Failed to build repo signer: {}", e)))?;
+        std::sync::Arc::new(s)
     };
 
-    // Apply empty writes to create new commit (like processWrites([]) in TypeScript)
-    let (commit_cid, rev) = repo_mgr.apply_writes(vec![], sign_fn).await
+    let (commit_cid, rev) = repo_mgr
+        .apply_writes(vec![], repo_signer_pb)
+        .await
         .map_err(|e| {
             tracing::warn!("Failed to create commit for {}: {}", did, e);
             e
@@ -204,7 +232,9 @@ async fn rotate_key_for_did(
     let account = ctx.account_manager.get_account(did).await?;
     let identity_evt = IdentityEvent::new(did.to_string(), account.handle);
 
-    ctx.sequencer.sequence_identity(identity_evt).await
+    ctx.sequencer
+        .sequence_identity(identity_evt)
+        .await
         .map_err(|e| {
             tracing::warn!("Failed to sequence identity event for {}: {}", did, e);
             e

@@ -1,7 +1,7 @@
 /// com.atproto.repo.uploadBlob and blob serving endpoints
 use crate::{
     api::middleware,
-    blob_store::{BlobUploadResponse},
+    blob_store::BlobUploadResponse,
     context::AppContext,
     error::{PdsError, PdsResult},
     oauth::AtProtoScope,
@@ -57,16 +57,10 @@ async fn upload_blob(
         .await?;
 
     // Return blob reference
-    let blob_ref = crate::blob_store::BlobRef::new(
-        temp_blob.cid,
-        temp_blob.mime_type,
-        temp_blob.size,
-    );
+    let blob_ref =
+        crate::blob_store::BlobRef::new(temp_blob.cid, temp_blob.mime_type, temp_blob.size);
 
-    Ok((
-        StatusCode::OK,
-        Json(BlobUploadResponse { blob: blob_ref }),
-    ))
+    Ok((StatusCode::OK, Json(BlobUploadResponse { blob: blob_ref })))
 }
 
 /// Get a blob by CID
@@ -174,7 +168,8 @@ fn parse_range(range_header: &str, total_size: usize) -> Option<(usize, usize)> 
             }
         } else {
             // Complete range: "bytes=500-999"
-            if let (Ok(start), Ok(mut end)) = (start_str.parse::<usize>(), end_str.parse::<usize>()) {
+            if let (Ok(start), Ok(mut end)) = (start_str.parse::<usize>(), end_str.parse::<usize>())
+            {
                 if start < total_size {
                     // Clamp end to total_size - 1
                     end = end.min(total_size - 1);

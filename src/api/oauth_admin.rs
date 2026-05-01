@@ -1,6 +1,18 @@
-/// OAuth-based admin authentication endpoints
+//! OAuth-based admin authentication endpoints.
+//!
+//! Wraps proto-blue's OAuth client to authenticate operators via their
+//! atproto identity. The flow:
+//!
+//! 1. `/admin-oauth/login` — discover the user's AS, build a PAR/PKCE
+//!    authorization URL, stash the `AuthState` + server metadata under
+//!    the `state` parameter, redirect.
+//! 2. `/admin-oauth/callback` — look up the stash, exchange the code
+//!    for a token, verify the resulting DID is on the admin list, mint
+//!    PDS access/refresh tokens, render a small HTML page that stows
+//!    them in localStorage.
+//! 3. `/oauth/client-metadata.json` — public client-metadata document
+//!    consumed by the AS during discovery.
 use crate::AppContext;
-use atproto::oauth::OAuthClient;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -8,14 +20,20 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use reqwest::Url;
+use proto_blue::oauth::{
+    types::{AuthState, OAuthClientMetadata, OAuthServerMetadata},
+    OAuthClient,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Storage for OAuth state and PKCE verifiers
-/// In production, this should be Redis or another distributed store
+/// In-memory stash of in-flight OAuth flows.
+///
+/// Keyed on the `state` parameter the AS will echo back. In production
+/// this should be a distributed store (Redis, etc.) so flows survive
+/// restarts and load-balance across replicas.
 #[derive(Clone)]
 pub struct OAuthStateStore {
     states: Arc<RwLock<HashMap<String, OAuthStateData>>>,
@@ -45,17 +63,21 @@ impl OAuthStateStore {
     }
 }
 
+/// Per-flow data we need to remember between `/login` and `/callback`.
 #[derive(Clone)]
 pub struct OAuthStateData {
-    pub code_verifier: String,
-    #[allow(dead_code)] // Future OAuth state field
+    /// PKCE verifier + DPoP key + issuer, produced by `OAuthClient::authorize`.
+    pub auth_state: AuthState,
+    /// AS metadata fetched during discovery — the callback needs it again to
+    /// drive token exchange (token_endpoint, iss-parameter support, etc.).
+    pub server_metadata: OAuthServerMetadata,
+    /// Optional handle hint, retained only for tracing.
+    #[allow(dead_code)]
     pub handle: Option<String>,
-    pub token_endpoint: String,
 }
 
 /// Build OAuth routes
 pub fn routes(state_store: OAuthStateStore) -> Router<AppContext> {
-    // Create a router with the OAuth state store, then layer it over the app context
     let oauth_router = Router::new()
         .route("/admin-oauth/login", get(initiate_oauth))
         .route("/admin-oauth/callback", get(handle_oauth_callback))
@@ -64,6 +86,28 @@ pub fn routes(state_store: OAuthStateStore) -> Router<AppContext> {
     Router::new()
         .merge(oauth_router)
         .route("/oauth/client-metadata.json", get(client_metadata))
+}
+
+/// Build a fresh `OAuthClient` configured for this PDS's admin flow.
+fn build_oauth_client(ctx: &AppContext) -> OAuthClient {
+    let metadata = OAuthClientMetadata {
+        client_id: ctx.config.authentication.oauth.client_id.clone(),
+        redirect_uris: vec![ctx.config.authentication.oauth.redirect_uri.clone()],
+        response_types: Some(vec!["code".to_string()]),
+        grant_types: Some(vec![
+            "authorization_code".to_string(),
+            "refresh_token".to_string(),
+        ]),
+        scope: Some("atproto transition:generic".to_string()),
+        token_endpoint_auth_method: Some("none".to_string()),
+        token_endpoint_auth_signing_alg: None,
+        application_type: Some("web".to_string()),
+        dpop_bound_access_tokens: Some(true),
+        client_name: Some("Aurora Locus Admin".to_string()),
+        client_uri: None,
+        logo_uri: None,
+    };
+    OAuthClient::new(metadata)
 }
 
 /// Query parameters for OAuth initiation
@@ -79,50 +123,23 @@ async fn initiate_oauth(
     axum::Extension(state_store): axum::Extension<OAuthStateStore>,
     Query(params): Query<OAuthInitParams>,
 ) -> Result<Redirect, (StatusCode, String)> {
-    use atproto::oauth::{OAuthClient, PkceParams};
-
     tracing::info!("Initiating OAuth admin login");
 
-    // Create OAuth client
-    let oauth_client = OAuthClient::new(
-        ctx.config.authentication.oauth.client_id.clone(),
-        ctx.config.authentication.oauth.redirect_uri.clone(),
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to create OAuth client: {}", e);
+    let oauth_client = build_oauth_client(&ctx);
+
+    // Discover the AS for this PDS.
+    let pds_url = &ctx.config.authentication.oauth.pds_url;
+    let server_metadata = oauth_client.discover_server(pds_url).await.map_err(|e| {
+        tracing::error!("Failed to discover server metadata: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("OAuth initialization failed: {}", e),
+            format!("Failed to discover OAuth server: {}", e),
         )
     })?;
 
-    // Generate PKCE parameters
-    let pkce = PkceParams::generate();
-
-    // Discover server metadata to get token endpoint
-    let handle = params.handle.as_deref().unwrap_or("user.bsky.social");
-    let pds_url = &ctx.config.authentication.oauth.pds_url;
-
-    let server_metadata = oauth_client
-        .discover_server_metadata(pds_url)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to discover server metadata: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to discover OAuth server: {}", e),
-            )
-        })?;
-
-    let token_endpoint = server_metadata.token_endpoint.clone();
-
-    // Build authorization URL
-    let auth_url = oauth_client
-        .build_authorization_url(
-            pds_url,
-            handle,
-            &pkce,
-        )
+    // Build authorization URL — proto-blue generates PKCE + DPoP keys + state internally.
+    let (auth_url, auth_state) = oauth_client
+        .authorize(&server_metadata)
         .await
         .map_err(|e| {
             tracing::error!("Failed to build authorization URL: {}", e);
@@ -132,42 +149,28 @@ async fn initiate_oauth(
             )
         })?;
 
-    // Store PKCE verifier for later use
-    // Extract state from the URL
-    let url = Url::parse(&auth_url).map_err(|e| {
-        tracing::error!("Invalid authorization URL: {}", e);
+    // The state we'll receive back on the callback is `app_state` on AuthState.
+    let state_key = auth_state.app_state.clone().ok_or_else(|| {
+        tracing::error!("OAuth client returned AuthState without app_state");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Invalid authorization URL".to_string(),
+            "OAuth client returned no state parameter".to_string(),
         )
     })?;
 
-    let state = url
-        .query_pairs()
-        .find(|(k, _)| k == "state")
-        .map(|(_, v)| v.to_string())
-        .ok_or_else(|| {
-            tracing::error!("No state parameter in authorization URL");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Missing state parameter".to_string(),
-            )
-        })?;
-
-    // Store state data including token endpoint
     state_store
         .store(
-            state,
+            state_key,
             OAuthStateData {
-                code_verifier: pkce.code_verifier,
+                auth_state,
+                server_metadata,
                 handle: params.handle.clone(),
-                token_endpoint,
             },
         )
         .await;
 
     tracing::info!("Redirecting to authorization URL: {}", auth_url);
-    Ok(Redirect::to(&auth_url))
+    Ok(Redirect::to(auth_url.as_str()))
 }
 
 /// OAuth callback parameters
@@ -175,12 +178,13 @@ async fn initiate_oauth(
 struct OAuthCallbackParams {
     code: Option<String>,
     state: Option<String>,
+    iss: Option<String>,
     error: Option<String>,
     error_description: Option<String>,
 }
 
 /// Response for successful OAuth login
-#[allow(dead_code)] // TODO: Implement OAuth login endpoint
+#[allow(dead_code)] // future structured-response variant
 #[derive(Serialize)]
 struct OAuthLoginResponse {
     access_token: String,
@@ -198,9 +202,10 @@ async fn handle_oauth_callback(
 ) -> Result<axum::response::Html<String>, (StatusCode, String)> {
     tracing::info!("Handling OAuth callback");
 
-    // Check for errors
     if let Some(error) = params.error {
-        let description = params.error_description.unwrap_or_else(|| "Unknown error".to_string());
+        let description = params
+            .error_description
+            .unwrap_or_else(|| "Unknown error".to_string());
         tracing::warn!("OAuth error: {} - {}", error, description);
         return Err((
             StatusCode::BAD_REQUEST,
@@ -208,18 +213,22 @@ async fn handle_oauth_callback(
         ));
     }
 
-    // Get authorization code and state
     let code = params.code.ok_or_else(|| {
         tracing::error!("Missing authorization code");
-        (StatusCode::BAD_REQUEST, "Missing authorization code".to_string())
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing authorization code".to_string(),
+        )
     })?;
 
     let state = params.state.ok_or_else(|| {
         tracing::error!("Missing state parameter");
-        (StatusCode::BAD_REQUEST, "Missing state parameter".to_string())
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing state parameter".to_string(),
+        )
     })?;
 
-    // Retrieve stored PKCE verifier
     let state_data = state_store.get(&state).await.ok_or_else(|| {
         tracing::error!("Invalid or expired state");
         (
@@ -228,25 +237,17 @@ async fn handle_oauth_callback(
         )
     })?;
 
-    // Create OAuth client
-    let oauth_client = OAuthClient::new(
-        ctx.config.authentication.oauth.client_id.clone(),
-        ctx.config.authentication.oauth.redirect_uri.clone(),
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to create OAuth client: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("OAuth client error: {}", e),
+    let oauth_client = build_oauth_client(&ctx);
+
+    // RFC 9207: when the AS supports it, verify the `iss` we got back matches
+    // the one we stored before exchanging the code.
+    let token_set = oauth_client
+        .callback_with_iss(
+            &code,
+            params.iss.as_deref(),
+            &state_data.auth_state,
+            &state_data.server_metadata,
         )
-    })?;
-
-    // Use the token endpoint discovered during authorization
-    let token_endpoint = &state_data.token_endpoint;
-
-    // Exchange code for tokens
-    let oauth_session = oauth_client
-        .exchange_code(&code, &state_data.code_verifier, token_endpoint)
         .await
         .map_err(|e| {
             tracing::error!("Failed to exchange code: {}", e);
@@ -256,23 +257,19 @@ async fn handle_oauth_callback(
             )
         })?;
 
-    let did = oauth_session.did.to_string();
+    let did = token_set.sub.clone();
     tracing::info!("OAuth authentication successful for DID: {}", did);
 
-    // Check if this DID is authorized as admin
+    // Admin authorisation check.
     let is_configured_admin = ctx.config.authentication.admin_dids.contains(&did);
 
-    let admin_role = ctx
-        .admin_role_manager
-        .get_role(&did)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to query admin role: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to check admin status".to_string(),
-            )
-        })?;
+    let admin_role = ctx.admin_role_manager.get_role(&did).await.map_err(|e| {
+        tracing::error!("Failed to query admin role: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to check admin status".to_string(),
+        )
+    })?;
 
     let is_admin = is_configured_admin || admin_role.is_some();
 
@@ -292,10 +289,10 @@ async fn handle_oauth_callback(
 
     tracing::info!("Admin {} authenticated with role {:?}", did, role);
 
-    // Check if account exists on this PDS
+    // Mint PDS-side tokens (real session if the user has an account, otherwise a
+    // 24h admin-scoped JWT for AS-only admins).
     let account_exists = ctx.account_manager.get_account(&did).await.is_ok();
 
-    // Create session tokens
     let (access_token, refresh_token) = if account_exists {
         let session = ctx
             .account_manager
@@ -311,7 +308,6 @@ async fn handle_oauth_callback(
 
         (session.access_token, session.refresh_token)
     } else {
-        // Create temporary admin-only JWT tokens
         use jsonwebtoken::{encode, EncodingKey, Header};
         use serde_json::json;
 
@@ -359,8 +355,8 @@ async fn handle_oauth_callback(
         (access_token, refresh_token)
     };
 
-    // Return HTML page that stores tokens and redirects to admin panel
-    let html = format!(r#"<!DOCTYPE html>
+    let html = format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Login Successful</title>
@@ -437,15 +433,16 @@ struct ClientMetadataResponse {
 }
 
 /// Serve OAuth client metadata
-async fn client_metadata(
-    State(ctx): State<AppContext>,
-) -> Json<ClientMetadataResponse> {
+async fn client_metadata(State(ctx): State<AppContext>) -> Json<ClientMetadataResponse> {
     Json(ClientMetadataResponse {
         client_id: ctx.config.authentication.oauth.client_id.clone(),
         client_name: "Aurora Locus Admin".to_string(),
         redirect_uris: vec![ctx.config.authentication.oauth.redirect_uri.clone()],
-        token_endpoint_auth_method: "none".to_string(), // Public client
-        grant_types: vec!["authorization_code".to_string(), "refresh_token".to_string()],
+        token_endpoint_auth_method: "none".to_string(),
+        grant_types: vec![
+            "authorization_code".to_string(),
+            "refresh_token".to_string(),
+        ],
         response_types: vec!["code".to_string()],
         scope: "atproto transition:generic".to_string(),
         application_type: "web".to_string(),

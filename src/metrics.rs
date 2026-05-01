@@ -13,9 +13,9 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_gauge, register_histogram_vec, register_int_counter,
-    register_int_counter_vec, register_int_gauge, register_int_gauge_vec, Gauge,
-    HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder, Encoder,
+    register_gauge, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, register_int_gauge_vec, Encoder, Gauge, HistogramVec, IntCounter,
+    IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
 
 lazy_static! {
@@ -692,16 +692,12 @@ pub fn record_handle_resolution(success: bool) {
 
 /// Record an error
 pub fn record_error(error_type: &str, module: &str) {
-    ERRORS_TOTAL
-        .with_label_values(&[error_type, module])
-        .inc();
+    ERRORS_TOTAL.with_label_values(&[error_type, module]).inc();
 }
 
 /// Record a relay event received (Phase 3)
 pub fn record_relay_event(event_type: &str, processing_duration: f64) {
-    RELAY_EVENTS_TOTAL
-        .with_label_values(&[event_type])
-        .inc();
+    RELAY_EVENTS_TOTAL.with_label_values(&[event_type]).inc();
     RELAY_EVENT_PROCESSING_DURATION_SECONDS
         .with_label_values(&[event_type])
         .observe(processing_duration);
@@ -885,8 +881,11 @@ pub fn record_firehose_backpressure(reason: &str, duration: f64) {
 /// Record a batch fetch during catch-up
 pub fn record_firehose_batch_fetch(event_count: usize) {
     FIREHOSE_BATCH_FETCHES_TOTAL.inc();
+    // prometheus 0.14 tightened `with_label_values` to require `V: AsRef<str>`,
+    // and an empty slice no longer infers a concrete element type. The empty
+    // `[&str; 0]` literal both communicates intent and satisfies the bound.
     FIREHOSE_BATCH_SIZE
-        .with_label_values(&[])
+        .with_label_values::<&str>(&[])
         .observe(event_count as f64);
 }
 
@@ -924,9 +923,7 @@ pub fn update_sequencer_cursor(consumer: &str, position: i64) {
 
 /// Update sequencer lag for a consumer
 pub fn update_sequencer_lag(consumer: &str, lag: i64) {
-    SEQUENCER_LAG
-        .with_label_values(&[consumer])
-        .set(lag);
+    SEQUENCER_LAG.with_label_values(&[consumer]).set(lag);
 }
 
 /// Update current sequencer position and calculate lag for all consumers

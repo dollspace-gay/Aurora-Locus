@@ -1,4 +1,12 @@
-/// Federation management API endpoints (Phase 1 & 2)
+//! Federation management API endpoints (Phase 1 & 2).
+//!
+//! Phase 2 federated-search handlers (`search_actors`, `search_posts` and
+//! their request/response structs) are staged but intentionally not yet
+//! wired to routes — they collide with the appview proxy paths and are
+//! held for a follow-up. Allow dead_code at the module level rather than
+//! sprinkling per-item attributes.
+#![allow(dead_code)]
+
 use crate::{
     auth::AdminAuthContext,
     context::AppContext,
@@ -33,16 +41,11 @@ pub fn routes() -> Router<AppContext> {
             get(aggregate_timeline),
         )
         // Phase 4: DPoP support
-        .route(
-            "/xrpc/com.aurora.dpop.getNonce",
-            get(get_dpop_nonce),
-        )
+        .route("/xrpc/com.aurora.dpop.getNonce", get(get_dpop_nonce))
 }
 
 /// Get federation status (public endpoint)
-async fn federation_status(
-    State(ctx): State<AppContext>,
-) -> Json<FederationStatusResponse> {
+async fn federation_status(State(ctx): State<AppContext>) -> Json<FederationStatusResponse> {
     let enabled = ctx.config.federation.enabled;
     let relay_connected = ctx.relay_client.is_some();
     let discovery_active = ctx.pds_discovery.is_some();
@@ -136,9 +139,10 @@ async fn search_actors(
     }
 
     // Check if federation is enabled
-    let search = ctx.federated_search.as_ref().ok_or_else(|| {
-        PdsError::Validation("Federation is not enabled".to_string())
-    })?;
+    let search = ctx
+        .federated_search
+        .as_ref()
+        .ok_or_else(|| PdsError::Validation("Federation is not enabled".to_string()))?;
 
     // Rate limiting is handled by the rate_limiter middleware
     let limit = params.limit.unwrap_or(25).min(100); // Cap at 100 results
@@ -159,9 +163,10 @@ async fn search_posts(
     }
 
     // Check if federation is enabled
-    let search = ctx.federated_search.as_ref().ok_or_else(|| {
-        PdsError::Validation("Federation is not enabled".to_string())
-    })?;
+    let search = ctx
+        .federated_search
+        .as_ref()
+        .ok_or_else(|| PdsError::Validation("Federation is not enabled".to_string()))?;
 
     let limit = params.limit.unwrap_or(25).min(100);
 
@@ -177,7 +182,9 @@ async fn aggregate_timeline(
 ) -> PdsResult<Json<TimelineResponse>> {
     // Validate DIDs
     if params.dids.is_empty() {
-        return Err(PdsError::Validation("At least one DID is required".to_string()));
+        return Err(PdsError::Validation(
+            "At least one DID is required".to_string(),
+        ));
     }
 
     if params.dids.len() > 50 {
@@ -185,9 +192,10 @@ async fn aggregate_timeline(
     }
 
     // Check if federation is enabled
-    let search = ctx.federated_search.as_ref().ok_or_else(|| {
-        PdsError::Validation("Federation is not enabled".to_string())
-    })?;
+    let search = ctx
+        .federated_search
+        .as_ref()
+        .ok_or_else(|| PdsError::Validation("Federation is not enabled".to_string()))?;
 
     let limit = params.limit.unwrap_or(50).min(200);
 
@@ -246,9 +254,7 @@ pub struct TimelineResponse {
 /// Clients should call this endpoint before making DPoP-protected requests.
 ///
 /// Reference: https://datatracker.ietf.org/doc/html/rfc9449#section-8
-async fn get_dpop_nonce(
-    State(ctx): State<AppContext>,
-) -> PdsResult<Json<DPopNonceResponse>> {
+async fn get_dpop_nonce(State(ctx): State<AppContext>) -> PdsResult<Json<DPopNonceResponse>> {
     let dpop_nonce_store = ctx
         .dpop_nonce_store
         .as_ref()

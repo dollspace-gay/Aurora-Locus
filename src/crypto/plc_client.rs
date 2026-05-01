@@ -3,11 +3,11 @@
 //! Provides high-level interface for interacting with the PLC directory,
 //! including fetching DID documents, comparing keys, and updating signing keys.
 
+use crate::identity::did_document::DidDocument;
 use crate::{
-    crypto::plc::{PlcOperationBuilder, PlcSigner, register_plc_did},
+    crypto::plc::{register_plc_did, PlcOperationBuilder, PlcSigner},
     error::{PdsError, PdsResult},
 };
-use atproto::did_doc::DidDocument;
 
 /// PLC Directory client configuration
 #[derive(Debug, Clone)]
@@ -54,34 +54,32 @@ impl PlcClient {
     pub async fn get_document(&self, did: &str) -> PdsResult<DidDocument> {
         if !did.starts_with("did:plc:") {
             return Err(PdsError::Validation(
-                "Only did:plc identifiers are supported".to_string()
+                "Only did:plc identifiers are supported".to_string(),
             ));
         }
 
         let url = format!("{}/{}", self.config.plc_url.trim_end_matches('/'), did);
 
-        let response = self.http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| PdsError::IdentityResolution(
-                format!("Failed to fetch PLC document: {}", e)
-            ))?;
+        let response = self.http_client.get(&url).send().await.map_err(|e| {
+            PdsError::IdentityResolution(format!("Failed to fetch PLC document: {}", e))
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(PdsError::IdentityResolution(
-                format!("PLC directory returned error {}: {}", status, error_body)
-            ));
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(PdsError::IdentityResolution(format!(
+                "PLC directory returned error {}: {}",
+                status, error_body
+            )));
         }
 
         let doc: DidDocument = response
             .json()
             .await
-            .map_err(|e| PdsError::IdentityResolution(
-                format!("Invalid PLC document: {}", e)
-            ))?;
+            .map_err(|e| PdsError::IdentityResolution(format!("Invalid PLC document: {}", e)))?;
 
         Ok(doc)
     }
@@ -99,7 +97,7 @@ impl PlcClient {
         }
 
         Err(PdsError::IdentityResolution(
-            "No signing key found in DID document".to_string()
+            "No signing key found in DID document".to_string(),
         ))
     }
 
@@ -161,11 +159,7 @@ impl PlcClient {
     /// Check if key rotation is needed
     ///
     /// Compares current PLC key with desired key
-    pub async fn needs_rotation(
-        &self,
-        did: &str,
-        desired_key: &str,
-    ) -> PdsResult<bool> {
+    pub async fn needs_rotation(&self, did: &str, desired_key: &str) -> PdsResult<bool> {
         let doc = self.get_document(did).await?;
         let current_key = self.get_signing_key(&doc)?;
 
@@ -186,7 +180,8 @@ impl PlcClient {
             return Ok(false);
         }
 
-        self.update_signing_key(did, new_signing_key, rotation_key_signer).await?;
+        self.update_signing_key(did, new_signing_key, rotation_key_signer)
+            .await?;
         Ok(true)
     }
 }

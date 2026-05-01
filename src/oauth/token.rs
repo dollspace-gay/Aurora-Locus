@@ -68,12 +68,8 @@ pub async fn token_endpoint(
 
     // Route to appropriate grant handler
     match request.grant_type.as_str() {
-        "authorization_code" => {
-            handle_authorization_code_grant(&ctx, headers, request).await
-        }
-        "refresh_token" => {
-            handle_refresh_token_grant(&ctx, headers, request).await
-        }
+        "authorization_code" => handle_authorization_code_grant(&ctx, headers, request).await,
+        "refresh_token" => handle_refresh_token_grant(&ctx, headers, request).await,
         _ => Err(PdsError::Validation(format!(
             "Unsupported grant_type: {}",
             request.grant_type
@@ -150,9 +146,7 @@ async fn handle_authorization_code_grant(
             "redirect_uri_mismatch",
             start_time.elapsed().as_secs_f64(),
         );
-        return Err(PdsError::Authentication(
-            "Invalid redirect_uri".to_string(),
-        ));
+        return Err(PdsError::Authentication("Invalid redirect_uri".to_string()));
     }
 
     // Step 5: Verify PKCE code_verifier
@@ -229,11 +223,7 @@ async fn handle_authorization_code_grant(
     mark_code_as_used(ctx, code).await?;
 
     // Step 10: Return token response
-    let token_type = if has_dpop {
-        "DPoP"
-    } else {
-        "Bearer"
-    };
+    let token_type = if has_dpop { "DPoP" } else { "Bearer" };
 
     // Record successful token exchange metrics
     crate::metrics::record_oauth_token_exchange(
@@ -377,19 +367,17 @@ async fn extract_dpop_proof(headers: &HeaderMap, _ctx: &AppContext) -> PdsResult
 
     // Parse JWT to extract JWK
     use jsonwebtoken::decode_header;
-    let header = decode_header(dpop_header).map_err(|e| {
-        PdsError::Authentication(format!("Invalid DPoP JWT header: {}", e))
-    })?;
+    let header = decode_header(dpop_header)
+        .map_err(|e| PdsError::Authentication(format!("Invalid DPoP JWT header: {}", e)))?;
 
     // Extract JWK from header
-    let jwk = header.jwk.ok_or_else(|| {
-        PdsError::Authentication("DPoP JWT missing jwk field".to_string())
-    })?;
+    let jwk = header
+        .jwk
+        .ok_or_else(|| PdsError::Authentication("DPoP JWT missing jwk field".to_string()))?;
 
     // Compute JWK thumbprint
-    let jwk_value = serde_json::to_value(jwk).map_err(|e| {
-        PdsError::Internal(format!("Failed to serialize JWK: {}", e))
-    })?;
+    let jwk_value = serde_json::to_value(jwk)
+        .map_err(|e| PdsError::Internal(format!("Failed to serialize JWK: {}", e)))?;
 
     let thumbprint = compute_jwk_thumbprint(&jwk_value)?;
 
@@ -471,18 +459,22 @@ mod tests {
         let wrong_verifier = "wrong_verifier_value";
 
         let result = verify_pkce_challenge(wrong_verifier, code_challenge);
-        assert!(result.is_err(), "PKCE verification should fail with wrong verifier");
+        assert!(
+            result.is_err(),
+            "PKCE verification should fail with wrong verifier"
+        );
     }
 
     #[test]
     fn test_generate_token() {
+        // Layout: "<prefix>_" + 32-char dash-stripped UUIDv4 = 35 chars total.
         let access_token = generate_token("at");
         assert!(access_token.starts_with("at_"));
-        assert!(access_token.len() > 35); // at_ + 32 hex chars
+        assert_eq!(access_token.len(), 35);
 
         let refresh_token = generate_token("rt");
         assert!(refresh_token.starts_with("rt_"));
-        assert!(refresh_token.len() > 35);
+        assert_eq!(refresh_token.len(), 35);
     }
 
     #[test]

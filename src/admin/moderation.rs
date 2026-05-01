@@ -45,7 +45,10 @@ impl FromStr for ModerationAction {
             "flag" => Ok(ModerationAction::Flag),
             "warn" => Ok(ModerationAction::Warn),
             "restore" => Ok(ModerationAction::Restore),
-            _ => Err(PdsError::Validation(format!("Invalid moderation action: {}", s))),
+            _ => Err(PdsError::Validation(format!(
+                "Invalid moderation action: {}",
+                s
+            ))),
         }
     }
 }
@@ -88,7 +91,10 @@ pub struct ModerationManager {
 
 impl ModerationManager {
     pub fn new(db: SqlitePool, account_manager: Arc<AccountManager>) -> Self {
-        Self { db, account_manager }
+        Self {
+            db,
+            account_manager,
+        }
     }
 
     /// Apply moderation action to an account
@@ -130,7 +136,11 @@ impl ModerationManager {
         if action == ModerationAction::Takedown {
             // Use moderation ID as takedown_ref for audit trail
             let takedown_ref = format!("mod_{}", id);
-            if let Err(e) = self.account_manager.takedown_account(did, &takedown_ref).await {
+            if let Err(e) = self
+                .account_manager
+                .takedown_account(did, &takedown_ref)
+                .await
+            {
                 tracing::error!("Failed to apply account takedown for {}: {}", did, e);
                 // Don't fail the whole operation - moderation record is already created
             }
@@ -191,7 +201,9 @@ impl ModerationManager {
             .bind(moderation_id)
             .fetch_optional(&self.db)
             .await?
-            .ok_or_else(|| PdsError::NotFound(format!("Moderation record {} not found", moderation_id)))?;
+            .ok_or_else(|| {
+                PdsError::NotFound(format!("Moderation record {} not found", moderation_id))
+            })?;
 
         let action_str: String = row.get("action");
         let did: String = row.get("did");
@@ -229,7 +241,9 @@ impl ModerationManager {
     /// Check if account is currently taken down
     pub async fn is_taken_down(&self, did: &str) -> PdsResult<bool> {
         let actions = self.get_active_actions(did).await?;
-        Ok(actions.iter().any(|a| a.action == ModerationAction::Takedown))
+        Ok(actions
+            .iter()
+            .any(|a| a.action == ModerationAction::Takedown))
     }
 
     /// Check if account is currently suspended
@@ -238,8 +252,7 @@ impl ModerationManager {
         let now = Utc::now();
 
         Ok(actions.iter().any(|a| {
-            a.action == ModerationAction::Suspend &&
-            a.expires_at.is_none_or(|exp| exp > now)
+            a.action == ModerationAction::Suspend && a.expires_at.is_none_or(|exp| exp > now)
         }))
     }
 
@@ -452,7 +465,10 @@ mod tests {
 
         // Create minimal account manager for tests
         let config = create_test_config();
-        let account_manager = Arc::new(crate::account::AccountManager::new(db.clone(), Arc::new(config)));
+        let account_manager = Arc::new(crate::account::AccountManager::new(
+            db.clone(),
+            Arc::new(config),
+        ));
 
         let manager = ModerationManager::new(db, account_manager);
 
@@ -511,7 +527,10 @@ mod tests {
 
         // Create minimal account manager for tests
         let config = create_test_config();
-        let account_manager = Arc::new(crate::account::AccountManager::new(db.clone(), Arc::new(config)));
+        let account_manager = Arc::new(crate::account::AccountManager::new(
+            db.clone(),
+            Arc::new(config),
+        ));
 
         let manager = ModerationManager::new(db, account_manager);
 
@@ -561,7 +580,10 @@ mod tests {
 
         // Create minimal account manager for tests
         let config = create_test_config();
-        let account_manager = Arc::new(crate::account::AccountManager::new(db.clone(), Arc::new(config)));
+        let account_manager = Arc::new(crate::account::AccountManager::new(
+            db.clone(),
+            Arc::new(config),
+        ));
 
         let manager = ModerationManager::new(db, account_manager);
 

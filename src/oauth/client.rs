@@ -89,9 +89,9 @@ impl ClientManager {
     /// # Returns
     /// Ok(()) if redirect_uri is whitelisted, Err otherwise
     pub fn validate_redirect_uri(&self, client_id: &str, redirect_uri: &str) -> PdsResult<()> {
-        let client = self.get_client(client_id).ok_or_else(|| {
-            PdsError::Authentication(format!("Unknown client: {}", client_id))
-        })?;
+        let client = self
+            .get_client(client_id)
+            .ok_or_else(|| PdsError::Authentication(format!("Unknown client: {}", client_id)))?;
 
         if client.redirect_uris.contains(&redirect_uri.to_string()) {
             Ok(())
@@ -373,9 +373,9 @@ impl ClientManager {
     /// # Returns
     /// Default scopes (space-separated string)
     pub fn get_default_scopes(&self, client_id: &str) -> PdsResult<String> {
-        let client = self.get_client(client_id).ok_or_else(|| {
-            PdsError::Authentication(format!("Unknown client: {}", client_id))
-        })?;
+        let client = self
+            .get_client(client_id)
+            .ok_or_else(|| PdsError::Authentication(format!("Unknown client: {}", client_id)))?;
 
         Ok(client.default_scopes.join(" "))
     }
@@ -415,8 +415,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_client_id() {
+    #[tokio::test]
+    async fn test_validate_client_id() {
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let client = create_test_client();
         let manager = ClientManager::new(pool, vec![client.clone()]);
@@ -425,8 +425,8 @@ mod tests {
         assert!(manager.validate_client_id("unknown").is_err());
     }
 
-    #[test]
-    fn test_validate_redirect_uri() {
+    #[tokio::test]
+    async fn test_validate_redirect_uri() {
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let client = create_test_client();
         let manager = ClientManager::new(pool, vec![client.clone()]);
@@ -445,8 +445,8 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn test_get_default_scopes() {
+    #[tokio::test]
+    async fn test_get_default_scopes() {
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let client = create_test_client();
         let manager = ClientManager::new(pool, vec![client.clone()]);
@@ -455,12 +455,12 @@ mod tests {
         assert_eq!(scopes, "atproto:read atproto:write");
     }
 
-    #[test]
-    fn test_is_trusted_client() {
+    #[tokio::test]
+    async fn test_is_trusted_client() {
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let client = create_test_client();
         let manager = ClientManager::new(pool, vec![client.clone()]);
 
-        assert_eq!(manager.is_trusted_client(&client.client_id), false);
+        assert!(!manager.is_trusted_client(&client.client_id));
     }
 }

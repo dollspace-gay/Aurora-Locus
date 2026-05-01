@@ -99,9 +99,9 @@ impl PlcOperationBuilder {
 
     /// Build the operation (without signature)
     pub fn build(self) -> PdsResult<PlcOperation> {
-        let did = self.did.ok_or_else(|| {
-            PdsError::Validation("DID is required for PLC operation".to_string())
-        })?;
+        let did = self
+            .did
+            .ok_or_else(|| PdsError::Validation("DID is required for PLC operation".to_string()))?;
 
         // Validate DID format
         if !did.starts_with("did:plc:") {
@@ -140,19 +140,10 @@ impl PlcSigner {
 
     /// Create a signer from hex-encoded private key
     pub fn from_hex(hex_key: &str) -> PdsResult<Self> {
-        let key_bytes = hex::decode(hex_key).map_err(|e| {
-            PdsError::Validation(format!("Invalid hex private key: {}", e))
-        })?;
+        let key_bytes = hex::decode(hex_key)
+            .map_err(|e| PdsError::Validation(format!("Invalid hex private key: {}", e)))?;
 
         Self::new(&key_bytes)
-    }
-
-    /// Sign raw bytes (for repository commits)
-    ///
-    /// Returns a 64-byte signature
-    pub fn sign(&self, data: &[u8]) -> Vec<u8> {
-        let signature: k256::ecdsa::Signature = self.keypair.signing_key().sign(data);
-        signature.to_bytes().to_vec()
     }
 
     /// Sign a PLC operation
@@ -164,9 +155,8 @@ impl PlcSigner {
         operation.sig = None;
 
         // Serialize to canonical JSON (sorted keys)
-        let canonical_json = serde_json::to_vec(&operation).map_err(|e| {
-            PdsError::Internal(format!("Failed to serialize operation: {}", e))
-        })?;
+        let canonical_json = serde_json::to_vec(&operation)
+            .map_err(|e| PdsError::Internal(format!("Failed to serialize operation: {}", e)))?;
 
         // Hash the JSON
         let mut hasher = Sha256::new();
@@ -227,9 +217,7 @@ pub fn validate_plc_operation(operation: &PlcOperation) -> PdsResult<()> {
 
     // Check signature is present
     if operation.sig.is_none() {
-        return Err(PdsError::Validation(
-            "Operation must be signed".to_string(),
-        ));
+        return Err(PdsError::Validation("Operation must be signed".to_string()));
     }
 
     // Validate signature format (should be hex)
@@ -247,10 +235,7 @@ pub fn validate_plc_operation(operation: &PlcOperation) -> PdsResult<()> {
 /// Register a PLC DID with the PLC Directory
 ///
 /// Submits a signed PLC operation to the directory to create or update a DID
-pub async fn register_plc_did(
-    plc_url: &str,
-    operation: PlcOperation,
-) -> PdsResult<String> {
+pub async fn register_plc_did(plc_url: &str, operation: PlcOperation) -> PdsResult<String> {
     // Validate operation before sending
     validate_plc_operation(&operation)?;
 
@@ -274,7 +259,10 @@ pub async fn register_plc_did(
         Ok(operation.did)
     } else {
         let status = response.status();
-        let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
         Err(PdsError::Internal(format!(
             "PLC directory returned error {}: {}",
             status, error_body

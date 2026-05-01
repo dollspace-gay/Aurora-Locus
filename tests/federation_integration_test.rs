@@ -8,7 +8,6 @@
 ///
 /// These tests verify federation components work correctly with mock data
 /// and handle error cases gracefully.
-
 use serde_json::json;
 
 #[cfg(test)]
@@ -29,10 +28,10 @@ mod federated_search_tests {
         // 3. Deduplication by DID/URI
         // 4. Proper handling of partial failures
 
-        let search_term = "test";
+        let _search_term = "test";
 
         // Mock response from PDS 1
-        let pds1_response = json!({
+        let _pds1_response = json!({
             "actors": [
                 {"did": "did:plc:user1", "handle": "alice.pds1.example"},
                 {"did": "did:plc:user2", "handle": "bob.pds1.example"}
@@ -40,7 +39,7 @@ mod federated_search_tests {
         });
 
         // Mock response from PDS 2
-        let pds2_response = json!({
+        let _pds2_response = json!({
             "actors": [
                 {"did": "did:plc:user3", "handle": "charlie.pds2.example"},
                 {"did": "did:plc:user1", "handle": "alice.pds1.example"} // Duplicate
@@ -50,7 +49,10 @@ mod federated_search_tests {
         // Expected: 3 unique actors (user1 deduplicated)
         let expected_count = 3;
 
-        println!("✓ Federated search would aggregate {} unique actors", expected_count);
+        println!(
+            "✓ Federated search would aggregate {} unique actors",
+            expected_count
+        );
 
         // TODO: Once FederatedSearch is refactored for testability,
         // inject mock HTTP client and verify actual aggregation logic
@@ -112,7 +114,8 @@ mod federated_search_tests {
 
         // Deduplication logic (by DID)
         let mut seen_dids = std::collections::HashSet::new();
-        let unique_actors: Vec<_> = actors.into_iter()
+        let unique_actors: Vec<_> = actors
+            .into_iter()
             .filter(|actor| {
                 let did = actor["did"].as_str().unwrap();
                 seen_dids.insert(did.to_string())
@@ -284,13 +287,13 @@ mod pds_discovery_tests {
         // When: Events are processed
         // Then: New PDSs are added to discovered instances
 
-        let event_from_pds1 = json!({
+        let _event_from_pds1 = json!({
             "event_type": "commit",
             "origin": "https://pds1.example.com",
             "did": "did:plc:user1"
         });
 
-        let event_from_pds2 = json!({
+        let _event_from_pds2 = json!({
             "event_type": "commit",
             "origin": "https://pds2.example.com",
             "did": "did:plc:user2"
@@ -302,7 +305,10 @@ mod pds_discovery_tests {
         discovered_pds.insert("https://pds2.example.com");
 
         assert_eq!(discovered_pds.len(), 2);
-        println!("✓ PDS discovery from relay verified: {} instances", discovered_pds.len());
+        println!(
+            "✓ PDS discovery from relay verified: {} instances",
+            discovered_pds.len()
+        );
 
         // TODO: Verify KNOWN_INSTANCES gauge is updated
     }
@@ -321,10 +327,13 @@ mod pds_discovery_tests {
             json!({"origin": "https://pds2.example.com"}),
         ];
 
-        let mut discovered = std::collections::HashSet::new();
+        // Collect owned strings — `event` is moved out of the iterator each
+        // iteration and a borrow into it can't outlive the loop body, so the
+        // HashSet must own its entries.
+        let mut discovered: std::collections::HashSet<String> = std::collections::HashSet::new();
         for event in events {
             if let Some(origin) = event["origin"].as_str() {
-                discovered.insert(origin);
+                discovered.insert(origin.to_string());
             }
         }
 
@@ -348,9 +357,9 @@ mod pds_discovery_tests {
         ];
 
         for origin in invalid_origins {
-            let is_valid = origin.starts_with("https://") &&
-                          origin.len() > 8 &&
-                          url::Url::parse(origin).is_ok();
+            let is_valid = origin.starts_with("https://")
+                && origin.len() > 8
+                && url::Url::parse(origin).is_ok();
 
             assert!(!is_valid, "Invalid origin should be rejected: {}", origin);
         }
@@ -488,7 +497,6 @@ mod cross_pds_authentication_tests {
 
 #[cfg(test)]
 mod integration_end_to_end_tests {
-    use super::*;
 
     #[tokio::test]
     async fn test_federation_full_flow_simulation() {
@@ -507,12 +515,15 @@ mod integration_end_to_end_tests {
         println!("1. ✓ Subscribed to relay firehose");
 
         // Step 2: Receive events and discover PDSs
-        let discovered_pds = vec![
+        let discovered_pds = [
             "https://pds1.example.com",
             "https://pds2.example.com",
             "https://pds3.example.com",
         ];
-        println!("2. ✓ Discovered {} PDS instances from relay", discovered_pds.len());
+        println!(
+            "2. ✓ Discovered {} PDS instances from relay",
+            discovered_pds.len()
+        );
 
         // Step 3: User initiates federated search
         let search_query = "atproto";
@@ -551,10 +562,16 @@ mod performance_tests {
 
         let duration = start.elapsed();
 
-        assert!(duration.as_secs() < 2,
-            "Federated search should complete in <2s, took {:?}", duration);
+        assert!(
+            duration.as_secs() < 2,
+            "Federated search should complete in <2s, took {:?}",
+            duration
+        );
 
-        println!("✓ Federated search latency: {:?} (target: <2s p95)", duration);
+        println!(
+            "✓ Federated search latency: {:?} (target: <2s p95)",
+            duration
+        );
     }
 
     #[tokio::test]
@@ -571,9 +588,15 @@ mod performance_tests {
 
         let duration = start.elapsed();
 
-        assert!(duration.as_millis() < 100,
-            "Event processing should complete in <100ms, took {:?}", duration);
+        assert!(
+            duration.as_millis() < 100,
+            "Event processing should complete in <100ms, took {:?}",
+            duration
+        );
 
-        println!("✓ Relay event processing: {:?} (target: <100ms p95)", duration);
+        println!(
+            "✓ Relay event processing: {:?} (target: <100ms p95)",
+            duration
+        );
     }
 }

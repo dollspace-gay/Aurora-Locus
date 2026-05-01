@@ -30,11 +30,17 @@ impl NotificationEmail {
         vars.insert("action".to_string(), action.to_string());
         vars.insert("reason".to_string(), reason.to_string());
         vars.insert("details".to_string(), details.to_string());
-        vars.insert("date".to_string(), chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string());
+        vars.insert(
+            "date".to_string(),
+            chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string(),
+        );
         vars.insert("service_name".to_string(), service_name.to_string());
         vars.insert("service_url".to_string(), service_url.to_string());
         vars.insert("appeal_url".to_string(), format!("{}/appeal", service_url));
-        vars.insert("guidelines_url".to_string(), format!("{}/guidelines", service_url));
+        vars.insert(
+            "guidelines_url".to_string(),
+            format!("{}/guidelines", service_url),
+        );
 
         Self {
             template_type: EmailTemplateType::ModerationAction,
@@ -60,7 +66,10 @@ impl NotificationEmail {
         vars.insert("details".to_string(), details.to_string());
         vars.insert("service_name".to_string(), service_name.to_string());
         vars.insert("service_url".to_string(), service_url.to_string());
-        vars.insert("appeal_policy_url".to_string(), format!("{}/appeal-policy", service_url));
+        vars.insert(
+            "appeal_policy_url".to_string(),
+            format!("{}/appeal-policy", service_url),
+        );
 
         Self {
             template_type: EmailTemplateType::AppealUpdate,
@@ -84,7 +93,10 @@ impl NotificationEmail {
         vars.insert("expires_at".to_string(), expires_at.to_string());
         vars.insert("service_name".to_string(), service_name.to_string());
         vars.insert("service_url".to_string(), service_url.to_string());
-        vars.insert("appeal_info".to_string(), format!("You can submit an appeal at {}/appeal", service_url));
+        vars.insert(
+            "appeal_info".to_string(),
+            format!("You can submit an appeal at {}/appeal", service_url),
+        );
 
         Self {
             template_type: EmailTemplateType::AccountSuspended,
@@ -108,10 +120,16 @@ impl NotificationEmail {
         vars.insert("content_uri".to_string(), content_uri.to_string());
         vars.insert("reason".to_string(), reason.to_string());
         vars.insert("details".to_string(), details.to_string());
-        vars.insert("date".to_string(), chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string());
+        vars.insert(
+            "date".to_string(),
+            chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string(),
+        );
         vars.insert("service_name".to_string(), service_name.to_string());
         vars.insert("service_url".to_string(), service_url.to_string());
-        vars.insert("appeal_info".to_string(), format!("You can submit an appeal at {}/appeal", service_url));
+        vars.insert(
+            "appeal_info".to_string(),
+            format!("You can submit an appeal at {}/appeal", service_url),
+        );
 
         Self {
             template_type: EmailTemplateType::ContentTakedown,
@@ -131,7 +149,10 @@ impl NotificationEmail {
         vars.insert("handle".to_string(), handle.to_string());
         vars.insert("alert_message".to_string(), alert_message.to_string());
         vars.insert("ip_address".to_string(), ip_address.to_string());
-        vars.insert("date".to_string(), chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string());
+        vars.insert(
+            "date".to_string(),
+            chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string(),
+        );
         vars.insert("service_name".to_string(), service_name.to_string());
         vars.insert("service_url".to_string(), service_url.to_string());
 
@@ -142,12 +163,7 @@ impl NotificationEmail {
     }
 
     /// Create welcome email notification
-    pub fn account_created(
-        handle: &str,
-        did: &str,
-        service_name: &str,
-        service_url: &str,
-    ) -> Self {
+    pub fn account_created(handle: &str, did: &str, service_name: &str, service_url: &str) -> Self {
         let mut vars = HashMap::new();
         vars.insert("handle".to_string(), handle.to_string());
         vars.insert("did".to_string(), did.to_string());
@@ -200,8 +216,14 @@ mod tests {
             "https://example.com",
         );
 
-        assert_eq!(notification.template_type(), EmailTemplateType::ModerationAction);
-        assert_eq!(notification.variables().get("handle").unwrap(), "alice.bsky.social");
+        assert_eq!(
+            notification.template_type(),
+            EmailTemplateType::ModerationAction
+        );
+        assert_eq!(
+            notification.variables().get("handle").unwrap(),
+            "alice.bsky.social"
+        );
         assert_eq!(notification.variables().get("action").unwrap(), "Takedown");
     }
 
@@ -217,7 +239,10 @@ mod tests {
             "https://example.com",
         );
 
-        assert_eq!(notification.template_type(), EmailTemplateType::AppealUpdate);
+        assert_eq!(
+            notification.template_type(),
+            EmailTemplateType::AppealUpdate
+        );
         assert_eq!(notification.variables().get("appeal_id").unwrap(), "123");
         assert_eq!(notification.variables().get("status").unwrap(), "Approved");
     }

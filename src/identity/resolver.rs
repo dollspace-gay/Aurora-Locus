@@ -1,10 +1,11 @@
+use crate::identity::did_document::DidDocument;
 /// Identity Resolver - Orchestrates handle and DID resolution with caching
 use crate::{
     error::{PdsError, PdsResult},
     identity::DidCache,
 };
-use atproto::{did_doc::DidDocument, handle::HandleResolver};
 use p256::pkcs8::EncodePublicKey;
+use proto_blue::identity::HandleResolver;
 use std::sync::Arc;
 
 /// Identity resolution configuration
@@ -51,10 +52,7 @@ pub struct IdentityResolver {
 
 impl IdentityResolver {
     /// Create a new identity resolver
-    pub fn new(
-        cache: DidCache,
-        config: IdentityResolverConfig,
-    ) -> PdsResult<Self> {
+    pub fn new(cache: DidCache, config: IdentityResolverConfig) -> PdsResult<Self> {
         // Build HTTP client
         let http_client = reqwest::Client::builder()
             .user_agent(&config.user_agent)
@@ -63,7 +61,8 @@ impl IdentityResolver {
             .map_err(|e| PdsError::Internal(format!("Failed to create HTTP client: {}", e)))?;
 
         // Create handle resolver from SDK
-        let handle_resolver = Arc::new(HandleResolver::new());
+        // 10s timeout matches the http_client; matches the SDK default for handle DNS+well-known races.
+        let handle_resolver = Arc::new(HandleResolver::new(10_000));
 
         Ok(Self {
             cache,
@@ -121,12 +120,19 @@ impl IdentityResolver {
 
             // Try to fetch fresh data
             match self.handle_resolver.resolve(&normalized).await {
-                Ok(did) => {
-                    let did_str = did.as_str().to_string();
+                Ok(Some(did_str)) => {
                     // Update cache with fresh data
                     self.cache.cache_handle(&normalized, &did_str).await?;
                     tracing::debug!(handle = %normalized, "Successfully refreshed stale cache");
                     return Ok(did_str);
+                }
+                Ok(None) => {
+                    // Resolver succeeded but found no DID — fall back to the stale cache value.
+                    tracing::warn!(
+                        handle = %normalized,
+                        "Resolver returned no DID, using stale cache as fallback"
+                    );
+                    return Ok(cached.did);
                 }
                 Err(e) => {
                     // Fresh fetch failed - use stale data as fallback (graceful degradation)
@@ -141,12 +147,17 @@ impl IdentityResolver {
         }
 
         // Cache miss - resolve via SDK
-        let did = self.handle_resolver
+        let did_str = self
+            .handle_resolver
             .resolve(&normalized)
             .await
-            .map_err(|e| PdsError::IdentityResolution(format!("Failed to resolve handle: {}", e)))?;
-
-        let did_str = did.as_str().to_string();
+            .map_err(|e| PdsError::IdentityResolution(format!("Failed to resolve handle: {}", e)))?
+            .ok_or_else(|| {
+                PdsError::IdentityResolution(format!(
+                    "Handle {} did not resolve to any DID",
+                    normalized
+                ))
+            })?;
 
         // Cache the successful resolution
         self.cache.cache_handle(&normalized, &did_str).await?;
@@ -190,8 +201,9 @@ impl IdentityResolver {
             match self.fetch_did_document(did).await {
                 Ok(doc) => {
                     // Update cache with fresh data
-                    let doc_json = serde_json::to_string(&doc)
-                        .map_err(|e| PdsError::Internal(format!("Failed to serialize DID document: {}", e)))?;
+                    let doc_json = serde_json::to_string(&doc).map_err(|e| {
+                        PdsError::Internal(format!("Failed to serialize DID document: {}", e))
+                    })?;
                     self.cache.cache_did_doc(did, &doc_json).await?;
                     tracing::debug!(did = %did, "Successfully refreshed stale DID doc cache");
                     return Ok(doc);
@@ -226,7 +238,10 @@ impl IdentityResolver {
         } else if did.starts_with("did:web:") {
             self.fetch_web_document(did).await
         } else {
-            Err(PdsError::IdentityResolution(format!("Unsupported DID method: {}", did)))
+            Err(PdsError::IdentityResolution(format!(
+                "Unsupported DID method: {}",
+                did
+            )))
         }
     }
 
@@ -242,16 +257,14 @@ impl IdentityResolver {
             return true;
         }
         if let Some(status) = error.status() {
-            return status.as_u16() == 429
-                || (status.is_server_error() && status.as_u16() != 501);
+            return status.as_u16() == 429 || (status.is_server_error() && status.as_u16() != 501);
         }
         false
     }
 
     /// Check if an HTTP status code is retryable
     fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-        status.as_u16() == 429
-            || (status.is_server_error() && status.as_u16() != 501)
+        status.as_u16() == 429 || (status.is_server_error() && status.as_u16() != 501)
     }
 
     /// Calculate delay for retry attempt using exponential backoff with jitter
@@ -287,7 +300,11 @@ impl IdentityResolver {
 
     /// Fetch DID document from PLC directory with retry logic
     async fn fetch_plc_document(&self, did: &str) -> PdsResult<DidDocument> {
-        let plc_url = format!("{}/{}", self.config.plc_directory_url.trim_end_matches('/'), did);
+        let plc_url = format!(
+            "{}/{}",
+            self.config.plc_directory_url.trim_end_matches('/'),
+            did
+        );
         let max_retries = self.config.max_retries;
         let mut last_error = None;
 
@@ -306,10 +323,9 @@ impl IdentityResolver {
             match self.http_client.get(&plc_url).send().await {
                 Ok(response) => {
                     if response.status().is_success() {
-                        let doc: DidDocument = response
-                            .json()
-                            .await
-                            .map_err(|e| PdsError::IdentityResolution(format!("Invalid PLC document: {}", e)))?;
+                        let doc: DidDocument = response.json().await.map_err(|e| {
+                            PdsError::IdentityResolution(format!("Invalid PLC document: {}", e))
+                        })?;
 
                         if attempt > 0 {
                             tracing::info!(
@@ -329,15 +345,17 @@ impl IdentityResolver {
                             attempt = attempt,
                             "PLC directory returned retryable error"
                         );
-                        last_error = Some(PdsError::IdentityResolution(
-                            format!("PLC directory returned error: {}", status)
-                        ));
+                        last_error = Some(PdsError::IdentityResolution(format!(
+                            "PLC directory returned error: {}",
+                            status
+                        )));
                         continue;
                     }
 
-                    return Err(PdsError::IdentityResolution(
-                        format!("PLC directory returned error: {}", status)
-                    ));
+                    return Err(PdsError::IdentityResolution(format!(
+                        "PLC directory returned error: {}",
+                        status
+                    )));
                 }
                 Err(e) => {
                     if Self::is_retryable_error(&e) && attempt < max_retries {
@@ -347,29 +365,40 @@ impl IdentityResolver {
                             attempt = attempt,
                             "Retryable error fetching PLC document"
                         );
-                        last_error = Some(PdsError::IdentityResolution(format!("Failed to fetch PLC document: {}", e)));
+                        last_error = Some(PdsError::IdentityResolution(format!(
+                            "Failed to fetch PLC document: {}",
+                            e
+                        )));
                         continue;
                     }
-                    return Err(PdsError::IdentityResolution(format!("Failed to fetch PLC document: {}", e)));
+                    return Err(PdsError::IdentityResolution(format!(
+                        "Failed to fetch PLC document: {}",
+                        e
+                    )));
                 }
             }
         }
 
         // All retries exhausted
-        Err(last_error.unwrap_or_else(|| PdsError::IdentityResolution(
-            format!("Failed to fetch PLC document after {} retries", max_retries)
-        )))
+        Err(last_error.unwrap_or_else(|| {
+            PdsError::IdentityResolution(format!(
+                "Failed to fetch PLC document after {} retries",
+                max_retries
+            ))
+        }))
     }
 
     /// Fetch DID document from did:web with retry logic
     async fn fetch_web_document(&self, did: &str) -> PdsResult<DidDocument> {
         // did:web:example.com -> https://example.com/.well-known/did.json
         // did:web:example.com:user:alice -> https://example.com/user/alice/did.json
-        let did_suffix = did.strip_prefix("did:web:")
+        let did_suffix = did
+            .strip_prefix("did:web:")
             .ok_or_else(|| PdsError::IdentityResolution("Invalid did:web format".to_string()))?;
 
         let parts: Vec<&str> = did_suffix.split(':').collect();
-        let domain = parts.first()
+        let domain = parts
+            .first()
             .ok_or_else(|| PdsError::IdentityResolution("Missing domain in did:web".to_string()))?;
 
         let url = if parts.len() == 1 {
@@ -397,10 +426,9 @@ impl IdentityResolver {
             match self.http_client.get(&url).send().await {
                 Ok(response) => {
                     if response.status().is_success() {
-                        let doc: DidDocument = response
-                            .json()
-                            .await
-                            .map_err(|e| PdsError::IdentityResolution(format!("Invalid did:web document: {}", e)))?;
+                        let doc: DidDocument = response.json().await.map_err(|e| {
+                            PdsError::IdentityResolution(format!("Invalid did:web document: {}", e))
+                        })?;
 
                         if attempt > 0 {
                             tracing::info!(
@@ -420,15 +448,17 @@ impl IdentityResolver {
                             attempt = attempt,
                             "did:web server returned retryable error"
                         );
-                        last_error = Some(PdsError::IdentityResolution(
-                            format!("did:web server returned error: {}", status)
-                        ));
+                        last_error = Some(PdsError::IdentityResolution(format!(
+                            "did:web server returned error: {}",
+                            status
+                        )));
                         continue;
                     }
 
-                    return Err(PdsError::IdentityResolution(
-                        format!("did:web server returned error: {}", status)
-                    ));
+                    return Err(PdsError::IdentityResolution(format!(
+                        "did:web server returned error: {}",
+                        status
+                    )));
                 }
                 Err(e) => {
                     if Self::is_retryable_error(&e) && attempt < max_retries {
@@ -438,18 +468,27 @@ impl IdentityResolver {
                             attempt = attempt,
                             "Retryable error fetching did:web document"
                         );
-                        last_error = Some(PdsError::IdentityResolution(format!("Failed to fetch did:web document: {}", e)));
+                        last_error = Some(PdsError::IdentityResolution(format!(
+                            "Failed to fetch did:web document: {}",
+                            e
+                        )));
                         continue;
                     }
-                    return Err(PdsError::IdentityResolution(format!("Failed to fetch did:web document: {}", e)));
+                    return Err(PdsError::IdentityResolution(format!(
+                        "Failed to fetch did:web document: {}",
+                        e
+                    )));
                 }
             }
         }
 
         // All retries exhausted
-        Err(last_error.unwrap_or_else(|| PdsError::IdentityResolution(
-            format!("Failed to fetch did:web document after {} retries", max_retries)
-        )))
+        Err(last_error.unwrap_or_else(|| {
+            PdsError::IdentityResolution(format!(
+                "Failed to fetch did:web document after {} retries",
+                max_retries
+            ))
+        }))
     }
 
     /// Get atproto signing key from DID document (for Phase 4: Service Auth)
@@ -588,14 +627,15 @@ impl IdentityResolver {
 
         // Decompress if necessary and validate the point is on the curve
         let public_key: Option<PublicKey> = PublicKey::from_encoded_point(&encoded_point).into();
-        let public_key = public_key.ok_or_else(|| {
-            PdsError::IdentityResolution("P-256 point not on curve".to_string())
-        })?;
+        let public_key = public_key
+            .ok_or_else(|| PdsError::IdentityResolution("P-256 point not on curve".to_string()))?;
 
         // Convert to PEM format (SPKI - SubjectPublicKeyInfo)
-        let pem = public_key.to_public_key_pem(Default::default()).map_err(|e| {
-            PdsError::IdentityResolution(format!("Failed to encode P-256 key as PEM: {}", e))
-        })?;
+        let pem = public_key
+            .to_public_key_pem(Default::default())
+            .map_err(|e| {
+                PdsError::IdentityResolution(format!("Failed to encode P-256 key as PEM: {}", e))
+            })?;
 
         Ok(pem.into_bytes())
     }
@@ -624,7 +664,10 @@ impl IdentityResolver {
         let pem = public_key
             .to_public_key_pem(Default::default())
             .map_err(|e| {
-                PdsError::IdentityResolution(format!("Failed to encode secp256k1 key as PEM: {}", e))
+                PdsError::IdentityResolution(format!(
+                    "Failed to encode secp256k1 key as PEM: {}",
+                    e
+                ))
             })?;
 
         Ok(pem.into_bytes())
@@ -657,9 +700,10 @@ impl IdentityResolver {
         // Verify the handle resolves to this DID
         let resolved_did = self.resolve_handle(&normalized).await?;
         if resolved_did != did {
-            return Err(PdsError::IdentityResolution(
-                format!("Handle {} does not resolve to DID {}", handle, did)
-            ));
+            return Err(PdsError::IdentityResolution(format!(
+                "Handle {} does not resolve to DID {}",
+                handle, did
+            )));
         }
 
         // Update cache
@@ -754,7 +798,8 @@ mod tests {
         let resolver = create_test_resolver().await;
 
         // Pre-populate cache
-        resolver.cache
+        resolver
+            .cache
             .cache_handle("alice.test", "did:plc:alice123")
             .await
             .unwrap();
@@ -773,7 +818,8 @@ mod tests {
         let resolver = create_test_resolver().await;
 
         // Pre-populate cache
-        resolver.cache
+        resolver
+            .cache
             .cache_handle("bob.test", "did:plc:bob456")
             .await
             .unwrap();
@@ -788,7 +834,8 @@ mod tests {
         let resolver = create_test_resolver().await;
 
         // Pre-populate cache
-        resolver.cache
+        resolver
+            .cache
             .cache_handle("charlie.test", "did:plc:charlie789")
             .await
             .unwrap();
@@ -869,15 +916,20 @@ mod tests {
         let resolver = IdentityResolver::new(cache.clone(), custom_config).unwrap();
 
         // Verify the custom URL is set correctly
-        assert_eq!(resolver.config.plc_directory_url, "https://test.plc.directory");
+        assert_eq!(
+            resolver.config.plc_directory_url,
+            "https://test.plc.directory"
+        );
 
         // Test with default configuration (should use official directory or env var)
-        let default_resolver = IdentityResolver::new(cache, IdentityResolverConfig::default()).unwrap();
+        let default_resolver =
+            IdentityResolver::new(cache, IdentityResolverConfig::default()).unwrap();
 
         // Should either be the default or from environment variable
         assert!(
-            default_resolver.config.plc_directory_url == "https://plc.directory" ||
-            default_resolver.config.plc_directory_url == std::env::var("PLC_DIRECTORY_URL").unwrap_or_default()
+            default_resolver.config.plc_directory_url == "https://plc.directory"
+                || default_resolver.config.plc_directory_url
+                    == std::env::var("PLC_DIRECTORY_URL").unwrap_or_default()
         );
     }
 
@@ -930,7 +982,10 @@ mod tests {
 
         // The fetch_plc_document method should handle trailing slashes correctly
         // by using trim_end_matches('/') in the format string
-        assert_eq!(resolver.config.plc_directory_url, "https://test.plc.directory/");
+        assert_eq!(
+            resolver.config.plc_directory_url,
+            "https://test.plc.directory/"
+        );
     }
 
     // =====================================================
@@ -1048,10 +1103,9 @@ mod tests {
         // This is a valid P-256 point (compressed)
         let compressed_key: [u8; 33] = [
             0x02, // Compressed point prefix (even y)
-            0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47,
-            0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40, 0xf2,
-            0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0,
-            0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96,
+            0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
+            0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45,
+            0xd8, 0x98, 0xc2, 0x96,
         ];
 
         // Encode with P-256 multicodec prefix (0x1200 = varint 0x80 0x24)
@@ -1062,7 +1116,11 @@ mod tests {
         let multibase_key = format!("z{}", encoded);
 
         let result = resolver.decode_multibase_key(&multibase_key);
-        assert!(result.is_ok(), "Failed to decode P-256 key: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to decode P-256 key: {:?}",
+            result.err()
+        );
 
         let pem_bytes = result.unwrap();
         let pem_string = String::from_utf8(pem_bytes).unwrap();

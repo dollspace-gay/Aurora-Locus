@@ -11,7 +11,7 @@
 //! - Readiness: Can the application serve traffic? (remove from load balancer if not)
 
 use crate::{context::AppContext, error::PdsResult, jobs, metrics};
-use axum::{extract::State, http::StatusCode, response::Json, Router, routing::get};
+use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -124,9 +124,7 @@ pub async fn readiness_probe(
 /// Detailed health check with all component statuses
 ///
 /// Returns comprehensive health information for monitoring
-pub async fn health_detailed(
-    State(ctx): State<AppContext>,
-) -> (StatusCode, Json<HealthStatus>) {
+pub async fn health_detailed(State(ctx): State<AppContext>) -> (StatusCode, Json<HealthStatus>) {
     let start = Instant::now();
     let mut checks = Vec::new();
 
@@ -177,9 +175,7 @@ pub async fn health_detailed(
 
 /// Check database connectivity
 async fn check_database(ctx: &AppContext) -> PdsResult<()> {
-    sqlx::query("SELECT 1")
-        .fetch_one(&ctx.account_db)
-        .await?;
+    sqlx::query("SELECT 1").fetch_one(&ctx.account_db).await?;
     Ok(())
 }
 
@@ -379,15 +375,13 @@ mod tests {
             status: "healthy".to_string(),
             version: "0.1.0".to_string(),
             uptime_seconds: 3600.5,
-            checks: vec![
-                ComponentHealth {
-                    name: "database".to_string(),
-                    status: "healthy".to_string(),
-                    response_time_ms: Some(5),
-                    error: None,
-                    details: Some(serde_json::json!({"type": "sqlite"})),
-                },
-            ],
+            checks: vec![ComponentHealth {
+                name: "database".to_string(),
+                status: "healthy".to_string(),
+                response_time_ms: Some(5),
+                error: None,
+                details: Some(serde_json::json!({"type": "sqlite"})),
+            }],
             message: None,
         };
 

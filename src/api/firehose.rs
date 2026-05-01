@@ -52,7 +52,7 @@ use axum::{
     routing::get,
     Router,
 };
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -167,11 +167,7 @@ pub async fn subscribe_repos(
 }
 
 /// Handle WebSocket subscription with backpressure and error recovery
-async fn handle_subscription(
-    socket: WebSocket,
-    params: SubscribeReposParams,
-    ctx: AppContext,
-) {
+async fn handle_subscription(socket: WebSocket, params: SubscribeReposParams, ctx: AppContext) {
     let (mut sender, mut receiver) = socket.split();
 
     // Validate cursor and get current sequence
@@ -221,9 +217,8 @@ async fn handle_subscription(
 
     // Spawn event producer task
     let producer_ctx = ctx.clone();
-    let producer = tokio::spawn(async move {
-        produce_events(producer_ctx, cursor, event_tx).await
-    });
+    let producer =
+        tokio::spawn(async move { produce_events(producer_ctx, cursor, event_tx).await });
 
     // Create ping interval
     let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
@@ -267,7 +262,12 @@ async fn handle_subscription(
                         break;
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        if sender.send(Message::Pong(data)).await.is_err() {
+                        // Can't fold the send into a `match` guard — guards run
+                        // by-reference, and `Message::Pong(data)` moves the bytes.
+                        // Bind the result first so clippy stops trying to collapse
+                        // the `if` into the outer match.
+                        let send_result = sender.send(Message::Pong(data)).await;
+                        if send_result.is_err() {
                             break;
                         }
                     }
@@ -297,11 +297,7 @@ async fn handle_subscription(
 ///
 /// Uses intelligent batching: when catching up (>100 events behind), fetches
 /// events in batches of 500. When near real-time, polls for single events.
-async fn produce_events(
-    ctx: AppContext,
-    mut cursor: i64,
-    tx: mpsc::Sender<FirehoseFrame>,
-) {
+async fn produce_events(ctx: AppContext, mut cursor: i64, tx: mpsc::Sender<FirehoseFrame>) {
     let mut tick = interval(Duration::from_millis(POLL_INTERVAL_MS));
     let mut error_count = 0;
     const MAX_ERRORS: u32 = 5;
@@ -324,7 +320,10 @@ async fn produce_events(
 
         if events_behind > BATCH_THRESHOLD {
             // Batch mode: fetch multiple events at once
-            tracing::debug!("Catch-up mode: {} events behind, using batch fetch", events_behind);
+            tracing::debug!(
+                "Catch-up mode: {} events behind, using batch fetch",
+                events_behind
+            );
 
             match ctx.sequencer.next_events(cursor, Some(500)).await {
                 Ok(events) if !events.is_empty() => {
@@ -406,15 +405,19 @@ fn event_to_frame(event: crate::sequencer::SeqRow) -> Option<FirehoseFrame> {
                     rev: commit.rev,
                     since: commit.since,
                     blocks: general_purpose::STANDARD.encode(&commit.blocks),
-                    ops: commit.ops.iter().map(|op| FirehoseOp {
-                        action: match op.action {
-                            crate::sequencer::events::OpAction::Create => "create".to_string(),
-                            crate::sequencer::events::OpAction::Update => "update".to_string(),
-                            crate::sequencer::events::OpAction::Delete => "delete".to_string(),
-                        },
-                        path: op.path.clone(),
-                        cid: op.cid.clone(),
-                    }).collect(),
+                    ops: commit
+                        .ops
+                        .iter()
+                        .map(|op| FirehoseOp {
+                            action: match op.action {
+                                crate::sequencer::events::OpAction::Create => "create".to_string(),
+                                crate::sequencer::events::OpAction::Update => "update".to_string(),
+                                crate::sequencer::events::OpAction::Delete => "delete".to_string(),
+                            },
+                            path: op.path.clone(),
+                            cid: op.cid.clone(),
+                        })
+                        .collect(),
                     blobs: commit.blobs,
                     time: event.sequenced_at,
                 }))
@@ -456,10 +459,16 @@ fn event_to_frame(event: crate::sequencer::SeqRow) -> Option<FirehoseFrame> {
                     time: event.sequenced_at,
                     active: account.active,
                     status: account.status.map(|s| match s {
-                        crate::sequencer::events::AccountStatus::Takendown => "takendown".to_string(),
-                        crate::sequencer::events::AccountStatus::Suspended => "suspended".to_string(),
+                        crate::sequencer::events::AccountStatus::Takendown => {
+                            "takendown".to_string()
+                        }
+                        crate::sequencer::events::AccountStatus::Suspended => {
+                            "suspended".to_string()
+                        }
                         crate::sequencer::events::AccountStatus::Deleted => "deleted".to_string(),
-                        crate::sequencer::events::AccountStatus::Deactivated => "deactivated".to_string(),
+                        crate::sequencer::events::AccountStatus::Deactivated => {
+                            "deactivated".to_string()
+                        }
                     }),
                 }))
             } else {
@@ -482,13 +491,14 @@ async fn send_frame_with_timeout(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     frame: &FirehoseFrame,
 ) -> Result<(), SendError> {
-    let json = serde_json::to_string(frame)
-        .map_err(|_| SendError::Disconnected)?;
+    let json = serde_json::to_string(frame).map_err(|_| SendError::Disconnected)?;
 
     match timeout(
         Duration::from_millis(SEND_TIMEOUT_MS),
-        sender.send(Message::Text(json))
-    ).await {
+        sender.send(Message::Text(json)),
+    )
+    .await
+    {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(_)) => Err(SendError::Disconnected),
         Err(_) => Err(SendError::Timeout),
@@ -500,8 +510,7 @@ async fn send_frame(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     frame: &FirehoseFrame,
 ) -> Result<(), ()> {
-    let json = serde_json::to_string(frame)
-        .map_err(|_| ())?;
+    let json = serde_json::to_string(frame).map_err(|_| ())?;
     sender.send(Message::Text(json)).await.map_err(|_| ())
 }
 
@@ -529,7 +538,7 @@ pub fn routes() -> Router<AppContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sequencer::{CommitEvent, SeqRow, events::CommitOp, events::OpAction};
+    use crate::sequencer::{events::CommitOp, events::OpAction, CommitEvent, SeqRow};
     use chrono::Utc;
 
     #[test]
@@ -578,7 +587,9 @@ mod tests {
             ops: vec![CommitOp {
                 action: OpAction::Create,
                 path: "app.bsky.feed.post/123".to_string(),
-                cid: Some("bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454".to_string()),
+                cid: Some(
+                    "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454".to_string(),
+                ),
             }],
             blobs: vec![],
             prev: None,
@@ -674,6 +685,13 @@ mod tests {
     }
 
     #[test]
+    // These constants are deliberately tested as bounds-checks; the lint
+    // is correct that each individual `assert!` is provably true at
+    // compile time, but the *intent* is to fail loudly at refactor time
+    // if someone changes a constant out of its acceptable range. Allow
+    // the lint locally rather than rewriting as `const _: () = ...` so
+    // the failure shows up under `cargo test` with a friendly message.
+    #[allow(clippy::assertions_on_constants)]
     fn test_constants() {
         // Verify configuration constants are reasonable
         assert!(BUFFER_SIZE > 0);

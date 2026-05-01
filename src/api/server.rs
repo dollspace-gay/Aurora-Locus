@@ -24,36 +24,102 @@ use serde::Serialize;
 pub fn routes() -> Router<AppContext> {
     Router::new()
         // Server metadata
-        .route("/xrpc/com.atproto.server.describeServer", get(describe_server))
+        .route(
+            "/xrpc/com.atproto.server.describeServer",
+            get(describe_server),
+        )
         // Account management
-        .route("/xrpc/com.atproto.server.createAccount", post(create_account))
-        .route("/xrpc/com.atproto.server.createSession", post(create_session))
+        .route(
+            "/xrpc/com.atproto.server.createAccount",
+            post(create_account),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createSession",
+            post(create_session),
+        )
         .route("/xrpc/com.atproto.server.getSession", get(get_session))
-        .route("/xrpc/com.atproto.server.deleteSession", post(delete_session))
-        .route("/xrpc/com.atproto.server.refreshSession", post(refresh_session))
-        .route("/xrpc/com.atproto.server.requestEmailConfirmation", post(request_email_confirmation))
+        .route(
+            "/xrpc/com.atproto.server.deleteSession",
+            post(delete_session),
+        )
+        .route(
+            "/xrpc/com.atproto.server.refreshSession",
+            post(refresh_session),
+        )
+        .route(
+            "/xrpc/com.atproto.server.requestEmailConfirmation",
+            post(request_email_confirmation),
+        )
         .route("/xrpc/com.atproto.server.confirmEmail", post(confirm_email))
-        .route("/xrpc/com.atproto.server.requestPasswordReset", post(request_password_reset))
-        .route("/xrpc/com.atproto.server.resetPassword", post(reset_password))
-        .route("/xrpc/com.atproto.server.requestEmailUpdate", post(request_email_update))
+        .route(
+            "/xrpc/com.atproto.server.requestPasswordReset",
+            post(request_password_reset),
+        )
+        .route(
+            "/xrpc/com.atproto.server.resetPassword",
+            post(reset_password),
+        )
+        .route(
+            "/xrpc/com.atproto.server.requestEmailUpdate",
+            post(request_email_update),
+        )
         .route("/xrpc/com.atproto.server.updateEmail", post(update_email))
-        .route("/xrpc/com.atproto.server.requestAccountDelete", post(request_account_delete))
-        .route("/xrpc/com.atproto.server.deleteAccount", post(delete_account))
-        .route("/xrpc/com.atproto.server.activateAccount", post(activate_account))
-        .route("/xrpc/com.atproto.server.deactivateAccount", post(deactivate_account))
-        .route("/xrpc/com.atproto.server.checkAccountStatus", get(check_account_status))
+        .route(
+            "/xrpc/com.atproto.server.requestAccountDelete",
+            post(request_account_delete),
+        )
+        .route(
+            "/xrpc/com.atproto.server.deleteAccount",
+            post(delete_account),
+        )
+        .route(
+            "/xrpc/com.atproto.server.activateAccount",
+            post(activate_account),
+        )
+        .route(
+            "/xrpc/com.atproto.server.deactivateAccount",
+            post(deactivate_account),
+        )
+        .route(
+            "/xrpc/com.atproto.server.checkAccountStatus",
+            get(check_account_status),
+        )
         // App passwords
-        .route("/xrpc/com.atproto.server.createAppPassword", post(create_app_password))
-        .route("/xrpc/com.atproto.server.listAppPasswords", get(list_app_passwords))
-        .route("/xrpc/com.atproto.server.revokeAppPassword", post(revoke_app_password))
+        .route(
+            "/xrpc/com.atproto.server.createAppPassword",
+            post(create_app_password),
+        )
+        .route(
+            "/xrpc/com.atproto.server.listAppPasswords",
+            get(list_app_passwords),
+        )
+        .route(
+            "/xrpc/com.atproto.server.revokeAppPassword",
+            post(revoke_app_password),
+        )
         // Invite codes
-        .route("/xrpc/com.atproto.server.getAccountInviteCodes", get(get_account_invite_codes))
-        .route("/xrpc/com.atproto.server.createInviteCode", post(create_invite_code))
-        .route("/xrpc/com.atproto.server.createInviteCodes", post(create_invite_codes))
+        .route(
+            "/xrpc/com.atproto.server.getAccountInviteCodes",
+            get(get_account_invite_codes),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createInviteCode",
+            post(create_invite_code),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createInviteCodes",
+            post(create_invite_codes),
+        )
         // Service auth
-        .route("/xrpc/com.atproto.server.getServiceAuth", get(get_service_auth))
+        .route(
+            "/xrpc/com.atproto.server.getServiceAuth",
+            get(get_service_auth),
+        )
         // Signing key reservation
-        .route("/xrpc/com.atproto.server.reserveSigningKey", post(reserve_signing_key))
+        .route(
+            "/xrpc/com.atproto.server.reserveSigningKey",
+            post(reserve_signing_key),
+        )
 }
 
 /// Create account endpoint
@@ -62,20 +128,31 @@ async fn create_account(
     headers: HeaderMap,
     Json(req): Json<CreateAccountRequest>,
 ) -> PdsResult<Json<CreateAccountResponse>> {
-    tracing::info!("create_account: Starting account creation for handle: {}", req.handle);
+    tracing::info!(
+        "create_account: Starting account creation for handle: {}",
+        req.handle
+    );
 
     // IP-based rate limiting for account creation (100 per 5 minutes per IP)
     // This is handled by the endpoint-specific middleware limits, but we add
     // an additional per-IP check here for extra protection
-    if let Some(client_ip) = crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy) {
-        tracing::debug!("create_account: Checking IP-based rate limit for IP: {}", client_ip);
+    if let Some(client_ip) =
+        crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
+    {
+        tracing::debug!(
+            "create_account: Checking IP-based rate limit for IP: {}",
+            client_ip
+        );
         ctx.rate_limiter.check_ip(&client_ip)?;
     }
 
     // If a DID is provided, verify we have a reserved keypair for it
     // This validates that the caller went through the proper account creation flow
     let reserved_signing_key = if let Some(ref did) = req.did {
-        tracing::debug!("create_account: Looking up reserved keypair for DID: {}", did);
+        tracing::debug!(
+            "create_account: Looking up reserved keypair for DID: {}",
+            did
+        );
         let keypair = ctx.actor_store.get_reserved_keypair(did).await?;
         if keypair.is_none() {
             tracing::warn!("create_account: No reserved keypair found for DID: {}", did);
@@ -95,7 +172,9 @@ async fn create_account(
         })?;
 
         // Validate and mark code as used
-        ctx.invite_manager.use_code(code, &req.handle).await
+        ctx.invite_manager
+            .use_code(code, &req.handle)
+            .await
             .map_err(|e| {
                 tracing::error!("create_account: Failed to use invite code: {}", e);
                 e
@@ -111,47 +190,67 @@ async fn create_account(
         .create_account(req.handle.clone(), req.email, req.password, None)
         .await
         .map_err(|e| {
-            tracing::error!("create_account: Failed to create account in database: {}", e);
+            tracing::error!(
+                "create_account: Failed to create account in database: {}",
+                e
+            );
             e
         })?;
-    tracing::info!("create_account: Account created successfully, DID: {}", account.did);
+    tracing::info!(
+        "create_account: Account created successfully, DID: {}",
+        account.did
+    );
 
     // Clear the reserved keypair now that the account is created
     if let Some(ref signing_key) = reserved_signing_key {
-        if let Err(e) = ctx.actor_store.clear_reserved_keypair(signing_key, req.did.as_deref()).await {
+        if let Err(e) = ctx
+            .actor_store
+            .clear_reserved_keypair(signing_key, req.did.as_deref())
+            .await
+        {
             tracing::warn!("create_account: Failed to clear reserved keypair: {}", e);
             // Don't fail account creation for cleanup failure
         }
     }
 
     // Initialize repository for the new account
-    tracing::debug!("create_account: Initializing repository for DID: {}", account.did);
+    tracing::debug!(
+        "create_account: Initializing repository for DID: {}",
+        account.did
+    );
     use crate::actor_store::RepositoryManager;
     let repo_mgr = RepositoryManager::with_validation_mode(
         account.did.clone(),
         (*ctx.actor_store).clone(),
         ctx.config.validation_mode,
     );
-    repo_mgr.initialize().await
-        .map_err(|e| {
-            tracing::error!("create_account: Failed to initialize repository: {}", e);
-            e
-        })?;
+    repo_mgr.initialize().await.map_err(|e| {
+        tracing::error!("create_account: Failed to initialize repository: {}", e);
+        e
+    })?;
     tracing::info!("create_account: Repository initialized successfully");
 
     // Generate and send email verification token if email was provided
     if let Some(email_val) = &email {
         if ctx.mailer.is_configured() {
-            match ctx.account_manager.generate_email_verification_token(&account.did).await {
+            match ctx
+                .account_manager
+                .generate_email_verification_token(&account.did)
+                .await
+            {
                 Ok(token) => {
                     // Send verification email
                     let base_url = ctx.service_url();
-                    if let Err(e) = ctx.mailer.send_verification_email(
-                        email_val,
-                        account.handle.as_deref().unwrap_or("unknown"),
-                        &token,
-                        &base_url
-                    ).await {
+                    if let Err(e) = ctx
+                        .mailer
+                        .send_verification_email(
+                            email_val,
+                            account.handle.as_deref().unwrap_or("unknown"),
+                            &token,
+                            &base_url,
+                        )
+                        .await
+                    {
                         tracing::warn!("Failed to send verification email: {}", e);
                         // Don't fail account creation if email fails
                     }
@@ -165,7 +264,10 @@ async fn create_account(
 
     // Create initial session
     tracing::debug!("create_account: Creating initial session");
-    let session = ctx.account_manager.create_session(&account.did, None).await
+    let session = ctx
+        .account_manager
+        .create_session(&account.did, None)
+        .await
         .map_err(|e| {
             tracing::error!("create_account: Failed to create session: {}", e);
             e
@@ -188,9 +290,15 @@ async fn create_session(
 ) -> PdsResult<Json<SessionResponse>> {
     // Identifier+IP rate limiting for login attempts (30 per 5min per identifier+IP)
     // Prevents brute-force attacks on specific accounts from specific IPs
-    if let Some(client_ip) = crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy) {
-        tracing::debug!("create_session: Checking identifier+IP rate limit for {}", req.identifier);
-        ctx.rate_limiter.check_identifier_ip(&req.identifier, &client_ip)?;
+    if let Some(client_ip) =
+        crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
+    {
+        tracing::debug!(
+            "create_session: Checking identifier+IP rate limit for {}",
+            req.identifier
+        );
+        ctx.rate_limiter
+            .check_identifier_ip(&req.identifier, &client_ip)?;
     }
 
     // Try regular password authentication first
@@ -290,7 +398,10 @@ async fn request_email_confirmation(
 
     // Per-user rate limiting for email confirmation requests (10 per hour per DID)
     // Prevents email spam
-    ctx.rate_limiter.check_did_endpoint(&validated.did, "/xrpc/com.atproto.server.requestEmailConfirmation")?;
+    ctx.rate_limiter.check_did_endpoint(
+        &validated.did,
+        "/xrpc/com.atproto.server.requestEmailConfirmation",
+    )?;
 
     // Get account info to retrieve email
     let account = ctx.account_manager.get_account(&validated.did).await?;
@@ -358,8 +469,13 @@ async fn request_password_reset(
 ) -> PdsResult<Json<serde_json::Value>> {
     // IP-based rate limiting for password reset (50 per 5 minutes per IP)
     // Prevents email spam and denial of service
-    if let Some(client_ip) = crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy) {
-        tracing::debug!("request_password_reset: Checking IP-based rate limit for IP: {}", client_ip);
+    if let Some(client_ip) =
+        crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
+    {
+        tracing::debug!(
+            "request_password_reset: Checking IP-based rate limit for IP: {}",
+            client_ip
+        );
         ctx.rate_limiter.check_ip(&client_ip)?;
     }
 
@@ -370,13 +486,21 @@ async fn request_password_reset(
         .await?;
 
     // Get account to retrieve handle for email
-    let account = ctx.account_manager.get_account_by_identifier(&req.identifier).await?;
+    let account = ctx
+        .account_manager
+        .get_account_by_identifier(&req.identifier)
+        .await?;
 
     // Send password reset email if mailer is configured
     if ctx.mailer.is_configured() {
         let base_url = ctx.service_url();
         ctx.mailer
-            .send_password_reset_email(&email, account.handle.as_deref().unwrap_or("unknown"), &token, &base_url)
+            .send_password_reset_email(
+                &email,
+                account.handle.as_deref().unwrap_or("unknown"),
+                &token,
+                &base_url,
+            )
             .await?;
     } else {
         tracing::warn!("Email not configured, reset token generated but not sent");
@@ -420,7 +544,10 @@ async fn request_email_update(
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
     // Per-user rate limiting (15 per day, 5 per hour)
-    ctx.rate_limiter.check_did_endpoint(&validated.did, "/xrpc/com.atproto.server.requestEmailUpdate")?;
+    ctx.rate_limiter.check_did_endpoint(
+        &validated.did,
+        "/xrpc/com.atproto.server.requestEmailUpdate",
+    )?;
 
     // Get account info
     let account = ctx.account_manager.get_account(&validated.did).await?;
@@ -531,7 +658,10 @@ async fn request_account_delete(
 
     // Per-user rate limiting for account deletion requests (5 per hour per DID)
     // Prevents email spam and abuse
-    ctx.rate_limiter.check_did_endpoint(&validated.did, "/xrpc/com.atproto.server.requestAccountDelete")?;
+    ctx.rate_limiter.check_did_endpoint(
+        &validated.did,
+        "/xrpc/com.atproto.server.requestAccountDelete",
+    )?;
 
     // Get account info to retrieve email
     let account = ctx.account_manager.get_account(&validated.did).await?;
@@ -550,11 +680,7 @@ async fn request_account_delete(
     // Send deletion confirmation email
     if ctx.mailer.is_configured() {
         ctx.mailer
-            .send_account_delete_email(
-                &email,
-                account.handle.as_deref().unwrap_or("user"),
-                &token,
-            )
+            .send_account_delete_email(&email, account.handle.as_deref().unwrap_or("user"), &token)
             .await?;
 
         tracing::info!(
@@ -594,7 +720,9 @@ async fn delete_account(
     Json(req): Json<DeleteAccountRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
     // IP-based rate limiting for account deletion (50 per 5 minutes)
-    if let Some(client_ip) = crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy) {
+    if let Some(client_ip) =
+        crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
+    {
         ctx.rate_limiter.check_ip(&client_ip)?;
     }
 
@@ -602,14 +730,19 @@ async fn delete_account(
     let account = ctx.account_manager.get_account(&req.did).await?;
 
     // Verify password - must have local account credentials
-    let password_hash = account.password_hash
-        .ok_or_else(|| crate::error::PdsError::Authorization("No local account credentials".to_string()))?;
+    let password_hash = account.password_hash.ok_or_else(|| {
+        crate::error::PdsError::Authorization("No local account credentials".to_string())
+    })?;
 
-    let valid = atproto::server_auth::PasswordHasher::verify(&req.password, &password_hash)
-        .map_err(|e| crate::error::PdsError::Internal(format!("Password verification failed: {}", e)))?;
+    let valid =
+        crate::auth::PasswordHasher::verify(&req.password, &password_hash).map_err(|e| {
+            crate::error::PdsError::Internal(format!("Password verification failed: {}", e))
+        })?;
 
     if !valid {
-        return Err(crate::error::PdsError::Authentication("Invalid did or password".to_string()));
+        return Err(crate::error::PdsError::Authentication(
+            "Invalid did or password".to_string(),
+        ));
     }
 
     // Validate deletion token
@@ -782,12 +915,10 @@ async fn get_service_auth(
 
         // Check expiration is not too far in the future
         if duration > HOUR_IN_SECONDS {
-            return Err(PdsError::Validation(
-                format!(
-                    "Token expiration too far in future: {} seconds (max: {} seconds)",
-                    duration, HOUR_IN_SECONDS
-                )
-            ));
+            return Err(PdsError::Validation(format!(
+                "Token expiration too far in future: {} seconds (max: {} seconds)",
+                duration, HOUR_IN_SECONDS
+            )));
         }
 
         // Check method-less tokens have shorter expiration
@@ -834,17 +965,17 @@ async fn get_service_auth(
         ];
 
         if protected_methods.iter().any(|&pm| method.starts_with(pm)) {
-            return Err(PdsError::Validation(
-                format!("Method '{}' is protected and cannot use service auth", method)
-            ));
+            return Err(PdsError::Validation(format!(
+                "Method '{}' is protected and cannot use service auth",
+                method
+            )));
         }
     }
 
     // Get signing key from config
     let signing_key_hex = &ctx.config.authentication.repo_signing_key;
-    let signing_key_bytes = hex::decode(signing_key_hex).map_err(|e| {
-        PdsError::Internal(format!("Failed to decode signing key: {}", e))
-    })?;
+    let signing_key_bytes = hex::decode(signing_key_hex)
+        .map_err(|e| PdsError::Internal(format!("Failed to decode signing key: {}", e)))?;
 
     if signing_key_bytes.len() != 32 {
         return Err(PdsError::Internal(
@@ -854,11 +985,11 @@ async fn get_service_auth(
 
     // Generate service auth JWT
     let token = service_auth::create_service_jwt(
-        &auth.did,                           // Issuer DID (authenticated user)
-        &req.aud,                            // Audience DID (target service)
-        exp_duration,                        // Expiration duration in seconds
-        req.lxm.as_deref(),                  // Optional lexicon method
-        &signing_key_bytes,                  // Signing key
+        &auth.did,          // Issuer DID (authenticated user)
+        &req.aud,           // Audience DID (target service)
+        exp_duration,       // Expiration duration in seconds
+        req.lxm.as_deref(), // Optional lexicon method
+        &signing_key_bytes, // Signing key
     )?;
 
     tracing::info!(
@@ -906,15 +1037,13 @@ struct DescribeServerLinks {
 ///
 /// Returns server metadata, DID, and available authentication methods.
 /// This is a public endpoint used for federation discovery.
-async fn describe_server(
-    State(ctx): State<AppContext>,
-) -> PdsResult<Json<DescribeServerResponse>> {
+async fn describe_server(State(ctx): State<AppContext>) -> PdsResult<Json<DescribeServerResponse>> {
     Ok(Json(DescribeServerResponse {
         did: ctx.config.service.service_did.clone(),
         available_user_domains: ctx.config.identity.service_handle_domains.clone(),
         invite_code_required: Some(ctx.config.invites.required),
         phone_verification_required: Some(false), // Not implemented yet
-        links: None, // TODO: Add from config if available
+        links: None,                              // TODO: Add from config if available
     }))
 }
 
@@ -955,17 +1084,26 @@ async fn get_account_invite_codes(
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
     // Get user's invite codes
-    let codes = ctx.account_manager.list_invite_codes(&validated.did).await?;
+    let codes = ctx
+        .account_manager
+        .list_invite_codes(&validated.did)
+        .await?;
 
     // Build response with usage information
     let mut code_infos = Vec::new();
     for code in codes {
         // Get usage history for each code
-        let uses_raw = ctx.account_manager.get_invite_code_usage(&code.code).await?;
-        let uses = uses_raw.into_iter().map(|u| InviteCodeUse {
-            used_by: u.used_by,
-            used_at: u.used_at.to_rfc3339(),
-        }).collect();
+        let uses_raw = ctx
+            .account_manager
+            .get_invite_code_usage(&code.code)
+            .await?;
+        let uses = uses_raw
+            .into_iter()
+            .map(|u| InviteCodeUse {
+                used_by: u.used_by,
+                used_at: u.used_at.to_rfc3339(),
+            })
+            .collect();
 
         code_infos.push(InviteCodeInfo {
             code: code.code,
@@ -1009,15 +1147,20 @@ async fn create_invite_code(
 
     // Validate use count
     if req.use_count < 1 {
-        return Err(PdsError::Validation("Use count must be at least 1".to_string()));
+        return Err(PdsError::Validation(
+            "Use count must be at least 1".to_string(),
+        ));
     }
 
     if req.use_count > 10 {
-        return Err(PdsError::Validation("Use count cannot exceed 10".to_string()));
+        return Err(PdsError::Validation(
+            "Use count cannot exceed 10".to_string(),
+        ));
     }
 
     // Create invite code
-    let code = ctx.account_manager
+    let code = ctx
+        .account_manager
         .create_invite_code(&validated.did, req.use_count, req.for_account)
         .await?;
 
@@ -1066,18 +1209,22 @@ async fn create_invite_codes(
 
     // Validate counts
     if req.code_count < 1 || req.code_count > 100 {
-        return Err(PdsError::Validation("Code count must be between 1 and 100".to_string()));
+        return Err(PdsError::Validation(
+            "Code count must be between 1 and 100".to_string(),
+        ));
     }
 
     if req.use_count < 1 || req.use_count > 10 {
-        return Err(PdsError::Validation("Use count must be between 1 and 10".to_string()));
+        return Err(PdsError::Validation(
+            "Use count must be between 1 and 10".to_string(),
+        ));
     }
 
     // Check if for_accounts matches code_count (if provided)
     if let Some(ref accounts) = req.for_accounts {
         if accounts.len() != req.code_count as usize {
             return Err(PdsError::Validation(
-                "Number of for_accounts must match code_count".to_string()
+                "Number of for_accounts must match code_count".to_string(),
             ));
         }
     }
@@ -1085,8 +1232,12 @@ async fn create_invite_codes(
     // Create codes
     let mut codes = Vec::new();
     for i in 0..req.code_count {
-        let for_account = req.for_accounts.as_ref().and_then(|a| a.get(i as usize).cloned());
-        let code = ctx.account_manager
+        let for_account = req
+            .for_accounts
+            .as_ref()
+            .and_then(|a| a.get(i as usize).cloned());
+        let code = ctx
+            .account_manager
             .create_invite_code(&validated.did, req.use_count, for_account.clone())
             .await?;
 
@@ -1120,13 +1271,17 @@ async fn activate_account(
 
     if account.delete_after.is_some() {
         // Account is pending deletion, cancel it completely
-        ctx.account_manager.cancel_account_deletion(&validated.did).await?;
+        ctx.account_manager
+            .cancel_account_deletion(&validated.did)
+            .await?;
         Ok(Json(serde_json::json!({
             "message": "Account deletion cancelled and account reactivated"
         })))
     } else {
         // Account is just temporarily deactivated, reactivate it
-        ctx.account_manager.reactivate_account(&validated.did).await?;
+        ctx.account_manager
+            .reactivate_account(&validated.did)
+            .await?;
         Ok(Json(serde_json::json!({
             "message": "Account reactivated successfully"
         })))
@@ -1148,10 +1303,11 @@ async fn deactivate_account(
 
     // Verify password before deactivation
     let account = ctx.account_manager.get_account(&validated.did).await?;
-    let password_hash = account.password_hash
+    let password_hash = account
+        .password_hash
         .ok_or_else(|| PdsError::Authorization("No local account credentials".to_string()))?;
 
-    let valid = atproto::server_auth::PasswordHasher::verify(&req.password, &password_hash)
+    let valid = crate::auth::PasswordHasher::verify(&req.password, &password_hash)
         .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
 
     if !valid {
@@ -1252,17 +1408,12 @@ async fn reserve_signing_key(
     // Validate DID format if provided
     if let Some(ref did) = req.did {
         if !did.starts_with("did:") {
-            return Err(PdsError::Validation(
-                "Invalid DID format".to_string()
-            ));
+            return Err(PdsError::Validation("Invalid DID format".to_string()));
         }
     }
 
     // Reserve or retrieve keypair
-    let signing_key = ctx
-        .actor_store
-        .reserve_keypair(req.did.as_deref())
-        .await?;
+    let signing_key = ctx.actor_store.reserve_keypair(req.did.as_deref()).await?;
 
     tracing::info!(
         signing_key = %signing_key,

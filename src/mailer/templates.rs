@@ -412,7 +412,10 @@ mod tests {
 
         let mut vars = HashMap::new();
         vars.insert("handle".to_string(), "alice.bsky.social".to_string());
-        vars.insert("verification_url".to_string(), "https://example.com/verify?token=abc123".to_string());
+        vars.insert(
+            "verification_url".to_string(),
+            "https://example.com/verify?token=abc123".to_string(),
+        );
         vars.insert("service_name".to_string(), "Aurora PDS".to_string());
         vars.insert("expiry_hours".to_string(), "24".to_string());
         vars.insert("service_url".to_string(), "https://example.com".to_string());
@@ -423,6 +426,8 @@ mod tests {
         let email = rendered.unwrap();
         assert!(email.subject.contains("Verify"));
         assert!(email.body_text.contains("alice.bsky.social"));
-        assert!(email.body_text.contains("https://example.com/verify?token=abc123"));
+        assert!(email
+            .body_text
+            .contains("https://example.com/verify?token=abc123"));
     }
 }

@@ -2,7 +2,10 @@
 ///
 /// Coordinates blob storage backends with database metadata tracking
 use crate::{
-    blob_store::{disk::DiskBlobBackend, BlobBackend, BlobBackendType, BlobMetadata, BlobRef, BlobStorageConfig, ImageDimensions, TempBlob},
+    blob_store::{
+        disk::DiskBlobBackend, BlobBackend, BlobBackendType, BlobMetadata, BlobRef,
+        BlobStorageConfig, ImageDimensions, TempBlob,
+    },
     error::{PdsError, PdsResult},
 };
 use chrono::Utc;
@@ -13,12 +16,10 @@ use std::sync::Arc;
 use tokio::fs;
 
 /// Blob store configuration
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BlobStoreConfig {
     pub storage: BlobStorageConfig,
 }
-
 
 /// Main blob store manager
 #[derive(Clone)]
@@ -32,15 +33,19 @@ impl BlobStore {
     /// Create a new blob store
     pub fn new(config: BlobStoreConfig, db: SqlitePool) -> PdsResult<Self> {
         let backend: Arc<dyn BlobBackend> = match &config.storage.backend {
-            BlobBackendType::Disk { location } => {
-                Arc::new(DiskBlobBackend::new(location.clone()))
-            }
+            BlobBackendType::Disk { location } => Arc::new(DiskBlobBackend::new(location.clone())),
             BlobBackendType::S3 { .. } => {
-                return Err(PdsError::Internal("S3 backend not yet implemented".to_string()));
+                return Err(PdsError::Internal(
+                    "S3 backend not yet implemented".to_string(),
+                ));
             }
         };
 
-        Ok(Self { config, backend, db })
+        Ok(Self {
+            config,
+            backend,
+            db,
+        })
     }
 
     /// Extract image dimensions from data
@@ -104,17 +109,22 @@ impl BlobStore {
     /// Stage a blob in temporary storage (Phase 1 of two-phase upload)
     ///
     /// Returns TempBlob with metadata for later commitment
-    pub async fn stage_blob(&self, data: Vec<u8>, mime_type: Option<&str>, creator_did: &str) -> PdsResult<TempBlob> {
+    pub async fn stage_blob(
+        &self,
+        data: Vec<u8>,
+        mime_type: Option<&str>,
+        creator_did: &str,
+    ) -> PdsResult<TempBlob> {
         // Validate size
         let size = data.len();
-        atproto::blob::validate_blob_size(size, self.config.storage.max_blob_size)
+        crate::blob_store::mime::validate_blob_size(size, self.config.storage.max_blob_size)
             .map_err(PdsError::Validation)?;
 
         // Detect MIME type from data if not provided
         let mime_type = mime_type
             .map(String::from)
             .or_else(|| {
-                atproto::blob::detect_mime_type_from_data(&data).map(String::from)
+                crate::blob_store::mime::detect_mime_type_from_data(&data).map(String::from)
             })
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
@@ -133,7 +143,9 @@ impl BlobStore {
         // Ensure temp directory exists
         fs::create_dir_all(&self.config.storage.temp_dir)
             .await
-            .map_err(|e| PdsError::BlobStorage(format!("Failed to create temp directory: {}", e)))?;
+            .map_err(|e| {
+                PdsError::BlobStorage(format!("Failed to create temp directory: {}", e))
+            })?;
 
         // Write to temp location
         let temp_path = self.get_temp_blob_path(&cid);
@@ -177,7 +189,9 @@ impl BlobStore {
             .map_err(|e| PdsError::BlobStorage(format!("Failed to read temp blob: {}", e)))?;
 
         // Get metadata from database (should have been stored during stage)
-        let metadata = self.get_temp_blob_metadata(cid).await?
+        let metadata = self
+            .get_temp_blob_metadata(cid)
+            .await?
             .ok_or_else(|| PdsError::NotFound(format!("Temp blob metadata not found: {}", cid)))?;
 
         // Extract dimensions for thumbnail generation
@@ -191,11 +205,15 @@ impl BlobStore {
         };
 
         // Generate thumbnail if this is an image
-        let thumbnail_cid = if let Some(thumb_data) = Self::generate_thumbnail(&data, &metadata.mime_type, 256) {
+        let thumbnail_cid = if let Some(thumb_data) =
+            Self::generate_thumbnail(&data, &metadata.mime_type, 256)
+        {
             let thumb_cid = self.calculate_cid(&thumb_data);
 
             if !self.backend.exists(&thumb_cid).await? {
-                self.backend.put(&thumb_cid, thumb_data.clone(), "image/jpeg").await?;
+                self.backend
+                    .put(&thumb_cid, thumb_data.clone(), "image/jpeg")
+                    .await?;
 
                 let thumb_dimensions = Self::extract_image_dimensions(&thumb_data, "image/jpeg");
                 self.store_metadata_full(
@@ -205,7 +223,8 @@ impl BlobStore {
                     &metadata.creator_did,
                     thumb_dimensions.as_ref(),
                     None,
-                ).await?;
+                )
+                .await?;
             }
 
             Some(thumb_cid)
@@ -224,7 +243,8 @@ impl BlobStore {
             &metadata.creator_did,
             dimensions.as_ref(),
             thumbnail_cid.as_deref(),
-        ).await?;
+        )
+        .await?;
 
         // Delete temp file
         fs::remove_file(&temp_path)
@@ -243,17 +263,22 @@ impl BlobStore {
     ///
     /// Returns the blob metadata and reference
     #[allow(dead_code)] // Future blob upload functionality
-    pub async fn upload(&self, data: Vec<u8>, mime_type: Option<&str>, creator_did: &str) -> PdsResult<BlobRef> {
+    pub async fn upload(
+        &self,
+        data: Vec<u8>,
+        mime_type: Option<&str>,
+        creator_did: &str,
+    ) -> PdsResult<BlobRef> {
         // Validate size
         let size = data.len();
-        atproto::blob::validate_blob_size(size, self.config.storage.max_blob_size)
+        crate::blob_store::mime::validate_blob_size(size, self.config.storage.max_blob_size)
             .map_err(PdsError::Validation)?;
 
         // Detect MIME type from data if not provided
         let mime_type = mime_type
             .map(String::from)
             .or_else(|| {
-                atproto::blob::detect_mime_type_from_data(&data).map(String::from)
+                crate::blob_store::mime::detect_mime_type_from_data(&data).map(String::from)
             })
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
@@ -267,13 +292,17 @@ impl BlobStore {
         let dimensions = Self::extract_image_dimensions(&data, &mime_type);
 
         // Generate thumbnail if this is an image (256x256 max)
-        let thumbnail_cid = if let Some(thumb_data) = Self::generate_thumbnail(&data, &mime_type, 256) {
+        let thumbnail_cid = if let Some(thumb_data) =
+            Self::generate_thumbnail(&data, &mime_type, 256)
+        {
             // Calculate thumbnail CID
             let thumb_cid = self.calculate_cid(&thumb_data);
 
             // Store thumbnail blob
             if !self.backend.exists(&thumb_cid).await? {
-                self.backend.put(&thumb_cid, thumb_data.clone(), "image/jpeg").await?;
+                self.backend
+                    .put(&thumb_cid, thumb_data.clone(), "image/jpeg")
+                    .await?;
 
                 // Extract dimensions from thumbnail
                 let thumb_dimensions = Self::extract_image_dimensions(&thumb_data, "image/jpeg");
@@ -286,7 +315,8 @@ impl BlobStore {
                     creator_did,
                     thumb_dimensions.as_ref(),
                     None, // thumbnails don't have their own thumbnails
-                ).await?;
+                )
+                .await?;
             }
 
             Some(thumb_cid)
@@ -311,7 +341,8 @@ impl BlobStore {
             creator_did,
             dimensions.as_ref(),
             thumbnail_cid.as_deref(),
-        ).await?;
+        )
+        .await?;
 
         Ok(BlobRef::new(cid, mime_type, size as i64))
     }
@@ -376,7 +407,13 @@ impl BlobStore {
 
     /// Store blob metadata in database (basic version without dimensions)
     #[allow(dead_code)] // Simplified version, use store_metadata_full for full metadata
-    async fn store_metadata(&self, cid: &str, mime_type: &str, size: i64, creator_did: &str) -> PdsResult<()> {
+    async fn store_metadata(
+        &self,
+        cid: &str,
+        mime_type: &str,
+        size: i64,
+        creator_did: &str,
+    ) -> PdsResult<()> {
         sqlx::query(
             r#"
             INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at)
@@ -534,9 +571,9 @@ impl BlobStore {
         // Delete temp file
         let temp_path = self.get_temp_blob_path(cid);
         if temp_path.exists() {
-            fs::remove_file(&temp_path)
-                .await
-                .map_err(|e| PdsError::BlobStorage(format!("Failed to delete temp blob file: {}", e)))?;
+            fs::remove_file(&temp_path).await.map_err(|e| {
+                PdsError::BlobStorage(format!("Failed to delete temp blob file: {}", e))
+            })?;
         }
 
         // Delete metadata
@@ -655,7 +692,7 @@ impl BlobStore {
                   AND rb.blob_cid > ?2
                 ORDER BY rb.blob_cid ASC
                 LIMIT ?3
-                "#
+                "#,
             )
             .bind(format!("at://{}/%", did))
             .bind(cursor)
@@ -670,7 +707,7 @@ impl BlobStore {
                   AND bm.cid IS NULL
                 ORDER BY rb.blob_cid ASC
                 LIMIT ?2
-                "#
+                "#,
             )
             .bind(format!("at://{}/%", did))
             .bind(limit)
@@ -701,7 +738,7 @@ impl BlobStore {
             INSERT INTO record_blob (blob_cid, record_uri, indexed_at)
             VALUES (?1, ?2, ?3)
             ON CONFLICT(blob_cid, record_uri) DO NOTHING
-            "#
+            "#,
         )
         .bind(blob_cid)
         .bind(record_uri)
@@ -752,7 +789,7 @@ impl BlobStore {
                 "SELECT cid FROM blob_metadata
                  WHERE creator_did = ?1 AND cid > ?2
                  ORDER BY cid ASC
-                 LIMIT ?3"
+                 LIMIT ?3",
             )
             .bind(did)
             .bind(cursor)
@@ -762,7 +799,7 @@ impl BlobStore {
                 "SELECT cid FROM blob_metadata
                  WHERE creator_did = ?1
                  ORDER BY cid ASC
-                 LIMIT ?2"
+                 LIMIT ?2",
             )
             .bind(did)
             .bind(limit)
@@ -825,7 +862,10 @@ mod tests {
         let store = create_test_store().await;
 
         let data = b"test image data".to_vec();
-        let blob_ref = store.upload(data.clone(), Some("image/png"), "did:plc:test").await.unwrap();
+        let blob_ref = store
+            .upload(data.clone(), Some("image/png"), "did:plc:test")
+            .await
+            .unwrap();
 
         assert_eq!(blob_ref.mime_type, "image/png");
         assert_eq!(blob_ref.size, 15);
@@ -843,8 +883,14 @@ mod tests {
         let data = b"duplicate data".to_vec();
 
         // Upload twice
-        let blob_ref1 = store.upload(data.clone(), Some("image/jpeg"), "did:plc:test1").await.unwrap();
-        let blob_ref2 = store.upload(data, Some("image/jpeg"), "did:plc:test2").await.unwrap();
+        let blob_ref1 = store
+            .upload(data.clone(), Some("image/jpeg"), "did:plc:test1")
+            .await
+            .unwrap();
+        let blob_ref2 = store
+            .upload(data, Some("image/jpeg"), "did:plc:test2")
+            .await
+            .unwrap();
 
         // Should have same CID (content-addressed)
         assert_eq!(blob_ref1.r#ref.link, blob_ref2.r#ref.link);
@@ -856,7 +902,9 @@ mod tests {
 
         let large_data = vec![0u8; 2 * 1024 * 1024]; // 2MB, over limit
 
-        let result = store.upload(large_data, Some("image/png"), "did:plc:test").await;
+        let result = store
+            .upload(large_data, Some("image/png"), "did:plc:test")
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
     }
@@ -867,9 +915,14 @@ mod tests {
 
         let data = b"test data".to_vec();
 
-        let result = store.upload(data, Some("application/exe"), "did:plc:test").await;
+        let result = store
+            .upload(data, Some("application/exe"), "did:plc:test")
+            .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unsupported MIME type"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported MIME type"));
     }
 
     #[tokio::test]
@@ -877,7 +930,10 @@ mod tests {
         let store = create_test_store().await;
 
         let data = b"to be deleted".to_vec();
-        let blob_ref = store.upload(data, Some("image/png"), "did:plc:test").await.unwrap();
+        let blob_ref = store
+            .upload(data, Some("image/png"), "did:plc:test")
+            .await
+            .unwrap();
 
         // Delete
         store.delete(&blob_ref.r#ref.link).await.unwrap();
@@ -898,10 +954,17 @@ mod tests {
         img.write_to(&mut cursor, ImageFormat::Png).unwrap();
 
         // Upload the image
-        let blob_ref = store.upload(buf, Some("image/png"), "did:plc:test").await.unwrap();
+        let blob_ref = store
+            .upload(buf, Some("image/png"), "did:plc:test")
+            .await
+            .unwrap();
 
         // Get metadata and verify dimensions
-        let metadata = store.get_metadata(&blob_ref.r#ref.link).await.unwrap().unwrap();
+        let metadata = store
+            .get_metadata(&blob_ref.r#ref.link)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(metadata.width, Some(10));
         assert_eq!(metadata.height, Some(10));
         assert_eq!(metadata.mime_type, "image/png");
@@ -918,11 +981,21 @@ mod tests {
         img.write_to(&mut cursor, ImageFormat::Png).unwrap();
 
         // Upload the image
-        let blob_ref = store.upload(buf, Some("image/png"), "did:plc:test").await.unwrap();
+        let blob_ref = store
+            .upload(buf, Some("image/png"), "did:plc:test")
+            .await
+            .unwrap();
 
         // Get metadata and verify thumbnail was created
-        let metadata = store.get_metadata(&blob_ref.r#ref.link).await.unwrap().unwrap();
-        assert!(metadata.thumbnail_cid.is_some(), "Thumbnail should be generated for images");
+        let metadata = store
+            .get_metadata(&blob_ref.r#ref.link)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            metadata.thumbnail_cid.is_some(),
+            "Thumbnail should be generated for images"
+        );
 
         // Verify thumbnail exists and is a valid blob
         let thumb_cid = metadata.thumbnail_cid.unwrap();
@@ -942,10 +1015,17 @@ mod tests {
         let store = create_test_store().await;
 
         let data = b"test data".to_vec();
-        let blob_ref = store.upload(data, Some("image/png"), "did:plc:test").await.unwrap();
+        let blob_ref = store
+            .upload(data, Some("image/png"), "did:plc:test")
+            .await
+            .unwrap();
 
         // Get metadata
-        let metadata = store.get_metadata(&blob_ref.r#ref.link).await.unwrap().unwrap();
+        let metadata = store
+            .get_metadata(&blob_ref.r#ref.link)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(metadata.cid, blob_ref.r#ref.link);
         assert_eq!(metadata.mime_type, "image/png");
         assert_eq!(metadata.size, 9);

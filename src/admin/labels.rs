@@ -8,11 +8,11 @@ use sqlx::{Row, SqlitePool};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Label {
     pub id: i64,
-    pub uri: String,  // AT-URI
+    pub uri: String, // AT-URI
     pub cid: Option<String>,
-    pub val: String,  // Label value (porn, spam, etc.)
-    pub neg: bool,    // Negative label (removal)
-    pub src: String,  // DID of source
+    pub val: String, // Label value (porn, spam, etc.)
+    pub neg: bool,   // Negative label (removal)
+    pub src: String, // DID of source
     pub created_at: DateTime<Utc>,
     pub created_by: String,
     pub expires_at: Option<DateTime<Utc>>,

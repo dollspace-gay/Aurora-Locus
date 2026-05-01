@@ -53,9 +53,9 @@ impl BlobBackend for DiskBlobBackend {
     async fn put(&self, cid: &str, data: Vec<u8>, _mime_type: &str) -> PdsResult<()> {
         let blob_path = self.ensure_blob_dir(cid).await?;
 
-        fs::write(&blob_path, data).await.map_err(|e| {
-            PdsError::BlobStorage(format!("Failed to write blob {}: {}", cid, e))
-        })?;
+        fs::write(&blob_path, data)
+            .await
+            .map_err(|e| PdsError::BlobStorage(format!("Failed to write blob {}: {}", cid, e)))?;
 
         Ok(())
     }

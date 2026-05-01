@@ -28,10 +28,7 @@ pub async fn generate_service_token(
     // Decode the repo signing key from hex
     let signing_key_hex = &ctx.config.authentication.repo_signing_key;
     let signing_key = hex::decode(signing_key_hex).map_err(|e| {
-        crate::error::PdsError::Internal(format!(
-            "Failed to decode repo signing key: {}",
-            e
-        ))
+        crate::error::PdsError::Internal(format!("Failed to decode repo signing key: {}", e))
     })?;
 
     // Validate key length (should be 32 bytes for secp256k1)

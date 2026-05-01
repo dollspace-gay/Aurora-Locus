@@ -56,12 +56,11 @@ pub async fn require_auth(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<ValidatedSession> {
-    let token = extract_bearer_token(&headers)
-        .ok_or_else(|| {
-            warn!("authentication_failed: missing authorization header");
-            metrics::record_error("AuthenticationFailed", "middleware");
-            PdsError::Authentication("Missing authorization header".to_string())
-        })?;
+    let token = extract_bearer_token(&headers).ok_or_else(|| {
+        warn!("authentication_failed: missing authorization header");
+        metrics::record_error("AuthenticationFailed", "middleware");
+        PdsError::Authentication("Missing authorization header".to_string())
+    })?;
 
     match ctx.account_manager.validate_access_token(&token).await {
         Ok(session) => {
@@ -145,12 +144,11 @@ pub async fn require_auth_unified(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<UnifiedAuthContext> {
-    let token = extract_bearer_token(&headers)
-        .ok_or_else(|| {
-            warn!("authentication_failed: missing authorization header");
-            metrics::record_error("AuthenticationFailed", "middleware");
-            PdsError::Authentication("Missing authorization header".to_string())
-        })?;
+    let token = extract_bearer_token(&headers).ok_or_else(|| {
+        warn!("authentication_failed: missing authorization header");
+        metrics::record_error("AuthenticationFailed", "middleware");
+        PdsError::Authentication("Missing authorization header".to_string())
+    })?;
 
     // Try OAuth token validation first (most modern)
     match crate::auth::validate_oauth_token(&ctx, &token).await {
@@ -191,7 +189,11 @@ pub async fn require_auth_unified(
     if let Some(service_auth) = &ctx.federation_auth {
         let service_did = ctx.service_did();
 
-        match service_auth.authenticator.verify_service_jwt(&token, service_did).await {
+        match service_auth
+            .authenticator
+            .verify_service_jwt(&token, service_did)
+            .await
+        {
             Ok(claims) => {
                 // Verify and consume nonce
                 if let Some(nonce_store) = &ctx.nonce_store {
@@ -210,7 +212,9 @@ pub async fn require_auth_unified(
                                 "service_auth_failed: replay_attack"
                             );
                             metrics::record_error("ServiceAuthReplayAttack", "middleware");
-                            return Err(PdsError::Authentication("Replay attack detected".to_string()));
+                            return Err(PdsError::Authentication(
+                                "Replay attack detected".to_string(),
+                            ));
                         }
                         Err(e) => {
                             error!(
@@ -237,7 +241,9 @@ pub async fn require_auth_unified(
     // All auth methods failed
     warn!("authentication_failed: invalid_token");
     metrics::record_error("AuthenticationFailed", "middleware");
-    Err(PdsError::Authentication("Invalid or expired token".to_string()))
+    Err(PdsError::Authentication(
+        "Invalid or expired token".to_string(),
+    ))
 }
 
 /// Moderation enforcement middleware
@@ -256,7 +262,10 @@ pub async fn check_account_moderation(
     if let Some(token) = extract_bearer_token(&headers) {
         if let Ok(session) = ctx.account_manager.validate_access_token(&token).await {
             // Check if this is an admin - admins bypass moderation checks
-            let is_admin = ctx.admin_role_manager.get_role(&session.did).await
+            let is_admin = ctx
+                .admin_role_manager
+                .get_role(&session.did)
+                .await
                 .unwrap_or(None)
                 .is_some();
 
@@ -269,7 +278,8 @@ pub async fn check_account_moderation(
                             "moderation_blocked: account_taken_down"
                         );
                         return Err(PdsError::AccountTakenDown(
-                            "Account has been taken down due to terms of service violations".to_string(),
+                            "Account has been taken down due to terms of service violations"
+                                .to_string(),
                         ));
                     }
                     Err(e) => {
@@ -416,7 +426,7 @@ fn should_log_request(path: &str) -> bool {
 
     // Sample 10% of feed/timeline requests (high volume)
     if path.contains("/feed/") || path.contains("/timeline") {
-        return rand::random::<u8>() < 26 // ~10% (26/256)
+        return rand::random::<u8>() < 26; // ~10% (26/256)
     }
 
     // Log everything else
@@ -426,11 +436,7 @@ fn should_log_request(path: &str) -> bool {
 /// Database query logging wrapper
 ///
 /// Logs slow queries (>100ms) and records metrics
-pub async fn log_db_query<T, F>(
-    operation: &str,
-    table: &str,
-    query: F,
-) -> PdsResult<T>
+pub async fn log_db_query<T, F>(operation: &str, table: &str, query: F) -> PdsResult<T>
 where
     F: std::future::Future<Output = PdsResult<T>>,
 {
@@ -500,7 +506,12 @@ pub async fn service_auth(
     // Check if this is a service auth request
     if let Some(token) = extract_bearer_token(&headers) {
         // Try local auth first
-        if ctx.account_manager.validate_access_token(&token).await.is_ok() {
+        if ctx
+            .account_manager
+            .validate_access_token(&token)
+            .await
+            .is_ok()
+        {
             // Local auth succeeded - continue with normal flow
             return Ok(next.run(req).await);
         }
@@ -510,7 +521,11 @@ pub async fn service_auth(
             let service_did = ctx.service_did();
 
             // Verify JWT with this PDS's DID as audience
-            match service_auth.authenticator.verify_service_jwt(&token, service_did).await {
+            match service_auth
+                .authenticator
+                .verify_service_jwt(&token, service_did)
+                .await
+            {
                 Ok(claims) => {
                     // JWT is valid - check nonce for replay prevention
                     if let Some(nonce_store) = &ctx.nonce_store {
@@ -600,23 +615,24 @@ pub async fn require_service_auth(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<ServiceAuthContext> {
-    let token = extract_bearer_token(&headers)
-        .ok_or_else(|| {
-            warn!("service_auth_failed: missing_authorization_header");
-            metrics::record_error("ServiceAuthMissing", "middleware");
-            PdsError::Authentication("Missing authorization header".to_string())
-        })?;
+    let token = extract_bearer_token(&headers).ok_or_else(|| {
+        warn!("service_auth_failed: missing_authorization_header");
+        metrics::record_error("ServiceAuthMissing", "middleware");
+        PdsError::Authentication("Missing authorization header".to_string())
+    })?;
 
-    let service_auth = ctx.federation_auth.as_ref()
-        .ok_or_else(|| {
-            warn!("service_auth_failed: federation_disabled");
-            PdsError::Authentication("Federation not enabled".to_string())
-        })?;
+    let service_auth = ctx.federation_auth.as_ref().ok_or_else(|| {
+        warn!("service_auth_failed: federation_disabled");
+        PdsError::Authentication("Federation not enabled".to_string())
+    })?;
 
     let service_did = ctx.service_did();
 
     // Verify JWT
-    let claims = service_auth.authenticator.verify_service_jwt(&token, service_did).await?;
+    let claims = service_auth
+        .authenticator
+        .verify_service_jwt(&token, service_did)
+        .await?;
 
     // Check nonce if nonce store is configured
     if let Some(nonce_store) = &ctx.nonce_store {
@@ -629,7 +645,9 @@ pub async fn require_service_auth(
                 "service_auth_failed: replay_attack"
             );
             metrics::record_error("ServiceAuthReplayAttack", "middleware");
-            return Err(PdsError::Authentication("Replay attack detected".to_string()));
+            return Err(PdsError::Authentication(
+                "Replay attack detected".to_string(),
+            ));
         }
     }
 
@@ -695,7 +713,9 @@ pub async fn jwt_deprecation_headers(
     next: Next,
 ) -> Response {
     // Check if JWT auth was used (stored in request extensions by AuthContext)
-    let is_jwt = req.extensions().get::<crate::auth::AuthMethod>()
+    let is_jwt = req
+        .extensions()
+        .get::<crate::auth::AuthMethod>()
         .map(|method| matches!(method, crate::auth::AuthMethod::Jwt))
         .unwrap_or(false);
 
@@ -706,10 +726,7 @@ pub async fn jwt_deprecation_headers(
     if is_jwt {
         let headers = response.headers_mut();
 
-        headers.insert(
-            "Deprecation",
-            "true".parse().unwrap(),
-        );
+        headers.insert("Deprecation", "true".parse().unwrap());
 
         headers.insert(
             "Sunset",
@@ -718,12 +735,18 @@ pub async fn jwt_deprecation_headers(
 
         headers.insert(
             "Warning",
-            "299 - \"JWT authentication is deprecated. Migrate to OAuth 2.1.\"".parse().unwrap(),
+            "299 - \"JWT authentication is deprecated. Migrate to OAuth 2.1.\""
+                .parse()
+                .unwrap(),
         );
 
         headers.insert(
             "X-OAuth-Migration-Guide",
-            ctx.config.authentication.oauth_migration_guide_url.parse().unwrap(),
+            ctx.config
+                .authentication
+                .oauth_migration_guide_url
+                .parse()
+                .unwrap(),
         );
 
         // Record metrics

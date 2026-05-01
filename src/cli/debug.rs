@@ -14,7 +14,10 @@ pub async fn inspect_account(ctx: &AppContext, identifier: &str, format: &str) -
     println!("════════════════════════════════════════════════════════\n");
 
     // Get account by identifier (DID or handle)
-    let account = ctx.account_manager.get_account_by_identifier(identifier).await?;
+    let account = ctx
+        .account_manager
+        .get_account_by_identifier(identifier)
+        .await?;
 
     // Get app passwords
     let app_passwords = ctx
@@ -73,7 +76,11 @@ pub async fn inspect_account(ctx: &AppContext, identifier: &str, format: &str) -
                 println!("Email:            {}", email);
                 println!(
                     "Email Confirmed:  {}",
-                    if account.email_confirmed_at.is_some() { "Yes" } else { "No" }
+                    if account.email_confirmed_at.is_some() {
+                        "Yes"
+                    } else {
+                        "No"
+                    }
                 );
             }
             println!("Created:          {}", account.created_at);
@@ -97,7 +104,11 @@ pub async fn inspect_account(ctx: &AppContext, identifier: &str, format: &str) -
             println!("Blobs:            {}", blob_count);
             println!(
                 "Repository:       {}",
-                if has_repo { "Exists" } else { "Not initialized" }
+                if has_repo {
+                    "Exists"
+                } else {
+                    "Not initialized"
+                }
             );
         }
     }
@@ -356,7 +367,8 @@ pub async fn check_blobs(ctx: &AppContext, did: Option<&str>, orphaned: bool) ->
                 }
             }
 
-            println!("\nTotal Size: {} bytes ({} KB, {} MB)",
+            println!(
+                "\nTotal Size: {} bytes ({} KB, {} MB)",
                 total_size,
                 total_size / 1024,
                 total_size / 1024 / 1024

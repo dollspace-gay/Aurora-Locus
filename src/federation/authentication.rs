@@ -8,8 +8,8 @@
 
 use crate::error::{PdsError, PdsResult};
 use crate::federation::ServiceAuthenticator;
+use crate::identity::did_document::DidDocument;
 use crate::identity::IdentityResolver;
-use atproto::did_doc::DidDocument;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -50,28 +50,21 @@ impl FederationAuthenticator {
         debug!("Verifying remote token for DID: {}", did);
 
         // Resolve DID to get user's home PDS
-        let did_doc = self
-            .identity_resolver
-            .resolve_did(did)
-            .await
-            .map_err(|e| {
-                warn!("Failed to resolve DID {}: {}", did, e);
-                PdsError::Authentication(format!("Failed to resolve DID: {}", e))
-            })?;
+        let did_doc = self.identity_resolver.resolve_did(did).await.map_err(|e| {
+            warn!("Failed to resolve DID {}: {}", did, e);
+            PdsError::Authentication(format!("Failed to resolve DID: {}", e))
+        })?;
 
         // Extract PDS endpoint from DID document
-        let pds_endpoint = self
-            .extract_pds_endpoint(&did_doc)
-            .ok_or_else(|| {
-                warn!("No PDS endpoint found in DID document for {}", did);
-                PdsError::Authentication("No PDS endpoint in DID document".to_string())
-            })?;
+        let pds_endpoint = self.extract_pds_endpoint(&did_doc).ok_or_else(|| {
+            warn!("No PDS endpoint found in DID document for {}", did);
+            PdsError::Authentication("No PDS endpoint in DID document".to_string())
+        })?;
 
         debug!("User's home PDS: {}", pds_endpoint);
 
         // Verify token with remote PDS
-        self.verify_token_with_pds(&pds_endpoint, did, token)
-            .await
+        self.verify_token_with_pds(&pds_endpoint, did, token).await
     }
 
     /// Extract PDS endpoint from DID document
@@ -131,10 +124,7 @@ impl FederationAuthenticator {
 
         // Verify DID matches
         if session.did != did {
-            warn!(
-                "DID mismatch: expected {}, got {}",
-                did, session.did
-            );
+            warn!("DID mismatch: expected {}, got {}", did, session.did);
             return Err(PdsError::Authentication("DID mismatch".to_string()));
         }
 
@@ -191,7 +181,9 @@ impl FederationAuthenticator {
         match pds_endpoint {
             Some(endpoint) => {
                 // Check if endpoint is in trusted list
-                Ok(trusted_instances.iter().any(|trusted| endpoint.contains(trusted)))
+                Ok(trusted_instances
+                    .iter()
+                    .any(|trusted| endpoint.contains(trusted)))
             }
             None => Ok(false),
         }

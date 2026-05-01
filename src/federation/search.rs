@@ -1,6 +1,11 @@
-//! Federated search across multiple PDS instances
+//! Federated search across multiple PDS instances.
 //!
-//! Enables searching for content, users, and posts across the entire federation
+//! Enables searching for content, users, and posts across the entire
+//! federation. The implementation is staged but not yet wired to public
+//! routes — see `src/api/federation.rs` for the deferral note. Allow
+//! dead_code at the module level so the staged code doesn't drown the
+//! lint output.
+#![allow(dead_code)]
 
 use crate::error::{PdsError, PdsResult};
 use crate::federation::discovery::{PdsDiscovery, PdsInstance};
@@ -136,7 +141,8 @@ impl FederatedSearch {
             let query = query.to_string();
 
             tasks.spawn(async move {
-                let result = Self::search_actors_on_instance(&client, &instance, &query, search_limit).await;
+                let result =
+                    Self::search_actors_on_instance(&client, &instance, &query, search_limit).await;
                 (instance.did.clone(), result)
             });
         }
@@ -165,8 +171,8 @@ impl FederatedSearch {
             }
         }
 
-        // Sort by relevance and limit
-        deduplicated.sort_by(|a, b| b.followers_count.cmp(&a.followers_count));
+        // Sort by relevance (highest followers first) and limit.
+        deduplicated.sort_by_key(|actor| std::cmp::Reverse(actor.followers_count));
         deduplicated.truncate(limit);
 
         debug!(
@@ -210,7 +216,8 @@ impl FederatedSearch {
             let query = query.to_string();
 
             tasks.spawn(async move {
-                let result = Self::search_posts_on_instance(&client, &instance, &query, search_limit).await;
+                let result =
+                    Self::search_posts_on_instance(&client, &instance, &query, search_limit).await;
                 (instance.did.clone(), result)
             });
         }
@@ -273,9 +280,10 @@ impl FederatedSearch {
             return Ok(Vec::new()); // Silently skip failed instances
         }
 
-        let search_response: ActorSearchResponse = response.json().await.map_err(|e| {
-            PdsError::Internal(format!("Failed to parse search response: {}", e))
-        })?;
+        let search_response: ActorSearchResponse = response
+            .json()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to parse search response: {}", e)))?;
 
         Ok(search_response.actors)
     }
@@ -302,15 +310,20 @@ impl FederatedSearch {
             return Ok(Vec::new());
         }
 
-        let search_response: PostSearchResponse = response.json().await.map_err(|e| {
-            PdsError::Internal(format!("Failed to parse search response: {}", e))
-        })?;
+        let search_response: PostSearchResponse = response
+            .json()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to parse search response: {}", e)))?;
 
         Ok(search_response.posts)
     }
 
     /// Aggregate timeline from multiple PDS instances
-    pub async fn aggregate_timeline(&self, dids: Vec<String>, limit: usize) -> PdsResult<Vec<PostResult>> {
+    pub async fn aggregate_timeline(
+        &self,
+        dids: Vec<String>,
+        limit: usize,
+    ) -> PdsResult<Vec<PostResult>> {
         debug!("Aggregating timeline from {} DIDs", dids.len());
 
         let mut results = Vec::new();
@@ -338,7 +351,10 @@ impl FederatedSearch {
                     drop(breakers);
 
                     if is_open {
-                        debug!("Skipping feed fetch from {} (circuit breaker open)", instance.did);
+                        debug!(
+                            "Skipping feed fetch from {} (circuit breaker open)",
+                            instance.did
+                        );
                         return (Some(instance.did.clone()), Ok(Vec::new()));
                     }
 
@@ -380,7 +396,10 @@ impl FederatedSearch {
         deduplicated.sort_by(|a, b| b.indexed_at.cmp(&a.indexed_at));
         deduplicated.truncate(limit);
 
-        debug!("Aggregated {} unique posts from timeline", deduplicated.len());
+        debug!(
+            "Aggregated {} unique posts from timeline",
+            deduplicated.len()
+        );
 
         Ok(deduplicated)
     }
@@ -397,17 +416,20 @@ impl FederatedSearch {
             instance.url, did, limit
         );
 
-        let response = client.get(&url).send().await.map_err(|e| {
-            PdsError::Internal(format!("Failed to fetch feed: {}", e))
-        })?;
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to fetch feed: {}", e)))?;
 
         if !response.status().is_success() {
             return Ok(Vec::new());
         }
 
-        let feed_response: FeedResponse = response.json().await.map_err(|e| {
-            PdsError::Internal(format!("Failed to parse feed response: {}", e))
-        })?;
+        let feed_response: FeedResponse = response
+            .json()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to parse feed response: {}", e)))?;
 
         Ok(feed_response
             .feed

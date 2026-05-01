@@ -33,9 +33,7 @@ pub async fn assert_repo_availability(
     is_admin_or_self: bool,
 ) -> PdsResult<()> {
     // Get account
-    let account = account_manager
-        .get_account(did)
-        .await?;
+    let account = account_manager.get_account(did).await?;
 
     // Admins and repo owners can access any repo state
     if is_admin_or_self {

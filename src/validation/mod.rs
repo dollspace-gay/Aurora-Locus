@@ -25,7 +25,6 @@ pub enum ValidationMode {
     None,
 }
 
-
 impl FromStr for ValidationMode {
     type Err = PdsError;
 
@@ -34,7 +33,10 @@ impl FromStr for ValidationMode {
             "required" => Ok(ValidationMode::Required),
             "optimistic" => Ok(ValidationMode::Optimistic),
             "none" => Ok(ValidationMode::None),
-            _ => Err(PdsError::Validation(format!("Invalid validation mode: {}", s))),
+            _ => Err(PdsError::Validation(format!(
+                "Invalid validation mode: {}",
+                s
+            ))),
         }
     }
 }
@@ -58,7 +60,13 @@ pub type ValidationResult = Result<(), Vec<ValidationError>>;
 /// - `2025-01-10T12:00:00+00:00`
 /// - `2025-01-10T12:00:00-05:00`
 fn validate_datetime(datetime_str: &str) -> bool {
-    // Try to parse as RFC3339
+    // chrono's parse_from_rfc3339 accepts a space between date and time
+    // (RFC 3339 §5.6 allows lowercase `t` or a space as the separator),
+    // but the AT Protocol spec requires the canonical upper-case `T`.
+    // Reject space-separated forms before delegating.
+    if !datetime_str.contains('T') {
+        return false;
+    }
     DateTime::parse_from_rfc3339(datetime_str).is_ok()
 }
 
@@ -80,7 +88,11 @@ fn validate_datetime(datetime_str: &str) -> bool {
 /// * `"hello"` - 5 bytes, 5 graphemes
 /// * `"👨‍👩‍👧‍👦"` - 25 bytes, 1 grapheme (family emoji)
 /// * `"café"` - 5 bytes, 4 graphemes (é is one grapheme)
-fn validate_text_length(text: &str, max_bytes: usize, max_graphemes: usize) -> Result<(), (usize, usize)> {
+fn validate_text_length(
+    text: &str,
+    max_bytes: usize,
+    max_graphemes: usize,
+) -> Result<(), (usize, usize)> {
     let byte_len = text.len();
     let grapheme_count = text.graphemes(true).count();
 
@@ -183,10 +195,7 @@ impl RecordValidator {
                 // Record each error type
                 for error in errors {
                     // Extract error type from message (first word or "unknown")
-                    let error_type = error.message
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("unknown");
+                    let error_type = error.message.split_whitespace().next().unwrap_or("unknown");
                     crate::metrics::record_validation_failure(collection, error_type);
                 }
             }
@@ -242,7 +251,10 @@ impl RecordValidator {
                     if arr.len() > 4 {
                         errors.push(ValidationError {
                             path: "$.embed.images".to_string(),
-                            message: format!("Array 'images' exceeds maximum length of 4: {}", arr.len()),
+                            message: format!(
+                                "Array 'images' exceeds maximum length of 4: {}",
+                                arr.len()
+                            ),
                         });
                     }
                     // Validate each image
@@ -280,8 +292,13 @@ impl RecordValidator {
                                         if let Some(w) = width.as_i64() {
                                             if w <= 0 {
                                                 errors.push(ValidationError {
-                                                    path: format!("$.embed.images[{}].aspectRatio.width", i),
-                                                    message: "Field 'width' must be a positive integer".to_string(),
+                                                    path: format!(
+                                                        "$.embed.images[{}].aspectRatio.width",
+                                                        i
+                                                    ),
+                                                    message:
+                                                        "Field 'width' must be a positive integer"
+                                                            .to_string(),
                                                 });
                                             }
                                         }
@@ -290,8 +307,13 @@ impl RecordValidator {
                                         if let Some(h) = height.as_i64() {
                                             if h <= 0 {
                                                 errors.push(ValidationError {
-                                                    path: format!("$.embed.images[{}].aspectRatio.height", i),
-                                                    message: "Field 'height' must be a positive integer".to_string(),
+                                                    path: format!(
+                                                        "$.embed.images[{}].aspectRatio.height",
+                                                        i
+                                                    ),
+                                                    message:
+                                                        "Field 'height' must be a positive integer"
+                                                            .to_string(),
                                                 });
                                             }
                                         }
@@ -338,7 +360,8 @@ impl RecordValidator {
                                 if !s.starts_with("http://") && !s.starts_with("https://") {
                                     errors.push(ValidationError {
                                         path: "$.embed.external.uri".to_string(),
-                                        message: "Field 'uri' must be a valid HTTP/HTTPS URL".to_string(),
+                                        message: "Field 'uri' must be a valid HTTP/HTTPS URL"
+                                            .to_string(),
                                     });
                                 }
                             }
@@ -634,13 +657,19 @@ impl RecordValidator {
                             if byte_len > 640 {
                                 errors.push(ValidationError {
                                     path: "$.displayName".to_string(),
-                                    message: format!("displayName exceeds maximum byte length of 640: {}", byte_len),
+                                    message: format!(
+                                        "displayName exceeds maximum byte length of 640: {}",
+                                        byte_len
+                                    ),
                                 });
                             }
                             if grapheme_count > 64 {
                                 errors.push(ValidationError {
                                     path: "$.displayName".to_string(),
-                                    message: format!("displayName exceeds maximum of 64 graphemes: {}", grapheme_count),
+                                    message: format!(
+                                        "displayName exceeds maximum of 64 graphemes: {}",
+                                        grapheme_count
+                                    ),
                                 });
                             }
                         }
@@ -651,17 +680,24 @@ impl RecordValidator {
                 if let Some(description) = record.get("description") {
                     if let Some(s) = description.as_str() {
                         // Validate using both byte length (2560) and grapheme count (256)
-                        if let Err((byte_len, grapheme_count)) = validate_text_length(s, 2560, 256) {
+                        if let Err((byte_len, grapheme_count)) = validate_text_length(s, 2560, 256)
+                        {
                             if byte_len > 2560 {
                                 errors.push(ValidationError {
                                     path: "$.description".to_string(),
-                                    message: format!("description exceeds maximum byte length of 2560: {}", byte_len),
+                                    message: format!(
+                                        "description exceeds maximum byte length of 2560: {}",
+                                        byte_len
+                                    ),
                                 });
                             }
                             if grapheme_count > 256 {
                                 errors.push(ValidationError {
                                     path: "$.description".to_string(),
-                                    message: format!("description exceeds maximum of 256 graphemes: {}", grapheme_count),
+                                    message: format!(
+                                        "description exceeds maximum of 256 graphemes: {}",
+                                        grapheme_count
+                                    ),
                                 });
                             }
                         }
@@ -1459,7 +1495,10 @@ pub fn validation_errors_to_pds_error(errors: Vec<ValidationError>) -> PdsError 
         .map(|e| format!("{}: {}", e.path, e.message))
         .collect();
 
-    PdsError::Validation(format!("Record validation failed:\n  - {}", messages.join("\n  - ")))
+    PdsError::Validation(format!(
+        "Record validation failed:\n  - {}",
+        messages.join("\n  - ")
+    ))
 }
 
 #[cfg(test)]
@@ -1618,7 +1657,9 @@ mod tests {
         assert!(result.is_err());
 
         if let Err(errors) = result {
-            assert!(errors.iter().any(|e| e.path == "$.createdAt" && e.message.contains("RFC3339")));
+            assert!(errors
+                .iter()
+                .any(|e| e.path == "$.createdAt" && e.message.contains("RFC3339")));
         }
     }
 
@@ -1931,7 +1972,10 @@ mod tests {
         });
 
         let result = validator.validate("app.bsky.feed.post", &invalid_post);
-        assert!(result.is_ok(), "ValidationMode::None should skip all validation");
+        assert!(
+            result.is_ok(),
+            "ValidationMode::None should skip all validation"
+        );
     }
 
     #[test]
@@ -1946,7 +1990,10 @@ mod tests {
         });
 
         let result = validator.validate("app.bsky.feed.post", &invalid_post);
-        assert!(result.is_err(), "Optimistic mode should validate known collections");
+        assert!(
+            result.is_err(),
+            "Optimistic mode should validate known collections"
+        );
     }
 
     #[test]
@@ -1960,7 +2007,10 @@ mod tests {
         });
 
         let result = validator.validate("com.example.custom.record", &unknown_record);
-        assert!(result.is_ok(), "Optimistic mode should accept unknown collections with basic validation");
+        assert!(
+            result.is_ok(),
+            "Optimistic mode should accept unknown collections with basic validation"
+        );
     }
 
     #[test]
@@ -1971,7 +2021,10 @@ mod tests {
         let invalid_record = json!("not an object");
 
         let result = validator.validate("com.example.custom.record", &invalid_record);
-        assert!(result.is_err(), "Optimistic mode should reject malformed unknown collections");
+        assert!(
+            result.is_err(),
+            "Optimistic mode should reject malformed unknown collections"
+        );
     }
 
     #[test]
@@ -1986,7 +2039,10 @@ mod tests {
         });
 
         let result = validator.validate("app.bsky.feed.post", &invalid_post);
-        assert!(result.is_err(), "Required mode should validate known collections");
+        assert!(
+            result.is_err(),
+            "Required mode should validate known collections"
+        );
     }
 
     #[test]
@@ -2000,7 +2056,10 @@ mod tests {
         });
 
         let result = validator.validate("com.example.custom.record", &unknown_record);
-        assert!(result.is_err(), "Required mode should reject unknown collections");
+        assert!(
+            result.is_err(),
+            "Required mode should reject unknown collections"
+        );
 
         if let Err(errors) = result {
             assert!(!errors.is_empty());
@@ -2010,12 +2069,27 @@ mod tests {
 
     #[test]
     fn test_validation_mode_from_str() {
-        assert_eq!(ValidationMode::from_str("required"), Ok(ValidationMode::Required));
-        assert_eq!(ValidationMode::from_str("Required"), Ok(ValidationMode::Required));
-        assert_eq!(ValidationMode::from_str("REQUIRED"), Ok(ValidationMode::Required));
+        assert_eq!(
+            ValidationMode::from_str("required"),
+            Ok(ValidationMode::Required)
+        );
+        assert_eq!(
+            ValidationMode::from_str("Required"),
+            Ok(ValidationMode::Required)
+        );
+        assert_eq!(
+            ValidationMode::from_str("REQUIRED"),
+            Ok(ValidationMode::Required)
+        );
 
-        assert_eq!(ValidationMode::from_str("optimistic"), Ok(ValidationMode::Optimistic));
-        assert_eq!(ValidationMode::from_str("Optimistic"), Ok(ValidationMode::Optimistic));
+        assert_eq!(
+            ValidationMode::from_str("optimistic"),
+            Ok(ValidationMode::Optimistic)
+        );
+        assert_eq!(
+            ValidationMode::from_str("Optimistic"),
+            Ok(ValidationMode::Optimistic)
+        );
 
         assert_eq!(ValidationMode::from_str("none"), Ok(ValidationMode::None));
         assert_eq!(ValidationMode::from_str("None"), Ok(ValidationMode::None));
@@ -2027,7 +2101,11 @@ mod tests {
     #[test]
     fn test_validation_mode_default() {
         let mode = ValidationMode::default();
-        assert_eq!(mode, ValidationMode::Optimistic, "Default validation mode should be Optimistic");
+        assert_eq!(
+            mode,
+            ValidationMode::Optimistic,
+            "Default validation mode should be Optimistic"
+        );
     }
 
     #[test]
@@ -2490,9 +2568,9 @@ mod tests {
         assert!(result.is_err());
 
         if let Err(errors) = result {
-            assert!(errors.iter().any(|e| {
-                e.path == "$.text" && e.message.contains("300 graphemes")
-            }));
+            assert!(errors
+                .iter()
+                .any(|e| { e.path == "$.text" && e.message.contains("300 graphemes") }));
         }
     }
 
@@ -2541,9 +2619,9 @@ mod tests {
         assert!(result.is_err());
 
         if let Err(errors) = result {
-            assert!(errors.iter().any(|e| {
-                e.path == "$.displayName" && e.message.contains("64 graphemes")
-            }));
+            assert!(errors
+                .iter()
+                .any(|e| { e.path == "$.displayName" && e.message.contains("64 graphemes") }));
         }
     }
 
@@ -2576,9 +2654,9 @@ mod tests {
         assert!(result.is_err());
 
         if let Err(errors) = result {
-            assert!(errors.iter().any(|e| {
-                e.path == "$.description" && e.message.contains("256 graphemes")
-            }));
+            assert!(errors
+                .iter()
+                .any(|e| { e.path == "$.description" && e.message.contains("256 graphemes") }));
         }
     }
 
@@ -2614,17 +2692,19 @@ mod tests {
         assert!(result.is_err());
 
         if let Err(errors) = result {
-            assert!(errors.iter().any(|e| {
-                e.path == "$.tags[0]" && e.message.contains("64 graphemes")
-            }));
+            assert!(errors
+                .iter()
+                .any(|e| { e.path == "$.tags[0]" && e.message.contains("64 graphemes") }));
         }
     }
 
     #[test]
     fn test_validate_text_length_mixed_unicode() {
-        // Mix of ASCII, Latin extended, emoji, and CJK
+        // Mix of ASCII, Latin extended, emoji, and CJK. The string is
+        // 21 graphemes (originally pegged at 20 by an off-by-one),
+        // so the generous limit needs to accommodate it.
         let mixed = "Hello café 👋 こんにちは 世界";
-        let result = validate_text_length(mixed, 100, 20);
+        let result = validate_text_length(mixed, 100, 25);
         assert!(result.is_ok());
 
         let result = validate_text_length(mixed, 100, 10);

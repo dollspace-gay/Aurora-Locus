@@ -64,7 +64,10 @@ impl DeviceManager {
         .execute(&self.db)
         .await?;
 
-        debug!("Created device: {} for session: {}", device_id, data.session_id);
+        debug!(
+            "Created device: {} for session: {}",
+            device_id, data.session_id
+        );
 
         Ok(device_id)
     }
@@ -128,11 +131,13 @@ impl DeviceManager {
         .bind(&data.dpop_public_key)
         .bind(device_id)
         .execute(&self.db)
-        .await
-        ?;
+        .await?;
 
         if result.rows_affected() == 0 {
-            return Err(PdsError::NotFound(format!("Device not found: {}", device_id)));
+            return Err(PdsError::NotFound(format!(
+                "Device not found: {}",
+                device_id
+            )));
         }
 
         debug!("Updated device: {}", device_id);
@@ -156,12 +161,14 @@ impl DeviceManager {
         )
         .bind(device_id)
         .execute(&self.db)
-        .await
-        ?;
+        .await?;
 
         if result.rows_affected() == 0 {
             warn!("Attempted to remove non-existent device: {}", device_id);
-            return Err(PdsError::NotFound(format!("Device not found: {}", device_id)));
+            return Err(PdsError::NotFound(format!(
+                "Device not found: {}",
+                device_id
+            )));
         }
 
         debug!("Removed device: {}", device_id);
@@ -199,8 +206,7 @@ impl DeviceManager {
         .bind(now)
         .bind(device_name)
         .execute(&self.db)
-        .await
-        ?;
+        .await?;
 
         debug!("Associated device {} with account {}", device_id, did);
 
@@ -238,8 +244,7 @@ impl DeviceManager {
         .bind(did)
         .bind(limit)
         .fetch_all(&self.db)
-        .await
-        ?;
+        .await?;
 
         let devices = rows
             .into_iter()
@@ -288,8 +293,7 @@ impl DeviceManager {
         .bind(did)
         .bind(device_id)
         .execute(&self.db)
-        .await
-        ?;
+        .await?;
 
         if result.rows_affected() == 0 {
             return Err(PdsError::NotFound(format!(
@@ -322,8 +326,7 @@ impl DeviceManager {
         .bind(now)
         .bind(device_id)
         .execute(&self.db)
-        .await
-        ?;
+        .await?;
 
         Ok(())
     }
@@ -348,8 +351,7 @@ impl DeviceManager {
         )
         .bind(device_id)
         .fetch_optional(&self.db)
-        .await
-        ?;
+        .await?;
 
         Ok(row.and_then(|r| r.get("dpop_public_key")))
     }
@@ -389,16 +391,19 @@ fn parse_user_agent(ua: Option<&str>) -> (String, Option<String>, Option<String>
         None
     };
 
+    // Order matters: iPhone/iPad UAs traditionally include "Mac OS X" for
+    // legacy compatibility, so iOS detection must come before macOS or
+    // every iPhone gets misclassified as macOS.
     let os = if ua.contains("Windows") {
         Some("Windows".to_string())
+    } else if ua.contains("iPhone") || ua.contains("iPad") || ua.contains("iOS") {
+        Some("iOS".to_string())
+    } else if ua.contains("Android") {
+        Some("Android".to_string())
     } else if ua.contains("Mac OS") {
         Some("macOS".to_string())
     } else if ua.contains("Linux") {
         Some("Linux".to_string())
-    } else if ua.contains("Android") {
-        Some("Android".to_string())
-    } else if ua.contains("iOS") || ua.contains("iPhone") || ua.contains("iPad") {
-        Some("iOS".to_string())
     } else {
         None
     };

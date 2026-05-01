@@ -119,17 +119,13 @@ impl ActorStore {
         .execute(&pool)
         .await?;
 
-        // Initialize empty repository root
-        sqlx::query(
-            "INSERT INTO repo_root (did, cid, rev, indexed_at)
-             VALUES (?1, ?2, ?3, ?4)"
-        )
-        .bind(did)
-        .bind("bafyreihk5ztsfapt6g2cnxbxgbxb7dltipq5pufb4jtwmqrxrxqaygceyq") // Empty MST root
-        .bind("3jzfcijpj2z2a") // Initial TID
-        .bind(chrono::Utc::now())
-        .execute(&pool)
-        .await?;
+        // Note: we deliberately do NOT seed a placeholder repo_root row here.
+        // The first call to `RepositoryManager::apply_writes` runs through
+        // `proto_blue::repo::Repo::create`, which writes the genuine empty
+        // signed-commit block and updates `repo_root` via the upsert path
+        // in `update_repo_root`. Pre-seeding a fake CID would break
+        // `Repo::load`, which would try to dereference a block that
+        // doesn't exist in the blockstore.
 
         // Add to cache
         {
@@ -154,7 +150,10 @@ impl ActorStore {
         let location = self.get_location(did);
 
         if !location.db_location.exists() {
-            return Err(PdsError::NotFound(format!("Actor repository not found for {}", did)));
+            return Err(PdsError::NotFound(format!(
+                "Actor repository not found for {}",
+                did
+            )));
         }
 
         let pool = SqlitePool::connect_with(
@@ -203,12 +202,13 @@ impl ActorStore {
     /// # }
     /// ```
     #[allow(dead_code)] // Future transaction and cleanup methods
-    pub async fn begin_transaction(&self, did: &str) -> PdsResult<crate::actor_store::ActorTransaction<'_>> {
+    pub async fn begin_transaction(
+        &self,
+        did: &str,
+    ) -> PdsResult<crate::actor_store::ActorTransaction<'_>> {
         let pool = self.open_db(did).await?;
 
-        let txn = pool.begin()
-            .await
-            .map_err(PdsError::Database)?;
+        let txn = pool.begin().await.map_err(PdsError::Database)?;
 
         Ok(crate::actor_store::ActorTransaction::new(
             txn,
@@ -221,13 +221,11 @@ impl ActorStore {
     pub async fn get_repo_root(&self, did: &str) -> PdsResult<RepoRoot> {
         let pool = self.open_db(did).await?;
 
-        let root = sqlx::query(
-            "SELECT did, cid, rev, indexed_at FROM repo_root WHERE did = ?1"
-        )
-        .bind(did)
-        .fetch_optional(&pool)
-        .await?
-        .ok_or_else(|| PdsError::NotFound("Repository root not found".to_string()))?;
+        let root = sqlx::query("SELECT did, cid, rev, indexed_at FROM repo_root WHERE did = ?1")
+            .bind(did)
+            .fetch_optional(&pool)
+            .await?
+            .ok_or_else(|| PdsError::NotFound("Repository root not found".to_string()))?;
 
         Ok(RepoRoot {
             did: root.get("did"),
@@ -237,17 +235,27 @@ impl ActorStore {
         })
     }
 
-    /// Update repository root
+    /// Upsert the repository root.
+    ///
+    /// Used both for the very first commit (when no row exists yet, since
+    /// `create` no longer seeds a placeholder) and for every subsequent
+    /// commit. SQLite's `ON CONFLICT (did) DO UPDATE` keeps the operation
+    /// idempotent regardless of whether the row already exists.
     pub async fn update_repo_root(&self, did: &str, cid: &str, rev: &str) -> PdsResult<()> {
         let pool = self.open_db(did).await?;
 
         sqlx::query(
-            "UPDATE repo_root SET cid = ?1, rev = ?2, indexed_at = ?3 WHERE did = ?4"
+            "INSERT INTO repo_root (did, cid, rev, indexed_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(did) DO UPDATE SET
+                 cid = excluded.cid,
+                 rev = excluded.rev,
+                 indexed_at = excluded.indexed_at",
         )
+        .bind(did)
         .bind(cid)
         .bind(rev)
         .bind(chrono::Utc::now())
-        .bind(did)
         .execute(&pool)
         .await?;
 
@@ -261,7 +269,7 @@ impl ActorStore {
         let record = sqlx::query(
             "SELECT uri, cid, collection, rkey, repo_rev, indexed_at, takedown_ref
              FROM record
-             WHERE uri = ?1"
+             WHERE uri = ?1",
         )
         .bind(uri)
         .fetch_optional(&pool)
@@ -298,7 +306,7 @@ impl ActorStore {
                  FROM record
                  WHERE collection = ?1 AND rkey > ?2
                  ORDER BY rkey ASC
-                 LIMIT ?3"
+                 LIMIT ?3",
             )
             .bind(collection)
             .bind(cursor)
@@ -309,7 +317,7 @@ impl ActorStore {
                  FROM record
                  WHERE collection = ?1
                  ORDER BY rkey ASC
-                 LIMIT ?2"
+                 LIMIT ?2",
             )
             .bind(collection)
             .bind(limit)
@@ -337,12 +345,11 @@ impl ActorStore {
     pub async fn get_collections(&self, did: &str) -> PdsResult<Vec<String>> {
         let pool = self.open_db(did).await?;
 
-        let collections: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT collection FROM record ORDER BY collection"
-        )
-        .fetch_all(&pool)
-        .await
-        .map_err(PdsError::Database)?;
+        let collections: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT collection FROM record ORDER BY collection")
+                .fetch_all(&pool)
+                .await
+                .map_err(PdsError::Database)?;
 
         Ok(collections)
     }
@@ -365,7 +372,7 @@ impl ActorStore {
              ON CONFLICT(uri) DO UPDATE SET
                 cid = excluded.cid,
                 repo_rev = excluded.repo_rev,
-                indexed_at = excluded.indexed_at"
+                indexed_at = excluded.indexed_at",
         )
         .bind(uri)
         .bind(cid)
@@ -407,7 +414,7 @@ impl ActorStore {
             "SELECT uri, cid, collection, rkey, repo_rev, indexed_at, takedown_ref
              FROM record
              WHERE repo_rev > ?1
-             ORDER BY repo_rev ASC"
+             ORDER BY repo_rev ASC",
         )
         .bind(since_rev)
         .fetch_all(&pool)
@@ -458,12 +465,10 @@ impl ActorStore {
     async fn get_record_value(&self, did: &str, cid: &str) -> PdsResult<Option<serde_json::Value>> {
         let pool = self.open_db(did).await?;
 
-        let block = sqlx::query(
-            "SELECT content FROM repo_block WHERE cid = ?1"
-        )
-        .bind(cid)
-        .fetch_optional(&pool)
-        .await?;
+        let block = sqlx::query("SELECT content FROM repo_block WHERE cid = ?1")
+            .bind(cid)
+            .fetch_optional(&pool)
+            .await?;
 
         if let Some(row) = block {
             let content: Vec<u8> = row.get("content");
@@ -480,12 +485,10 @@ impl ActorStore {
     pub async fn count_records(&self, did: &str, collection: &str) -> PdsResult<i64> {
         let pool = self.open_db(did).await?;
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM record WHERE collection = ?1"
-        )
-        .bind(collection)
-        .fetch_one(&pool)
-        .await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM record WHERE collection = ?1")
+            .bind(collection)
+            .fetch_one(&pool)
+            .await?;
 
         Ok(count)
     }
@@ -497,7 +500,7 @@ impl ActorStore {
         sqlx::query(
             "INSERT INTO repo_block (cid, content, indexed_at)
              VALUES (?1, ?2, ?3)
-             ON CONFLICT(cid) DO NOTHING"
+             ON CONFLICT(cid) DO NOTHING",
         )
         .bind(cid)
         .bind(content)
@@ -512,12 +515,11 @@ impl ActorStore {
     pub async fn get_block(&self, did: &str, cid: &str) -> PdsResult<Option<Vec<u8>>> {
         let pool = self.open_db(did).await?;
 
-        let content: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT content FROM repo_block WHERE cid = ?1"
-        )
-        .bind(cid)
-        .fetch_optional(&pool)
-        .await?;
+        let content: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT content FROM repo_block WHERE cid = ?1")
+                .bind(cid)
+                .fetch_optional(&pool)
+                .await?;
 
         Ok(content)
     }
@@ -526,17 +528,20 @@ impl ActorStore {
     pub async fn get_all_blocks(&self, did: &str) -> PdsResult<Vec<(String, Vec<u8>)>> {
         let pool = self.open_db(did).await?;
 
-        let blocks: Vec<(String, Vec<u8>)> = sqlx::query_as(
-            "SELECT cid, content FROM repo_block ORDER BY indexed_at"
-        )
-        .fetch_all(&pool)
-        .await?;
+        let blocks: Vec<(String, Vec<u8>)> =
+            sqlx::query_as("SELECT cid, content FROM repo_block ORDER BY indexed_at")
+                .fetch_all(&pool)
+                .await?;
 
         Ok(blocks)
     }
 
     /// Get specific blocks by CIDs
-    pub async fn get_blocks_by_cids(&self, did: &str, cids: &[String]) -> PdsResult<Vec<(String, Vec<u8>)>> {
+    pub async fn get_blocks_by_cids(
+        &self,
+        did: &str,
+        cids: &[String],
+    ) -> PdsResult<Vec<(String, Vec<u8>)>> {
         let mut blocks = Vec::new();
         for cid in cids {
             if let Some(content) = self.get_block(did, cid).await? {
@@ -547,14 +552,20 @@ impl ActorStore {
         Ok(blocks)
     }
 
-    /// List all records in the repository
+    /// List all records in the repository.
+    ///
+    /// Used by the legacy in-memory MST reload path; kept around because
+    /// the same enumeration shape is the natural seed for the proto-blue
+    /// migration tool that will walk existing repos and re-emit signed
+    /// commits.
+    #[allow(dead_code)]
     pub async fn list_all_records(&self, did: &str) -> PdsResult<Vec<Record>> {
         let pool = self.open_db(did).await?;
 
         let rows = sqlx::query(
             "SELECT uri, cid, collection, rkey, repo_rev, indexed_at, takedown_ref
              FROM record
-             ORDER BY collection, rkey"
+             ORDER BY collection, rkey",
         )
         .fetch_all(&pool)
         .await?;
@@ -586,13 +597,14 @@ impl ActorStore {
         let pool = self.open_db(did).await?;
 
         // Serialize validation errors to JSON
-        let errors_json = serde_json::to_string(errors)
-            .map_err(|e| PdsError::Internal(format!("Failed to serialize validation errors: {}", e)))?;
+        let errors_json = serde_json::to_string(errors).map_err(|e| {
+            PdsError::Internal(format!("Failed to serialize validation errors: {}", e))
+        })?;
 
         // Insert into lexicon_failure table
         sqlx::query(
             "INSERT INTO lexicon_failure (collection, record_uri, validation_errors)
-             VALUES (?1, ?2, ?3)"
+             VALUES (?1, ?2, ?3)",
         )
         .bind(collection)
         .bind(record_uri)
@@ -627,7 +639,7 @@ impl ActorStore {
                  FROM lexicon_failure
                  WHERE collection = ?1
                  ORDER BY created_at DESC
-                 LIMIT ?2"
+                 LIMIT ?2",
             )
             .bind(coll)
             .bind(limit)
@@ -640,7 +652,7 @@ impl ActorStore {
                 "SELECT id, collection, record_uri, validation_errors, created_at
                  FROM lexicon_failure
                  ORDER BY created_at DESC
-                 LIMIT ?1"
+                 LIMIT ?1",
             )
             .bind(limit)
             .fetch_all(&pool)
@@ -723,7 +735,10 @@ impl ActorStore {
     /// Get a previously reserved keypair
     ///
     /// The identifier can be either a did:key or a did:plc that was used when reserving.
-    pub async fn get_reserved_keypair(&self, identifier: &str) -> PdsResult<Option<Secp256k1KeyPair>> {
+    pub async fn get_reserved_keypair(
+        &self,
+        identifier: &str,
+    ) -> PdsResult<Option<Secp256k1KeyPair>> {
         Self::assert_safe_path_part(identifier)?;
 
         let key_path = self.reserved_key_dir().join(identifier);
@@ -767,7 +782,8 @@ impl ActorStore {
     /// Validate that a path component is safe (no directory traversal)
     fn assert_safe_path_part(part: &str) -> PdsResult<()> {
         // Check for path traversal attempts
-        if part.contains('/') || part.contains('\\') || part.starts_with('.') || part.contains("..") {
+        if part.contains('/') || part.contains('\\') || part.starts_with('.') || part.contains("..")
+        {
             return Err(PdsError::Validation(format!(
                 "Unsafe path component: {}",
                 part

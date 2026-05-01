@@ -108,7 +108,8 @@ use std::{
 };
 
 /// Type alias for endpoint rate limiters (multiple limiters per endpoint)
-type EndpointLimiters = Arc<HashMap<String, Vec<Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>>>>;
+type EndpointLimiters =
+    Arc<HashMap<String, Vec<Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>>>>;
 
 /// Rate limit state information for headers
 #[derive(Debug, Clone)]
@@ -146,14 +147,14 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            authenticated_rps: 100,        // 100 req/sec for authenticated
-            unauthenticated_rps: 10,       // 10 req/sec for unauthenticated
-            admin_rps: 1000,               // 1000 req/sec for admins
-            cross_pds_rps: 10,             // 10 req/sec for cross-PDS (10x stricter than local)
-            burst_size: 50,                // Allow bursts up to 50 requests
-            trust_proxy: false,            // Default to false for security (don't trust proxy headers)
-            handle_resolution_rps: 50,     // 50 req/sec for handle resolution (protect outbound)
-            did_resolution_rps: 50,        // 50 req/sec for DID resolution (protect outbound)
+            authenticated_rps: 100,    // 100 req/sec for authenticated
+            unauthenticated_rps: 10,   // 10 req/sec for unauthenticated
+            admin_rps: 1000,           // 1000 req/sec for admins
+            cross_pds_rps: 10,         // 10 req/sec for cross-PDS (10x stricter than local)
+            burst_size: 50,            // Allow bursts up to 50 requests
+            trust_proxy: false,        // Default to false for security (don't trust proxy headers)
+            handle_resolution_rps: 50, // 50 req/sec for handle resolution (protect outbound)
+            did_resolution_rps: 50,    // 50 req/sec for DID resolution (protect outbound)
         }
     }
 }
@@ -191,7 +192,8 @@ impl EndpointRateLimit {
 
     /// Create quota for this endpoint limit
     fn to_quota(&self) -> Quota {
-        let per_period = NonZeroU32::new(self.max_requests).unwrap_or(NonZeroU32::new(100).unwrap());
+        let per_period =
+            NonZeroU32::new(self.max_requests).unwrap_or(NonZeroU32::new(100).unwrap());
         let duration = Duration::from_secs(self.duration_secs);
         let burst = self.burst_size.unwrap_or(self.max_requests / 2);
 
@@ -432,9 +434,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 || ipv4.is_broadcast()
                 || ipv4.is_documentation()
         }
-        IpAddr::V6(ipv6) => {
-            ipv6.is_loopback() || ipv6.is_unspecified() || ipv6.is_multicast()
-        }
+        IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unspecified() || ipv6.is_multicast(),
     }
 }
 
@@ -466,72 +466,65 @@ pub struct RateLimiter {
     did_key_limiter: Arc<GovernorLimiter<String, DashMap<String, InMemoryState>, DefaultClock>>,
 }
 
-    #[allow(dead_code)] // Future rate limit checking methods
+#[allow(dead_code)] // Future rate limit checking methods
 impl RateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
         Self::with_endpoint_config(config, EndpointRateLimitConfig::new())
     }
 
     /// Create a new rate limiter with per-endpoint configuration
-    pub fn with_endpoint_config(config: RateLimitConfig, endpoint_config: EndpointRateLimitConfig) -> Self {
+    pub fn with_endpoint_config(
+        config: RateLimitConfig,
+        endpoint_config: EndpointRateLimitConfig,
+    ) -> Self {
         let auth_quota = Quota::per_second(
-            NonZeroU32::new(config.authenticated_rps)
-                .unwrap_or(NonZeroU32::new(100).unwrap()),
+            NonZeroU32::new(config.authenticated_rps).unwrap_or(NonZeroU32::new(100).unwrap()),
         )
         .allow_burst(NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::new(50).unwrap()));
 
         let unauth_quota = Quota::per_second(
-            NonZeroU32::new(config.unauthenticated_rps)
-                .unwrap_or(NonZeroU32::new(10).unwrap()),
+            NonZeroU32::new(config.unauthenticated_rps).unwrap_or(NonZeroU32::new(10).unwrap()),
         )
-        .allow_burst(NonZeroU32::new(config.burst_size / 5).unwrap_or(NonZeroU32::new(10).unwrap()));
+        .allow_burst(
+            NonZeroU32::new(config.burst_size / 5).unwrap_or(NonZeroU32::new(10).unwrap()),
+        );
 
         let admin_quota = Quota::per_second(
-            NonZeroU32::new(config.admin_rps)
-                .unwrap_or(NonZeroU32::new(1000).unwrap()),
+            NonZeroU32::new(config.admin_rps).unwrap_or(NonZeroU32::new(1000).unwrap()),
         )
         .allow_burst(
             NonZeroU32::new(config.burst_size * 2).unwrap_or(NonZeroU32::new(100).unwrap()),
         );
 
         let cross_pds_quota = Quota::per_second(
-            NonZeroU32::new(config.cross_pds_rps)
-                .unwrap_or(NonZeroU32::new(10).unwrap()),
+            NonZeroU32::new(config.cross_pds_rps).unwrap_or(NonZeroU32::new(10).unwrap()),
         )
         .allow_burst(
             NonZeroU32::new(config.burst_size / 10).unwrap_or(NonZeroU32::new(5).unwrap()),
         );
 
         // IP-based rate limiter quota (10 requests per second per IP, burst of 20)
-        let ip_quota = Quota::per_second(
-            NonZeroU32::new(10).unwrap(),
-        )
-        .allow_burst(NonZeroU32::new(20).unwrap());
+        let ip_quota = Quota::per_second(NonZeroU32::new(10).unwrap())
+            .allow_burst(NonZeroU32::new(20).unwrap());
 
         // Identity resolution rate limiters (protect outbound requests)
         let handle_resolution_quota = Quota::per_second(
-            NonZeroU32::new(config.handle_resolution_rps)
-                .unwrap_or(NonZeroU32::new(50).unwrap()),
+            NonZeroU32::new(config.handle_resolution_rps).unwrap_or(NonZeroU32::new(50).unwrap()),
         )
         .allow_burst(NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::new(50).unwrap()));
 
         let did_resolution_quota = Quota::per_second(
-            NonZeroU32::new(config.did_resolution_rps)
-                .unwrap_or(NonZeroU32::new(50).unwrap()),
+            NonZeroU32::new(config.did_resolution_rps).unwrap_or(NonZeroU32::new(50).unwrap()),
         )
         .allow_burst(NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::new(50).unwrap()));
 
         // Per-handle/per-DID keyed limiters (5 requests per second per key, burst of 10)
         // This prevents enumeration attacks on specific handles/DIDs
-        let handle_key_quota = Quota::per_second(
-            NonZeroU32::new(5).unwrap(),
-        )
-        .allow_burst(NonZeroU32::new(10).unwrap());
+        let handle_key_quota = Quota::per_second(NonZeroU32::new(5).unwrap())
+            .allow_burst(NonZeroU32::new(10).unwrap());
 
-        let did_key_quota = Quota::per_second(
-            NonZeroU32::new(5).unwrap(),
-        )
-        .allow_burst(NonZeroU32::new(10).unwrap());
+        let did_key_quota = Quota::per_second(NonZeroU32::new(5).unwrap())
+            .allow_burst(NonZeroU32::new(10).unwrap());
 
         // Create per-endpoint rate limiters (supports multiple limits per endpoint)
         let mut endpoint_limiters = HashMap::new();
@@ -833,7 +826,8 @@ impl RateLimiter {
         };
 
         // Get request count for current window
-        let (remaining, reset_seconds) = self.request_counts
+        let (remaining, reset_seconds) = self
+            .request_counts
             .get(identifier)
             .map(|entry| {
                 let (window_start, count) = *entry;
@@ -912,9 +906,8 @@ impl RateLimiter {
     /// This is useful for memory management in long-running servers.
     pub fn cleanup_old_counts(&self) {
         let now = Self::current_timestamp();
-        self.request_counts.retain(|_, (window_start, _)| {
-            now.saturating_sub(*window_start) < 60
-        });
+        self.request_counts
+            .retain(|_, (window_start, _)| now.saturating_sub(*window_start) < 60);
     }
 }
 
@@ -938,45 +931,43 @@ pub async fn rate_limit_middleware(
     let is_admin = endpoint_path.contains("/xrpc/com.atproto.admin");
 
     // Check if user is authenticated (has Authorization header)
-    let has_auth_header = request
-        .headers()
-        .get("authorization")
-        .is_some();
+    let has_auth_header = request.headers().get("authorization").is_some();
 
     // PRIORITY 1: Check endpoint-specific rate limit first
-    let rate_limit_result = if let Some(endpoint_result) = ctx.rate_limiter.check_endpoint(endpoint_path) {
-        // Endpoint has a specific rate limit configured - use it
-        endpoint_result
-    } else {
-        // PRIORITY 2: Fall back to global rate limits based on user type
-        if is_admin && has_auth_header {
-            // Admin endpoints with auth - highest rate limit
-            ctx.rate_limiter.check_admin()
-        } else if has_auth_header {
-            // Authenticated users - medium rate limit
-            ctx.rate_limiter.check_authenticated()
+    let rate_limit_result =
+        if let Some(endpoint_result) = ctx.rate_limiter.check_endpoint(endpoint_path) {
+            // Endpoint has a specific rate limit configured - use it
+            endpoint_result
         } else {
-            // Unauthenticated users - check both global and IP-based limits
-            // First check global limit
-            let global_result = ctx.rate_limiter.check_unauthenticated();
+            // PRIORITY 2: Fall back to global rate limits based on user type
+            if is_admin && has_auth_header {
+                // Admin endpoints with auth - highest rate limit
+                ctx.rate_limiter.check_admin()
+            } else if has_auth_header {
+                // Authenticated users - medium rate limit
+                ctx.rate_limiter.check_authenticated()
+            } else {
+                // Unauthenticated users - check both global and IP-based limits
+                // First check global limit
+                let global_result = ctx.rate_limiter.check_unauthenticated();
 
-            // Then check IP-based limit if we have an IP and global limit passed
-            match (global_result, client_ip) {
-                (Ok(()), Some(ip)) => {
-                    // Global limit passed, now check IP-specific limit
-                    ctx.rate_limiter.check_ip(&ip)
-                }
-                (Ok(()), None) => {
-                    // Global limit passed, but no IP - allow request
-                    Ok(())
-                }
-                (Err(e), _) => {
-                    // Global limit failed - return error
-                    Err(e)
+                // Then check IP-based limit if we have an IP and global limit passed
+                match (global_result, client_ip) {
+                    (Ok(()), Some(ip)) => {
+                        // Global limit passed, now check IP-specific limit
+                        ctx.rate_limiter.check_ip(&ip)
+                    }
+                    (Ok(()), None) => {
+                        // Global limit passed, but no IP - allow request
+                        Ok(())
+                    }
+                    (Err(e), _) => {
+                        // Global limit failed - return error
+                        Err(e)
+                    }
                 }
             }
-        }
-    };
+        };
 
     // Determine limiter type for header generation
     let limiter_type = if is_admin && has_auth_header {
@@ -1045,10 +1036,7 @@ pub async fn rate_limit_middleware(
             *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
 
             let headers = response.headers_mut();
-            headers.insert(
-                "Retry-After",
-                retry_after_secs.to_string().parse().unwrap(),
-            );
+            headers.insert("Retry-After", retry_after_secs.to_string().parse().unwrap());
 
             // Also include rate limit headers showing exhausted limit
             let limit_info = ctx.rate_limiter.get_limit_info(&identifier, limiter_type);
@@ -1056,10 +1044,7 @@ pub async fn rate_limit_middleware(
                 "RateLimit-Limit",
                 limit_info.limit.to_string().parse().unwrap(),
             );
-            headers.insert(
-                "RateLimit-Remaining",
-                "0".parse().unwrap(),
-            );
+            headers.insert("RateLimit-Remaining", "0".parse().unwrap());
             headers.insert(
                 "RateLimit-Reset",
                 retry_after_secs.to_string().parse().unwrap(),
@@ -1115,10 +1100,8 @@ mod tests {
             EndpointRateLimit::with_burst(5, 60, 5), // 5 requests per minute with burst of 5
         );
 
-        let limiter = RateLimiter::with_endpoint_config(
-            RateLimitConfig::default(),
-            endpoint_config,
-        );
+        let limiter =
+            RateLimiter::with_endpoint_config(RateLimitConfig::default(), endpoint_config);
 
         // Should have endpoint limit configured
         assert!(limiter.has_endpoint_limit("/xrpc/com.atproto.server.createAccount"));
@@ -1134,7 +1117,10 @@ mod tests {
         // Should hit rate limit after burst
         let result = limiter.check_endpoint("/xrpc/com.atproto.server.createAccount");
         assert!(result.is_some());
-        assert!(result.unwrap().is_err(), "Request after burst should be rate limited");
+        assert!(
+            result.unwrap().is_err(),
+            "Request after burst should be rate limited"
+        );
     }
 
     #[test]
@@ -1169,11 +1155,18 @@ mod tests {
         let config = EndpointRateLimitConfig::bluesky_defaults();
 
         // Should have expected endpoints
-        assert!(config.endpoints.contains_key("/xrpc/com.atproto.server.createAccount"));
-        assert!(config.endpoints.contains_key("/xrpc/com.atproto.server.createSession"));
+        assert!(config
+            .endpoints
+            .contains_key("/xrpc/com.atproto.server.createAccount"));
+        assert!(config
+            .endpoints
+            .contains_key("/xrpc/com.atproto.server.createSession"));
 
         // Check specific limits
-        let create_account_limits = config.endpoints.get("/xrpc/com.atproto.server.createAccount").unwrap();
+        let create_account_limits = config
+            .endpoints
+            .get("/xrpc/com.atproto.server.createAccount")
+            .unwrap();
         let create_account_limit = &create_account_limits[0];
         assert_eq!(create_account_limit.max_requests, 100);
         assert_eq!(create_account_limit.duration_secs, 300); // 5 minutes
@@ -1182,7 +1175,10 @@ mod tests {
     #[test]
     fn test_extract_ip_from_x_forwarded_for() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "192.168.1.100, 10.0.0.1".parse().unwrap());
+        headers.insert(
+            "x-forwarded-for",
+            "192.168.1.100, 10.0.0.1".parse().unwrap(),
+        );
 
         let ip = extract_client_ip(&headers, true);
         assert!(ip.is_some());
@@ -1264,8 +1260,10 @@ mod tests {
 
     #[test]
     fn test_rate_limiter_trust_proxy_config() {
-        let mut config = RateLimitConfig::default();
-        config.trust_proxy = true;
+        let config = RateLimitConfig {
+            trust_proxy: true,
+            ..RateLimitConfig::default()
+        };
 
         let limiter = RateLimiter::new(config);
         assert!(limiter.trust_proxy);
@@ -1423,7 +1421,7 @@ mod tests {
     fn test_make_did_endpoint_key() {
         let key = RateLimiter::make_did_endpoint_key(
             "did:plc:user123",
-            "/xrpc/com.atproto.repo.createRecord"
+            "/xrpc/com.atproto.repo.createRecord",
         );
         assert_eq!(key, "did:plc:user123-/xrpc/com.atproto.repo.createRecord");
     }
@@ -1439,7 +1437,7 @@ mod tests {
         config.add_limits(
             "/xrpc/test.endpoint",
             vec![
-                EndpointRateLimit::with_burst(5, 60, 5),   // 5 per minute with burst of 5
+                EndpointRateLimit::with_burst(5, 60, 5), // 5 per minute with burst of 5
                 EndpointRateLimit::with_burst(20, 60, 20), // 20 per minute with burst of 20
             ],
         );
@@ -1450,13 +1448,20 @@ mod tests {
         for i in 0..5 {
             let result = limiter.check_endpoint("/xrpc/test.endpoint");
             assert!(result.is_some(), "Request {} should have endpoint limit", i);
-            assert!(result.unwrap().is_ok(), "Request {} should pass both limits", i);
+            assert!(
+                result.unwrap().is_ok(),
+                "Request {} should pass both limits",
+                i
+            );
         }
 
         // 6th request should fail (exceeds first limit of 5)
         let result = limiter.check_endpoint("/xrpc/test.endpoint");
         assert!(result.is_some());
-        assert!(result.unwrap().is_err(), "Request 6 should fail the 5/minute limit");
+        assert!(
+            result.unwrap().is_err(),
+            "Request 6 should fail the 5/minute limit"
+        );
     }
 
     #[test]
@@ -1471,7 +1476,10 @@ mod tests {
         config.add_limit("/xrpc/test.endpoint", EndpointRateLimit::new(5, 60));
 
         // Should have 2 limits for this endpoint
-        assert_eq!(config.endpoints.get("/xrpc/test.endpoint").unwrap().len(), 2);
+        assert_eq!(
+            config.endpoints.get("/xrpc/test.endpoint").unwrap().len(),
+            2
+        );
     }
 
     #[test]
@@ -1492,7 +1500,10 @@ mod tests {
         );
 
         // Should have exactly 2 limits (not 3)
-        assert_eq!(config.endpoints.get("/xrpc/test.endpoint").unwrap().len(), 2);
+        assert_eq!(
+            config.endpoints.get("/xrpc/test.endpoint").unwrap().len(),
+            2
+        );
     }
 
     #[test]
@@ -1505,7 +1516,7 @@ mod tests {
         config.add_limits(
             "/xrpc/com.atproto.server.createSession",
             vec![
-                EndpointRateLimit::with_burst(10, 60, 10),    // 10 per minute
+                EndpointRateLimit::with_burst(10, 60, 10), // 10 per minute
                 EndpointRateLimit::with_burst(100, 3600, 100), // 100 per hour
             ],
         );
@@ -1541,7 +1552,7 @@ mod tests {
         config.add_limits(
             "/xrpc/test.strict",
             vec![
-                EndpointRateLimit::with_burst(3, 60, 3),    // Very strict: 3/minute
+                EndpointRateLimit::with_burst(3, 60, 3), // Very strict: 3/minute
                 EndpointRateLimit::with_burst(1000, 60, 1000), // Very loose: 1000/minute
             ],
         );
@@ -1638,7 +1649,10 @@ mod tests {
 
         // After burst limit (10), should be rate limited
         let result = limiter.check_handle_resolution(handle);
-        assert!(result.is_err(), "Request after burst should be rate limited");
+        assert!(
+            result.is_err(),
+            "Request after burst should be rate limited"
+        );
 
         // But different handle should still work
         let result = limiter.check_handle_resolution("other.handle");
@@ -1671,7 +1685,10 @@ mod tests {
 
         // After burst limit (10), should be rate limited
         let result = limiter.check_did_resolution(did);
-        assert!(result.is_err(), "Request after burst should be rate limited");
+        assert!(
+            result.is_err(),
+            "Request after burst should be rate limited"
+        );
 
         // But different DID should still work
         let result = limiter.check_did_resolution("did:plc:other");
@@ -1695,7 +1712,10 @@ mod tests {
 
         // Both should now be rate limited for this DID
         let result = limiter.check_did_resolution(did);
-        assert!(result.is_err(), "DID resolution should be rate limited after signing key exhausts limit");
+        assert!(
+            result.is_err(),
+            "DID resolution should be rate limited after signing key exhausts limit"
+        );
     }
 
     #[test]
@@ -1709,7 +1729,10 @@ mod tests {
 
         // Same handle in different case should be rate limited (normalized to lowercase)
         let result = limiter.check_handle_resolution("ALICE.BSKY.SOCIAL");
-        assert!(result.is_err(), "Uppercase handle should share limit with lowercase");
+        assert!(
+            result.is_err(),
+            "Uppercase handle should share limit with lowercase"
+        );
     }
 
     #[test]

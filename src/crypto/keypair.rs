@@ -93,12 +93,12 @@ impl KeyPair {
         let point = verifying_key.to_encoded_point(false); // Uncompressed
 
         // Extract coordinates
-        let x = point.x().ok_or_else(|| {
-            PdsError::Internal("Failed to extract x coordinate".to_string())
-        })?;
-        let y = point.y().ok_or_else(|| {
-            PdsError::Internal("Failed to extract y coordinate".to_string())
-        })?;
+        let x = point
+            .x()
+            .ok_or_else(|| PdsError::Internal("Failed to extract x coordinate".to_string()))?;
+        let y = point
+            .y()
+            .ok_or_else(|| PdsError::Internal("Failed to extract y coordinate".to_string()))?;
 
         // Get private scalar (d)
         let d = self.signing_key.to_bytes();
@@ -118,12 +118,12 @@ impl KeyPair {
         let point = verifying_key.to_encoded_point(false); // Uncompressed
 
         // Extract coordinates
-        let x = point.x().ok_or_else(|| {
-            PdsError::Internal("Failed to extract x coordinate".to_string())
-        })?;
-        let y = point.y().ok_or_else(|| {
-            PdsError::Internal("Failed to extract y coordinate".to_string())
-        })?;
+        let x = point
+            .x()
+            .ok_or_else(|| PdsError::Internal("Failed to extract x coordinate".to_string()))?;
+        let y = point
+            .y()
+            .ok_or_else(|| PdsError::Internal("Failed to extract y coordinate".to_string()))?;
 
         Ok(Jwk {
             kty: "EC".to_string(),
@@ -167,9 +167,8 @@ impl KeyPair {
                 } else {
                     self.public_key_jwk()?
                 };
-                serde_json::to_string_pretty(&jwk).map_err(|e| {
-                    PdsError::Internal(format!("Failed to serialize JWK: {}", e))
-                })
+                serde_json::to_string_pretty(&jwk)
+                    .map_err(|e| PdsError::Internal(format!("Failed to serialize JWK: {}", e)))
             }
             KeyFormat::Did => {
                 if include_private {

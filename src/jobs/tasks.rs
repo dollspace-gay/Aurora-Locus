@@ -2,12 +2,16 @@
 #![allow(dead_code)]
 
 /// Background task implementations
-use crate::{context::AppContext, error::{PdsError, PdsResult}};
+use crate::{
+    context::AppContext,
+    error::{PdsError, PdsResult},
+};
 
 /// Cleanup expired sessions
 pub async fn cleanup_expired_sessions(ctx: &AppContext) -> PdsResult<u64> {
     // Call AccountManager to cleanup expired sessions and refresh tokens
-    let (sessions_deleted, refresh_tokens_deleted) = ctx.account_manager.cleanup_expired_sessions().await?;
+    let (sessions_deleted, refresh_tokens_deleted) =
+        ctx.account_manager.cleanup_expired_sessions().await?;
 
     // Return total count of deleted items
     Ok(sessions_deleted + refresh_tokens_deleted)
@@ -26,9 +30,7 @@ pub async fn cleanup_identity_cache(ctx: &AppContext) -> PdsResult<()> {
 /// Health check - verify all systems are operational
 pub async fn health_check(ctx: &AppContext) -> PdsResult<()> {
     // Check database connectivity
-    sqlx::query("SELECT 1")
-        .fetch_one(&ctx.account_db)
-        .await?;
+    sqlx::query("SELECT 1").fetch_one(&ctx.account_db).await?;
 
     // All checks passed
     Ok(())
@@ -167,7 +169,10 @@ pub async fn refresh_pds_discovery(ctx: &AppContext) -> PdsResult<usize> {
 }
 
 /// Process relay event from firehose (Phase 3)
-pub async fn process_relay_event(ctx: &AppContext, event: crate::federation::relay::RelayEvent) -> PdsResult<()> {
+pub async fn process_relay_event(
+    ctx: &AppContext,
+    event: crate::federation::relay::RelayEvent,
+) -> PdsResult<()> {
     use tracing::{debug, info, warn};
 
     // Start timing for metrics
@@ -230,7 +235,10 @@ pub async fn process_relay_event(ctx: &AppContext, event: crate::federation::rel
 
             // Invalidate identity cache (handles are part of identity)
             if let Err(e) = ctx.identity_resolver.invalidate_did(&event.did).await {
-                warn!("Failed to invalidate cache for handle change {}: {}", event.did, e);
+                warn!(
+                    "Failed to invalidate cache for handle change {}: {}",
+                    event.did, e
+                );
             }
         }
 
@@ -275,12 +283,11 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
     crate::metrics::ACCOUNTS_TOTAL.set(account_count);
 
     // 2. Count active sessions (not expired)
-    let session_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')"
-    )
-    .fetch_one(&ctx.account_db)
-    .await
-    .map_err(PdsError::Database)?;
+    let session_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')")
+            .fetch_one(&ctx.account_db)
+            .await
+            .map_err(PdsError::Database)?;
 
     crate::metrics::SESSIONS_ACTIVE.set(session_count);
 

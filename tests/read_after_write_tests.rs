@@ -1,7 +1,7 @@
-/// Read-After-Write Consistency Tests
-///
-/// Tests for the read-after-write consistency module that ensures users
-/// see their own writes immediately, even before AppView indexing completes.
+//! Read-After-Write Consistency Tests
+//!
+//! Tests for the read-after-write consistency module that ensures users
+//! see their own writes immediately, even before AppView indexing completes.
 
 #[cfg(test)]
 mod read_after_write_tests {
@@ -30,11 +30,18 @@ mod read_after_write_tests {
         let new_time = "2024-01-01T11:00:00Z";
 
         let local_records = LocalRecords {
-            rev: "abc123".to_string(),
             count: 2,
             posts: vec![
-                create_test_post("at://did:plc:test/app.bsky.feed.post/1", old_time, "Old post"),
-                create_test_post("at://did:plc:test/app.bsky.feed.post/2", new_time, "New post"),
+                create_test_post(
+                    "at://did:plc:test/app.bsky.feed.post/1",
+                    old_time,
+                    "Old post",
+                ),
+                create_test_post(
+                    "at://did:plc:test/app.bsky.feed.post/2",
+                    new_time,
+                    "New post",
+                ),
             ],
             profile: None,
         };
@@ -49,7 +56,6 @@ mod read_after_write_tests {
         let profile_time = "2024-01-01T10:00:00Z";
 
         let local_records = LocalRecords {
-            rev: "abc123".to_string(),
             count: 1,
             posts: vec![],
             profile: Some(RecordDescript {
@@ -71,7 +77,6 @@ mod read_after_write_tests {
     #[test]
     fn test_get_local_lag_empty() {
         let local_records = LocalRecords {
-            rev: "abc123".to_string(),
             count: 0,
             posts: vec![],
             profile: None,
@@ -109,7 +114,11 @@ mod read_after_write_tests {
         // Verify timestamps are parseable and can be compared
         for post in &posts {
             let parsed = chrono::DateTime::parse_from_rfc3339(&post.indexed_at);
-            assert!(parsed.is_ok(), "Failed to parse timestamp: {}", post.indexed_at);
+            assert!(
+                parsed.is_ok(),
+                "Failed to parse timestamp: {}",
+                post.indexed_at
+            );
         }
 
         // Verify chronological comparison works
@@ -120,7 +129,6 @@ mod read_after_write_tests {
     #[test]
     fn test_local_records_count() {
         let local_records = LocalRecords {
-            rev: "abc123".to_string(),
             count: 3,
             posts: vec![
                 create_test_post(
@@ -144,7 +152,6 @@ mod read_after_write_tests {
 
         assert_eq!(local_records.count, 3);
         assert_eq!(local_records.posts.len(), 3);
-        assert_eq!(local_records.rev, "abc123");
     }
 
     #[test]
@@ -170,7 +177,6 @@ mod read_after_write_tests {
         let local_time = now;
 
         let local_records = LocalRecords {
-            rev: "latest".to_string(),
             count: 1,
             posts: vec![create_test_post(
                 "at://did:plc:test/app.bsky.feed.post/1",
@@ -212,10 +218,7 @@ mod read_after_write_tests {
             }),
         };
 
-        assert_eq!(
-            profile.uri,
-            "at://did:plc:test/app.bsky.actor.profile/self"
-        );
+        assert_eq!(profile.uri, "at://did:plc:test/app.bsky.actor.profile/self");
         assert_eq!(profile.record["displayName"], "Test User");
         assert_eq!(profile.record["description"], "Test bio");
         assert_eq!(profile.record["$type"], "app.bsky.actor.profile");
@@ -225,7 +228,6 @@ mod read_after_write_tests {
     fn test_empty_feed_with_local_posts() {
         // Test that local posts are added to an empty feed
         let local_records = LocalRecords {
-            rev: "abc123".to_string(),
             count: 1,
             posts: vec![create_test_post(
                 "at://did:plc:test/app.bsky.feed.post/1",

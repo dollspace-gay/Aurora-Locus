@@ -1,7 +1,7 @@
-/// Tests for admin panel API endpoints
-///
-/// Note: These are unit tests that verify the logic is correct.
-/// Integration tests would require a running server.
+//! Tests for admin panel API endpoints.
+//!
+//! Note: These are unit tests that verify the logic is correct.
+//! Integration tests would require a running server.
 
 #[cfg(test)]
 mod tests {
@@ -67,12 +67,17 @@ mod tests {
     }
 
     #[test]
+    // The whole point of the test is to exercise the `.unwrap_or(0)`
+    // fallback pattern admin-stats queries use. Clippy correctly notices
+    // the inputs are compile-time `None` / `Some(42)` and therefore the
+    // unwraps are statically known — disable the lint locally so the
+    // intent (fallback behaviour) stays explicit.
+    #[allow(clippy::unnecessary_literal_unwrap)]
     fn test_admin_stats_default_values() {
-        // Verify that unwrap_or returns 0 for missing stats
-        let total_users: i64 = None.unwrap_or(0);
-        let total_posts: i64 = Some(42).unwrap_or(0);
+        let missing: Option<i64> = None;
+        let present: Option<i64> = Some(42);
 
-        assert_eq!(total_users, 0);
-        assert_eq!(total_posts, 42);
+        assert_eq!(missing.unwrap_or(0), 0);
+        assert_eq!(present.unwrap_or(0), 42);
     }
 }

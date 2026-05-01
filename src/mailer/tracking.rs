@@ -115,13 +115,11 @@ impl EmailTracker {
     pub async fn mark_sent(&self, delivery_id: i64) -> PdsResult<()> {
         let now = Utc::now();
 
-        sqlx::query(
-            "UPDATE email_delivery SET status = 'sent', sent_at = ? WHERE id = ?",
-        )
-        .bind(now.to_rfc3339())
-        .bind(delivery_id)
-        .execute(&self.db)
-        .await?;
+        sqlx::query("UPDATE email_delivery SET status = 'sent', sent_at = ? WHERE id = ?")
+            .bind(now.to_rfc3339())
+            .bind(delivery_id)
+            .execute(&self.db)
+            .await?;
 
         tracing::info!("Email delivery {} marked as sent", delivery_id);
         Ok(())
@@ -170,7 +168,7 @@ impl EmailTracker {
     /// Check if email address has bounced
     pub async fn is_bounced(&self, email: &str) -> PdsResult<bool> {
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM email_delivery WHERE recipient = ? AND status = 'bounced'"
+            "SELECT COUNT(*) FROM email_delivery WHERE recipient = ? AND status = 'bounced'",
         )
         .bind(email)
         .fetch_one(&self.db)
@@ -218,29 +216,28 @@ impl EmailTracker {
 
     /// Get email statistics
     pub async fn get_stats(&self, since: DateTime<Utc>) -> PdsResult<EmailStats> {
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM email_delivery WHERE created_at >= ?"
-        )
-        .bind(since.to_rfc3339())
-        .fetch_one(&self.db)
-        .await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM email_delivery WHERE created_at >= ?")
+                .bind(since.to_rfc3339())
+                .fetch_one(&self.db)
+                .await?;
 
         let sent: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM email_delivery WHERE created_at >= ? AND status = 'sent'"
+            "SELECT COUNT(*) FROM email_delivery WHERE created_at >= ? AND status = 'sent'",
         )
         .bind(since.to_rfc3339())
         .fetch_one(&self.db)
         .await?;
 
         let failed: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM email_delivery WHERE created_at >= ? AND status = 'failed'"
+            "SELECT COUNT(*) FROM email_delivery WHERE created_at >= ? AND status = 'failed'",
         )
         .bind(since.to_rfc3339())
         .fetch_one(&self.db)
         .await?;
 
         let bounced: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM email_delivery WHERE created_at >= ? AND status = 'bounced'"
+            "SELECT COUNT(*) FROM email_delivery WHERE created_at >= ? AND status = 'bounced'",
         )
         .bind(since.to_rfc3339())
         .fetch_one(&self.db)
@@ -255,7 +252,10 @@ impl EmailTracker {
     }
 
     /// Parse database rows into EmailDelivery objects
-    async fn parse_deliveries(&self, rows: Vec<sqlx::sqlite::SqliteRow>) -> PdsResult<Vec<EmailDelivery>> {
+    async fn parse_deliveries(
+        &self,
+        rows: Vec<sqlx::sqlite::SqliteRow>,
+    ) -> PdsResult<Vec<EmailDelivery>> {
         let mut deliveries = Vec::new();
 
         for row in rows {

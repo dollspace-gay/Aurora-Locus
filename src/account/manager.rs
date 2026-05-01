@@ -54,7 +54,10 @@ impl AccountManager {
 
         // Check if handle already exists
         if self.handle_exists(&handle).await? {
-            return Err(PdsError::Conflict(format!("Handle {} already taken", handle)));
+            return Err(PdsError::Conflict(format!(
+                "Handle {} already taken",
+                handle
+            )));
         }
 
         // Check if email already exists
@@ -65,17 +68,17 @@ impl AccountManager {
         }
 
         // Hash password using SDK's Argon2id implementation
-        let password_hash = atproto::server_auth::PasswordHasher::hash(&password)
+        let password_hash = crate::auth::PasswordHasher::hash(&password)
             .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
 
         // Generate DID with PLC registration
-        let (did, plc_key, plc_key_public, plc_operation_cid) = self.generate_plc_did(&handle).await?;
+        let (did, plc_key, plc_key_public, plc_operation_cid) =
+            self.generate_plc_did(&handle).await?;
 
         let now = Utc::now();
 
         // Begin transaction to insert into multiple tables atomically
-        let mut tx = self.db.begin().await
-            .map_err(PdsError::Database)?;
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
 
         // Insert into actor table (public identity)
         sqlx::query(
@@ -92,7 +95,7 @@ impl AccountManager {
         // Insert into account table (private auth)
         sqlx::query(
             "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled)
-             VALUES (?1, ?2, ?3, NULL, 0)"
+             VALUES (?1, ?2, ?3, NULL, 0)",
         )
         .bind(&did)
         .bind(&email)
@@ -104,7 +107,7 @@ impl AccountManager {
         // Insert into plc_keys table (cryptographic material)
         sqlx::query(
             "INSERT INTO plc_keys (did, rotation_key, rotation_key_public, last_operation_cid)
-             VALUES (?1, ?2, ?3, ?4)"
+             VALUES (?1, ?2, ?3, ?4)",
         )
         .bind(&did)
         .bind(&plc_key)
@@ -115,8 +118,7 @@ impl AccountManager {
         .map_err(PdsError::Database)?;
 
         // Commit transaction
-        tx.commit().await
-            .map_err(PdsError::Database)?;
+        tx.commit().await.map_err(PdsError::Database)?;
 
         // Use invite code if provided
         if let Some(code) = invite_code {
@@ -161,19 +163,24 @@ impl AccountManager {
 
             // Check if account is deactivated or taken down
             if account.deactivated_at.is_some() {
-                return Err(PdsError::Authorization("Account is deactivated".to_string()));
+                return Err(PdsError::Authorization(
+                    "Account is deactivated".to_string(),
+                ));
             }
 
             if account.takedown_ref.is_some() {
-                return Err(PdsError::Authorization("Account has been taken down".to_string()));
+                return Err(PdsError::Authorization(
+                    "Account has been taken down".to_string(),
+                ));
             }
 
             // Verify password exists (must have local account)
-            let password_hash = account.password_hash.as_ref()
-                .ok_or_else(|| PdsError::Authentication("No local account credentials".to_string()))?;
+            let password_hash = account.password_hash.as_ref().ok_or_else(|| {
+                PdsError::Authentication("No local account credentials".to_string())
+            })?;
 
             // Verify password
-            let valid = atproto::server_auth::PasswordHasher::verify(password, password_hash)
+            let valid = crate::auth::PasswordHasher::verify(password, password_hash)
                 .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
 
             if !valid {
@@ -184,7 +191,8 @@ impl AccountManager {
             let session = self.create_session(&account.did, None).await?;
 
             Ok((account, session))
-        }.await;
+        }
+        .await;
 
         // Mitigate timing attacks by ensuring minimum execution time
         // This prevents attackers from distinguishing valid vs invalid usernames
@@ -235,7 +243,7 @@ impl AccountManager {
 
         sqlx::query(
             "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used, next_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
         )
         .bind(&refresh_token_id)
         .bind(did)
@@ -259,10 +267,13 @@ impl AccountManager {
     }
 
     /// Validate access token and return session info
-    pub async fn validate_access_token(&self, token: &str) -> PdsResult<crate::account::ValidatedSession> {
+    pub async fn validate_access_token(
+        &self,
+        token: &str,
+    ) -> PdsResult<crate::account::ValidatedSession> {
         // Find session by access token
         let row = sqlx::query(
-            "SELECT id, did, expires_at, app_password_name FROM session WHERE access_token = ?1"
+            "SELECT id, did, expires_at, app_password_name FROM session WHERE access_token = ?1",
         )
         .bind(token)
         .fetch_optional(&self.db)
@@ -324,7 +335,9 @@ impl AccountManager {
 
         // Check expiration
         if now > expires_at {
-            return Err(PdsError::Authentication("Refresh token expired".to_string()));
+            return Err(PdsError::Authentication(
+                "Refresh token expired".to_string(),
+            ));
         }
 
         // If token was already used but has a next_id (grace period scenario)
@@ -355,7 +368,9 @@ impl AccountManager {
                     });
                 }
             }
-            return Err(PdsError::Authentication("Refresh token already used".to_string()));
+            return Err(PdsError::Authentication(
+                "Refresh token already used".to_string(),
+            ));
         }
 
         // Create new refresh token
@@ -366,7 +381,7 @@ impl AccountManager {
         // Insert new refresh token
         sqlx::query(
             "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used, next_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
         )
         .bind(&new_token_id)
         .bind(&did)
@@ -431,7 +446,7 @@ impl AccountManager {
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              LEFT JOIN account ac ON a.did = ac.did
-             WHERE a.did = ?1"
+             WHERE a.did = ?1",
         )
         .bind(did)
         .fetch_optional(&self.db)
@@ -476,7 +491,7 @@ impl AccountManager {
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              LEFT JOIN account ac ON a.did = ac.did
-             WHERE a.handle = ?1"
+             WHERE a.handle = ?1",
         )
         .bind(handle)
         .fetch_optional(&self.db)
@@ -510,7 +525,7 @@ impl AccountManager {
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              INNER JOIN account ac ON a.did = ac.did
-             WHERE ac.email = ?1"
+             WHERE ac.email = ?1",
         )
         .bind(email)
         .fetch_optional(&self.db)
@@ -565,7 +580,10 @@ impl AccountManager {
         // Check if new handle is already taken by another account
         if let Ok(existing) = self.get_account_by_handle(new_handle).await {
             if existing.did != did {
-                return Err(PdsError::Conflict(format!("Handle {} already taken", new_handle)));
+                return Err(PdsError::Conflict(format!(
+                    "Handle {} already taken",
+                    new_handle
+                )));
             }
         }
 
@@ -596,9 +614,9 @@ impl AccountManager {
     ///
     /// Returns: (did, rotation_key_hex, rotation_key_public_hex, operation_cid)
     async fn generate_plc_did(&self, handle: &str) -> PdsResult<(String, String, String, String)> {
-        use crate::crypto::plc::{PlcOperationBuilder, PlcSigner, register_plc_did};
-        use sha2::{Digest, Sha256};
+        use crate::crypto::plc::{register_plc_did, PlcOperationBuilder, PlcSigner};
         use rand::RngCore;
+        use sha2::{Digest, Sha256};
 
         // Generate a random 32-byte private key for PLC rotation
         let mut private_key = [0u8; 32];
@@ -625,12 +643,22 @@ impl AccountManager {
         let service_url = format!("https://{}", self.config.service.hostname);
 
         // Check if handle already includes the domain
-        let full_handle = if handle.contains('.') && self.config.identity.service_handle_domains.iter().any(|d| handle.ends_with(d)) {
+        let full_handle = if handle.contains('.')
+            && self
+                .config
+                .identity
+                .service_handle_domains
+                .iter()
+                .any(|d| handle.ends_with(d))
+        {
             // Handle is already full (e.g., "test.locus.dollsky.social")
             handle.to_string()
         } else {
             // Handle needs domain appended (e.g., "test" -> "test.locus.dollsky.social")
-            format!("{}.{}", handle, self.config.identity.service_handle_domains[0])
+            format!(
+                "{}.{}",
+                handle, self.config.identity.service_handle_domains[0]
+            )
         };
 
         let services = serde_json::json!([{
@@ -673,8 +701,7 @@ impl AccountManager {
 
                 // For operation CID, we'll use a simplified hash of the operation
                 // In production, this should be a proper CID
-                let operation_json = serde_json::to_string(&signed_operation)
-                    .unwrap_or_default();
+                let operation_json = serde_json::to_string(&signed_operation).unwrap_or_default();
                 let mut cid_hasher = Sha256::new();
                 cid_hasher.update(operation_json.as_bytes());
                 let cid_hash = cid_hasher.finalize();
@@ -683,7 +710,10 @@ impl AccountManager {
                 Ok((did, private_key_hex, public_key_hex, operation_cid))
             }
             Err(e) => {
-                tracing::warn!("Failed to register DID with PLC directory: {}. Falling back to did:web", e);
+                tracing::warn!(
+                    "Failed to register DID with PLC directory: {}. Falling back to did:web",
+                    e
+                );
                 // Fallback to did:web if PLC registration fails
                 // full_handle is already constructed above (line 463)
                 let did_web = format!("did:web:{}", full_handle);
@@ -868,14 +898,12 @@ impl AccountManager {
             .map_err(PdsError::Database)?;
 
         // Mark email as confirmed in account (only update email_confirmed_at)
-        sqlx::query(
-            "UPDATE account SET email_confirmed_at = ?1 WHERE did = ?2",
-        )
-        .bind(now)
-        .bind(&did)
-        .execute(&self.db)
-        .await
-        .map_err(PdsError::Database)?;
+        sqlx::query("UPDATE account SET email_confirmed_at = ?1 WHERE did = ?2")
+            .bind(now)
+            .bind(&did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
 
         tracing::info!("Email confirmed for DID: {}", did);
 
@@ -911,7 +939,10 @@ impl AccountManager {
     /// Generate password reset token
     ///
     /// Creates a reset token that expires in 1 hour
-    pub async fn generate_password_reset_token(&self, identifier: &str) -> PdsResult<(String, String)> {
+    pub async fn generate_password_reset_token(
+        &self,
+        identifier: &str,
+    ) -> PdsResult<(String, String)> {
         // Find account by email or handle
         let account = self.get_account_by_identifier(identifier).await?;
 
@@ -977,13 +1008,11 @@ impl AccountManager {
 
         // Check expiration
         if now > expires_at {
-            return Err(PdsError::Validation(
-                "Reset token has expired".to_string(),
-            ));
+            return Err(PdsError::Validation("Reset token has expired".to_string()));
         }
 
         // Hash new password
-        let password_hash = atproto::server_auth::PasswordHasher::hash(new_password)
+        let password_hash = crate::auth::PasswordHasher::hash(new_password)
             .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
 
         // Update password in database
@@ -1076,7 +1105,9 @@ impl AccountManager {
 
         // Verify token is for the correct DID
         if token_did != did {
-            return Err(PdsError::Validation("Token does not match account".to_string()));
+            return Err(PdsError::Validation(
+                "Token does not match account".to_string(),
+            ));
         }
 
         // Check if already used
@@ -1162,7 +1193,9 @@ impl AccountManager {
         let used: bool = row.try_get("used")?;
 
         if token_did != did {
-            return Err(PdsError::Validation("Token does not match account".to_string()));
+            return Err(PdsError::Validation(
+                "Token does not match account".to_string(),
+            ));
         }
 
         if used {
@@ -1193,14 +1226,12 @@ impl AccountManager {
     /// Returns an error if the email is already in use by another account.
     pub async fn update_email(&self, did: &str, new_email: &str) -> PdsResult<()> {
         // Check if email is already in use by another account
-        let existing = sqlx::query(
-            "SELECT did FROM account WHERE email = ?1 AND did != ?2"
-        )
-        .bind(new_email)
-        .bind(did)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(PdsError::Database)?;
+        let existing = sqlx::query("SELECT did FROM account WHERE email = ?1 AND did != ?2")
+            .bind(new_email)
+            .bind(did)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
 
         if existing.is_some() {
             return Err(PdsError::Validation(
@@ -1209,14 +1240,12 @@ impl AccountManager {
         }
 
         // Update email and clear email confirmation
-        sqlx::query(
-            "UPDATE account SET email = ?1, email_confirmed_at = NULL WHERE did = ?2"
-        )
-        .bind(new_email)
-        .bind(did)
-        .execute(&self.db)
-        .await
-        .map_err(PdsError::Database)?;
+        sqlx::query("UPDATE account SET email = ?1, email_confirmed_at = NULL WHERE did = ?2")
+            .bind(new_email)
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
 
         tracing::info!(
             did = %did,
@@ -1234,7 +1263,7 @@ impl AccountManager {
     /// as a security measure.
     pub async fn update_password(&self, did: &str, new_password: &str) -> PdsResult<()> {
         // Hash new password
-        let password_hash = atproto::server_auth::PasswordHasher::hash(new_password)
+        let password_hash = crate::auth::PasswordHasher::hash(new_password)
             .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
 
         // Update password in database
@@ -1374,14 +1403,12 @@ impl AccountManager {
 
         // Set deactivated_at to NOW (not future deletion date)
         // Keep delete_after as NULL (this distinguishes temporary deactivation from deletion)
-        sqlx::query(
-            "UPDATE actor SET deactivated_at = ?1, delete_after = NULL WHERE did = ?2"
-        )
-        .bind(now)
-        .bind(did)
-        .execute(&self.db)
-        .await
-        .map_err(PdsError::Database)?;
+        sqlx::query("UPDATE actor SET deactivated_at = ?1, delete_after = NULL WHERE did = ?2")
+            .bind(now)
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
 
         // Revoke all sessions (force logout)
         sqlx::query("DELETE FROM session WHERE did = ?1")
@@ -1436,8 +1463,7 @@ impl AccountManager {
     /// * `Err(PdsError)` if the account doesn't exist or database operation fails
     pub async fn takedown_account(&self, did: &str, takedown_ref: &str) -> PdsResult<()> {
         // Begin transaction
-        let mut tx = self.db.begin().await
-            .map_err(PdsError::Database)?;
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
 
         // Set takedown_ref in actor table
         let result = sqlx::query("UPDATE actor SET takedown_ref = ?1 WHERE did = ?2")
@@ -1466,8 +1492,7 @@ impl AccountManager {
             .map_err(PdsError::Database)?;
 
         // Commit transaction
-        tx.commit().await
-            .map_err(PdsError::Database)?;
+        tx.commit().await.map_err(PdsError::Database)?;
 
         tracing::info!(
             "Account taken down: DID={}, takedown_ref={}, sessions and tokens revoked",
@@ -1516,11 +1541,15 @@ impl AccountManager {
     ) -> PdsResult<String> {
         // Validate name
         if name.is_empty() {
-            return Err(PdsError::Validation("App password name cannot be empty".to_string()));
+            return Err(PdsError::Validation(
+                "App password name cannot be empty".to_string(),
+            ));
         }
 
         if name.len() > 100 {
-            return Err(PdsError::Validation("App password name too long".to_string()));
+            return Err(PdsError::Validation(
+                "App password name too long".to_string(),
+            ));
         }
 
         // Check if app password with this name already exists for this user
@@ -1532,7 +1561,10 @@ impl AccountManager {
             .map_err(PdsError::Database)?;
 
         if existing.is_some() {
-            return Err(PdsError::Conflict(format!("App password '{}' already exists", name)));
+            return Err(PdsError::Conflict(format!(
+                "App password '{}' already exists",
+                name
+            )));
         }
 
         // Generate a random password (32 characters, alphanumeric)
@@ -1550,14 +1582,14 @@ impl AccountManager {
         );
 
         // Hash the password using Argon2id
-        let password_hash = atproto::server_auth::PasswordHasher::hash(&raw_password)
+        let password_hash = crate::auth::PasswordHasher::hash(&raw_password)
             .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
 
         // Store app password
         let now = Utc::now();
         sqlx::query(
             "INSERT INTO app_password (did, name, password_hash, created_at, privileged)
-             VALUES (?1, ?2, ?3, ?4, ?5)"
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(did)
         .bind(name)
@@ -1606,7 +1638,10 @@ impl AccountManager {
             .map_err(PdsError::Database)?;
 
         if result.rows_affected() == 0 {
-            return Err(PdsError::NotFound(format!("App password '{}' not found", name)));
+            return Err(PdsError::NotFound(format!(
+                "App password '{}' not found",
+                name
+            )));
         }
 
         // Delete all sessions created with this app password
@@ -1641,28 +1676,30 @@ impl AccountManager {
 
             // Check if account is deactivated or taken down
             if account.deactivated_at.is_some() {
-                return Err(PdsError::Authorization("Account is deactivated".to_string()));
+                return Err(PdsError::Authorization(
+                    "Account is deactivated".to_string(),
+                ));
             }
 
             if account.takedown_ref.is_some() {
-                return Err(PdsError::Authorization("Account has been taken down".to_string()));
+                return Err(PdsError::Authorization(
+                    "Account has been taken down".to_string(),
+                ));
             }
 
             // Find matching app password by trying to verify against all user's app passwords
-            let rows = sqlx::query(
-                "SELECT name, password_hash FROM app_password WHERE did = ?1"
-            )
-            .bind(&account.did)
-            .fetch_all(&self.db)
-            .await
-            .map_err(PdsError::Database)?;
+            let rows = sqlx::query("SELECT name, password_hash FROM app_password WHERE did = ?1")
+                .bind(&account.did)
+                .fetch_all(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
 
             let mut matched_name: Option<String> = None;
             for row in rows {
                 let name: String = row.get("name");
                 let hash: String = row.get("password_hash");
 
-                if let Ok(true) = atproto::server_auth::PasswordHasher::verify(app_password, &hash) {
+                if let Ok(true) = crate::auth::PasswordHasher::verify(app_password, &hash) {
                     matched_name = Some(name);
                     break;
                 }
@@ -1672,10 +1709,13 @@ impl AccountManager {
                 .ok_or_else(|| PdsError::Authentication("Invalid app password".to_string()))?;
 
             // Create session with app_password_name
-            let session = self.create_session(&account.did, Some(app_password_name.clone())).await?;
+            let session = self
+                .create_session(&account.did, Some(app_password_name.clone()))
+                .await?;
 
             Ok((account, session, app_password_name))
-        }.await;
+        }
+        .await;
 
         // Mitigate timing attacks by ensuring minimum execution time
         // This prevents attackers from distinguishing valid vs invalid usernames
@@ -1785,7 +1825,7 @@ impl AccountManager {
         }
 
         let row = sqlx::query(
-            "SELECT code, available_uses, disabled, created_for FROM invite_code WHERE code = ?1"
+            "SELECT code, available_uses, disabled, created_for FROM invite_code WHERE code = ?1",
         )
         .bind(code)
         .fetch_optional(&self.db)
@@ -1799,12 +1839,16 @@ impl AccountManager {
 
         // Check if disabled
         if disabled {
-            return Err(PdsError::Validation("Invite code has been disabled".to_string()));
+            return Err(PdsError::Validation(
+                "Invite code has been disabled".to_string(),
+            ));
         }
 
         // Check if uses remain
         if available_uses <= 0 {
-            return Err(PdsError::Validation("Invite code has no uses remaining".to_string()));
+            return Err(PdsError::Validation(
+                "Invite code has no uses remaining".to_string(),
+            ));
         }
 
         // Check if code is for a specific person
@@ -1837,30 +1881,33 @@ impl AccountManager {
         let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
 
         // Validate code
-        let row = sqlx::query(
-            "SELECT code, available_uses, disabled FROM invite_code WHERE code = ?1"
-        )
-        .bind(code)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(PdsError::Database)?
-        .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
+        let row =
+            sqlx::query("SELECT code, available_uses, disabled FROM invite_code WHERE code = ?1")
+                .bind(code)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(PdsError::Database)?
+                .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
 
         let available_uses: i32 = row.get("available_uses");
         let disabled: bool = row.get("disabled");
 
         if disabled {
-            return Err(PdsError::Validation("Invite code has been disabled".to_string()));
+            return Err(PdsError::Validation(
+                "Invite code has been disabled".to_string(),
+            ));
         }
 
         if available_uses <= 0 {
-            return Err(PdsError::Validation("Invite code has no uses remaining".to_string()));
+            return Err(PdsError::Validation(
+                "Invite code has no uses remaining".to_string(),
+            ));
         }
 
         // Record usage
         sqlx::query(
             "INSERT INTO invite_code_use (code, used_by, used_at)
-             VALUES (?1, ?2, ?3)"
+             VALUES (?1, ?2, ?3)",
         )
         .bind(code)
         .bind(used_by)
@@ -1884,12 +1931,15 @@ impl AccountManager {
     }
 
     /// List invite codes created by a user
-    pub async fn list_invite_codes(&self, created_by: &str) -> PdsResult<Vec<crate::db::account::InviteCode>> {
+    pub async fn list_invite_codes(
+        &self,
+        created_by: &str,
+    ) -> PdsResult<Vec<crate::db::account::InviteCode>> {
         let rows = sqlx::query_as::<_, crate::db::account::InviteCode>(
             "SELECT code, available_uses, disabled, created_by, created_at, created_for
              FROM invite_code
              WHERE created_by = ?1
-             ORDER BY created_at DESC"
+             ORDER BY created_at DESC",
         )
         .bind(created_by)
         .fetch_all(&self.db)
@@ -1900,12 +1950,15 @@ impl AccountManager {
     }
 
     /// Get usage history for an invite code
-    pub async fn get_invite_code_usage(&self, code: &str) -> PdsResult<Vec<crate::db::account::InviteCodeUse>> {
+    pub async fn get_invite_code_usage(
+        &self,
+        code: &str,
+    ) -> PdsResult<Vec<crate::db::account::InviteCodeUse>> {
         let rows = sqlx::query_as::<_, crate::db::account::InviteCodeUse>(
             "SELECT code, used_by, used_at
              FROM invite_code_use
              WHERE code = ?1
-             ORDER BY used_at DESC"
+             ORDER BY used_at DESC",
         )
         .bind(code)
         .fetch_all(&self.db)
@@ -1929,7 +1982,11 @@ impl AccountManager {
         let created_by: String = row.get("created_by");
 
         // Check if requester is creator or admin
-        let is_admin = self.config.authentication.admin_dids.contains(&requesting_did.to_string());
+        let is_admin = self
+            .config
+            .authentication
+            .admin_dids
+            .contains(&requesting_did.to_string());
         if created_by != requesting_did && !is_admin {
             return Err(PdsError::Authorization(
                 "Only the creator or an admin can disable this invite code".to_string(),
@@ -2033,7 +2090,7 @@ impl AccountManager {
                  LEFT JOIN account ac ON a.did = ac.did
                  WHERE a.did > ?1
                  ORDER BY a.did
-                 LIMIT ?2"
+                 LIMIT ?2",
             )
             .bind(cursor_did)
             .bind(limit)
@@ -2048,7 +2105,7 @@ impl AccountManager {
                  FROM actor a
                  LEFT JOIN account ac ON a.did = ac.did
                  ORDER BY a.did
-                 LIMIT ?1"
+                 LIMIT ?1",
             )
             .bind(limit)
             .fetch_all(&self.db)
@@ -2088,7 +2145,9 @@ impl AccountManager {
 
         // If account is not deactivated, they're not in queue
         if account.deactivated_at.is_none() {
-            return Err(PdsError::NotFound("Account is not in signup queue".to_string()));
+            return Err(PdsError::NotFound(
+                "Account is not in signup queue".to_string(),
+            ));
         }
 
         // Count how many deactivated accounts were created before this one
@@ -2098,7 +2157,7 @@ impl AccountManager {
              WHERE deactivated_at IS NOT NULL
              AND takedown_ref IS NULL
              AND created_at < (SELECT created_at FROM actor WHERE did = ?1)
-             AND did != ?1"
+             AND did != ?1",
         )
         .bind(did)
         .fetch_one(&self.db)
@@ -2121,82 +2180,15 @@ mod tests {
     }
 
     async fn create_test_manager() -> AccountManager {
-
-        // Create in-memory database
+        // Use the real migrations directory so the test schema mirrors
+        // production. The previous hand-rolled CREATE TABLE block missed
+        // the actor/account split landed in commit 87783e3 and silently
+        // broke every account-manager test that touched `JOIN actor`.
         let db = SqlitePool::connect(":memory:").await.unwrap();
-
-        // Create tables
-        sqlx::query(
-            r#"
-            CREATE TABLE account (
-                did TEXT PRIMARY KEY,
-                handle TEXT UNIQUE NOT NULL,
-                email TEXT UNIQUE,
-                password_hash TEXT NOT NULL,
-                created_at DATETIME NOT NULL,
-                email_confirmed BOOLEAN NOT NULL DEFAULT 0,
-                email_confirmed_at DATETIME,
-                deactivated_at DATETIME,
-                taken_down BOOLEAN NOT NULL DEFAULT 0
-            )
-            "#,
-        )
-        .execute(&db)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                did TEXT NOT NULL,
-                access_token TEXT UNIQUE NOT NULL,
-                refresh_token TEXT UNIQUE NOT NULL,
-                created_at DATETIME NOT NULL,
-                expires_at DATETIME NOT NULL,
-                app_password_name TEXT,
-                FOREIGN KEY (did) REFERENCES account(did)
-            )
-            "#,
-        )
-        .execute(&db)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE refresh_token (
-                id TEXT PRIMARY KEY,
-                did TEXT NOT NULL,
-                token TEXT UNIQUE NOT NULL,
-                created_at DATETIME NOT NULL,
-                expires_at DATETIME NOT NULL,
-                used BOOLEAN NOT NULL DEFAULT 0,
-                used_at DATETIME,
-                FOREIGN KEY (did) REFERENCES account(did)
-            )
-            "#,
-        )
-        .execute(&db)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE app_password (
-                did TEXT NOT NULL,
-                name TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                created_at DATETIME NOT NULL,
-                privileged BOOLEAN NOT NULL DEFAULT 0,
-                PRIMARY KEY (did, name),
-                FOREIGN KEY (did) REFERENCES account(did)
-            )
-            "#,
-        )
-        .execute(&db)
-        .await
-        .unwrap();
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("test schema migrations failed");
 
         // Create minimal test configuration
         let config = Arc::new(ServerConfig {
@@ -2275,26 +2267,29 @@ mod tests {
 
         // Create a test account
         let did = "did:web:test.localhost";
-        sqlx::query(
-            "INSERT INTO account (did, handle, email, password_hash, created_at, email_confirmed, taken_down)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-        )
-        .bind(did)
-        .bind("testuser")
-        .bind("test@example.com")
-        .bind("hash")
-        .bind(now)
-        .bind(false)
-        .bind(false)
-        .execute(&manager.db)
-        .await
-        .unwrap();
+        // Account / actor split: `handle` lives on `actor`, the secrets
+        // and email live on `account`. Both rows are required because
+        // `account.did` foreign-keys into `actor.did`.
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES (?1, ?2, ?3)")
+            .bind(did)
+            .bind("testuser")
+            .bind(now)
+            .execute(&manager.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO account (did, email, password_hash) VALUES (?1, ?2, ?3)")
+            .bind(did)
+            .bind("test@example.com")
+            .bind("hash")
+            .execute(&manager.db)
+            .await
+            .unwrap();
 
         // Insert expired session (expired 1 hour ago)
         let expired_time = now - Duration::hours(1);
         sqlx::query(
             "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind("expired-session-1")
         .bind(did)
@@ -2310,7 +2305,7 @@ mod tests {
         let future_time = now + Duration::hours(1);
         sqlx::query(
             "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind("valid-session-1")
         .bind(did)
@@ -2325,7 +2320,7 @@ mod tests {
         // Insert expired refresh token
         sqlx::query(
             "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind("expired-refresh-1")
         .bind(did)
@@ -2340,7 +2335,7 @@ mod tests {
         // Insert valid refresh token
         sqlx::query(
             "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind("valid-refresh-1")
         .bind(did)
@@ -2353,11 +2348,15 @@ mod tests {
         .unwrap();
 
         // Run cleanup
-        let (sessions_deleted, refresh_tokens_deleted) = manager.cleanup_expired_sessions().await.unwrap();
+        let (sessions_deleted, refresh_tokens_deleted) =
+            manager.cleanup_expired_sessions().await.unwrap();
 
         // Verify counts
         assert_eq!(sessions_deleted, 1, "Should delete 1 expired session");
-        assert_eq!(refresh_tokens_deleted, 1, "Should delete 1 expired refresh token");
+        assert_eq!(
+            refresh_tokens_deleted, 1,
+            "Should delete 1 expired refresh token"
+        );
 
         // Verify valid session still exists
         let session_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session")
@@ -2381,26 +2380,29 @@ mod tests {
 
         // Create a test account
         let did = "did:web:test.localhost";
-        sqlx::query(
-            "INSERT INTO account (did, handle, email, password_hash, created_at, email_confirmed, taken_down)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-        )
-        .bind(did)
-        .bind("testuser")
-        .bind("test@example.com")
-        .bind("hash")
-        .bind(now)
-        .bind(false)
-        .bind(false)
-        .execute(&manager.db)
-        .await
-        .unwrap();
+        // Account / actor split: `handle` lives on `actor`, the secrets
+        // and email live on `account`. Both rows are required because
+        // `account.did` foreign-keys into `actor.did`.
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES (?1, ?2, ?3)")
+            .bind(did)
+            .bind("testuser")
+            .bind(now)
+            .execute(&manager.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO account (did, email, password_hash) VALUES (?1, ?2, ?3)")
+            .bind(did)
+            .bind("test@example.com")
+            .bind("hash")
+            .execute(&manager.db)
+            .await
+            .unwrap();
 
         // Insert only valid session
         let future_time = now + Duration::hours(1);
         sqlx::query(
             "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind("valid-session")
         .bind(did)
@@ -2413,11 +2415,15 @@ mod tests {
         .unwrap();
 
         // Run cleanup
-        let (sessions_deleted, refresh_tokens_deleted) = manager.cleanup_expired_sessions().await.unwrap();
+        let (sessions_deleted, refresh_tokens_deleted) =
+            manager.cleanup_expired_sessions().await.unwrap();
 
         // Verify no deletions
         assert_eq!(sessions_deleted, 0, "Should not delete any sessions");
-        assert_eq!(refresh_tokens_deleted, 0, "Should not delete any refresh tokens");
+        assert_eq!(
+            refresh_tokens_deleted, 0,
+            "Should not delete any refresh tokens"
+        );
     }
 
     #[tokio::test]
@@ -2449,7 +2455,7 @@ mod tests {
         let passwords = manager.list_app_passwords(&account.did).await.unwrap();
         assert_eq!(passwords.len(), 1);
         assert_eq!(passwords[0].name, "Test App");
-        assert_eq!(passwords[0].privileged, false);
+        assert!(!passwords[0].privileged);
 
         // Create another app password with privileged flag
         manager
@@ -2600,7 +2606,7 @@ mod tests {
 
         // Verify session exists
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session WHERE did = ?1 AND app_password_name = ?2"
+            "SELECT COUNT(*) FROM session WHERE did = ?1 AND app_password_name = ?2",
         )
         .bind(&account.did)
         .bind("Test App")
@@ -2621,7 +2627,7 @@ mod tests {
 
         // Verify sessions with this app password are deleted
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session WHERE did = ?1 AND app_password_name = ?2"
+            "SELECT COUNT(*) FROM session WHERE did = ?1 AND app_password_name = ?2",
         )
         .bind(&account.did)
         .bind("Test App")
@@ -2716,7 +2722,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(validated.did, account.did);
-        assert_eq!(validated.is_app_password, true);
+        assert!(validated.is_app_password);
 
         // Create regular session for comparison
         let (_account, regular_session) = manager.login("testuser", "password123").await.unwrap();
@@ -2727,7 +2733,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(validated_regular.did, account.did);
-        assert_eq!(validated_regular.is_app_password, false);
+        assert!(!validated_regular.is_app_password);
     }
 
     #[tokio::test]
@@ -2804,10 +2810,7 @@ mod tests {
             .unwrap();
 
         // Update to same handle (should be no-op)
-        let old_handle = manager
-            .update_handle(&account.did, "alice")
-            .await
-            .unwrap();
+        let old_handle = manager.update_handle(&account.did, "alice").await.unwrap();
 
         assert_eq!(old_handle, "alice");
 

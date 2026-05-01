@@ -25,8 +25,8 @@ pub struct EmailRateLimitConfig {
 impl Default for EmailRateLimitConfig {
     fn default() -> Self {
         Self {
-            max_per_hour: 5,      // 5 emails per recipient per hour
-            max_per_day: 20,      // 20 emails per recipient per day
+            max_per_hour: 5,           // 5 emails per recipient per hour
+            max_per_day: 20,           // 20 emails per recipient per day
             max_global_per_hour: 1000, // 1000 total emails per hour
         }
     }
@@ -75,7 +75,9 @@ impl EmailRateLimiter {
                 if hourly_count >= self.config.max_per_hour {
                     tracing::warn!(
                         "Email hourly rate limit exceeded for {}: {} emails in last hour (max: {})",
-                        recipient, hourly_count, self.config.max_per_hour
+                        recipient,
+                        hourly_count,
+                        self.config.max_per_hour
                     );
                     return Err(PdsError::RateLimitExceeded {
                         retry_after: std::time::Duration::from_secs(3600), // Retry after 1 hour
@@ -84,15 +86,15 @@ impl EmailRateLimiter {
 
                 // Check daily limit
                 let one_day_ago = now - Duration::days(1);
-                let daily_count = records
-                    .iter()
-                    .filter(|r| r.timestamp > one_day_ago)
-                    .count() as u32;
+                let daily_count =
+                    records.iter().filter(|r| r.timestamp > one_day_ago).count() as u32;
 
                 if daily_count >= self.config.max_per_day {
                     tracing::warn!(
                         "Email daily rate limit exceeded for {}: {} emails in last day (max: {})",
-                        recipient, daily_count, self.config.max_per_day
+                        recipient,
+                        daily_count,
+                        self.config.max_per_day
                     );
                     return Err(PdsError::RateLimitExceeded {
                         retry_after: std::time::Duration::from_secs(86400), // Retry after 24 hours
@@ -105,15 +107,13 @@ impl EmailRateLimiter {
         {
             let global = self.global_history.read().await;
             let one_hour_ago = now - Duration::hours(1);
-            let global_count = global
-                .iter()
-                .filter(|r| r.timestamp > one_hour_ago)
-                .count() as u32;
+            let global_count = global.iter().filter(|r| r.timestamp > one_hour_ago).count() as u32;
 
             if global_count >= self.config.max_global_per_hour {
                 tracing::warn!(
                     "Global email rate limit exceeded: {} emails in last hour (max: {})",
-                    global_count, self.config.max_global_per_hour
+                    global_count,
+                    self.config.max_global_per_hour
                 );
                 return Err(PdsError::RateLimitExceeded {
                     retry_after: std::time::Duration::from_secs(3600), // Retry after 1 hour
@@ -195,12 +195,7 @@ impl EmailRateLimiter {
         let history = self.recipient_history.read().await;
         history
             .get(recipient)
-            .map(|records| {
-                records
-                    .iter()
-                    .filter(|r| r.timestamp > one_day_ago)
-                    .count() as u32
-            })
+            .map(|records| records.iter().filter(|r| r.timestamp > one_day_ago).count() as u32)
             .unwrap_or(0)
     }
 
@@ -210,10 +205,7 @@ impl EmailRateLimiter {
         let one_hour_ago = now - Duration::hours(1);
 
         let global = self.global_history.read().await;
-        global
-            .iter()
-            .filter(|r| r.timestamp > one_hour_ago)
-            .count() as u32
+        global.iter().filter(|r| r.timestamp > one_hour_ago).count() as u32
     }
 }
 

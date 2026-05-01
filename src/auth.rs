@@ -4,18 +4,10 @@
 //! Authentication extractors and utilities
 
 use crate::{
-    account::ValidatedSession,
-    admin::Role,
-    api::middleware::extract_bearer_token,
-    context::AppContext,
-    error::PdsError,
-    oauth::ScopeSet,
+    account::ValidatedSession, admin::Role, api::middleware::extract_bearer_token,
+    context::AppContext, error::PdsError, oauth::ScopeSet,
 };
-use axum::{
-    async_trait,
-    extract::FromRequestParts,
-    http::request::Parts,
-};
+use axum::{async_trait, extract::FromRequestParts, http::request::Parts};
 use uuid::Uuid;
 
 /// Authentication method used for the request
@@ -77,10 +69,7 @@ impl FromRequestParts<AppContext> for AuthContext {
             }
             Err(_) => {
                 // Fallback to JWT validation for backward compatibility
-                let session = state
-                    .account_manager
-                    .validate_access_token(&token)
-                    .await?;
+                let session = state.account_manager.validate_access_token(&token).await?;
 
                 let did = session.did.clone();
                 let duration = start.elapsed().as_secs_f64();
@@ -136,7 +125,11 @@ impl FromRequestParts<AppContext> for OptionalAuthContext {
                     };
 
                     // Record metrics
-                    crate::metrics::record_oauth_token_exchange("validation_optional", "success", duration);
+                    crate::metrics::record_oauth_token_exchange(
+                        "validation_optional",
+                        "success",
+                        duration,
+                    );
 
                     // Store auth method in extensions for middleware
                     parts.extensions.insert(AuthMethod::OAuth);
@@ -155,7 +148,11 @@ impl FromRequestParts<AppContext> for OptionalAuthContext {
                             let duration = start.elapsed().as_secs_f64();
 
                             // Record metrics (JWT fallback)
-                            crate::metrics::record_oauth_token_exchange("jwt_fallback_optional", "success", duration);
+                            crate::metrics::record_oauth_token_exchange(
+                                "jwt_fallback_optional",
+                                "success",
+                                duration,
+                            );
 
                             // Store auth method in extensions for middleware
                             parts.extensions.insert(AuthMethod::Jwt);
@@ -206,25 +203,34 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
             }
             Err(_) => {
                 // Session validation failed, try JWT validation for admin-only tokens
-                tracing::debug!("AdminAuthContext: Session validation failed, trying JWT validation");
+                tracing::debug!(
+                    "AdminAuthContext: Session validation failed, trying JWT validation"
+                );
 
                 let token_data = verify_jwt_token(&token, &state.config.authentication.jwt_secret)?;
 
                 // Extract DID from JWT claims
                 let claims = &token_data.claims;
-                let did = claims.get("sub")
+                let did = claims
+                    .get("sub")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| PdsError::Authentication("Invalid JWT: missing 'sub' claim".to_string()))?
+                    .ok_or_else(|| {
+                        PdsError::Authentication("Invalid JWT: missing 'sub' claim".to_string())
+                    })?
                     .to_string();
 
                 // Check scope is admin
-                let scope = claims.get("scope")
-                    .and_then(|v| v.as_str());
+                let scope = claims.get("scope").and_then(|v| v.as_str());
                 if scope != Some("admin") {
-                    return Err(PdsError::Authentication("JWT token does not have admin scope".to_string()));
+                    return Err(PdsError::Authentication(
+                        "JWT token does not have admin scope".to_string(),
+                    ));
                 }
 
-                tracing::info!("AdminAuthContext: JWT validation successful for DID: {}", did);
+                tracing::info!(
+                    "AdminAuthContext: JWT validation successful for DID: {}",
+                    did
+                );
 
                 // Create a synthetic session for admin JWT tokens
                 let session = ValidatedSession {
@@ -245,25 +251,26 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
         // Try to get role from database
         let role = if let Some(admin_role) = state.admin_role_manager.get_role(&did).await? {
             // User has a role in the database
-            tracing::info!("AdminAuthContext: User {} has role {} from database", did, admin_role.role.as_str());
+            tracing::info!(
+                "AdminAuthContext: User {} has role {} from database",
+                did,
+                admin_role.role.as_str()
+            );
             admin_role.role
         } else if is_configured_admin {
             // User is in configured admin DIDs, grant SuperAdmin
-            tracing::info!("AdminAuthContext: User {} is configured admin, granting SuperAdmin", did);
+            tracing::info!(
+                "AdminAuthContext: User {} is configured admin, granting SuperAdmin",
+                did
+            );
             Role::SuperAdmin
         } else {
             // User is not an admin
             tracing::warn!("AdminAuthContext: User {} is not an admin", did);
-            return Err(PdsError::Authorization(
-                "Admin role required".to_string()
-            ));
+            return Err(PdsError::Authorization("Admin role required".to_string()));
         };
 
-        Ok(AdminAuthContext {
-            did,
-            session,
-            role,
-        })
+        Ok(AdminAuthContext { did, session, role })
     }
 }
 
@@ -287,27 +294,29 @@ macro_rules! require_admin_role {
 /// 1. JWT signature verification
 /// 2. Expiration checking
 /// 3. Claims validation
-pub fn verify_jwt_token(token: &str, jwt_secret: &str) -> Result<jsonwebtoken::TokenData<serde_json::Value>, PdsError> {
-    use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+pub fn verify_jwt_token(
+    token: &str,
+    jwt_secret: &str,
+) -> Result<jsonwebtoken::TokenData<serde_json::Value>, PdsError> {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 
     let decoding_key = DecodingKey::from_secret(jwt_secret.as_bytes());
     let mut validation = Validation::new(Algorithm::HS256);
     // Allow some clock skew (5 minutes)
     validation.leeway = 300;
 
-    decode::<serde_json::Value>(token, &decoding_key, &validation)
-        .map_err(|e| {
-            tracing::warn!("JWT verification failed: {}", e);
-            match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-                    PdsError::Authentication("Token has expired".to_string())
-                }
-                jsonwebtoken::errors::ErrorKind::InvalidSignature => {
-                    PdsError::Authentication("Invalid token signature".to_string())
-                }
-                _ => PdsError::Authentication(format!("Invalid token: {}", e))
+    decode::<serde_json::Value>(token, &decoding_key, &validation).map_err(|e| {
+        tracing::warn!("JWT verification failed: {}", e);
+        match e.kind() {
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
+                PdsError::Authentication("Token has expired".to_string())
             }
-        })
+            jsonwebtoken::errors::ErrorKind::InvalidSignature => {
+                PdsError::Authentication("Invalid token signature".to_string())
+            }
+            _ => PdsError::Authentication(format!("Invalid token: {}", e)),
+        }
+    })
 }
 
 /// Simplified admin token verification for admin panel
@@ -436,7 +445,9 @@ pub async fn validate_oauth_token(
     let expires_at: chrono::DateTime<chrono::Utc> = row.get("expires_at");
 
     if expires_at < chrono::Utc::now() {
-        return Err(PdsError::Authentication("Access token has expired".to_string()));
+        return Err(PdsError::Authentication(
+            "Access token has expired".to_string(),
+        ));
     }
 
     Ok(OAuthToken {
@@ -489,4 +500,68 @@ pub async fn validate_dpop_proof(
     // 8. Verify proof is not expired
 
     Ok(())
+}
+
+/// Argon2id password hashing.
+///
+/// Vendored from the previously embedded `atproto::server_auth::PasswordHasher`
+/// because proto-blue is a client SDK and does not include server-side password
+/// hashing. Argon2id is the OWASP-recommended algorithm.
+pub struct PasswordHasher;
+
+impl PasswordHasher {
+    /// Hash a password using Argon2id with a fresh random salt.
+    pub fn hash(password: &str) -> Result<String, PdsError> {
+        use argon2::password_hash::{rand_core::OsRng, PasswordHasher as _, SaltString};
+        let salt = SaltString::generate(&mut OsRng);
+        argon2::Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|h| h.to_string())
+            .map_err(|e| PdsError::Internal(format!("password hash failed: {}", e)))
+    }
+
+    /// Verify a password against a previously stored Argon2 hash.
+    ///
+    /// Returns `Ok(true)` on a match, `Ok(false)` on a clean mismatch.
+    /// Returns `Err` only if the stored hash is malformed.
+    pub fn verify(password: &str, hash: &str) -> Result<bool, PdsError> {
+        use argon2::password_hash::{PasswordHash, PasswordVerifier};
+        let parsed = PasswordHash::new(hash)
+            .map_err(|e| PdsError::Internal(format!("malformed password hash: {}", e)))?;
+        Ok(argon2::Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok())
+    }
+}
+
+#[cfg(test)]
+mod password_tests {
+    use super::PasswordHasher;
+
+    #[test]
+    fn hash_then_verify_correct_returns_true() {
+        let hash = PasswordHasher::hash("hunter2_correct_horse").unwrap();
+        assert!(PasswordHasher::verify("hunter2_correct_horse", &hash).unwrap());
+    }
+
+    #[test]
+    fn verify_wrong_password_returns_false() {
+        let hash = PasswordHasher::hash("right").unwrap();
+        assert!(!PasswordHasher::verify("wrong", &hash).unwrap());
+    }
+
+    #[test]
+    fn verify_malformed_hash_errors() {
+        let result = PasswordHasher::verify("anything", "not-a-real-hash");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn two_hashes_of_same_password_differ_due_to_salt() {
+        let h1 = PasswordHasher::hash("same").unwrap();
+        let h2 = PasswordHasher::hash("same").unwrap();
+        assert_ne!(h1, h2);
+        assert!(PasswordHasher::verify("same", &h1).unwrap());
+        assert!(PasswordHasher::verify("same", &h2).unwrap());
+    }
 }

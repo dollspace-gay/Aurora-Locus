@@ -94,7 +94,10 @@ impl PartialEq for PdsError {
             (PdsError::BlobStorage(a), PdsError::BlobStorage(b)) => a == b,
             (PdsError::DidResolution(a), PdsError::DidResolution(b)) => a == b,
             (PdsError::IdentityResolution(a), PdsError::IdentityResolution(b)) => a == b,
-            (PdsError::RateLimitExceeded { retry_after: a }, PdsError::RateLimitExceeded { retry_after: b }) => a == b,
+            (
+                PdsError::RateLimitExceeded { retry_after: a },
+                PdsError::RateLimitExceeded { retry_after: b },
+            ) => a == b,
             (PdsError::NotFound(a), PdsError::NotFound(b)) => a == b,
             (PdsError::Conflict(a), PdsError::Conflict(b)) => a == b,
             (PdsError::Internal(a), PdsError::Internal(b)) => a == b,
@@ -126,41 +129,23 @@ impl IntoResponse for PdsError {
                 "AuthenticationRequired",
                 self.to_string(),
             ),
-            PdsError::Authorization(_) => (
-                StatusCode::FORBIDDEN,
-                "Forbidden",
-                self.to_string(),
-            ),
-            PdsError::Validation(_) => (
-                StatusCode::BAD_REQUEST,
-                "InvalidRequest",
-                self.to_string(),
-            ),
-            PdsError::NotFound(_) => (
-                StatusCode::NOT_FOUND,
-                "NotFound",
-                self.to_string(),
-            ),
-            PdsError::Conflict(_) => (
-                StatusCode::CONFLICT,
-                "Conflict",
-                self.to_string(),
-            ),
+            PdsError::Authorization(_) => (StatusCode::FORBIDDEN, "Forbidden", self.to_string()),
+            PdsError::Validation(_) => {
+                (StatusCode::BAD_REQUEST, "InvalidRequest", self.to_string())
+            }
+            PdsError::NotFound(_) => (StatusCode::NOT_FOUND, "NotFound", self.to_string()),
+            PdsError::Conflict(_) => (StatusCode::CONFLICT, "Conflict", self.to_string()),
             PdsError::RateLimitExceeded { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "RateLimitExceeded",
                 "Rate limit exceeded".to_string(),
             ),
-            PdsError::AccountTakenDown(_) => (
-                StatusCode::FORBIDDEN,
-                "AccountTakedown",
-                self.to_string(),
-            ),
-            PdsError::AccountSuspended(_) => (
-                StatusCode::FORBIDDEN,
-                "AccountSuspended",
-                self.to_string(),
-            ),
+            PdsError::AccountTakenDown(_) => {
+                (StatusCode::FORBIDDEN, "AccountTakedown", self.to_string())
+            }
+            PdsError::AccountSuspended(_) => {
+                (StatusCode::FORBIDDEN, "AccountSuspended", self.to_string())
+            }
             PdsError::Database(_) | PdsError::Internal(_) | PdsError::Io(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalServerError",

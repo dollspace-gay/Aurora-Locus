@@ -33,8 +33,7 @@ pub fn build_router(ctx: AppContext) -> Router {
 
     // Static file serving for admin panel
     // Must come AFTER API routes to not conflict with /oauth/admin/* endpoints
-    let admin_static = Router::new()
-        .nest_service("/admin", ServeDir::new("static/admin"));
+    let admin_static = Router::new().nest_service("/admin", ServeDir::new("static/admin"));
 
     // Build router with middleware
     Router::new()
@@ -48,7 +47,10 @@ pub fn build_router(ctx: AppContext) -> Router {
         // Merge admin static files (after with_state so it doesn't need state)
         .merge(admin_static)
         // Apply moderation check middleware (checks if account is suspended/taken down)
-        .layer(middleware::from_fn_with_state(ctx.clone(), check_account_moderation))
+        .layer(middleware::from_fn_with_state(
+            ctx.clone(),
+            check_account_moderation,
+        ))
         // Apply rate limiting middleware (after state so it can access AppContext)
         .layer(middleware::from_fn_with_state(ctx, rate_limit_middleware))
         .layer(cors)
@@ -62,7 +64,10 @@ async fn metrics_handler() -> Response {
     let metrics_text = metrics::render_metrics();
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+        .header(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
         .body(metrics_text.into())
         .unwrap()
 }

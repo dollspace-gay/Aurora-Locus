@@ -10,7 +10,10 @@
 
 use crate::{
     actor_store::car,
-    api::{middleware, sync_helpers::{assert_repo_availability, get_repo_status}},
+    api::{
+        middleware,
+        sync_helpers::{assert_repo_availability, get_repo_status},
+    },
     context::AppContext,
     error::{PdsError, PdsResult},
 };
@@ -161,12 +164,8 @@ pub async fn get_repo(
     assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
 
     // Export repository as CAR
-    let car_bytes = car::export_repo_to_car(
-        &ctx.actor_store,
-        &params.did,
-        params.since.as_deref(),
-    )
-    .await?;
+    let car_bytes =
+        car::export_repo_to_car(&ctx.actor_store, &params.did, params.since.as_deref()).await?;
 
     // Return CAR file as application/vnd.ipld.car
     Ok(Response::builder()
@@ -285,8 +284,14 @@ pub async fn get_blob(
         [
             (header::CONTENT_TYPE, mime_type.as_str()),
             (header::CONTENT_LENGTH, &data.len().to_string()),
-            (header::HeaderName::from_static("x-content-type-options"), "nosniff"),
-            (header::HeaderName::from_static("content-security-policy"), "default-src 'none'; sandbox"),
+            (
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
+            (
+                header::HeaderName::from_static("content-security-policy"),
+                "default-src 'none'; sandbox",
+            ),
         ],
         data,
     )
@@ -387,10 +392,7 @@ pub async fn get_repo_status_endpoint(
 ) -> PdsResult<Json<GetRepoStatusResponse>> {
     // No auth required - this is public info about repo availability
 
-    let account = ctx
-        .account_manager
-        .get_account(&params.did)
-        .await?;
+    let account = ctx.account_manager.get_account(&params.did).await?;
 
     let (active, status) = get_repo_status(
         account.takedown_ref.is_some(),

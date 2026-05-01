@@ -17,7 +17,10 @@ where
 }
 
 /// Custom serializer for Option<DateTime> that uses RFC3339 with millisecond precision
-fn serialize_optional_datetime<S>(dt: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_optional_datetime<S>(
+    dt: &Option<DateTime<Utc>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -133,7 +136,9 @@ impl InviteCodeManager {
         }
 
         if available <= 0 {
-            return Err(PdsError::Validation("Invite code has no uses remaining".to_string()));
+            return Err(PdsError::Validation(
+                "Invite code has no uses remaining".to_string(),
+            ));
         }
 
         if let Ok(Some(expires_at_str)) = row.try_get::<Option<String>, _>("expires_at") {
@@ -392,17 +397,29 @@ mod tests {
 
         // Create code with 1 use
         let code = manager
-            .create_invite("did:plc:admin", 1, None, Some("Test code".to_string()), None)
+            .create_invite(
+                "did:plc:admin",
+                1,
+                None,
+                Some("Test code".to_string()),
+                None,
+            )
             .await
             .unwrap();
 
         assert_eq!(code.available, 1);
 
         // Use code
-        manager.use_code(&code.code, "did:plc:newuser").await.unwrap();
+        manager
+            .use_code(&code.code, "did:plc:newuser")
+            .await
+            .unwrap();
 
         // Should fail to use again
-        assert!(manager.use_code(&code.code, "did:plc:another").await.is_err());
+        assert!(manager
+            .use_code(&code.code, "did:plc:another")
+            .await
+            .is_err());
     }
 
     #[test]

@@ -22,11 +22,7 @@ use tokio::time::sleep;
 /// * `ctx` - Application context containing sequencer
 /// * `dids` - List of DIDs to publish identity events for
 /// * `delay_ms` - Delay in milliseconds between each publish
-pub async fn publish_identity(
-    ctx: &AppContext,
-    dids: Vec<String>,
-    delay_ms: u64,
-) -> PdsResult<()> {
+pub async fn publish_identity(ctx: &AppContext, dids: Vec<String>, delay_ms: u64) -> PdsResult<()> {
     if dids.is_empty() {
         return Err(PdsError::Validation("No DIDs provided".to_string()));
     }
@@ -45,14 +41,23 @@ pub async fn publish_identity(
         match publish_identity_event(ctx, did).await {
             Ok(seq) => {
                 success_count += 1;
-                println!("[{}/{}] ✓ Published identity event for {}",
-                    idx + 1, dids.len(), did);
+                println!(
+                    "[{}/{}] ✓ Published identity event for {}",
+                    idx + 1,
+                    dids.len(),
+                    did
+                );
                 println!("        Sequence: {}", seq);
             }
             Err(e) => {
                 error_count += 1;
-                eprintln!("[{}/{}] ✗ Failed to publish identity event for {}: {}",
-                    idx + 1, dids.len(), did, e);
+                eprintln!(
+                    "[{}/{}] ✗ Failed to publish identity event for {}: {}",
+                    idx + 1,
+                    dids.len(),
+                    did,
+                    e
+                );
             }
         }
 
@@ -70,7 +75,10 @@ pub async fn publish_identity(
     println!("═══════════════════════════════════════\n");
 
     if error_count > 0 {
-        println!("⚠️  Warning: {} identity event(s) failed to publish", error_count);
+        println!(
+            "⚠️  Warning: {} identity event(s) failed to publish",
+            error_count
+        );
     } else {
         println!("✓ All identity events published successfully");
     }
@@ -101,7 +109,9 @@ pub async fn publish_identity_from_file(
         .collect();
 
     if dids.is_empty() {
-        return Err(PdsError::Validation("No valid DIDs found in file".to_string()));
+        return Err(PdsError::Validation(
+            "No valid DIDs found in file".to_string(),
+        ));
     }
 
     publish_identity(ctx, dids, delay_ms).await
@@ -118,10 +128,7 @@ async fn publish_identity_event(ctx: &AppContext, did: &str) -> PdsResult<i64> {
     let account = ctx.account_manager.get_account(did).await?;
 
     // Create identity event
-    let evt = IdentityEvent::new(
-        did.to_string(),
-        account.handle.clone(),
-    );
+    let evt = IdentityEvent::new(did.to_string(), account.handle.clone());
 
     // Sequence the event
     let seq = ctx.sequencer.sequence_identity(evt).await?;

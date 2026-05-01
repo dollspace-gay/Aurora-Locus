@@ -81,7 +81,7 @@ impl ServiceAuthClaims {
         // Check expiration hasn't passed
         if self.exp <= now {
             return Err(PdsError::Authentication(
-                "Service auth token has expired".to_string()
+                "Service auth token has expired".to_string(),
             ));
         }
 
@@ -266,19 +266,23 @@ pub async fn verify_service_jwt(
     // Split JWT into parts
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
-        return Err(PdsError::Jwt("Invalid JWT format: expected 3 parts".to_string()));
+        return Err(PdsError::Jwt(
+            "Invalid JWT format: expected 3 parts".to_string(),
+        ));
     }
 
     let (header_b64, claims_b64, signature_b64) = (parts[0], parts[1], parts[2]);
 
     // Decode header
-    let header_bytes = URL_SAFE_NO_PAD.decode(header_b64)
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_b64)
         .map_err(|e| PdsError::Jwt(format!("Failed to decode header: {}", e)))?;
     let header: serde_json::Value = serde_json::from_slice(&header_bytes)
         .map_err(|e| PdsError::Jwt(format!("Failed to parse header: {}", e)))?;
 
     // Verify algorithm is ES256K
-    let alg = header.get("alg")
+    let alg = header
+        .get("alg")
         .and_then(|v| v.as_str())
         .ok_or_else(|| PdsError::Jwt("Missing algorithm in JWT header".to_string()))?;
 
@@ -287,7 +291,8 @@ pub async fn verify_service_jwt(
     }
 
     // Decode claims
-    let claims_bytes = URL_SAFE_NO_PAD.decode(claims_b64)
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(claims_b64)
         .map_err(|e| PdsError::Jwt(format!("Failed to decode claims: {}", e)))?;
     let claims: ServiceAuthClaims = serde_json::from_slice(&claims_bytes)
         .map_err(|e| PdsError::Jwt(format!("Failed to parse claims: {}", e)))?;
@@ -304,19 +309,15 @@ pub async fn verify_service_jwt(
     let did_doc = identity_resolver
         .resolve_did(&claims.iss)
         .await
-        .map_err(|e| {
-            PdsError::Authentication(format!("Failed to resolve issuer DID: {}", e))
-        })?;
+        .map_err(|e| PdsError::Authentication(format!("Failed to resolve issuer DID: {}", e)))?;
 
     // Extract signing key from DID document
-    let verification_method = did_doc
-        .get_signing_key()
-        .ok_or_else(|| {
-            PdsError::Authentication(format!(
-                "No signing key found in DID document for {}",
-                claims.iss
-            ))
-        })?;
+    let verification_method = did_doc.get_signing_key().ok_or_else(|| {
+        PdsError::Authentication(format!(
+            "No signing key found in DID document for {}",
+            claims.iss
+        ))
+    })?;
 
     // Decode multibase public key
     let public_key_bytes = verification_method
@@ -334,14 +335,16 @@ pub async fn verify_service_jwt(
         .map_err(|e| PdsError::Authentication(format!("Invalid public key: {}", e)))?;
 
     // Decode signature
-    let signature_bytes = URL_SAFE_NO_PAD.decode(signature_b64)
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(signature_b64)
         .map_err(|e| PdsError::Jwt(format!("Failed to decode signature: {}", e)))?;
     let signature = Signature::from_der(&signature_bytes)
         .map_err(|e| PdsError::Authentication(format!("Invalid signature format: {}", e)))?;
 
     // Verify signature
     let signing_input = format!("{}.{}", header_b64, claims_b64);
-    verifying_key.verify(signing_input.as_bytes(), &signature)
+    verifying_key
+        .verify(signing_input.as_bytes(), &signature)
         .map_err(|e| PdsError::Authentication(format!("Signature verification failed: {}", e)))?;
 
     // Validate claims (expiration, etc.)
@@ -576,7 +579,10 @@ mod tests {
         // Invalid prefix (not 'z')
         let result = decode_multibase_key("a123456");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must start with 'z'"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must start with 'z'"));
     }
 
     #[test]

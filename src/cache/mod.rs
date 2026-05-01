@@ -65,8 +65,7 @@ impl CacheConfig {
                 .unwrap_or(false),
             redis_url: std::env::var("REDIS_URL")
                 .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
-            key_prefix: std::env::var("CACHE_KEY_PREFIX")
-                .unwrap_or_else(|_| "aurora:".to_string()),
+            key_prefix: std::env::var("CACHE_KEY_PREFIX").unwrap_or_else(|_| "aurora:".to_string()),
             default_ttl: std::env::var("CACHE_DEFAULT_TTL")
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()
@@ -126,7 +125,11 @@ impl CacheClient {
     }
 
     /// Get a value from cache
-    pub async fn get<T: DeserializeOwned>(&self, category: &str, key: &str) -> PdsResult<Option<T>> {
+    pub async fn get<T: DeserializeOwned>(
+        &self,
+        category: &str,
+        key: &str,
+    ) -> PdsResult<Option<T>> {
         let cache_key = self.build_key(category, key);
 
         debug!("Cache GET: {}", cache_key);
@@ -282,10 +285,13 @@ impl CacheClient {
     /// Ping Redis to check connection
     pub async fn ping(&self) -> PdsResult<()> {
         let mut conn = self.connection.clone();
-        let pong: String = redis::cmd("PING").query_async(&mut conn).await.map_err(|e| {
-            error!("Redis PING failed: {}", e);
-            PdsError::Internal(format!("Cache ping failed: {}", e))
-        })?;
+        let pong: String = redis::cmd("PING")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                error!("Redis PING failed: {}", e);
+                PdsError::Internal(format!("Cache ping failed: {}", e))
+            })?;
 
         if pong != "PONG" {
             return Err(PdsError::Internal(
@@ -357,7 +363,7 @@ mod tests {
     #[test]
     fn test_cache_config_default() {
         let config = CacheConfig::default();
-        assert_eq!(config.enabled, false);
+        assert!(!config.enabled);
         assert_eq!(config.key_prefix, "aurora:");
         assert_eq!(config.default_ttl, 300);
     }
@@ -366,7 +372,7 @@ mod tests {
     fn test_build_key() {
         let config = CacheConfig::default();
         // We can't easily test async without Redis, but we can test key building logic
-        let key = format!("{}{}{}",  config.key_prefix, "test:", "123");
+        let key = format!("{}{}{}", config.key_prefix, "test:", "123");
         assert_eq!(key, "aurora:test:123");
     }
 

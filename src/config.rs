@@ -272,8 +272,8 @@ impl ServerConfig {
             .parse()
             .map_err(|_| PdsError::Validation("Invalid port number".to_string()))?;
 
-        let service_did = env::var("PDS_SERVICE_DID")
-            .unwrap_or_else(|_| format!("did:web:{}", hostname));
+        let service_did =
+            env::var("PDS_SERVICE_DID").unwrap_or_else(|_| format!("did:web:{}", hostname));
         let version = env::var("PDS_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
         let blob_upload_limit = env::var("PDS_BLOB_UPLOAD_LIMIT")
             .unwrap_or_else(|_| "5242880".to_string())
@@ -338,11 +338,11 @@ impl ServerConfig {
             .unwrap_or_else(|_| format!("https://{}/oauth/client-metadata.json", hostname));
         let oauth_redirect_uri = env::var("PDS_OAUTH_REDIRECT_URI")
             .unwrap_or_else(|_| format!("https://{}/admin-oauth/callback", hostname));
-        let oauth_pds_url = env::var("PDS_OAUTH_PDS_URL")
-            .unwrap_or_else(|_| "https://bsky.social".to_string());
+        let oauth_pds_url =
+            env::var("PDS_OAUTH_PDS_URL").unwrap_or_else(|_| "https://bsky.social".to_string());
 
-        let did_plc_url = env::var("PDS_DID_PLC_URL")
-            .unwrap_or_else(|_| "https://plc.directory".to_string());
+        let did_plc_url =
+            env::var("PDS_DID_PLC_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
         let service_handle_domains = env::var("PDS_SERVICE_HANDLE_DOMAINS")
             .unwrap_or_else(|_| format!(".{}", hostname))
             .split(',')
@@ -375,8 +375,8 @@ impl ServerConfig {
             .unwrap_or_else(|_| "604800".to_string())
             .parse()
             .unwrap_or(604800);
-        let invite_epoch = env::var("PDS_INVITE_EPOCH")
-            .unwrap_or_else(|_| "2024-01-01T00:00:00Z".to_string());
+        let invite_epoch =
+            env::var("PDS_INVITE_EPOCH").unwrap_or_else(|_| "2024-01-01T00:00:00Z".to_string());
 
         let rate_limit_enabled = env::var("PDS_RATE_LIMITS_ENABLED")
             .unwrap_or_else(|_| "true".to_string())

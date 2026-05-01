@@ -97,9 +97,12 @@ impl PdsDiscovery {
 
         debug!("Fetching PDS list from relay: {}", url);
 
-        let response = self.http_client.get(&url).send().await.map_err(|e| {
-            PdsError::Internal(format!("Failed to connect to relay: {}", e))
-        })?;
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to connect to relay: {}", e)))?;
 
         if !response.status().is_success() {
             return Err(PdsError::Internal(format!(
@@ -109,9 +112,10 @@ impl PdsDiscovery {
         }
 
         // Parse response
-        let relay_response: RelayResponse = response.json().await.map_err(|e| {
-            PdsError::Internal(format!("Failed to parse relay response: {}", e))
-        })?;
+        let relay_response: RelayResponse = response
+            .json()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to parse relay response: {}", e)))?;
 
         // Convert to PdsInstance format
         let instances: Vec<PdsInstance> = relay_response
@@ -141,13 +145,17 @@ impl PdsDiscovery {
 
         debug!("Discovering PDS via well-known: {}", url);
 
-        let response = self.http_client.get(&url).send().await.map_err(|e| {
-            PdsError::NotFound(format!("Failed to fetch well-known: {}", e))
-        })?;
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| PdsError::NotFound(format!("Failed to fetch well-known: {}", e)))?;
 
-        let did = response.text().await.map_err(|e| {
-            PdsError::Internal(format!("Failed to read response: {}", e))
-        })?;
+        let did = response
+            .text()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to read response: {}", e)))?;
 
         // Fetch PDS info
         let pds_url = format!("https://{}", domain);
@@ -158,13 +166,17 @@ impl PdsDiscovery {
     async fn fetch_pds_info(&self, pds_url: &str, did: &str) -> PdsResult<PdsInstance> {
         let url = format!("{}/xrpc/com.atproto.server.describeServer", pds_url);
 
-        let response = self.http_client.get(&url).send().await.map_err(|e| {
-            PdsError::Internal(format!("Failed to fetch PDS info: {}", e))
-        })?;
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to fetch PDS info: {}", e)))?;
 
-        let info: ServerDescription = response.json().await.map_err(|e| {
-            PdsError::Internal(format!("Failed to parse PDS info: {}", e))
-        })?;
+        let info: ServerDescription = response
+            .json()
+            .await
+            .map_err(|e| PdsError::Internal(format!("Failed to parse PDS info: {}", e)))?;
 
         Ok(PdsInstance {
             did: did.to_string(),
@@ -215,12 +227,7 @@ impl PdsDiscovery {
         // Remove stale instances (not seen in 7 days)
         let cutoff = chrono::Utc::now().timestamp() - (7 * 24 * 60 * 60);
         let mut known = self.known_instances.write().await;
-        known.retain(|_, instance| {
-            instance
-                .last_seen
-                .map(|ts| ts > cutoff)
-                .unwrap_or(true)
-        });
+        known.retain(|_, instance| instance.last_seen.map(|ts| ts > cutoff).unwrap_or(true));
 
         info!("Instance list refreshed: {} known instances", known.len());
 
@@ -269,7 +276,7 @@ mod tests {
         let deserialized: PdsInstance = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.did, "did:plc:test123");
-        assert_eq!(deserialized.open_registrations, true);
+        assert!(deserialized.open_registrations);
         assert_eq!(deserialized.features.len(), 2);
     }
 

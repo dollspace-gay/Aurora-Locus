@@ -1,22 +1,15 @@
 /// Moderation API Endpoints
 /// Implements com.atproto.moderation.* endpoints for user-submitted reports
-use crate::{
-    admin::reports::ReportReason,
-    auth::AuthContext,
-    context::AppContext,
-};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::post,
-    Json, Router,
-};
+use crate::{admin::reports::ReportReason, auth::AuthContext, context::AppContext};
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 
 /// Build moderation API routes
 pub fn routes() -> Router<AppContext> {
-    Router::new()
-        .route("/xrpc/com.atproto.moderation.createReport", post(create_report))
+    Router::new().route(
+        "/xrpc/com.atproto.moderation.createReport",
+        post(create_report),
+    )
 }
 
 // ============================================================================
@@ -90,8 +83,8 @@ async fn create_report(
     Json(req): Json<CreateReportRequest>,
 ) -> Result<Json<CreateReportResponse>, (StatusCode, String)> {
     // Parse the reason type from ATProto format to our internal format
-    let reason_type = parse_reason_type(&req.reason_type)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let reason_type =
+        parse_reason_type(&req.reason_type).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Extract subject details
     let (subject_did, subject_uri, subject_cid) = match &req.subject {
@@ -114,14 +107,23 @@ async fn create_report(
                 ));
             }
             // Extract DID from URI (at://did:plc:xxx/collection/rkey)
-            let did = extract_did_from_uri(&strong_ref.uri)
-                .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid record URI format".to_string()))?;
-            (Some(did), Some(strong_ref.uri.clone()), Some(strong_ref.cid.clone()))
+            let did = extract_did_from_uri(&strong_ref.uri).ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid record URI format".to_string(),
+                )
+            })?;
+            (
+                Some(did),
+                Some(strong_ref.uri.clone()),
+                Some(strong_ref.cid.clone()),
+            )
         }
     };
 
     // Submit the report
-    let report = ctx.report_manager
+    let report = ctx
+        .report_manager
         .submit_report(
             subject_did.as_deref(),
             subject_uri.as_deref(),
@@ -196,16 +198,34 @@ fn map_ozone_reason(ozone_reason: &str) -> String {
     match ozone_reason.to_lowercase().as_str() {
         // Spam/Misleading category
         s if s.contains("spam") => "spam".to_string(),
-        s if s.contains("misleading") || s.contains("impersonation") || s.contains("scam") || s.contains("bot") => "misleading".to_string(),
+        s if s.contains("misleading")
+            || s.contains("impersonation")
+            || s.contains("scam")
+            || s.contains("bot") =>
+        {
+            "misleading".to_string()
+        }
 
         // Sexual content category
         s if s.contains("sexual") => "sexual".to_string(),
 
         // Harassment/Rude category
-        s if s.contains("harassment") || s.contains("hate") || s.contains("doxxing") || s.contains("troll") => "rude".to_string(),
+        s if s.contains("harassment")
+            || s.contains("hate")
+            || s.contains("doxxing")
+            || s.contains("troll") =>
+        {
+            "rude".to_string()
+        }
 
         // Violation category (violence, child safety, rules)
-        s if s.contains("violence") || s.contains("child") || s.contains("rule") || s.contains("selfharm") => "violation".to_string(),
+        s if s.contains("violence")
+            || s.contains("child")
+            || s.contains("rule")
+            || s.contains("selfharm") =>
+        {
+            "violation".to_string()
+        }
 
         // Default to other
         _ => "other".to_string(),
@@ -262,8 +282,14 @@ mod tests {
     #[test]
     fn test_parse_reason_type_short_format() {
         assert!(matches!(parse_reason_type("spam"), Ok(ReportReason::Spam)));
-        assert!(matches!(parse_reason_type("violation"), Ok(ReportReason::Violation)));
-        assert!(matches!(parse_reason_type("Misleading"), Ok(ReportReason::Misleading)));
+        assert!(matches!(
+            parse_reason_type("violation"),
+            Ok(ReportReason::Violation)
+        ));
+        assert!(matches!(
+            parse_reason_type("Misleading"),
+            Ok(ReportReason::Misleading)
+        ));
     }
 
     #[test]
@@ -303,6 +329,9 @@ mod tests {
             Some("did:web:example.com".to_string())
         );
         assert_eq!(extract_did_from_uri("invalid-uri"), None);
-        assert_eq!(extract_did_from_uri("at://handle.bsky.social/col/key"), None);
+        assert_eq!(
+            extract_did_from_uri("at://handle.bsky.social/col/key"),
+            None
+        );
     }
 }

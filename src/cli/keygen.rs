@@ -2,7 +2,10 @@
 //!
 //! Provides command-line tools for generating P-256 keypairs in various formats.
 
-use crate::{crypto::keypair::{KeyFormat, KeyPair}, error::PdsResult};
+use crate::{
+    crypto::keypair::{KeyFormat, KeyPair},
+    error::PdsResult,
+};
 use std::fs;
 use std::str::FromStr;
 
@@ -20,12 +23,20 @@ pub fn generate_did_key(
     let format = KeyFormat::from_str(format_str)?;
 
     println!("Format: {:?}", format);
-    println!("Type:   {}", if include_private { "Private + Public" } else { "Public Only" });
+    println!(
+        "Type:   {}",
+        if include_private {
+            "Private + Public"
+        } else {
+            "Public Only"
+        }
+    );
 
     // Validate format/private combination
     if format == KeyFormat::Did && include_private {
         return Err(crate::error::PdsError::Validation(
-            "DID format does not support private keys. Use --format pem or --format jwk instead.".to_string()
+            "DID format does not support private keys. Use --format pem or --format jwk instead."
+                .to_string(),
         ));
     }
 
@@ -81,7 +92,9 @@ pub fn generate_did_key(
                 println!("  Keep it secure and do not share it.\n");
             } else {
                 println!("Usage:");
-                println!("  This public JWK can be used in OAuth/DPoP or other JWT-based systems.\n");
+                println!(
+                    "  This public JWK can be used in OAuth/DPoP or other JWT-based systems.\n"
+                );
             }
         }
     }

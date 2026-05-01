@@ -75,12 +75,9 @@ pub async fn migrate_user(
 }
 
 /// Count active sessions for a user
-async fn count_user_sessions(
-    ctx: &AppContext,
-    did: &str,
-) -> PdsResult<usize> {
+async fn count_user_sessions(ctx: &AppContext, did: &str) -> PdsResult<usize> {
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session WHERE did = ? AND expires_at > datetime('now')"
+        "SELECT COUNT(*) FROM session WHERE did = ? AND expires_at > datetime('now')",
     )
     .bind(did)
     .fetch_one(&ctx.account_db)
@@ -91,17 +88,12 @@ async fn count_user_sessions(
 }
 
 /// Revoke all active sessions for a user
-async fn revoke_all_sessions(
-    ctx: &AppContext,
-    did: &str,
-) -> PdsResult<usize> {
-    let result = sqlx::query(
-        "DELETE FROM session WHERE did = ?"
-    )
-    .bind(did)
-    .execute(&ctx.account_db)
-    .await
-    .map_err(PdsError::Database)?;
+async fn revoke_all_sessions(ctx: &AppContext, did: &str) -> PdsResult<usize> {
+    let result = sqlx::query("DELETE FROM session WHERE did = ?")
+        .bind(did)
+        .execute(&ctx.account_db)
+        .await
+        .map_err(PdsError::Database)?;
 
     Ok(result.rows_affected() as usize)
 }
@@ -138,12 +130,11 @@ pub async fn bulk_migrate_users(
     info!("Starting bulk OAuth migration");
 
     // Get all DIDs with active sessions
-    let dids: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT did FROM session WHERE expires_at > datetime('now')"
-    )
-    .fetch_all(&ctx.account_db)
-    .await
-    .map_err(PdsError::Database)?;
+    let dids: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT did FROM session WHERE expires_at > datetime('now')")
+            .fetch_all(&ctx.account_db)
+            .await
+            .map_err(PdsError::Database)?;
 
     info!("Found {} users with active JWT sessions", dids.len());
 
@@ -165,10 +156,7 @@ pub async fn bulk_migrate_users(
         }
     }
 
-    info!(
-        "Bulk migration complete: {} users processed",
-        results.len()
-    );
+    info!("Bulk migration complete: {} users processed", results.len());
 
     Ok(results)
 }
@@ -180,7 +168,14 @@ pub fn print_migration_result(result: &MigrationResult) {
     println!("════════════════════════════════════════════════════════");
     println!("DID: {}", result.did);
     println!("Sessions Revoked: {}", result.sessions_revoked);
-    println!("Status: {}", if result.success { "✓ SUCCESS" } else { "⚠ SKIPPED" });
+    println!(
+        "Status: {}",
+        if result.success {
+            "✓ SUCCESS"
+        } else {
+            "⚠ SKIPPED"
+        }
+    );
 
     if result.success {
         println!("\nNext Steps:");

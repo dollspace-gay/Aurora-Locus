@@ -2,9 +2,7 @@
 use crate::{
     account::AccountManager,
     actor_store::{ActorStore, ActorStoreConfig},
-    admin::{
-        AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager, ReportManager,
-    },
+    admin::{AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager, ReportManager},
     blob_store::{BlobStore, BlobStoreConfig},
     config::ServerConfig,
     db,
@@ -14,9 +12,7 @@ use crate::{
         discovery::PdsDiscovery,
         dpop::{DPopNonceStore, DPopVerifier},
         search::FederatedSearch,
-        NonceStore,
-        RelayClient,
-        RelayConfig,
+        NonceStore, RelayClient, RelayConfig,
     },
     identity::{DidCache, IdentityResolver, IdentityResolverConfig},
     mailer::Mailer,
@@ -82,7 +78,8 @@ impl AppContext {
         Self::ensure_directories(&config).await?;
 
         // Initialize account database
-        let account_db = db::create_pool(&config.storage.account_db, db::DatabaseOptions::default()).await?;
+        let account_db =
+            db::create_pool(&config.storage.account_db, db::DatabaseOptions::default()).await?;
 
         // Run database migrations (includes OAuth tables)
         db::run_migrations(&account_db).await?;
@@ -91,7 +88,10 @@ impl AppContext {
         db::test_connection(&account_db).await?;
 
         // Initialize account manager
-        let account_manager = Arc::new(AccountManager::new(account_db.clone(), Arc::new(config.clone())));
+        let account_manager = Arc::new(AccountManager::new(
+            account_db.clone(),
+            Arc::new(config.clone()),
+        ));
 
         // Initialize actor store
         let actor_store_config = ActorStoreConfig {
@@ -111,8 +111,9 @@ impl AppContext {
             db::DatabaseOptions {
                 max_connections: 10,
                 enable_wal: true, // Enable WAL mode for concurrent reads during writes
-            }
-        ).await?;
+            },
+        )
+        .await?;
 
         // Run migrations for identity cache
         db::run_migrations(&did_cache_db).await?;
@@ -132,11 +133,10 @@ impl AppContext {
             .map_err(PdsError::Database)?;
 
         // Initialize identity resolver with separate WAL-enabled cache database
-        let did_cache = DidCache::new(did_cache_db)
-            .with_did_doc_ttls(
-                chrono::Duration::seconds(config.identity.did_cache_stale_ttl as i64),
-                chrono::Duration::seconds(config.identity.did_cache_max_ttl as i64)
-            );
+        let did_cache = DidCache::new(did_cache_db).with_did_doc_ttls(
+            chrono::Duration::seconds(config.identity.did_cache_stale_ttl as i64),
+            chrono::Duration::seconds(config.identity.did_cache_max_ttl as i64),
+        );
         let identity_config = IdentityResolverConfig {
             user_agent: format!("Aurora-Locus/{}", config.service.version),
             use_doh: false,
@@ -145,13 +145,14 @@ impl AppContext {
             retry_base_delay_ms: 100,
             retry_max_delay_ms: 5000,
         };
-        let identity_resolver = Arc::new(
-            IdentityResolver::new(did_cache, identity_config)?
-        );
+        let identity_resolver = Arc::new(IdentityResolver::new(did_cache, identity_config)?);
 
         // Initialize admin & moderation managers
         let admin_role_manager = Arc::new(AdminRoleManager::new(account_db.clone()));
-        let moderation_manager = Arc::new(ModerationManager::new(account_db.clone(), account_manager.clone()));
+        let moderation_manager = Arc::new(ModerationManager::new(
+            account_db.clone(),
+            account_manager.clone(),
+        ));
         let label_manager = Arc::new(LabelManager::new(
             account_db.clone(),
             config.service.service_did.clone(),
@@ -167,8 +168,12 @@ impl AppContext {
         let oauth_device_manager = Arc::new(DeviceManager::new(account_db.clone()));
 
         // Initialize relay client first (optional - only if relay servers configured and federation enabled)
-        let relay_client = if config.federation.enabled && !config.federation.relay_urls.is_empty() {
-            tracing::info!("Federation enabled with {} relay server(s)", config.federation.relay_urls.len());
+        let relay_client = if config.federation.enabled && !config.federation.relay_urls.is_empty()
+        {
+            tracing::info!(
+                "Federation enabled with {} relay server(s)",
+                config.federation.relay_urls.len()
+            );
             let relay_config = RelayConfig {
                 servers: config.federation.relay_urls.clone(),
                 reconnect_interval: 5,
@@ -187,14 +192,10 @@ impl AppContext {
             tracing::info!("Initializing federation authenticator and PDS discovery");
 
             // Federation authenticator for cross-PDS authentication
-            let auth = Arc::new(FederationAuthenticator::new(
-                Arc::clone(&identity_resolver)
-            ));
+            let auth = Arc::new(FederationAuthenticator::new(Arc::clone(&identity_resolver)));
 
             // PDS discovery for finding other instances
-            let discovery = Arc::new(PdsDiscovery::new(
-                config.federation.relay_urls.clone()
-            ));
+            let discovery = Arc::new(PdsDiscovery::new(config.federation.relay_urls.clone()));
 
             (Some(auth), Some(discovery))
         } else {
@@ -207,8 +208,8 @@ impl AppContext {
                 tracing::info!("Initializing federated search (max_concurrent: 10, timeout: 30s)");
                 Some(Arc::new(FederatedSearch::new(
                     Arc::clone(discovery),
-                    10,  // max_concurrent requests
-                    30,  // timeout_secs
+                    10, // max_concurrent requests
+                    30, // timeout_secs
                 )))
             } else {
                 None
@@ -239,13 +240,16 @@ impl AppContext {
         let sequencer = Arc::new(Sequencer::with_relay(
             account_db.clone(),
             SequencerConfig::default(),
-            relay_client.clone()
+            relay_client.clone(),
         ));
 
         // Initialize distributed rate limiter if Redis is enabled
         let distributed_rate_limiter = if config.rate_limit.use_redis {
             if let Some(ref redis_url) = config.rate_limit.redis_url {
-                tracing::info!("Initializing distributed Redis-backed rate limiter: {}", redis_url);
+                tracing::info!(
+                    "Initializing distributed Redis-backed rate limiter: {}",
+                    redis_url
+                );
                 // Create cache client for Redis
                 let cache_config = crate::cache::CacheConfig {
                     enabled: true,
@@ -267,7 +271,9 @@ impl AppContext {
         };
 
         // Initialize rate limiter with Bluesky-compatible endpoint limits
-        let rate_limiter = Arc::new(RateLimiter::with_bluesky_defaults(crate::rate_limit::RateLimitConfig::default()));
+        let rate_limiter = Arc::new(RateLimiter::with_bluesky_defaults(
+            crate::rate_limit::RateLimitConfig::default(),
+        ));
 
         // Initialize mailer
         let mailer = Arc::new(Mailer::new(config.email.clone())?);

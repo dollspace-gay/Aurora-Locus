@@ -1,1 +1,0 @@
-C:\Users\admin\RustSDK\Rust-Atproto-SDK\codegen\target\debug\generate.exe: C:\Users\admin\RustSDK\Rust-Atproto-SDK\codegen\src\codegen.rs C:\Users\admin\RustSDK\Rust-Atproto-SDK\codegen\src\lexicon.rs C:\Users\admin\RustSDK\Rust-Atproto-SDK\codegen\src\main.rs

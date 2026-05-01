@@ -8,7 +8,7 @@
 
 use crate::error::{PdsError, PdsResult};
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use tracing::{info, error};
+use tracing::{error, info};
 
 /// PostgreSQL database configuration
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ impl Default for PostgresConfig {
             min_connections: 10,
             connect_timeout: 30,
             max_lifetime: 1800, // 30 minutes
-            idle_timeout: 600,   // 10 minutes
+            idle_timeout: 600,  // 10 minutes
         }
     }
 }
@@ -52,7 +52,9 @@ impl PostgresConfig {
         let database_url = std::env::var("DATABASE_URL")
             .or_else(|_| std::env::var("POSTGRES_URL"))
             .map_err(|_| {
-                PdsError::Internal("DATABASE_URL or POSTGRES_URL must be set for PostgreSQL".to_string())
+                PdsError::Internal(
+                    "DATABASE_URL or POSTGRES_URL must be set for PostgreSQL".to_string(),
+                )
             })?;
 
         Ok(Self {

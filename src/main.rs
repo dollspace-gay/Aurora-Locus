@@ -6,13 +6,13 @@
 //! and federation capabilities for the AT Protocol network.
 
 mod account;
+mod actor_store; // Must come after read_after_write (uses its types)
 mod admin;
 mod api;
 mod auth;
 mod backup;
 mod blob_store;
 mod cache;
-mod car;
 mod cli;
 mod config;
 mod context;
@@ -22,13 +22,12 @@ mod error;
 mod federation;
 mod identity;
 mod jobs;
-mod oauth;
 mod mailer;
 mod metrics;
+mod oauth;
 mod rate_limit;
-mod rate_limit_new;  // Distributed Redis-backed rate limiting
+mod rate_limit_new; // Distributed Redis-backed rate limiting
 mod read_after_write;
-mod actor_store;  // Must come after read_after_write (uses its types)
 mod sequencer;
 mod server;
 mod service_auth;
@@ -88,13 +87,22 @@ async fn main() -> PdsResult<()> {
             server::serve((*ctx).clone()).await?;
         }
 
-        Some(Commands::CreateAccount { email, handle, password, invite_code }) => {
-            cli::account::create_account(&ctx, &email, &handle, &password, invite_code.as_deref()).await?;
+        Some(Commands::CreateAccount {
+            email,
+            handle,
+            password,
+            invite_code,
+        }) => {
+            cli::account::create_account(&ctx, &email, &handle, &password, invite_code.as_deref())
+                .await?;
         }
 
         Some(Commands::MigrateOauth { did, yes, dry_run }) => {
             if !yes && !dry_run {
-                println!("WARNING: This will revoke all active JWT sessions for {}", did);
+                println!(
+                    "WARNING: This will revoke all active JWT sessions for {}",
+                    did
+                );
                 println!("The user will need to re-authenticate using OAuth 2.1");
                 print!("\nContinue? [y/N]: ");
                 use std::io::{self, Write};
@@ -136,12 +144,19 @@ async fn main() -> PdsResult<()> {
             println!("  Bulk Migration Summary");
             println!("════════════════════════════════════════════════════════");
             println!("Total users processed: {}", results.len());
-            println!("Successful migrations: {}", results.iter().filter(|r| r.success).count());
+            println!(
+                "Successful migrations: {}",
+                results.iter().filter(|r| r.success).count()
+            );
             println!("Skipped: {}", results.iter().filter(|r| !r.success).count());
             println!("════════════════════════════════════════════════════════\n");
         }
 
-        Some(Commands::Backup { output, compress, all }) => {
+        Some(Commands::Backup {
+            output,
+            compress,
+            all,
+        }) => {
             cli::backup::backup_database(&ctx, &output, compress, all).await?;
         }
 
@@ -149,12 +164,17 @@ async fn main() -> PdsResult<()> {
             cli::backup::restore_database(&ctx, &input, yes).await?;
         }
 
-        Some(Commands::GenerateDidKey { format, output, private }) => {
+        Some(Commands::GenerateDidKey {
+            format,
+            output,
+            private,
+        }) => {
             cli::keygen::generate_did_key(&format, output.as_deref(), private)?;
         }
 
         Some(Commands::GenerateServiceToken { aud, lifetime, lxm }) => {
-            cli::service_token::generate_service_token(&ctx, &aud, lifetime, lxm.as_deref()).await?;
+            cli::service_token::generate_service_token(&ctx, &aud, lifetime, lxm.as_deref())
+                .await?;
         }
 
         Some(Commands::HealthCheck { format }) => {

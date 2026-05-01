@@ -72,12 +72,8 @@ pub async fn backup_database(
         }
 
         // Show file sizes
-        let original_size = fs::metadata(db_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let backup_size = fs::metadata(&output_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let original_size = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        let backup_size = fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
 
         println!(
             "Original: {} bytes, Backup: {} bytes",
@@ -160,10 +156,7 @@ pub async fn restore_database(
         let backup_path = db_path.with_extension("db.backup");
         println!("Creating safety backup: {}", backup_path.display());
         fs::copy(db_path, &backup_path).map_err(|e| {
-            crate::error::PdsError::Internal(format!(
-                "Failed to create safety backup: {}",
-                e
-            ))
+            crate::error::PdsError::Internal(format!("Failed to create safety backup: {}", e))
         })?;
     }
 

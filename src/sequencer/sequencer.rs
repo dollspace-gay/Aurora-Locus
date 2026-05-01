@@ -55,7 +55,11 @@ impl Sequencer {
     }
 
     /// Create a new sequencer with relay client for federation
-    pub fn with_relay(db: SqlitePool, config: SequencerConfig, relay_client: Option<Arc<Mutex<RelayClient>>>) -> Self {
+    pub fn with_relay(
+        db: SqlitePool,
+        config: SequencerConfig,
+        relay_client: Option<Arc<Mutex<RelayClient>>>,
+    ) -> Self {
         Self {
             db,
             config,
@@ -69,11 +73,13 @@ impl Sequencer {
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode commit event: {}", e)))?;
 
-        let seq = self.insert_event(&evt.repo, EventType::Commit, event_bytes)
+        let seq = self
+            .insert_event(&evt.repo, EventType::Commit, event_bytes)
             .await?;
 
         // Publish to relay if configured
-        self.publish_to_relay("commit", &evt.repo, seq, Some(&evt.commit)).await;
+        self.publish_to_relay("commit", &evt.repo, seq, Some(&evt.commit))
+            .await;
 
         Ok(seq)
     }
@@ -84,7 +90,8 @@ impl Sequencer {
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode sync event: {}", e)))?;
 
-        let seq = self.insert_event(&evt.did, EventType::Sync, event_bytes)
+        let seq = self
+            .insert_event(&evt.did, EventType::Sync, event_bytes)
             .await?;
 
         // Publish to relay if configured
@@ -98,7 +105,8 @@ impl Sequencer {
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode identity event: {}", e)))?;
 
-        let seq = self.insert_event(&evt.did, EventType::Identity, event_bytes)
+        let seq = self
+            .insert_event(&evt.did, EventType::Identity, event_bytes)
             .await?;
 
         // Publish to relay if configured
@@ -113,7 +121,8 @@ impl Sequencer {
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode account event: {}", e)))?;
 
-        let seq = self.insert_event(&evt.did, EventType::Account, event_bytes)
+        let seq = self
+            .insert_event(&evt.did, EventType::Account, event_bytes)
             .await?;
 
         // Publish to relay if configured
@@ -123,7 +132,12 @@ impl Sequencer {
     }
 
     /// Insert event into database
-    async fn insert_event(&self, did: &str, event_type: EventType, event: Vec<u8>) -> PdsResult<i64> {
+    async fn insert_event(
+        &self,
+        did: &str,
+        event_type: EventType,
+        event: Vec<u8>,
+    ) -> PdsResult<i64> {
         let now = Utc::now().to_rfc3339();
 
         let result = sqlx::query(
@@ -152,12 +166,18 @@ impl Sequencer {
 
     /// Get current maximum sequence number
     pub async fn current_seq(&self) -> PdsResult<Option<i64>> {
+        // `MAX(seq)` over an empty (or fully-invalidated) `repo_seq` returns
+        // NULL — SQL aggregate behaviour. Request `Option<i64>` explicitly so
+        // sqlx maps that NULL onto `None` instead of falling back through
+        // `.try_get(...).ok()`, which can produce `Some(0)` on some sqlx
+        // versions when decoding NULL into a non-Option `i64`.
         let result = sqlx::query("SELECT MAX(seq) as max_seq FROM repo_seq WHERE invalidated = 0")
             .fetch_one(&self.db)
             .await
             .map_err(PdsError::Database)?;
 
-        Ok(result.try_get("max_seq").ok())
+        let max_seq: Option<i64> = result.try_get("max_seq").map_err(PdsError::Database)?;
+        Ok(max_seq)
     }
 
     /// Get next event after cursor (single event)
@@ -223,9 +243,7 @@ impl Sequencer {
         latest_seq: Option<i64>,
         limit: Option<i64>,
     ) -> PdsResult<Vec<SeqEvent>> {
-        let limit = limit
-            .unwrap_or(500)
-            .min(self.config.max_query_limit);
+        let limit = limit.unwrap_or(500).min(self.config.max_query_limit);
 
         let mut query_str = String::from(
             "SELECT seq, did, event_type, event, invalidated, sequenced_at FROM repo_seq WHERE invalidated = 0"
@@ -289,8 +307,9 @@ impl Sequencer {
 
         match event_type {
             EventType::Commit => {
-                let evt: CommitEvent = serde_cbor::from_slice(&row.event)
-                    .map_err(|e| PdsError::Internal(format!("Failed to decode commit event: {}", e)))?;
+                let evt: CommitEvent = serde_cbor::from_slice(&row.event).map_err(|e| {
+                    PdsError::Internal(format!("Failed to decode commit event: {}", e))
+                })?;
                 Ok(Some(SeqEvent::Commit {
                     seq: row.seq,
                     time,
@@ -298,8 +317,9 @@ impl Sequencer {
                 }))
             }
             EventType::Sync => {
-                let evt: SyncEvent = serde_cbor::from_slice(&row.event)
-                    .map_err(|e| PdsError::Internal(format!("Failed to decode sync event: {}", e)))?;
+                let evt: SyncEvent = serde_cbor::from_slice(&row.event).map_err(|e| {
+                    PdsError::Internal(format!("Failed to decode sync event: {}", e))
+                })?;
                 Ok(Some(SeqEvent::Sync {
                     seq: row.seq,
                     time,
@@ -307,8 +327,9 @@ impl Sequencer {
                 }))
             }
             EventType::Identity => {
-                let evt: IdentityEvent = serde_cbor::from_slice(&row.event)
-                    .map_err(|e| PdsError::Internal(format!("Failed to decode identity event: {}", e)))?;
+                let evt: IdentityEvent = serde_cbor::from_slice(&row.event).map_err(|e| {
+                    PdsError::Internal(format!("Failed to decode identity event: {}", e))
+                })?;
                 Ok(Some(SeqEvent::Identity {
                     seq: row.seq,
                     time,
@@ -316,8 +337,9 @@ impl Sequencer {
                 }))
             }
             EventType::Account => {
-                let evt: AccountEvent = serde_cbor::from_slice(&row.event)
-                    .map_err(|e| PdsError::Internal(format!("Failed to decode account event: {}", e)))?;
+                let evt: AccountEvent = serde_cbor::from_slice(&row.event).map_err(|e| {
+                    PdsError::Internal(format!("Failed to decode account event: {}", e))
+                })?;
                 Ok(Some(SeqEvent::Account {
                     seq: row.seq,
                     time,
@@ -328,7 +350,13 @@ impl Sequencer {
     }
 
     /// Publish event to relay (non-blocking, errors logged but not propagated)
-    async fn publish_to_relay(&self, event_type: &str, did: &str, seq: i64, commit_cid: Option<&str>) {
+    async fn publish_to_relay(
+        &self,
+        event_type: &str,
+        did: &str,
+        seq: i64,
+        commit_cid: Option<&str>,
+    ) {
         if let Some(ref relay_client) = self.relay_client {
             use crate::federation::relay::RelayEvent;
 
@@ -344,9 +372,18 @@ impl Sequencer {
             let event_type_owned = event_type.to_string();
             tokio::spawn(async move {
                 if let Err(e) = client.lock().await.publish_event(&relay_event).await {
-                    tracing::warn!("Failed to publish event to relay: {} seq={}: {}", event_type_owned, relay_event.seq, e);
+                    tracing::warn!(
+                        "Failed to publish event to relay: {} seq={}: {}",
+                        event_type_owned,
+                        relay_event.seq,
+                        e
+                    );
                 } else {
-                    tracing::debug!("Event published to relay: {} seq={}", event_type_owned, relay_event.seq);
+                    tracing::debug!(
+                        "Event published to relay: {} seq={}",
+                        event_type_owned,
+                        relay_event.seq
+                    );
                 }
             });
         }
@@ -465,7 +502,10 @@ mod tests {
         }
 
         // Query range
-        let events = sequencer.request_seq_range(Some(2), Some(4), None).await.unwrap();
+        let events = sequencer
+            .request_seq_range(Some(2), Some(4), None)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 2); // seq 3 and 4
     }
 }

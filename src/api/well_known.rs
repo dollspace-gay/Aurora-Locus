@@ -1,11 +1,7 @@
+use crate::identity::did_document::{DidDocument, Service, VerificationMethod};
 /// Well-known endpoints
 /// Handles /.well-known/* endpoints for DID resolution and other standards
-use crate::{
-    context::AppContext,
-    crypto::plc::PlcSigner,
-    error::PdsResult,
-};
-use atproto::did_doc::{DidDocument, Service, VerificationMethod};
+use crate::{context::AppContext, crypto::plc::PlcSigner, error::PdsResult};
 use axum::{
     extract::State,
     http::{header, StatusCode},

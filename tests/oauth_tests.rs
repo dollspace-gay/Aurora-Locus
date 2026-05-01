@@ -1,10 +1,13 @@
-/// OAuth 2.1 Unit Tests
-///
-/// Tests for OAuth token validation, scope enforcement, and security features.
+//! OAuth 2.1 Unit Tests.
+//!
+//! Tests for OAuth token validation, scope enforcement, and security features.
 
 #[cfg(test)]
 mod oauth_token_validation {
-    use aurora_locus::oauth::{AtProtoScope, ScopeSet, require_scope, require_any_scope, require_all_scopes};
+    use aurora_locus::oauth::{
+        require_all_scopes, require_any_scope, require_scope, AtProtoScope, ScopeSet,
+    };
+    use std::str::FromStr;
 
     #[test]
     fn test_scope_set_parsing_single_scope() {
@@ -139,10 +142,7 @@ mod oauth_token_validation {
     #[test]
     fn test_require_all_scopes_success() {
         let token_scopes = "atproto:repo.create atproto:repo.update atproto:blob.upload";
-        let required = vec![
-            AtProtoScope::RepoCreate,
-            AtProtoScope::RepoUpdate,
-        ];
+        let required = vec![AtProtoScope::RepoCreate, AtProtoScope::RepoUpdate];
         let result = require_all_scopes(token_scopes, &required);
 
         assert!(result.is_ok());
@@ -151,10 +151,7 @@ mod oauth_token_validation {
     #[test]
     fn test_require_all_scopes_failure_missing_one() {
         let token_scopes = "atproto:repo.create";
-        let required = vec![
-            AtProtoScope::RepoCreate,
-            AtProtoScope::RepoUpdate,
-        ];
+        let required = vec![AtProtoScope::RepoCreate, AtProtoScope::RepoUpdate];
         let result = require_all_scopes(token_scopes, &required);
 
         assert!(result.is_err());
@@ -230,7 +227,7 @@ mod oauth_token_validation {
 
         // Admin scopes should not be included in write wildcard
         assert!(!scopes.has_scope(&AtProtoScope::AdminAll));
-        assert!(!scopes.has_scope(&AtProtoScope::AdminManageAccounts));
+        assert!(!scopes.has_scope(&AtProtoScope::AdminServer));
     }
 
     #[test]
@@ -240,7 +237,7 @@ mod oauth_token_validation {
 
         // atproto:* should include admin scopes
         assert!(scopes.has_scope(&AtProtoScope::AdminAll));
-        assert!(scopes.has_scope(&AtProtoScope::AdminManageAccounts));
+        assert!(scopes.has_scope(&AtProtoScope::AdminServer));
     }
 }
 
@@ -415,8 +412,8 @@ mod oauth_security {
 
 #[cfg(test)]
 mod pkce_verification {
-    use sha2::{Digest, Sha256};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use sha2::{Digest, Sha256};
 
     /// Test helper to generate PKCE code_challenge from code_verifier
     fn generate_code_challenge(code_verifier: &str) -> String {
@@ -434,7 +431,9 @@ mod pkce_verification {
 
         // Challenge should be base64url encoded SHA-256 hash (43 characters)
         assert_eq!(challenge.len(), 43);
-        assert!(challenge.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+        assert!(challenge
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
@@ -584,7 +583,9 @@ mod backward_compatibility {
 
         // Each part should be base64
         for part in parts {
-            assert!(part.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+            assert!(part
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
         }
     }
 

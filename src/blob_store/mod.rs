@@ -4,6 +4,7 @@
 //! Supports multiple backend implementations (disk, S3, etc.)
 
 pub mod disk;
+pub mod mime;
 pub mod models;
 pub mod quarantine;
 // Temporarily disabled due to AWS SDK build issues on Windows
@@ -71,9 +72,7 @@ impl Default for BlobStorageConfig {
 #[derive(Debug, Clone)]
 pub enum BlobBackendType {
     /// Store blobs on local disk
-    Disk {
-        location: PathBuf,
-    },
+    Disk { location: PathBuf },
 
     /// Store blobs in S3-compatible storage
     #[allow(dead_code)]

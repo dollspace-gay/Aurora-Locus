@@ -65,11 +65,8 @@ impl BackupConfig {
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()
                 .unwrap_or(30),
-            compression: std::env::var("BACKUP_COMPRESSION")
-                .unwrap_or_else(|_| "gzip".to_string()),
-            script_path: std::env::var("BACKUP_SCRIPT_PATH")
-                .ok()
-                .map(PathBuf::from),
+            compression: std::env::var("BACKUP_COMPRESSION").unwrap_or_else(|_| "gzip".to_string()),
+            script_path: std::env::var("BACKUP_SCRIPT_PATH").ok().map(PathBuf::from),
         }
     }
 }
@@ -223,11 +220,17 @@ pub fn list_backups(backup_dir: &Path) -> PdsResult<Vec<BackupMetadata>> {
     for entry in std::fs::read_dir(backup_dir)
         .map_err(|e| PdsError::Internal(format!("Failed to read backup dir: {}", e)))?
     {
-        let entry = entry
-            .map_err(|e| PdsError::Internal(format!("Failed to read dir entry: {}", e)))?;
+        let entry =
+            entry.map_err(|e| PdsError::Internal(format!("Failed to read dir entry: {}", e)))?;
         let path = entry.path();
 
-        if path.is_dir() && path.file_name().unwrap_or_default().to_string_lossy().starts_with("backup_") {
+        if path.is_dir()
+            && path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with("backup_")
+        {
             // Try to read manifest
             let manifest_path = path.join("manifest.json");
             if manifest_path.exists() {
@@ -266,8 +269,8 @@ pub fn list_backups(backup_dir: &Path) -> PdsResult<Vec<BackupMetadata>> {
         }
     }
 
-    // Sort by timestamp (newest first)
-    backups.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    // Sort by timestamp (newest first).
+    backups.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
 
     Ok(backups)
 }
@@ -321,7 +324,7 @@ mod tests {
     #[test]
     fn test_backup_config_default() {
         let config = BackupConfig::default();
-        assert_eq!(config.enabled, false);
+        assert!(!config.enabled);
         assert_eq!(config.interval_hours, 24);
         assert_eq!(config.retain_days, 30);
         assert_eq!(config.compression, "gzip");
@@ -336,8 +339,10 @@ mod tests {
 
     #[test]
     fn test_is_backup_due_no_previous_backup() {
-        let mut config = BackupConfig::default();
-        config.enabled = true;
+        let config = BackupConfig {
+            enabled: true,
+            ..BackupConfig::default()
+        };
         let scheduler = BackupScheduler::new(config);
         assert!(scheduler.is_backup_due());
     }

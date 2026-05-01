@@ -20,7 +20,7 @@ pub struct SeqRow {
     pub seq: i64,
     pub did: String,
     pub event_type: String,
-    pub event: Vec<u8>,  // CBOR-encoded
+    pub event: Vec<u8>, // CBOR-encoded
     pub invalidated: bool,
     pub sequenced_at: DateTime<Utc>,
 }
