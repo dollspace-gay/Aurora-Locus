@@ -2,11 +2,16 @@
   "next_display_id": 1,
   "next_comment_id": 1,
   "display_id_map": {},
-  "locks": {},
+  "locks": {
+    "15": {
+      "agent_id": "vW4n",
+      "claimed_at": "2026-05-01T01:29:46.437589855Z"
+    }
+  },
   "issues": {},
   "watermark": {
-    "timestamp": "2026-05-01T01:29:26.586354309Z",
+    "timestamp": "2026-05-01T01:29:46.437589855Z",
     "agent_id": "vW4n",
-    "agent_seq": 28
+    "agent_seq": 29
   }
 }
