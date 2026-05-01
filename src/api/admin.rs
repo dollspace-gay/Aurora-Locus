@@ -24,6 +24,10 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.listAccounts", get(get_users)) // Alias for frontend compatibility
         .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
         .route(
+            "/xrpc/com.atproto.admin.searchAccounts",
+            get(search_accounts),
+        )
+        .route(
             "/xrpc/com.atproto.admin.getAccountInfo",
             get(get_account_info),
         )
@@ -1771,6 +1775,86 @@ async fn get_account_infos(
 struct GetAccountInfoQuery {
     /// DID of the account to look up
     did: String,
+}
+
+#[derive(Deserialize)]
+struct SearchAccountsQuery {
+    /// Optional email to filter by (exact, case-insensitive)
+    #[serde(default)]
+    email: Option<String>,
+    /// Pagination cursor (opaque to clients; server treats it as the
+    /// last DID returned by the previous page)
+    #[serde(default)]
+    cursor: Option<String>,
+    /// Page size, 1-100, default 50 per lexicon
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct SearchAccountsResponse {
+    /// Required per lexicon — always present, possibly empty
+    accounts: Vec<AccountInfo>,
+    /// Present only when more pages remain
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+}
+
+/// Search accounts by email with cursor pagination
+/// (lexicon `com.atproto.admin.searchAccounts`).
+///
+/// Reuses the `build_account_info` helper with `get_account_info` and
+/// `get_account_infos` so the `accountView` shape stays consistent across
+/// all three endpoints. Cursor pagination uses the trailing DID as an
+/// opaque cursor; the same scheme will be reused by Phase 1.10 (#65) when
+/// it backfills pagination on `listAccounts` and `getInviteCodes`.
+async fn search_accounts(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<SearchAccountsQuery>,
+) -> Result<Json<SearchAccountsResponse>, (StatusCode, String)> {
+    // Lexicon: limit is integer 1-100, default 50.
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and 100".to_string(),
+        ));
+    }
+
+    // Fetch limit+1 to detect whether more pages remain.
+    let rows = ctx
+        .account_manager
+        .search_accounts(
+            query.email.as_deref(),
+            query.cursor.as_deref(),
+            limit + 1,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let has_more = rows.len() as i64 > limit;
+    let page: Vec<_> = rows.into_iter().take(limit as usize).collect();
+    let next_cursor = if has_more {
+        page.last().map(|a| a.did.clone())
+    } else {
+        None
+    };
+
+    let mut accounts = Vec::with_capacity(page.len());
+    for actor in &page {
+        // Reuse the shared accountView builder. Errors here mean the
+        // account row was deleted between the search and the per-DID
+        // lookup — extremely rare, but skip rather than fail the page.
+        if let Ok(info) = build_account_info(&ctx, &actor.did).await {
+            accounts.push(info);
+        }
+    }
+
+    Ok(Json(SearchAccountsResponse {
+        accounts,
+        cursor: next_cursor,
+    }))
 }
 
 /// Get details about a single account (lexicon `com.atproto.admin.getAccountInfo`).
@@ -4492,5 +4576,173 @@ mod tests {
         };
         let result = disable_invite_codes(State(ctx), admin_test_auth(), Json(req)).await;
         assert_eq!(result.unwrap(), StatusCode::OK);
+    }
+
+    /// Insert minimal actor+account rows directly into the test database.
+    /// Bypasses `account_manager.create_account` which requires PLC
+    /// registration over the network. Used only for endpoint tests that
+    /// need real DB rows to query against.
+    async fn seed_test_account(ctx: &AppContext, did: &str, handle: &str, email: Option<&str>) {
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at, takedown_ref, deactivated_at, delete_after)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
+        )
+        .bind(did)
+        .bind(handle)
+        .bind(now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled)
+             VALUES (?1, ?2, 'test-hash', NULL, 0)",
+        )
+        .bind(did)
+        .bind(email)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_search_accounts_rejects_out_of_range_limit() {
+        let ctx = create_test_context().await;
+        let result = search_accounts(
+            State(ctx),
+            admin_test_auth(),
+            Query(SearchAccountsQuery {
+                email: None,
+                cursor: None,
+                limit: Some(101),
+            }),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("limit > 100 should be rejected"),
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("limit"));
+
+        let ctx2 = create_test_context().await;
+        let result2 = search_accounts(
+            State(ctx2),
+            admin_test_auth(),
+            Query(SearchAccountsQuery {
+                email: None,
+                cursor: None,
+                limit: Some(0),
+            }),
+        )
+        .await;
+        let err2 = match result2 {
+            Err(e) => e,
+            Ok(_) => panic!("limit < 1 should be rejected"),
+        };
+        assert_eq!(err2.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_search_accounts_empty_db_returns_empty_no_cursor() {
+        let ctx = create_test_context().await;
+        let resp = search_accounts(
+            State(ctx),
+            admin_test_auth(),
+            Query(SearchAccountsQuery {
+                email: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(resp.accounts.is_empty());
+        assert!(resp.cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_search_accounts_filters_by_email_case_insensitive() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:aaaa", "alice.test", Some("Alice@Example.com")).await;
+        seed_test_account(&ctx, "did:plc:bbbb", "bob.test", Some("bob@example.com")).await;
+        seed_test_account(&ctx, "did:plc:cccc", "carol.test", None).await;
+
+        // Case-insensitive match should find Alice regardless of casing.
+        let resp = search_accounts(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Query(SearchAccountsQuery {
+                email: Some("alice@example.com".to_string()),
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.accounts.len(), 1);
+        assert_eq!(resp.accounts[0].did, "did:plc:aaaa");
+        assert!(resp.cursor.is_none());
+
+        // Non-matching email returns empty.
+        let resp = search_accounts(
+            State(ctx),
+            admin_test_auth(),
+            Query(SearchAccountsQuery {
+                email: Some("nobody@example.com".to_string()),
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(resp.accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_accounts_paginates_with_cursor() {
+        let ctx = create_test_context().await;
+        // Three accounts, ordered did:plc:a < did:plc:b < did:plc:c.
+        seed_test_account(&ctx, "did:plc:a", "a.test", Some("a@x")).await;
+        seed_test_account(&ctx, "did:plc:b", "b.test", Some("b@x")).await;
+        seed_test_account(&ctx, "did:plc:c", "c.test", Some("c@x")).await;
+
+        // Page size 2 → first page returns a, b with cursor = "did:plc:b".
+        let page1 = search_accounts(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Query(SearchAccountsQuery {
+                email: None,
+                cursor: None,
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page1.accounts.len(), 2);
+        assert_eq!(page1.accounts[0].did, "did:plc:a");
+        assert_eq!(page1.accounts[1].did, "did:plc:b");
+        assert_eq!(page1.cursor.as_deref(), Some("did:plc:b"));
+
+        // Second page picks up after the cursor; returns c, no further cursor.
+        let page2 = search_accounts(
+            State(ctx),
+            admin_test_auth(),
+            Query(SearchAccountsQuery {
+                email: None,
+                cursor: page1.cursor,
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page2.accounts.len(), 1);
+        assert_eq!(page2.accounts[0].did, "did:plc:c");
+        assert!(page2.cursor.is_none());
     }
 }

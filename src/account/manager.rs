@@ -2076,6 +2076,67 @@ impl AccountManager {
     /// Returns accounts ordered by DID for consistent pagination.
     /// Use the last DID as cursor for next page.
     /// Joins actor and account tables to get complete information.
+    /// Search accounts by email (case-insensitive exact match) with cursor
+    /// pagination ordered by `did`.
+    ///
+    /// Cursor opaqueness: the cursor value is the last `did` returned in the
+    /// previous page; callers should treat it as a black box. When
+    /// `email` is `None`, returns all accounts (matching the behavior
+    /// `searchAccounts` exposes when called without an email parameter).
+    pub async fn search_accounts(
+        &self,
+        email: Option<&str>,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> PdsResult<Vec<ActorAccount>> {
+        // Build SQL with optional email and cursor predicates so we don't run
+        // a join+filter when the caller only wants pagination.
+        let mut sql = String::from(
+            "SELECT
+                a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
+             FROM actor a
+             LEFT JOIN account ac ON a.did = ac.did
+             WHERE 1=1",
+        );
+        if email.is_some() {
+            sql.push_str(" AND LOWER(ac.email) = LOWER(?)");
+        }
+        if cursor.is_some() {
+            sql.push_str(" AND a.did > ?");
+        }
+        sql.push_str(" ORDER BY a.did LIMIT ?");
+
+        let mut q = sqlx::query(&sql);
+        if let Some(e) = email {
+            q = q.bind(e);
+        }
+        if let Some(c) = cursor {
+            q = q.bind(c);
+        }
+        q = q.bind(limit);
+
+        let rows = q.fetch_all(&self.db).await.map_err(PdsError::Database)?;
+
+        let mut accounts = Vec::new();
+        for row in rows {
+            accounts.push(ActorAccount {
+                did: row.get("did"),
+                handle: row.get("handle"),
+                created_at: row.get("created_at"),
+                takedown_ref: row.get("takedown_ref"),
+                deactivated_at: row.get("deactivated_at"),
+                delete_after: row.get("delete_after"),
+                email: row.get("email"),
+                password_hash: row.get("password_hash"),
+                email_confirmed_at: row.get("email_confirmed_at"),
+                invites_disabled: row.get("invites_disabled"),
+            });
+        }
+
+        Ok(accounts)
+    }
+
     pub async fn list_accounts(
         &self,
         cursor: Option<&str>,
