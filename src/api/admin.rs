@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Duration;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Build admin API routes
 pub fn routes() -> Router<AppContext> {
@@ -2058,78 +2058,355 @@ async fn get_account_info(
     }
 }
 
-#[derive(Deserialize)]
-struct UpdateSubjectStatusRequest {
-    subject: String, // DID or AT-URI
-    #[serde(default)]
-    action: String, // "suspend", "takedown", "restore"
-    #[serde(default)]
-    duration: Option<i64>, // Duration in seconds for temporary suspensions
+/// Polymorphic subject for `updateSubjectStatus` and `getSubjectStatus`.
+///
+/// Lexicon-conformant union of `com.atproto.admin.defs#repoRef`,
+/// `com.atproto.repo.strongRef`, and `com.atproto.admin.defs#repoBlobRef`,
+/// internally-tagged via the `$type` discriminator per the ATProto JSON
+/// convention. Phase 1.6 (#61) introduced this; the existing `SubjectRef`
+/// struct used by `getSubjectStatus`'s response is left in place since
+/// changing its shape would touch separate scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "$type")]
+// Variant names mirror the lexicon's union member names verbatim;
+// clippy's enum-variant-names lint flags the shared `Ref` postfix but
+// renaming would diverge from the spec namespace.
+#[allow(clippy::enum_variant_names)]
+enum SubjectUnion {
+    #[serde(rename = "com.atproto.admin.defs#repoRef")]
+    RepoRef { did: String },
+    #[serde(
+        rename = "com.atproto.repo.strongRef",
+        rename_all = "camelCase"
+    )]
+    StrongRef { uri: String, cid: String },
+    #[serde(
+        rename = "com.atproto.admin.defs#repoBlobRef",
+        rename_all = "camelCase"
+    )]
+    RepoBlobRef {
+        did: String,
+        cid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_uri: Option<String>,
+    },
 }
 
-/// Update subject status (unified moderation endpoint)
+/// Request shape for `com.atproto.admin.updateSubjectStatus` (Phase 1.6).
+///
+/// Replaces the legacy imperative `{subject: string, action, duration}`
+/// shape with the spec-conformant declarative status-patch model. Both
+/// `takedown` and `deactivated` are optional patches; restore is implicit
+/// via `takedown: {applied: false}`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSubjectStatusRequest {
+    subject: SubjectUnion,
+    #[serde(default)]
+    takedown: Option<StatusAttr>,
+    #[serde(default)]
+    deactivated: Option<StatusAttr>,
+}
+
+/// Response shape for `com.atproto.admin.updateSubjectStatus`.
+///
+/// Per the lexicon: subject (required) plus an optional `takedown` echoed
+/// back. The lexicon does *not* echo `deactivated` in the output — we
+/// match the spec exactly.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSubjectStatusResponse {
+    subject: SubjectUnion,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    takedown: Option<StatusAttr>,
+}
+
+/// Update the service-specific admin status of a subject (lexicon
+/// `com.atproto.admin.updateSubjectStatus`).
+///
+/// Phase 1.6 (#61) replaced the imperative-action model with the
+/// declarative status-patch model per spec. Subject dispatch:
+/// - `repoRef`: account-level. Both `takedown` and `deactivated` patches
+///   are honored, mapped to `account_manager` setters.
+/// - `repoBlobRef`: blob-level. `takedown` is honored via `BlobQuarantine`;
+///   `deactivated` is rejected (400 InvalidRequest) since it isn't
+///   applicable to blobs.
+/// - `strongRef`: record-level. `takedown` returns 501 (no setter exists
+///   yet — tracked under a follow-up); `deactivated` is rejected (400
+///   InvalidRequest) since records aren't a deactivable concept.
 async fn update_subject_status(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<UpdateSubjectStatusRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::admin::moderation::{ApplyActionParams, ModerationAction};
+) -> Result<Json<UpdateSubjectStatusResponse>, axum::response::Response> {
+    use axum::response::IntoResponse;
 
-    // Extract DID from subject (handle both DID and AT-URI)
-    let did = if req.subject.starts_with("did:") {
-        req.subject.clone()
-    } else if req.subject.starts_with("at://") {
-        // Extract DID from AT-URI (format: at://did:plc:xyz/...)
-        req.subject
-            .trim_start_matches("at://")
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .to_string()
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid subject format".to_string(),
-        ));
-    };
+    let UpdateSubjectStatusRequest {
+        subject,
+        takedown,
+        deactivated,
+    } = req;
 
-    let action = match req.action.as_str() {
-        "suspend" => ModerationAction::Suspend,
-        "takedown" => ModerationAction::Takedown,
-        "restore" => {
-            // For restore, we reverse existing moderation actions
-            // This is a simplified implementation - in production you'd want to track specific actions to reverse
-            return Ok(Json(serde_json::json!({
-                "success": true,
-                "did": did,
-                "action": "restore",
-                "message": "To restore, use the reverse_action endpoint with the specific moderation_id"
-            })));
-        }
-        _ => return Err((StatusCode::BAD_REQUEST, "Invalid action".to_string())),
-    };
-
-    let duration = req.duration.map(Duration::seconds);
-    let reason = format!("Admin action: {}", req.action);
-
-    ctx.moderation_manager
-        .apply_action(ApplyActionParams {
-            did: &did,
-            action,
-            reason: &reason,
-            moderated_by: &auth.did,
-            expires_in: duration,
-            report_id: None,
-            notes: None,
-        })
+    let response_takedown = match &subject {
+        SubjectUnion::RepoRef { did } => apply_account_status(
+            &ctx,
+            &auth,
+            did,
+            takedown.as_ref(),
+            deactivated.as_ref(),
+        )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|(s, m)| (s, m).into_response())?,
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": did,
-        "action": req.action,
-    })))
+        SubjectUnion::RepoBlobRef { did, cid, .. } => {
+            // Blobs don't have a deactivation concept — reject so the
+            // caller learns their patch wasn't silently dropped.
+            if deactivated.is_some() {
+                return Err(xrpc_invalid_request_error(
+                    "deactivated patch is not applicable to blob subjects; \
+                     only takedown applies to blobs",
+                ));
+            }
+            apply_blob_status(&ctx, &auth, did, cid, takedown.as_ref()).await?
+        }
+
+        SubjectUnion::StrongRef { .. } => {
+            // Same reasoning: records aren't deactivable as a concept.
+            // Reject deactivated before falling through to the takedown
+            // 501 so the caller gets a precise error.
+            if deactivated.is_some() {
+                return Err(xrpc_invalid_request_error(
+                    "deactivated patch is not applicable to record subjects; \
+                     only takedown applies to records",
+                ));
+            }
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                "Record-level (strongRef) subject takedown is not yet implemented; \
+                 the actor-store record.takedown_ref column exists but has no setter.",
+            )
+                .into_response());
+        }
+    };
+
+    Ok(Json(UpdateSubjectStatusResponse {
+        subject,
+        takedown: response_takedown,
+    }))
+}
+
+/// Build a structured XRPC `InvalidRequest` 400 response per the atproto
+/// error convention `{"error": "InvalidRequest", "message": "..."}`.
+fn xrpc_invalid_request_error(message: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "InvalidRequest",
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
+/// Build a structured XRPC `BlobNotFound` 404 response.
+fn xrpc_blob_not_found_error(cid: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "BlobNotFound",
+            "message": format!("Blob not found: cid={}", cid),
+        })),
+    )
+        .into_response()
+}
+
+/// Apply takedown/deactivated patches to an account. Returns the post-patch
+/// takedown status to echo back in the response.
+async fn apply_account_status(
+    ctx: &AppContext,
+    auth: &AdminAuthContext,
+    did: &str,
+    takedown: Option<&StatusAttr>,
+    deactivated: Option<&StatusAttr>,
+) -> Result<Option<StatusAttr>, (StatusCode, String)> {
+    if let Some(td) = takedown {
+        if td.applied {
+            // Use the caller-supplied `ref` if present, otherwise generate one
+            // from the admin DID + timestamp so audit trails always have a key.
+            // Auto-generated when caller omits `ref` so the audit trail
+            // always has a key. Format puts timestamp first to keep the
+            // DID's colons unambiguous to downstream parsers.
+            let takedown_ref = td.ref_field.clone().unwrap_or_else(|| {
+                format!("auto-{}-{}", chrono::Utc::now().timestamp(), auth.did)
+            });
+            ctx.account_manager
+                .takedown_account(did, &takedown_ref)
+                .await
+                .map_err(map_account_err(did))?;
+        } else {
+            ctx.account_manager
+                .activate_account(did)
+                .await
+                .map_err(map_account_err(did))?;
+        }
+        let _ = ctx
+            .admin_role_manager
+            .log_action(
+                &auth.did,
+                if td.applied {
+                    "subject.takedown.apply"
+                } else {
+                    "subject.takedown.remove"
+                },
+                Some(did),
+                td.ref_field.as_deref(),
+                None,
+            )
+            .await;
+    }
+
+    if let Some(d) = deactivated {
+        if d.applied {
+            ctx.account_manager
+                .deactivate_account(did)
+                .await
+                .map_err(map_account_err(did))?;
+        } else {
+            ctx.account_manager
+                .reactivate_account(did)
+                .await
+                .map_err(map_account_err(did))?;
+        }
+        let _ = ctx
+            .admin_role_manager
+            .log_action(
+                &auth.did,
+                if d.applied {
+                    "subject.deactivate.apply"
+                } else {
+                    "subject.deactivate.remove"
+                },
+                Some(did),
+                d.ref_field.as_deref(),
+                None,
+            )
+            .await;
+    }
+
+    // Read fresh state so the response reflects post-patch reality.
+    let account = ctx
+        .account_manager
+        .get_account(did)
+        .await
+        .map_err(map_account_err(did))?;
+    Ok(Some(StatusAttr {
+        applied: account.takedown_ref.is_some(),
+        ref_field: account.takedown_ref,
+    }))
+}
+
+/// Apply a takedown patch to a blob via the existing quarantine machinery.
+///
+/// Verifies the blob exists in `BlobStore` before any quarantine action so
+/// that operating on a non-existent CID returns 404 BlobNotFound rather
+/// than silently no-op'ing through the idempotency path. Already-in-state
+/// cases (already quarantined when applying, not quarantined when removing)
+/// are treated as idempotent success.
+async fn apply_blob_status(
+    ctx: &AppContext,
+    auth: &AdminAuthContext,
+    did: &str,
+    cid: &str,
+    takedown: Option<&StatusAttr>,
+) -> Result<Option<StatusAttr>, axum::response::Response> {
+    use crate::blob_store::quarantine::{BlobQuarantine, QuarantineReason};
+    use axum::response::IntoResponse;
+
+    // Establish that the blob actually exists. `BlobStore::get_metadata`
+    // returns Some(_) iff the blob is registered; missing → 404.
+    let exists = ctx
+        .blob_store
+        .get_metadata(cid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?
+        .is_some();
+    if !exists {
+        return Err(xrpc_blob_not_found_error(cid));
+    }
+
+    let quarantine = BlobQuarantine::new(ctx.account_db.clone());
+
+    if let Some(td) = takedown {
+        if td.applied {
+            // Already-quarantined → Conflict from the quarantine layer →
+            // idempotent success since the desired post-state already obtains.
+            match quarantine
+                .quarantine_blob(
+                    cid,
+                    QuarantineReason::Other,
+                    td.ref_field.as_deref(),
+                    &auth.did,
+                    None,
+                )
+                .await
+            {
+                Ok(_) | Err(PdsError::Conflict(_)) => {}
+                Err(e) => {
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+                }
+            }
+        } else {
+            // Not-currently-quarantined → NotFound from `restore_blob` →
+            // idempotent success (operator wanted "ensure not quarantined";
+            // we already are).
+            match quarantine.restore_blob(cid, &auth.did).await {
+                Ok(_) | Err(PdsError::NotFound(_)) => {}
+                Err(e) => {
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+                }
+            }
+        }
+        let _ = ctx
+            .admin_role_manager
+            .log_action(
+                &auth.did,
+                if td.applied {
+                    "subject.takedown.apply"
+                } else {
+                    "subject.takedown.remove"
+                },
+                Some(did),
+                Some(cid),
+                None,
+            )
+            .await;
+    }
+
+    let is_taken_down = quarantine
+        .is_quarantined(cid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+    Ok(Some(StatusAttr {
+        applied: is_taken_down,
+        ref_field: takedown.and_then(|td| td.ref_field.clone()),
+    }))
+}
+
+/// Map an account-manager error to an HTTP status, matching the pattern
+/// established by other admin handlers (NotFound → 404, otherwise 500).
+fn map_account_err(did: &str) -> impl Fn(PdsError) -> (StatusCode, String) + '_ {
+    move |e| {
+        if matches!(e, PdsError::NotFound(_)) {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Account not found: {}", did),
+            )
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2173,11 +2450,16 @@ struct SubjectRef {
 }
 
 /// Status attribute with applied flag and optional reference
-#[derive(serde::Serialize)]
+/// (lexicon `com.atproto.admin.defs#statusAttr`).
+///
+/// Used on the request side for `updateSubjectStatus` (per Phase 1.6 / #61)
+/// and on the response side for both `getSubjectStatus` and
+/// `updateSubjectStatus`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StatusAttr {
     applied: bool,
-    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     ref_field: Option<String>,
 }
 
@@ -5252,6 +5534,484 @@ mod tests {
             .await
             .expect_err("missing recipient should 404");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // ---- Phase 1.6: updateSubjectStatus polymorphism ---------------------
+
+    #[test]
+    fn test_subject_union_repo_ref_round_trip() {
+        let json = serde_json::json!({
+            "$type": "com.atproto.admin.defs#repoRef",
+            "did": "did:plc:abc"
+        });
+        let parsed: SubjectUnion = serde_json::from_value(json.clone()).unwrap();
+        match &parsed {
+            SubjectUnion::RepoRef { did } => assert_eq!(did, "did:plc:abc"),
+            _ => panic!("expected RepoRef"),
+        }
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(serialized, json);
+    }
+
+    #[test]
+    fn test_subject_union_strong_ref_round_trip() {
+        let json = serde_json::json!({
+            "$type": "com.atproto.repo.strongRef",
+            "uri": "at://did:plc:abc/app.bsky.feed.post/xyz",
+            "cid": "bafyabc"
+        });
+        let parsed: SubjectUnion = serde_json::from_value(json.clone()).unwrap();
+        match &parsed {
+            SubjectUnion::StrongRef { uri, cid } => {
+                assert_eq!(uri, "at://did:plc:abc/app.bsky.feed.post/xyz");
+                assert_eq!(cid, "bafyabc");
+            }
+            _ => panic!("expected StrongRef"),
+        }
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn test_subject_union_repo_blob_ref_round_trip() {
+        let json = serde_json::json!({
+            "$type": "com.atproto.admin.defs#repoBlobRef",
+            "did": "did:plc:abc",
+            "cid": "bafyblob",
+            "recordUri": "at://did:plc:abc/app.bsky.feed.post/xyz"
+        });
+        let parsed: SubjectUnion = serde_json::from_value(json.clone()).unwrap();
+        match &parsed {
+            SubjectUnion::RepoBlobRef {
+                did,
+                cid,
+                record_uri,
+            } => {
+                assert_eq!(did, "did:plc:abc");
+                assert_eq!(cid, "bafyblob");
+                assert_eq!(record_uri.as_deref(), Some("at://did:plc:abc/app.bsky.feed.post/xyz"));
+            }
+            _ => panic!("expected RepoBlobRef"),
+        }
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn test_subject_union_rejects_missing_type_discriminator() {
+        let json = serde_json::json!({"did": "did:plc:abc"});
+        let result: Result<SubjectUnion, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_status_attr_round_trip() {
+        let json = serde_json::json!({"applied": true, "ref": "ticket-1234"});
+        let parsed: StatusAttr = serde_json::from_value(json).unwrap();
+        assert!(parsed.applied);
+        assert_eq!(parsed.ref_field.as_deref(), Some("ticket-1234"));
+
+        let json_no_ref = serde_json::json!({"applied": false});
+        let parsed: StatusAttr = serde_json::from_value(json_no_ref).unwrap();
+        assert!(!parsed.applied);
+        assert!(parsed.ref_field.is_none());
+    }
+
+    /// Helper: read takedown_ref off the actor table.
+    async fn account_takedown_ref(ctx: &AppContext, did: &str) -> Option<String> {
+        use sqlx::Row;
+        sqlx::query("SELECT takedown_ref FROM actor WHERE did = ?")
+            .bind(did)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// Helper: read deactivated_at off the actor table.
+    async fn account_deactivated(ctx: &AppContext, did: &str) -> bool {
+        use sqlx::Row;
+        let row: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query("SELECT deactivated_at FROM actor WHERE did = ?")
+                .bind(did)
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap()
+                .get(0);
+        row.is_some()
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_takedown_account() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:victim", "victim.test", None).await;
+
+        let req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::RepoRef {
+                did: "did:plc:victim".to_string(),
+            },
+            takedown: Some(StatusAttr {
+                applied: true,
+                ref_field: Some("ticket-99".to_string()),
+            }),
+            deactivated: None,
+        };
+        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        // Echoes back the subject and the post-patch takedown state.
+        match resp.subject {
+            SubjectUnion::RepoRef { did } => assert_eq!(did, "did:plc:victim"),
+            _ => panic!("expected RepoRef"),
+        }
+        let td = resp.takedown.expect("takedown should be echoed");
+        assert!(td.applied);
+        assert_eq!(td.ref_field.as_deref(), Some("ticket-99"));
+        assert_eq!(
+            account_takedown_ref(&ctx, "did:plc:victim").await.as_deref(),
+            Some("ticket-99")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_restores_account_via_applied_false() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:revived", "revived.test", None).await;
+        // Pre-takedown the account.
+        ctx.account_manager
+            .takedown_account("did:plc:revived", "ticket-old")
+            .await
+            .unwrap();
+        assert!(account_takedown_ref(&ctx, "did:plc:revived").await.is_some());
+
+        // Patch with applied=false -> implicit restore per spec.
+        let req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::RepoRef {
+                did: "did:plc:revived".to_string(),
+            },
+            takedown: Some(StatusAttr {
+                applied: false,
+                ref_field: None,
+            }),
+            deactivated: None,
+        };
+        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        let td = resp.takedown.expect("takedown should be echoed");
+        assert!(!td.applied);
+        assert!(td.ref_field.is_none());
+        assert!(account_takedown_ref(&ctx, "did:plc:revived").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_deactivates_account() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:dorm", "dorm.test", None).await;
+
+        let req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::RepoRef {
+                did: "did:plc:dorm".to_string(),
+            },
+            takedown: None,
+            deactivated: Some(StatusAttr {
+                applied: true,
+                ref_field: None,
+            }),
+        };
+        let _ = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+            .await
+            .unwrap();
+        assert!(account_deactivated(&ctx, "did:plc:dorm").await);
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_record_returns_501() {
+        let ctx = create_test_context().await;
+        let req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::StrongRef {
+                uri: "at://did:plc:foo/app.bsky.feed.post/xyz".to_string(),
+                cid: "bafyabc".to_string(),
+            },
+            takedown: Some(StatusAttr {
+                applied: true,
+                ref_field: None,
+            }),
+            deactivated: None,
+        };
+        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("strongRef should return 501 until record-level setter exists");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("Record-level"));
+    }
+
+    /// Seed a blob row directly into `blob_metadata` so the existence
+    /// check in `apply_blob_status` (`BlobStore::get_metadata`) finds it.
+    /// Bypasses the upload path.
+    async fn seed_test_blob(ctx: &AppContext, cid: &str, did: &str) {
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at)
+             VALUES (?, 'application/octet-stream', 0, ?, ?)",
+        )
+        .bind(cid)
+        .bind(did)
+        .bind(chrono::Utc::now())
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_takedown_blob() {
+        let ctx = create_test_context().await;
+        seed_test_blob(&ctx, "bafyblob01", "did:plc:owner").await;
+
+        let req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::RepoBlobRef {
+                did: "did:plc:owner".to_string(),
+                cid: "bafyblob01".to_string(),
+                record_uri: None,
+            },
+            takedown: Some(StatusAttr {
+                applied: true,
+                ref_field: Some("legal-1".to_string()),
+            }),
+            deactivated: None,
+        };
+        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        let td = resp.takedown.expect("takedown should be echoed");
+        assert!(td.applied);
+
+        // Verify via the quarantine system directly.
+        use crate::blob_store::quarantine::BlobQuarantine;
+        let quarantine = BlobQuarantine::new(ctx.account_db.clone());
+        assert!(quarantine.is_quarantined("bafyblob01").await.unwrap());
+    }
+
+    /// Helper: read body bytes and parse JSON for a Response error.
+    async fn read_xrpc_error(resp: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("error body must be JSON");
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_blob_deactivated_returns_400() {
+        let ctx = create_test_context().await;
+        seed_test_blob(&ctx, "bafyblob02", "did:plc:owner").await;
+
+        let req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::RepoBlobRef {
+                did: "did:plc:owner".to_string(),
+                cid: "bafyblob02".to_string(),
+                record_uri: None,
+            },
+            takedown: None,
+            deactivated: Some(StatusAttr {
+                applied: true,
+                ref_field: None,
+            }),
+        };
+        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("blob + deactivated should reject");
+        let (status, body) = read_xrpc_error(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "InvalidRequest");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("not applicable to blob"));
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_record_deactivated_returns_400() {
+        let ctx = create_test_context().await;
+        let req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::StrongRef {
+                uri: "at://did:plc:foo/app.bsky.feed.post/xyz".to_string(),
+                cid: "bafyabc".to_string(),
+            },
+            takedown: None,
+            deactivated: Some(StatusAttr {
+                applied: true,
+                ref_field: None,
+            }),
+        };
+        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("record + deactivated should reject");
+        let (status, body) = read_xrpc_error(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "InvalidRequest");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("not applicable to record"));
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_blob_not_found_returns_404() {
+        let ctx = create_test_context().await;
+        // Do not seed; the blob doesn't exist.
+
+        let req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::RepoBlobRef {
+                did: "did:plc:owner".to_string(),
+                cid: "bafynonexistent".to_string(),
+                record_uri: None,
+            },
+            takedown: Some(StatusAttr {
+                applied: true,
+                ref_field: None,
+            }),
+            deactivated: None,
+        };
+        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("non-existent blob should 404");
+        let (status, body) = read_xrpc_error(resp).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "BlobNotFound");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("bafynonexistent"));
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_restore_non_quarantined_blob_idempotent() {
+        let ctx = create_test_context().await;
+        seed_test_blob(&ctx, "bafyblob03", "did:plc:owner").await;
+        // Blob exists but is NOT quarantined; restore should succeed
+        // (idempotent — desired post-state already obtains).
+
+        let req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::RepoBlobRef {
+                did: "did:plc:owner".to_string(),
+                cid: "bafyblob03".to_string(),
+                record_uri: None,
+            },
+            takedown: Some(StatusAttr {
+                applied: false,
+                ref_field: None,
+            }),
+            deactivated: None,
+        };
+        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        let td = resp.takedown.expect("takedown should be echoed");
+        assert!(!td.applied);
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_takedown_already_quarantined_idempotent() {
+        let ctx = create_test_context().await;
+        seed_test_blob(&ctx, "bafyblob04", "did:plc:owner").await;
+        // Pre-quarantine.
+        use crate::blob_store::quarantine::{BlobQuarantine, QuarantineReason};
+        let quarantine = BlobQuarantine::new(ctx.account_db.clone());
+        quarantine
+            .quarantine_blob(
+                "bafyblob04",
+                QuarantineReason::Other,
+                Some("first-takedown"),
+                "did:plc:admin1",
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Repeat takedown — should succeed despite already-quarantined.
+        let req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::RepoBlobRef {
+                did: "did:plc:owner".to_string(),
+                cid: "bafyblob04".to_string(),
+                record_uri: None,
+            },
+            takedown: Some(StatusAttr {
+                applied: true,
+                ref_field: Some("second-takedown".to_string()),
+            }),
+            deactivated: None,
+        };
+        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .unwrap()
+            .0;
+        let td = resp.takedown.expect("takedown should be echoed");
+        assert!(td.applied);
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_rejects_malformed_subject() {
+        // Subject without $type discriminator → serde rejects deserialization.
+        let json = serde_json::json!({
+            "subject": {"did": "did:plc:abc"},
+            "takedown": {"applied": true}
+        });
+        let result: Result<UpdateSubjectStatusRequest, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_rejects_status_attr_without_applied() {
+        let json = serde_json::json!({
+            "subject": {
+                "$type": "com.atproto.admin.defs#repoRef",
+                "did": "did:plc:abc"
+            },
+            "takedown": {"ref": "missing-applied-field"}
+        });
+        let result: Result<UpdateSubjectStatusRequest, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_subject_status_response_shape_matches_lexicon() {
+        // Lexicon output: subject (required) + takedown (optional). No
+        // deactivated. Verify the serialised JSON matches.
+        let resp = UpdateSubjectStatusResponse {
+            subject: SubjectUnion::RepoRef {
+                did: "did:plc:abc".to_string(),
+            },
+            takedown: Some(StatusAttr {
+                applied: true,
+                ref_field: Some("ticket-1".to_string()),
+            }),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["subject"]["$type"], "com.atproto.admin.defs#repoRef");
+        assert_eq!(json["subject"]["did"], "did:plc:abc");
+        assert_eq!(json["takedown"]["applied"], true);
+        assert_eq!(json["takedown"]["ref"], "ticket-1");
+        // No deactivated field per the lexicon's output schema.
+        assert!(json.get("deactivated").is_none());
+
+        // takedown can be omitted entirely when None.
+        let resp_no_td = UpdateSubjectStatusResponse {
+            subject: SubjectUnion::RepoRef {
+                did: "did:plc:xyz".to_string(),
+            },
+            takedown: None,
+        };
+        let json = serde_json::to_value(&resp_no_td).unwrap();
+        assert!(json.get("takedown").is_none());
     }
 
     // ---- Phase 1.10: invite-code pagination -------------------------------
