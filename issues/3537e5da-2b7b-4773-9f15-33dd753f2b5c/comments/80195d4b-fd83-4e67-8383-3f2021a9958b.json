@@ -1,0 +1,10 @@
+{
+  "uuid": "80195d4b-fd83-4e67-8383-3f2021a9958b",
+  "issue_uuid": "3537e5da-2b7b-4773-9f15-33dd753f2b5c",
+  "author": "vW4n",
+  "content": "Committed as c2d6fd2 refactor(sdk): replace embedded Rust-Atproto-SDK with proto-blue 0.2.6. 1364 files changed (mostly Rust-Atproto-SDK deletions): -70533/+4951.",
+  "created_at": "2026-05-01T01:32:10.887058534Z",
+  "kind": "result",
+  "signed_by": "SHA256:FE0u9OWnwKx5uvLuSiKuHnl7pLtr4oXeEOi3s6yPOZY",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg31dKNoRTmx2sQF5ORSg1RnlKJqTXtDbr2pcYw8kivkkAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASE3pB6sms2QFQLNrx5S25a/KvPDfcJW9Po2yDZFyraEJ23KAuJTTCdf2YT1rOFl4VGMJZgiGHda4LZIHzHJeCg=="
+}
