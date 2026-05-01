@@ -76,6 +76,10 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/com.atproto.admin.deleteAccount",
             post(admin_delete_account),
         )
+        .route(
+            "/xrpc/com.atproto.admin.updateAccountSigningKey",
+            post(update_account_signing_key),
+        )
         // Account moderation
         .route(
             "/xrpc/com.atproto.admin.takedownAccount",
@@ -748,6 +752,218 @@ async fn admin_delete_account(
         "did": req.did,
         "message": "Account permanently deleted"
     })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateAccountSigningKeyRequest {
+    /// DID of the account whose signing key is being updated
+    did: String,
+    /// New signing key in did:key: format (per the lexicon)
+    signing_key: String,
+}
+
+/// Update an account's signing key in the PLC directory
+///
+/// Implements `com.atproto.admin.updateAccountSigningKey`. Submits a PLC
+/// operation rotating the `verificationMethods.atproto` entry to the supplied
+/// did:key value, then advances the repository commit chain with an empty
+/// commit and sequences an identity event so federation peers learn of the
+/// change.
+///
+/// Aurora-Locus runs in a single-operator-key model: the operator's
+/// `authentication.repo_signing_key` is the only private key the PDS can sign
+/// commits with. Rotating to any other public key would leave the account
+/// unable to produce new commits, so this handler enforces strict-mode
+/// validation: the supplied `signingKey` must match the operator's configured
+/// key. The lexicon contract permits arbitrary `signingKey` values; the
+/// strict-mode check is an Aurora-architecture safety constraint.
+async fn update_account_signing_key(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<UpdateAccountSigningKeyRequest>,
+) -> Result<StatusCode, axum::response::Response> {
+    use crate::actor_store::repository::RepositoryManager;
+    use crate::crypto::{
+        plc::PlcSigner,
+        plc_client::{PlcClient, PlcClientConfig},
+        proto_blue_signer::RepoSigner,
+    };
+    use crate::sequencer::events::IdentityEvent;
+    use axum::response::IntoResponse;
+
+    fn plain_err(status: StatusCode, msg: impl Into<String>) -> axum::response::Response {
+        (status, msg.into()).into_response()
+    }
+    fn xrpc_err(
+        status: StatusCode,
+        error: &str,
+        message: impl Into<String>,
+    ) -> axum::response::Response {
+        (
+            status,
+            Json(serde_json::json!({
+                "error": error,
+                "message": message.into(),
+            })),
+        )
+            .into_response()
+    }
+
+    if !req.did.starts_with("did:plc:") {
+        return Err(plain_err(
+            StatusCode::BAD_REQUEST,
+            "did must be a did:plc identifier",
+        ));
+    }
+    if !req.signing_key.starts_with("did:key:") {
+        return Err(plain_err(
+            StatusCode::BAD_REQUEST,
+            "signingKey must be in did:key: format",
+        ));
+    }
+
+    // Strict-mode validation: the supplied signingKey must match the operator's
+    // configured repo_signing_key. Aurora-Locus has a single operator-level
+    // private key; any other rotation target would leave the account unable to
+    // sign new commits.
+    //
+    // TODO: Relax this check when Aurora-Locus supports per-account signing
+    // keys. The lexicon contract permits arbitrary signingKey values; this
+    // strict-mode validation is a safety check appropriate to Aurora's
+    // current single-key architecture.
+    let repo_signer = PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key)
+        .map_err(|e| {
+            plain_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Operator repo signing key not configured: {}", e),
+            )
+        })?;
+    let operator_did_key = repo_signer.public_key_did_key();
+    if req.signing_key != operator_did_key {
+        return Err(xrpc_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "signingKey does not match operator's configured signing key. \
+             Aurora-Locus uses a single operator-level signing key model; \
+             the provided signingKey must match the operator's \
+             repo_signing_key config.",
+        ));
+    }
+
+    let plc_client = PlcClient::new(PlcClientConfig {
+        plc_url: ctx.config.identity.did_plc_url.clone(),
+        timeout_secs: 30,
+    })
+    .map_err(|e| {
+        plain_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("PLC client init failed: {}", e),
+        )
+    })?;
+
+    let rotation_signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)
+        .map_err(|e| {
+            plain_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("PLC rotation key not configured: {}", e),
+            )
+        })?;
+
+    // Compare against the current PLC document. Aurora's PlcClient::get_signing_key
+    // returns multibase form (the bare `z...` prefix); the request's signingKey is
+    // in did:key form. Strip the prefix for comparison so we don't submit a no-op
+    // PLC operation when the keys already match.
+    let current_doc = plc_client.get_document(&req.did).await.map_err(|e| {
+        if matches!(e, PdsError::IdentityResolution(_)) {
+            plain_err(
+                StatusCode::NOT_FOUND,
+                format!("DID document not found: {}", e),
+            )
+        } else {
+            plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    })?;
+    let current_key_multibase = plc_client
+        .get_signing_key(&current_doc)
+        .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let new_key_multibase = req
+        .signing_key
+        .strip_prefix("did:key:")
+        .unwrap_or(&req.signing_key);
+
+    if plc_client.keys_match(&current_key_multibase, new_key_multibase) {
+        tracing::debug!(did = %req.did, "Signing key already up to date; skipping PLC submission");
+        return Ok(StatusCode::OK);
+    }
+
+    // Submit PLC update with the did:key form so the entry stores the canonical
+    // verificationMethods.atproto value.
+    plc_client
+        .update_signing_key(&req.did, &req.signing_key, &rotation_signer)
+        .await
+        .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Advance the repository commit chain with an empty commit so the rotation
+    // is reflected in repository state, not just the DID document. Mirrors the
+    // CLI rotation flow in src/cli/rotate_keys.rs. Strict-mode validation
+    // guarantees the operator's repo_signing_key matches the new PLC entry, so
+    // the commit signature will verify against the newly-installed key.
+    let repo_mgr = RepositoryManager::with_sequencer(
+        req.did.clone(),
+        (*ctx.actor_store).clone(),
+        ctx.sequencer.clone(),
+    );
+    let repo_signer_pb: std::sync::Arc<dyn proto_blue::crypto::Signer> = {
+        let key_bytes = hex::decode(&ctx.config.authentication.repo_signing_key).map_err(|e| {
+            plain_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid hex repo signing key: {}", e),
+            )
+        })?;
+        let s = RepoSigner::from_bytes(&key_bytes).map_err(|e| {
+            plain_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build repo signer: {}", e),
+            )
+        })?;
+        std::sync::Arc::new(s)
+    };
+    let (commit_cid, rev) = repo_mgr
+        .apply_writes(vec![], repo_signer_pb)
+        .await
+        .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tracing::info!(
+        did = %req.did,
+        commit_cid = %commit_cid,
+        rev = %rev,
+        "Created empty commit for signing key rotation"
+    );
+
+    // Announce the change via an identity event.
+    let account = ctx.account_manager.get_account(&req.did).await.map_err(|e| {
+        if matches!(e, PdsError::NotFound(_)) {
+            plain_err(
+                StatusCode::NOT_FOUND,
+                format!("Account not found: {}", req.did),
+            )
+        } else {
+            plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    })?;
+    let identity_evt = IdentityEvent::new(req.did.clone(), account.handle);
+    ctx.sequencer
+        .sequence_identity(identity_evt)
+        .await
+        .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tracing::info!(
+        admin = %auth.did,
+        did = %req.did,
+        "Updated account signing key via XRPC"
+    );
+
+    Ok(StatusCode::OK)
 }
 
 // ============================================================================
@@ -3588,8 +3804,10 @@ mod tests {
             authentication: AuthConfig {
                 // Config validation requires JWT secrets >= 32 chars.
                 jwt_secret: "test-secret-key-for-admin-tests-32-chars".to_string(),
-                repo_signing_key: "test-key".to_string(),
-                plc_rotation_key: "test-rotation-key".to_string(),
+                // Valid 32-byte hex keys so PlcSigner::from_hex succeeds in
+                // tests that exercise PLC code paths.
+                repo_signing_key: "a".repeat(64),
+                plc_rotation_key: "b".repeat(64),
                 admin_dids: vec![],
                 oauth: OAuthConfig {
                     client_id: "http://localhost:3000/client-metadata.json".to_string(),
@@ -3916,5 +4134,121 @@ mod tests {
         assert!(hits >= 2);
         assert!(misses >= 1);
         assert!((0.0..=100.0).contains(&hit_rate));
+    }
+
+    fn admin_test_auth() -> AdminAuthContext {
+        AdminAuthContext {
+            did: "did:plc:test".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:test".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        }
+    }
+
+    async fn read_response_body(resp: axum::response::Response) -> (StatusCode, String) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_update_account_signing_key_rejects_non_plc_did() {
+        let ctx = create_test_context().await;
+        let req = UpdateAccountSigningKeyRequest {
+            did: "did:web:example.com".to_string(),
+            signing_key: "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH".to_string(),
+        };
+
+        let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("non-did:plc DID should be rejected");
+        let (status, body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("did:plc"));
+    }
+
+    #[tokio::test]
+    async fn test_update_account_signing_key_rejects_non_did_key_signing_key() {
+        let ctx = create_test_context().await;
+        let req = UpdateAccountSigningKeyRequest {
+            did: "did:plc:abcdefghijklmnop".to_string(),
+            signing_key: "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH".to_string(),
+        };
+
+        let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("bare multibase signingKey should be rejected");
+        let (status, body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("did:key"));
+    }
+
+    #[tokio::test]
+    async fn test_update_account_signing_key_rejects_mismatched_signing_key() {
+        use crate::crypto::plc::PlcSigner;
+
+        let ctx = create_test_context().await;
+        // Sanity-check: derive the operator's did:key so we know what would be
+        // accepted, then submit something different.
+        let operator_signer =
+            PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key).unwrap();
+        let operator_did_key = operator_signer.public_key_did_key();
+        let mismatching_did_key = "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme";
+        assert_ne!(operator_did_key, mismatching_did_key);
+
+        let req = UpdateAccountSigningKeyRequest {
+            did: "did:plc:abcdefghijklmnop".to_string(),
+            signing_key: mismatching_did_key.to_string(),
+        };
+
+        let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("mismatched signingKey should be rejected by strict-mode");
+        let (status, body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
+        assert_eq!(parsed["error"], "InvalidRequest");
+        assert!(parsed["message"]
+            .as_str()
+            .unwrap()
+            .contains("operator's configured signing key"));
+    }
+
+    #[tokio::test]
+    async fn test_update_account_signing_key_accepts_matching_signing_key() {
+        use crate::crypto::plc::PlcSigner;
+
+        let ctx = create_test_context().await;
+        let operator_signer =
+            PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key).unwrap();
+        let operator_did_key = operator_signer.public_key_did_key();
+
+        let req = UpdateAccountSigningKeyRequest {
+            did: "did:plc:abcdefghijklmnop".to_string(),
+            signing_key: operator_did_key.clone(),
+        };
+
+        // A matching signingKey passes strict-mode validation; the handler
+        // then proceeds to fetch the PLC document, which fails in the test
+        // environment because the configured PLC URL is plc.directory and
+        // the DID is fictitious. We assert that the failure is *not* the
+        // strict-mode 400 InvalidRequest — i.e., strict-mode let us through.
+        let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("PLC document fetch will fail in test env");
+        let (status, body) = read_response_body(resp).await;
+        if status == StatusCode::BAD_REQUEST {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("BAD_REQUEST body must be JSON in this path");
+            assert_ne!(
+                parsed["error"], "InvalidRequest",
+                "strict-mode incorrectly rejected matching signingKey"
+            );
+        }
+        // Otherwise we hit a downstream failure (network, NOT_FOUND from
+        // PLC, etc.) — which is expected and confirms strict-mode passed.
     }
 }
