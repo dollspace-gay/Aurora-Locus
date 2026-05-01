@@ -1,0 +1,10 @@
+{
+  "uuid": "01704685-364a-4694-a6b9-3e3c328d030f",
+  "issue_uuid": "535cc4bc-fd48-4b0a-86dd-a77d95db0152",
+  "author": "vW4n",
+  "content": "Plan: 1) cargo update for in-range bumps (Cargo.lock only). 2) Audit Cargo.toml for major-version upgrades worth taking — sqlx, axum/0.7->0.8, redis, base64, k256, p256, image, validator, jsonwebtoken/10 etc. Skip risky majors (axum has breaking middleware/extractor changes between 0.7 and 0.8). 3) cargo fmt --all. 4) cargo clippy --all-targets — fix anything actionable; record any deferrals.",
+  "created_at": "2026-05-01T00:30:39.109362780Z",
+  "kind": "plan",
+  "signed_by": "SHA256:FE0u9OWnwKx5uvLuSiKuHnl7pLtr4oXeEOi3s6yPOZY",
+  "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg31dKNoRTmx2sQF5ORSg1RnlKJqTXtDbr2pcYw8kivkkAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8A7pzcZ7uGhGozzliI9SNJ1Lqx+iNrGSpEB4JUC/ih/l7ZX4ORT3WFhx31b0MYU45Li+tHmoDoTXe94FqeR4CQ=="
+}
