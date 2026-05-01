@@ -21,14 +21,16 @@ use crate::{
     read_after_write::LocalRecordsCache,
     sequencer::{Sequencer, SequencerConfig},
 };
-use sqlx::SqlitePool;
 use std::sync::Arc;
 
 /// Application context holding all shared services
 #[derive(Clone)]
 pub struct AppContext {
     pub config: Arc<ServerConfig>,
-    pub account_db: SqlitePool,
+    /// Shared-database pool for account, sequencer, OAuth tables, etc.
+    /// Backend is selected by `config.database.backend` (SQLite or
+    /// Postgres). `AnyPool` makes the dispatch transparent to consumers.
+    pub account_db: sqlx::AnyPool,
     pub account_manager: Arc<AccountManager>,
     pub actor_store: Arc<ActorStore>,
     pub blob_store: Arc<BlobStore>,
@@ -74,37 +76,18 @@ impl AppContext {
         // Validate configuration
         config.validate()?;
 
-        // Phase 2 (chainlink #75) added DatabaseConfig with backend
-        // selection, but Phase 3 (#76) has not yet refactored the 16
-        // shared-DB consumer modules from SqlitePool to AnyPool. Until
-        // that lands, only SQLite is constructible at runtime — reject
-        // Postgres explicitly so operators get a clear error rather
-        // than a build-time mismatch deeper in the stack.
-        if matches!(
-            config.database.backend,
-            crate::config::DatabaseBackend::Postgres
-        ) {
-            return Err(PdsError::Validation(
-                "PDS_DB_BACKEND=postgres is not yet wired into the runtime; \
-                 the dispatch layer is in place but per-file refactoring \
-                 (Postgres workstream Phase 3, chainlink #76) must land \
-                 first. Use PDS_DB_BACKEND=sqlite (or unset it) for now."
-                    .to_string(),
-            ));
-        }
-
         // Create data directories if they don't exist
         Self::ensure_directories(&config).await?;
 
-        // Initialize account database
+        // Open the shared-database pool. `db::create_any_pool` dispatches
+        // on `config.database.backend` to either SQLite (using the
+        // configured file path as the fallback) or Postgres (using the
+        // configured URL). Phase 3 (chainlink #76) collapsed the
+        // dual-pool transient that existed during the SqlitePool→AnyPool
+        // refactor into this single AnyPool.
         let account_db =
-            db::create_pool(&config.storage.account_db, db::DatabaseOptions::default()).await?;
-
-        // Run database migrations (includes OAuth tables)
-        db::run_migrations(&account_db).await?;
-
-        // Test connection
-        db::test_connection(&account_db).await?;
+            db::create_any_pool(&config.database, &config.storage.account_db).await?;
+        db::run_any_migrations(&account_db, &config.database).await?;
 
         // Initialize account manager
         let account_manager = Arc::new(AccountManager::new(
@@ -126,60 +109,42 @@ impl AppContext {
         let blob_store =
             Arc::new(BlobStore::new(blob_store_config, account_db.clone()).await?);
 
-        // Initialize identity cache database with WAL mode enabled.
-        // WAL mode provides better read concurrency. The legacy SqlitePool
-        // is used for one-time setup (migrations, PRAGMAs) because it
-        // exposes SqliteConnectOptions; DidCache itself now holds an
-        // AnyPool (Phase 3 / chainlink #76) so we re-open the same
-        // SQLite file as an AnyPool after the setup pool has run. The
-        // dual-pool bridge lifts at the end of sub-phase 3b when
-        // AppContext fully flips to AnyPool.
-        let did_cache_db_setup = db::create_pool(
-            &config.storage.did_cache_db,
-            db::DatabaseOptions {
-                max_connections: 10,
-                enable_wal: true,
+        // Initialize identity cache database. The DidCache holds an
+        // AnyPool that dispatches to the configured backend. SQLite-only
+        // tuning (WAL mode, autocheckpoint, synchronous=NORMAL) is
+        // applied via PRAGMA when the backend is SQLite; PRAGMAs are
+        // a no-op via sqlx::query on Postgres but the early-return
+        // guards against accidentally running them.
+        //
+        // The cache uses its own DatabaseConfig synthesized from the
+        // configured did_cache_db path so that operators don't have to
+        // configure a separate Postgres database for the cache — for now
+        // it always uses SQLite at the configured file path. (Future
+        // work: a separate cache backend selector if desired.)
+        let did_cache_db = {
+            let cache_config = crate::config::DatabaseConfig {
+                backend: crate::config::DatabaseBackend::Sqlite,
+                url: None,
+                ..config.database.clone()
+            };
+            db::create_any_pool(&cache_config, &config.storage.did_cache_db).await?
+        };
+        db::run_any_migrations(
+            &did_cache_db,
+            &crate::config::DatabaseConfig {
+                backend: crate::config::DatabaseBackend::Sqlite,
+                url: None,
+                ..config.database.clone()
             },
         )
         .await?;
-
-        // Run migrations for identity cache
-        db::run_migrations(&did_cache_db_setup).await?;
-
-        // Configure WAL checkpoint settings for optimal performance
-        // autocheckpoint=1000 pages (~4MB with default 4KB page size)
-        sqlx::query("PRAGMA wal_autocheckpoint = 1000")
-            .execute(&did_cache_db_setup)
-            .await
-            .map_err(PdsError::Database)?;
-
-        // Set synchronous=NORMAL for better write performance while maintaining durability
-        // NORMAL is safe with WAL mode and provides good balance of performance/safety
-        sqlx::query("PRAGMA synchronous = NORMAL")
-            .execute(&did_cache_db_setup)
-            .await
-            .map_err(PdsError::Database)?;
-
-        drop(did_cache_db_setup);
-
-        // Open the AnyPool for DidCache against the same SQLite file.
-        // The setup pool above already established WAL mode (persistent
-        // across opens for SQLite).
-        let did_cache_db = {
-            use std::sync::Once;
-            static INSTALL: Once = Once::new();
-            INSTALL.call_once(sqlx::any::install_default_drivers);
-            let path = config
-                .storage
-                .did_cache_db
-                .to_str()
-                .ok_or_else(|| {
-                    PdsError::Validation("did_cache_db path must be valid UTF-8".to_string())
-                })?;
-            sqlx::AnyPool::connect(&format!("sqlite://{}?mode=rwc", path))
-                .await
-                .map_err(PdsError::Database)?
-        };
+        // SQLite tuning PRAGMAs (silent no-ops if Postgres ever takes over).
+        let _ = sqlx::query("PRAGMA wal_autocheckpoint = 1000")
+            .execute(&did_cache_db)
+            .await;
+        let _ = sqlx::query("PRAGMA synchronous = NORMAL")
+            .execute(&did_cache_db)
+            .await;
 
         // Initialize identity resolver with separate WAL-enabled cache database
         let did_cache = DidCache::new(did_cache_db).with_did_doc_ttls(

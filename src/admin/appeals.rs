@@ -9,7 +9,7 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
 
 /// Appeal status
@@ -79,11 +79,11 @@ pub struct Appeal {
 /// Appeal manager
 #[derive(Clone)]
 pub struct AppealManager {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl AppealManager {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -146,7 +146,7 @@ impl AppealManager {
         );
 
         Ok(Appeal {
-            id: result.last_insert_rowid(),
+            id: result.last_insert_id().unwrap_or(0),
             moderation_id,
             report_id,
             quarantine_id,
@@ -338,7 +338,7 @@ impl AppealManager {
     }
 
     /// Parse database rows into Appeal objects
-    async fn parse_appeals(&self, rows: Vec<sqlx::sqlite::SqliteRow>) -> PdsResult<Vec<Appeal>> {
+    async fn parse_appeals(&self, rows: Vec<sqlx::any::AnyRow>) -> PdsResult<Vec<Appeal>> {
         let mut appeals = Vec::new();
         for row in rows {
             appeals.push(self.parse_appeal(row)?);
@@ -347,7 +347,7 @@ impl AppealManager {
     }
 
     /// Parse single database row into Appeal
-    fn parse_appeal(&self, row: sqlx::sqlite::SqliteRow) -> PdsResult<Appeal> {
+    fn parse_appeal(&self, row: sqlx::any::AnyRow) -> PdsResult<Appeal> {
         let status_str: String = row.get("status");
         let status = status_str.parse()?;
 
@@ -384,9 +384,20 @@ impl AppealManager {
 mod tests {
     use super::*;
 
+    async fn open_test_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_submit_and_process_appeal() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         sqlx::query(
             r#"
@@ -455,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_appeal_prevention() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         sqlx::query(
             r#"

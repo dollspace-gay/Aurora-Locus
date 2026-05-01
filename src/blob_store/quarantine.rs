@@ -9,7 +9,7 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
 
 /// Quarantine reason types
@@ -79,11 +79,11 @@ pub struct QuarantineRecord {
 /// Blob quarantine manager
 #[derive(Clone)]
 pub struct BlobQuarantine {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl BlobQuarantine {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -123,7 +123,7 @@ impl BlobQuarantine {
         .await?;
 
         // Update blob table to mark as taken down
-        sqlx::query("UPDATE blob SET takedown = 1 WHERE cid = ?1")
+        sqlx::query("UPDATE blob SET takedown = true WHERE cid = ?1")
             .bind(cid)
             .execute(&self.db)
             .await?;
@@ -136,7 +136,10 @@ impl BlobQuarantine {
         );
 
         Ok(QuarantineRecord {
-            id: result.last_insert_rowid(),
+            // sqlx::Any uses last_insert_id (returns Option<i64>); Postgres
+            // returns None without RETURNING. unwrap_or(0) preserves the
+            // existing return-type contract.
+            id: result.last_insert_id().unwrap_or(0),
             cid: cid.to_string(),
             reason,
             details: details.map(String::from),
@@ -174,7 +177,7 @@ impl BlobQuarantine {
         }
 
         // Update blob table to remove takedown
-        sqlx::query("UPDATE blob SET takedown = 0 WHERE cid = ?1")
+        sqlx::query("UPDATE blob SET takedown = false WHERE cid = ?1")
             .bind(cid)
             .execute(&self.db)
             .await?;
@@ -264,7 +267,7 @@ impl BlobQuarantine {
     }
 
     /// Parse database row into QuarantineRecord
-    fn parse_quarantine_record(&self, row: sqlx::sqlite::SqliteRow) -> PdsResult<QuarantineRecord> {
+    fn parse_quarantine_record(&self, row: sqlx::any::AnyRow) -> PdsResult<QuarantineRecord> {
         let reason_str: String = row.get("reason");
         let reason = QuarantineReason::from_str(&reason_str)?;
 
@@ -297,9 +300,23 @@ impl BlobQuarantine {
 mod tests {
     use super::*;
 
+    /// Open a single-connection SQLite-backed `AnyPool` for the in-memory
+    /// test fixture. Single-connection is mandatory for `:memory:` SQLite
+    /// (each connection has its own private database otherwise).
+    async fn open_test_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_quarantine_and_restore() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         // Create tables
         sqlx::query(

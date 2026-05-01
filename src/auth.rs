@@ -10,6 +10,15 @@ use crate::{
 use axum::{async_trait, extract::FromRequestParts, http::request::Parts};
 use uuid::Uuid;
 
+
+/// Parse RFC3339 timestamp string to DateTime<Utc>. Required for sqlx::Any
+/// since chrono types don't implement Type<Any>. See chainlink #76.
+fn parse_ts(s: &str) -> Result<chrono::DateTime<chrono::Utc>, crate::error::PdsError> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| crate::error::PdsError::Internal(format!("Invalid timestamp: {}", e)))
+}
+
 /// Authentication method used for the request
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
@@ -442,7 +451,7 @@ pub async fn validate_oauth_token(
 
     // Check if token is expired
     use sqlx::Row;
-    let expires_at: chrono::DateTime<chrono::Utc> = row.get("expires_at");
+    let expires_at: chrono::DateTime<chrono::Utc> = parse_ts(&row.get::<String, _>("expires_at"))?;
 
     if expires_at < chrono::Utc::now() {
         return Err(PdsError::Authentication(

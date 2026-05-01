@@ -18,13 +18,21 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
+/// Parse an RFC3339 string from the database into a `DateTime<Utc>`.
+/// See chainlink #76 / Phase 3 design notes on chrono ↔ AnyPool.
+fn parse_timestamp(s: &str) -> PdsResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))
+}
+
 /// Token rotation manager
 pub struct TokenRotationManager {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 /// Refresh token rotation result
@@ -48,7 +56,7 @@ pub struct RotationResult {
 
 impl TokenRotationManager {
     /// Create a new TokenRotationManager
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -146,8 +154,8 @@ impl TokenRotationManager {
             "#,
         )
         .bind(&new_refresh_token)
-        .bind(now)
-        .bind(refresh_expires)
+        .bind(now.to_rfc3339())
+        .bind(refresh_expires.to_rfc3339())
         .bind(&token_record.token_id)
         .execute(&self.db)
         .await?;
@@ -208,7 +216,7 @@ impl TokenRotationManager {
         .bind(refresh_token)
         .bind(token_id)
         .bind(did)
-        .bind(now)
+        .bind(now.to_rfc3339())
         .execute(&self.db)
         .await?;
 
@@ -253,14 +261,17 @@ impl TokenRotationManager {
         .await?
         .ok_or_else(|| PdsError::Authentication("Invalid refresh token".to_string()))?;
 
+        let expires_at_s: String = row.get("expires_at");
+        let created_at_s: String = row.get("created_at");
+        let updated_at_s: String = row.get("updated_at");
         Ok(TokenRecord {
             token_id: row.get("token_id"),
             did: row.get("did"),
             client_id: row.get("client_id"),
             scope: row.get("scope"),
-            expires_at: row.get("expires_at"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
+            expires_at: parse_timestamp(&expires_at_s)?,
+            created_at: parse_timestamp(&created_at_s)?,
+            updated_at: parse_timestamp(&updated_at_s)?,
         })
     }
 
@@ -309,7 +320,7 @@ impl TokenRotationManager {
             WHERE used_at < ?
             "#,
         )
-        .bind(cutoff)
+        .bind(cutoff.to_rfc3339())
         .execute(&self.db)
         .await?;
 

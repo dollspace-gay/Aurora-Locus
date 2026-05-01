@@ -73,7 +73,7 @@ pub async fn health_check(ctx: &AppContext, format: &str) -> PdsResult<()> {
 }
 
 /// Check database health
-async fn check_database(db: &sqlx::SqlitePool) -> ComponentHealth {
+async fn check_database(db: &sqlx::AnyPool) -> ComponentHealth {
     match sqlx::query("SELECT 1 as test").fetch_one(db).await {
         Ok(row) => {
             let value: i32 = row.get("test");

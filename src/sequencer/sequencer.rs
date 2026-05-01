@@ -9,7 +9,7 @@ use crate::{
 };
 use chrono::Utc;
 use serde_cbor;
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -36,7 +36,7 @@ impl Default for SequencerConfig {
 /// Main sequencer - manages event log
 #[derive(Clone)]
 pub struct Sequencer {
-    db: SqlitePool,
+    db: AnyPool,
     config: SequencerConfig,
     last_seq: Arc<RwLock<Option<i64>>>,
     relay_client: Option<Arc<Mutex<RelayClient>>>,
@@ -45,7 +45,7 @@ pub struct Sequencer {
 impl Sequencer {
     /// Create a new sequencer
     #[allow(dead_code)] // Public API for future use
-    pub fn new(db: SqlitePool, config: SequencerConfig) -> Self {
+    pub fn new(db: AnyPool, config: SequencerConfig) -> Self {
         Self {
             db,
             config,
@@ -56,7 +56,7 @@ impl Sequencer {
 
     /// Create a new sequencer with relay client for federation
     pub fn with_relay(
-        db: SqlitePool,
+        db: AnyPool,
         config: SequencerConfig,
         relay_client: Option<Arc<Mutex<RelayClient>>>,
     ) -> Self {
@@ -171,7 +171,7 @@ impl Sequencer {
         // sqlx maps that NULL onto `None` instead of falling back through
         // `.try_get(...).ok()`, which can produce `Some(0)` on some sqlx
         // versions when decoding NULL into a non-Option `i64`.
-        let result = sqlx::query("SELECT MAX(seq) as max_seq FROM repo_seq WHERE invalidated = 0")
+        let result = sqlx::query("SELECT MAX(seq) as max_seq FROM repo_seq WHERE NOT invalidated")
             .fetch_one(&self.db)
             .await
             .map_err(PdsError::Database)?;
@@ -186,7 +186,7 @@ impl Sequencer {
             r#"
             SELECT seq, did, event_type, event, invalidated, sequenced_at
             FROM repo_seq
-            WHERE seq > ?1 AND invalidated = 0
+            WHERE seq > ?1 AND NOT invalidated
             ORDER BY seq ASC
             LIMIT 1
             "#,
@@ -219,7 +219,7 @@ impl Sequencer {
             r#"
             SELECT seq, did, event_type, event, invalidated, sequenced_at
             FROM repo_seq
-            WHERE seq > ?1 AND invalidated = 0
+            WHERE seq > ?1 AND NOT invalidated
             ORDER BY seq ASC
             LIMIT ?2
             "#,
@@ -246,7 +246,7 @@ impl Sequencer {
         let limit = limit.unwrap_or(500).min(self.config.max_query_limit);
 
         let mut query_str = String::from(
-            "SELECT seq, did, event_type, event, invalidated, sequenced_at FROM repo_seq WHERE invalidated = 0"
+            "SELECT seq, did, event_type, event, invalidated, sequenced_at FROM repo_seq WHERE NOT invalidated"
         );
 
         let mut conditions = Vec::new();
@@ -281,7 +281,7 @@ impl Sequencer {
     }
 
     /// Convert database row to SeqRow
-    fn row_to_seq_row(&self, row: sqlx::sqlite::SqliteRow) -> PdsResult<SeqRow> {
+    fn row_to_seq_row(&self, row: sqlx::any::AnyRow) -> PdsResult<SeqRow> {
         use chrono::DateTime;
 
         Ok(SeqRow {
@@ -289,7 +289,9 @@ impl Sequencer {
             did: row.try_get("did")?,
             event_type: row.try_get("event_type")?,
             event: row.try_get("event")?,
-            invalidated: row.try_get::<i32, _>("invalidated")? != 0,
+            // BOOLEAN on Postgres, INTEGER 0/1 on SQLite — sqlx::Any
+            // decodes both into bool transparently.
+            invalidated: row.try_get::<bool, _>("invalidated")?,
             sequenced_at: {
                 let time_str: String = row.try_get("sequenced_at")?;
                 DateTime::parse_from_rfc3339(&time_str)
@@ -396,7 +398,7 @@ impl Sequencer {
             r#"
             SELECT seq, did, event_type, event, invalidated, sequenced_at
             FROM repo_seq
-            WHERE did = ?1 AND invalidated = 0
+            WHERE did = ?1 AND NOT invalidated
             ORDER BY seq DESC
             LIMIT ?2
             "#,
@@ -421,10 +423,21 @@ impl Sequencer {
 
 #[cfg(test)]
 mod tests {
+    async fn open_test_pool() -> sqlx::AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     use super::*;
 
     async fn create_test_sequencer() -> Sequencer {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         // Create table
         sqlx::query(

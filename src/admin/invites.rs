@@ -6,7 +6,7 @@ use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize, Serializer};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 
 /// Custom serializer for DateTime that uses RFC3339 with millisecond precision
 fn serialize_datetime<S>(dt: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
@@ -101,11 +101,11 @@ pub struct InviteCode {
 /// Invite code manager
 #[derive(Clone)]
 pub struct InviteCodeManager {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl InviteCodeManager {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -245,7 +245,7 @@ impl InviteCodeManager {
         let result = sqlx::query(
             r#"
             UPDATE invite_code
-            SET disabled = 1
+            SET disabled = true
             WHERE code = ?
             "#,
         )
@@ -279,14 +279,14 @@ impl InviteCodeManager {
         let mut tx = self.db.begin().await?;
 
         for code in codes {
-            sqlx::query("UPDATE invite_code SET disabled = 1 WHERE code = ?")
+            sqlx::query("UPDATE invite_code SET disabled = true WHERE code = ?")
                 .bind(code)
                 .execute(&mut *tx)
                 .await?;
         }
 
         for did in accounts {
-            sqlx::query("UPDATE invite_code SET disabled = 1 WHERE for_account = ?")
+            sqlx::query("UPDATE invite_code SET disabled = true WHERE for_account = ?")
                 .bind(did)
                 .execute(&mut *tx)
                 .await?;
@@ -540,7 +540,7 @@ impl InviteCodeManager {
     }
 
     fn rows_to_codes_with_count(
-        rows: Vec<sqlx::sqlite::SqliteRow>,
+        rows: Vec<sqlx::any::AnyRow>,
     ) -> PdsResult<Vec<(InviteCode, i64)>> {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -576,7 +576,7 @@ impl InviteCodeManager {
         let query = if include_disabled {
             "SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account FROM invite_code ORDER BY created_at DESC"
         } else {
-            "SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account FROM invite_code WHERE disabled = 0 ORDER BY created_at DESC"
+            "SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account FROM invite_code WHERE NOT disabled ORDER BY created_at DESC"
         };
 
         let rows = sqlx::query(query).fetch_all(&self.db).await?;
@@ -614,16 +614,27 @@ impl InviteCodeManager {
 mod tests {
     use super::*;
 
+    async fn open_test_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_create_and_use_invite() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         sqlx::query(
             r#"
             CREATE TABLE invite_code (
                 code TEXT PRIMARY KEY,
                 available INTEGER NOT NULL DEFAULT 1,
-                disabled INTEGER NOT NULL DEFAULT 0,
+                disabled BOOLEAN NOT NULL DEFAULT false,
                 created_by TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 expires_at TEXT,

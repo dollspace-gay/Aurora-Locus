@@ -5,7 +5,7 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
 
 /// Parse a timestamp string from the database, tolerating both RFC3339
@@ -94,11 +94,11 @@ pub struct AdminRole {
 /// Admin role manager
 #[derive(Clone)]
 pub struct AdminRoleManager {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl AdminRoleManager {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -136,7 +136,7 @@ impl AdminRoleManager {
         .execute(&self.db)
         .await?;
 
-        let id = result.last_insert_rowid();
+        let id = result.last_insert_id().unwrap_or(0);
 
         Ok(AdminRole {
             id,
@@ -163,11 +163,11 @@ impl AdminRoleManager {
         let result = sqlx::query(
             r#"
             UPDATE admin_roles
-            SET revoked = 1,
+            SET revoked = true,
                 revoked_at = ?,
                 revoked_by = ?,
                 notes = COALESCE(?, notes)
-            WHERE did = ? AND revoked = 0
+            WHERE did = ? AND NOT revoked
             "#,
         )
         .bind(now.to_rfc3339())
@@ -193,7 +193,7 @@ impl AdminRoleManager {
             r#"
             SELECT id, did, role, granted_by, granted_at, revoked, revoked_at, revoked_by, notes
             FROM admin_roles
-            WHERE did = ? AND revoked = 0
+            WHERE did = ? AND NOT revoked
             ORDER BY granted_at DESC
             LIMIT 1
             "#,
@@ -245,7 +245,7 @@ impl AdminRoleManager {
             r#"
             SELECT id, did, role, granted_by, granted_at, revoked, revoked_at, revoked_by, notes
             FROM admin_roles
-            WHERE revoked = 0
+            WHERE NOT revoked
             ORDER BY granted_at DESC
             "#,
         )
@@ -399,6 +399,20 @@ impl AdminRoleManager {
 mod tests {
     use super::*;
 
+    /// Open a single-connection SQLite-backed `AnyPool` for tests.
+    /// Single-connection cap is required because each connection to
+    /// `:memory:` SQLite has its own private database.
+    async fn open_test_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn test_role_hierarchy() {
         assert!(Role::SuperAdmin > Role::Admin);
@@ -424,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grant_and_get_role() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         // Create table
         sqlx::query(
@@ -435,7 +449,7 @@ mod tests {
                 role TEXT NOT NULL,
                 granted_by TEXT,
                 granted_at TEXT NOT NULL,
-                revoked INTEGER NOT NULL DEFAULT 0,
+                revoked BOOLEAN NOT NULL DEFAULT false,
                 revoked_at TEXT,
                 revoked_by TEXT,
                 notes TEXT
@@ -501,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_revoke_role() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         sqlx::query(
             r#"
@@ -511,7 +525,7 @@ mod tests {
                 role TEXT NOT NULL,
                 granted_by TEXT,
                 granted_at TEXT NOT NULL,
-                revoked INTEGER NOT NULL DEFAULT 0,
+                revoked BOOLEAN NOT NULL DEFAULT false,
                 revoked_at TEXT,
                 revoked_by TEXT,
                 notes TEXT

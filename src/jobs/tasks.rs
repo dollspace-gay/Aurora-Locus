@@ -55,7 +55,7 @@ pub async fn purge_deleted_accounts(ctx: &AppContext) -> PdsResult<u64> {
           AND a.delete_after < ?1
         "#,
     )
-    .bind(now)
+    .bind(now.to_rfc3339())
     .fetch_all(&ctx.account_db)
     .await?;
 

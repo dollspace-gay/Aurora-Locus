@@ -2,7 +2,7 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 
 /// Content label
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,12 +22,12 @@ pub struct Label {
 /// Label manager
 #[derive(Clone)]
 pub struct LabelManager {
-    db: SqlitePool,
+    db: AnyPool,
     server_did: String,
 }
 
 impl LabelManager {
-    pub fn new(db: SqlitePool, server_did: String) -> Self {
+    pub fn new(db: AnyPool, server_did: String) -> Self {
         Self { db, server_did }
     }
 
@@ -60,7 +60,7 @@ impl LabelManager {
         .await?;
 
         Ok(Label {
-            id: result.last_insert_rowid(),
+            id: result.last_insert_id().unwrap_or(0),
             uri: uri.to_string(),
             cid: cid.map(String::from),
             val: val.to_string(),
@@ -99,7 +99,7 @@ impl LabelManager {
         .await?;
 
         Ok(Label {
-            id: result.last_insert_rowid(),
+            id: result.last_insert_id().unwrap_or(0),
             uri: uri.to_string(),
             cid: cid.map(String::from),
             val: val.to_string(),

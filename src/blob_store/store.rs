@@ -8,10 +8,18 @@ use crate::{
     },
     error::{PdsError, PdsResult},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+
+/// Parse an RFC3339 string from the database into a `DateTime<Utc>`.
+/// See chainlink #76 / Phase 3 design notes on chrono ↔ AnyPool.
+fn parse_timestamp(s: &str) -> PdsResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))
+}
 use image::ImageFormat;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::sync::Arc;
 use tokio::fs;
 
@@ -26,14 +34,14 @@ pub struct BlobStoreConfig {
 pub struct BlobStore {
     config: BlobStoreConfig,
     backend: Arc<dyn BlobBackend>,
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl BlobStore {
     /// Create a new blob store. Async because S3 backend init performs
     /// SDK config loading which is async; the disk path is also awaited
     /// for uniformity even though it has no async work.
-    pub async fn new(config: BlobStoreConfig, db: SqlitePool) -> PdsResult<Self> {
+    pub async fn new(config: BlobStoreConfig, db: AnyPool) -> PdsResult<Self> {
         let backend: Arc<dyn BlobBackend> = match &config.storage.backend {
             BlobBackendType::Disk { location } => Arc::new(DiskBlobBackend::new(location.clone())),
             BlobBackendType::S3 {
@@ -444,7 +452,7 @@ impl BlobStore {
         .bind(mime_type)
         .bind(size)
         .bind(creator_did)
-        .bind(Utc::now())
+        .bind(Utc::now().to_rfc3339())
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -481,7 +489,7 @@ impl BlobStore {
         .bind(mime_type)
         .bind(size)
         .bind(creator_did)
-        .bind(Utc::now())
+        .bind(Utc::now().to_rfc3339())
         .bind(width)
         .bind(height)
         .bind(thumbnail_cid)
@@ -509,7 +517,7 @@ impl BlobStore {
         .bind(&temp_blob.mime_type)
         .bind(temp_blob.size)
         .bind(&temp_blob.creator_did)
-        .bind(temp_blob.created_at)
+        .bind(temp_blob.created_at.to_rfc3339())
         .bind(temp_blob.width)
         .bind(temp_blob.height)
         .execute(&self.db)
@@ -540,7 +548,7 @@ impl BlobStore {
                 mime_type: row.try_get("mime_type")?,
                 size: row.try_get("size")?,
                 creator_did: row.try_get("creator_did")?,
-                created_at: row.try_get("created_at")?,
+                created_at: parse_timestamp(&row.try_get::<String, _>("created_at")?)?,
                 width: row.try_get("width")?,
                 height: row.try_get("height")?,
             }))
@@ -572,7 +580,7 @@ impl BlobStore {
             ORDER BY created_at ASC
             "#,
         )
-        .bind(cutoff)
+        .bind(cutoff.to_rfc3339())
         .fetch_all(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -621,7 +629,7 @@ impl BlobStore {
                 mime_type: row.try_get("mime_type")?,
                 size: row.try_get("size")?,
                 creator_did: row.try_get("creator_did")?,
-                created_at: row.try_get("created_at")?,
+                created_at: parse_timestamp(&row.try_get::<String, _>("created_at")?)?,
                 width: row.try_get("width")?,
                 height: row.try_get("height")?,
                 alt_text: row.try_get("alt_text")?,
@@ -667,7 +675,7 @@ impl BlobStore {
                 mime_type: row.try_get("mime_type")?,
                 size: row.try_get("size")?,
                 creator_did: row.try_get("creator_did")?,
-                created_at: row.try_get("created_at")?,
+                created_at: parse_timestamp(&row.try_get::<String, _>("created_at")?)?,
                 width: row.try_get("width")?,
                 height: row.try_get("height")?,
                 alt_text: row.try_get("alt_text")?,
@@ -761,7 +769,7 @@ impl BlobStore {
         )
         .bind(blob_cid)
         .bind(record_uri)
-        .bind(Utc::now())
+        .bind(Utc::now().to_rfc3339())
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -850,8 +858,17 @@ mod tests {
             },
         };
 
-        // Create in-memory database for testing
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        // Create in-memory database for testing. Single-connection pool
+        // is required for `:memory:` SQLite (each connection has its own
+        // private database otherwise).
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let db = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
 
         // Create blob_metadata table with new columns
         sqlx::query(
@@ -861,7 +878,7 @@ mod tests {
                 mime_type TEXT NOT NULL,
                 size INTEGER NOT NULL,
                 creator_did TEXT NOT NULL,
-                created_at DATETIME NOT NULL,
+                created_at TEXT NOT NULL,
                 width INTEGER,
                 height INTEGER,
                 alt_text TEXT,

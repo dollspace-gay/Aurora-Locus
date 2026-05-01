@@ -8,7 +8,7 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
 
 /// Email delivery status
@@ -76,11 +76,11 @@ pub struct EmailDelivery {
 /// Email tracking manager
 #[derive(Clone)]
 pub struct EmailTracker {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl EmailTracker {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -108,7 +108,10 @@ impl EmailTracker {
         .execute(&self.db)
         .await?;
 
-        Ok(result.last_insert_rowid())
+        // sqlx::Any uses last_insert_id (returns Option<i64>); Postgres
+        // returns None without RETURNING. unwrap_or(0) preserves the
+        // existing return-type contract.
+        Ok(result.last_insert_id().unwrap_or(0))
     }
 
     /// Mark email as sent
@@ -254,7 +257,7 @@ impl EmailTracker {
     /// Parse database rows into EmailDelivery objects
     async fn parse_deliveries(
         &self,
-        rows: Vec<sqlx::sqlite::SqliteRow>,
+        rows: Vec<sqlx::any::AnyRow>,
     ) -> PdsResult<Vec<EmailDelivery>> {
         let mut deliveries = Vec::new();
 
@@ -306,7 +309,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_email_tracking() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        // Single-connection AnyPool to in-memory SQLite (each connection
+        // has its own private :memory: database otherwise).
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let db = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
 
         sqlx::query(
             r#"

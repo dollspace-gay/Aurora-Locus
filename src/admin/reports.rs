@@ -5,7 +5,7 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
 
 /// Report reason types
@@ -110,11 +110,11 @@ pub struct Report {
 /// Report manager
 #[derive(Clone)]
 pub struct ReportManager {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl ReportManager {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -154,7 +154,7 @@ impl ReportManager {
         .await?;
 
         Ok(Report {
-            id: result.last_insert_rowid(),
+            id: result.last_insert_id().unwrap_or(0),
             subject_did: subject_did.map(String::from),
             subject_uri: subject_uri.map(String::from),
             subject_cid: subject_cid.map(String::from),
@@ -270,7 +270,7 @@ impl ReportManager {
         Ok(reports)
     }
 
-    fn parse_report(&self, row: sqlx::sqlite::SqliteRow) -> PdsResult<Report> {
+    fn parse_report(&self, row: sqlx::any::AnyRow) -> PdsResult<Report> {
         let reason_type_str: String = row.get("reason_type");
         let reason_type = reason_type_str.parse()?;
 

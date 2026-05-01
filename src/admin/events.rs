@@ -9,7 +9,7 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
 
 /// Moderation event types
@@ -111,11 +111,11 @@ pub struct LogEventParams<'a> {
 /// Moderation event logger
 #[derive(Clone)]
 pub struct ModerationEventLogger {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl ModerationEventLogger {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -168,7 +168,7 @@ impl ModerationEventLogger {
         );
 
         Ok(ModerationEvent {
-            id: result.last_insert_rowid(),
+            id: result.last_insert_id().unwrap_or(0),
             event_type,
             actor_did: actor_did.to_string(),
             subject_did: subject_did.map(String::from),
@@ -280,7 +280,7 @@ impl ModerationEventLogger {
     /// Parse database rows into ModerationEvent objects
     async fn parse_events(
         &self,
-        rows: Vec<sqlx::sqlite::SqliteRow>,
+        rows: Vec<sqlx::any::AnyRow>,
     ) -> PdsResult<Vec<ModerationEvent>> {
         let mut events = Vec::new();
 
@@ -323,9 +323,20 @@ impl ModerationEventLogger {
 mod tests {
     use super::*;
 
+    async fn open_test_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_log_and_retrieve_event() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         sqlx::query(
             r#"

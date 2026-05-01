@@ -3331,9 +3331,12 @@ async fn list_blobs(
                 creator_did: row
                     .try_get("creator_did")
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-                created_at: row
-                    .try_get("created_at")
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                created_at: chrono::DateTime::parse_from_rfc3339(
+                        &row.try_get::<String, _>("created_at")
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                    )
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Invalid timestamp: {}", e)))?,
                 width: row
                     .try_get("width")
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
@@ -5078,7 +5081,7 @@ mod tests {
         )
         .bind(did)
         .bind(handle)
-        .bind(now)
+        .bind(now.to_rfc3339())
         .execute(&ctx.account_db)
         .await
         .unwrap();
@@ -5630,7 +5633,7 @@ mod tests {
     /// Helper: read deactivated_at off the actor table.
     async fn account_deactivated(ctx: &AppContext, did: &str) -> bool {
         use sqlx::Row;
-        let row: Option<chrono::DateTime<chrono::Utc>> =
+        let row: Option<String> =
             sqlx::query("SELECT deactivated_at FROM actor WHERE did = ?")
                 .bind(did)
                 .fetch_one(&ctx.account_db)
@@ -5762,7 +5765,7 @@ mod tests {
         )
         .bind(cid)
         .bind(did)
-        .bind(chrono::Utc::now())
+        .bind(chrono::Utc::now().to_rfc3339())
         .execute(&ctx.account_db)
         .await
         .unwrap();

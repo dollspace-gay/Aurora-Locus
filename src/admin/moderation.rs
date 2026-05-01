@@ -3,7 +3,7 @@ use crate::account::AccountManager;
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -85,12 +85,12 @@ pub struct ApplyActionParams<'a> {
 /// Moderation manager
 #[derive(Clone)]
 pub struct ModerationManager {
-    db: SqlitePool,
+    db: AnyPool,
     account_manager: Arc<AccountManager>,
 }
 
 impl ModerationManager {
-    pub fn new(db: SqlitePool, account_manager: Arc<AccountManager>) -> Self {
+    pub fn new(db: AnyPool, account_manager: Arc<AccountManager>) -> Self {
         Self {
             db,
             account_manager,
@@ -130,7 +130,7 @@ impl ModerationManager {
         .execute(&self.db)
         .await?;
 
-        let id = result.last_insert_rowid();
+        let id = result.last_insert_id().unwrap_or(0);
 
         // Apply account-level action if it's a takedown
         if action == ModerationAction::Takedown {
@@ -175,11 +175,11 @@ impl ModerationManager {
         let result = sqlx::query(
             r#"
             UPDATE account_moderation
-            SET reversed = 1,
+            SET reversed = true,
                 reversed_at = ?,
                 reversed_by = ?,
                 reversal_reason = ?
-            WHERE id = ? AND reversed = 0
+            WHERE id = ? AND NOT reversed
             "#,
         )
         .bind(now.to_rfc3339())
@@ -227,7 +227,7 @@ impl ModerationManager {
                    expires_at, reversed, reversed_at, reversed_by,
                    reversal_reason, report_id, notes
             FROM account_moderation
-            WHERE did = ? AND reversed = 0
+            WHERE did = ? AND NOT reversed
             ORDER BY moderated_at DESC
             "#,
         )
@@ -282,12 +282,12 @@ impl ModerationManager {
         let result = sqlx::query(
             r#"
             UPDATE account_moderation
-            SET reversed = 1,
+            SET reversed = true,
                 reversed_at = ?,
                 reversed_by = 'system',
                 reversal_reason = 'Expired'
             WHERE action = 'suspend'
-              AND reversed = 0
+              AND NOT reversed
               AND expires_at IS NOT NULL
               AND expires_at < ?
             "#,
@@ -303,7 +303,7 @@ impl ModerationManager {
     /// Parse database rows into ModerationRecord objects
     async fn parse_moderation_records(
         &self,
-        rows: Vec<sqlx::sqlite::SqliteRow>,
+        rows: Vec<sqlx::any::AnyRow>,
     ) -> PdsResult<Vec<ModerationRecord>> {
         let mut records = Vec::new();
 
@@ -439,7 +439,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_and_get_action() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        {
+            use std::sync::Once;
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(sqlx::any::install_default_drivers);
+        }
+        let db = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
 
         sqlx::query(
             r#"
@@ -451,7 +460,7 @@ mod tests {
                 moderated_by TEXT NOT NULL,
                 moderated_at TEXT NOT NULL,
                 expires_at TEXT,
-                reversed INTEGER NOT NULL DEFAULT 0,
+                reversed BOOLEAN NOT NULL DEFAULT false,
                 reversed_at TEXT,
                 reversed_by TEXT,
                 reversal_reason TEXT,
@@ -501,7 +510,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_suspend_with_expiration() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        {
+            use std::sync::Once;
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(sqlx::any::install_default_drivers);
+        }
+        let db = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
 
         sqlx::query(
             r#"
@@ -513,7 +531,7 @@ mod tests {
                 moderated_by TEXT NOT NULL,
                 moderated_at TEXT NOT NULL,
                 expires_at TEXT,
-                reversed INTEGER NOT NULL DEFAULT 0,
+                reversed BOOLEAN NOT NULL DEFAULT false,
                 reversed_at TEXT,
                 reversed_by TEXT,
                 reversal_reason TEXT,
@@ -554,7 +572,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_reverse_action() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        {
+            use std::sync::Once;
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(sqlx::any::install_default_drivers);
+        }
+        let db = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
 
         sqlx::query(
             r#"
@@ -566,7 +593,7 @@ mod tests {
                 moderated_by TEXT NOT NULL,
                 moderated_at TEXT NOT NULL,
                 expires_at TEXT,
-                reversed INTEGER NOT NULL DEFAULT 0,
+                reversed BOOLEAN NOT NULL DEFAULT false,
                 reversed_at TEXT,
                 reversed_by TEXT,
                 reversal_reason TEXT,

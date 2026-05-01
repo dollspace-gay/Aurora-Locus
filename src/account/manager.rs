@@ -9,19 +9,33 @@ use crate::{
     error::{PdsError, PdsResult},
 };
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Parse an RFC3339 string from the database into a `DateTime<Utc>`.
+/// See chainlink #76 / Phase 3 design notes on chrono ↔ AnyPool.
+fn parse_timestamp(s: &str) -> PdsResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))
+}
+
+/// Parse `Option<String>` → `Option<DateTime<Utc>>`, propagating parse errors.
+fn opt_parse_timestamp(s: Option<String>) -> PdsResult<Option<DateTime<Utc>>> {
+    s.as_deref().map(parse_timestamp).transpose()
+}
+
+
 /// Account manager service
 pub struct AccountManager {
-    db: SqlitePool,
+    db: AnyPool,
     config: Arc<ServerConfig>,
 }
 
 impl AccountManager {
     /// Create a new account manager
-    pub fn new(db: SqlitePool, config: Arc<ServerConfig>) -> Self {
+    pub fn new(db: AnyPool, config: Arc<ServerConfig>) -> Self {
         Self { db, config }
     }
 
@@ -87,7 +101,7 @@ impl AccountManager {
         )
         .bind(&did)
         .bind(&handle)
-        .bind(now)
+        .bind(now.to_rfc3339())
         .execute(&mut *tx)
         .await
         .map_err(PdsError::Database)?;
@@ -230,8 +244,8 @@ impl AccountManager {
         .bind(did)
         .bind(&access_token)
         .bind(&refresh_token_str)
-        .bind(now)
-        .bind(expires_at)
+        .bind(now.to_rfc3339())
+        .bind(expires_at.to_rfc3339())
         .bind(&app_password_name)
         .execute(&self.db)
         .await
@@ -248,8 +262,8 @@ impl AccountManager {
         .bind(&refresh_token_id)
         .bind(did)
         .bind(&refresh_token_str)
-        .bind(now)
-        .bind(refresh_expires)
+        .bind(now.to_rfc3339())
+        .bind(refresh_expires.to_rfc3339())
         .bind(false)
         .execute(&self.db)
         .await
@@ -283,7 +297,7 @@ impl AccountManager {
 
         let session_id: String = row.get("id");
         let did: String = row.get("did");
-        let expires_at: DateTime<Utc> = row.get("expires_at");
+        let expires_at: DateTime<Utc> = parse_timestamp(&row.get::<String, _>("expires_at"))?;
         let app_password_name: Option<String> = row.get("app_password_name");
 
         // Check expiration
@@ -329,7 +343,7 @@ impl AccountManager {
 
         let _token_id: String = row.get("id");
         let did: String = row.get("did");
-        let expires_at: DateTime<Utc> = row.get("expires_at");
+        let expires_at: DateTime<Utc> = parse_timestamp(&row.get::<String, _>("expires_at"))?;
         let used: bool = row.get("used");
         let next_id: Option<String> = row.get("next_id");
 
@@ -362,8 +376,8 @@ impl AccountManager {
                         did: session_row.get("did"),
                         access_token: session_row.get("access_token"),
                         refresh_token: session_row.get("refresh_token"),
-                        created_at: session_row.get("created_at"),
-                        expires_at: session_row.get("expires_at"),
+                        created_at: parse_timestamp(&session_row.get::<String, _>("created_at"))?,
+                        expires_at: parse_timestamp(&session_row.get::<String, _>("expires_at"))?,
                         app_password_name: session_row.get("app_password_name"),
                     });
                 }
@@ -386,8 +400,8 @@ impl AccountManager {
         .bind(&new_token_id)
         .bind(&did)
         .bind(&new_refresh_token)
-        .bind(now)
-        .bind(refresh_expires)
+        .bind(now.to_rfc3339())
+        .bind(refresh_expires.to_rfc3339())
         .bind(false)
         .execute(&self.db)
         .await
@@ -398,9 +412,9 @@ impl AccountManager {
         sqlx::query(
             "UPDATE refresh_token SET used = TRUE, used_at = ?1, next_id = ?2, expires_at = ?3 WHERE id = ?4"
         )
-        .bind(now)
+        .bind(now.to_rfc3339())
         .bind(&new_token_id)
-        .bind(grace_period_expires)
+        .bind(grace_period_expires.to_rfc3339())
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -419,8 +433,8 @@ impl AccountManager {
         .bind(&did)
         .bind(&access_token)
         .bind(&new_refresh_token)
-        .bind(now)
-        .bind(access_expires)
+        .bind(now.to_rfc3339())
+        .bind(access_expires.to_rfc3339())
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -458,14 +472,14 @@ impl AccountManager {
             // Actor fields
             did: row.get("did"),
             handle: row.get("handle"),
-            created_at: row.get("created_at"),
+            created_at: parse_timestamp(&row.get::<String, _>("created_at"))?,
             takedown_ref: row.get("takedown_ref"),
-            deactivated_at: row.get("deactivated_at"),
-            delete_after: row.get("delete_after"),
+            deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
+            delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
             // Account fields (may be None for federated actors)
             email: row.get("email"),
             password_hash: row.get("password_hash"),
-            email_confirmed_at: row.get("email_confirmed_at"),
+            email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
             invites_disabled: row.get("invites_disabled"),
         })
     }
@@ -523,14 +537,14 @@ impl AccountManager {
             // Actor fields
             did: row.get("did"),
             handle: row.get("handle"),
-            created_at: row.get("created_at"),
+            created_at: parse_timestamp(&row.get::<String, _>("created_at"))?,
             takedown_ref: row.get("takedown_ref"),
-            deactivated_at: row.get("deactivated_at"),
-            delete_after: row.get("delete_after"),
+            deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
+            delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
             // Account fields (may be None for federated actors)
             email: row.get("email"),
             password_hash: row.get("password_hash"),
-            email_confirmed_at: row.get("email_confirmed_at"),
+            email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
             invites_disabled: row.get("invites_disabled"),
         })
     }
@@ -557,14 +571,14 @@ impl AccountManager {
             // Actor fields
             did: row.get("did"),
             handle: row.get("handle"),
-            created_at: row.get("created_at"),
+            created_at: parse_timestamp(&row.get::<String, _>("created_at"))?,
             takedown_ref: row.get("takedown_ref"),
-            deactivated_at: row.get("deactivated_at"),
-            delete_after: row.get("delete_after"),
+            deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
+            delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
             // Account fields
             email: row.get("email"),
             password_hash: row.get("password_hash"),
-            email_confirmed_at: row.get("email_confirmed_at"),
+            email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
             invites_disabled: row.get("invites_disabled"),
         })
     }
@@ -815,7 +829,7 @@ impl AccountManager {
 
         // Delete expired access token sessions
         let sessions_result = sqlx::query("DELETE FROM session WHERE expires_at < ?1")
-            .bind(now)
+            .bind(now.to_rfc3339())
             .execute(&self.db)
             .await
             .map_err(PdsError::Database)?;
@@ -824,7 +838,7 @@ impl AccountManager {
 
         // Delete expired refresh tokens
         let refresh_result = sqlx::query("DELETE FROM refresh_token WHERE expires_at < ?1")
-            .bind(now)
+            .bind(now.to_rfc3339())
             .execute(&self.db)
             .await
             .map_err(PdsError::Database)?;
@@ -862,8 +876,8 @@ impl AccountManager {
         .bind(&token)
         .bind(did)
         .bind("confirm_email")
-        .bind(now)
-        .bind(expires_at)
+        .bind(now.to_rfc3339())
+        .bind(expires_at.to_rfc3339())
         .bind(false)
         .execute(&self.db)
         .await
@@ -893,7 +907,7 @@ impl AccountManager {
         .ok_or_else(|| PdsError::NotFound("Invalid verification token".to_string()))?;
 
         let did: String = row.try_get("did")?;
-        let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+        let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
         let used: bool = row.try_get("used")?;
 
         // Check if already used
@@ -919,7 +933,7 @@ impl AccountManager {
 
         // Mark email as confirmed in account (only update email_confirmed_at)
         sqlx::query("UPDATE account SET email_confirmed_at = ?1 WHERE did = ?2")
-            .bind(now)
+            .bind(now.to_rfc3339())
             .bind(&did)
             .execute(&self.db)
             .await
@@ -985,8 +999,8 @@ impl AccountManager {
         .bind(&token)
         .bind(&account.did)
         .bind("reset_password")
-        .bind(now)
-        .bind(expires_at)
+        .bind(now.to_rfc3339())
+        .bind(expires_at.to_rfc3339())
         .bind(false)
         .execute(&self.db)
         .await
@@ -1016,7 +1030,7 @@ impl AccountManager {
         .ok_or_else(|| PdsError::NotFound("Invalid reset token".to_string()))?;
 
         let did: String = row.try_get("did")?;
-        let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+        let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
         let used: bool = row.try_get("used")?;
 
         // Check if already used
@@ -1087,8 +1101,8 @@ impl AccountManager {
         .bind(&token)
         .bind(did)
         .bind("delete_account")
-        .bind(now)
-        .bind(expires_at)
+        .bind(now.to_rfc3339())
+        .bind(expires_at.to_rfc3339())
         .bind(false)
         .execute(&self.db)
         .await
@@ -1120,7 +1134,7 @@ impl AccountManager {
         .ok_or_else(|| PdsError::Validation("Invalid deletion token".to_string()))?;
 
         let token_did: String = row.try_get("did")?;
-        let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+        let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
         let used: bool = row.try_get("used")?;
 
         // Verify token is for the correct DID
@@ -1178,8 +1192,8 @@ impl AccountManager {
         .bind(&token)
         .bind(did)
         .bind("update_email")
-        .bind(now)
-        .bind(expires_at)
+        .bind(now.to_rfc3339())
+        .bind(expires_at.to_rfc3339())
         .bind(false)
         .execute(&self.db)
         .await
@@ -1209,7 +1223,7 @@ impl AccountManager {
         .ok_or_else(|| PdsError::Validation("Invalid email update token".to_string()))?;
 
         let token_did: String = row.try_get("did")?;
-        let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+        let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
         let used: bool = row.try_get("used")?;
 
         if token_did != did {
@@ -1389,8 +1403,8 @@ impl AccountManager {
             .map_err(PdsError::Database)?
             .ok_or_else(|| PdsError::NotFound("Actor not found".to_string()))?;
 
-        let deactivated_at: Option<DateTime<Utc>> = row.try_get("deactivated_at")?;
-        Ok(deactivated_at.is_some())
+        let deactivated_at_s: Option<String> = row.try_get("deactivated_at")?;
+        Ok(deactivated_at_s.is_some())
     }
 
     /// Cancel account deletion (if within grace period)
@@ -1424,7 +1438,7 @@ impl AccountManager {
         // Set deactivated_at to NOW (not future deletion date)
         // Keep delete_after as NULL (this distinguishes temporary deactivation from deletion)
         sqlx::query("UPDATE actor SET deactivated_at = ?1, delete_after = NULL WHERE did = ?2")
-            .bind(now)
+            .bind(now.to_rfc3339())
             .bind(did)
             .execute(&self.db)
             .await
@@ -1614,7 +1628,7 @@ impl AccountManager {
         .bind(did)
         .bind(name)
         .bind(&password_hash)
-        .bind(now)
+        .bind(now.to_rfc3339())
         .bind(privileged)
         .execute(&self.db)
         .await
@@ -1640,7 +1654,7 @@ impl AccountManager {
         for row in rows {
             passwords.push(AppPasswordInfo {
                 name: row.get("name"),
-                created_at: row.get("created_at"),
+                created_at: parse_timestamp(&row.get::<String, _>("created_at"))?,
                 privileged: row.get("privileged"),
             });
         }
@@ -1817,7 +1831,7 @@ impl AccountManager {
         .bind(use_count)
         .bind(false)
         .bind(created_by)
-        .bind(now)
+        .bind(now.to_rfc3339())
         .bind(&for_account)
         .execute(&self.db)
         .await
@@ -1931,7 +1945,7 @@ impl AccountManager {
         )
         .bind(code)
         .bind(used_by)
-        .bind(now)
+        .bind(now.to_rfc3339())
         .execute(&mut *tx)
         .await
         .map_err(PdsError::Database)?;
@@ -1955,7 +1969,11 @@ impl AccountManager {
         &self,
         created_by: &str,
     ) -> PdsResult<Vec<crate::db::account::InviteCode>> {
-        let rows = sqlx::query_as::<_, crate::db::account::InviteCode>(
+        // Manual row → struct conversion: the auto-derived FromRow on
+        // InviteCode wants `Decode<Any>` for chrono::DateTime, which
+        // sqlx::Any doesn't provide. We read created_at as String and
+        // parse via parse_timestamp.
+        let rows = sqlx::query(
             "SELECT code, available_uses, disabled, created_by, created_at, created_for
              FROM invite_code
              WHERE created_by = ?1
@@ -1966,7 +1984,19 @@ impl AccountManager {
         .await
         .map_err(PdsError::Database)?;
 
-        Ok(rows)
+        rows.into_iter()
+            .map(|row| {
+                let created_at_s: String = row.try_get("created_at")?;
+                Ok(crate::db::account::InviteCode {
+                    code: row.try_get("code")?,
+                    available_uses: row.try_get("available_uses")?,
+                    disabled: row.try_get("disabled")?,
+                    created_by: row.try_get("created_by")?,
+                    created_at: parse_timestamp(&created_at_s)?,
+                    created_for: row.try_get("created_for")?,
+                })
+            })
+            .collect()
     }
 
     /// Get usage history for an invite code
@@ -1974,7 +2004,7 @@ impl AccountManager {
         &self,
         code: &str,
     ) -> PdsResult<Vec<crate::db::account::InviteCodeUse>> {
-        let rows = sqlx::query_as::<_, crate::db::account::InviteCodeUse>(
+        let rows = sqlx::query(
             "SELECT code, used_by, used_at
              FROM invite_code_use
              WHERE code = ?1
@@ -1985,7 +2015,16 @@ impl AccountManager {
         .await
         .map_err(PdsError::Database)?;
 
-        Ok(rows)
+        rows.into_iter()
+            .map(|row| {
+                let used_at_s: String = row.try_get("used_at")?;
+                Ok(crate::db::account::InviteCodeUse {
+                    code: row.try_get("code")?,
+                    used_by: row.try_get("used_by")?,
+                    used_at: parse_timestamp(&used_at_s)?,
+                })
+            })
+            .collect()
     }
 
     /// Disable an invite code (admin/creator only)
@@ -2143,13 +2182,13 @@ impl AccountManager {
             accounts.push(ActorAccount {
                 did: row.get("did"),
                 handle: row.get("handle"),
-                created_at: row.get("created_at"),
+                created_at: parse_timestamp(&row.get::<String, _>("created_at"))?,
                 takedown_ref: row.get("takedown_ref"),
-                deactivated_at: row.get("deactivated_at"),
-                delete_after: row.get("delete_after"),
+                deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
+                delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
-                email_confirmed_at: row.get("email_confirmed_at"),
+                email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
                 invites_disabled: row.get("invites_disabled"),
             });
         }
@@ -2200,14 +2239,14 @@ impl AccountManager {
                 // Actor fields
                 did: row.get("did"),
                 handle: row.get("handle"),
-                created_at: row.get("created_at"),
+                created_at: parse_timestamp(&row.get::<String, _>("created_at"))?,
                 takedown_ref: row.get("takedown_ref"),
-                deactivated_at: row.get("deactivated_at"),
-                delete_after: row.get("delete_after"),
+                deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
+                delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
                 // Account fields (may be None for federated actors)
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
-                email_confirmed_at: row.get("email_confirmed_at"),
+                email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
                 invites_disabled: row.get("invites_disabled"),
             });
         }
@@ -2265,7 +2304,16 @@ mod tests {
         // production. The previous hand-rolled CREATE TABLE block missed
         // the actor/account split landed in commit 87783e3 and silently
         // broke every account-manager test that touched `JOIN actor`.
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        {
+            use std::sync::Once;
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(sqlx::any::install_default_drivers);
+        }
+        let db = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::migrate!("./migrations")
             .run(&db)
             .await
@@ -2355,7 +2403,7 @@ mod tests {
         sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES (?1, ?2, ?3)")
             .bind(did)
             .bind("testuser")
-            .bind(now)
+            .bind(now.to_rfc3339())
             .execute(&manager.db)
             .await
             .unwrap();
@@ -2377,8 +2425,8 @@ mod tests {
         .bind(did)
         .bind("expired-access-token-1")
         .bind("expired-refresh-token-1")
-        .bind(now - Duration::hours(2))
-        .bind(expired_time)
+        .bind((now - Duration::hours(2)).to_rfc3339())
+        .bind(expired_time.to_rfc3339())
         .execute(&manager.db)
         .await
         .unwrap();
@@ -2393,8 +2441,8 @@ mod tests {
         .bind(did)
         .bind("valid-access-token-1")
         .bind("valid-refresh-token-1")
-        .bind(now)
-        .bind(future_time)
+        .bind(now.to_rfc3339())
+        .bind(future_time.to_rfc3339())
         .execute(&manager.db)
         .await
         .unwrap();
@@ -2407,8 +2455,8 @@ mod tests {
         .bind("expired-refresh-1")
         .bind(did)
         .bind("old-refresh-token-1")
-        .bind(now - Duration::days(200))
-        .bind(now - Duration::days(20))
+        .bind((now - Duration::days(200)).to_rfc3339())
+        .bind((now - Duration::days(20)).to_rfc3339())
         .bind(false)
         .execute(&manager.db)
         .await
@@ -2422,8 +2470,8 @@ mod tests {
         .bind("valid-refresh-1")
         .bind(did)
         .bind("valid-refresh-token-1")
-        .bind(now)
-        .bind(now + Duration::days(180))
+        .bind(now.to_rfc3339())
+        .bind((now + Duration::days(180)).to_rfc3339())
         .bind(false)
         .execute(&manager.db)
         .await
@@ -2468,7 +2516,7 @@ mod tests {
         sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES (?1, ?2, ?3)")
             .bind(did)
             .bind("testuser")
-            .bind(now)
+            .bind(now.to_rfc3339())
             .execute(&manager.db)
             .await
             .unwrap();
@@ -2490,8 +2538,8 @@ mod tests {
         .bind(did)
         .bind("valid-token")
         .bind("valid-refresh")
-        .bind(now)
-        .bind(future_time)
+        .bind(now.to_rfc3339())
+        .bind(future_time.to_rfc3339())
         .execute(&manager.db)
         .await
         .unwrap();

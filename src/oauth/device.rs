@@ -9,10 +9,20 @@
 
 use crate::error::{PdsError, PdsResult};
 use crate::oauth::models::{Device, DeviceData, DeviceInfo, DeviceListResponse};
-use chrono::Utc;
-use sqlx::{Row, SqlitePool};
+use chrono::{DateTime, Utc};
+use sqlx::{AnyPool, Row};
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+/// Parse an RFC3339 string from the database into a `DateTime<Utc>`.
+/// Used because sqlx's `Any` driver does not support binding/decoding
+/// chrono types directly — timestamps cross the AnyPool boundary as
+/// RFC3339 strings (chainlink #76 / Phase 3 design decision).
+fn parse_timestamp(s: &str) -> PdsResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))
+}
 
 /// Device Manager
 ///
@@ -22,12 +32,12 @@ use uuid::Uuid;
 /// - Device revocation for security
 /// - Multi-device session management
 pub struct DeviceManager {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl DeviceManager {
     /// Create a new DeviceManager
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -58,9 +68,9 @@ impl DeviceManager {
         .bind(&data.session_id)
         .bind(&data.user_agent)
         .bind(&data.ip_address)
-        .bind(data.last_seen_at)
+        .bind(data.last_seen_at.to_rfc3339())
         .bind(&data.dpop_public_key)
-        .bind(now)
+        .bind(now.to_rfc3339())
         .execute(&self.db)
         .await?;
 
@@ -93,14 +103,16 @@ impl DeviceManager {
         .await?
         .ok_or_else(|| PdsError::NotFound(format!("Device not found: {}", device_id)))?;
 
+        let last_seen_at_s: String = row.get("last_seen_at");
+        let created_at_s: String = row.get("created_at");
         Ok(Device {
             id: row.get("id"),
             session_id: row.get("session_id"),
             user_agent: row.get("user_agent"),
             ip_address: row.get("ip_address"),
-            last_seen_at: row.get("last_seen_at"),
+            last_seen_at: parse_timestamp(&last_seen_at_s)?,
             dpop_public_key: row.get("dpop_public_key"),
-            created_at: row.get("created_at"),
+            created_at: parse_timestamp(&created_at_s)?,
         })
     }
 
@@ -127,7 +139,7 @@ impl DeviceManager {
         .bind(&data.session_id)
         .bind(&data.user_agent)
         .bind(&data.ip_address)
-        .bind(data.last_seen_at)
+        .bind(data.last_seen_at.to_rfc3339())
         .bind(&data.dpop_public_key)
         .bind(device_id)
         .execute(&self.db)
@@ -198,19 +210,25 @@ impl DeviceManager {
             INSERT INTO account_device (
                 did, device_id, authorized_at, device_name, is_active
             )
-            VALUES (?, ?, ?, ?, 1)
+            VALUES (?, ?, ?, ?, true)
             "#,
         )
         .bind(did)
         .bind(device_id)
-        .bind(now)
+        .bind(now.to_rfc3339())
         .bind(device_name)
         .execute(&self.db)
         .await?;
 
         debug!("Associated device {} with account {}", device_id, did);
 
-        Ok(result.last_insert_rowid())
+        // sqlx::Any uses `last_insert_id` (returns Option<i64>) instead of
+        // sqlite-specific `last_insert_rowid`. Postgres doesn't surface a
+        // last-insert id without RETURNING, so this returns None on Postgres;
+        // unwrap_or(0) preserves the existing return-type contract for
+        // callers that don't actually use the value (the audit log call
+        // sites in admin.rs ignore it).
+        Ok(result.last_insert_id().unwrap_or(0))
     }
 
     /// List devices for an account
@@ -236,7 +254,7 @@ impl DeviceManager {
                 ad.is_active
             FROM account_device ad
             INNER JOIN device d ON ad.device_id = d.id
-            WHERE ad.did = ? AND ad.is_active = 1
+            WHERE ad.did = ? AND ad.is_active
             ORDER BY d.last_seen_at DESC
             LIMIT ?
             "#,
@@ -248,22 +266,23 @@ impl DeviceManager {
 
         let devices = rows
             .into_iter()
-            .map(|row| {
+            .map(|row| -> PdsResult<DeviceInfo> {
                 let user_agent: Option<String> = row.get("user_agent");
                 let (device_type, browser, os) = parse_user_agent(user_agent.as_deref());
-
-                DeviceInfo {
+                let last_seen_at_s: String = row.get("last_seen_at");
+                let authorized_at_s: String = row.get("authorized_at");
+                Ok(DeviceInfo {
                     id: row.get("id"),
                     name: row.get("device_name"),
                     device_type,
                     browser,
                     os,
-                    last_seen_at: row.get("last_seen_at"),
-                    authorized_at: row.get("authorized_at"),
+                    last_seen_at: parse_timestamp(&last_seen_at_s)?,
+                    authorized_at: parse_timestamp(&authorized_at_s)?,
                     is_current: false, // TODO: Detect current device from request context
-                }
+                })
             })
-            .collect();
+            .collect::<PdsResult<Vec<_>>>()?;
 
         Ok(DeviceListResponse {
             devices,
@@ -285,11 +304,11 @@ impl DeviceManager {
         let result = sqlx::query(
             r#"
             UPDATE account_device
-            SET is_active = 0, revoked_at = ?
+            SET is_active = false, revoked_at = ?
             WHERE did = ? AND device_id = ?
             "#,
         )
-        .bind(now)
+        .bind(now.to_rfc3339())
         .bind(did)
         .bind(device_id)
         .execute(&self.db)
@@ -323,7 +342,7 @@ impl DeviceManager {
             WHERE id = ?
             "#,
         )
-        .bind(now)
+        .bind(now.to_rfc3339())
         .bind(device_id)
         .execute(&self.db)
         .await?;
