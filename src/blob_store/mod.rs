@@ -76,13 +76,18 @@ pub enum BlobBackendType {
     /// Store blobs on local disk
     Disk { location: PathBuf },
 
-    /// Store blobs in S3-compatible storage.
-    /// Phase 2 (#72) will construct this variant from configuration; until
-    /// then the dead-code lint fires. Allow lifts in Phase 2.
-    #[allow(dead_code)]
+    /// Store blobs in S3-compatible storage. Phase 2 (#72) added the
+    /// credential and prefix fields needed to actually instantiate
+    /// `S3BlobBackend`; the variant is now constructed at runtime from
+    /// `ServerConfig.storage.blobstore`.
     S3 {
         bucket: String,
         region: String,
         endpoint: Option<String>,
+        access_key_id: String,
+        secret_access_key: String,
+        /// S3 object key prefix (default `"blobs/"` matches the
+        /// pre-existing `S3Config::default()`).
+        prefix: String,
     },
 }

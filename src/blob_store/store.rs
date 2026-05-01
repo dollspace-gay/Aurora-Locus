@@ -3,8 +3,8 @@
 /// Coordinates blob storage backends with database metadata tracking
 use crate::{
     blob_store::{
-        disk::DiskBlobBackend, BlobBackend, BlobBackendType, BlobMetadata, BlobRef,
-        BlobStorageConfig, ImageDimensions, TempBlob,
+        disk::DiskBlobBackend, s3::S3BlobBackend, s3::S3Config, BlobBackend, BlobBackendType,
+        BlobMetadata, BlobRef, BlobStorageConfig, ImageDimensions, TempBlob,
     },
     error::{PdsError, PdsResult},
 };
@@ -30,15 +30,30 @@ pub struct BlobStore {
 }
 
 impl BlobStore {
-    /// Create a new blob store
-    pub fn new(config: BlobStoreConfig, db: SqlitePool) -> PdsResult<Self> {
+    /// Create a new blob store. Async because S3 backend init performs
+    /// SDK config loading which is async; the disk path is also awaited
+    /// for uniformity even though it has no async work.
+    pub async fn new(config: BlobStoreConfig, db: SqlitePool) -> PdsResult<Self> {
         let backend: Arc<dyn BlobBackend> = match &config.storage.backend {
             BlobBackendType::Disk { location } => Arc::new(DiskBlobBackend::new(location.clone())),
-            BlobBackendType::S3 { .. } => {
-                return Err(PdsError::Internal(
-                    "S3 backend not yet implemented".to_string(),
-                ));
-            }
+            BlobBackendType::S3 {
+                bucket,
+                region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+                prefix,
+            } => Arc::new(
+                S3BlobBackend::new(S3Config {
+                    bucket: bucket.clone(),
+                    region: region.clone(),
+                    endpoint: endpoint.clone(),
+                    access_key_id: access_key_id.clone(),
+                    secret_access_key: secret_access_key.clone(),
+                    prefix: prefix.clone(),
+                })
+                .await?,
+            ),
         };
 
         Ok(Self {
@@ -854,7 +869,7 @@ mod tests {
         .await
         .unwrap();
 
-        BlobStore::new(config, db).unwrap()
+        BlobStore::new(config, db).await.unwrap()
     }
 
     #[tokio::test]

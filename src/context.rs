@@ -3,8 +3,8 @@ use crate::{
     account::AccountManager,
     actor_store::{ActorStore, ActorStoreConfig},
     admin::{AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager, ReportManager},
-    blob_store::{BlobStore, BlobStoreConfig},
-    config::ServerConfig,
+    blob_store::{BlobBackendType, BlobStorageConfig, BlobStore, BlobStoreConfig},
+    config::{BlobstoreConfig, ServerConfig},
     db,
     error::{PdsError, PdsResult},
     federation::{
@@ -100,9 +100,12 @@ impl AppContext {
         };
         let actor_store = Arc::new(ActorStore::new(actor_store_config));
 
-        // Initialize blob store
-        let blob_store_config = BlobStoreConfig::default();
-        let blob_store = Arc::new(BlobStore::new(blob_store_config, account_db.clone())?);
+        // Initialize blob store. Convert the config-layer `BlobstoreConfig`
+        // to the storage-layer `BlobBackendType`, then hand it to
+        // `BlobStore::new` which dispatches to the disk or S3 backend.
+        let blob_store_config = build_blob_store_config(&config)?;
+        let blob_store =
+            Arc::new(BlobStore::new(blob_store_config, account_db.clone()).await?);
 
         // Initialize identity cache database with WAL mode enabled
         // WAL mode provides better read concurrency - reads don't block during cache writes
@@ -350,4 +353,56 @@ impl AppContext {
     pub fn service_did(&self) -> &str {
         &self.config.service.service_did
     }
+}
+
+/// Convert the configuration-layer `BlobstoreConfig` (S3 vs Disk variants
+/// loaded from env vars) into the storage-layer `BlobStoreConfig` that
+/// `BlobStore::new` consumes. Centralised here so the dispatch lives
+/// next to `AppContext::new`'s blob store construction.
+fn build_blob_store_config(config: &ServerConfig) -> PdsResult<BlobStoreConfig> {
+    // `tmp_location` and `temp_dir` are conceptually the same — the disk
+    // backend writes pending uploads to a temp directory before atomically
+    // renaming into place. We keep the config-layer name `tmp_location`
+    // and pass it through to the storage layer's `temp_dir`.
+    let (backend, temp_dir) = match &config.storage.blobstore {
+        BlobstoreConfig::Disk {
+            location,
+            tmp_location,
+        } => (
+            BlobBackendType::Disk {
+                location: location.clone(),
+            },
+            tmp_location.clone(),
+        ),
+        BlobstoreConfig::S3 {
+            bucket,
+            region,
+            access_key_id,
+            secret_access_key,
+            endpoint,
+        } => (
+            BlobBackendType::S3 {
+                bucket: bucket.clone(),
+                region: region.clone(),
+                endpoint: endpoint.clone(),
+                access_key_id: access_key_id.clone(),
+                secret_access_key: secret_access_key.clone(),
+                // The s3 module's default key prefix; Phase 3 (#73) may
+                // make this configurable for parity with bsky-PDS.
+                prefix: "blobs/".to_string(),
+            },
+            // S3 backend doesn't need a local temp dir for blob bodies,
+            // but the wrapper's other code paths still expect one.
+            // Reuse the configured data directory.
+            config.storage.data_directory.join("temp"),
+        ),
+    };
+
+    Ok(BlobStoreConfig {
+        storage: BlobStorageConfig {
+            backend,
+            max_blob_size: config.service.blob_upload_limit,
+            temp_dir,
+        },
+    })
 }

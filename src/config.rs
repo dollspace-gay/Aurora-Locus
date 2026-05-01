@@ -3,7 +3,7 @@ use crate::error::{PdsError, PdsResult};
 use crate::validation::ValidationMode;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Main server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +56,78 @@ pub enum BlobstoreConfig {
         secret_access_key: String,
         endpoint: Option<String>,
     },
+}
+
+impl BlobstoreConfig {
+    /// Construct a `BlobstoreConfig` from explicit option-typed values.
+    ///
+    /// Factored out of `ServerConfig::from_env` for testability — env vars
+    /// are process-global and racy in parallel test runs, but pure
+    /// `Option<String>` inputs are not. The wrapper in `from_env` reads
+    /// env::var and threads the results into this function.
+    ///
+    /// Behavior:
+    /// - Both S3 bucket and disk location set → `Validation` error (mutual
+    ///   exclusion: operators must pick one backend).
+    /// - S3 bucket set, no disk location → S3 variant, with credentials
+    ///   required (missing access key or secret key → error naming the
+    ///   missing env var).
+    /// - No S3 bucket → Disk variant, defaulting `location` to
+    ///   `data_directory/blobs` and `tmp_location` to `data_directory/temp`
+    ///   when the disk env vars are unset.
+    // Eight Option<String> args matches the eight env vars this constructor
+    // demultiplexes; collapsing into a struct would obscure the call site.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_env_values(
+        data_directory: &Path,
+        s3_bucket: Option<String>,
+        s3_region: Option<String>,
+        s3_endpoint: Option<String>,
+        s3_access_key_id: Option<String>,
+        s3_secret_access_key: Option<String>,
+        disk_location: Option<String>,
+        disk_tmp_location: Option<String>,
+    ) -> PdsResult<Self> {
+        if s3_bucket.is_some() && disk_location.is_some() {
+            return Err(PdsError::Validation(
+                "Configure either S3 or disk blob storage, not both. \
+                 Set PDS_BLOBSTORE_S3_BUCKET for S3 or \
+                 PDS_BLOBSTORE_DISK_LOCATION for disk."
+                    .to_string(),
+            ));
+        }
+
+        if let Some(bucket) = s3_bucket {
+            return Ok(BlobstoreConfig::S3 {
+                bucket,
+                region: s3_region.unwrap_or_else(|| "us-east-1".to_string()),
+                access_key_id: s3_access_key_id.ok_or_else(|| {
+                    PdsError::Validation(
+                        "PDS_BLOBSTORE_S3_ACCESS_KEY_ID is required when \
+                         PDS_BLOBSTORE_S3_BUCKET is set"
+                            .to_string(),
+                    )
+                })?,
+                secret_access_key: s3_secret_access_key.ok_or_else(|| {
+                    PdsError::Validation(
+                        "PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY is required when \
+                         PDS_BLOBSTORE_S3_BUCKET is set"
+                            .to_string(),
+                    )
+                })?,
+                endpoint: s3_endpoint,
+            });
+        }
+
+        Ok(BlobstoreConfig::Disk {
+            location: disk_location
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data_directory.join("blobs")),
+            tmp_location: disk_tmp_location
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data_directory.join("temp")),
+        })
+    }
 }
 
 /// Authentication configuration
@@ -296,27 +368,16 @@ impl ServerConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| data_directory.join("actors"));
 
-        let blobstore = if let Ok(bucket) = env::var("PDS_BLOBSTORE_S3_BUCKET") {
-            BlobstoreConfig::S3 {
-                bucket,
-                region: env::var("PDS_BLOBSTORE_S3_REGION")
-                    .unwrap_or_else(|_| "us-east-1".to_string()),
-                access_key_id: env::var("PDS_BLOBSTORE_S3_ACCESS_KEY_ID")
-                    .map_err(|_| PdsError::Validation("S3 access key required".to_string()))?,
-                secret_access_key: env::var("PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY")
-                    .map_err(|_| PdsError::Validation("S3 secret key required".to_string()))?,
-                endpoint: env::var("PDS_BLOBSTORE_S3_ENDPOINT").ok(),
-            }
-        } else {
-            BlobstoreConfig::Disk {
-                location: env::var("PDS_BLOBSTORE_DISK_LOCATION")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| data_directory.join("blobs")),
-                tmp_location: env::var("PDS_BLOBSTORE_DISK_TMP_LOCATION")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| data_directory.join("temp")),
-            }
-        };
+        let blobstore = BlobstoreConfig::from_env_values(
+            &data_directory,
+            env::var("PDS_BLOBSTORE_S3_BUCKET").ok(),
+            env::var("PDS_BLOBSTORE_S3_REGION").ok(),
+            env::var("PDS_BLOBSTORE_S3_ENDPOINT").ok(),
+            env::var("PDS_BLOBSTORE_S3_ACCESS_KEY_ID").ok(),
+            env::var("PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY").ok(),
+            env::var("PDS_BLOBSTORE_DISK_LOCATION").ok(),
+            env::var("PDS_BLOBSTORE_DISK_TMP_LOCATION").ok(),
+        )?;
 
         let jwt_secret = env::var("PDS_JWT_SECRET")
             .map_err(|_| PdsError::Validation("JWT secret required".to_string()))?;
@@ -502,5 +563,166 @@ impl ServerConfig {
         // Admin password removed - OAuth uses DID-based authentication
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod blobstore_tests {
+    use super::*;
+
+    fn data_dir() -> PathBuf {
+        PathBuf::from("/tmp/aurora-test-data")
+    }
+
+    #[test]
+    fn from_env_values_defaults_to_disk_when_nothing_set() {
+        let cfg = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        match cfg {
+            BlobstoreConfig::Disk {
+                location,
+                tmp_location,
+            } => {
+                assert_eq!(location, data_dir().join("blobs"));
+                assert_eq!(tmp_location, data_dir().join("temp"));
+            }
+            _ => panic!("expected Disk variant"),
+        }
+    }
+
+    #[test]
+    fn from_env_values_disk_only_uses_provided_location() {
+        let cfg = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("/var/blobs".to_string()),
+            None,
+        )
+        .unwrap();
+        match cfg {
+            BlobstoreConfig::Disk { location, .. } => {
+                assert_eq!(location, PathBuf::from("/var/blobs"));
+            }
+            _ => panic!("expected Disk variant"),
+        }
+    }
+
+    #[test]
+    fn from_env_values_s3_only_constructs_s3_variant() {
+        let cfg = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("my-bucket".to_string()),
+            Some("eu-west-1".to_string()),
+            Some("https://s3.eu-west-1.amazonaws.com".to_string()),
+            Some("AKIAEXAMPLE".to_string()),
+            Some("secret-example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        match cfg {
+            BlobstoreConfig::S3 {
+                bucket,
+                region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+            } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(region, "eu-west-1");
+                assert_eq!(
+                    endpoint.as_deref(),
+                    Some("https://s3.eu-west-1.amazonaws.com")
+                );
+                assert_eq!(access_key_id, "AKIAEXAMPLE");
+                assert_eq!(secret_access_key, "secret-example");
+            }
+            _ => panic!("expected S3 variant"),
+        }
+    }
+
+    #[test]
+    fn from_env_values_s3_defaults_region_to_us_east_1() {
+        let cfg = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("b".to_string()),
+            None,
+            None,
+            Some("k".to_string()),
+            Some("s".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        match cfg {
+            BlobstoreConfig::S3 { region, .. } => assert_eq!(region, "us-east-1"),
+            _ => panic!("expected S3 variant"),
+        }
+    }
+
+    #[test]
+    fn from_env_values_rejects_both_s3_and_disk() {
+        let err = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("bucket".to_string()),
+            None,
+            None,
+            Some("k".to_string()),
+            Some("s".to_string()),
+            Some("/var/blobs".to_string()),
+            None,
+        )
+        .expect_err("both backends configured should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not both"));
+        assert!(msg.contains("PDS_BLOBSTORE_S3_BUCKET"));
+        assert!(msg.contains("PDS_BLOBSTORE_DISK_LOCATION"));
+    }
+
+    #[test]
+    fn from_env_values_rejects_s3_bucket_without_access_key() {
+        let err = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("bucket".to_string()),
+            None,
+            None,
+            None,
+            Some("s".to_string()),
+            None,
+            None,
+        )
+        .expect_err("S3 bucket without access key should be rejected");
+        assert!(err.to_string().contains("PDS_BLOBSTORE_S3_ACCESS_KEY_ID"));
+    }
+
+    #[test]
+    fn from_env_values_rejects_s3_bucket_without_secret_key() {
+        let err = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("bucket".to_string()),
+            None,
+            None,
+            Some("k".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect_err("S3 bucket without secret key should be rejected");
+        assert!(err
+            .to_string()
+            .contains("PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY"));
     }
 }
