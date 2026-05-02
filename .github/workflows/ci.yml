@@ -68,10 +68,16 @@ jobs:
       # docker for postgres:16-alpine) works without setup.
       - name: Verify Docker daemon
         run: docker version
+      # postgres-client provides pg_dump and psql for the
+      # backup_restore_roundtrip_on_postgres test (chainlink #95 /
+      # Phase 5.2). The test skips silently if these aren't on PATH,
+      # so installing them upgrades the test from skip to actually-run.
+      - name: Install postgres-client (for pg_dump / psql)
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
       # `--test-threads=1` because each test spins up its own Postgres
-      # container; running 5 in parallel races on port allocation
+      # container; running them in parallel races on port allocation
       # under some Docker configs. Tests are short individually
-      # (~3-5s each) so the serial cost is small.
+      # (~3-7s each) so the serial cost is small.
       - name: cargo test --test postgres_smoke_test
         run: cargo test --test postgres_smoke_test -- --test-threads=1
       - name: cargo test --test multi_instance_test

@@ -450,3 +450,106 @@ async fn account_manager_round_trip_on_postgres() {
         .expect("get_account_by_identifier renamed");
     assert_eq!(renamed.did, acc.did);
 }
+
+// ===========================================================================
+// Phase 5.2 (chainlink #95) — backup/restore round-trip.
+//
+// pg_dump → file → psql restore. Tests the underlying mechanism the
+// `aurora-locus backup` and `aurora-locus restore` wrappers use,
+// against the production schema with real data. Catches regressions
+// in: pg_dump invocation flags (--no-owner, --no-acl), psql restore
+// flags (--single-transaction, --set=ON_ERROR_STOP=on), and any
+// schema feature that doesn't survive a logical-backup round-trip.
+//
+// Skipped silently if pg_dump/psql aren't on PATH — this is a CI
+// concern, not a hard test prerequisite, since CI installs them
+// alongside the postgres-client package.
+// ===========================================================================
+
+#[tokio::test]
+async fn backup_restore_roundtrip_on_postgres() {
+    use std::process::{Command, Stdio};
+    use tempfile::tempdir;
+
+    // Skip silently if pg_dump or psql isn't installed. CI installs
+    // postgres-client to satisfy this; local devs without it just
+    // get a skip.
+    if Command::new("pg_dump").arg("--version").stdout(Stdio::null()).status().is_err()
+        || Command::new("psql").arg("--version").stdout(Stdio::null()).status().is_err()
+    {
+        eprintln!("skipping backup_restore_roundtrip_on_postgres: pg_dump/psql not on PATH");
+        return;
+    }
+
+    let (_pg, url) = start_postgres().await;
+    let pool = open_pool(&url).await;
+
+    // Seed: insert an actor row directly so the round-trip has
+    // something to verify.
+    sqlx::query(
+        "INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)",
+    )
+    .bind("did:plc:roundtrip")
+    .bind("rt.test")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("seed actor");
+
+    // pg_dump → tempfile (mirrors the wrapper's flags exactly).
+    let tmp = tempdir().unwrap();
+    let backup_path = tmp.path().join("aurora-roundtrip.sql");
+    let dump_status = Command::new("pg_dump")
+        .arg("--no-owner")
+        .arg("--no-acl")
+        .arg(&url)
+        .stdout(File::create(&backup_path).expect("create backup file"))
+        .status()
+        .expect("invoke pg_dump");
+    assert!(dump_status.success(), "pg_dump failed");
+    assert!(
+        std::fs::metadata(&backup_path).unwrap().len() > 0,
+        "backup file is empty"
+    );
+
+    // Wipe everything, then restore. Two separate statements because
+    // sqlx's prepared-statement protocol rejects multi-command strings.
+    sqlx::query("DROP SCHEMA public CASCADE")
+        .execute(&pool)
+        .await
+        .expect("drop schema");
+    sqlx::query("CREATE SCHEMA public")
+        .execute(&pool)
+        .await
+        .expect("recreate schema");
+
+    // Verify the wipe took.
+    let wiped: Result<i64, _> =
+        sqlx::query_scalar("SELECT COUNT(*) FROM actor").fetch_one(&pool).await;
+    assert!(
+        wiped.is_err(),
+        "actor table should be gone after wipe (got {:?})",
+        wiped
+    );
+
+    // psql restore (mirrors the wrapper's flags exactly).
+    let restore_status = Command::new("psql")
+        .arg("--quiet")
+        .arg("--single-transaction")
+        .arg("--set=ON_ERROR_STOP=on")
+        .arg(&url)
+        .stdin(File::open(&backup_path).expect("open backup file"))
+        .status()
+        .expect("invoke psql");
+    assert!(restore_status.success(), "psql restore failed");
+
+    // Verify our seeded row is back.
+    let did: String = sqlx::query_scalar("SELECT did FROM actor WHERE handle = $1")
+        .bind("rt.test")
+        .fetch_one(&pool)
+        .await
+        .expect("seeded row should be restored");
+    assert_eq!(did, "did:plc:roundtrip");
+}
+
+use std::fs::File;
