@@ -384,8 +384,8 @@ pub async fn mark_code_as_used(ctx: &AppContext, authorization_code: &str) -> Pd
     let result = sqlx::query(
         r#"
         UPDATE authorization_request
-        SET code_used = 1, code_used_at = $1
-        WHERE authorization_code = $2 AND code_used = 0
+        SET code_used = TRUE, code_used_at = $1
+        WHERE authorization_code = $2 AND code_used = FALSE
         "#,
     )
     .bind(now.to_rfc3339())

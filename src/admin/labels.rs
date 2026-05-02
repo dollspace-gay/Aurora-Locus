@@ -46,7 +46,7 @@ impl LabelManager {
         let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO label (uri, cid, val, neg, src, created_at, created_by, expires_at)
-            VALUES ($1, $2, $3, 0, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, FALSE, $4, $5, $6, $7)
             RETURNING id
             "#,
         )
@@ -87,7 +87,7 @@ impl LabelManager {
         let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO label (uri, cid, val, neg, src, created_at, created_by)
-            VALUES ($1, $2, $3, 1, $4, $5, $6)
+            VALUES ($1, $2, $3, TRUE, $4, $5, $6)
             RETURNING id
             "#,
         )

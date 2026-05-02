@@ -109,7 +109,7 @@ impl AccountManager {
         // Insert into account table (private auth)
         sqlx::query(
             "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled)
-             VALUES (?1, ?2, ?3, NULL, 0)",
+             VALUES (?1, ?2, ?3, NULL, FALSE)",
         )
         .bind(&did)
         .bind(&email)
@@ -2072,7 +2072,7 @@ impl AccountManager {
     ///
     /// Allows the account to create and use invite codes.
     pub async fn enable_account_invites(&self, did: &str) -> PdsResult<()> {
-        let result = sqlx::query("UPDATE account SET invites_disabled = 0 WHERE did = ?1")
+        let result = sqlx::query("UPDATE account SET invites_disabled = FALSE WHERE did = ?1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -2090,7 +2090,7 @@ impl AccountManager {
     ///
     /// Prevents the account from creating new invite codes.
     pub async fn disable_account_invites(&self, did: &str) -> PdsResult<()> {
-        let result = sqlx::query("UPDATE account SET invites_disabled = 1 WHERE did = ?1")
+        let result = sqlx::query("UPDATE account SET invites_disabled = TRUE WHERE did = ?1")
             .bind(did)
             .execute(&self.db)
             .await
