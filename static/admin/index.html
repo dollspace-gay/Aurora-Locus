@@ -34,6 +34,10 @@
                     Reports
                     <span class="badge" id="reports-count">0</span>
                 </a>
+                <a href="#events" class="nav-item" data-page="events">
+                    <span class="icon">📜</span>
+                    Mod Events
+                </a>
                 <a href="#invites" class="nav-item" data-page="invites">
                     <span class="icon">✉️</span>
                     Invite Codes
@@ -185,6 +189,30 @@
 
                 <div class="reports-list" id="reports-list">
                     <!-- Populated by JS -->
+                </div>
+            </div>
+
+            <!-- Mod Events Page (chainlink #100 / Phase 3.3) -->
+            <div id="page-events" class="page">
+                <header class="page-header">
+                    <h2>Moderation Events</h2>
+                    <p class="page-subtitle">
+                        Cross-instance event log via tools.aurora.moderator.queryEvents.
+                        Click an event for full context.
+                    </p>
+                </header>
+                <div class="filter-bar" style="margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap;">
+                    <input type="text" id="events-filter-actor" placeholder="Filter by actor DID" style="flex: 1; min-width: 200px;">
+                    <input type="text" id="events-filter-subject" placeholder="Filter by subject DID" style="flex: 1; min-width: 200px;">
+                    <input type="text" id="events-filter-type" placeholder="Filter by event type" style="flex: 1; min-width: 160px;">
+                    <button class="btn-primary" onclick="loadEvents()">Apply</button>
+                </div>
+                <div id="events-table-container">
+                    <p class="empty-state">Click Apply to load events.</p>
+                </div>
+                <div style="margin-top: 16px; display: flex; gap: 8px;">
+                    <button class="btn-secondary" id="events-prev-btn" onclick="loadEventsPrev()" disabled>Previous</button>
+                    <button class="btn-secondary" id="events-next-btn" onclick="loadEventsNext()" disabled>Next</button>
                 </div>
             </div>
 

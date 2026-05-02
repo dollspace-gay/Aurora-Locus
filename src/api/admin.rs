@@ -292,6 +292,33 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.ops.triggerPdsDiscovery",
             post(trigger_pds_discovery),
         )
+        // ---- tools.aurora.moderator.* (chainlink #100 / Phase 3.3) ----
+        //
+        // Moderator-tier read endpoints. Five queries with shared
+        // rich-context infrastructure (resolve_handles, etc.) in
+        // src/api/aurora_moderator.rs. Auth: AdminAuthContext
+        // (Moderator+); namespace middleware also gates
+        // tools.aurora.moderator.* to atproto:admin.moderation.
+        .route(
+            "/xrpc/tools.aurora.moderator.queryEvents",
+            get(crate::api::aurora_moderator::query_events),
+        )
+        .route(
+            "/xrpc/tools.aurora.moderator.getEvent",
+            get(crate::api::aurora_moderator::get_event),
+        )
+        .route(
+            "/xrpc/tools.aurora.moderator.queryStatuses",
+            get(crate::api::aurora_moderator::query_statuses),
+        )
+        .route(
+            "/xrpc/tools.aurora.moderator.getSubjectContext",
+            get(crate::api::aurora_moderator::get_subject_context),
+        )
+        .route(
+            "/xrpc/tools.aurora.moderator.getSubjectHistory",
+            get(crate::api::aurora_moderator::get_subject_history),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -2187,7 +2214,14 @@ fn aurora_capability_families() -> serde_json::Value {
             "listKnownInstances",
             "triggerPdsDiscovery"
         ],
-        "tools.aurora.moderator": [],
+        // Phase 3.3 (chainlink #100) — moderator-tier reads.
+        "tools.aurora.moderator": [
+            "queryEvents",
+            "getEvent",
+            "queryStatuses",
+            "getSubjectContext",
+            "getSubjectHistory"
+        ],
         "tools.aurora.admin": [],
         // Phase 3.6 (chainlink #103) — role management relocated from
         // com.atproto.admin.{grantRole,revokeRole}.

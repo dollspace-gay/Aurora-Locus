@@ -680,6 +680,112 @@ function saveSettings(formId) {
     alert('Settings saved successfully');
 }
 
+// Aurora moderator-tier event browser (chainlink #100 / Phase 3.3).
+// Fetches tools.aurora.moderator.queryEvents with filter params and
+// renders results in a table. Cursor-based pagination via
+// loadEventsPrev/loadEventsNext.
+let eventsCursorStack = [];      // page history for "Previous"
+let eventsNextCursor = null;     // cursor for "Next"
+
+function loadEvents() {
+    eventsCursorStack = [];
+    eventsNextCursor = null;
+    fetchEventsPage(null);
+}
+
+function loadEventsNext() {
+    if (eventsNextCursor) {
+        eventsCursorStack.push(eventsNextCursor);
+        fetchEventsPage(eventsNextCursor);
+    }
+}
+
+function loadEventsPrev() {
+    if (eventsCursorStack.length > 1) {
+        eventsCursorStack.pop();          // current page
+        const prev = eventsCursorStack[eventsCursorStack.length - 1] || null;
+        fetchEventsPage(prev);
+    } else if (eventsCursorStack.length === 1) {
+        eventsCursorStack = [];
+        fetchEventsPage(null);
+    }
+}
+
+function fetchEventsPage(cursor) {
+    const params = new URLSearchParams();
+    const actor = document.getElementById('events-filter-actor').value.trim();
+    const subj = document.getElementById('events-filter-subject').value.trim();
+    const evtType = document.getElementById('events-filter-type').value.trim();
+    if (actor) params.set('actor', actor);
+    if (subj) params.set('subjectDid', subj);
+    if (evtType) params.set('eventType', evtType);
+    if (cursor) params.set('cursor', cursor);
+    params.set('limit', '25');
+
+    const container = document.getElementById('events-table-container');
+    container.innerHTML = '<p class="empty-state">Loading...</p>';
+
+    fetch(`${API_BASE}/tools.aurora.moderator.queryEvents?${params.toString()}`, {
+        headers: { 'Authorization': `Bearer ${adminToken}` }
+    })
+    .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+    })
+    .then(data => renderEventsTable(data))
+    .catch(err => {
+        container.innerHTML = `<p class="empty-state">Error: ${err.message}</p>`;
+    });
+}
+
+function renderEventsTable(data) {
+    const container = document.getElementById('events-table-container');
+    const items = data.items || [];
+    eventsNextCursor = data.cursor || null;
+
+    document.getElementById('events-prev-btn').disabled = eventsCursorStack.length === 0;
+    document.getElementById('events-next-btn').disabled = !eventsNextCursor;
+
+    if (items.length === 0) {
+        container.innerHTML = '<p class="empty-state">No events match these filters.</p>';
+        return;
+    }
+
+    let html = '<table class="data-table"><thead><tr>'
+        + '<th>When</th><th>Type</th><th>Actor</th><th>Subject</th><th>ID</th>'
+        + '</tr></thead><tbody>';
+    for (const e of items) {
+        const when = new Date(e.createdAt).toLocaleString();
+        const actor = e.actorHandle || e.actorDid;
+        let subject = '—';
+        if (e.subject) {
+            const subjType = e.subject['$type'] || '?';
+            if (subjType.endsWith('repoRef')) {
+                subject = `repo: ${e.subjectHandle || e.subject.did}`;
+            } else if (subjType.endsWith('strongRef')) {
+                subject = `record: ${e.subject.uri}`;
+            } else if (subjType.endsWith('repoBlobRef')) {
+                subject = `blob: ${e.subject.cid}`;
+            }
+        }
+        html += `<tr><td>${when}</td><td>${e.eventType}</td><td>${actor}</td>`
+            + `<td>${subject}</td><td><a href="javascript:void(0)" onclick="loadEventDetail(${e.id})">${e.id}</a></td></tr>`;
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+}
+
+function loadEventDetail(id) {
+    fetch(`${API_BASE}/tools.aurora.moderator.getEvent?id=${id}`, {
+        headers: { 'Authorization': `Bearer ${adminToken}` }
+    })
+    .then(res => res.json())
+    .then(data => {
+        alert(JSON.stringify(data, null, 2));
+    })
+    .catch(err => alert(`Error: ${err.message}`));
+}
+
 // Aurora capability probe (chainlink #99 / Phase 3.2). Calls
 // tools.aurora.describeCapabilities and renders the JSON response
 // inline. Operators use this to verify which Aurora extensions
