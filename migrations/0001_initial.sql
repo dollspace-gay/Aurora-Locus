@@ -23,10 +23,10 @@
 CREATE TABLE actor (
     did              TEXT PRIMARY KEY,
     handle           TEXT UNIQUE NOT NULL,
-    created_at       DATETIME NOT NULL,
+    created_at       TEXT NOT NULL,
     takedown_ref     TEXT,
-    deactivated_at   DATETIME,
-    delete_after     DATETIME
+    deactivated_at   TEXT,
+    delete_after     TEXT
 );
 
 CREATE INDEX idx_actor_handle ON actor(handle);
@@ -35,7 +35,7 @@ CREATE TABLE account (
     did                 TEXT PRIMARY KEY,
     email               TEXT UNIQUE,
     password_hash       TEXT NOT NULL,
-    email_confirmed_at  DATETIME,
+    email_confirmed_at  TEXT,
     invites_disabled    INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (did) REFERENCES actor(did)
 );
@@ -59,8 +59,8 @@ CREATE TABLE session (
     did                  TEXT NOT NULL,
     access_token         TEXT UNIQUE NOT NULL,
     refresh_token        TEXT UNIQUE NOT NULL,
-    created_at           DATETIME NOT NULL,
-    expires_at           DATETIME NOT NULL,
+    created_at           TEXT NOT NULL,
+    expires_at           TEXT NOT NULL,
     app_password_name    TEXT,
     FOREIGN KEY (did) REFERENCES actor(did)
 );
@@ -72,10 +72,10 @@ CREATE TABLE refresh_token (
     id           TEXT PRIMARY KEY,
     did          TEXT NOT NULL,
     token        TEXT UNIQUE NOT NULL,
-    created_at   DATETIME NOT NULL,
-    expires_at   DATETIME NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
     used         INTEGER NOT NULL DEFAULT 0,
-    used_at      DATETIME,
+    used_at      TEXT,
     next_id      TEXT,
     FOREIGN KEY (did) REFERENCES actor(did)
 );
@@ -86,7 +86,7 @@ CREATE TABLE app_password (
     did             TEXT NOT NULL,
     name            TEXT NOT NULL,
     password_hash   TEXT NOT NULL,
-    created_at      DATETIME NOT NULL,
+    created_at      TEXT NOT NULL,
     privileged      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (did, name),
     FOREIGN KEY (did) REFERENCES actor(did)
@@ -100,8 +100,8 @@ CREATE TABLE email_token (
     token        TEXT PRIMARY KEY,
     did          TEXT NOT NULL,
     purpose      TEXT NOT NULL,  -- 'confirm_email', 'reset_password', 'delete_account'
-    created_at   DATETIME NOT NULL,
-    expires_at   DATETIME NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
     used         INTEGER NOT NULL DEFAULT 0
 );
 
@@ -169,7 +169,7 @@ CREATE TABLE blob_metadata (
     mime_type        TEXT NOT NULL,
     size             INTEGER NOT NULL,
     creator_did      TEXT NOT NULL,
-    created_at       DATETIME NOT NULL,
+    created_at       TEXT NOT NULL,
     width            INTEGER,
     height           INTEGER,
     alt_text         TEXT,
@@ -183,7 +183,7 @@ CREATE TABLE temp_blob_metadata (
     mime_type        TEXT NOT NULL,
     size             INTEGER NOT NULL,
     creator_did      TEXT NOT NULL,
-    created_at       DATETIME NOT NULL,
+    created_at       TEXT NOT NULL,
     width            INTEGER,
     height           INTEGER
 );
@@ -209,7 +209,7 @@ CREATE INDEX idx_blob_quarantine_cid ON blob_quarantine(cid);
 CREATE TABLE record_blob (
     blob_cid     TEXT NOT NULL,
     record_uri   TEXT NOT NULL,
-    indexed_at   DATETIME NOT NULL,
+    indexed_at   TEXT NOT NULL,
     PRIMARY KEY (blob_cid, record_uri)
 );
 
@@ -391,9 +391,9 @@ CREATE TABLE device (
     session_id          TEXT NOT NULL,
     user_agent          TEXT,
     ip_address          TEXT,
-    last_seen_at        DATETIME,
+    last_seen_at        TEXT,
     dpop_public_key     TEXT,
-    created_at          DATETIME NOT NULL
+    created_at          TEXT NOT NULL
 );
 
 CREATE INDEX idx_device_session ON device(session_id);
@@ -402,10 +402,10 @@ CREATE TABLE account_device (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     did               TEXT NOT NULL,
     device_id         TEXT NOT NULL,
-    authorized_at     DATETIME NOT NULL,
+    authorized_at     TEXT NOT NULL,
     device_name       TEXT,
     is_active         INTEGER NOT NULL DEFAULT 1,
-    revoked_at        DATETIME,
+    revoked_at        TEXT,
     FOREIGN KEY (device_id) REFERENCES device(id)
 );
 
@@ -426,8 +426,8 @@ CREATE TABLE authorization_request (
     state                   TEXT,
     authorization_code      TEXT,
     code_used               INTEGER NOT NULL DEFAULT 0,
-    created_at              DATETIME NOT NULL,
-    expires_at              DATETIME NOT NULL
+    created_at              TEXT NOT NULL,
+    expires_at              TEXT NOT NULL
 );
 
 CREATE INDEX idx_auth_request_code ON authorization_request(authorization_code) WHERE authorization_code IS NOT NULL;
@@ -438,8 +438,8 @@ CREATE TABLE authorized_client (
     did                      TEXT NOT NULL,
     client_id                TEXT NOT NULL,
     scope                    TEXT NOT NULL,
-    first_authorized_at      DATETIME NOT NULL,
-    last_used_at             DATETIME NOT NULL,
+    first_authorized_at      TEXT NOT NULL,
+    last_used_at             TEXT NOT NULL,
     is_active                INTEGER NOT NULL DEFAULT 1,
     UNIQUE (did, client_id)
 );
@@ -456,13 +456,13 @@ CREATE TABLE token (
     client_id                 TEXT NOT NULL,
     current_refresh_token     TEXT,
     scope                     TEXT NOT NULL,
-    created_at                DATETIME NOT NULL,
-    updated_at                DATETIME NOT NULL,
-    expires_at                DATETIME NOT NULL,
+    created_at                TEXT NOT NULL,
+    updated_at                TEXT NOT NULL,
+    expires_at                TEXT NOT NULL,
     dpop_thumbprint           TEXT,
     device_id                 TEXT,
     revoked                   INTEGER NOT NULL DEFAULT 0,
-    revoked_at                DATETIME
+    revoked_at                TEXT
 );
 
 CREATE INDEX idx_token_did ON token(did) WHERE revoked = 0;
@@ -473,7 +473,7 @@ CREATE TABLE used_refresh_token (
     refresh_token    TEXT PRIMARY KEY,
     token_id         TEXT NOT NULL,
     did              TEXT NOT NULL,
-    used_at          DATETIME NOT NULL
+    used_at          TEXT NOT NULL
 );
 
 CREATE INDEX idx_used_refresh_did ON used_refresh_token(did);

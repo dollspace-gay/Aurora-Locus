@@ -43,10 +43,11 @@ impl LabelManager {
         let now = Utc::now();
         let expires_at = expires_in.map(|d| now + d);
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO label (uri, cid, val, neg, src, created_at, created_by, expires_at)
             VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+            RETURNING id
             "#,
         )
         .bind(uri)
@@ -56,11 +57,11 @@ impl LabelManager {
         .bind(now.to_rfc3339())
         .bind(created_by)
         .bind(expires_at.map(|dt| dt.to_rfc3339()))
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
         Ok(Label {
-            id: result.last_insert_id().unwrap_or(0),
+            id,
             uri: uri.to_string(),
             cid: cid.map(String::from),
             val: val.to_string(),
@@ -83,10 +84,11 @@ impl LabelManager {
     ) -> PdsResult<Label> {
         let now = Utc::now();
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO label (uri, cid, val, neg, src, created_at, created_by)
             VALUES (?, ?, ?, 1, ?, ?, ?)
+            RETURNING id
             "#,
         )
         .bind(uri)
@@ -95,11 +97,11 @@ impl LabelManager {
         .bind(&self.server_did)
         .bind(now.to_rfc3339())
         .bind(created_by)
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
         Ok(Label {
-            id: result.last_insert_id().unwrap_or(0),
+            id,
             uri: uri.to_string(),
             cid: cid.map(String::from),
             val: val.to_string(),
@@ -144,7 +146,7 @@ impl LabelManager {
                 uri: row.get("uri"),
                 cid: row.get("cid"),
                 val: row.get("val"),
-                neg: row.get("neg"),
+                neg: row.get::<i64, _>("neg") != 0,
                 src: row.get("src"),
                 created_at,
                 created_by: row.get("created_by"),

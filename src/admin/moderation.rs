@@ -112,11 +112,14 @@ impl ModerationManager {
         let now = Utc::now();
         let expires_at = expires_in.map(|d| now + d);
 
-        let result = sqlx::query(
+        // RETURNING id is portable (SQLite 3.35+, Postgres). AnyPool's
+        // last_insert_id() is unreliable on SQLite.
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO account_moderation
             (did, action, reason, moderated_by, moderated_at, expires_at, report_id, notes)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
             "#,
         )
         .bind(did)
@@ -127,10 +130,8 @@ impl ModerationManager {
         .bind(expires_at.map(|dt| dt.to_rfc3339()))
         .bind(report_id)
         .bind(&notes)
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
-
-        let id = result.last_insert_id().unwrap_or(0);
 
         // Apply account-level action if it's a takedown
         if action == ModerationAction::Takedown {
@@ -336,7 +337,7 @@ impl ModerationManager {
                 moderated_by: row.get("moderated_by"),
                 moderated_at,
                 expires_at,
-                reversed: row.get("reversed"),
+                reversed: row.get::<i64, _>("reversed") != 0,
                 reversed_at,
                 reversed_by: row.get("reversed_by"),
                 reversal_reason: row.get("reversal_reason"),
@@ -460,7 +461,7 @@ mod tests {
                 moderated_by TEXT NOT NULL,
                 moderated_at TEXT NOT NULL,
                 expires_at TEXT,
-                reversed BOOLEAN NOT NULL DEFAULT false,
+                reversed INTEGER NOT NULL DEFAULT 0,
                 reversed_at TEXT,
                 reversed_by TEXT,
                 reversal_reason TEXT,
@@ -531,7 +532,7 @@ mod tests {
                 moderated_by TEXT NOT NULL,
                 moderated_at TEXT NOT NULL,
                 expires_at TEXT,
-                reversed BOOLEAN NOT NULL DEFAULT false,
+                reversed INTEGER NOT NULL DEFAULT 0,
                 reversed_at TEXT,
                 reversed_by TEXT,
                 reversal_reason TEXT,
@@ -593,7 +594,7 @@ mod tests {
                 moderated_by TEXT NOT NULL,
                 moderated_at TEXT NOT NULL,
                 expires_at TEXT,
-                reversed BOOLEAN NOT NULL DEFAULT false,
+                reversed INTEGER NOT NULL DEFAULT 0,
                 reversed_at TEXT,
                 reversed_by TEXT,
                 reversal_reason TEXT,

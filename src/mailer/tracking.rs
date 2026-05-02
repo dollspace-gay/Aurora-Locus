@@ -94,10 +94,11 @@ impl EmailTracker {
     ) -> PdsResult<i64> {
         let now = Utc::now();
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO email_delivery (recipient, subject, template_type, status, created_at, message_id, retry_count)
             VALUES (?, ?, ?, 'queued', ?, ?, 0)
+            RETURNING id
             "#,
         )
         .bind(recipient)
@@ -105,13 +106,10 @@ impl EmailTracker {
         .bind(template_type)
         .bind(now.to_rfc3339())
         .bind(message_id)
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
-        // sqlx::Any uses last_insert_id (returns Option<i64>); Postgres
-        // returns None without RETURNING. unwrap_or(0) preserves the
-        // existing return-type contract.
-        Ok(result.last_insert_id().unwrap_or(0))
+        Ok(id)
     }
 
     /// Mark email as sent

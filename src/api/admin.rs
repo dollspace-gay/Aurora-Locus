@@ -4442,8 +4442,14 @@ mod tests {
 
     async fn create_test_context() -> AppContext {
         let _guard = fixture_setup_lock().lock().await;
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
+        // `into_path()` leaks the TempDir so its Drop doesn't unlink the
+        // directory while sqlx connections still hold it open. Under the
+        // AnyPool default journal mode (DELETE), SQLite reports
+        // SQLITE_READONLY_DBMOVED on the next write once the directory
+        // entry is gone — WAL was previously masking this. The OS cleans
+        // up /tmp on its own; this is test-only so leaking is fine.
+        let dir = tempdir().unwrap().keep();
+        let db_path = dir.join("test.db");
 
         let config = ServerConfig {
             service: ServiceConfig {
@@ -4454,14 +4460,14 @@ mod tests {
                 blob_upload_limit: 5242880,
             },
             storage: StorageConfig {
-                data_directory: dir.path().to_path_buf(),
+                data_directory: dir.clone(),
                 account_db: db_path.clone(),
-                sequencer_db: dir.path().join("sequencer.db"),
-                did_cache_db: dir.path().join("did_cache.db"),
-                actor_store_directory: dir.path().join("actors"),
+                sequencer_db: dir.join("sequencer.db"),
+                did_cache_db: dir.join("did_cache.db"),
+                actor_store_directory: dir.join("actors"),
                 blobstore: BlobstoreConfig::Disk {
-                    location: dir.path().join("blobs"),
-                    tmp_location: dir.path().join("temp"),
+                    location: dir.join("blobs"),
+                    tmp_location: dir.join("temp"),
                 },
             },
             database: Default::default(),

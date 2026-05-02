@@ -122,10 +122,14 @@ impl AppealManager {
             }
         }
 
-        let result = sqlx::query(
+        // RETURNING id is portable (SQLite 3.35+, Postgres). AnyPool's
+        // last_insert_id() is unreliable on SQLite, so we round-trip the
+        // generated id explicitly.
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO appeal (moderation_id, report_id, quarantine_id, appellant_did, reason, details, submitted_at, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+            RETURNING id
             "#,
         )
         .bind(moderation_id)
@@ -135,7 +139,7 @@ impl AppealManager {
         .bind(reason)
         .bind(details)
         .bind(now.to_rfc3339())
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
         tracing::info!(
@@ -146,7 +150,7 @@ impl AppealManager {
         );
 
         Ok(Appeal {
-            id: result.last_insert_id().unwrap_or(0),
+            id,
             moderation_id,
             report_id,
             quarantine_id,

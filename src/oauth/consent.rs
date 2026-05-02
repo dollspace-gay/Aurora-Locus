@@ -451,7 +451,7 @@ pub async fn get_request_by_code(
     }
 
     // Check if already used
-    let code_used: bool = row.get("code_used");
+    let code_used: bool = row.get::<i64, _>("code_used") != 0;
     if code_used {
         return Err(PdsError::Authentication(
             "Authorization code already used".to_string(),
@@ -471,7 +471,7 @@ pub async fn get_request_by_code(
         state: row.get("state"),
         created_at: parse_ts(&row.get::<String, _>("created_at"))?,
         expires_at: parse_ts(&row.get::<String, _>("expires_at"))?,
-        code_used: row.get("code_used"),
+        code_used: row.get::<i64, _>("code_used") != 0,
         code_used_at: row
             .get::<Option<String>, _>("code_used_at")
             .as_deref()

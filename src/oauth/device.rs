@@ -205,30 +205,25 @@ impl DeviceManager {
     ) -> PdsResult<i64> {
         let now = Utc::now();
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO account_device (
                 did, device_id, authorized_at, device_name, is_active
             )
             VALUES (?, ?, ?, ?, true)
+            RETURNING id
             "#,
         )
         .bind(did)
         .bind(device_id)
         .bind(now.to_rfc3339())
         .bind(device_name)
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
         debug!("Associated device {} with account {}", device_id, did);
 
-        // sqlx::Any uses `last_insert_id` (returns Option<i64>) instead of
-        // sqlite-specific `last_insert_rowid`. Postgres doesn't surface a
-        // last-insert id without RETURNING, so this returns None on Postgres;
-        // unwrap_or(0) preserves the existing return-type contract for
-        // callers that don't actually use the value (the audit log call
-        // sites in admin.rs ignore it).
-        Ok(result.last_insert_id().unwrap_or(0))
+        Ok(id)
     }
 
     /// List devices for an account

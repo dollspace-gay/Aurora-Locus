@@ -180,7 +180,7 @@ impl InviteCodeManager {
         let row = row.ok_or_else(|| PdsError::NotFound("Invite code not found".to_string()))?;
 
         let available: i32 = row.get("available");
-        let disabled: bool = row.get("disabled");
+        let disabled: bool = row.get::<i64, _>("disabled") != 0;
         let for_account: Option<String> = row.get("for_account");
 
         // Validate code
@@ -324,7 +324,7 @@ impl InviteCodeManager {
             Ok(Some(InviteCode {
                 code: row.get("code"),
                 available: row.get("available"),
-                disabled: row.get("disabled"),
+                disabled: row.get::<i64, _>("disabled") != 0,
                 created_by: row.get("created_by"),
                 created_at,
                 expires_at,
@@ -391,7 +391,7 @@ impl InviteCodeManager {
             codes.push(InviteCode {
                 code: row.get("code"),
                 available: row.get("available"),
-                disabled: row.get("disabled"),
+                disabled: row.get::<i64, _>("disabled") != 0,
                 created_by: row.get("created_by"),
                 created_at,
                 expires_at,
@@ -558,7 +558,7 @@ impl InviteCodeManager {
                 InviteCode {
                     code: row.get("code"),
                     available: row.get("available"),
-                    disabled: row.get("disabled"),
+                    disabled: row.get::<i64, _>("disabled") != 0,
                     created_by: row.get("created_by"),
                     created_at,
                     expires_at,
@@ -597,7 +597,7 @@ impl InviteCodeManager {
             codes.push(InviteCode {
                 code: row.get("code"),
                 available: row.get("available"),
-                disabled: row.get("disabled"),
+                disabled: row.get::<i64, _>("disabled") != 0,
                 created_by: row.get("created_by"),
                 created_at,
                 expires_at,
@@ -634,7 +634,7 @@ mod tests {
             CREATE TABLE invite_code (
                 code TEXT PRIMARY KEY,
                 available INTEGER NOT NULL DEFAULT 1,
-                disabled BOOLEAN NOT NULL DEFAULT false,
+                disabled INTEGER NOT NULL DEFAULT 0,
                 created_by TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 expires_at TEXT,

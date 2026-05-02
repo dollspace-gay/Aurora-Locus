@@ -149,7 +149,7 @@ impl ClientManager {
 
         if let Some(row) = existing {
             let id: i64 = row.get("id");
-            let is_active: bool = row.get("is_active");
+            let is_active: bool = row.get::<i64, _>("is_active") != 0;
 
             if is_active {
                 // Update existing authorization
@@ -197,12 +197,13 @@ impl ClientManager {
         }
 
         // Create new authorization
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO authorized_client (
                 did, client_id, scope, first_authorized_at, last_used_at, is_active
             )
             VALUES (?, ?, ?, ?, ?, 1)
+            RETURNING id
             "#,
         )
         .bind(did)
@@ -210,7 +211,7 @@ impl ClientManager {
         .bind(scope)
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
         debug!(
@@ -218,10 +219,7 @@ impl ClientManager {
             did, client_id
         );
 
-        // sqlx::Any uses last_insert_id (returns Option<i64>); Postgres
-        // returns None without RETURNING but the existing call site
-        // ignores the value.
-        Ok(result.last_insert_id().unwrap_or(0))
+        Ok(id)
     }
 
     /// Update last used timestamp for authorized client

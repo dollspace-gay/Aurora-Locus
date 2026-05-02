@@ -344,7 +344,7 @@ impl AccountManager {
         let _token_id: String = row.get("id");
         let did: String = row.get("did");
         let expires_at: DateTime<Utc> = parse_timestamp(&row.get::<String, _>("expires_at"))?;
-        let used: bool = row.get("used");
+        let used: bool = row.get::<i64, _>("used") != 0;
         let next_id: Option<String> = row.get("next_id");
 
         // Check expiration
@@ -480,7 +480,7 @@ impl AccountManager {
             email: row.get("email"),
             password_hash: row.get("password_hash"),
             email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
-            invites_disabled: row.get("invites_disabled"),
+            invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
         })
     }
 
@@ -545,7 +545,7 @@ impl AccountManager {
             email: row.get("email"),
             password_hash: row.get("password_hash"),
             email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
-            invites_disabled: row.get("invites_disabled"),
+            invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
         })
     }
 
@@ -579,7 +579,7 @@ impl AccountManager {
             email: row.get("email"),
             password_hash: row.get("password_hash"),
             email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
-            invites_disabled: row.get("invites_disabled"),
+            invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
         })
     }
 
@@ -1655,7 +1655,7 @@ impl AccountManager {
             passwords.push(AppPasswordInfo {
                 name: row.get("name"),
                 created_at: parse_timestamp(&row.get::<String, _>("created_at"))?,
-                privileged: row.get("privileged"),
+                privileged: row.get::<i64, _>("privileged") != 0,
             });
         }
 
@@ -1868,7 +1868,7 @@ impl AccountManager {
         .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
 
         let available_uses: i32 = row.get("available_uses");
-        let disabled: bool = row.get("disabled");
+        let disabled: bool = row.get::<i64, _>("disabled") != 0;
         let created_for: Option<String> = row.get("created_for");
 
         // Check if disabled
@@ -1924,7 +1924,7 @@ impl AccountManager {
                 .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
 
         let available_uses: i32 = row.get("available_uses");
-        let disabled: bool = row.get("disabled");
+        let disabled: bool = row.get::<i64, _>("disabled") != 0;
 
         if disabled {
             return Err(PdsError::Validation(
@@ -1990,7 +1990,7 @@ impl AccountManager {
                 Ok(crate::db::account::InviteCode {
                     code: row.try_get("code")?,
                     available_uses: row.try_get("available_uses")?,
-                    disabled: row.try_get("disabled")?,
+                    disabled: row.try_get::<i64, _>("disabled")? != 0,
                     created_by: row.try_get("created_by")?,
                     created_at: parse_timestamp(&created_at_s)?,
                     created_for: row.try_get("created_for")?,
@@ -2114,7 +2114,7 @@ impl AccountManager {
             .map_err(PdsError::Database)?
             .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
 
-        let invites_disabled: bool = row.get("invites_disabled");
+        let invites_disabled: bool = row.get::<i64, _>("invites_disabled") != 0;
 
         if invites_disabled {
             return Ok(Vec::new()); // Don't allocate if disabled
@@ -2189,7 +2189,7 @@ impl AccountManager {
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
                 email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
-                invites_disabled: row.get("invites_disabled"),
+                invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
             });
         }
 
@@ -2247,7 +2247,7 @@ impl AccountManager {
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
                 email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
-                invites_disabled: row.get("invites_disabled"),
+                invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
             });
         }
 

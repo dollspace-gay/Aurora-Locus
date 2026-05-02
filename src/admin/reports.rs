@@ -137,10 +137,11 @@ impl ReportManager {
             ));
         }
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO report (subject_did, subject_uri, subject_cid, reason_type, reason, reported_by, reported_at, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+            RETURNING id
             "#,
         )
         .bind(subject_did)
@@ -150,11 +151,11 @@ impl ReportManager {
         .bind(reason)
         .bind(reported_by)
         .bind(now.to_rfc3339())
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
         Ok(Report {
-            id: result.last_insert_id().unwrap_or(0),
+            id,
             subject_did: subject_did.map(String::from),
             subject_uri: subject_uri.map(String::from),
             subject_cid: subject_cid.map(String::from),

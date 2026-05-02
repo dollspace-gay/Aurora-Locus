@@ -142,10 +142,11 @@ impl ModerationEventLogger {
             .transpose()
             .map_err(|e| PdsError::Internal(format!("Failed to serialize meta: {}", e)))?;
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO moderation_event (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
             "#,
         )
         .bind(event_type.as_str())
@@ -156,7 +157,7 @@ impl ModerationEventLogger {
         .bind(&details_json)
         .bind(now.to_rfc3339())
         .bind(&meta_json)
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
         tracing::info!(
@@ -168,7 +169,7 @@ impl ModerationEventLogger {
         );
 
         Ok(ModerationEvent {
-            id: result.last_insert_id().unwrap_or(0),
+            id,
             event_type,
             actor_did: actor_did.to_string(),
             subject_did: subject_did.map(String::from),

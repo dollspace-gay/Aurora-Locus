@@ -107,10 +107,11 @@ impl BlobQuarantine {
             )));
         }
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO blob_quarantine (cid, reason, details, quarantined_by, quarantined_at, legal_reference)
             VALUES (?, ?, ?, ?, ?, ?)
+            RETURNING id
             "#,
         )
         .bind(cid)
@@ -119,7 +120,7 @@ impl BlobQuarantine {
         .bind(quarantined_by)
         .bind(now.to_rfc3339())
         .bind(legal_reference)
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
         // Update blob table to mark as taken down
@@ -136,10 +137,7 @@ impl BlobQuarantine {
         );
 
         Ok(QuarantineRecord {
-            // sqlx::Any uses last_insert_id (returns Option<i64>); Postgres
-            // returns None without RETURNING. unwrap_or(0) preserves the
-            // existing return-type contract.
-            id: result.last_insert_id().unwrap_or(0),
+            id,
             cid: cid.to_string(),
             reason,
             details: details.map(String::from),

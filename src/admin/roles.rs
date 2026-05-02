@@ -122,10 +122,11 @@ impl AdminRoleManager {
             }
         }
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO admin_roles (did, role, granted_by, granted_at, notes)
             VALUES (?, ?, ?, ?, ?)
+            RETURNING id
             "#,
         )
         .bind(did)
@@ -133,10 +134,8 @@ impl AdminRoleManager {
         .bind(granted_by)
         .bind(now.to_rfc3339())
         .bind(&notes)
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
-
-        let id = result.last_insert_id().unwrap_or(0);
 
         Ok(AdminRole {
             id,
@@ -220,7 +219,7 @@ impl AdminRoleManager {
                 role,
                 granted_by: row.get("granted_by"),
                 granted_at,
-                revoked: row.get("revoked"),
+                revoked: row.get::<i64, _>("revoked") != 0,
                 revoked_at,
                 revoked_by: row.get("revoked_by"),
                 notes: row.get("notes"),
@@ -274,7 +273,7 @@ impl AdminRoleManager {
                 role,
                 granted_by: row.get("granted_by"),
                 granted_at,
-                revoked: row.get("revoked"),
+                revoked: row.get::<i64, _>("revoked") != 0,
                 revoked_at,
                 revoked_by: row.get("revoked_by"),
                 notes: row.get("notes"),
@@ -449,7 +448,7 @@ mod tests {
                 role TEXT NOT NULL,
                 granted_by TEXT,
                 granted_at TEXT NOT NULL,
-                revoked BOOLEAN NOT NULL DEFAULT false,
+                revoked INTEGER NOT NULL DEFAULT 0,
                 revoked_at TEXT,
                 revoked_by TEXT,
                 notes TEXT
@@ -525,7 +524,7 @@ mod tests {
                 role TEXT NOT NULL,
                 granted_by TEXT,
                 granted_at TEXT NOT NULL,
-                revoked BOOLEAN NOT NULL DEFAULT false,
+                revoked INTEGER NOT NULL DEFAULT 0,
                 revoked_at TEXT,
                 revoked_by TEXT,
                 notes TEXT
