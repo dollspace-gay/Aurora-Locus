@@ -4,10 +4,16 @@
 //! All repository updates are recorded in a monotonically increasing sequence.
 
 pub mod events;
+pub mod leader_election;
 #[allow(clippy::module_inception)] // Intentional: sequencer module contains Sequencer type
 pub mod sequencer;
 
 pub use events::*;
+#[allow(unused_imports)] // PostgresLockProvider/SEQUENCER_LEADER_LOCK_KEY used by AppContext only
+pub use leader_election::{
+    LeaderElection, LeaderElectionConfig, LeaderRole, LockProvider, PostgresLockProvider,
+    SEQUENCER_LEADER_LOCK_KEY,
+};
 pub use sequencer::{Sequencer, SequencerConfig};
 
 use chrono::{DateTime, Utc};

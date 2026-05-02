@@ -10,6 +10,7 @@ use crate::{
 use chrono::Utc;
 use serde_cbor;
 use sqlx::{AnyPool, Row};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -40,10 +41,18 @@ pub struct Sequencer {
     config: SequencerConfig,
     last_seq: Arc<RwLock<Option<i64>>>,
     relay_client: Option<Arc<Mutex<RelayClient>>>,
+    /// Multi-instance leadership flag (chainlink #89, design doc §3.5).
+    /// `true` = this process is the sequencer leader and may write
+    /// firehose events; `false` = standby, writes return NotLeader.
+    /// Default `true` preserves single-instance behaviour for SQLite
+    /// deployments and Postgres deployments without leader election
+    /// wired up.
+    is_leader: Arc<AtomicBool>,
 }
 
 impl Sequencer {
-    /// Create a new sequencer
+    /// Create a new sequencer (single-instance mode — `is_leader` defaults
+    /// to true).
     #[allow(dead_code)] // Public API for future use
     pub fn new(db: AnyPool, config: SequencerConfig) -> Self {
         Self {
@@ -51,10 +60,12 @@ impl Sequencer {
             config,
             last_seq: Arc::new(RwLock::new(None)),
             relay_client: None,
+            is_leader: Arc::new(AtomicBool::new(true)),
         }
     }
 
     /// Create a new sequencer with relay client for federation
+    /// (single-instance mode — `is_leader` defaults to true).
     pub fn with_relay(
         db: AnyPool,
         config: SequencerConfig,
@@ -65,11 +76,46 @@ impl Sequencer {
             config,
             last_seq: Arc::new(RwLock::new(None)),
             relay_client,
+            is_leader: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Replace the internal leadership flag with a shared `Arc<AtomicBool>`
+    /// owned by [`super::LeaderElection`]. Call this once during startup
+    /// for multi-instance Postgres deployments before the sequencer sees
+    /// any writes; SQLite and single-instance deployments leave the
+    /// default-true flag in place. See chainlink #89 / design doc §3.5.
+    pub fn attach_leader_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.is_leader = flag;
+    }
+
+    /// Cheap atomic load — checked at the top of every write path.
+    pub fn is_leader(&self) -> bool {
+        self.is_leader.load(Ordering::SeqCst)
+    }
+
+    /// Returns a clone of the leadership flag handle so the leader-election
+    /// task can mutate it.
+    pub fn leader_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.is_leader)
+    }
+
+    /// Reject writes from non-leaders with `PdsError::NotLeader` (HTTP 503).
+    /// Per design doc §3.1 / §7.1: load balancers retry on the next
+    /// instance, eventually landing on the leader.
+    fn check_leader(&self) -> PdsResult<()> {
+        if self.is_leader.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(PdsError::NotLeader(
+                "sequencer leader is on a different instance; retry".to_string(),
+            ))
         }
     }
 
     /// Sequence a commit event
     pub async fn sequence_commit(&self, evt: CommitEvent) -> PdsResult<i64> {
+        self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode commit event: {}", e)))?;
 
@@ -87,6 +133,7 @@ impl Sequencer {
     /// Sequence a sync event (lightweight repo state sync for account creation/activation)
     #[allow(dead_code)] // Will be used when implementing sync events
     pub async fn sequence_sync(&self, evt: SyncEvent) -> PdsResult<i64> {
+        self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode sync event: {}", e)))?;
 
@@ -102,6 +149,7 @@ impl Sequencer {
 
     /// Sequence an identity event
     pub async fn sequence_identity(&self, evt: IdentityEvent) -> PdsResult<i64> {
+        self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode identity event: {}", e)))?;
 
@@ -118,6 +166,7 @@ impl Sequencer {
     /// Sequence an account event
     #[allow(dead_code)] // Will be used when implementing account status changes
     pub async fn sequence_account(&self, evt: AccountEvent) -> PdsResult<i64> {
+        self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode account event: {}", e)))?;
 

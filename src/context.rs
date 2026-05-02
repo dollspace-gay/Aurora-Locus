@@ -251,11 +251,54 @@ impl AppContext {
         };
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database)
-        let sequencer = Arc::new(Sequencer::with_relay(
+        let mut seq = Sequencer::with_relay(
             account_db.clone(),
             SequencerConfig::default(),
             relay_client.clone(),
-        ));
+        );
+
+        // Multi-instance leader election (Postgres only). SQLite
+        // deployments are inherently single-instance and skip election;
+        // the sequencer's default-true `is_leader` flag remains in place.
+        // See chainlink #89 / docs/POSTGRES_PHASE_4_DESIGN.md §3.
+        //
+        // The election task runs for the lifetime of the process and is
+        // not joined explicitly here — graceful shutdown is handled by
+        // the runtime tearing down. A future refactor to expose a
+        // top-level shutdown handle could call LeaderElection::shutdown
+        // for explicit `pg_advisory_unlock` on cooperative termination
+        // (see chainlink #89 / design doc §3.5 and the `ShutdownHandle`
+        // open question).
+        if matches!(
+            config.database.backend,
+            crate::config::DatabaseBackend::Postgres
+        ) {
+            use crate::sequencer::{
+                LeaderElection, LeaderElectionConfig, PostgresLockProvider,
+                SEQUENCER_LEADER_LOCK_KEY,
+            };
+            // Standby until first acquire tick.
+            seq.attach_leader_flag(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            let provider = Arc::new(PostgresLockProvider::new(
+                account_db.clone(),
+                SEQUENCER_LEADER_LOCK_KEY,
+            ));
+            let mut election = LeaderElection::new(provider, seq.leader_flag());
+            election.spawn(LeaderElectionConfig {
+                retry_interval: std::time::Duration::from_millis(
+                    config.database.leader_retry_interval_ms,
+                ),
+            });
+            // Election handle leaks intentionally — it owns the JoinHandle
+            // and lives for the process lifetime. See comment above.
+            std::mem::forget(election);
+            tracing::info!(
+                "Sequencer leader election spawned (retry interval: {}ms)",
+                config.database.leader_retry_interval_ms
+            );
+        }
+
+        let sequencer = Arc::new(seq);
 
         // Initialize distributed rate limiter if Redis is enabled
         let distributed_rate_limiter = if config.rate_limit.use_redis {

@@ -51,6 +51,11 @@ pub struct DatabaseConfig {
     pub acquire_timeout_secs: u64,
     pub idle_timeout_secs: Option<u64>,
     pub max_lifetime_secs: Option<u64>,
+    /// Standby retry interval for the sequencer leader-election loop
+    /// (Phase 4.2 / chainlink #89). Postgres-only — SQLite deployments
+    /// skip leader election entirely. See
+    /// docs/POSTGRES_PHASE_4_DESIGN.md §3.2.
+    pub leader_retry_interval_ms: u64,
 }
 
 impl Default for DatabaseConfig {
@@ -64,6 +69,7 @@ impl Default for DatabaseConfig {
             acquire_timeout_secs: 30,
             idle_timeout_secs: None,
             max_lifetime_secs: None,
+            leader_retry_interval_ms: 2000,
         }
     }
 }
@@ -82,6 +88,7 @@ impl DatabaseConfig {
         acquire_timeout_secs: Option<String>,
         idle_timeout_secs: Option<String>,
         max_lifetime_secs: Option<String>,
+        leader_retry_interval_ms: Option<String>,
     ) -> PdsResult<Self> {
         let backend = match backend.as_deref().map(str::to_ascii_lowercase) {
             None => DatabaseBackend::Sqlite,
@@ -135,6 +142,18 @@ impl DatabaseConfig {
             ));
         }
 
+        let leader_retry_interval_ms = parse_u64_env(
+            "PDS_SEQUENCER_LEADER_RETRY_MS",
+            leader_retry_interval_ms,
+            2000,
+        )?;
+        if !(500..=30_000).contains(&leader_retry_interval_ms) {
+            return Err(PdsError::Validation(format!(
+                "PDS_SEQUENCER_LEADER_RETRY_MS ({}) must be between 500 and 30000",
+                leader_retry_interval_ms
+            )));
+        }
+
         Ok(Self {
             backend,
             url,
@@ -143,6 +162,7 @@ impl DatabaseConfig {
             acquire_timeout_secs,
             idle_timeout_secs,
             max_lifetime_secs,
+            leader_retry_interval_ms,
         })
     }
 }
@@ -707,6 +727,7 @@ impl ServerConfig {
             env::var("PDS_DB_ACQUIRE_TIMEOUT_SECS").ok(),
             env::var("PDS_DB_IDLE_TIMEOUT_SECS").ok(),
             env::var("PDS_DB_MAX_LIFETIME_SECS").ok(),
+            env::var("PDS_SEQUENCER_LEADER_RETRY_MS").ok(),
         )?;
 
         Ok(ServerConfig {
@@ -796,7 +817,9 @@ mod database_tests {
 
     #[test]
     fn from_env_values_defaults_to_sqlite() {
-        let cfg = DatabaseConfig::from_env_values(None, None, None, None, None, None, None)
+        let cfg = DatabaseConfig::from_env_values(None, None, None, None, None, None, None,
+            None,
+        )
             .unwrap();
         assert_eq!(cfg.backend, DatabaseBackend::Sqlite);
         assert!(cfg.url.is_none());
@@ -817,7 +840,8 @@ mod database_tests {
             None,
             None,
             None,
-        )
+        
+            None,)
         .unwrap();
         assert_eq!(cfg.backend, DatabaseBackend::Postgres);
         assert_eq!(
@@ -836,7 +860,8 @@ mod database_tests {
             None,
             None,
             None,
-        )
+        
+            None,)
         .unwrap();
         assert_eq!(cfg.backend, DatabaseBackend::Postgres);
     }
@@ -851,7 +876,8 @@ mod database_tests {
             None,
             None,
             None,
-        )
+        
+            None,)
         .expect_err("postgres without URL should be rejected");
         assert!(err.to_string().contains("PDS_DB_URL is required"));
     }
@@ -866,7 +892,8 @@ mod database_tests {
             None,
             None,
             None,
-        )
+        
+            None,)
         .expect_err("non-postgres URL should be rejected");
         assert!(err.to_string().contains("postgres://"));
     }
@@ -881,7 +908,8 @@ mod database_tests {
             None,
             None,
             None,
-        )
+        
+            None,)
         .expect_err("unknown backend should be rejected");
         let msg = err.to_string();
         assert!(msg.contains("sqlite"));
@@ -898,7 +926,8 @@ mod database_tests {
             None,
             None,
             None,
-        )
+        
+            None,)
         .expect_err("min > max should be rejected");
         let msg = err.to_string();
         assert!(msg.contains("MIN_CONNECTIONS"));
@@ -915,7 +944,8 @@ mod database_tests {
             None,
             None,
             None,
-        )
+        
+            None,)
         .expect_err("max=0 should be rejected");
         assert!(err.to_string().contains("greater than 0"));
     }
@@ -930,7 +960,8 @@ mod database_tests {
             Some("0".to_string()),
             None,
             None,
-        )
+        
+            None,)
         .expect_err("acquire timeout=0 should be rejected");
         assert!(err.to_string().contains("ACQUIRE_TIMEOUT_SECS"));
     }
@@ -945,7 +976,8 @@ mod database_tests {
             Some("not-a-number".to_string()),
             None,
             None,
-        )
+        
+            None,)
         .expect_err("non-integer timeout should be rejected");
         assert!(err.to_string().contains("non-negative integer"));
     }
@@ -960,7 +992,8 @@ mod database_tests {
             None,
             Some("60".to_string()),
             Some("3600".to_string()),
-        )
+        
+            None,)
         .unwrap();
         assert_eq!(cfg.idle_timeout_secs, Some(60));
         assert_eq!(cfg.max_lifetime_secs, Some(3600));

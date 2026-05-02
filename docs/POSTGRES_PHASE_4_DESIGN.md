@@ -71,7 +71,7 @@ next attempt.
 ### 3.2 Standby retry interval
 
 Standbys re-attempt `pg_try_advisory_lock` every 2 seconds (default).
-Configurable via env var `AURORA_SEQUENCER_LEADER_RETRY_MS` (default
+Configurable via env var `PDS_SEQUENCER_LEADER_RETRY_MS` (default
 `2000`). Bounds: minimum `500ms` (no faster than that to avoid lock
 churn under contention), maximum `30000ms` (no slower than that to
 keep failover latency bounded for the operator).
@@ -287,8 +287,8 @@ sites in repo write handlers, single LISTEN connection per process**.
 
 Each Aurora-Locus instance opens:
 
-- The existing `AnyPool` for application queries (default 10
-  connections; configured via `AURORA_DB_MAX_CONNECTIONS`).
+- The existing `AnyPool` for application queries (default 25
+  connections; configured via `PDS_DB_MAX_CONNECTIONS`).
 - One dedicated connection for the sequencer leader-election lock
   (the lock is held for the lifetime of a leader, so it's a
   long-idle connection).
@@ -317,7 +317,7 @@ for `(pool_size + 2) × instance_count`.
 
 New env vars introduced in Phase 4:
 
-- `AURORA_SEQUENCER_LEADER_RETRY_MS` (default `2000`): standby retry
+- `PDS_SEQUENCER_LEADER_RETRY_MS` (default `2000`): standby retry
   interval. Bounds 500–30000.
 
 No other configuration; channel names, lock keys, payload schema are
