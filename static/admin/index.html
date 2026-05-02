@@ -293,6 +293,17 @@
                             <button type="submit" class="btn-primary">Save Changes</button>
                         </form>
                     </div>
+
+                    <!-- Aurora capability probe (chainlink #99 / Phase 3.2) -->
+                    <div class="settings-card">
+                        <h3>Aurora Capabilities</h3>
+                        <p class="settings-help">
+                            Discover which Aurora extensions this instance supports.
+                            Returns the static capability list at compile time.
+                        </p>
+                        <button type="button" class="btn-primary" onclick="loadCapabilities()">Probe Capabilities</button>
+                        <pre id="capabilities-output" class="capabilities-output" style="display: none; margin-top: 12px; max-height: 400px; overflow-y: auto; padding: 12px; background: #1a1a1a; color: #e6e6e6; border-radius: 4px; font-family: monospace; font-size: 12px;"></pre>
+                    </div>
                 </div>
             </div>
         </main>

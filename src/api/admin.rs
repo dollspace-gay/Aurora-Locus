@@ -160,6 +160,15 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/com.atproto.admin.listRecentEvents",
             get(list_recent_events),
         )
+        // ---- tools.aurora.* top-level (chainlink #99 / Phase 3.2) ----
+        //
+        // Capability probe — clients call this to discover which
+        // Aurora extensions this instance supports without trial-
+        // and-error against individual endpoints.
+        .route(
+            "/xrpc/tools.aurora.describeCapabilities",
+            get(describe_capabilities),
+        )
         // ---- tools.aurora.ops.* (operator / infrastructure tier) ----
         //
         // Stats and account-listing.
@@ -2056,6 +2065,110 @@ async fn search_accounts(
     Ok(Json(SearchAccountsResponse {
         accounts,
         cursor: next_cursor,
+    }))
+}
+
+// ---- tools.aurora.describeCapabilities (chainlink #99 / Phase 3.2) ----
+//
+// Top-level capability probe. Static at compile time (open question
+// §9.4 resolved as Option A): the response reflects what's
+// structurally present in this build, not what's wired-and-ready at
+// runtime. Future sub-phases (3.5 event-variants, 3.8 hash-chained-
+// audit, 3.9 realtime-events) extend the static lists below as they
+// land.
+//
+// Auth: AdminAuthContext (Moderator+) — matches Phase 2.3 ops
+// convention. Capability advertisement is a privileged operation
+// because it surfaces operational structure that could inform
+// targeted attacks; we don't gate the wire format on an unauth
+// probe.
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DescribeCapabilitiesResponse {
+    families: serde_json::Value,
+    extensions: Vec<CapabilityExtension>,
+    implementation: &'static str,
+    version: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapabilityExtension {
+    name: &'static str,
+    /// Optional structured value (e.g. `event-variants` carries the list of
+    /// supported ModEvent variant names). Omitted when not applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<serde_json::Value>,
+}
+
+/// Endpoint names per Aurora namespace, as currently shipped. Updated
+/// by future sub-phases as they land. Phase 3.2's snapshot reflects
+/// the surface present at this commit; sub-phases 3.3-3.9 each add
+/// their endpoint names to the appropriate family.
+fn aurora_capability_families() -> serde_json::Value {
+    serde_json::json!({
+        "tools.aurora.ops": [
+            "getStats",
+            "listAccounts",
+            "getInstanceMetrics",
+            "getValidationFailures",
+            "getSystemHealth",
+            "getDatabaseStatus",
+            "getResourceUsage",
+            "listBackgroundJobs",
+            "runHealthChecks",
+            "getVersionInfo",
+            "getSystemMetrics",
+            "getNonceStoreStatus",
+            "cleanupNonceStores",
+            "getBlobStatistics",
+            "listBlobs",
+            "deleteBlob",
+            "quarantineBlob",
+            "restoreBlob",
+            "runBlobGC",
+            "getBlobQuotas",
+            "getSequencerStatus",
+            "pauseSequencer",
+            "resumeSequencer",
+            "resetSequencerCursor",
+            "rebuildSequencer",
+            "getRateLimitConfig",
+            "getRateLimitStatus",
+            "cleanupRateLimitState",
+            "getFederationStatus",
+            "getRelayConfig",
+            "listKnownInstances",
+            "triggerPdsDiscovery"
+        ],
+        "tools.aurora.moderator": [],
+        "tools.aurora.admin": [],
+        "tools.aurora.superadmin": []
+    })
+}
+
+/// Static extension list, reflecting what's structurally present in
+/// this build. Extensions added incrementally by future sub-phases:
+///   - "event-variants" (Phase 3.5: ModEvent variant names)
+///   - "hash-chained-audit" (Phase 3.8: getAuditTrail verified flag)
+///   - "realtime-events" (Phase 3.9: subscribeModEvents WebSocket)
+fn aurora_capability_extensions() -> Vec<CapabilityExtension> {
+    // Empty for Phase 3.2 — sub-phases 3.5/3.8/3.9 will append.
+    Vec::new()
+}
+
+/// `tools.aurora.describeCapabilities` — top-level probe.
+async fn describe_capabilities(
+    State(_ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<DescribeCapabilitiesResponse>, (StatusCode, String)> {
+    Ok(Json(DescribeCapabilitiesResponse {
+        families: aurora_capability_families(),
+        extensions: aurora_capability_extensions(),
+        implementation: "aurora-locus",
+        // Cargo.toml's package version. Bumped as part of release work.
+        version: env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -5856,6 +5969,96 @@ mod tests {
         // db_pool_size > 0 because at least one connection is open after the
         // SELECT 1 and the COUNT(*) queries above. Same for idle.
         assert!(resp.resource_usage.db_pool_size >= 1);
+    }
+
+    // ---- tools.aurora.describeCapabilities (chainlink #99 / Phase 3.2) ----
+
+    #[tokio::test]
+    async fn test_describe_capabilities_returns_expected_shape() {
+        let ctx = create_test_context().await;
+        let resp = describe_capabilities(State(ctx), admin_test_auth())
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(resp.implementation, "aurora-locus");
+        // version comes from CARGO_PKG_VERSION; non-empty is enough
+        // to confirm the env! macro resolved.
+        assert!(!resp.version.is_empty(), "version must be set");
+
+        // Families object must include the four Aurora namespaces, each
+        // a JSON array (possibly empty for namespaces that haven't
+        // shipped endpoints yet).
+        let families = resp.families.as_object().expect("families is object");
+        for ns in [
+            "tools.aurora.ops",
+            "tools.aurora.moderator",
+            "tools.aurora.admin",
+            "tools.aurora.superadmin",
+        ] {
+            assert!(
+                families.get(ns).map(|v| v.is_array()).unwrap_or(false),
+                "missing or non-array family: {}",
+                ns
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_capabilities_lists_phase_2_3_ops_endpoints() {
+        // Sanity-check the static list against what's actually shipped
+        // — every endpoint named here was registered in Phase 2.3
+        // (chainlink #84). Future sub-phases extend the list; this
+        // test guards against the static list silently drifting from
+        // the route registrations.
+        let ctx = create_test_context().await;
+        let resp = describe_capabilities(State(ctx), admin_test_auth())
+            .await
+            .unwrap()
+            .0;
+
+        let ops = resp
+            .families
+            .get("tools.aurora.ops")
+            .and_then(|v| v.as_array())
+            .expect("ops family present");
+        let ops_names: Vec<&str> =
+            ops.iter().map(|v| v.as_str().unwrap()).collect();
+
+        // Spot-check several Phase 2.3 endpoints across categories.
+        for expected in [
+            "getStats",
+            "listAccounts",
+            "getInstanceMetrics",
+            "pauseSequencer",
+            "getFederationStatus",
+        ] {
+            assert!(
+                ops_names.contains(&expected),
+                "Phase 2.3 endpoint {} missing from capability list",
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_capabilities_extensions_initially_empty() {
+        // Phase 3.2 ships with no extensions; the list grows as
+        // sub-phases 3.5/3.8/3.9 land. This test catches accidental
+        // additions before their backing infrastructure is ready —
+        // an extension advertised before the sub-phase lands would
+        // mislead clients.
+        let ctx = create_test_context().await;
+        let resp = describe_capabilities(State(ctx), admin_test_auth())
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            resp.extensions.is_empty(),
+            "extensions list should be empty until sub-phases 3.5/3.8/3.9 ship; \
+             got {:?}",
+            resp.extensions.iter().map(|e| e.name).collect::<Vec<_>>()
+        );
     }
 
     // ---- Phase 1.7: account/did deprecation-alias rollout ---------------

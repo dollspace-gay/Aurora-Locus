@@ -680,6 +680,31 @@ function saveSettings(formId) {
     alert('Settings saved successfully');
 }
 
+// Aurora capability probe (chainlink #99 / Phase 3.2). Calls
+// tools.aurora.describeCapabilities and renders the JSON response
+// inline. Operators use this to verify which Aurora extensions
+// their instance supports without grepping the source.
+function loadCapabilities() {
+    const out = document.getElementById('capabilities-output');
+    out.style.display = 'block';
+    out.textContent = 'Loading...';
+    fetch(`${API_BASE}/tools.aurora.describeCapabilities`, {
+        headers: { 'Authorization': `Bearer ${adminToken}` }
+    })
+    .then(res => {
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        }
+        return res.json();
+    })
+    .then(data => {
+        out.textContent = JSON.stringify(data, null, 2);
+    })
+    .catch(err => {
+        out.textContent = `Error: ${err.message}`;
+    });
+}
+
 // Refresh data periodically
 setInterval(() => {
     if (currentPage === 'dashboard') {

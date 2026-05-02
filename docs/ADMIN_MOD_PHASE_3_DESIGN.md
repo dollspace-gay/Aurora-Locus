@@ -244,7 +244,9 @@ should reuse the shared vocabulary where it fits.
 ### 5.1 `tools.aurora.describeCapabilities` — top-level probe
 
 **Type:** Query
-**Auth:** none (public)
+**Auth:** Moderator+ via `AdminAuthContext` (matches Phase 2.3 ops
+convention — scope alone isn't enough; role lookup confirms admin
+status)
 **Sub-phase:** 3.2 (#99)
 
 Returns the set of Aurora extensions this server supports, so
