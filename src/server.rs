@@ -1,6 +1,6 @@
 /// HTTP server setup and routing
 use crate::{
-    api::middleware::check_account_moderation,
+    api::middleware::{check_account_moderation, namespace_scope_check},
     context::AppContext,
     error::{PdsError, PdsResult},
     metrics,
@@ -50,6 +50,13 @@ pub fn build_router(ctx: AppContext) -> Router {
         .layer(middleware::from_fn_with_state(
             ctx.clone(),
             check_account_moderation,
+        ))
+        // Apply namespace scope-check middleware. No-op for non-admin paths
+        // and session-token requests; enforces atproto:admin.* scope on
+        // OAuth-authenticated requests to admin namespaces (chainlink #84).
+        .layer(middleware::from_fn_with_state(
+            ctx.clone(),
+            namespace_scope_check,
         ))
         // Apply rate limiting middleware (after state so it can access AppContext)
         .layer(middleware::from_fn_with_state(ctx, rate_limit_middleware))
