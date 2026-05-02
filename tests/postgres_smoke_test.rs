@@ -101,3 +101,47 @@ async fn identity_did_cache_round_trip_on_postgres() {
         .await
         .expect("delete_handle");
 }
+
+// ===========================================================================
+// Group 2: src/jobs/* — background tasks (chainlink #93 / Phase 5.0.2)
+//
+// The cleanup-deactivated-accounts job uses 5 SQL statements; smoke
+// asserts they parse and run against a Postgres instance with the
+// production schema.
+// ===========================================================================
+
+#[tokio::test]
+async fn jobs_account_purge_queries_parse_on_postgres() {
+    let (_pg, url) = start_postgres().await;
+    let pool = open_pool(&url).await;
+
+    // The SELECT used by the job to find purgeable accounts. Empty
+    // result on an empty schema is fine — the test confirms the SQL
+    // syntax + placeholder binding is Postgres-compatible.
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT a.did, a.handle
+        FROM actor a
+        WHERE a.deactivated_at IS NOT NULL
+          AND a.delete_after IS NOT NULL
+          AND a.delete_after < $1
+        "#,
+    )
+    .bind(&now)
+    .fetch_all(&pool)
+    .await
+    .expect("purge SELECT must parse on Postgres");
+    assert!(rows.is_empty());
+
+    // Each of the 4 DELETE statements the job runs. No rows match, but
+    // the queries must parse and bind correctly.
+    for table in &["session", "refresh_token", "email_token", "account"] {
+        let sql = format!("DELETE FROM {} WHERE did = $1", table);
+        sqlx::query(&sql)
+            .bind("did:plc:nonexistent")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("DELETE FROM {} must parse: {}", table, e));
+    }
+}

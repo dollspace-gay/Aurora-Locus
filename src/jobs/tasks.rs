@@ -52,7 +52,7 @@ pub async fn purge_deleted_accounts(ctx: &AppContext) -> PdsResult<u64> {
         FROM actor a
         WHERE a.deactivated_at IS NOT NULL
           AND a.delete_after IS NOT NULL
-          AND a.delete_after < ?1
+          AND a.delete_after < $1
         "#,
     )
     .bind(now.to_rfc3339())
@@ -89,24 +89,24 @@ pub async fn purge_deleted_accounts(ctx: &AppContext) -> PdsResult<u64> {
         tracing::info!("Actor store cleanup for {} (not yet implemented)", did);
 
         // Delete all sessions and refresh tokens
-        sqlx::query("DELETE FROM session WHERE did = ?1")
+        sqlx::query("DELETE FROM session WHERE did = $1")
             .bind(&did)
             .execute(&ctx.account_db)
             .await?;
 
-        sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
+        sqlx::query("DELETE FROM refresh_token WHERE did = $1")
             .bind(&did)
             .execute(&ctx.account_db)
             .await?;
 
         // Delete all email tokens
-        sqlx::query("DELETE FROM email_token WHERE did = ?1")
+        sqlx::query("DELETE FROM email_token WHERE did = $1")
             .bind(&did)
             .execute(&ctx.account_db)
             .await?;
 
         // Delete account record (permanent)
-        sqlx::query("DELETE FROM account WHERE did = ?1")
+        sqlx::query("DELETE FROM account WHERE did = $1")
             .bind(&did)
             .execute(&ctx.account_db)
             .await?;
