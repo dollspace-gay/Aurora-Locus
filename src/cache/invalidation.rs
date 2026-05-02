@@ -96,14 +96,13 @@ impl PostgresNotifyEmitter {
 #[async_trait]
 impl NotifyEmitter for PostgresNotifyEmitter {
     async fn emit(&self, payload: &InvalidationPayload) -> PdsResult<()> {
-        // Postgres requires the payload to be a string literal; bind it
-        // as text. Channel name is hardcoded so no injection risk.
+        // Postgres `NOTIFY <channel>, '<payload>'` only accepts a
+        // string literal payload — no placeholder binding. Use the
+        // `pg_notify(text, text)` function instead, which accepts
+        // both arguments parameterized.
         let json = payload.to_json();
-        let sql = format!("NOTIFY {}, $1", CHANNEL_NAME);
-        // sqlx binds the payload safely. Falls back to NOTIFY without
-        // a payload if bind fails (which would only happen if Postgres
-        // grew NOTIFY syntax constraints we hadn't seen).
-        sqlx::query(&sql)
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(CHANNEL_NAME)
             .bind(&json)
             .execute(&self.pool)
             .await

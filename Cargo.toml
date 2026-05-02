@@ -123,3 +123,7 @@ flate2 = "1.1.5"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+# Phase 4.4 (chainlink #91): real-Postgres integration tests for
+# multi-instance leader election and LISTEN/NOTIFY cache invalidation.
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }

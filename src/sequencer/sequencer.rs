@@ -192,7 +192,7 @@ impl Sequencer {
         let result = sqlx::query(
             r#"
             INSERT INTO repo_seq (did, event_type, event, sequenced_at)
-            VALUES (?1, ?2, ?3, ?4)
+            VALUES ($1, $2, $3, $4)
             RETURNING seq
             "#,
         )
@@ -235,7 +235,7 @@ impl Sequencer {
             r#"
             SELECT seq, did, event_type, event, invalidated, sequenced_at
             FROM repo_seq
-            WHERE seq > ?1 AND NOT invalidated
+            WHERE seq > $1 AND NOT invalidated
             ORDER BY seq ASC
             LIMIT 1
             "#,
@@ -268,9 +268,9 @@ impl Sequencer {
             r#"
             SELECT seq, did, event_type, event, invalidated, sequenced_at
             FROM repo_seq
-            WHERE seq > ?1 AND NOT invalidated
+            WHERE seq > $1 AND NOT invalidated
             ORDER BY seq ASC
-            LIMIT ?2
+            LIMIT $2
             "#,
         )
         .bind(cursor)
@@ -447,9 +447,9 @@ impl Sequencer {
             r#"
             SELECT seq, did, event_type, event, invalidated, sequenced_at
             FROM repo_seq
-            WHERE did = ?1 AND NOT invalidated
+            WHERE did = $1 AND NOT invalidated
             ORDER BY seq DESC
-            LIMIT ?2
+            LIMIT $2
             "#,
         )
         .bind(did)
