@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_namespace_scope_lookup_com_atproto_admin() {
-        let req = required_scopes_for_path("/xrpc/com.atproto.admin.getStats").unwrap();
+        let req = required_scopes_for_path("/xrpc/com.atproto.admin.searchAccounts").unwrap();
         assert_eq!(
             req,
             &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration]
@@ -553,7 +553,7 @@ mod tests {
             "/xrpc/tools.aurora.moderator.listEvents",
             "/xrpc/tools.aurora.admin.grantRole",
             "/xrpc/tools.aurora.superadmin.purgeAccount",
-            "/xrpc/com.atproto.admin.getStats",
+            "/xrpc/com.atproto.admin.searchAccounts",
         ] {
             assert!(
                 enforce_namespace_scope(path, &scopes).is_ok(),
@@ -568,7 +568,7 @@ mod tests {
         // com.atproto.admin.* accepts either admin.server OR admin.moderation
         let server_only: ScopeSet = "atproto:admin.server".parse().unwrap();
         let mod_only: ScopeSet = "atproto:admin.moderation".parse().unwrap();
-        let path = "/xrpc/com.atproto.admin.getStats";
+        let path = "/xrpc/com.atproto.admin.searchAccounts";
         assert!(enforce_namespace_scope(path, &server_only).is_ok());
         assert!(enforce_namespace_scope(path, &mod_only).is_ok());
     }
@@ -594,7 +594,7 @@ mod tests {
         for path in [
             "/xrpc/tools.aurora.ops.pauseSequencer",
             "/xrpc/tools.aurora.moderator.listEvents",
-            "/xrpc/com.atproto.admin.getStats",
+            "/xrpc/com.atproto.admin.searchAccounts",
         ] {
             assert!(
                 enforce_namespace_scope(path, &empty).is_err(),

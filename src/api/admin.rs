@@ -15,27 +15,34 @@ use axum::{
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
 
-/// Build admin API routes
+/// Build admin API routes.
+///
+/// Two namespaces are mounted here:
+///
+/// - `com.atproto.admin.*` — moderation/admin-tier endpoints. After
+///   Phase 2.4 (chainlink #85) this surface is exactly the
+///   bsky-PDS-2025-Q1 parity baseline plus the parity gaps closed in
+///   Phase 1; operator/infrastructure endpoints have been removed.
+///
+/// - `tools.aurora.ops.*` — operator/infrastructure tier (chainlink #84).
+///   30 relocated endpoints from the legacy admin namespace plus 2
+///   net-new ones (`listAccounts`, `getInstanceMetrics`). Scope-checked
+///   to `atproto:admin.server` via the namespace middleware (e9b66b9).
+///
+/// `listRecentEvents` intentionally stays at `com.atproto.admin.*` —
+/// moderation-flavored stream review, not operator infrastructure. It
+/// will likely move under `tools.aurora.moderator.*` when admin/mod
+/// Phase 3 lands.
 pub fn routes() -> Router<AppContext> {
     Router::new()
-        // Admin stats and data
-        .route("/xrpc/com.atproto.admin.getStats", get(get_stats))
-        // getStats — operator namespace (chainlink #84). Other entries
-        // in this block (getUsers/getAccount/...) are moderation-flavored
-        // and stay at com.atproto.admin.*. Operator-flavored listAccounts
-        // lives at tools.aurora.ops.listAccounts (Phase 2.3.7) with a
-        // broader filter set than bsky-PDS searchAccounts.
-        .route("/xrpc/tools.aurora.ops.getStats", get(get_stats))
-        .route(
-            "/xrpc/tools.aurora.ops.listAccounts",
-            get(ops_list_accounts),
-        )
-        .route(
-            "/xrpc/tools.aurora.ops.getInstanceMetrics",
-            get(ops_get_instance_metrics),
-        )
+        // ---- com.atproto.admin.* (moderation/admin tier) ----
+
+        // Account read
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
-        .route("/xrpc/com.atproto.admin.listAccounts", get(get_users)) // Alias for frontend compatibility
+        // listAccounts here is the bsky-PDS-compat alias to getUsers; the
+        // operator-flavored listAccounts (broader filters) lives at
+        // /xrpc/tools.aurora.ops.listAccounts.
+        .route("/xrpc/com.atproto.admin.listAccounts", get(get_users))
         .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
         .route(
             "/xrpc/com.atproto.admin.searchAccounts",
@@ -49,6 +56,7 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/com.atproto.admin.getAccountInfos",
             get(get_account_infos),
         )
+        // Subject status (cross-cutting moderation surface)
         .route(
             "/xrpc/com.atproto.admin.updateSubjectStatus",
             post(update_subject_status),
@@ -146,41 +154,25 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/com.atproto.admin.sendEmail", post(send_email))
         // Audit logs
         .route("/xrpc/com.atproto.admin.getAuditLog", get(get_audit_log))
-        // Validation failures
+        // Sequencer event review (moderation-flavored; ops controls live
+        // at tools.aurora.ops.{getSequencerStatus,pauseSequencer,...}).
         .route(
-            "/xrpc/com.atproto.admin.getValidationFailures",
-            get(get_validation_failures),
+            "/xrpc/com.atproto.admin.listRecentEvents",
+            get(list_recent_events),
         )
-        // System health and diagnostics
+        // ---- tools.aurora.ops.* (operator / infrastructure tier) ----
+        //
+        // Stats and account-listing.
+        .route("/xrpc/tools.aurora.ops.getStats", get(get_stats))
         .route(
-            "/xrpc/com.atproto.admin.getSystemHealth",
-            get(get_system_health),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.getDatabaseStatus",
-            get(get_database_status),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.getResourceUsage",
-            get(get_resource_usage),
+            "/xrpc/tools.aurora.ops.listAccounts",
+            get(ops_list_accounts),
         )
         .route(
-            "/xrpc/com.atproto.admin.listBackgroundJobs",
-            get(list_background_jobs),
+            "/xrpc/tools.aurora.ops.getInstanceMetrics",
+            get(ops_get_instance_metrics),
         )
-        .route(
-            "/xrpc/com.atproto.admin.runHealthChecks",
-            get(run_health_checks),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.getVersionInfo",
-            get(get_version_info),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.getSystemMetrics",
-            get(get_system_metrics),
-        )
-        // Health, metrics, validation — operator namespace (chainlink #84).
+        // Health, metrics, validation, nonce store.
         .route(
             "/xrpc/tools.aurora.ops.getValidationFailures",
             get(get_validation_failures),
@@ -213,26 +205,15 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.ops.getSystemMetrics",
             get(get_system_metrics),
         )
-        // Blob storage management
         .route(
-            "/xrpc/com.atproto.admin.getBlobStatistics",
-            get(get_blob_statistics),
+            "/xrpc/tools.aurora.ops.getNonceStoreStatus",
+            get(get_nonce_store_status),
         )
-        .route("/xrpc/com.atproto.admin.listBlobs", get(list_blobs))
-        .route("/xrpc/com.atproto.admin.deleteBlob", post(delete_blob))
         .route(
-            "/xrpc/com.atproto.admin.quarantineBlob",
-            post(quarantine_blob),
+            "/xrpc/tools.aurora.ops.cleanupNonceStores",
+            post(cleanup_nonce_stores),
         )
-        .route("/xrpc/com.atproto.admin.restoreBlob", post(restore_blob))
-        .route("/xrpc/com.atproto.admin.runBlobGC", post(run_blob_gc))
-        .route(
-            "/xrpc/com.atproto.admin.getBlobQuotas",
-            get(get_blob_quotas),
-        )
-        // Blob storage management — operator namespace (chainlink #84).
-        // Legacy com.atproto.admin.* paths above remain functional pending
-        // Phase 2.4 cleanup; both register the same handlers.
+        // Blob storage.
         .route(
             "/xrpc/tools.aurora.ops.getBlobStatistics",
             get(get_blob_statistics),
@@ -249,34 +230,7 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.ops.getBlobQuotas",
             get(get_blob_quotas),
         )
-        // Sequencer management
-        .route(
-            "/xrpc/com.atproto.admin.getSequencerStatus",
-            get(get_sequencer_status),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.pauseSequencer",
-            post(pause_sequencer),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.resumeSequencer",
-            post(resume_sequencer),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.listRecentEvents",
-            get(list_recent_events),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.resetSequencerCursor",
-            post(reset_sequencer_cursor),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.rebuildSequencer",
-            post(rebuild_sequencer),
-        )
-        // Sequencer management — operator namespace (chainlink #84).
-        // listRecentEvents stays admin-only per assessment §6 (it's
-        // moderation-flavored, not operator infrastructure).
+        // Sequencer infrastructure.
         .route(
             "/xrpc/tools.aurora.ops.getSequencerStatus",
             get(get_sequencer_status),
@@ -297,20 +251,7 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.ops.rebuildSequencer",
             post(rebuild_sequencer),
         )
-        // Rate limiting management
-        .route(
-            "/xrpc/com.atproto.admin.getRateLimitConfig",
-            get(get_rate_limit_config),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.getRateLimitStatus",
-            get(get_rate_limit_status),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.cleanupRateLimitState",
-            post(cleanup_rate_limit_state),
-        )
-        // Rate limiting management — operator namespace (chainlink #84).
+        // Rate limiting.
         .route(
             "/xrpc/tools.aurora.ops.getRateLimitConfig",
             get(get_rate_limit_config),
@@ -323,45 +264,7 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.ops.cleanupRateLimitState",
             post(cleanup_rate_limit_state),
         )
-        // Federation and relay management
-        .route(
-            "/xrpc/com.atproto.admin.getFederationStatus",
-            get(get_federation_status),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.getRelayConfig",
-            get(get_relay_config),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.listKnownInstances",
-            get(list_known_instances),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.triggerPdsDiscovery",
-            post(trigger_pds_discovery),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.getNonceStoreStatus",
-            get(get_nonce_store_status),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.cleanupNonceStores",
-            post(cleanup_nonce_stores),
-        )
-        // Nonce store — operator namespace (chainlink #84). Categorized
-        // under health/metrics rather than federation per Phase 2.3.6.
-        .route(
-            "/xrpc/tools.aurora.ops.getNonceStoreStatus",
-            get(get_nonce_store_status),
-        )
-        .route(
-            "/xrpc/tools.aurora.ops.cleanupNonceStores",
-            post(cleanup_nonce_stores),
-        )
-        // Federation/relay management — operator namespace (chainlink #84).
-        // getNonceStoreStatus / cleanupNonceStores relocate under
-        // health/metrics in Phase 2.3.6 (nonce store is shared
-        // infrastructure, not specific to federation).
+        // Federation / relay.
         .route(
             "/xrpc/tools.aurora.ops.getFederationStatus",
             get(get_federation_status),

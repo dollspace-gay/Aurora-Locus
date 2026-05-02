@@ -883,7 +883,7 @@ mod namespace_scope_tests {
         for path in [
             "/xrpc/tools.aurora.ops.pauseSequencer",
             "/xrpc/tools.aurora.moderator.listEvents",
-            "/xrpc/com.atproto.admin.getStats",
+            "/xrpc/com.atproto.admin.searchAccounts",
         ] {
             assert_eq!(
                 classify_namespace_scope(path, None),
@@ -932,7 +932,7 @@ mod namespace_scope_tests {
             "/xrpc/tools.aurora.moderator.listEvents",
             "/xrpc/tools.aurora.admin.grantRole",
             "/xrpc/tools.aurora.superadmin.purgeAccount",
-            "/xrpc/com.atproto.admin.getStats",
+            "/xrpc/com.atproto.admin.searchAccounts",
         ] {
             assert_eq!(
                 classify_namespace_scope(path, Some("atproto:admin.*")),
@@ -965,7 +965,7 @@ mod namespace_scope_tests {
     #[test]
     fn oauth_com_atproto_admin_accepts_either_scope() {
         // Bsky-PDS parity baseline: server OR moderation accepted.
-        let path = "/xrpc/com.atproto.admin.getStats";
+        let path = "/xrpc/com.atproto.admin.searchAccounts";
         assert_eq!(
             classify_namespace_scope(path, Some("atproto:admin.server")),
             NamespaceScopeOutcome::Allow
