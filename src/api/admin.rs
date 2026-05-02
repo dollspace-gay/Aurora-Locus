@@ -227,6 +227,29 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/com.atproto.admin.rebuildSequencer",
             post(rebuild_sequencer),
         )
+        // Sequencer management — operator namespace (chainlink #84).
+        // listRecentEvents stays admin-only per assessment §6 (it's
+        // moderation-flavored, not operator infrastructure).
+        .route(
+            "/xrpc/tools.aurora.ops.getSequencerStatus",
+            get(get_sequencer_status),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.pauseSequencer",
+            post(pause_sequencer),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.resumeSequencer",
+            post(resume_sequencer),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.resetSequencerCursor",
+            post(reset_sequencer_cursor),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.rebuildSequencer",
+            post(rebuild_sequencer),
+        )
         // Rate limiting management
         .route(
             "/xrpc/com.atproto.admin.getRateLimitConfig",
