@@ -288,6 +288,26 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/com.atproto.admin.cleanupNonceStores",
             post(cleanup_nonce_stores),
         )
+        // Federation/relay management — operator namespace (chainlink #84).
+        // getNonceStoreStatus / cleanupNonceStores relocate under
+        // health/metrics in Phase 2.3.6 (nonce store is shared
+        // infrastructure, not specific to federation).
+        .route(
+            "/xrpc/tools.aurora.ops.getFederationStatus",
+            get(get_federation_status),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.getRelayConfig",
+            get(get_relay_config),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.listKnownInstances",
+            get(list_known_instances),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.triggerPdsDiscovery",
+            post(trigger_pds_discovery),
+        )
 }
 
 // ============================================================================
