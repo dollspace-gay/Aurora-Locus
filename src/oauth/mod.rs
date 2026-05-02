@@ -30,6 +30,7 @@ pub use device::DeviceManager;
 // silence it here. Removing the allow once a non-test caller appears.
 #[allow(unused_imports)]
 pub use scope::{
-    lexicon_to_scope, require_all_scopes, require_any_scope, require_scope, AtProtoScope, ScopeSet,
+    enforce_namespace_scope, lexicon_to_scope, require_all_scopes, require_any_scope,
+    require_scope, required_scopes_for_path, AtProtoScope, ScopeSet,
 };
 pub use token::token_endpoint;
