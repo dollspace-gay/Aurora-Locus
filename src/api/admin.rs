@@ -21,9 +21,15 @@ pub fn routes() -> Router<AppContext> {
         // Admin stats and data
         .route("/xrpc/com.atproto.admin.getStats", get(get_stats))
         // getStats — operator namespace (chainlink #84). Other entries
-        // in this block (getUsers/listAccounts/getAccount/...) are
-        // moderation-flavored and stay at com.atproto.admin.*.
+        // in this block (getUsers/getAccount/...) are moderation-flavored
+        // and stay at com.atproto.admin.*. Operator-flavored listAccounts
+        // lives at tools.aurora.ops.listAccounts (Phase 2.3.7) with a
+        // broader filter set than bsky-PDS searchAccounts.
         .route("/xrpc/tools.aurora.ops.getStats", get(get_stats))
+        .route(
+            "/xrpc/tools.aurora.ops.listAccounts",
+            get(ops_list_accounts),
+        )
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
         .route("/xrpc/com.atproto.admin.listAccounts", get(get_users)) // Alias for frontend compatibility
         .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
@@ -1903,7 +1909,7 @@ struct GetAccountInfosQuery {
 /// `handle` is required per the lexicon. Phase 1.9 (#64) flipped it from
 /// `Option<String>` to `String`; the underlying `actor.handle` column is
 /// `NOT NULL` in the schema, so the backing data is always present.
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountInfo {
     did: String,
@@ -1920,7 +1926,7 @@ struct AccountInfo {
 }
 
 /// Invite code info embedded in account info
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InviteCodeInfo {
     code: String,
@@ -1933,7 +1939,7 @@ struct InviteCodeInfo {
 }
 
 /// Record of invite code usage
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InviteCodeUse {
     used_by: String,
@@ -1941,7 +1947,7 @@ struct InviteCodeUse {
 }
 
 /// Threat signature (for future anti-spam/abuse detection)
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreatSignature {
     property: String,
@@ -2141,6 +2147,141 @@ async fn search_accounts(
     }
 
     Ok(Json(SearchAccountsResponse {
+        accounts,
+        cursor: next_cursor,
+    }))
+}
+
+// ---- tools.aurora.ops.listAccounts (chainlink #84 / Phase 2.3.7) ----
+
+/// Query parameters for tools.aurora.ops.listAccounts.
+///
+/// Operator-facing account listing with broader filters than
+/// com.atproto.admin.searchAccounts. See AccountManager::ops_list_accounts
+/// for the full filter semantics.
+#[derive(Deserialize)]
+struct OpsListAccountsQuery {
+    /// Lower bound for `actor.created_at` (inclusive), RFC3339.
+    #[serde(rename = "signupDateFrom", default)]
+    signup_date_from: Option<String>,
+    /// Upper bound for `actor.created_at` (inclusive), RFC3339.
+    #[serde(rename = "signupDateTo", default)]
+    signup_date_to: Option<String>,
+    /// Filter to accounts onboarded via an invite code created by this DID.
+    #[serde(rename = "inviteSource", default)]
+    invite_source: Option<String>,
+    /// Status filter: `active` | `deactivated` | `takedown` | `suspended`.
+    #[serde(default)]
+    status: Option<String>,
+    /// Pagination cursor: trailing DID from previous page (opaque to clients).
+    #[serde(default)]
+    cursor: Option<String>,
+    /// Page size, 1-100, default 50.
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OpsListAccountsResponse {
+    /// Required, possibly empty.
+    accounts: Vec<AccountInfo>,
+    /// Present only when more pages remain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+}
+
+/// Operator-facing account listing.
+///
+/// Preserves Aurora-Locus's broader filtering capability beyond bsky-PDS's
+/// `searchAccounts`. Filters on signup date range, invite source DID, and
+/// status; cursor + limit pagination. Returns paginated `accountView[]`
+/// using the same `build_account_info` helper as the other admin
+/// account endpoints so the wire shape stays consistent.
+async fn ops_list_accounts(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(query): Query<OpsListAccountsQuery>,
+) -> Result<Json<OpsListAccountsResponse>, (StatusCode, String)> {
+    // Validate limit.
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and 100".to_string(),
+        ));
+    }
+
+    // Validate status enum if provided. Anything else is a client bug; reject
+    // explicitly so callers don't quietly get unfiltered results.
+    if let Some(s) = query.status.as_deref() {
+        if !matches!(s, "active" | "deactivated" | "takedown" | "suspended") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "status must be one of: active, deactivated, takedown, suspended (got {})",
+                    s
+                ),
+            ));
+        }
+    }
+
+    // Validate dates as RFC3339 (failure here means client typo, not server
+    // problem; reject upfront rather than letting the SQL string-compare
+    // through).
+    for (label, val) in [
+        ("signupDateFrom", &query.signup_date_from),
+        ("signupDateTo", &query.signup_date_to),
+    ] {
+        if let Some(s) = val {
+            if chrono::DateTime::parse_from_rfc3339(s).is_err() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("{} must be RFC3339 datetime", label),
+                ));
+            }
+        }
+    }
+
+    // Validate inviteSource is a DID-looking string.
+    if let Some(d) = query.invite_source.as_deref() {
+        if !d.starts_with("did:") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "inviteSource must be a DID identifier".to_string(),
+            ));
+        }
+    }
+
+    // Fetch limit+1 to detect more pages.
+    let rows = ctx
+        .account_manager
+        .ops_list_accounts(
+            query.signup_date_from.as_deref(),
+            query.signup_date_to.as_deref(),
+            query.invite_source.as_deref(),
+            query.status.as_deref(),
+            query.cursor.as_deref(),
+            limit + 1,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let has_more = rows.len() as i64 > limit;
+    let page: Vec<_> = rows.into_iter().take(limit as usize).collect();
+    let next_cursor = if has_more {
+        page.last().map(|a| a.did.clone())
+    } else {
+        None
+    };
+
+    let mut accounts = Vec::with_capacity(page.len());
+    for actor in &page {
+        if let Ok(info) = build_account_info(&ctx, &actor.did).await {
+            accounts.push(info);
+        }
+    }
+
+    Ok(Json(OpsListAccountsResponse {
         accounts,
         cursor: next_cursor,
     }))
@@ -5319,6 +5460,225 @@ mod tests {
         .unwrap()
         .0;
         assert!(resp.accounts.is_empty());
+    }
+
+    // ---- tools.aurora.ops.listAccounts (chainlink #84 / Phase 2.3.7) ----
+
+    fn ops_list_query() -> OpsListAccountsQuery {
+        OpsListAccountsQuery {
+            signup_date_from: None,
+            signup_date_to: None,
+            invite_source: None,
+            status: None,
+            cursor: None,
+            limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ops_list_accounts_empty_db_returns_empty() {
+        let ctx = create_test_context().await;
+        let resp = ops_list_accounts(State(ctx), admin_test_auth(), Query(ops_list_query()))
+            .await
+            .unwrap()
+            .0;
+        assert!(resp.accounts.is_empty());
+        assert!(resp.cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ops_list_accounts_returns_all_when_no_filters() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:a1", "a1.test", Some("a@x")).await;
+        seed_test_account(&ctx, "did:plc:b2", "b2.test", Some("b@x")).await;
+        seed_test_account(&ctx, "did:plc:c3", "c3.test", None).await;
+
+        let resp = ops_list_accounts(State(ctx), admin_test_auth(), Query(ops_list_query()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.accounts.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_ops_list_accounts_takedown_status_filter() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:active", "ok.test", None).await;
+        seed_test_account(&ctx, "did:plc:downed", "down.test", None).await;
+        ctx.account_manager
+            .takedown_account("did:plc:downed", "ticket-1")
+            .await
+            .unwrap();
+
+        let mut q = ops_list_query();
+        q.status = Some("takedown".to_string());
+        let resp = ops_list_accounts(State(ctx.clone()), admin_test_auth(), Query(q))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.accounts.len(), 1);
+        assert_eq!(resp.accounts[0].did, "did:plc:downed");
+
+        let mut q = ops_list_query();
+        q.status = Some("active".to_string());
+        let resp = ops_list_accounts(State(ctx), admin_test_auth(), Query(q))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.accounts.len(), 1);
+        assert_eq!(resp.accounts[0].did, "did:plc:active");
+    }
+
+    #[tokio::test]
+    async fn test_ops_list_accounts_signup_date_range_filters() {
+        let ctx = create_test_context().await;
+        // Seed accounts and override created_at directly in SQL for the test.
+        seed_test_account(&ctx, "did:plc:old", "old.test", None).await;
+        seed_test_account(&ctx, "did:plc:mid", "mid.test", None).await;
+        seed_test_account(&ctx, "did:plc:new", "new.test", None).await;
+        sqlx::query("UPDATE actor SET created_at = ? WHERE did = ?")
+            .bind("2024-01-01T00:00:00+00:00")
+            .bind("did:plc:old")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE actor SET created_at = ? WHERE did = ?")
+            .bind("2025-01-01T00:00:00+00:00")
+            .bind("did:plc:mid")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE actor SET created_at = ? WHERE did = ?")
+            .bind("2026-01-01T00:00:00+00:00")
+            .bind("did:plc:new")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+
+        // Window catches just the middle one.
+        let mut q = ops_list_query();
+        q.signup_date_from = Some("2024-06-01T00:00:00+00:00".to_string());
+        q.signup_date_to = Some("2025-06-01T00:00:00+00:00".to_string());
+        let resp = ops_list_accounts(State(ctx), admin_test_auth(), Query(q))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.accounts.len(), 1);
+        assert_eq!(resp.accounts[0].did, "did:plc:mid");
+    }
+
+    #[tokio::test]
+    async fn test_ops_list_accounts_invite_source_filter() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:inviter", "inv.test", None).await;
+        seed_test_account(&ctx, "did:plc:invited", "vee.test", None).await;
+        seed_test_account(&ctx, "did:plc:other", "other.test", None).await;
+
+        // Create an invite code by inviter and have invited use it.
+        let code = ctx
+            .invite_manager
+            .create_invite("did:plc:inviter", 5, None, None, None)
+            .await
+            .unwrap();
+        ctx.invite_manager
+            .use_code(&code.code, "did:plc:invited")
+            .await
+            .unwrap();
+
+        let mut q = ops_list_query();
+        q.invite_source = Some("did:plc:inviter".to_string());
+        let resp = ops_list_accounts(State(ctx), admin_test_auth(), Query(q))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.accounts.len(), 1);
+        assert_eq!(resp.accounts[0].did, "did:plc:invited");
+    }
+
+    #[tokio::test]
+    async fn test_ops_list_accounts_paginates_with_cursor() {
+        let ctx = create_test_context().await;
+        for did in ["did:plc:a", "did:plc:b", "did:plc:c", "did:plc:d"] {
+            seed_test_account(&ctx, did, &format!("{}.test", &did[8..]), None).await;
+        }
+
+        let mut q = ops_list_query();
+        q.limit = Some(2);
+        let page1 = ops_list_accounts(State(ctx.clone()), admin_test_auth(), Query(q))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(page1.accounts.len(), 2);
+        let cursor = page1.cursor.clone().expect("cursor expected");
+
+        let mut q = ops_list_query();
+        q.limit = Some(2);
+        q.cursor = Some(cursor);
+        let page2 = ops_list_accounts(State(ctx), admin_test_auth(), Query(q))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(page2.accounts.len(), 2);
+        // No overlap.
+        let p1: Vec<_> = page1.accounts.iter().map(|a| a.did.as_str()).collect();
+        let p2: Vec<_> = page2.accounts.iter().map(|a| a.did.as_str()).collect();
+        for did in &p2 {
+            assert!(!p1.contains(did), "page2 should not overlap page1");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ops_list_accounts_validation_limit_out_of_range() {
+        let ctx = create_test_context().await;
+        let mut q = ops_list_query();
+        q.limit = Some(0);
+        let err = ops_list_accounts(State(ctx.clone()), admin_test_auth(), Query(q))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let mut q = ops_list_query();
+        q.limit = Some(101);
+        let err = ops_list_accounts(State(ctx), admin_test_auth(), Query(q))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_ops_list_accounts_validation_unknown_status() {
+        let ctx = create_test_context().await;
+        let mut q = ops_list_query();
+        q.status = Some("on-fire".to_string());
+        let err = ops_list_accounts(State(ctx), admin_test_auth(), Query(q))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("status"));
+    }
+
+    #[tokio::test]
+    async fn test_ops_list_accounts_validation_bad_date() {
+        let ctx = create_test_context().await;
+        let mut q = ops_list_query();
+        q.signup_date_from = Some("yesterday".to_string());
+        let err = ops_list_accounts(State(ctx), admin_test_auth(), Query(q))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("RFC3339"));
+    }
+
+    #[tokio::test]
+    async fn test_ops_list_accounts_validation_bad_invite_source() {
+        let ctx = create_test_context().await;
+        let mut q = ops_list_query();
+        q.invite_source = Some("not-a-did".to_string());
+        let err = ops_list_accounts(State(ctx), admin_test_auth(), Query(q))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("DID"));
     }
 
     // ---- Phase 1.7: account/did deprecation-alias rollout ---------------

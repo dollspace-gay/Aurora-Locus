@@ -2254,6 +2254,132 @@ impl AccountManager {
         Ok(accounts)
     }
 
+    /// Operator-facing account listing with broader filters than the
+    /// bsky-PDS-flavored `search_accounts` (chainlink #84).
+    ///
+    /// All filters are AND'd; pagination is the same trailing-DID cursor
+    /// scheme used by `search_accounts` and `list_accounts`.
+    ///
+    /// # Filters
+    /// - `signup_from` / `signup_to`: RFC3339 datetime range over
+    ///   `actor.created_at` (inclusive on both ends).
+    /// - `invite_source`: DID of the account that *created* the invite
+    ///   code used to onboard the row. Joins `invite_code_use` →
+    ///   `invite_code` and matches `invite_code.created_by`.
+    /// - `status`: one of `active` | `deactivated` | `takedown` |
+    ///   `suspended`. Caller must validate the value (handler does);
+    ///   any other value yields no status filter.
+    ///   - `active`: no takedown_ref, no deactivated_at, no active
+    ///     non-reversed suspend.
+    ///   - `deactivated`: deactivated_at IS NOT NULL.
+    ///   - `takedown`: takedown_ref IS NOT NULL.
+    ///   - `suspended`: at least one non-reversed `account_moderation`
+    ///     row with `action='suspend'` whose `expires_at` is NULL or
+    ///     in the future.
+    pub async fn ops_list_accounts(
+        &self,
+        signup_from: Option<&str>,
+        signup_to: Option<&str>,
+        invite_source: Option<&str>,
+        status: Option<&str>,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> PdsResult<Vec<ActorAccount>> {
+        let mut sql = String::from(
+            "SELECT \
+                a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after, \
+                ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled \
+             FROM actor a \
+             LEFT JOIN account ac ON a.did = ac.did",
+        );
+
+        let mut clauses: Vec<&'static str> = Vec::new();
+        let mut bind_strs: Vec<String> = Vec::new();
+        let now_iso = Utc::now().to_rfc3339();
+
+        if let Some(d) = invite_source {
+            clauses.push(
+                "EXISTS (SELECT 1 FROM invite_code_use icu \
+                 JOIN invite_code ic ON icu.code = ic.code \
+                 WHERE icu.used_by = a.did AND ic.created_by = ?)",
+            );
+            bind_strs.push(d.to_string());
+        }
+        if let Some(s) = signup_from {
+            clauses.push("a.created_at >= ?");
+            bind_strs.push(s.to_string());
+        }
+        if let Some(s) = signup_to {
+            clauses.push("a.created_at <= ?");
+            bind_strs.push(s.to_string());
+        }
+        if let Some(c) = cursor {
+            clauses.push("a.did > ?");
+            bind_strs.push(c.to_string());
+        }
+        match status {
+            Some("active") => {
+                clauses.push("a.takedown_ref IS NULL");
+                clauses.push("a.deactivated_at IS NULL");
+                clauses.push(
+                    "NOT EXISTS (SELECT 1 FROM account_moderation am \
+                     WHERE am.did = a.did AND am.action = 'suspend' AND NOT am.reversed \
+                       AND (am.expires_at IS NULL OR am.expires_at > ?))",
+                );
+                bind_strs.push(now_iso.clone());
+            }
+            Some("deactivated") => {
+                clauses.push("a.deactivated_at IS NOT NULL");
+            }
+            Some("takedown") => {
+                clauses.push("a.takedown_ref IS NOT NULL");
+            }
+            Some("suspended") => {
+                clauses.push(
+                    "EXISTS (SELECT 1 FROM account_moderation am \
+                     WHERE am.did = a.did AND am.action = 'suspend' AND NOT am.reversed \
+                       AND (am.expires_at IS NULL OR am.expires_at > ?))",
+                );
+                bind_strs.push(now_iso.clone());
+            }
+            _ => {}
+        }
+
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY a.did LIMIT ?");
+
+        let mut q = sqlx::query(&sql);
+        for b in &bind_strs {
+            q = q.bind(b);
+        }
+        q = q.bind(limit);
+
+        let rows = q.fetch_all(&self.db).await.map_err(PdsError::Database)?;
+
+        let mut accounts = Vec::with_capacity(rows.len());
+        for row in rows {
+            accounts.push(ActorAccount {
+                did: row.get("did"),
+                handle: row.get("handle"),
+                created_at: parse_timestamp(&row.get::<String, _>("created_at"))?,
+                takedown_ref: row.get("takedown_ref"),
+                deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
+                delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+                email: row.get("email"),
+                password_hash: row.get("password_hash"),
+                email_confirmed_at: opt_parse_timestamp(
+                    row.get::<Option<String>, _>("email_confirmed_at"),
+                )?,
+                invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
+            });
+        }
+
+        Ok(accounts)
+    }
+
     /// Get a user's position in the signup queue
     ///
     /// Returns the number of deactivated accounts created before this account,
