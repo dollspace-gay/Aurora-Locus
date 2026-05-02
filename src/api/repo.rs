@@ -341,7 +341,7 @@ async fn create_record(
     }
 
     // Invalidate read-after-write cache for this user
-    ctx.local_records_cache.invalidate_did(auth_did).await;
+    ctx.cache_invalidator.invalidate_did(auth_did).await;
     tracing::debug!("create_record: Invalidated cache for DID: {}", auth_did);
 
     tracing::info!(
@@ -414,7 +414,7 @@ async fn put_record(
     }
 
     // Invalidate read-after-write cache for this user
-    ctx.local_records_cache.invalidate_did(auth_did).await;
+    ctx.cache_invalidator.invalidate_did(auth_did).await;
 
     Ok(Json(PutRecordResponse { uri, cid }))
 }
@@ -470,7 +470,7 @@ async fn delete_record(
     }
 
     // Invalidate read-after-write cache for this user
-    ctx.local_records_cache.invalidate_did(auth_did).await;
+    ctx.cache_invalidator.invalidate_did(auth_did).await;
 
     Ok(Json(serde_json::json!({})))
 }

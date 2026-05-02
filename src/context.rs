@@ -68,6 +68,12 @@ pub struct AppContext {
     pub mailer: Arc<Mailer>,
     // Read-after-write cache
     pub local_records_cache: Arc<LocalRecordsCache>,
+    /// Front door for cache invalidations — does local invalidation
+    /// plus (Postgres only) cross-instance NOTIFY emit. Write handlers
+    /// call `cache_invalidator.invalidate_did(did)` instead of touching
+    /// `local_records_cache.invalidate_did` directly. See
+    /// chainlink #90 / docs/POSTGRES_PHASE_4_DESIGN.md §4.
+    pub cache_invalidator: Arc<crate::cache::invalidation::CacheInvalidator>,
 }
 
 impl AppContext {
@@ -335,8 +341,59 @@ impl AppContext {
         // Initialize mailer
         let mailer = Arc::new(Mailer::new(config.email.clone())?);
 
-        // Initialize read-after-write cache (5s TTL, 10k entries)
+        // Initialize read-after-write cache (5s TTL, 10k entries) and the
+        // cache invalidator front door. Multi-instance Postgres
+        // deployments wire a NOTIFY emitter so writes here propagate
+        // to other instances; SQLite skips the emitter (single-instance
+        // by definition). See chainlink #90 / docs/POSTGRES_PHASE_4_DESIGN.md §4.
         let local_records_cache = Arc::new(LocalRecordsCache::new());
+        let notify_emitter: Option<Arc<dyn crate::cache::invalidation::NotifyEmitter>> =
+            if matches!(
+                config.database.backend,
+                crate::config::DatabaseBackend::Postgres
+            ) {
+                Some(Arc::new(crate::cache::invalidation::PostgresNotifyEmitter::new(
+                    account_db.clone(),
+                )))
+            } else {
+                None
+            };
+        let cache_invalidator = Arc::new(crate::cache::invalidation::CacheInvalidator::new(
+            Arc::clone(&local_records_cache),
+            notify_emitter,
+        ));
+
+        // Spawn the LISTEN loop on Postgres so this instance receives
+        // NOTIFYs from peer instances and applies them to its local
+        // cache. SQLite skips entirely. The listener task lives for the
+        // process lifetime; like the leader-election task in Phase 4.2,
+        // we leak the handle here pending a top-level shutdown handle
+        // (chainlink #89 §3.5 follow-up).
+        if matches!(
+            config.database.backend,
+            crate::config::DatabaseBackend::Postgres
+        ) {
+            if let Some(url) = config.database.url.clone() {
+                let listener = crate::cache::invalidation::CacheInvalidationListener::spawn(
+                    url,
+                    Arc::clone(&cache_invalidator),
+                );
+                std::mem::forget(listener);
+                tracing::info!(
+                    channel = crate::cache::invalidation::CHANNEL_NAME,
+                    "Cache invalidation listener spawned"
+                );
+            } else {
+                // Validation in DatabaseConfig::from_env_values rejects
+                // postgres-without-URL, so this branch should be
+                // unreachable in practice. Logging instead of unwrap
+                // keeps the code defensive against config-loading paths
+                // that bypass validation (e.g. test fixtures).
+                tracing::warn!(
+                    "Postgres backend without URL — cache invalidation listener not spawned"
+                );
+            }
+        }
 
         Ok(Self {
             config: Arc::new(config),
@@ -364,6 +421,7 @@ impl AppContext {
             distributed_rate_limiter,
             mailer,
             local_records_cache,
+            cache_invalidator,
         })
     }
 
