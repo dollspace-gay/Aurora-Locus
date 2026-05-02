@@ -28,7 +28,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "skydeval/v0.2-cycle"]
   pull_request:
     branches: [main]
 
