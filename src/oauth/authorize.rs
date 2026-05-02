@@ -312,7 +312,7 @@ pub async fn get_authorization_request(
         state: row.get("state"),
         created_at: parse_ts(&row.get::<String, _>("created_at"))?,
         expires_at: parse_ts(&row.get::<String, _>("expires_at"))?,
-        code_used: row.get::<i64, _>("code_used") != 0,
+        code_used: crate::db::read_bool(&row, "code_used")?,
         code_used_at: row
             .get::<Option<String>, _>("code_used_at")
             .as_deref()

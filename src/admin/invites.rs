@@ -180,7 +180,7 @@ impl InviteCodeManager {
         let row = row.ok_or_else(|| PdsError::NotFound("Invite code not found".to_string()))?;
 
         let available: i32 = row.get("available");
-        let disabled: bool = row.get::<i64, _>("disabled") != 0;
+        let disabled: bool = crate::db::read_bool(&row, "disabled")?;
         let for_account: Option<String> = row.get("for_account");
 
         // Validate code
@@ -324,7 +324,7 @@ impl InviteCodeManager {
             Ok(Some(InviteCode {
                 code: row.get("code"),
                 available: row.get("available"),
-                disabled: row.get::<i64, _>("disabled") != 0,
+                disabled: crate::db::read_bool(&row, "disabled")?,
                 created_by: row.get("created_by"),
                 created_at,
                 expires_at,
@@ -391,7 +391,7 @@ impl InviteCodeManager {
             codes.push(InviteCode {
                 code: row.get("code"),
                 available: row.get("available"),
-                disabled: row.get::<i64, _>("disabled") != 0,
+                disabled: crate::db::read_bool(&row, "disabled")?,
                 created_by: row.get("created_by"),
                 created_at,
                 expires_at,
@@ -558,7 +558,7 @@ impl InviteCodeManager {
                 InviteCode {
                     code: row.get("code"),
                     available: row.get("available"),
-                    disabled: row.get::<i64, _>("disabled") != 0,
+                    disabled: crate::db::read_bool(&row, "disabled")?,
                     created_by: row.get("created_by"),
                     created_at,
                     expires_at,
@@ -597,7 +597,7 @@ impl InviteCodeManager {
             codes.push(InviteCode {
                 code: row.get("code"),
                 available: row.get("available"),
-                disabled: row.get::<i64, _>("disabled") != 0,
+                disabled: crate::db::read_bool(&row, "disabled")?,
                 created_by: row.get("created_by"),
                 created_at,
                 expires_at,

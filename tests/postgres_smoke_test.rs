@@ -284,22 +284,25 @@ async fn admin_managers_round_trip_on_postgres() {
     let (_pg, url) = start_postgres().await;
     let pool = open_pool(&url).await;
 
-    // Roles: grant only (smoke at the SQL placeholder layer; we don't
-    // do the follow-up get_role here because that read decodes the
-    // `revoked BOOLEAN` column with the Phase 3 `i64 != 0` pattern,
-    // which fails against Postgres BOOLEAN — separate issue, see the
-    // follow-up filed alongside this commit). Exercising INSERT
-    // confirms the placeholder sweep produced parseable Postgres SQL.
+    // Grant a role and read it back. After Phase 5.0.5b (chainlink #96)
+    // the read path uses `crate::db::read_bool` so the `revoked
+    // BOOLEAN` column decodes correctly on Postgres.
     let roles = AdminRoleManager::new(pool);
     roles
         .grant_role("did:plc:adm", Role::Admin, "did:plc:granter", None)
         .await
         .expect("grant_role");
+    let r = roles
+        .get_role("did:plc:adm")
+        .await
+        .expect("get_role")
+        .expect("role present");
+    assert_eq!(r.role, Role::Admin);
+    assert!(!r.revoked, "freshly-granted role should not be revoked");
 
     // Other admin managers (labels, invites, reports, appeals,
-    // moderation, events) all share the same INSERT-RETURNING +
-    // SELECT WHERE + UPDATE WHERE shapes; per-manager behavior is
-    // covered by src/admin/<module>/tests against SQLite. Adding more
-    // smoke here would replay the same bool-decode issue at every
-    // SELECT path — the follow-up issue tracks the broader fix.
+    // moderation, events) all share the same shapes; per-manager
+    // behavior is covered by src/admin/<module>/tests against SQLite,
+    // and the bool-read paths (revoked, reversed, neg, disabled, ...)
+    // all flow through the same `read_bool` helper now.
 }

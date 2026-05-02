@@ -149,7 +149,7 @@ impl ClientManager {
 
         if let Some(row) = existing {
             let id: i64 = row.get("id");
-            let is_active: bool = row.get::<i64, _>("is_active") != 0;
+            let is_active: bool = crate::db::read_bool(&row, "is_active")?;
 
             if is_active {
                 // Update existing authorization

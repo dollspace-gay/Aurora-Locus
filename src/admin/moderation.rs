@@ -337,7 +337,7 @@ impl ModerationManager {
                 moderated_by: row.get("moderated_by"),
                 moderated_at,
                 expires_at,
-                reversed: row.get::<i64, _>("reversed") != 0,
+                reversed: crate::db::read_bool(&row, "reversed")?,
                 reversed_at,
                 reversed_by: row.get("reversed_by"),
                 reversal_reason: row.get("reversal_reason"),

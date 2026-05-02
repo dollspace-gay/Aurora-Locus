@@ -340,7 +340,7 @@ impl Sequencer {
             event: row.try_get("event")?,
             // BOOLEAN on Postgres, INTEGER 0/1 on SQLite — sqlx::Any
             // requires reading SQLite INTEGER as i64 and converting; chainlink #76.
-            invalidated: row.try_get::<i64, _>("invalidated")? != 0,
+            invalidated: crate::db::read_bool(&row, "invalidated")?,
             sequenced_at: {
                 let time_str: String = row.try_get("sequenced_at")?;
                 DateTime::parse_from_rfc3339(&time_str)

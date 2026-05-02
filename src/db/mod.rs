@@ -11,8 +11,32 @@ use crate::error::{PdsError, PdsResult};
 use sqlx::any::AnyPoolOptions;
 use sqlx::sqlite::SqlitePool;
 use sqlx::AnyPool;
+use sqlx::Row;
 use std::path::Path;
 use std::time::Duration;
+
+/// Portable boolean column read across SQLite (INTEGER 0/1) and
+/// Postgres (BOOLEAN) backends via `sqlx::Any` (chainlink #96).
+///
+/// Phase 3 (b851678) standardized boolean reads on the
+/// `row.get::<i64, _>(col) != 0` pattern because SQLite migration
+/// columns are INTEGER-typed and `sqlx::Any` couldn't decode INTEGER
+/// directly into `bool` when the column type was declared INTEGER.
+/// That pattern fails on Postgres, where the same logical columns
+/// are real `BOOLEAN` and `sqlx::Any` rejects `i64` decoding from
+/// `BOOLEAN` with `ColumnDecode`.
+///
+/// `read_bool` papers over the difference: try `bool` first
+/// (Postgres BOOLEAN succeeds; SQLite INTEGER may also succeed via
+/// the Any driver's loose typing), then fall back to `i64 != 0`
+/// (legacy SQLite INTEGER columns where the bool decode refuses).
+/// Single decision point for all current and future bool reads.
+pub fn read_bool(row: &sqlx::any::AnyRow, col: &str) -> Result<bool, sqlx::Error> {
+    match row.try_get::<bool, _>(col) {
+        Ok(b) => Ok(b),
+        Err(_) => row.try_get::<i64, _>(col).map(|i| i != 0),
+    }
+}
 
 /// Database connection options
 #[derive(Debug, Clone)]
@@ -228,6 +252,72 @@ mod tests {
             "delete",
             "DELETE mode should be used when WAL is disabled"
         );
+    }
+
+    /// Verify `read_bool` against SQLite-via-Any with INTEGER 0/1
+    /// columns — the legacy decode path that Phase 3's pattern handled.
+    /// Postgres BOOLEAN is exercised by the integration test layer
+    /// (tests/postgres_smoke_test.rs) once the helper is wired in.
+    #[tokio::test]
+    async fn test_read_bool_sqlite_integer_columns() {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Schema mirrors the production pattern: INTEGER 0/1 booleans.
+        sqlx::query("CREATE TABLE flags (id INTEGER PRIMARY KEY, on_flag INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO flags (id, on_flag) VALUES (1, 1), (2, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let row1 = sqlx::query("SELECT on_flag FROM flags WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(read_bool(&row1, "on_flag").unwrap(), "1 → true");
+
+        let row2 = sqlx::query("SELECT on_flag FROM flags WHERE id = 2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!read_bool(&row2, "on_flag").unwrap(), "0 → false");
+    }
+
+    #[tokio::test]
+    async fn test_read_bool_unknown_column_errors() {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE x (id INTEGER PRIMARY KEY, on_flag INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO x (id, on_flag) VALUES (1, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT on_flag FROM x WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // Unknown column name surfaces as a sqlx::Error from try_get.
+        assert!(read_bool(&row, "no_such_column").is_err());
     }
 
     #[tokio::test]

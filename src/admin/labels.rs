@@ -146,7 +146,7 @@ impl LabelManager {
                 uri: row.get("uri"),
                 cid: row.get("cid"),
                 val: row.get("val"),
-                neg: row.get::<i64, _>("neg") != 0,
+                neg: crate::db::read_bool(&row, "neg")?,
                 src: row.get("src"),
                 created_at,
                 created_by: row.get("created_by"),
