@@ -415,6 +415,18 @@ After Phase 3.6 lands and Phase 2.4-style legacy removal happens,
 `com.atproto.admin.grantRole`/`revokeRole` are deleted from the
 parity surface.
 
+**Asymmetry note: `listRoles` stays put.** `grantRole` and
+`revokeRole` relocate to `tools.aurora.superadmin.*` because they're
+destructive role-authority operations requiring SuperAdmin tier.
+`listRoles` (read-side role discoverability — "who has what
+role?") stays at `com.atproto.admin.listRoles` because it serves
+all moderators legitimately and doesn't require SuperAdmin tier.
+The asymmetry reflects "authority tier matches operation
+destructiveness" rather than "all role-related endpoints belong to
+one tier" — the same principle that keeps `getAuditLog` at the
+moderator tier while `emitEvent` (which writes to it) requires
+admin tier.
+
 ## 6. Schema additions
 
 ### 6.1 Hash-chain columns on `admin_audit_log`
