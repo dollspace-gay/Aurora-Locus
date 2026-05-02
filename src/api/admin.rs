@@ -263,6 +263,19 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/com.atproto.admin.cleanupRateLimitState",
             post(cleanup_rate_limit_state),
         )
+        // Rate limiting management — operator namespace (chainlink #84).
+        .route(
+            "/xrpc/tools.aurora.ops.getRateLimitConfig",
+            get(get_rate_limit_config),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.getRateLimitStatus",
+            get(get_rate_limit_status),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.cleanupRateLimitState",
+            post(cleanup_rate_limit_state),
+        )
         // Federation and relay management
         .route(
             "/xrpc/com.atproto.admin.getFederationStatus",
