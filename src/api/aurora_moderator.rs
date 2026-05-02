@@ -1,17 +1,20 @@
 //! Moderator-tier read endpoints under `tools.aurora.moderator.*`.
 //!
-//! Implements Phase 3.3 (chainlink #100) per the
-//! [design doc](../../docs/ADMIN_MOD_PHASE_3_DESIGN.md) §5.2:
+//! Implements Phase 3.3 (chainlink #100) and Phase 3.4 (chainlink
+//! #101) per the [design doc](../../docs/ADMIN_MOD_PHASE_3_DESIGN.md)
+//! §5.2:
 //!
 //! - `queryEvents` — paginated query of moderation events
 //! - `getEvent` — single event by ID
 //! - `queryStatuses` — paginated query of subject statuses
 //! - `getSubjectContext` — comprehensive view of single subject
 //! - `getSubjectHistory` — chronological action history for subject
+//! - `listAppeals` — paginated appeals query (3.4)
+//! - `getAppeal` — single appeal by ID with timeline (3.4)
 //!
-//! All five share rich-context helpers (`resolve_handles`,
-//! `fetch_subject_metadata`, `fetch_cross_references`) that batch
-//! resolution per response page rather than N+1 per item.
+//! All endpoints share rich-context helpers (`resolve_handles`,
+//! `fetch_action_summaries`) that batch resolution per response page
+//! rather than N+1 per item.
 //!
 //! Auth: Moderator+ via `AdminAuthContext` (matches Phase 2.3 ops
 //! convention). The namespace scope-check middleware also gates
@@ -974,6 +977,582 @@ pub async fn get_subject_history(
 }
 
 // ===========================================================================
+// 5.2.6 / 5.2.7 — Appeals reads (Phase 3.4 / chainlink #101)
+// ===========================================================================
+//
+// Two endpoints (listAppeals + getAppeal) reusing 3.3's foundation
+// types and rich-context patterns. Subject derivation: appeals
+// reference one of moderation_id, report_id, or quarantine_id; we
+// resolve the underlying subject DID/URI to construct a Subject.
+// blob_quarantine carries cid only (no DID), so quarantine appeals
+// fall back to a Repo subject keyed on the appellant.
+
+/// Wire-format appeal status. Mirrors the `appeal.status` column
+/// vocabulary (snake_case) directly so the serialized JSON matches
+/// what's stored. Distinct from `crate::admin::appeals::AppealStatus`
+/// (which uses `rename_all = "lowercase"` and disagrees with its own
+/// `as_str()` form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiAppealStatus {
+    Pending,
+    UnderReview,
+    Approved,
+    Denied,
+    Escalated,
+}
+
+impl ApiAppealStatus {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::UnderReview => "under_review",
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Escalated => "escalated",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "under_review" => Some(Self::UnderReview),
+            "approved" => Some(Self::Approved),
+            "denied" => Some(Self::Denied),
+            "escalated" => Some(Self::Escalated),
+            _ => None,
+        }
+    }
+}
+
+/// Brief description of the action being appealed. Embedded in
+/// AppealView so list consumers don't need a follow-up query to
+/// understand what each appeal is about.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OriginalActionSummary {
+    /// One of `"moderation"`, `"report"`, `"quarantine"`.
+    pub kind: &'static str,
+    pub id: i64,
+    /// Short human-readable summary (e.g. `"takedown: spam"` for a
+    /// moderation action, `"open report: harassment"` for a report).
+    pub summary: String,
+}
+
+/// Appeal resolution. Present only when the appeal has been reviewed
+/// (status != Pending|UnderReview).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppealResolution {
+    pub reviewed_by: String,
+    pub reviewed_by_handle: Option<String>,
+    pub reviewed_at: DateTime<Utc>,
+    pub decision: Option<String>,
+    pub notes: Option<String>,
+}
+
+/// Paginated appeal list item.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppealView {
+    pub id: i64,
+    pub status: ApiAppealStatus,
+    pub submitter_did: String,
+    pub submitter_handle: Option<String>,
+    pub subject: Option<Subject>,
+    pub reason: String,
+    pub details: Option<String>,
+    pub submitted_at: DateTime<Utc>,
+    pub original_action_summary: Option<OriginalActionSummary>,
+    pub resolution: Option<AppealResolution>,
+}
+
+/// Single timeline entry on an appeal (lifecycle event).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppealTimelineEntry {
+    /// `"submitted"` or `"reviewed"`.
+    pub kind: &'static str,
+    pub at: DateTime<Utc>,
+    pub by_did: String,
+    pub by_handle: Option<String>,
+    pub note: Option<String>,
+}
+
+/// Detailed appeal view returned by `getAppeal`. Same fields as
+/// `AppealView` plus a chronological timeline of the appeal's
+/// lifecycle.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppealDetail {
+    #[serde(flatten)]
+    pub view: AppealView,
+    pub timeline: Vec<AppealTimelineEntry>,
+}
+
+/// Batch-fetch action summaries for the given moderation/report/
+/// quarantine IDs. Returns three maps `id -> (Option<subject>,
+/// summary)`. Mirrors `resolve_handles`'s shape — one SQL query per
+/// table per call regardless of input size.
+pub(crate) async fn fetch_action_summaries(
+    ctx: &AppContext,
+    moderation_ids: &[i64],
+    report_ids: &[i64],
+    quarantine_ids: &[i64],
+) -> Result<
+    (
+        HashMap<i64, (Option<Subject>, OriginalActionSummary)>,
+        HashMap<i64, (Option<Subject>, OriginalActionSummary)>,
+        HashMap<i64, (Option<Subject>, OriginalActionSummary)>,
+    ),
+    PdsError,
+> {
+    let mut moderations = HashMap::new();
+    let mut reports = HashMap::new();
+    let mut quarantines = HashMap::new();
+
+    if !moderation_ids.is_empty() {
+        let unique: HashSet<i64> = moderation_ids.iter().copied().collect();
+        let placeholders: Vec<String> =
+            (1..=unique.len()).map(|i| format!("${}", i)).collect();
+        let sql = format!(
+            "SELECT id, did, action, reason FROM account_moderation WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut q = sqlx::query(&sql);
+        for id in &unique {
+            q = q.bind(*id);
+        }
+        let rows = q.fetch_all(&ctx.account_db).await?;
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            let did: String = row.try_get("did")?;
+            let action: String = row.try_get("action")?;
+            let reason: String = row.try_get("reason")?;
+            let summary = OriginalActionSummary {
+                kind: "moderation",
+                id,
+                summary: format!("{}: {}", action, reason),
+            };
+            moderations.insert(id, (Some(Subject::Repo { did }), summary));
+        }
+    }
+
+    if !report_ids.is_empty() {
+        let unique: HashSet<i64> = report_ids.iter().copied().collect();
+        let placeholders: Vec<String> =
+            (1..=unique.len()).map(|i| format!("${}", i)).collect();
+        let sql = format!(
+            "SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason, status \
+             FROM report WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut q = sqlx::query(&sql);
+        for id in &unique {
+            q = q.bind(*id);
+        }
+        let rows = q.fetch_all(&ctx.account_db).await?;
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            let subject_did: Option<String> = row.try_get("subject_did").ok().flatten();
+            let subject_uri: Option<String> = row.try_get("subject_uri").ok().flatten();
+            let subject_cid: Option<String> = row.try_get("subject_cid").ok().flatten();
+            let reason_type: String = row.try_get("reason_type")?;
+            let status: String = row.try_get("status")?;
+            let reason: Option<String> = row.try_get("reason").ok().flatten();
+            let summary_text = match reason {
+                Some(r) if !r.is_empty() => format!("{} report ({}): {}", status, reason_type, r),
+                _ => format!("{} report ({})", status, reason_type),
+            };
+            let subject = Subject::from_columns(
+                subject_did.as_deref(),
+                subject_uri.as_deref(),
+                subject_cid.as_deref(),
+            );
+            reports.insert(
+                id,
+                (
+                    subject,
+                    OriginalActionSummary {
+                        kind: "report",
+                        id,
+                        summary: summary_text,
+                    },
+                ),
+            );
+        }
+    }
+
+    if !quarantine_ids.is_empty() {
+        let unique: HashSet<i64> = quarantine_ids.iter().copied().collect();
+        let placeholders: Vec<String> =
+            (1..=unique.len()).map(|i| format!("${}", i)).collect();
+        let sql = format!(
+            "SELECT id, cid, reason FROM blob_quarantine WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut q = sqlx::query(&sql);
+        for id in &unique {
+            q = q.bind(*id);
+        }
+        let rows = q.fetch_all(&ctx.account_db).await?;
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            let cid: String = row.try_get("cid")?;
+            let reason: String = row.try_get("reason")?;
+            // blob_quarantine has no DID column — Subject can't be
+            // populated from this row alone, so the appeal handler
+            // falls back to Repo{appellant_did}. The summary still
+            // carries the cid so callers know which blob it was.
+            quarantines.insert(
+                id,
+                (
+                    None,
+                    OriginalActionSummary {
+                        kind: "quarantine",
+                        id,
+                        summary: format!("blob quarantine ({}): {}", cid, reason),
+                    },
+                ),
+            );
+        }
+    }
+
+    Ok((moderations, reports, quarantines))
+}
+
+/// Query parameters for `tools.aurora.moderator.listAppeals`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListAppealsParams {
+    #[serde(default)]
+    pub status: Option<ApiAppealStatus>,
+    /// Filter by appellant DID.
+    #[serde(default)]
+    pub appellant: Option<String>,
+    /// Filter by reviewer DID (matches `reviewed_by`).
+    #[serde(default)]
+    pub reviewer: Option<String>,
+    /// Lower bound on `submitted_at` (inclusive), RFC3339.
+    #[serde(default)]
+    pub submitted_after: Option<String>,
+    /// Upper bound on `submitted_at` (inclusive), RFC3339.
+    #[serde(default)]
+    pub submitted_before: Option<String>,
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+}
+
+pub async fn list_appeals(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(params): Query<ListAppealsParams>,
+) -> Result<Json<PaginatedResponse<AppealView>>, (StatusCode, Json<serde_json::Value>)> {
+    let limit = params.pagination.effective_limit() as i64;
+    let cursor = params.pagination.decode_cursor().map_err(|_| {
+        let e = AuroraAdminError::OutdatedCursor;
+        (e.http_status(), Json(serde_json::json!({"error": e.code()})))
+    })?;
+
+    let mut clauses: Vec<&'static str> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+
+    if let Some(s) = &params.status {
+        clauses.push("status = ?");
+        binds.push(s.as_db_str().to_string());
+    }
+    if let Some(a) = &params.appellant {
+        clauses.push("appellant_did = ?");
+        binds.push(a.clone());
+    }
+    if let Some(r) = &params.reviewer {
+        clauses.push("reviewed_by = ?");
+        binds.push(r.clone());
+    }
+    if let Some(a) = &params.submitted_after {
+        clauses.push("submitted_at >= ?");
+        binds.push(a.clone());
+    }
+    if let Some(b) = &params.submitted_before {
+        clauses.push("submitted_at <= ?");
+        binds.push(b.clone());
+    }
+    if let Some(c) = &cursor {
+        clauses.push("(submitted_at < ? OR (submitted_at = ? AND id < ?))");
+        binds.push(c.after_created.to_rfc3339());
+        binds.push(c.after_created.to_rfc3339());
+    }
+
+    let clauses_pg = renumber_placeholders(&clauses, &binds, cursor.is_some());
+    let where_sql = if clauses_pg.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses_pg.join(" AND "))
+    };
+    let limit_idx = binds.len() + if cursor.is_some() { 2 } else { 1 };
+    let sql = format!(
+        "SELECT id, moderation_id, report_id, quarantine_id, appellant_did, reason, details, \
+                submitted_at, status, reviewed_by, reviewed_at, decision, notes \
+         FROM appeal{} \
+         ORDER BY submitted_at DESC, id DESC \
+         LIMIT ${}",
+        where_sql, limit_idx
+    );
+
+    let mut q = sqlx::query(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    if let Some(c) = &cursor {
+        q = q.bind(c.after_id);
+    }
+    q = q.bind(limit + 1);
+
+    let rows = q.fetch_all(&ctx.account_db).await.map_err(internal)?;
+    let has_more = rows.len() as i64 > limit;
+    let page_rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
+
+    // Collect IDs for batch action-summary lookup.
+    let mut mod_ids = Vec::new();
+    let mut rep_ids = Vec::new();
+    let mut qua_ids = Vec::new();
+    let mut handle_dids = Vec::new();
+    for row in &page_rows {
+        if let Ok(Some(i)) = row.try_get::<Option<i64>, _>("moderation_id") {
+            mod_ids.push(i);
+        }
+        if let Ok(Some(i)) = row.try_get::<Option<i64>, _>("report_id") {
+            rep_ids.push(i);
+        }
+        if let Ok(Some(i)) = row.try_get::<Option<i64>, _>("quarantine_id") {
+            qua_ids.push(i);
+        }
+        if let Ok(d) = row.try_get::<String, _>("appellant_did") {
+            handle_dids.push(d);
+        }
+        if let Ok(Some(d)) = row.try_get::<Option<String>, _>("reviewed_by") {
+            handle_dids.push(d);
+        }
+    }
+    let (moderations, reports, quarantines) =
+        fetch_action_summaries(&ctx, &mod_ids, &rep_ids, &qua_ids)
+            .await
+            .map_err(internal_pds)?;
+    // Add subject DIDs that came from the moderation/report lookups
+    // so handle resolution covers them too.
+    for (subj, _) in moderations.values().chain(reports.values()) {
+        if let Some(s) = subj {
+            if let Some(d) = s.primary_did() {
+                handle_dids.push(d.to_string());
+            }
+        }
+    }
+    let handles = resolve_handles(&ctx, &handle_dids)
+        .await
+        .map_err(internal_pds)?;
+
+    let mut items = Vec::with_capacity(page_rows.len());
+    let mut last_at = None;
+    let mut last_id = None;
+    for row in page_rows {
+        let view = build_appeal_view(&row, &moderations, &reports, &quarantines, &handles)
+            .map_err(internal_pds)?;
+        last_at = Some(view.submitted_at);
+        last_id = Some(view.id);
+        items.push(view);
+    }
+
+    let next_cursor = if has_more {
+        match (last_at, last_id) {
+            (Some(t), Some(i)) => Some(
+                CursorPosition {
+                    after_created: t,
+                    after_id: i,
+                }
+                .encode(),
+            ),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(Json(PaginatedResponse {
+        items,
+        cursor: next_cursor,
+    }))
+}
+
+/// Extract one `AppealView` from a row + the pre-fetched lookup maps.
+/// Pulled out to keep `list_appeals` and `get_appeal` from
+/// duplicating the column-extraction dance.
+fn build_appeal_view(
+    row: &sqlx::any::AnyRow,
+    moderations: &HashMap<i64, (Option<Subject>, OriginalActionSummary)>,
+    reports: &HashMap<i64, (Option<Subject>, OriginalActionSummary)>,
+    quarantines: &HashMap<i64, (Option<Subject>, OriginalActionSummary)>,
+    handles: &HashMap<String, String>,
+) -> Result<AppealView, PdsError> {
+    let id: i64 = row.try_get("id")?;
+    let moderation_id: Option<i64> = row.try_get("moderation_id").ok().flatten();
+    let report_id: Option<i64> = row.try_get("report_id").ok().flatten();
+    let quarantine_id: Option<i64> = row.try_get("quarantine_id").ok().flatten();
+    let appellant_did: String = row.try_get("appellant_did")?;
+    let reason: String = row.try_get("reason")?;
+    let details: Option<String> = row.try_get("details").ok().flatten();
+    let submitted_at = parse_ts(&row.try_get::<String, _>("submitted_at")?)?;
+    let status_str: String = row.try_get("status")?;
+    let status = ApiAppealStatus::from_db_str(&status_str).ok_or_else(|| {
+        PdsError::Internal(format!("Unknown appeal status in db: {}", status_str))
+    })?;
+    let reviewed_by: Option<String> = row.try_get("reviewed_by").ok().flatten();
+    let reviewed_at_str: Option<String> = row.try_get("reviewed_at").ok().flatten();
+    let reviewed_at = parse_ts_opt(reviewed_at_str)?;
+    let decision: Option<String> = row.try_get("decision").ok().flatten();
+    let notes: Option<String> = row.try_get("notes").ok().flatten();
+
+    // Pick whichever reference is populated (moderation > report >
+    // quarantine in priority). Use the lookup maps for both subject
+    // and summary; fall back to Repo{appellant_did} if nothing
+    // resolves.
+    let (subject, summary) = if let Some(mid) = moderation_id {
+        moderations
+            .get(&mid)
+            .cloned()
+            .map(|(s, sm)| (s, Some(sm)))
+            .unwrap_or((None, None))
+    } else if let Some(rid) = report_id {
+        reports
+            .get(&rid)
+            .cloned()
+            .map(|(s, sm)| (s, Some(sm)))
+            .unwrap_or((None, None))
+    } else if let Some(qid) = quarantine_id {
+        quarantines
+            .get(&qid)
+            .cloned()
+            .map(|(s, sm)| (s, Some(sm)))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+    let subject = subject.or(Some(Subject::Repo {
+        did: appellant_did.clone(),
+    }));
+
+    let submitter_handle = handles.get(&appellant_did).cloned();
+    let resolution = match (reviewed_by.clone(), reviewed_at) {
+        (Some(by), Some(at)) => Some(AppealResolution {
+            reviewed_by_handle: handles.get(&by).cloned(),
+            reviewed_by: by,
+            reviewed_at: at,
+            decision: decision.clone(),
+            notes: notes.clone(),
+        }),
+        _ => None,
+    };
+
+    Ok(AppealView {
+        id,
+        status,
+        submitter_did: appellant_did,
+        submitter_handle,
+        subject,
+        reason,
+        details,
+        submitted_at,
+        original_action_summary: summary,
+        resolution,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetAppealParams {
+    pub id: i64,
+}
+
+pub async fn get_appeal(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+    Query(params): Query<GetAppealParams>,
+) -> Result<Json<AppealDetail>, (StatusCode, Json<serde_json::Value>)> {
+    let row = sqlx::query(
+        "SELECT id, moderation_id, report_id, quarantine_id, appellant_did, reason, details, \
+                submitted_at, status, reviewed_by, reviewed_at, decision, notes \
+         FROM appeal WHERE id = $1",
+    )
+    .bind(params.id)
+    .fetch_optional(&ctx.account_db)
+    .await
+    .map_err(internal)?;
+
+    let row = row.ok_or_else(|| -> (StatusCode, Json<serde_json::Value>) {
+        AuroraAdminError::AppealNotFound.into()
+    })?;
+
+    let moderation_id: Option<i64> = row.try_get("moderation_id").ok().flatten();
+    let report_id: Option<i64> = row.try_get("report_id").ok().flatten();
+    let quarantine_id: Option<i64> = row.try_get("quarantine_id").ok().flatten();
+
+    let mod_ids: Vec<i64> = moderation_id.into_iter().collect();
+    let rep_ids: Vec<i64> = report_id.into_iter().collect();
+    let qua_ids: Vec<i64> = quarantine_id.into_iter().collect();
+    let (moderations, reports, quarantines) =
+        fetch_action_summaries(&ctx, &mod_ids, &rep_ids, &qua_ids)
+            .await
+            .map_err(internal_pds)?;
+
+    let mut handle_dids = Vec::new();
+    if let Ok(d) = row.try_get::<String, _>("appellant_did") {
+        handle_dids.push(d);
+    }
+    if let Ok(Some(d)) = row.try_get::<Option<String>, _>("reviewed_by") {
+        handle_dids.push(d);
+    }
+    for (subj, _) in moderations.values().chain(reports.values()) {
+        if let Some(s) = subj {
+            if let Some(d) = s.primary_did() {
+                handle_dids.push(d.to_string());
+            }
+        }
+    }
+    let handles = resolve_handles(&ctx, &handle_dids)
+        .await
+        .map_err(internal_pds)?;
+
+    let view = build_appeal_view(&row, &moderations, &reports, &quarantines, &handles)
+        .map_err(internal_pds)?;
+
+    // Build timeline. The appeal table stores at most two lifecycle
+    // events directly: submission + review. Future event-history
+    // sources (e.g. moderation_event entries with appeal_submit /
+    // appeal_review types from Phase 3.5 onward) can extend this
+    // without a wire-format break.
+    let mut timeline = vec![AppealTimelineEntry {
+        kind: "submitted",
+        at: view.submitted_at,
+        by_did: view.submitter_did.clone(),
+        by_handle: view.submitter_handle.clone(),
+        note: Some(view.reason.clone()),
+    }];
+    if let Some(res) = &view.resolution {
+        timeline.push(AppealTimelineEntry {
+            kind: "reviewed",
+            at: res.reviewed_at,
+            by_did: res.reviewed_by.clone(),
+            by_handle: res.reviewed_by_handle.clone(),
+            note: res
+                .decision
+                .clone()
+                .or_else(|| res.notes.clone())
+                .or_else(|| Some(format!("status -> {:?}", view.status))),
+        });
+    }
+
+    Ok(Json(AppealDetail { view, timeline }))
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1407,5 +1986,437 @@ mod tests {
         let ctx = create_test_context().await;
         let h = resolve_handles(&ctx, &[]).await.unwrap();
         assert!(h.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3.4 — appeals reads (chainlink #101)
+    // -----------------------------------------------------------------
+
+    /// Insert one appeal row. `moderation_id` may be supplied to wire
+    /// a backing moderation action; pass `None` for a standalone
+    /// appeal that falls back to Repo{appellant_did}.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_appeal(
+        ctx: &AppContext,
+        appellant_did: &str,
+        appellant_handle: Option<&str>,
+        moderation_id: Option<i64>,
+        report_id: Option<i64>,
+        reason: &str,
+        status: &str,
+        reviewed_by: Option<&str>,
+        offset_secs: i64,
+    ) -> i64 {
+        if let Some(h) = appellant_handle {
+            sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+                .bind(appellant_did)
+                .bind(h)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&ctx.account_db)
+                .await
+                .ok();
+        }
+        // Stagger submitted_at so cursor pagination has distinct
+        // timestamps even when seeding in a tight loop.
+        let when = (chrono::Utc::now() - chrono::Duration::seconds(offset_secs)).to_rfc3339();
+        let reviewed_at = if reviewed_by.is_some() {
+            Some(chrono::Utc::now().to_rfc3339())
+        } else {
+            None
+        };
+        sqlx::query(
+            "INSERT INTO appeal (moderation_id, report_id, quarantine_id, appellant_did, \
+                                 reason, details, submitted_at, status, reviewed_by, \
+                                 reviewed_at, decision, notes) \
+             VALUES ($1, $2, NULL, $3, $4, NULL, $5, $6, $7, $8, NULL, NULL) \
+             RETURNING id",
+        )
+        .bind(moderation_id)
+        .bind(report_id)
+        .bind(appellant_did)
+        .bind(reason)
+        .bind(when)
+        .bind(status)
+        .bind(reviewed_by)
+        .bind(reviewed_at)
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap()
+        .try_get::<i64, _>(0)
+        .unwrap()
+    }
+
+    /// Insert one account_moderation row, return its id.
+    async fn seed_moderation(
+        ctx: &AppContext,
+        did: &str,
+        action: &str,
+        reason: &str,
+        moderated_by: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO account_moderation (did, action, reason, moderated_by, moderated_at, \
+                                              reversed) \
+             VALUES ($1, $2, $3, $4, $5, 0) \
+             RETURNING id",
+        )
+        .bind(did)
+        .bind(action)
+        .bind(reason)
+        .bind(moderated_by)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap()
+        .try_get::<i64, _>(0)
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_appeals_returns_with_handle_and_subject() {
+        let ctx = create_test_context().await;
+        let mod_id = seed_moderation(
+            &ctx,
+            "did:plc:victim",
+            "takedown",
+            "spam",
+            "did:plc:adminx",
+        )
+        .await;
+        seed_appeal(
+            &ctx,
+            "did:plc:victim",
+            Some("victim.test"),
+            Some(mod_id),
+            None,
+            "false positive",
+            "pending",
+            None,
+            0,
+        )
+        .await;
+
+        let resp = list_appeals(
+            State(ctx),
+            moderator_test_auth(),
+            Query(ListAppealsParams {
+                status: None,
+                appellant: None,
+                reviewer: None,
+                submitted_after: None,
+                submitted_before: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.items.len(), 1);
+        let a = &resp.items[0];
+        assert_eq!(a.status, ApiAppealStatus::Pending);
+        assert_eq!(a.submitter_handle.as_deref(), Some("victim.test"));
+        // Subject derived from moderation -> Repo{victim DID}.
+        assert!(matches!(&a.subject, Some(Subject::Repo { did }) if did == "did:plc:victim"));
+        let summary = a.original_action_summary.as_ref().unwrap();
+        assert_eq!(summary.kind, "moderation");
+        assert!(summary.summary.contains("takedown"));
+        assert!(a.resolution.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_appeals_filters_by_status() {
+        let ctx = create_test_context().await;
+        seed_appeal(
+            &ctx,
+            "did:plc:a1",
+            Some("a1.test"),
+            None,
+            None,
+            "first",
+            "pending",
+            None,
+            0,
+        )
+        .await;
+        seed_appeal(
+            &ctx,
+            "did:plc:a2",
+            Some("a2.test"),
+            None,
+            None,
+            "second",
+            "approved",
+            Some("did:plc:adminx"),
+            5,
+        )
+        .await;
+
+        let resp = list_appeals(
+            State(ctx),
+            moderator_test_auth(),
+            Query(ListAppealsParams {
+                status: Some(ApiAppealStatus::Approved),
+                appellant: None,
+                reviewer: None,
+                submitted_after: None,
+                submitted_before: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].status, ApiAppealStatus::Approved);
+        assert!(resp.items[0].resolution.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_appeals_paginates_with_cursor() {
+        let ctx = create_test_context().await;
+        for i in 0..5 {
+            seed_appeal(
+                &ctx,
+                &format!("did:plc:a{}", i),
+                Some(&format!("a{}.test", i)),
+                None,
+                None,
+                &format!("appeal {}", i),
+                "pending",
+                None,
+                i as i64, // distinct submitted_at per row
+            )
+            .await;
+        }
+
+        let page1 = list_appeals(
+            State(ctx.clone()),
+            moderator_test_auth(),
+            Query(ListAppealsParams {
+                status: None,
+                appellant: None,
+                reviewer: None,
+                submitted_after: None,
+                submitted_before: None,
+                pagination: PaginationParams {
+                    cursor: None,
+                    limit: Some(2),
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page1.items.len(), 2);
+        assert!(page1.cursor.is_some(), "expected cursor for next page");
+
+        let page2 = list_appeals(
+            State(ctx),
+            moderator_test_auth(),
+            Query(ListAppealsParams {
+                status: None,
+                appellant: None,
+                reviewer: None,
+                submitted_after: None,
+                submitted_before: None,
+                pagination: PaginationParams {
+                    cursor: page1.cursor,
+                    limit: Some(2),
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page2.items.len(), 2);
+        let p1: Vec<i64> = page1.items.iter().map(|a| a.id).collect();
+        let p2: Vec<i64> = page2.items.iter().map(|a| a.id).collect();
+        for id in &p2 {
+            assert!(!p1.contains(id), "page2 must not overlap page1");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_appeals_filters_by_appellant_and_date_range() {
+        let ctx = create_test_context().await;
+        seed_appeal(
+            &ctx,
+            "did:plc:keep",
+            Some("keep.test"),
+            None,
+            None,
+            "kept",
+            "pending",
+            None,
+            0,
+        )
+        .await;
+        seed_appeal(
+            &ctx,
+            "did:plc:other",
+            Some("other.test"),
+            None,
+            None,
+            "filtered",
+            "pending",
+            None,
+            10,
+        )
+        .await;
+
+        // Appellant filter: keeps only the matching DID.
+        let resp = list_appeals(
+            State(ctx.clone()),
+            moderator_test_auth(),
+            Query(ListAppealsParams {
+                status: None,
+                appellant: Some("did:plc:keep".to_string()),
+                reviewer: None,
+                submitted_after: None,
+                submitted_before: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].submitter_did, "did:plc:keep");
+
+        // Date range: only the recent appeal (within last 5 seconds).
+        let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let resp = list_appeals(
+            State(ctx),
+            moderator_test_auth(),
+            Query(ListAppealsParams {
+                status: None,
+                appellant: None,
+                reviewer: None,
+                submitted_after: Some(cutoff),
+                submitted_before: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].submitter_did, "did:plc:keep");
+    }
+
+    #[tokio::test]
+    async fn get_appeal_returns_404_for_missing() {
+        let ctx = create_test_context().await;
+        let err = get_appeal(
+            State(ctx),
+            moderator_test_auth(),
+            Query(GetAppealParams { id: 99999 }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        // Error envelope carries the AppealNotFound code (distinct from
+        // SubjectNotFound which getEvent uses).
+        let body = err.1.0;
+        assert_eq!(body["error"], "AppealNotFound");
+    }
+
+    #[tokio::test]
+    async fn get_appeal_returns_full_detail_with_timeline() {
+        let ctx = create_test_context().await;
+        let mod_id = seed_moderation(
+            &ctx,
+            "did:plc:user",
+            "suspend",
+            "ToS violation",
+            "did:plc:adm1",
+        )
+        .await;
+        // Reviewer needs an actor row so handle resolution populates
+        // resolution.reviewedByHandle.
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+            .bind("did:plc:adm1")
+            .bind("admin1.test")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let appeal_id = seed_appeal(
+            &ctx,
+            "did:plc:user",
+            Some("user.test"),
+            Some(mod_id),
+            None,
+            "I did not violate",
+            "approved",
+            Some("did:plc:adm1"),
+            0,
+        )
+        .await;
+
+        let resp = get_appeal(
+            State(ctx),
+            moderator_test_auth(),
+            Query(GetAppealParams { id: appeal_id }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.view.id, appeal_id);
+        assert_eq!(resp.view.status, ApiAppealStatus::Approved);
+        assert_eq!(resp.view.submitter_handle.as_deref(), Some("user.test"));
+        let res = resp.view.resolution.as_ref().unwrap();
+        assert_eq!(res.reviewed_by, "did:plc:adm1");
+        assert_eq!(res.reviewed_by_handle.as_deref(), Some("admin1.test"));
+        // Timeline: submission + review.
+        assert_eq!(resp.timeline.len(), 2);
+        assert_eq!(resp.timeline[0].kind, "submitted");
+        assert_eq!(resp.timeline[1].kind, "reviewed");
+        assert_eq!(resp.timeline[0].by_did, "did:plc:user");
+        assert_eq!(resp.timeline[1].by_did, "did:plc:adm1");
+    }
+
+    #[tokio::test]
+    async fn get_appeal_pending_has_single_timeline_entry() {
+        // Pending appeals have no review event yet — timeline is just
+        // the submission.
+        let ctx = create_test_context().await;
+        let appeal_id = seed_appeal(
+            &ctx,
+            "did:plc:pend",
+            Some("pend.test"),
+            None,
+            None,
+            "still waiting",
+            "pending",
+            None,
+            0,
+        )
+        .await;
+
+        let resp = get_appeal(
+            State(ctx),
+            moderator_test_auth(),
+            Query(GetAppealParams { id: appeal_id }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.timeline.len(), 1);
+        assert_eq!(resp.timeline[0].kind, "submitted");
+        assert!(resp.view.resolution.is_none());
+        // No backing moderation/report — falls back to Repo{appellant}.
+        assert!(matches!(&resp.view.subject, Some(Subject::Repo { did }) if did == "did:plc:pend"));
+        assert!(resp.view.original_action_summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn api_appeal_status_serializes_snake_case() {
+        // Wire format guard: response JSON must use snake_case so it
+        // matches the stored db vocabulary one-to-one.
+        let json = serde_json::to_string(&ApiAppealStatus::UnderReview).unwrap();
+        assert_eq!(json, "\"under_review\"");
+        let parsed: ApiAppealStatus = serde_json::from_str("\"under_review\"").unwrap();
+        assert_eq!(parsed, ApiAppealStatus::UnderReview);
     }
 }

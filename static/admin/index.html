@@ -38,6 +38,10 @@
                     <span class="icon">📜</span>
                     Mod Events
                 </a>
+                <a href="#appeals" class="nav-item" data-page="appeals">
+                    <span class="icon">⚖️</span>
+                    Appeals
+                </a>
                 <a href="#invites" class="nav-item" data-page="invites">
                     <span class="icon">✉️</span>
                     Invite Codes
@@ -213,6 +217,37 @@
                 <div style="margin-top: 16px; display: flex; gap: 8px;">
                     <button class="btn-secondary" id="events-prev-btn" onclick="loadEventsPrev()" disabled>Previous</button>
                     <button class="btn-secondary" id="events-next-btn" onclick="loadEventsNext()" disabled>Next</button>
+                </div>
+            </div>
+
+            <!-- Appeals Page (chainlink #101 / Phase 3.4) -->
+            <div id="page-appeals" class="page">
+                <header class="page-header">
+                    <h2>Moderation Appeals</h2>
+                    <p class="page-subtitle">
+                        Cross-instance appeals log via tools.aurora.moderator.listAppeals.
+                        Click an appeal for the full timeline.
+                    </p>
+                </header>
+                <div class="filter-bar" style="margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap;">
+                    <select id="appeals-filter-status" style="min-width: 160px;">
+                        <option value="">All statuses</option>
+                        <option value="pending">Pending</option>
+                        <option value="under_review">Under Review</option>
+                        <option value="approved">Approved</option>
+                        <option value="denied">Denied</option>
+                        <option value="escalated">Escalated</option>
+                    </select>
+                    <input type="text" id="appeals-filter-appellant" placeholder="Filter by appellant DID" style="flex: 1; min-width: 200px;">
+                    <input type="text" id="appeals-filter-reviewer" placeholder="Filter by reviewer DID" style="flex: 1; min-width: 200px;">
+                    <button class="btn-primary" onclick="loadAppeals()">Apply</button>
+                </div>
+                <div id="appeals-table-container">
+                    <p class="empty-state">Click Apply to load appeals.</p>
+                </div>
+                <div style="margin-top: 16px; display: flex; gap: 8px;">
+                    <button class="btn-secondary" id="appeals-prev-btn" onclick="loadAppealsPrev()" disabled>Previous</button>
+                    <button class="btn-secondary" id="appeals-next-btn" onclick="loadAppealsNext()" disabled>Next</button>
                 </div>
             </div>
 

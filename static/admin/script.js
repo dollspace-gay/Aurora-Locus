@@ -88,6 +88,9 @@ function navigateTo(page) {
         case 'invites':
             loadInvites();
             break;
+        case 'appeals':
+            loadAppeals();
+            break;
     }
 }
 
@@ -777,6 +780,118 @@ function renderEventsTable(data) {
 
 function loadEventDetail(id) {
     fetch(`${API_BASE}/tools.aurora.moderator.getEvent?id=${id}`, {
+        headers: { 'Authorization': `Bearer ${adminToken}` }
+    })
+    .then(res => res.json())
+    .then(data => {
+        alert(JSON.stringify(data, null, 2));
+    })
+    .catch(err => alert(`Error: ${err.message}`));
+}
+
+// Aurora moderator-tier appeals browser (chainlink #101 / Phase 3.4).
+// Fetches tools.aurora.moderator.listAppeals with filter params and
+// renders results in a table. Cursor-based pagination via
+// loadAppealsPrev/loadAppealsNext. Mirrors the Mod Events page.
+let appealsCursorStack = [];
+let appealsNextCursor = null;
+
+function loadAppeals() {
+    appealsCursorStack = [];
+    appealsNextCursor = null;
+    fetchAppealsPage(null);
+}
+
+function loadAppealsNext() {
+    if (appealsNextCursor) {
+        appealsCursorStack.push(appealsNextCursor);
+        fetchAppealsPage(appealsNextCursor);
+    }
+}
+
+function loadAppealsPrev() {
+    if (appealsCursorStack.length > 1) {
+        appealsCursorStack.pop();
+        const prev = appealsCursorStack[appealsCursorStack.length - 1] || null;
+        fetchAppealsPage(prev);
+    } else if (appealsCursorStack.length === 1) {
+        appealsCursorStack = [];
+        fetchAppealsPage(null);
+    }
+}
+
+function fetchAppealsPage(cursor) {
+    const params = new URLSearchParams();
+    const status = document.getElementById('appeals-filter-status').value.trim();
+    const appellant = document.getElementById('appeals-filter-appellant').value.trim();
+    const reviewer = document.getElementById('appeals-filter-reviewer').value.trim();
+    if (status) params.set('status', status);
+    if (appellant) params.set('appellant', appellant);
+    if (reviewer) params.set('reviewer', reviewer);
+    if (cursor) params.set('cursor', cursor);
+    params.set('limit', '25');
+
+    const container = document.getElementById('appeals-table-container');
+    container.innerHTML = '<p class="empty-state">Loading...</p>';
+
+    fetch(`${API_BASE}/tools.aurora.moderator.listAppeals?${params.toString()}`, {
+        headers: { 'Authorization': `Bearer ${adminToken}` }
+    })
+    .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+    })
+    .then(data => renderAppealsTable(data))
+    .catch(err => {
+        container.innerHTML = `<p class="empty-state">Error: ${err.message}</p>`;
+    });
+}
+
+function renderAppealsTable(data) {
+    const container = document.getElementById('appeals-table-container');
+    const items = data.items || [];
+    appealsNextCursor = data.cursor || null;
+
+    document.getElementById('appeals-prev-btn').disabled = appealsCursorStack.length === 0;
+    document.getElementById('appeals-next-btn').disabled = !appealsNextCursor;
+
+    if (items.length === 0) {
+        container.innerHTML = '<p class="empty-state">No appeals match these filters.</p>';
+        return;
+    }
+
+    let html = '<table class="data-table"><thead><tr>'
+        + '<th>Submitted</th><th>Status</th><th>Appellant</th><th>Subject</th>'
+        + '<th>Original Action</th><th>Reason</th><th>ID</th>'
+        + '</tr></thead><tbody>';
+    for (const a of items) {
+        const when = new Date(a.submittedAt).toLocaleString();
+        const appellant = a.submitterHandle || a.submitterDid;
+        let subject = '—';
+        if (a.subject) {
+            const subjType = a.subject['$type'] || '?';
+            if (subjType.endsWith('repoRef')) {
+                subject = `repo: ${a.subject.did}`;
+            } else if (subjType.endsWith('strongRef')) {
+                subject = `record: ${a.subject.uri}`;
+            } else if (subjType.endsWith('repoBlobRef')) {
+                subject = `blob: ${a.subject.cid}`;
+            }
+        }
+        const orig = a.originalActionSummary
+            ? `${a.originalActionSummary.kind} #${a.originalActionSummary.id}: ${a.originalActionSummary.summary}`
+            : '—';
+        const reason = a.reason || '';
+        html += `<tr><td>${when}</td><td>${a.status}</td><td>${appellant}</td>`
+            + `<td>${subject}</td><td>${orig}</td><td>${reason}</td>`
+            + `<td><a href="javascript:void(0)" onclick="loadAppealDetail(${a.id})">${a.id}</a></td></tr>`;
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+}
+
+function loadAppealDetail(id) {
+    fetch(`${API_BASE}/tools.aurora.moderator.getAppeal?id=${id}`, {
         headers: { 'Authorization': `Bearer ${adminToken}` }
     })
     .then(res => res.json())

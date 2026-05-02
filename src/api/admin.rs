@@ -319,6 +319,20 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.moderator.getSubjectHistory",
             get(crate::api::aurora_moderator::get_subject_history),
         )
+        // ---- tools.aurora.moderator.* appeals reads (chainlink #101 / Phase 3.4) ----
+        //
+        // Two endpoints reusing 3.3's foundation types and rich-context
+        // helpers (resolve_handles + new fetch_action_summaries batch
+        // lookup). Auth: same AdminAuthContext + namespace scope as
+        // the other moderator-tier endpoints.
+        .route(
+            "/xrpc/tools.aurora.moderator.listAppeals",
+            get(crate::api::aurora_moderator::list_appeals),
+        )
+        .route(
+            "/xrpc/tools.aurora.moderator.getAppeal",
+            get(crate::api::aurora_moderator::get_appeal),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -2215,12 +2229,15 @@ fn aurora_capability_families() -> serde_json::Value {
             "triggerPdsDiscovery"
         ],
         // Phase 3.3 (chainlink #100) — moderator-tier reads.
+        // Phase 3.4 (chainlink #101) — appeals reads (listAppeals, getAppeal).
         "tools.aurora.moderator": [
             "queryEvents",
             "getEvent",
             "queryStatuses",
             "getSubjectContext",
-            "getSubjectHistory"
+            "getSubjectHistory",
+            "listAppeals",
+            "getAppeal"
         ],
         "tools.aurora.admin": [],
         // Phase 3.6 (chainlink #103) — role management relocated from
