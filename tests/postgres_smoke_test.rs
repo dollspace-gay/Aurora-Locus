@@ -12,6 +12,19 @@
 //!
 //! Prerequisites: Docker daemon access for the test runner. Tests fail
 //! fast with a clear panic message if Docker is unreachable.
+//!
+//! # Coverage scope (chainlink #94 / Phase 5.1)
+//!
+//! CI runs these 6 smokes plus the 5 multi_instance_test scenarios
+//! against real Postgres on every commit. That's deliberately less
+//! than the full lib suite (543 tests) — the rationale: smokes
+//! exercise every manager group's primary write+read shapes, and
+//! catch the three Postgres-vs-SQLite incompatibility classes
+//! identified during Phase 5.0 (placeholder syntax, read-side bool
+//! decode, write-side bool literals). Promoting the full lib suite
+//! to also run against Postgres is a future-cycle concern, deferred
+//! pending post-v0.2 experience showing whether the gap matters
+//! (e.g. a fourth incompatibility class slipping through smokes).
 
 use sqlx::any::AnyPoolOptions;
 use sqlx::AnyPool;
