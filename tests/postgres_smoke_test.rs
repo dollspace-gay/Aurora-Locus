@@ -205,3 +205,65 @@ async fn oauth_device_manager_round_trip_on_postgres() {
         .expect("remove_device");
     assert!(mgr.get_device(&device_id).await.is_err());
 }
+
+// ===========================================================================
+// Group 4: src/blob_store/* — blob metadata + quarantine (chainlink #93 / Phase 5.0.4)
+//
+// 24 SQL strings across store.rs and quarantine.rs. The smoke
+// exercises BlobQuarantine round-trip: quarantine → check → restore
+// → verify cleared. Hits INSERT-RETURNING, SELECT, UPDATE patterns.
+// ===========================================================================
+
+#[tokio::test]
+async fn blob_store_quarantine_round_trip_on_postgres() {
+    use aurora_locus::blob_store::quarantine::{BlobQuarantine, QuarantineReason};
+
+    let (_pg, url) = start_postgres().await;
+    let pool = open_pool(&url).await;
+
+    // Seed a blob row so the UPDATE in quarantine_blob has something to
+    // update (FK-style enforcement isn't on this column but the row
+    // needs to exist for rows_affected to be non-zero in restore).
+    sqlx::query(
+        "INSERT INTO blob (cid, did, size, mime_type, created_at, takedown) \
+         VALUES ($1, 'did:plc:owner', 100, 'image/png', $2, false)",
+    )
+    .bind("bafkreismoke")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("seed blob");
+
+    let q = BlobQuarantine::new(pool);
+
+    // Initially not quarantined.
+    assert!(!q.is_quarantined("bafkreismoke").await.unwrap());
+
+    // Quarantine it.
+    let rec = q
+        .quarantine_blob(
+            "bafkreismoke",
+            QuarantineReason::Dmca,
+            Some("test"),
+            "did:plc:mod",
+            None,
+        )
+        .await
+        .expect("quarantine_blob");
+    assert!(rec.id > 0);
+    assert!(q.is_quarantined("bafkreismoke").await.unwrap());
+
+    // get_quarantine returns the record.
+    let fetched = q
+        .get_quarantine("bafkreismoke")
+        .await
+        .unwrap()
+        .expect("present");
+    assert_eq!(fetched.cid, "bafkreismoke");
+
+    // Restore it.
+    q.restore_blob("bafkreismoke", "did:plc:mod")
+        .await
+        .expect("restore_blob");
+    assert!(!q.is_quarantined("bafkreismoke").await.unwrap());
+}

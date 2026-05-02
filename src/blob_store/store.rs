@@ -444,7 +444,7 @@ impl BlobStore {
         sqlx::query(
             r#"
             INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT(cid) DO NOTHING
             "#,
         )
@@ -478,7 +478,7 @@ impl BlobStore {
         sqlx::query(
             r#"
             INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, width, height, thumbnail_cid)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT(cid) DO UPDATE SET
                 width = excluded.width,
                 height = excluded.height,
@@ -505,7 +505,7 @@ impl BlobStore {
         sqlx::query(
             r#"
             INSERT INTO temp_blob_metadata (cid, mime_type, size, creator_did, created_at, width, height)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT(cid) DO UPDATE SET
                 mime_type = excluded.mime_type,
                 size = excluded.size,
@@ -534,7 +534,7 @@ impl BlobStore {
             r#"
             SELECT cid, mime_type, size, creator_did, created_at, width, height
             FROM temp_blob_metadata
-            WHERE cid = ?1
+            WHERE cid = $1
             "#,
         )
         .bind(cid)
@@ -559,7 +559,7 @@ impl BlobStore {
 
     /// Delete temp blob metadata from database
     async fn delete_temp_blob_metadata(&self, cid: &str) -> PdsResult<()> {
-        sqlx::query("DELETE FROM temp_blob_metadata WHERE cid = ?1")
+        sqlx::query("DELETE FROM temp_blob_metadata WHERE cid = $1")
             .bind(cid)
             .execute(&self.db)
             .await
@@ -576,7 +576,7 @@ impl BlobStore {
             r#"
             SELECT cid
             FROM temp_blob_metadata
-            WHERE created_at < ?1
+            WHERE created_at < $1
             ORDER BY created_at ASC
             "#,
         )
@@ -615,7 +615,7 @@ impl BlobStore {
             r#"
             SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
             FROM blob_metadata
-            WHERE cid = ?1
+            WHERE cid = $1
             "#,
         )
         .bind(cid)
@@ -642,7 +642,7 @@ impl BlobStore {
 
     /// Delete blob metadata from database
     async fn delete_metadata(&self, cid: &str) -> PdsResult<()> {
-        sqlx::query("DELETE FROM blob_metadata WHERE cid = ?1")
+        sqlx::query("DELETE FROM blob_metadata WHERE cid = $1")
             .bind(cid)
             .execute(&self.db)
             .await
@@ -657,9 +657,9 @@ impl BlobStore {
             r#"
             SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
             FROM blob_metadata
-            WHERE creator_did = ?1
+            WHERE creator_did = $1
             ORDER BY created_at DESC
-            LIMIT ?2
+            LIMIT $2
             "#,
         )
         .bind(did)
@@ -714,11 +714,11 @@ impl BlobStore {
                 SELECT rb.blob_cid, rb.record_uri
                 FROM record_blob rb
                 LEFT JOIN blob_metadata bm ON rb.blob_cid = bm.cid
-                WHERE rb.record_uri LIKE ?1
+                WHERE rb.record_uri LIKE $1
                   AND bm.cid IS NULL
-                  AND rb.blob_cid > ?2
+                  AND rb.blob_cid > $2
                 ORDER BY rb.blob_cid ASC
-                LIMIT ?3
+                LIMIT $3
                 "#,
             )
             .bind(format!("at://{}/%", did))
@@ -730,10 +730,10 @@ impl BlobStore {
                 SELECT rb.blob_cid, rb.record_uri
                 FROM record_blob rb
                 LEFT JOIN blob_metadata bm ON rb.blob_cid = bm.cid
-                WHERE rb.record_uri LIKE ?1
+                WHERE rb.record_uri LIKE $1
                   AND bm.cid IS NULL
                 ORDER BY rb.blob_cid ASC
-                LIMIT ?2
+                LIMIT $2
                 "#,
             )
             .bind(format!("at://{}/%", did))
@@ -763,7 +763,7 @@ impl BlobStore {
         sqlx::query(
             r#"
             INSERT INTO record_blob (blob_cid, record_uri, indexed_at)
-            VALUES (?1, ?2, ?3)
+            VALUES ($1, $2, $3)
             ON CONFLICT(blob_cid, record_uri) DO NOTHING
             "#,
         )
@@ -781,7 +781,7 @@ impl BlobStore {
     ///
     /// Called when a record is deleted.
     pub async fn remove_record_blob_references(&self, record_uri: &str) -> PdsResult<()> {
-        sqlx::query("DELETE FROM record_blob WHERE record_uri = ?1")
+        sqlx::query("DELETE FROM record_blob WHERE record_uri = $1")
             .bind(record_uri)
             .execute(&self.db)
             .await
@@ -814,9 +814,9 @@ impl BlobStore {
         let query = if let Some(cursor) = cursor {
             sqlx::query_scalar(
                 "SELECT cid FROM blob_metadata
-                 WHERE creator_did = ?1 AND cid > ?2
+                 WHERE creator_did = $1 AND cid > $2
                  ORDER BY cid ASC
-                 LIMIT ?3",
+                 LIMIT $3",
             )
             .bind(did)
             .bind(cursor)
@@ -824,9 +824,9 @@ impl BlobStore {
         } else {
             sqlx::query_scalar(
                 "SELECT cid FROM blob_metadata
-                 WHERE creator_did = ?1
+                 WHERE creator_did = $1
                  ORDER BY cid ASC
-                 LIMIT ?2",
+                 LIMIT $2",
             )
             .bind(did)
             .bind(limit)

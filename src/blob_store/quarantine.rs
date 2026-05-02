@@ -110,7 +110,7 @@ impl BlobQuarantine {
         let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO blob_quarantine (cid, reason, details, quarantined_by, quarantined_at, legal_reference)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id
             "#,
         )
@@ -124,7 +124,7 @@ impl BlobQuarantine {
         .await?;
 
         // Update blob table to mark as taken down
-        sqlx::query("UPDATE blob SET takedown = true WHERE cid = ?1")
+        sqlx::query("UPDATE blob SET takedown = true WHERE cid = $1")
             .bind(cid)
             .execute(&self.db)
             .await?;
@@ -156,9 +156,9 @@ impl BlobQuarantine {
         let result = sqlx::query(
             r#"
             UPDATE blob_quarantine
-            SET restored_at = ?,
-                restored_by = ?
-            WHERE cid = ? AND restored_at IS NULL
+            SET restored_at = $1,
+                restored_by = $2
+            WHERE cid = $3 AND restored_at IS NULL
             "#,
         )
         .bind(now.to_rfc3339())
@@ -175,7 +175,7 @@ impl BlobQuarantine {
         }
 
         // Update blob table to remove takedown
-        sqlx::query("UPDATE blob SET takedown = false WHERE cid = ?1")
+        sqlx::query("UPDATE blob SET takedown = false WHERE cid = $1")
             .bind(cid)
             .execute(&self.db)
             .await?;
@@ -187,7 +187,7 @@ impl BlobQuarantine {
     /// Check if blob is quarantined
     pub async fn is_quarantined(&self, cid: &str) -> PdsResult<bool> {
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM blob_quarantine WHERE cid = ?1 AND restored_at IS NULL",
+            "SELECT COUNT(*) FROM blob_quarantine WHERE cid = $1 AND restored_at IS NULL",
         )
         .bind(cid)
         .fetch_one(&self.db)
@@ -203,7 +203,7 @@ impl BlobQuarantine {
             SELECT id, cid, reason, details, quarantined_by, quarantined_at,
                    restored_at, restored_by, legal_reference
             FROM blob_quarantine
-            WHERE cid = ? AND restored_at IS NULL
+            WHERE cid = $1 AND restored_at IS NULL
             "#,
         )
         .bind(cid)
@@ -226,7 +226,7 @@ impl BlobQuarantine {
             FROM blob_quarantine
             WHERE restored_at IS NULL
             ORDER BY quarantined_at DESC
-            LIMIT ?
+            LIMIT $1
             "#,
         )
         .bind(limit)
@@ -248,7 +248,7 @@ impl BlobQuarantine {
             SELECT id, cid, reason, details, quarantined_by, quarantined_at,
                    restored_at, restored_by, legal_reference
             FROM blob_quarantine
-            WHERE cid = ?
+            WHERE cid = $1
             ORDER BY quarantined_at DESC
             "#,
         )
@@ -354,7 +354,7 @@ mod tests {
 
         // Insert test blob
         sqlx::query(
-            "INSERT INTO blob (cid, did, size, mime_type, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO blob (cid, did, size, mime_type, created_at) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind("bafytest123")
         .bind("did:plc:alice")
