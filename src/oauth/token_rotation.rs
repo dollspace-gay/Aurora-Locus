@@ -147,10 +147,10 @@ impl TokenRotationManager {
         sqlx::query(
             r#"
             UPDATE token
-            SET current_refresh_token = ?,
-                updated_at = ?,
-                expires_at = ?
-            WHERE token_id = ?
+            SET current_refresh_token = $1,
+                updated_at = $2,
+                expires_at = $3
+            WHERE token_id = $4
             "#,
         )
         .bind(&new_refresh_token)
@@ -183,7 +183,7 @@ impl TokenRotationManager {
             r#"
             SELECT COUNT(*) as count
             FROM used_refresh_token
-            WHERE refresh_token = ?
+            WHERE refresh_token = $1
             "#,
         )
         .bind(refresh_token)
@@ -210,7 +210,7 @@ impl TokenRotationManager {
             INSERT INTO used_refresh_token (
                 refresh_token, token_id, did, used_at
             )
-            VALUES (?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4)
             "#,
         )
         .bind(refresh_token)
@@ -231,7 +231,7 @@ impl TokenRotationManager {
             r#"
             SELECT did
             FROM used_refresh_token
-            WHERE refresh_token = ?
+            WHERE refresh_token = $1
             LIMIT 1
             "#,
         )
@@ -253,7 +253,7 @@ impl TokenRotationManager {
             r#"
             SELECT token_id, did, client_id, scope, expires_at, created_at, updated_at
             FROM token
-            WHERE current_refresh_token = ?
+            WHERE current_refresh_token = $1
             "#,
         )
         .bind(refresh_token)
@@ -284,7 +284,7 @@ impl TokenRotationManager {
         let result = sqlx::query(
             r#"
             DELETE FROM token
-            WHERE did = ?
+            WHERE did = $1
             "#,
         )
         .bind(did)
@@ -317,7 +317,7 @@ impl TokenRotationManager {
         let result = sqlx::query(
             r#"
             DELETE FROM used_refresh_token
-            WHERE used_at < ?
+            WHERE used_at < $1
             "#,
         )
         .bind(cutoff.to_rfc3339())

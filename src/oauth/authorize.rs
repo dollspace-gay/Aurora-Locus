@@ -243,7 +243,7 @@ async fn create_authorization_request(
             request_id, did, client_id, code_challenge, code_challenge_method,
             scope, redirect_uri, state, created_at, expires_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(&request_id)
@@ -281,7 +281,7 @@ pub async fn get_authorization_request(
             authorization_code, scope, redirect_uri, state, created_at, expires_at,
             code_used, code_used_at
         FROM authorization_request
-        WHERE request_id = ?
+        WHERE request_id = $1
         "#,
     )
     .bind(request_id)
@@ -336,7 +336,7 @@ pub async fn cleanup_expired_requests(ctx: &AppContext) -> PdsResult<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM authorization_request
-        WHERE expires_at < ?
+        WHERE expires_at < $1
         "#,
     )
     .bind(now.to_rfc3339())

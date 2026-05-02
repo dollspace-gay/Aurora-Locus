@@ -61,7 +61,7 @@ impl DeviceManager {
                 id, session_id, user_agent, ip_address, last_seen_at,
                 dpop_public_key, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(&device_id)
@@ -95,7 +95,7 @@ impl DeviceManager {
             SELECT id, session_id, user_agent, ip_address, last_seen_at,
                    dpop_public_key, created_at
             FROM device
-            WHERE id = ?
+            WHERE id = $1
             "#,
         )
         .bind(device_id)
@@ -128,12 +128,12 @@ impl DeviceManager {
         let result = sqlx::query(
             r#"
             UPDATE device
-            SET session_id = ?,
-                user_agent = ?,
-                ip_address = ?,
-                last_seen_at = ?,
-                dpop_public_key = ?
-            WHERE id = ?
+            SET session_id = $1,
+                user_agent = $2,
+                ip_address = $3,
+                last_seen_at = $4,
+                dpop_public_key = $5
+            WHERE id = $6
             "#,
         )
         .bind(&data.session_id)
@@ -168,7 +168,7 @@ impl DeviceManager {
         let result = sqlx::query(
             r#"
             DELETE FROM device
-            WHERE id = ?
+            WHERE id = $1
             "#,
         )
         .bind(device_id)
@@ -210,7 +210,7 @@ impl DeviceManager {
             INSERT INTO account_device (
                 did, device_id, authorized_at, device_name, is_active
             )
-            VALUES (?, ?, ?, ?, true)
+            VALUES ($1, $2, $3, $4, true)
             RETURNING id
             "#,
         )
@@ -249,9 +249,9 @@ impl DeviceManager {
                 ad.is_active
             FROM account_device ad
             INNER JOIN device d ON ad.device_id = d.id
-            WHERE ad.did = ? AND ad.is_active
+            WHERE ad.did = $1 AND ad.is_active
             ORDER BY d.last_seen_at DESC
-            LIMIT ?
+            LIMIT $2
             "#,
         )
         .bind(did)
@@ -299,8 +299,8 @@ impl DeviceManager {
         let result = sqlx::query(
             r#"
             UPDATE account_device
-            SET is_active = false, revoked_at = ?
-            WHERE did = ? AND device_id = ?
+            SET is_active = false, revoked_at = $1
+            WHERE did = $2 AND device_id = $3
             "#,
         )
         .bind(now.to_rfc3339())
@@ -333,8 +333,8 @@ impl DeviceManager {
         sqlx::query(
             r#"
             UPDATE device
-            SET last_seen_at = ?
-            WHERE id = ?
+            SET last_seen_at = $1
+            WHERE id = $2
             "#,
         )
         .bind(now.to_rfc3339())
@@ -360,7 +360,7 @@ impl DeviceManager {
             r#"
             SELECT dpop_public_key
             FROM device
-            WHERE id = ?
+            WHERE id = $1
             "#,
         )
         .bind(device_id)

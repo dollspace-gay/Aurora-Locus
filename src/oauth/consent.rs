@@ -270,8 +270,8 @@ pub async fn grant_authorization(
     sqlx::query(
         r#"
         UPDATE authorization_request
-        SET authorization_code = ?
-        WHERE request_id = ?
+        SET authorization_code = $1
+        WHERE request_id = $2
         "#,
     )
     .bind(&authorization_code)
@@ -329,7 +329,7 @@ pub async fn deny_authorization(
     let result = sqlx::query(
         r#"
         DELETE FROM authorization_request
-        WHERE request_id = ?
+        WHERE request_id = $1
         "#,
     )
     .bind(&form.request_id)
@@ -384,8 +384,8 @@ pub async fn mark_code_as_used(ctx: &AppContext, authorization_code: &str) -> Pd
     let result = sqlx::query(
         r#"
         UPDATE authorization_request
-        SET code_used = 1, code_used_at = ?
-        WHERE authorization_code = ? AND code_used = 0
+        SET code_used = 1, code_used_at = $1
+        WHERE authorization_code = $2 AND code_used = 0
         "#,
     )
     .bind(now.to_rfc3339())
@@ -429,7 +429,7 @@ pub async fn get_request_by_code(
             authorization_code, scope, redirect_uri, state, created_at, expires_at,
             code_used, code_used_at
         FROM authorization_request
-        WHERE authorization_code = ?
+        WHERE authorization_code = $1
         "#,
     )
     .bind(authorization_code)

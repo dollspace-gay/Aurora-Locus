@@ -139,7 +139,7 @@ impl ClientManager {
             r#"
             SELECT id, is_active
             FROM authorized_client
-            WHERE did = ? AND client_id = ?
+            WHERE did = $1 AND client_id = $2
             "#,
         )
         .bind(did)
@@ -156,8 +156,8 @@ impl ClientManager {
                 sqlx::query(
                     r#"
                     UPDATE authorized_client
-                    SET scope = ?, last_used_at = ?
-                    WHERE id = ?
+                    SET scope = $1, last_used_at = $2
+                    WHERE id = $3
                     "#,
                 )
                 .bind(scope)
@@ -177,8 +177,8 @@ impl ClientManager {
                 sqlx::query(
                     r#"
                     UPDATE authorized_client
-                    SET scope = ?, is_active = true, revoked_at = NULL, last_used_at = ?
-                    WHERE id = ?
+                    SET scope = $1, is_active = true, revoked_at = NULL, last_used_at = $2
+                    WHERE id = $3
                     "#,
                 )
                 .bind(scope)
@@ -202,7 +202,7 @@ impl ClientManager {
             INSERT INTO authorized_client (
                 did, client_id, scope, first_authorized_at, last_used_at, is_active
             )
-            VALUES (?, ?, ?, ?, ?, 1)
+            VALUES ($1, $2, $3, $4, $5, 1)
             RETURNING id
             "#,
         )
@@ -235,8 +235,8 @@ impl ClientManager {
         sqlx::query(
             r#"
             UPDATE authorized_client
-            SET last_used_at = ?
-            WHERE did = ? AND client_id = ? AND is_active = true
+            SET last_used_at = $1
+            WHERE did = $2 AND client_id = $3 AND is_active = true
             "#,
         )
         .bind(now.to_rfc3339())
@@ -272,9 +272,9 @@ impl ClientManager {
                 first_authorized_at,
                 last_used_at
             FROM authorized_client
-            WHERE did = ? AND is_active = true
+            WHERE did = $1 AND is_active = true
             ORDER BY last_used_at DESC, first_authorized_at DESC
-            LIMIT ?
+            LIMIT $2
             "#,
         )
         .bind(did)
@@ -329,8 +329,8 @@ impl ClientManager {
         let result = sqlx::query(
             r#"
             UPDATE authorized_client
-            SET is_active = false, revoked_at = ?
-            WHERE did = ? AND client_id = ?
+            SET is_active = false, revoked_at = $1
+            WHERE did = $2 AND client_id = $3
             "#,
         )
         .bind(now.to_rfc3339())
@@ -367,7 +367,7 @@ impl ClientManager {
             r#"
             SELECT COUNT(*) as count
             FROM authorized_client
-            WHERE did = ? AND client_id = ? AND is_active = true
+            WHERE did = $1 AND client_id = $2 AND is_active = true
             "#,
         )
         .bind(did)

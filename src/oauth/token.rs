@@ -201,7 +201,7 @@ async fn handle_authorization_code_grant(
             scope, created_at, updated_at, expires_at,
             dpop_thumbprint, device_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(&token_id)
