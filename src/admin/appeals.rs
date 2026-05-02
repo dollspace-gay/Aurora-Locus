@@ -109,7 +109,7 @@ impl AppealManager {
         // Check for duplicate appeals
         if let Some(mod_id) = moderation_id {
             let existing: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM appeal WHERE moderation_id = ?1 AND status IN ('pending', 'under_review', 'escalated')"
+                "SELECT COUNT(*) FROM appeal WHERE moderation_id = $1 AND status IN ('pending', 'under_review', 'escalated')"
             )
             .bind(mod_id)
             .fetch_one(&self.db)
@@ -128,7 +128,7 @@ impl AppealManager {
         let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO appeal (moderation_id, report_id, quarantine_id, appellant_did, reason, details, submitted_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
             RETURNING id
             "#,
         )
@@ -180,12 +180,12 @@ impl AppealManager {
         let result = sqlx::query(
             r#"
             UPDATE appeal
-            SET status = ?,
-                reviewed_by = ?,
-                reviewed_at = ?,
-                decision = ?,
-                notes = ?
-            WHERE id = ?
+            SET status = $1,
+                reviewed_by = $2,
+                reviewed_at = $3,
+                decision = $4,
+                notes = $5
+            WHERE id = $6
             "#,
         )
         .bind(status.as_str())
@@ -272,7 +272,7 @@ impl AppealManager {
             SELECT id, moderation_id, report_id, quarantine_id, appellant_did, reason, details,
                    submitted_at, status, reviewed_by, reviewed_at, decision, notes
             FROM appeal
-            WHERE id = ?
+            WHERE id = $1
             "#,
         )
         .bind(appeal_id)
@@ -295,7 +295,7 @@ impl AppealManager {
             FROM appeal
             WHERE status = 'pending'
             ORDER BY submitted_at ASC
-            LIMIT ?
+            LIMIT $1
             "#,
         )
         .bind(limit)
@@ -312,7 +312,7 @@ impl AppealManager {
             SELECT id, moderation_id, report_id, quarantine_id, appellant_did, reason, details,
                    submitted_at, status, reviewed_by, reviewed_at, decision, notes
             FROM appeal
-            WHERE appellant_did = ?
+            WHERE appellant_did = $1
             ORDER BY submitted_at DESC
             "#,
         )
@@ -330,7 +330,7 @@ impl AppealManager {
             SELECT id, moderation_id, report_id, quarantine_id, appellant_did, reason, details,
                    submitted_at, status, reviewed_by, reviewed_at, decision, notes
             FROM appeal
-            WHERE moderation_id = ?
+            WHERE moderation_id = $1
             ORDER BY submitted_at DESC
             "#,
         )

@@ -118,7 +118,7 @@ impl ModerationManager {
             r#"
             INSERT INTO account_moderation
             (did, action, reason, moderated_by, moderated_at, expires_at, report_id, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id
             "#,
         )
@@ -177,10 +177,10 @@ impl ModerationManager {
             r#"
             UPDATE account_moderation
             SET reversed = true,
-                reversed_at = ?,
-                reversed_by = ?,
-                reversal_reason = ?
-            WHERE id = ? AND NOT reversed
+                reversed_at = $1,
+                reversed_by = $2,
+                reversal_reason = $3
+            WHERE id = $4 AND NOT reversed
             "#,
         )
         .bind(now.to_rfc3339())
@@ -198,7 +198,7 @@ impl ModerationManager {
         }
 
         // Get the action type that was reversed
-        let row = sqlx::query("SELECT action, did FROM account_moderation WHERE id = ?1")
+        let row = sqlx::query("SELECT action, did FROM account_moderation WHERE id = $1")
             .bind(moderation_id)
             .fetch_optional(&self.db)
             .await?
@@ -228,7 +228,7 @@ impl ModerationManager {
                    expires_at, reversed, reversed_at, reversed_by,
                    reversal_reason, report_id, notes
             FROM account_moderation
-            WHERE did = ? AND NOT reversed
+            WHERE did = $1 AND NOT reversed
             ORDER BY moderated_at DESC
             "#,
         )
@@ -265,7 +265,7 @@ impl ModerationManager {
                    expires_at, reversed, reversed_at, reversed_by,
                    reversal_reason, report_id, notes
             FROM account_moderation
-            WHERE did = ?
+            WHERE did = $1
             ORDER BY moderated_at DESC
             "#,
         )
@@ -284,13 +284,13 @@ impl ModerationManager {
             r#"
             UPDATE account_moderation
             SET reversed = true,
-                reversed_at = ?,
+                reversed_at = $1,
                 reversed_by = 'system',
                 reversal_reason = 'Expired'
             WHERE action = 'suspend'
               AND NOT reversed
               AND expires_at IS NOT NULL
-              AND expires_at < ?
+              AND expires_at < $2
             "#,
         )
         .bind(now.to_rfc3339())

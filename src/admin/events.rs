@@ -145,7 +145,7 @@ impl ModerationEventLogger {
         let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO moderation_event (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id
             "#,
         )
@@ -225,9 +225,9 @@ impl ModerationEventLogger {
             r#"
             SELECT id, event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta
             FROM moderation_event
-            WHERE actor_did = ?
+            WHERE actor_did = $1
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT $2
             "#,
         )
         .bind(actor_did)
@@ -248,9 +248,9 @@ impl ModerationEventLogger {
             r#"
             SELECT id, event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta
             FROM moderation_event
-            WHERE event_type = ?
+            WHERE event_type = $1
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT $2
             "#,
         )
         .bind(event_type.as_str())
@@ -268,7 +268,7 @@ impl ModerationEventLogger {
             SELECT id, event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta
             FROM moderation_event
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT $1
             "#,
         )
         .bind(limit)

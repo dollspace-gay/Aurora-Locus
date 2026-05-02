@@ -136,7 +136,7 @@ impl InviteCodeManager {
         sqlx::query(
             r#"
             INSERT INTO invite_code (code, available, created_by, created_at, expires_at, note, for_account)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(&code)
@@ -170,7 +170,7 @@ impl InviteCodeManager {
             r#"
             SELECT available, disabled, expires_at, for_account
             FROM invite_code
-            WHERE code = ?
+            WHERE code = $1
             "#,
         )
         .bind(code)
@@ -218,7 +218,7 @@ impl InviteCodeManager {
             r#"
             UPDATE invite_code
             SET available = available - 1
-            WHERE code = ?
+            WHERE code = $1
             "#,
         )
         .bind(code)
@@ -228,7 +228,7 @@ impl InviteCodeManager {
         sqlx::query(
             r#"
             INSERT INTO invite_code_use (code, used_by, used_at)
-            VALUES (?, ?, ?)
+            VALUES ($1, $2, $3)
             "#,
         )
         .bind(code)
@@ -246,7 +246,7 @@ impl InviteCodeManager {
             r#"
             UPDATE invite_code
             SET disabled = true
-            WHERE code = ?
+            WHERE code = $1
             "#,
         )
         .bind(code)
@@ -279,14 +279,14 @@ impl InviteCodeManager {
         let mut tx = self.db.begin().await?;
 
         for code in codes {
-            sqlx::query("UPDATE invite_code SET disabled = true WHERE code = ?")
+            sqlx::query("UPDATE invite_code SET disabled = true WHERE code = $1")
                 .bind(code)
                 .execute(&mut *tx)
                 .await?;
         }
 
         for did in accounts {
-            sqlx::query("UPDATE invite_code SET disabled = true WHERE for_account = ?")
+            sqlx::query("UPDATE invite_code SET disabled = true WHERE for_account = $1")
                 .bind(did)
                 .execute(&mut *tx)
                 .await?;
@@ -302,7 +302,7 @@ impl InviteCodeManager {
             r#"
             SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account
             FROM invite_code
-            WHERE code = ?
+            WHERE code = $1
             "#,
         )
         .bind(code)
@@ -344,7 +344,7 @@ impl InviteCodeManager {
         // First, find the invite code that was used by this account
         let use_row = sqlx::query(
             r#"
-            SELECT code FROM invite_code_use WHERE used_by = ?
+            SELECT code FROM invite_code_use WHERE used_by = $1
             "#,
         )
         .bind(did)
@@ -367,7 +367,7 @@ impl InviteCodeManager {
             r#"
             SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account
             FROM invite_code
-            WHERE created_by = ?
+            WHERE created_by = $1
             ORDER BY created_at DESC
             "#,
         )

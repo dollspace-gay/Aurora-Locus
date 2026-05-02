@@ -125,7 +125,7 @@ impl AdminRoleManager {
         let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO admin_roles (did, role, granted_by, granted_at, notes)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             "#,
         )
@@ -163,10 +163,10 @@ impl AdminRoleManager {
             r#"
             UPDATE admin_roles
             SET revoked = true,
-                revoked_at = ?,
-                revoked_by = ?,
-                notes = COALESCE(?, notes)
-            WHERE did = ? AND NOT revoked
+                revoked_at = $1,
+                revoked_by = $2,
+                notes = COALESCE($3, notes)
+            WHERE did = $4 AND NOT revoked
             "#,
         )
         .bind(now.to_rfc3339())
@@ -192,7 +192,7 @@ impl AdminRoleManager {
             r#"
             SELECT id, did, role, granted_by, granted_at, revoked, revoked_at, revoked_by, notes
             FROM admin_roles
-            WHERE did = ? AND NOT revoked
+            WHERE did = $1 AND NOT revoked
             ORDER BY granted_at DESC
             LIMIT 1
             "#,
@@ -297,7 +297,7 @@ impl AdminRoleManager {
         sqlx::query(
             r#"
             INSERT INTO admin_audit_log (admin_did, action, subject_did, details, timestamp, ip_address)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(admin_did)

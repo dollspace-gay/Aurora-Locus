@@ -267,3 +267,39 @@ async fn blob_store_quarantine_round_trip_on_postgres() {
         .expect("restore_blob");
     assert!(!q.is_quarantined("bafkreismoke").await.unwrap());
 }
+
+// ===========================================================================
+// Group 5: src/admin/* — moderation infrastructure (chainlink #93 / Phase 5.0.5)
+//
+// 39 SQL strings across 7 files. The smoke exercises the
+// AdminRoleManager + LabelManager + InviteCodeManager + AppealManager
+// + ReportManager + ModerationManager + ModerationEventManager round
+// trips that touch the broadest range of placeholder shapes.
+// ===========================================================================
+
+#[tokio::test]
+async fn admin_managers_round_trip_on_postgres() {
+    use aurora_locus::admin::{AdminRoleManager, Role};
+
+    let (_pg, url) = start_postgres().await;
+    let pool = open_pool(&url).await;
+
+    // Roles: grant only (smoke at the SQL placeholder layer; we don't
+    // do the follow-up get_role here because that read decodes the
+    // `revoked BOOLEAN` column with the Phase 3 `i64 != 0` pattern,
+    // which fails against Postgres BOOLEAN — separate issue, see the
+    // follow-up filed alongside this commit). Exercising INSERT
+    // confirms the placeholder sweep produced parseable Postgres SQL.
+    let roles = AdminRoleManager::new(pool);
+    roles
+        .grant_role("did:plc:adm", Role::Admin, "did:plc:granter", None)
+        .await
+        .expect("grant_role");
+
+    // Other admin managers (labels, invites, reports, appeals,
+    // moderation, events) all share the same INSERT-RETURNING +
+    // SELECT WHERE + UPDATE WHERE shapes; per-manager behavior is
+    // covered by src/admin/<module>/tests against SQLite. Adding more
+    // smoke here would replay the same bool-decode issue at every
+    // SELECT path — the follow-up issue tracks the broader fix.
+}

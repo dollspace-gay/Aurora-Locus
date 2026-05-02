@@ -140,7 +140,7 @@ impl ReportManager {
         let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO report (subject_did, subject_uri, subject_cid, reason_type, reason, reported_by, reported_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'open')
             RETURNING id
             "#,
         )
@@ -183,11 +183,11 @@ impl ReportManager {
         let result = sqlx::query(
             r#"
             UPDATE report
-            SET status = ?,
-                reviewed_by = ?,
-                reviewed_at = ?,
-                resolution = ?
-            WHERE id = ?
+            SET status = $1,
+                reviewed_by = $2,
+                reviewed_at = $3,
+                resolution = $4
+            WHERE id = $5
             "#,
         )
         .bind(status.as_str())
@@ -215,7 +215,7 @@ impl ReportManager {
             SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason,
                    reported_by, reported_at, status, reviewed_by, reviewed_at, resolution
             FROM report
-            WHERE id = ?
+            WHERE id = $1
             "#,
         )
         .bind(report_id)
@@ -241,9 +241,9 @@ impl ReportManager {
                 SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason,
                        reported_by, reported_at, status, reviewed_by, reviewed_at, resolution
                 FROM report
-                WHERE status = ?
+                WHERE status = $1
                 ORDER BY reported_at DESC
-                LIMIT ?
+                LIMIT $2
                 "#,
             )
             .bind(status.as_str())
@@ -255,7 +255,7 @@ impl ReportManager {
                        reported_by, reported_at, status, reviewed_by, reviewed_at, resolution
                 FROM report
                 ORDER BY reported_at DESC
-                LIMIT ?
+                LIMIT $1
                 "#,
             )
             .bind(limit.unwrap_or(100))
