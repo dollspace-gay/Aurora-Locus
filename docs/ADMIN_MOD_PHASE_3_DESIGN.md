@@ -241,6 +241,18 @@ should reuse the shared vocabulary where it fits.
 
 ## 5. Per-namespace API surface
 
+**Module organization convention** (clarified during 3.3 work,
+chainlink #100). Each Phase 3 sub-phase that adds handlers does so
+in a dedicated `src/api/aurora_<tier>.rs` module rather than
+extending `src/api/admin.rs` (which is already 7500+ lines from
+Phases 1–2). Phase 3.3 established the pattern with
+`src/api/aurora_moderator.rs`; sub-phases 3.4, 3.5, 3.7, 3.8, 3.9
+follow the same shape (one module per `tools.aurora.*` namespace).
+Route registration still lives in `admin.rs::routes()` for
+visibility — the per-namespace `// ---- tools.aurora.<tier>.*`
+section markers under that function locate the routes for each
+sub-phase.
+
 ### 5.1 `tools.aurora.describeCapabilities` — top-level probe
 
 **Type:** Query
@@ -310,13 +322,21 @@ namespace check. Listed by sub-phase grouping.
   Option<String> }`
 - Rich context: handle resolution for created_by + subject DIDs.
 
-**`querySubjects`** (Query)
+**`querySubjects`** (Query — implemented as `queryStatuses` in 3.3)
 - Input: pagination + filters `{ subject_type: Option<SubjectType>,
   has_takedown: Option<bool>, has_open_appeal: Option<bool>,
   modified_after: Option<DateTime> }`
 - Output: `PaginatedResponse<SubjectStatusSummary>` where each
   summary embeds the event counts that the UI's queue view needs
   without per-row queries.
+- **Filter vocabulary is forward-looking**: `subject_type` accepts
+  `Repo`, `Record`, `Blob` for wire-format stability, but
+  `Record | Blob` currently short-circuits to an empty page because
+  `subject_status` only tracks repo-level state today. Per-record
+  and per-blob status tracking lands with sub-phase 3.7's
+  aggregations work; the filter shape stays unchanged when that
+  infrastructure arrives, so consumers written against 3.3 keep
+  working without a wire-format break.
 
 #### Appeals reads (sub-phase 3.4, #101)
 
