@@ -30,6 +30,10 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.ops.listAccounts",
             get(ops_list_accounts),
         )
+        .route(
+            "/xrpc/tools.aurora.ops.getInstanceMetrics",
+            get(ops_get_instance_metrics),
+        )
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
         .route("/xrpc/com.atproto.admin.listAccounts", get(get_users)) // Alias for frontend compatibility
         .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
@@ -2284,6 +2288,192 @@ async fn ops_list_accounts(
     Ok(Json(OpsListAccountsResponse {
         accounts,
         cursor: next_cursor,
+    }))
+}
+
+// ---- tools.aurora.ops.getInstanceMetrics (chainlink #84 / Phase 2.3.8) ----
+
+/// Aggregated operator-flavored metrics for the instance.
+///
+/// Fields that aren't populated from existing instrumentation are omitted
+/// rather than zero-filled, so absence is meaningful (e.g. no relay client
+/// configured → federation_health.relay_connected is false, but the field
+/// itself is always present; cpu_seconds_total may be None on platforms
+/// where prometheus doesn't surface process-level counters).
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpsInstanceMetrics {
+    system_health: OpsSystemHealth,
+    resource_usage: OpsResourceUsage,
+    account_growth: OpsAccountGrowth,
+    federation_health: OpsFederationHealth,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpsSystemHealth {
+    /// "healthy" if a SELECT 1 against the account DB succeeds.
+    status: &'static str,
+    version: String,
+    uptime_seconds: f64,
+    active_http_requests: i64,
+    active_sessions: i64,
+    active_background_jobs: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpsResourceUsage {
+    /// Process resident memory in bytes (None when prometheus collector
+    /// hasn't surfaced this counter — uncommon).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_resident_bytes: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_seconds_total: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_fds: Option<i64>,
+    db_pool_size: u32,
+    db_pool_idle_connections: u32,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpsAccountGrowth {
+    signups_last_24h: i64,
+    signups_last_7d: i64,
+    signups_last_30d: i64,
+    total_accounts: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpsFederationHealth {
+    federation_enabled: bool,
+    relay_connected: bool,
+    /// Known peer count from the federation registry; 0 when federation
+    /// is disabled or the registry is empty.
+    known_instances: i64,
+}
+
+/// Operator-facing aggregate metrics endpoint.
+///
+/// Aggregates from sources Aurora-Locus already tracks (metrics module,
+/// prometheus gauges, db pool stats, simple SQL counts). No new
+/// instrumentation is added here — fields that aren't tracked end up as
+/// `None` (omitted) rather than zero-filled.
+async fn ops_get_instance_metrics(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> Result<Json<OpsInstanceMetrics>, (StatusCode, String)> {
+    use crate::metrics;
+
+    // ---- System health ----
+    let db_healthy = sqlx::query("SELECT 1")
+        .fetch_one(&ctx.account_db)
+        .await
+        .is_ok();
+    let system_health = OpsSystemHealth {
+        status: if db_healthy { "healthy" } else { "unhealthy" },
+        version: ctx.config.service.version.clone(),
+        uptime_seconds: metrics::UPTIME_SECONDS.get(),
+        active_http_requests: metrics::HTTP_REQUESTS_ACTIVE.get(),
+        active_sessions: metrics::SESSIONS_ACTIVE.get(),
+        active_background_jobs: metrics::BACKGROUND_JOBS_ACTIVE.get(),
+    };
+
+    // ---- Resource usage (prometheus process metrics) ----
+    let metric_families = prometheus::gather();
+    let mut memory_resident_bytes = None;
+    let mut cpu_seconds_total = None;
+    let mut open_fds = None;
+    for mf in &metric_families {
+        match mf.name() {
+            "process_resident_memory_bytes" => {
+                if let Some(m) = mf.get_metric().first() {
+                    memory_resident_bytes = Some(m.get_gauge().value());
+                }
+            }
+            "process_cpu_seconds_total" => {
+                if let Some(m) = mf.get_metric().first() {
+                    cpu_seconds_total = Some(m.get_counter().value());
+                }
+            }
+            "process_open_fds" => {
+                if let Some(m) = mf.get_metric().first() {
+                    open_fds = Some(m.get_gauge().value() as i64);
+                }
+            }
+            _ => {}
+        }
+    }
+    let resource_usage = OpsResourceUsage {
+        memory_resident_bytes,
+        cpu_seconds_total,
+        open_fds,
+        db_pool_size: ctx.account_db.size(),
+        db_pool_idle_connections: ctx.account_db.num_idle() as u32,
+    };
+
+    // ---- Account growth (windowed counts) ----
+    let now = chrono::Utc::now();
+    let cutoff_24h = (now - chrono::Duration::hours(24)).to_rfc3339();
+    let cutoff_7d = (now - chrono::Duration::days(7)).to_rfc3339();
+    let cutoff_30d = (now - chrono::Duration::days(30)).to_rfc3339();
+
+    let signups_last_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM actor WHERE created_at > ?",
+    )
+    .bind(&cutoff_24h)
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(0);
+    let signups_last_7d: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM actor WHERE created_at > ?",
+    )
+    .bind(&cutoff_7d)
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(0);
+    let signups_last_30d: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM actor WHERE created_at > ?",
+    )
+    .bind(&cutoff_30d)
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(0);
+    let total_accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actor")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap_or(0);
+
+    let account_growth = OpsAccountGrowth {
+        signups_last_24h,
+        signups_last_7d,
+        signups_last_30d,
+        total_accounts,
+    };
+
+    // ---- Federation health ----
+    // Known instances come from the in-memory pds_discovery registry
+    // (not a SQL table). 0 when federation is disabled or discovery is
+    // not configured.
+    let known_instances = if let Some(ref discovery) = ctx.pds_discovery {
+        discovery.get_known_instances().await.len() as i64
+    } else {
+        0
+    };
+
+    let federation_health = OpsFederationHealth {
+        federation_enabled: ctx.config.federation.enabled,
+        relay_connected: ctx.relay_client.is_some(),
+        known_instances,
+    };
+
+    Ok(Json(OpsInstanceMetrics {
+        system_health,
+        resource_usage,
+        account_growth,
+        federation_health,
     }))
 }
 
@@ -5679,6 +5869,90 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("DID"));
+    }
+
+    // ---- tools.aurora.ops.getInstanceMetrics (chainlink #84 / Phase 2.3.8) ----
+
+    #[tokio::test]
+    async fn test_ops_get_instance_metrics_empty_instance() {
+        let ctx = create_test_context().await;
+        let resp = ops_get_instance_metrics(State(ctx), admin_test_auth())
+            .await
+            .unwrap()
+            .0;
+
+        // System health: db is alive, version matches config.
+        assert_eq!(resp.system_health.status, "healthy");
+        assert_eq!(resp.system_health.version, "0.1.0-test");
+
+        // Account growth: empty DB = zero counts everywhere.
+        assert_eq!(resp.account_growth.total_accounts, 0);
+        assert_eq!(resp.account_growth.signups_last_24h, 0);
+        assert_eq!(resp.account_growth.signups_last_7d, 0);
+        assert_eq!(resp.account_growth.signups_last_30d, 0);
+
+        // Federation: disabled in test config.
+        assert!(!resp.federation_health.federation_enabled);
+        assert!(!resp.federation_health.relay_connected);
+        assert_eq!(resp.federation_health.known_instances, 0);
+    }
+
+    #[tokio::test]
+    async fn test_ops_get_instance_metrics_account_growth_window() {
+        let ctx = create_test_context().await;
+        // Three accounts, one in each of 24h / 7d-not-24h / older windows.
+        seed_test_account(&ctx, "did:plc:fresh", "fresh.test", None).await;
+        seed_test_account(&ctx, "did:plc:weekish", "weekish.test", None).await;
+        seed_test_account(&ctx, "did:plc:ancient", "ancient.test", None).await;
+        // Move "weekish" to ~3 days ago (in 7d window, not 24h).
+        sqlx::query("UPDATE actor SET created_at = ? WHERE did = ?")
+            .bind(
+                (chrono::Utc::now() - chrono::Duration::days(3))
+                    .to_rfc3339(),
+            )
+            .bind("did:plc:weekish")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        // Move "ancient" to ~60 days ago (outside all windows).
+        sqlx::query("UPDATE actor SET created_at = ? WHERE did = ?")
+            .bind(
+                (chrono::Utc::now() - chrono::Duration::days(60))
+                    .to_rfc3339(),
+            )
+            .bind("did:plc:ancient")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+
+        let resp = ops_get_instance_metrics(State(ctx), admin_test_auth())
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(resp.account_growth.total_accounts, 3);
+        assert_eq!(resp.account_growth.signups_last_24h, 1, "fresh");
+        assert_eq!(
+            resp.account_growth.signups_last_7d, 2,
+            "fresh + weekish"
+        );
+        assert_eq!(
+            resp.account_growth.signups_last_30d, 2,
+            "ancient is outside 30d"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ops_get_instance_metrics_resource_usage_db_pool() {
+        let ctx = create_test_context().await;
+        let resp = ops_get_instance_metrics(State(ctx), admin_test_auth())
+            .await
+            .unwrap()
+            .0;
+
+        // db_pool_size > 0 because at least one connection is open after the
+        // SELECT 1 and the COUNT(*) queries above. Same for idle.
+        assert!(resp.resource_usage.db_pool_size >= 1);
     }
 
     // ---- Phase 1.7: account/did deprecation-alias rollout ---------------
