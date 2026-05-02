@@ -86,7 +86,7 @@ impl DidCache {
             r#"
             SELECT did, doc, updated_at, cached_at
             FROM did_doc
-            WHERE did = ?1
+            WHERE did = $1
             "#,
         )
         .bind(did)
@@ -131,7 +131,7 @@ impl DidCache {
         sqlx::query(
             r#"
             INSERT INTO did_doc (did, doc, updated_at, cached_at)
-            VALUES (?1, ?2, ?3, ?4)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT(did) DO UPDATE SET
                 doc = excluded.doc,
                 updated_at = excluded.updated_at,
@@ -151,7 +151,7 @@ impl DidCache {
 
     /// Delete DID document from cache
     pub async fn delete_did_doc(&self, did: &str) -> PdsResult<()> {
-        sqlx::query("DELETE FROM did_doc WHERE did = ?1")
+        sqlx::query("DELETE FROM did_doc WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -175,7 +175,7 @@ impl DidCache {
             r#"
             SELECT handle, did, declared_at, updated_at
             FROM did_handle
-            WHERE handle = ?1
+            WHERE handle = $1
             "#,
         )
         .bind(&normalized)
@@ -223,7 +223,7 @@ impl DidCache {
         sqlx::query(
             r#"
             INSERT INTO did_handle (handle, did, updated_at)
-            VALUES (?1, ?2, ?3)
+            VALUES ($1, $2, $3)
             ON CONFLICT(handle) DO UPDATE SET
                 did = excluded.did,
                 updated_at = excluded.updated_at
@@ -243,7 +243,7 @@ impl DidCache {
     pub async fn delete_handle(&self, handle: &str) -> PdsResult<()> {
         let normalized = handle.to_lowercase();
 
-        sqlx::query("DELETE FROM did_handle WHERE handle = ?1")
+        sqlx::query("DELETE FROM did_handle WHERE handle = $1")
             .bind(&normalized)
             .execute(&self.db)
             .await
@@ -258,7 +258,7 @@ impl DidCache {
             r#"
             SELECT handle
             FROM did_handle
-            WHERE did = ?1
+            WHERE did = $1
             ORDER BY updated_at DESC
             LIMIT 1
             "#,
@@ -284,14 +284,14 @@ impl DidCache {
         let handle_cutoff = (Utc::now() - self.handle_max_ttl).to_rfc3339();
 
         // Delete DID documents past max_ttl
-        let did_result = sqlx::query("DELETE FROM did_doc WHERE cached_at < ?1")
+        let did_result = sqlx::query("DELETE FROM did_doc WHERE cached_at < $1")
             .bind(&did_doc_cutoff)
             .execute(&self.db)
             .await
             .map_err(PdsError::Database)?;
 
         // Delete handles past max_ttl
-        let handle_result = sqlx::query("DELETE FROM did_handle WHERE updated_at < ?1")
+        let handle_result = sqlx::query("DELETE FROM did_handle WHERE updated_at < $1")
             .bind(&handle_cutoff)
             .execute(&self.db)
             .await
