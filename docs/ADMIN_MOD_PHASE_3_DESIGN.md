@@ -353,6 +353,24 @@ namespace check. Listed by sub-phase grouping.
 - Output: `AppealDetail` with the same fields as `AppealView` plus
   full event history (timeline of the appeal's lifecycle).
 
+**Appeal `subject` derivation** (clarified during 3.4 work,
+chainlink #101). The `appeal` table references one of three backing
+records (`moderation_id`, `report_id`, `quarantine_id`) plus an
+`appellant_did`. Subject is derived by priority:
+- `moderation_id` present → `Subject::Repo{did}` from the
+  account_moderation row's `did` column.
+- `report_id` present → `Subject::from_columns(...)` over the
+  report's `subject_did/uri/cid`, producing whichever of
+  `Repo|Record|Blob` the original report named.
+- `quarantine_id` present → falls back to `Subject::Repo{appellant_did}`
+  because `blob_quarantine` carries `cid` only with no DID column;
+  the action summary still surfaces the quarantined cid for
+  context.
+- None of the above → `Subject::Repo{appellant_did}` as the safe
+  default. Forward-looking: when sub-phase 3.5's `emitEvent` lands,
+  appeals can grow a richer subject linkage without a wire-format
+  break.
+
 #### Aggregations (sub-phase 3.7, #104)
 
 **`getModerationMetrics`** (Query)
