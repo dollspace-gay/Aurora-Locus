@@ -95,8 +95,10 @@ pub fn routes() -> Router<AppContext> {
             post(disable_account_invites),
         )
         // Role management
-        .route("/xrpc/com.atproto.admin.grantRole", post(grant_role))
-        .route("/xrpc/com.atproto.admin.revokeRole", post(revoke_role))
+        // grantRole and revokeRole relocated to tools.aurora.superadmin.*
+        // in Phase 3.6 (chainlink #103). listRoles stays at the
+        // moderation tier — moderators may legitimately need to see
+        // who has what role without being SuperAdmin themselves.
         .route("/xrpc/com.atproto.admin.listRoles", get(list_roles))
         // Account management
         .route(
@@ -289,6 +291,21 @@ pub fn routes() -> Router<AppContext> {
         .route(
             "/xrpc/tools.aurora.ops.triggerPdsDiscovery",
             post(trigger_pds_discovery),
+        )
+        // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
+        //
+        // Role management relocated from com.atproto.admin.* per design
+        // doc §5.4. SuperAdmin scope check is enforced at handler level
+        // (auth.role.can_act_as(Role::SuperAdmin)) — the namespace
+        // alone doesn't gate this; the handler does. Per pre-deployment
+        // framing, no deprecation aliases — clean wire-break.
+        .route(
+            "/xrpc/tools.aurora.superadmin.grantRole",
+            post(grant_role),
+        )
+        .route(
+            "/xrpc/tools.aurora.superadmin.revokeRole",
+            post(revoke_role),
         )
 }
 
@@ -625,6 +642,20 @@ async fn grant_role(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     use crate::admin::roles::Role;
 
+    // SuperAdmin only — relocated to tools.aurora.superadmin.* in
+    // Phase 3.6 (chainlink #103). Per design doc §5.4, role
+    // management is structurally a SuperAdmin operation; the
+    // namespace makes that boundary visible, this guard enforces it.
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "grantRole requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+
     // Parse role
     let role: Role = req
         .role
@@ -671,6 +702,20 @@ async fn revoke_role(
     auth: AdminAuthContext,
     Json(req): Json<RevokeRoleRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::admin::roles::Role;
+
+    // SuperAdmin only — same rationale as grant_role above
+    // (chainlink #103 / Phase 3.6).
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "revokeRole requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+
     // Revoke role (revoke_role doesn't take a specific role, revokes the active role)
     ctx.admin_role_manager
         .revoke_role(&req.did, &auth.did, req.reason.clone())
@@ -2144,7 +2189,12 @@ fn aurora_capability_families() -> serde_json::Value {
         ],
         "tools.aurora.moderator": [],
         "tools.aurora.admin": [],
-        "tools.aurora.superadmin": []
+        // Phase 3.6 (chainlink #103) — role management relocated from
+        // com.atproto.admin.{grantRole,revokeRole}.
+        "tools.aurora.superadmin": [
+            "grantRole",
+            "revokeRole"
+        ]
     })
 }
 
@@ -5287,6 +5337,22 @@ mod tests {
         }
     }
 
+    /// SuperAdmin auth fixture for tests of tools.aurora.superadmin.*
+    /// endpoints (Phase 3.6 / chainlink #103). Same shape as
+    /// admin_test_auth, role bumped to SuperAdmin so the handler-level
+    /// SuperAdmin gate passes.
+    fn superadmin_test_auth() -> AdminAuthContext {
+        AdminAuthContext {
+            did: "did:plc:superadmin".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:superadmin".to_string(),
+                session_id: "test_session_superadmin".to_string(),
+                is_app_password: false,
+            },
+            role: Role::SuperAdmin,
+        }
+    }
+
     async fn read_response_body(resp: axum::response::Response) -> (StatusCode, String) {
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
@@ -6039,6 +6105,85 @@ mod tests {
                 expected
             );
         }
+    }
+
+    // ---- tools.aurora.superadmin.{grant,revoke}Role (chainlink #103 / Phase 3.6) ----
+
+    #[tokio::test]
+    async fn test_grant_role_rejects_non_superadmin() {
+        // Admin is not enough — role management is SuperAdmin-only post
+        // Phase 3.6. Verifies the handler-level gate fires before any
+        // role mutation reaches the database.
+        let ctx = create_test_context().await;
+        let req = GrantRoleRequest {
+            did: "did:plc:nominee".to_string(),
+            role: "moderator".to_string(),
+        };
+        let (status, body) = grant_role(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("Admin must not be allowed to grant roles");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body.contains("SuperAdmin"),
+            "error message should reference SuperAdmin requirement, got: {}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revoke_role_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let req = RevokeRoleRequest {
+            did: "did:plc:victim".to_string(),
+            reason: None,
+        };
+        let (status, body) = revoke_role(State(ctx), admin_test_auth(), Json(req))
+            .await
+            .expect_err("Admin must not be allowed to revoke roles");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("SuperAdmin"));
+    }
+
+    #[tokio::test]
+    async fn test_grant_role_allowed_for_superadmin() {
+        // Happy path: SuperAdmin grants a Moderator role; succeeds.
+        let ctx = create_test_context().await;
+        let req = GrantRoleRequest {
+            did: "did:plc:newmod".to_string(),
+            role: "moderator".to_string(),
+        };
+        let resp = grant_role(State(ctx.clone()), superadmin_test_auth(), Json(req))
+            .await
+            .expect("SuperAdmin should be allowed to grant roles");
+        let json = resp.0;
+        assert_eq!(
+            json.get("did").and_then(|v| v.as_str()),
+            Some("did:plc:newmod")
+        );
+        assert_eq!(
+            json.get("role").and_then(|v| v.as_str()),
+            Some("moderator")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_describe_capabilities_advertises_superadmin_endpoints() {
+        // Phase 3.6 adds grantRole + revokeRole to the superadmin
+        // family. Catches accidental removal from the static list.
+        let ctx = create_test_context().await;
+        let resp = describe_capabilities(State(ctx), admin_test_auth())
+            .await
+            .unwrap()
+            .0;
+        let superadmin = resp
+            .families
+            .get("tools.aurora.superadmin")
+            .and_then(|v| v.as_array())
+            .expect("superadmin family present");
+        let names: Vec<&str> =
+            superadmin.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(names.contains(&"grantRole"), "grantRole missing");
+        assert!(names.contains(&"revokeRole"), "revokeRole missing");
     }
 
     #[tokio::test]
