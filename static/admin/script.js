@@ -94,7 +94,7 @@ function navigateTo(page) {
 // Dashboard
 function loadDashboardData() {
     // Load stats
-    fetch(`${API_BASE}/com.atproto.admin.getStats`, {
+    fetch(`${API_BASE}/tools.aurora.ops.getStats`, {
         headers: { 'Authorization': `Bearer ${adminToken}` }
     })
     .then(res => {
