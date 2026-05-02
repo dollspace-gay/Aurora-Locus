@@ -20,6 +20,10 @@ pub fn routes() -> Router<AppContext> {
     Router::new()
         // Admin stats and data
         .route("/xrpc/com.atproto.admin.getStats", get(get_stats))
+        // getStats — operator namespace (chainlink #84). Other entries
+        // in this block (getUsers/listAccounts/getAccount/...) are
+        // moderation-flavored and stay at com.atproto.admin.*.
+        .route("/xrpc/tools.aurora.ops.getStats", get(get_stats))
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
         .route("/xrpc/com.atproto.admin.listAccounts", get(get_users)) // Alias for frontend compatibility
         .route("/xrpc/com.atproto.admin.getAccount", get(get_account))
@@ -166,6 +170,39 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/com.atproto.admin.getSystemMetrics",
             get(get_system_metrics),
         )
+        // Health, metrics, validation — operator namespace (chainlink #84).
+        .route(
+            "/xrpc/tools.aurora.ops.getValidationFailures",
+            get(get_validation_failures),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.getSystemHealth",
+            get(get_system_health),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.getDatabaseStatus",
+            get(get_database_status),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.getResourceUsage",
+            get(get_resource_usage),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.listBackgroundJobs",
+            get(list_background_jobs),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.runHealthChecks",
+            get(run_health_checks),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.getVersionInfo",
+            get(get_version_info),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.getSystemMetrics",
+            get(get_system_metrics),
+        )
         // Blob storage management
         .route(
             "/xrpc/com.atproto.admin.getBlobStatistics",
@@ -299,6 +336,16 @@ pub fn routes() -> Router<AppContext> {
         )
         .route(
             "/xrpc/com.atproto.admin.cleanupNonceStores",
+            post(cleanup_nonce_stores),
+        )
+        // Nonce store — operator namespace (chainlink #84). Categorized
+        // under health/metrics rather than federation per Phase 2.3.6.
+        .route(
+            "/xrpc/tools.aurora.ops.getNonceStoreStatus",
+            get(get_nonce_store_status),
+        )
+        .route(
+            "/xrpc/tools.aurora.ops.cleanupNonceStores",
             post(cleanup_nonce_stores),
         )
         // Federation/relay management — operator namespace (chainlink #84).
