@@ -183,6 +183,25 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/com.atproto.admin.getBlobQuotas",
             get(get_blob_quotas),
         )
+        // Blob storage management — operator namespace (chainlink #84).
+        // Legacy com.atproto.admin.* paths above remain functional pending
+        // Phase 2.4 cleanup; both register the same handlers.
+        .route(
+            "/xrpc/tools.aurora.ops.getBlobStatistics",
+            get(get_blob_statistics),
+        )
+        .route("/xrpc/tools.aurora.ops.listBlobs", get(list_blobs))
+        .route("/xrpc/tools.aurora.ops.deleteBlob", post(delete_blob))
+        .route(
+            "/xrpc/tools.aurora.ops.quarantineBlob",
+            post(quarantine_blob),
+        )
+        .route("/xrpc/tools.aurora.ops.restoreBlob", post(restore_blob))
+        .route("/xrpc/tools.aurora.ops.runBlobGC", post(run_blob_gc))
+        .route(
+            "/xrpc/tools.aurora.ops.getBlobQuotas",
+            get(get_blob_quotas),
+        )
         // Sequencer management
         .route(
             "/xrpc/com.atproto.admin.getSequencerStatus",
