@@ -306,3 +306,134 @@ async fn admin_managers_round_trip_on_postgres() {
     // and the bool-read paths (revoked, reversed, neg, disabled, ...)
     // all flow through the same `read_bool` helper now.
 }
+
+// ===========================================================================
+// Group 6: src/account/manager.rs — account lifecycle (chainlink #93 / Phase 5.0.6)
+//
+// 92 placeholder sites + 12 bool-decode sites. Largest single file in
+// the sweep. Smoke exercises create_account → get_account →
+// update_handle → get_account_by_identifier — exercises the most
+// common write+read paths plus a bool-decode read (`invites_disabled`).
+// ===========================================================================
+
+#[tokio::test]
+async fn account_manager_round_trip_on_postgres() {
+    use aurora_locus::account::AccountManager;
+    use aurora_locus::config::*;
+    use aurora_locus::validation::ValidationMode;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    let (_pg, url) = start_postgres().await;
+    let pool = open_pool(&url).await;
+
+    // Build a minimal config — AccountManager only reads service.hostname,
+    // invites.*, and authentication.repo_signing_key fields for the
+    // create + lookup flow we exercise.
+    let config = Arc::new(ServerConfig {
+        service: ServiceConfig {
+            hostname: "localhost".to_string(),
+            port: 2583,
+            service_did: "did:web:localhost".to_string(),
+            version: "0.1.0-test".to_string(),
+            blob_upload_limit: 5_242_880,
+        },
+        storage: StorageConfig {
+            data_directory: PathBuf::from("./data"),
+            account_db: PathBuf::from(":memory:"),
+            sequencer_db: PathBuf::from(":memory:"),
+            did_cache_db: PathBuf::from(":memory:"),
+            actor_store_directory: PathBuf::from("./data/actors"),
+            blobstore: BlobstoreConfig::Disk {
+                location: PathBuf::from("./data/blobs"),
+                tmp_location: PathBuf::from("./data/tmp"),
+            },
+        },
+        database: Default::default(),
+        authentication: AuthConfig {
+            jwt_secret: "test-secret-key-for-account-smoke-32-chars".to_string(),
+            repo_signing_key: "a".repeat(64),
+            plc_rotation_key: "b".repeat(64),
+            admin_dids: vec![],
+            oauth: OAuthConfig {
+                client_id: "http://localhost:3000/client-metadata.json".to_string(),
+                redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
+                pds_url: "http://localhost:3000".to_string(),
+            },
+            jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
+            oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
+            oauth_features: Default::default(),
+        },
+        identity: IdentityConfig {
+            did_plc_url: "https://plc.directory".to_string(),
+            service_handle_domains: vec![".localhost".to_string()],
+            did_cache_stale_ttl: 3600,
+            did_cache_max_ttl: 86400,
+        },
+        email: None,
+        invites: InviteConfig {
+            required: false,
+            interval: 604800,
+            epoch: "2024-01-01T00:00:00Z".to_string(),
+        },
+        rate_limit: RateLimitConfig {
+            enabled: false,
+            global_requests_per_minute: 3000,
+            redis_url: None,
+            use_redis: false,
+        },
+        logging: LoggingConfig {
+            level: "info".to_string(),
+        },
+        federation: FederationConfig {
+            enabled: false,
+            relay_urls: vec![],
+            appview_url: None,
+            firehose_enabled: false,
+            crawl_enabled: false,
+            public_url: None,
+            auto_stream_events: false,
+        },
+        validation_mode: ValidationMode::Optimistic,
+    });
+
+    let mgr = AccountManager::new(pool, config);
+
+    // Create + look up by DID + look up by handle (exercises 3
+    // SELECT shapes plus 1 INSERT-with-transaction). The retrieved
+    // account's `invites_disabled` flow through `read_bool`, so this
+    // is also a regression test for chainlink #96 on Postgres.
+    let acc = mgr
+        .create_account(
+            "smoke.localhost".to_string(),
+            Some("smoke@example.com".to_string()),
+            "supersecret-test-pw".to_string(),
+            None,
+        )
+        .await
+        .expect("create_account");
+    assert_eq!(acc.handle.as_deref(), Some("smoke.localhost"));
+    assert_eq!(acc.email.as_deref(), Some("smoke@example.com"));
+    // invites_disabled defaults to false on a fresh account; this
+    // verifies the read_bool helper's BOOLEAN decode path.
+    assert_eq!(acc.invites_disabled, Some(false));
+
+    let by_did = mgr.get_account(&acc.did).await.expect("get_account");
+    assert_eq!(by_did.handle.as_deref(), Some("smoke.localhost"));
+
+    let by_handle = mgr
+        .get_account_by_identifier("smoke.localhost")
+        .await
+        .expect("get_account_by_identifier handle");
+    assert_eq!(by_handle.did, acc.did);
+
+    // Update handle and verify the new lookup works.
+    mgr.update_handle(&acc.did, "renamed.localhost")
+        .await
+        .expect("update_handle");
+    let renamed = mgr
+        .get_account_by_identifier("renamed.localhost")
+        .await
+        .expect("get_account_by_identifier renamed");
+    assert_eq!(renamed.did, acc.did);
+}

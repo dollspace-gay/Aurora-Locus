@@ -97,7 +97,7 @@ impl AccountManager {
         // Insert into actor table (public identity)
         sqlx::query(
             "INSERT INTO actor (did, handle, created_at, takedown_ref, deactivated_at, delete_after)
-             VALUES (?1, ?2, ?3, NULL, NULL, NULL)"
+             VALUES ($1, $2, $3, NULL, NULL, NULL)"
         )
         .bind(&did)
         .bind(&handle)
@@ -109,7 +109,7 @@ impl AccountManager {
         // Insert into account table (private auth)
         sqlx::query(
             "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled)
-             VALUES (?1, ?2, ?3, NULL, FALSE)",
+             VALUES ($1, $2, $3, NULL, FALSE)",
         )
         .bind(&did)
         .bind(&email)
@@ -121,7 +121,7 @@ impl AccountManager {
         // Insert into plc_keys table (cryptographic material)
         sqlx::query(
             "INSERT INTO plc_keys (did, rotation_key, rotation_key_public, last_operation_cid)
-             VALUES (?1, ?2, ?3, ?4)",
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(&did)
         .bind(&plc_key)
@@ -238,7 +238,7 @@ impl AccountManager {
         // Insert session
         sqlx::query(
             "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+             VALUES ($1, $2, $3, $4, $5, $6, $7)"
         )
         .bind(&session_id)
         .bind(did)
@@ -257,7 +257,7 @@ impl AccountManager {
 
         sqlx::query(
             "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used, next_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)",
         )
         .bind(&refresh_token_id)
         .bind(did)
@@ -287,7 +287,7 @@ impl AccountManager {
     ) -> PdsResult<crate::account::ValidatedSession> {
         // Find session by access token
         let row = sqlx::query(
-            "SELECT id, did, expires_at, app_password_name FROM session WHERE access_token = ?1",
+            "SELECT id, did, expires_at, app_password_name FROM session WHERE access_token = $1",
         )
         .bind(token)
         .fetch_optional(&self.db)
@@ -314,7 +314,7 @@ impl AccountManager {
 
     /// Delete a session (logout)
     pub async fn delete_session(&self, session_id: &str) -> PdsResult<()> {
-        sqlx::query("DELETE FROM session WHERE id = ?1")
+        sqlx::query("DELETE FROM session WHERE id = $1")
             .bind(session_id)
             .execute(&self.db)
             .await
@@ -333,7 +333,7 @@ impl AccountManager {
 
         // Find and validate refresh token
         let row = sqlx::query(
-            "SELECT id, did, token, created_at, expires_at, used, used_at, next_id FROM refresh_token WHERE token = ?1"
+            "SELECT id, did, token, created_at, expires_at, used, used_at, next_id FROM refresh_token WHERE token = $1"
         )
         .bind(refresh_token)
         .fetch_optional(&self.db)
@@ -344,7 +344,7 @@ impl AccountManager {
         let _token_id: String = row.get("id");
         let did: String = row.get("did");
         let expires_at: DateTime<Utc> = parse_timestamp(&row.get::<String, _>("expires_at"))?;
-        let used: bool = row.get::<i64, _>("used") != 0;
+        let used: bool = crate::db::read_bool(&row, "used")?;
         let next_id: Option<String> = row.get("next_id");
 
         // Check expiration
@@ -362,8 +362,8 @@ impl AccountManager {
                 let next_row = sqlx::query(
                     "SELECT s.id, s.did, s.access_token, s.refresh_token, s.created_at, s.expires_at, s.app_password_name
                      FROM refresh_token rt
-                     JOIN session s ON s.refresh_token = (SELECT token FROM refresh_token WHERE id = ?1)
-                     WHERE rt.id = ?1"
+                     JOIN session s ON s.refresh_token = (SELECT token FROM refresh_token WHERE id = $1)
+                     WHERE rt.id = $1"
                 )
                 .bind(&next_token_id)
                 .fetch_optional(&self.db)
@@ -395,7 +395,7 @@ impl AccountManager {
         // Insert new refresh token
         sqlx::query(
             "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used, next_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)",
         )
         .bind(&new_token_id)
         .bind(&did)
@@ -410,7 +410,7 @@ impl AccountManager {
         // Update old refresh token: mark as used, set next_id, and shorten expiration to 2 hours
         let grace_period_expires = now + Duration::hours(2);
         sqlx::query(
-            "UPDATE refresh_token SET used = TRUE, used_at = ?1, next_id = ?2, expires_at = ?3 WHERE id = ?4"
+            "UPDATE refresh_token SET used = TRUE, used_at = $1, next_id = $2, expires_at = $3 WHERE id = $4"
         )
         .bind(now.to_rfc3339())
         .bind(&new_token_id)
@@ -427,7 +427,7 @@ impl AccountManager {
         // Insert new session
         sqlx::query(
             "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)"
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)"
         )
         .bind(&new_session_id)
         .bind(&did)
@@ -460,7 +460,7 @@ impl AccountManager {
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              LEFT JOIN account ac ON a.did = ac.did
-             WHERE a.did = ?1",
+             WHERE a.did = $1",
         )
         .bind(did)
         .fetch_optional(&self.db)
@@ -480,7 +480,7 @@ impl AccountManager {
             email: row.get("email"),
             password_hash: row.get("password_hash"),
             email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
-            invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
+            invites_disabled: Some(crate::db::read_bool(&row, "invites_disabled")?),
         })
     }
 
@@ -525,7 +525,7 @@ impl AccountManager {
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              LEFT JOIN account ac ON a.did = ac.did
-             WHERE a.handle = ?1",
+             WHERE a.handle = $1",
         )
         .bind(handle)
         .fetch_optional(&self.db)
@@ -545,7 +545,7 @@ impl AccountManager {
             email: row.get("email"),
             password_hash: row.get("password_hash"),
             email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
-            invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
+            invites_disabled: Some(crate::db::read_bool(&row, "invites_disabled")?),
         })
     }
 
@@ -559,7 +559,7 @@ impl AccountManager {
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              INNER JOIN account ac ON a.did = ac.did
-             WHERE ac.email = ?1",
+             WHERE ac.email = $1",
         )
         .bind(email)
         .fetch_optional(&self.db)
@@ -579,13 +579,13 @@ impl AccountManager {
             email: row.get("email"),
             password_hash: row.get("password_hash"),
             email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
-            invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
+            invites_disabled: Some(crate::db::read_bool(&row, "invites_disabled")?),
         })
     }
 
     /// Check if handle exists
     async fn handle_exists(&self, handle: &str) -> PdsResult<bool> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actor WHERE handle = ?1")
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actor WHERE handle = $1")
             .bind(handle)
             .fetch_one(&self.db)
             .await
@@ -622,7 +622,7 @@ impl AccountManager {
         }
 
         // Update handle in actor table (not account table)
-        sqlx::query("UPDATE actor SET handle = ?1 WHERE did = ?2")
+        sqlx::query("UPDATE actor SET handle = $1 WHERE did = $2")
             .bind(new_handle)
             .bind(did)
             .execute(&self.db)
@@ -634,7 +634,7 @@ impl AccountManager {
 
     /// Check if email exists
     async fn email_exists(&self, email: &str) -> PdsResult<bool> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account WHERE email = ?1")
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account WHERE email = $1")
             .bind(email)
             .fetch_one(&self.db)
             .await
@@ -828,7 +828,7 @@ impl AccountManager {
         let now = Utc::now();
 
         // Delete expired access token sessions
-        let sessions_result = sqlx::query("DELETE FROM session WHERE expires_at < ?1")
+        let sessions_result = sqlx::query("DELETE FROM session WHERE expires_at < $1")
             .bind(now.to_rfc3339())
             .execute(&self.db)
             .await
@@ -837,7 +837,7 @@ impl AccountManager {
         let sessions_deleted = sessions_result.rows_affected();
 
         // Delete expired refresh tokens
-        let refresh_result = sqlx::query("DELETE FROM refresh_token WHERE expires_at < ?1")
+        let refresh_result = sqlx::query("DELETE FROM refresh_token WHERE expires_at < $1")
             .bind(now.to_rfc3339())
             .execute(&self.db)
             .await
@@ -870,7 +870,7 @@ impl AccountManager {
         sqlx::query(
             r#"
             INSERT INTO email_token (token, did, purpose, created_at, expires_at, used)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(&token)
@@ -897,7 +897,7 @@ impl AccountManager {
             r#"
             SELECT token, did, purpose, expires_at, used
             FROM email_token
-            WHERE token = ?1 AND purpose = 'confirm_email'
+            WHERE token = $1 AND purpose = 'confirm_email'
             "#,
         )
         .bind(token)
@@ -925,14 +925,14 @@ impl AccountManager {
         }
 
         // Mark token as used
-        sqlx::query("UPDATE email_token SET used = true WHERE token = ?1")
+        sqlx::query("UPDATE email_token SET used = true WHERE token = $1")
             .bind(token)
             .execute(&self.db)
             .await
             .map_err(PdsError::Database)?;
 
         // Mark email as confirmed in account (only update email_confirmed_at)
-        sqlx::query("UPDATE account SET email_confirmed_at = ?1 WHERE did = ?2")
+        sqlx::query("UPDATE account SET email_confirmed_at = $1 WHERE did = $2")
             .bind(now.to_rfc3339())
             .bind(&did)
             .execute(&self.db)
@@ -949,7 +949,7 @@ impl AccountManager {
     /// Generates a new token and can optionally send verification email
     pub async fn request_email_confirmation(&self, did: &str) -> PdsResult<String> {
         // Verify account exists and has email
-        let row = sqlx::query("SELECT email FROM account WHERE did = ?1")
+        let row = sqlx::query("SELECT email FROM account WHERE did = $1")
             .bind(did)
             .fetch_optional(&self.db)
             .await
@@ -993,7 +993,7 @@ impl AccountManager {
         sqlx::query(
             r#"
             INSERT INTO email_token (token, did, purpose, created_at, expires_at, used)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(&token)
@@ -1020,7 +1020,7 @@ impl AccountManager {
             r#"
             SELECT token, did, purpose, expires_at, used
             FROM email_token
-            WHERE token = ?1 AND purpose = 'reset_password'
+            WHERE token = $1 AND purpose = 'reset_password'
             "#,
         )
         .bind(token)
@@ -1050,7 +1050,7 @@ impl AccountManager {
             .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
 
         // Update password in database
-        sqlx::query("UPDATE account SET password_hash = ?1 WHERE did = ?2")
+        sqlx::query("UPDATE account SET password_hash = $1 WHERE did = $2")
             .bind(&password_hash)
             .bind(&did)
             .execute(&self.db)
@@ -1058,21 +1058,21 @@ impl AccountManager {
             .map_err(PdsError::Database)?;
 
         // Mark token as used
-        sqlx::query("UPDATE email_token SET used = true WHERE token = ?1")
+        sqlx::query("UPDATE email_token SET used = true WHERE token = $1")
             .bind(token)
             .execute(&self.db)
             .await
             .map_err(PdsError::Database)?;
 
         // Invalidate all sessions for this account (security best practice)
-        sqlx::query("DELETE FROM session WHERE did = ?1")
+        sqlx::query("DELETE FROM session WHERE did = $1")
             .bind(&did)
             .execute(&self.db)
             .await
             .map_err(PdsError::Database)?;
 
         // Also delete all refresh tokens
-        sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
+        sqlx::query("DELETE FROM refresh_token WHERE did = $1")
             .bind(&did)
             .execute(&self.db)
             .await
@@ -1095,7 +1095,7 @@ impl AccountManager {
         sqlx::query(
             r#"
             INSERT INTO email_token (token, did, purpose, created_at, expires_at, used)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(&token)
@@ -1124,7 +1124,7 @@ impl AccountManager {
             r#"
             SELECT token, did, purpose, expires_at, used
             FROM email_token
-            WHERE token = ?1 AND purpose = 'delete_account'
+            WHERE token = $1 AND purpose = 'delete_account'
             "#,
         )
         .bind(token)
@@ -1165,7 +1165,7 @@ impl AccountManager {
     ///
     /// Called after successful account deletion to prevent token reuse.
     pub async fn mark_delete_token_used(&self, token: &str) -> PdsResult<()> {
-        sqlx::query("UPDATE email_token SET used = true WHERE token = ?1")
+        sqlx::query("UPDATE email_token SET used = true WHERE token = $1")
             .bind(token)
             .execute(&self.db)
             .await
@@ -1186,7 +1186,7 @@ impl AccountManager {
         sqlx::query(
             r#"
             INSERT INTO email_token (token, did, purpose, created_at, expires_at, used)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(&token)
@@ -1213,7 +1213,7 @@ impl AccountManager {
             r#"
             SELECT token, did, purpose, expires_at, used
             FROM email_token
-            WHERE token = ?1 AND purpose = 'update_email'
+            WHERE token = $1 AND purpose = 'update_email'
             "#,
         )
         .bind(token)
@@ -1245,7 +1245,7 @@ impl AccountManager {
         }
 
         // Mark token as used
-        sqlx::query("UPDATE email_token SET used = true WHERE token = ?1")
+        sqlx::query("UPDATE email_token SET used = true WHERE token = $1")
             .bind(token)
             .execute(&self.db)
             .await
@@ -1260,7 +1260,7 @@ impl AccountManager {
     /// Returns an error if the email is already in use by another account.
     pub async fn update_email(&self, did: &str, new_email: &str) -> PdsResult<()> {
         // Check if email is already in use by another account
-        let existing = sqlx::query("SELECT did FROM account WHERE email = ?1 AND did != ?2")
+        let existing = sqlx::query("SELECT did FROM account WHERE email = $1 AND did != $2")
             .bind(new_email)
             .bind(did)
             .fetch_optional(&self.db)
@@ -1274,7 +1274,7 @@ impl AccountManager {
         }
 
         // Update email and clear email confirmation
-        sqlx::query("UPDATE account SET email = ?1, email_confirmed_at = NULL WHERE did = ?2")
+        sqlx::query("UPDATE account SET email = $1, email_confirmed_at = NULL WHERE did = $2")
             .bind(new_email)
             .bind(did)
             .execute(&self.db)
@@ -1301,7 +1301,7 @@ impl AccountManager {
             .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
 
         // Update password in database
-        let result = sqlx::query("UPDATE account SET password_hash = ?1 WHERE did = ?2")
+        let result = sqlx::query("UPDATE account SET password_hash = $1 WHERE did = $2")
             .bind(&password_hash)
             .bind(did)
             .execute(&self.db)
@@ -1313,14 +1313,14 @@ impl AccountManager {
         }
 
         // Invalidate all sessions for this account (security best practice)
-        sqlx::query("DELETE FROM session WHERE did = ?1")
+        sqlx::query("DELETE FROM session WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
             .map_err(PdsError::Database)?;
 
         // Also delete all refresh tokens
-        sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
+        sqlx::query("DELETE FROM refresh_token WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -1343,43 +1343,43 @@ impl AccountManager {
         let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
 
         // Delete from all related tables
-        sqlx::query("DELETE FROM session WHERE did = ?1")
+        sqlx::query("DELETE FROM session WHERE did = $1")
             .bind(did)
             .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
-        sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
+        sqlx::query("DELETE FROM refresh_token WHERE did = $1")
             .bind(did)
             .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
-        sqlx::query("DELETE FROM app_password WHERE did = ?1")
+        sqlx::query("DELETE FROM app_password WHERE did = $1")
             .bind(did)
             .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
-        sqlx::query("DELETE FROM email_token WHERE did = ?1")
+        sqlx::query("DELETE FROM email_token WHERE did = $1")
             .bind(did)
             .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
-        sqlx::query("DELETE FROM plc_keys WHERE did = ?1")
+        sqlx::query("DELETE FROM plc_keys WHERE did = $1")
             .bind(did)
             .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
-        sqlx::query("DELETE FROM account WHERE did = ?1")
+        sqlx::query("DELETE FROM account WHERE did = $1")
             .bind(did)
             .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
-        sqlx::query("DELETE FROM actor WHERE did = ?1")
+        sqlx::query("DELETE FROM actor WHERE did = $1")
             .bind(did)
             .execute(&mut *tx)
             .await
@@ -1396,7 +1396,7 @@ impl AccountManager {
     /// Check if account is marked for deletion
     #[allow(dead_code)] // Future account deletion feature
     pub async fn is_account_pending_deletion(&self, did: &str) -> PdsResult<bool> {
-        let row = sqlx::query("SELECT deactivated_at FROM actor WHERE did = ?1")
+        let row = sqlx::query("SELECT deactivated_at FROM actor WHERE did = $1")
             .bind(did)
             .fetch_optional(&self.db)
             .await
@@ -1409,7 +1409,7 @@ impl AccountManager {
 
     /// Cancel account deletion (if within grace period)
     pub async fn cancel_account_deletion(&self, did: &str) -> PdsResult<()> {
-        sqlx::query("UPDATE actor SET deactivated_at = NULL, delete_after = NULL WHERE did = ?1")
+        sqlx::query("UPDATE actor SET deactivated_at = NULL, delete_after = NULL WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -1437,7 +1437,7 @@ impl AccountManager {
 
         // Set deactivated_at to NOW (not future deletion date)
         // Keep delete_after as NULL (this distinguishes temporary deactivation from deletion)
-        sqlx::query("UPDATE actor SET deactivated_at = ?1, delete_after = NULL WHERE did = ?2")
+        sqlx::query("UPDATE actor SET deactivated_at = $1, delete_after = NULL WHERE did = $2")
             .bind(now.to_rfc3339())
             .bind(did)
             .execute(&self.db)
@@ -1445,13 +1445,13 @@ impl AccountManager {
             .map_err(PdsError::Database)?;
 
         // Revoke all sessions (force logout)
-        sqlx::query("DELETE FROM session WHERE did = ?1")
+        sqlx::query("DELETE FROM session WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
             .map_err(PdsError::Database)?;
 
-        sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
+        sqlx::query("DELETE FROM refresh_token WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -1471,7 +1471,7 @@ impl AccountManager {
     /// * `did` - The DID of the account to reactivate
     pub async fn reactivate_account(&self, did: &str) -> PdsResult<()> {
         // Clear deactivated_at to restore account
-        sqlx::query("UPDATE actor SET deactivated_at = NULL WHERE did = ?1")
+        sqlx::query("UPDATE actor SET deactivated_at = NULL WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -1500,7 +1500,7 @@ impl AccountManager {
         let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
 
         // Set takedown_ref in actor table
-        let result = sqlx::query("UPDATE actor SET takedown_ref = ?1 WHERE did = ?2")
+        let result = sqlx::query("UPDATE actor SET takedown_ref = $1 WHERE did = $2")
             .bind(takedown_ref)
             .bind(did)
             .execute(&mut *tx)
@@ -1512,14 +1512,14 @@ impl AccountManager {
         }
 
         // Delete all active sessions for this account
-        sqlx::query("DELETE FROM session WHERE did = ?1")
+        sqlx::query("DELETE FROM session WHERE did = $1")
             .bind(did)
             .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
         // Delete all refresh tokens for this account
-        sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
+        sqlx::query("DELETE FROM refresh_token WHERE did = $1")
             .bind(did)
             .execute(&mut *tx)
             .await
@@ -1549,7 +1549,7 @@ impl AccountManager {
     /// * `Ok(())` if the activation was successful
     /// * `Err(PdsError)` if the account doesn't exist or database operation fails
     pub async fn activate_account(&self, did: &str) -> PdsResult<()> {
-        let result = sqlx::query("UPDATE actor SET takedown_ref = NULL WHERE did = ?1")
+        let result = sqlx::query("UPDATE actor SET takedown_ref = NULL WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -1587,7 +1587,7 @@ impl AccountManager {
         }
 
         // Check if app password with this name already exists for this user
-        let existing = sqlx::query("SELECT name FROM app_password WHERE did = ?1 AND name = ?2")
+        let existing = sqlx::query("SELECT name FROM app_password WHERE did = $1 AND name = $2")
             .bind(did)
             .bind(name)
             .fetch_optional(&self.db)
@@ -1623,7 +1623,7 @@ impl AccountManager {
         let now = Utc::now();
         sqlx::query(
             "INSERT INTO app_password (did, name, password_hash, created_at, privileged)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(did)
         .bind(name)
@@ -1643,7 +1643,7 @@ impl AccountManager {
     /// List all app passwords for a user (without the actual passwords)
     pub async fn list_app_passwords(&self, did: &str) -> PdsResult<Vec<AppPasswordInfo>> {
         let rows = sqlx::query(
-            "SELECT name, created_at, privileged FROM app_password WHERE did = ?1 ORDER BY created_at DESC"
+            "SELECT name, created_at, privileged FROM app_password WHERE did = $1 ORDER BY created_at DESC"
         )
         .bind(did)
         .fetch_all(&self.db)
@@ -1655,7 +1655,7 @@ impl AccountManager {
             passwords.push(AppPasswordInfo {
                 name: row.get("name"),
                 created_at: parse_timestamp(&row.get::<String, _>("created_at"))?,
-                privileged: row.get::<i64, _>("privileged") != 0,
+                privileged: crate::db::read_bool(&row, "privileged")?,
             });
         }
 
@@ -1664,7 +1664,7 @@ impl AccountManager {
 
     /// Revoke (delete) an app password
     pub async fn revoke_app_password(&self, did: &str, name: &str) -> PdsResult<()> {
-        let result = sqlx::query("DELETE FROM app_password WHERE did = ?1 AND name = ?2")
+        let result = sqlx::query("DELETE FROM app_password WHERE did = $1 AND name = $2")
             .bind(did)
             .bind(name)
             .execute(&self.db)
@@ -1679,7 +1679,7 @@ impl AccountManager {
         }
 
         // Delete all sessions created with this app password
-        sqlx::query("DELETE FROM session WHERE did = ?1 AND app_password_name = ?2")
+        sqlx::query("DELETE FROM session WHERE did = $1 AND app_password_name = $2")
             .bind(did)
             .bind(name)
             .execute(&self.db)
@@ -1722,7 +1722,7 @@ impl AccountManager {
             }
 
             // Find matching app password by trying to verify against all user's app passwords
-            let rows = sqlx::query("SELECT name, password_hash FROM app_password WHERE did = ?1")
+            let rows = sqlx::query("SELECT name, password_hash FROM app_password WHERE did = $1")
                 .bind(&account.did)
                 .fetch_all(&self.db)
                 .await
@@ -1825,7 +1825,7 @@ impl AccountManager {
 
         sqlx::query(
             "INSERT INTO invite_code (code, available_uses, disabled, created_by, created_at, created_for)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+             VALUES ($1, $2, $3, $4, $5, $6)"
         )
         .bind(&code)
         .bind(use_count)
@@ -1859,7 +1859,7 @@ impl AccountManager {
         }
 
         let row = sqlx::query(
-            "SELECT code, available_uses, disabled, created_for FROM invite_code WHERE code = ?1",
+            "SELECT code, available_uses, disabled, created_for FROM invite_code WHERE code = $1",
         )
         .bind(code)
         .fetch_optional(&self.db)
@@ -1868,7 +1868,7 @@ impl AccountManager {
         .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
 
         let available_uses: i32 = row.get("available_uses");
-        let disabled: bool = row.get::<i64, _>("disabled") != 0;
+        let disabled: bool = crate::db::read_bool(&row, "disabled")?;
         let created_for: Option<String> = row.get("created_for");
 
         // Check if disabled
@@ -1916,7 +1916,7 @@ impl AccountManager {
 
         // Validate code
         let row =
-            sqlx::query("SELECT code, available_uses, disabled FROM invite_code WHERE code = ?1")
+            sqlx::query("SELECT code, available_uses, disabled FROM invite_code WHERE code = $1")
                 .bind(code)
                 .fetch_optional(&mut *tx)
                 .await
@@ -1924,7 +1924,7 @@ impl AccountManager {
                 .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
 
         let available_uses: i32 = row.get("available_uses");
-        let disabled: bool = row.get::<i64, _>("disabled") != 0;
+        let disabled: bool = crate::db::read_bool(&row, "disabled")?;
 
         if disabled {
             return Err(PdsError::Validation(
@@ -1941,7 +1941,7 @@ impl AccountManager {
         // Record usage
         sqlx::query(
             "INSERT INTO invite_code_use (code, used_by, used_at)
-             VALUES (?1, ?2, ?3)",
+             VALUES ($1, $2, $3)",
         )
         .bind(code)
         .bind(used_by)
@@ -1951,7 +1951,7 @@ impl AccountManager {
         .map_err(PdsError::Database)?;
 
         // Decrement available uses
-        sqlx::query("UPDATE invite_code SET available_uses = available_uses - 1 WHERE code = ?1")
+        sqlx::query("UPDATE invite_code SET available_uses = available_uses - 1 WHERE code = $1")
             .bind(code)
             .execute(&mut *tx)
             .await
@@ -1976,7 +1976,7 @@ impl AccountManager {
         let rows = sqlx::query(
             "SELECT code, available_uses, disabled, created_by, created_at, created_for
              FROM invite_code
-             WHERE created_by = ?1
+             WHERE created_by = $1
              ORDER BY created_at DESC",
         )
         .bind(created_by)
@@ -1990,7 +1990,7 @@ impl AccountManager {
                 Ok(crate::db::account::InviteCode {
                     code: row.try_get("code")?,
                     available_uses: row.try_get("available_uses")?,
-                    disabled: row.try_get::<i64, _>("disabled")? != 0,
+                    disabled: crate::db::read_bool(&row, "disabled")?,
                     created_by: row.try_get("created_by")?,
                     created_at: parse_timestamp(&created_at_s)?,
                     created_for: row.try_get("created_for")?,
@@ -2007,7 +2007,7 @@ impl AccountManager {
         let rows = sqlx::query(
             "SELECT code, used_by, used_at
              FROM invite_code_use
-             WHERE code = ?1
+             WHERE code = $1
              ORDER BY used_at DESC",
         )
         .bind(code)
@@ -2031,7 +2031,7 @@ impl AccountManager {
     #[allow(dead_code)] // Future invite management feature
     pub async fn disable_invite_code(&self, code: &str, requesting_did: &str) -> PdsResult<()> {
         // Verify requester is the creator or an admin
-        let row = sqlx::query("SELECT created_by FROM invite_code WHERE code = ?1")
+        let row = sqlx::query("SELECT created_by FROM invite_code WHERE code = $1")
             .bind(code)
             .fetch_optional(&self.db)
             .await
@@ -2053,7 +2053,7 @@ impl AccountManager {
         }
 
         // Disable the code
-        sqlx::query("UPDATE invite_code SET disabled = TRUE WHERE code = ?1")
+        sqlx::query("UPDATE invite_code SET disabled = TRUE WHERE code = $1")
             .bind(code)
             .execute(&self.db)
             .await
@@ -2072,7 +2072,7 @@ impl AccountManager {
     ///
     /// Allows the account to create and use invite codes.
     pub async fn enable_account_invites(&self, did: &str) -> PdsResult<()> {
-        let result = sqlx::query("UPDATE account SET invites_disabled = FALSE WHERE did = ?1")
+        let result = sqlx::query("UPDATE account SET invites_disabled = FALSE WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -2090,7 +2090,7 @@ impl AccountManager {
     ///
     /// Prevents the account from creating new invite codes.
     pub async fn disable_account_invites(&self, did: &str) -> PdsResult<()> {
-        let result = sqlx::query("UPDATE account SET invites_disabled = TRUE WHERE did = ?1")
+        let result = sqlx::query("UPDATE account SET invites_disabled = TRUE WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -2107,14 +2107,14 @@ impl AccountManager {
     #[allow(dead_code)] // Future invite allocation feature
     pub async fn allocate_invite_codes(&self, did: &str, count: i32) -> PdsResult<Vec<String>> {
         // Check if invites are disabled for this account
-        let row = sqlx::query("SELECT invites_disabled FROM account WHERE did = ?1")
+        let row = sqlx::query("SELECT invites_disabled FROM account WHERE did = $1")
             .bind(did)
             .fetch_optional(&self.db)
             .await
             .map_err(PdsError::Database)?
             .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
 
-        let invites_disabled: bool = row.get::<i64, _>("invites_disabled") != 0;
+        let invites_disabled: bool = crate::db::read_bool(&row, "invites_disabled")?;
 
         if invites_disabled {
             return Ok(Vec::new()); // Don't allocate if disabled
@@ -2189,7 +2189,7 @@ impl AccountManager {
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
                 email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
-                invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
+                invites_disabled: Some(crate::db::read_bool(&row, "invites_disabled")?),
             });
         }
 
@@ -2208,9 +2208,9 @@ impl AccountManager {
                     ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
                  FROM actor a
                  LEFT JOIN account ac ON a.did = ac.did
-                 WHERE a.did > ?1
+                 WHERE a.did > $1
                  ORDER BY a.did
-                 LIMIT ?2",
+                 LIMIT $2",
             )
             .bind(cursor_did)
             .bind(limit)
@@ -2225,7 +2225,7 @@ impl AccountManager {
                  FROM actor a
                  LEFT JOIN account ac ON a.did = ac.did
                  ORDER BY a.did
-                 LIMIT ?1",
+                 LIMIT $1",
             )
             .bind(limit)
             .fetch_all(&self.db)
@@ -2247,7 +2247,7 @@ impl AccountManager {
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
                 email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
-                invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
+                invites_disabled: Some(crate::db::read_bool(&row, "invites_disabled")?),
             });
         }
 
@@ -2373,7 +2373,7 @@ impl AccountManager {
                 email_confirmed_at: opt_parse_timestamp(
                     row.get::<Option<String>, _>("email_confirmed_at"),
                 )?,
-                invites_disabled: Some(row.get::<i64, _>("invites_disabled") != 0),
+                invites_disabled: Some(crate::db::read_bool(&row, "invites_disabled")?),
             });
         }
 
@@ -2402,8 +2402,8 @@ impl AccountManager {
             "SELECT COUNT(*) FROM actor
              WHERE deactivated_at IS NOT NULL
              AND takedown_ref IS NULL
-             AND created_at < (SELECT created_at FROM actor WHERE did = ?1)
-             AND did != ?1",
+             AND created_at < (SELECT created_at FROM actor WHERE did = $1)
+             AND did != $1",
         )
         .bind(did)
         .fetch_one(&self.db)
@@ -2526,14 +2526,14 @@ mod tests {
         // Account / actor split: `handle` lives on `actor`, the secrets
         // and email live on `account`. Both rows are required because
         // `account.did` foreign-keys into `actor.did`.
-        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES (?1, ?2, ?3)")
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
             .bind(did)
             .bind("testuser")
             .bind(now.to_rfc3339())
             .execute(&manager.db)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO account (did, email, password_hash) VALUES (?1, ?2, ?3)")
+        sqlx::query("INSERT INTO account (did, email, password_hash) VALUES ($1, $2, $3)")
             .bind(did)
             .bind("test@example.com")
             .bind("hash")
@@ -2545,7 +2545,7 @@ mod tests {
         let expired_time = now - Duration::hours(1);
         sqlx::query(
             "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind("expired-session-1")
         .bind(did)
@@ -2561,7 +2561,7 @@ mod tests {
         let future_time = now + Duration::hours(1);
         sqlx::query(
             "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind("valid-session-1")
         .bind(did)
@@ -2576,7 +2576,7 @@ mod tests {
         // Insert expired refresh token
         sqlx::query(
             "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind("expired-refresh-1")
         .bind(did)
@@ -2591,7 +2591,7 @@ mod tests {
         // Insert valid refresh token
         sqlx::query(
             "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind("valid-refresh-1")
         .bind(did)
@@ -2639,14 +2639,14 @@ mod tests {
         // Account / actor split: `handle` lives on `actor`, the secrets
         // and email live on `account`. Both rows are required because
         // `account.did` foreign-keys into `actor.did`.
-        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES (?1, ?2, ?3)")
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
             .bind(did)
             .bind("testuser")
             .bind(now.to_rfc3339())
             .execute(&manager.db)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO account (did, email, password_hash) VALUES (?1, ?2, ?3)")
+        sqlx::query("INSERT INTO account (did, email, password_hash) VALUES ($1, $2, $3)")
             .bind(did)
             .bind("test@example.com")
             .bind("hash")
@@ -2658,7 +2658,7 @@ mod tests {
         let future_time = now + Duration::hours(1);
         sqlx::query(
             "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind("valid-session")
         .bind(did)
@@ -2787,7 +2787,7 @@ mod tests {
         assert!(!session.access_token.is_empty());
 
         // Verify session has app_password_name set
-        let row = sqlx::query("SELECT app_password_name FROM session WHERE id = ?1")
+        let row = sqlx::query("SELECT app_password_name FROM session WHERE id = $1")
             .bind(&session.id)
             .fetch_one(&manager.db)
             .await
@@ -2862,7 +2862,7 @@ mod tests {
 
         // Verify session exists
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session WHERE did = ?1 AND app_password_name = ?2",
+            "SELECT COUNT(*) FROM session WHERE did = $1 AND app_password_name = $2",
         )
         .bind(&account.did)
         .bind("Test App")
@@ -2883,7 +2883,7 @@ mod tests {
 
         // Verify sessions with this app password are deleted
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session WHERE did = ?1 AND app_password_name = ?2",
+            "SELECT COUNT(*) FROM session WHERE did = $1 AND app_password_name = $2",
         )
         .bind(&account.did)
         .bind("Test App")
