@@ -1083,3 +1083,59 @@ input[type="checkbox"][disabled] {
 #sidebar-theme-toggle:focus {
     background: var(--sidebar-hover, #334155);
 }
+
+/* #108D — utility helpers for inline-style migration (chainlink #121).
+   Common layout/spacing patterns captured as reusable classes so the
+   most repetitive inline styles in 3.3-3.10 page additions can move
+   here. Full migration to a structured CSS module set lands with
+   #122 (Section 12 file-structure restructure). */
+
+.u-mb-sm { margin-bottom: 0.5rem; }
+.u-mb-md { margin-bottom: 1rem; }
+.u-mb-lg { margin-bottom: 1.5rem; }
+.u-mt-sm { margin-top: 0.5rem; }
+.u-mt-md { margin-top: 0.75rem; }
+.u-mt-lg { margin-top: 1rem; }
+.u-flex-row { display: flex; gap: 0.5rem; align-items: center; }
+.u-flex-row-wrap { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.u-flex-col { display: flex; gap: 0.5rem; flex-direction: column; }
+.u-w-full { width: 100%; }
+.u-min-w-200 { min-width: 200px; }
+.u-flex-grow { flex: 1; }
+
+/* Filter bar shape used by Mod Events / Appeals / Audit pages */
+.filter-bar {
+    margin-bottom: 1rem;
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.filter-bar input[type="text"],
+.filter-bar select {
+    flex: 1;
+    min-width: 200px;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border-color, #e0e0e0);
+    border-radius: 6px;
+    font-size: 0.875rem;
+}
+
+/* Pagination strip used by Mod Events / Appeals / Audit pages */
+.pagination-strip {
+    margin-top: 1rem;
+    display: flex;
+    gap: 0.5rem;
+}
+
+/* Phase 3.10 settings card fieldsets */
+.settings-card fieldset {
+    border: 1px solid var(--border-color, #e0e0e0);
+    padding: 0.75rem;
+    margin-top: 0.75rem;
+}
+
+.settings-card fieldset > legend {
+    padding: 0 0.25rem;
+    font-weight: 600;
+}
