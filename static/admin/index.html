@@ -61,6 +61,7 @@
                     <p class="admin-name" id="admin-name">Admin</p>
                     <p class="admin-role">Administrator</p>
                 </div>
+                <button class="btn-logout" id="sidebar-theme-toggle" onclick="cycleSidebarTheme()" aria-label="Toggle theme" style="margin-bottom: 0.5rem;">🖥 System</button>
                 <button class="btn-logout" onclick="logout()">Logout</button>
             </div>
         </aside>
@@ -537,6 +538,7 @@
     <!-- Phase 3.5 substrate primitives (chainlink #102) -->
     <!-- Load order matters: capabilities feeds the others. -->
     <script src="/admin/substrate/capabilities.js"></script>
+    <script src="/admin/substrate/i18n.js"></script>
     <script src="/admin/substrate/action-panel.js"></script>
     <script src="/admin/substrate/bulk-action-panel.js"></script>
     <script src="/admin/substrate/subscription.js"></script>

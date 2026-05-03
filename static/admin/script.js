@@ -10,6 +10,13 @@ const API_BASE = '/xrpc';
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', () => {
+    // Phase 3.10/#108A: load i18n strings for the operator's locale
+    // before any rendering. Falls back to English if requested locale
+    // file isn't present. Defaults to navigator.language → 'en'.
+    const lang = (localStorage.getItem('ui.language') || (navigator.language || 'en').split('-')[0]) || 'en';
+    if (window.AuroraI18n) {
+        AuroraI18n.load(lang).catch(() => {});
+    }
     checkAuth();
     setupNavigation();
     loadDashboardData();
@@ -1985,3 +1992,132 @@ function saveModerationMode() {
         document.documentElement.setAttribute('data-theme', resolved);
     } catch (e) { /* no localStorage — leave default */ }
 })();
+
+// =====================================================================
+// 108B/C (chainlink #119, #120) — theme toggle in sidebar + command palette
+// per docs/AURORA_ADMIN_UI_DESIGN.md §6.14, §6.15.
+// =====================================================================
+
+// Sidebar theme toggle: cycle Light → Dark → System per §6.14.
+function cycleSidebarTheme() {
+    const current = localStorage.getItem('ui.theme') || 'system';
+    const next = current === 'light' ? 'dark' : current === 'dark' ? 'system' : 'light';
+    setUiTheme(next);
+    const btn = document.getElementById('sidebar-theme-toggle');
+    if (btn) btn.textContent = themeLabel(next);
+}
+
+function themeLabel(theme) {
+    if (theme === 'light') return '☀ Light';
+    if (theme === 'dark') return '🌙 Dark';
+    return '🖥 System';
+}
+
+// Command palette (substrate primitive 15, §6.15). Cmd/Ctrl+K opens
+// a modal with an input + filtered list of nav destinations + key
+// actions. Selecting an item dispatches via existing nav.
+const COMMAND_PALETTE_ITEMS = [
+    { id: 'nav-dashboard', label: 'Go to Dashboard', action: () => navigateTo('dashboard') },
+    { id: 'nav-users', label: 'Go to Users', action: () => navigateTo('users') },
+    { id: 'nav-moderation', label: 'Go to Moderation Queue', action: () => navigateTo('moderation') },
+    { id: 'nav-reports', label: 'Go to Reports', action: () => navigateTo('reports') },
+    { id: 'nav-events', label: 'Go to Mod Events', action: () => navigateTo('events') },
+    { id: 'nav-appeals', label: 'Go to Appeals', action: () => navigateTo('appeals') },
+    { id: 'nav-audit', label: 'Go to Audit', action: () => navigateTo('audit') },
+    { id: 'nav-invites', label: 'Go to Invite Codes', action: () => navigateTo('invites') },
+    { id: 'nav-settings', label: 'Go to Settings', action: () => navigateTo('settings') },
+    { id: 'theme-cycle', label: 'Toggle theme (light → dark → system)', action: cycleSidebarTheme },
+    { id: 'logout', label: 'Log out', action: () => logout() },
+];
+
+function openCommandPalette() {
+    let modal = document.getElementById('modal-command-palette');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'modal-command-palette';
+        modal.className = 'modal command-palette-modal';
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-label', 'Command palette');
+        modal.innerHTML = `
+            <div class="modal-header">
+                <input type="text" id="cp-input" placeholder="Type a command…" aria-label="Command search" autofocus />
+            </div>
+            <div class="modal-body">
+                <ul id="cp-results" role="listbox" style="list-style: none; padding: 0; margin: 0;"></ul>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        const input = modal.querySelector('#cp-input');
+        input.addEventListener('input', renderCommandPaletteResults);
+        input.addEventListener('keydown', handleCommandPaletteKey);
+    }
+    document.getElementById('modal-overlay').classList.add('active');
+    modal.classList.add('active');
+    const input = modal.querySelector('#cp-input');
+    input.value = '';
+    renderCommandPaletteResults();
+    setTimeout(() => input.focus(), 0);
+}
+
+function closeCommandPalette() {
+    document.getElementById('modal-command-palette')?.classList.remove('active');
+    document.getElementById('modal-overlay').classList.remove('active');
+}
+
+function renderCommandPaletteResults() {
+    const input = document.getElementById('cp-input');
+    const list = document.getElementById('cp-results');
+    if (!list) return;
+    const q = (input?.value || '').toLowerCase().trim();
+    const matches = q
+        ? COMMAND_PALETTE_ITEMS.filter(it => it.label.toLowerCase().includes(q))
+        : COMMAND_PALETTE_ITEMS;
+    list.innerHTML = matches.map((it, i) =>
+        `<li role="option" data-cp-idx="${i}" class="cp-item${i === 0 ? ' active' : ''}" ` +
+        `onclick="selectCommandPaletteItem(${i})">${it.label}</li>`
+    ).join('');
+    list.dataset.matches = JSON.stringify(matches.map(it => it.id));
+}
+
+function selectCommandPaletteItem(idx) {
+    const list = document.getElementById('cp-results');
+    if (!list) return;
+    const ids = JSON.parse(list.dataset.matches || '[]');
+    const id = ids[idx];
+    const item = COMMAND_PALETTE_ITEMS.find(it => it.id === id);
+    if (item) {
+        closeCommandPalette();
+        item.action();
+    }
+}
+
+function handleCommandPaletteKey(e) {
+    const list = document.getElementById('cp-results');
+    if (!list) return;
+    const items = list.querySelectorAll('.cp-item');
+    if (items.length === 0) return;
+    const activeIdx = Array.from(items).findIndex(el => el.classList.contains('active'));
+    if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        items[activeIdx]?.classList.remove('active');
+        items[(activeIdx + 1) % items.length].classList.add('active');
+    } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        items[activeIdx]?.classList.remove('active');
+        items[(activeIdx - 1 + items.length) % items.length].classList.add('active');
+    } else if (e.key === 'Enter') {
+        e.preventDefault();
+        selectCommandPaletteItem(activeIdx >= 0 ? activeIdx : 0);
+    } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeCommandPalette();
+    }
+}
+
+// Wire global Cmd/Ctrl+K handler.
+document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        openCommandPalette();
+    }
+});

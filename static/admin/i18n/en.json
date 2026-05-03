@@ -1,0 +1,128 @@
+{
+  "common": {
+    "loading": "Loading…",
+    "error": "Error: {message}",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "save": "Save",
+    "previous": "Previous",
+    "next": "Next",
+    "apply": "Apply",
+    "clear": "Clear all",
+    "view": "View",
+    "search": "Search",
+    "all": "All",
+    "actions": "Actions",
+    "subject": "Subject",
+    "rationale": "Rationale (required)",
+    "rationale_optional": "Rationale (optional)"
+  },
+  "nav": {
+    "dashboard": "Dashboard",
+    "users": "Users",
+    "moderation": "Moderation Queue",
+    "reports": "Reports",
+    "events": "Mod Events",
+    "appeals": "Appeals",
+    "audit": "Audit",
+    "invites": "Invite Codes",
+    "settings": "Settings"
+  },
+  "dashboard": {
+    "title": "Dashboard",
+    "subtitle": "Overview of your PDS instance",
+    "tab_operator": "Operator",
+    "tab_moderator": "Moderator",
+    "stat_open_reports": "Open Reports",
+    "stat_pending_appeals": "Pending Appeals",
+    "stat_queue_total": "Queue attention",
+    "stat_oldest_age": "Oldest open report",
+    "metrics_title": "Moderation metrics — last 30 days"
+  },
+  "queue": {
+    "title": "Moderation Queue",
+    "empty_filtered": "No matches. Try widening your filters.",
+    "empty_unfiltered": "Nothing in the queue. Things will appear here as reports and appeals come in."
+  },
+  "reports": {
+    "title": "Content Reports",
+    "filter_open": "Open",
+    "filter_resolved": "Resolved",
+    "filter_all": "All",
+    "count": "{count, plural, =0 {No reports} one {# report} other {# reports}}"
+  },
+  "appeals": {
+    "title": "Moderation Appeals",
+    "subtitle": "Cross-instance appeals log via tools.aurora.moderator.listAppeals.",
+    "empty_filtered": "No appeals match these filters.",
+    "filter_status": "All statuses",
+    "filter_pending": "Pending",
+    "filter_under_review": "Under Review",
+    "filter_approved": "Approved",
+    "filter_denied": "Denied",
+    "filter_escalated": "Escalated"
+  },
+  "events": {
+    "title": "Moderation Events",
+    "subtitle": "Cross-instance event log via tools.aurora.moderator.queryEvents.",
+    "empty_filtered": "No events match these filters."
+  },
+  "audit": {
+    "title": "Audit Trail",
+    "subtitle": "Hash-chained audit log via tools.aurora.admin.getAuditTrail.",
+    "verified_only": "Verified only",
+    "verified_yes": "✓ verified",
+    "verified_no": "✗ unverified",
+    "empty_filtered": "No audit entries match these filters."
+  },
+  "invites": {
+    "title": "Invite Codes",
+    "stat_total": "Total Codes",
+    "stat_available": "Available",
+    "stat_used": "Used",
+    "btn_generate": "Generate Codes",
+    "bulk_disable": "Disable selected"
+  },
+  "settings": {
+    "title": "Settings",
+    "subtitle": "Configure your PDS instance",
+    "ui_modes_title": "UI & modes",
+    "ui_modes_subtitle": "Theme, language, deployment moderation mode.",
+    "theme_label": "Theme",
+    "theme_light": "Light",
+    "theme_dark": "Dark",
+    "theme_system": "System",
+    "theme_help": "System uses your operating system preference.",
+    "language_label": "Language",
+    "language_help": "Other languages may be available as locale files are added.",
+    "mod_mode_label": "Moderation mode",
+    "mod_mode_full": "Full",
+    "mod_mode_reduced": "Reduced",
+    "mod_mode_disabled": "Disabled",
+    "mod_mode_save": "Save mode change",
+    "mod_mode_warning": "Changing this affects all operators and is recorded in the audit chain."
+  },
+  "actions": {
+    "takedown_account": "Takedown account",
+    "suspend_account": "Suspend account",
+    "restore_account": "Restore account",
+    "delete_account": "Delete account permanently",
+    "apply_label": "Apply label",
+    "remove_label": "Remove label",
+    "send_email": "Send email",
+    "send_password_reset": "Send password reset",
+    "generate_forensic_export": "Generate forensic export"
+  },
+  "bulk": {
+    "selected_count": "{count, plural, one {# selected} other {# selected}}",
+    "subjects_count": "{count, plural, one {# subject} other {# subjects}}",
+    "confirm_n_actions": "Confirm {count, plural, one {# action} other {# actions}}",
+    "max_size_warning": "Batch operations are limited to {max} subjects per call. Select fewer or repeat in batches."
+  },
+  "realtime": {
+    "connected": "Live",
+    "reconnecting": "Reconnecting…",
+    "offline": "Offline",
+    "polling": "Polling every 10s"
+  }
+}
