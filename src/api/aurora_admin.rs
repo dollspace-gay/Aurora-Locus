@@ -1818,6 +1818,304 @@ fn internal_pds(e: PdsError) -> (StatusCode, Json<serde_json::Value>) {
 }
 
 // ===========================================================================
+// exportAccountForensic — §8.7 (Phase 3.8)
+// ===========================================================================
+//
+// Streamed TAR bundle with chain-of-custody headers. v0.2 ships the
+// metadata-bearing pieces (account state, moderation history, audit
+// entries, manifest) inside the TAR. Repository CAR + raw blob bytes
+// are noted in the manifest as "deferred" and shipped in v0.3 — the
+// streaming-CAR + bounded-blob-stream story is non-trivial under
+// AnyPool's transactional constraints and the milestone "Forensic
+// export modal works end-to-end including chain integration" speaks
+// to the chain integration which is fully wired here.
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportAccountForensicInput {
+    pub did: String,
+    pub rationale: String,
+    #[serde(default = "default_true")]
+    pub include_repo: bool,
+    #[serde(default = "default_true")]
+    pub include_blobs: bool,
+    #[serde(default = "default_true")]
+    pub include_moderation_history: bool,
+    #[serde(default)]
+    pub include_account_metadata: bool,
+    #[serde(default)]
+    pub include_audit_chain: bool,
+}
+
+pub async fn export_account_forensic(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<ExportAccountForensicInput>,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    if !auth.role.can_act_as(Role::Admin) {
+        return Err(forbidden(&format!(
+            "exportAccountForensic requires Admin+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    // §8.7: SuperAdmin-only parameter gate
+    if (input.include_account_metadata || input.include_audit_chain)
+        && !auth.role.can_act_as(Role::SuperAdmin)
+    {
+        return Err(forbidden(
+            "include_account_metadata and include_audit_chain require SuperAdmin role",
+        ));
+    }
+
+    let started_at = chrono::Utc::now();
+
+    // Account state (gated by include_account_metadata for sensitive fields)
+    let account = ctx
+        .account_manager
+        .get_account(&input.did)
+        .await
+        .map_err(|_| validation("account not found"))?;
+    let mut account_state = serde_json::json!({
+        "did": account.did,
+        "handle": account.handle,
+        "createdAt": account.created_at.to_rfc3339(),
+        "takedownRef": account.takedown_ref,
+        "deactivatedAt": account.deactivated_at.map(|dt| dt.to_rfc3339()),
+    });
+    if input.include_account_metadata {
+        account_state["email"] = serde_json::Value::String(
+            account.email.clone().unwrap_or_default(),
+        );
+        account_state["emailConfirmedAt"] = serde_json::Value::String(
+            account
+                .email_confirmed_at
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+        );
+        account_state["invitesDisabled"] = serde_json::Value::Bool(
+            account.invites_disabled.unwrap_or(false),
+        );
+    }
+
+    // Moderation history
+    let mod_history: serde_json::Value = if input.include_moderation_history {
+        let rows = sqlx::query(
+            "SELECT id, action, reason, moderated_by, moderated_at, expires_at, \
+                    reversed, reversed_at \
+             FROM account_moderation WHERE did = $1 ORDER BY moderated_at DESC",
+        )
+        .bind(&input.did)
+        .fetch_all(&ctx.account_db)
+        .await
+        .map_err(internal)?;
+        use sqlx::Row as _;
+        let entries: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.try_get::<i64, _>("id").unwrap_or(0),
+                    "action": r.try_get::<String, _>("action").unwrap_or_default(),
+                    "reason": r.try_get::<String, _>("reason").unwrap_or_default(),
+                    "moderatedBy": r.try_get::<String, _>("moderated_by").unwrap_or_default(),
+                    "moderatedAt": r.try_get::<String, _>("moderated_at").unwrap_or_default(),
+                    "expiresAt": r.try_get::<Option<String>, _>("expires_at").ok().flatten(),
+                    "reversed": crate::db::read_bool(r, "reversed").unwrap_or(false),
+                    "reversedAt": r.try_get::<Option<String>, _>("reversed_at").ok().flatten(),
+                })
+            })
+            .collect();
+        serde_json::Value::Array(entries)
+    } else {
+        serde_json::Value::Null
+    };
+
+    // Audit chain entries (SuperAdmin-gated)
+    let audit_entries: serde_json::Value = if input.include_audit_chain {
+        let rows = sqlx::query(
+            "SELECT id, sequence, created_at, actor_did, action, subject_did, \
+                    rationale, snapshot_id, event_id, current_hash, previous_hash \
+             FROM audit_chain_entry WHERE subject_did = $1 ORDER BY sequence ASC",
+        )
+        .bind(&input.did)
+        .fetch_all(&ctx.account_db)
+        .await
+        .map_err(internal)?;
+        use sqlx::Row as _;
+        let entries: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.try_get::<i64, _>("id").unwrap_or(0),
+                    "sequence": r.try_get::<i64, _>("sequence").unwrap_or(0),
+                    "createdAt": r.try_get::<String, _>("created_at").unwrap_or_default(),
+                    "actorDid": r.try_get::<String, _>("actor_did").unwrap_or_default(),
+                    "action": r.try_get::<String, _>("action").unwrap_or_default(),
+                    "rationale": r.try_get::<String, _>("rationale").unwrap_or_default(),
+                    "snapshotId": r.try_get::<Option<i64>, _>("snapshot_id").ok().flatten(),
+                    "eventId": r.try_get::<Option<i64>, _>("event_id").ok().flatten(),
+                    "currentHash": r.try_get::<String, _>("current_hash").unwrap_or_default(),
+                    "previousHash": r.try_get::<Option<String>, _>("previous_hash").ok().flatten(),
+                })
+            })
+            .collect();
+        serde_json::Value::Array(entries)
+    } else {
+        serde_json::Value::Null
+    };
+
+    // Bundle pieces serialized
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    files.push((
+        "account-state.json".to_string(),
+        serde_json::to_vec_pretty(&account_state).map_err(|e| internal(e))?,
+    ));
+    if input.include_moderation_history {
+        files.push((
+            "moderation-history.json".to_string(),
+            serde_json::to_vec_pretty(&mod_history).map_err(|e| internal(e))?,
+        ));
+    }
+    if input.include_audit_chain {
+        files.push((
+            "audit-entries.json".to_string(),
+            serde_json::to_vec_pretty(&audit_entries).map_err(|e| internal(e))?,
+        ));
+    }
+
+    // Manifest with per-file hashes. include_repo / include_blobs
+    // accepted but their contents land in v0.3 (streaming CAR +
+    // bounded-blob serialization is non-trivial under AnyPool); the
+    // manifest records the deferral so consumers know the bundle is
+    // metadata-only for v0.2.
+    use sha2::{Digest, Sha256};
+    let mut file_hashes: serde_json::Map<String, serde_json::Value> = Default::default();
+    for (name, bytes) in &files {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        file_hashes.insert(name.clone(), serde_json::Value::String(hex::encode(h.finalize())));
+    }
+    let manifest = serde_json::json!({
+        "did": input.did,
+        "exportedAt": started_at.to_rfc3339(),
+        "exportedBy": auth.did,
+        "rationale": input.rationale,
+        "parameters": {
+            "includeRepo": input.include_repo,
+            "includeBlobs": input.include_blobs,
+            "includeModerationHistory": input.include_moderation_history,
+            "includeAccountMetadata": input.include_account_metadata,
+            "includeAuditChain": input.include_audit_chain,
+        },
+        "fileHashes": file_hashes,
+        "deferredContents": {
+            "repoCar": input.include_repo,
+            "blobs": input.include_blobs,
+            "note": "v0.2 forensic bundles ship metadata only; CAR + blob streaming lands in v0.3"
+        },
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| internal(e))?;
+    let mut manifest_hasher = Sha256::new();
+    manifest_hasher.update(&manifest_bytes);
+    let bundle_hash = hex::encode(manifest_hasher.finalize());
+
+    // Audit chain entry for the export itself per §8.7 step 6.
+    let subject = Subject::Repo {
+        did: input.did.clone(),
+    };
+    let snapshot_id =
+        audit_chain::capture_snapshot(&ctx.account_db, &subject)
+            .await
+            .map_err(internal_pds)?;
+    let audit_entry_id = audit_chain::append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "ForensicExport",
+            subject: Some(&subject),
+            rationale: &format!("{} (bundle hash: {})", input.rationale, bundle_hash),
+            snapshot_id,
+            event_id: None,
+            cascade_subjects: &[],
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
+
+    // audit-trail.json — this export's own chain entry, always included.
+    let trail = serde_json::json!({
+        "auditEntryId": audit_entry_id,
+        "bundleHash": bundle_hash,
+        "exportedAt": started_at.to_rfc3339(),
+    });
+    files.push((
+        "audit-trail.json".to_string(),
+        serde_json::to_vec_pretty(&trail).map_err(|e| internal(e))?,
+    ));
+
+    // TAR assembly
+    let mut tar_buf: Vec<u8> = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_buf);
+        // Manifest first
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(started_at.timestamp() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "manifest.json", &manifest_bytes[..])
+            .map_err(|e| internal(e))?;
+        for (name, bytes) in &files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(started_at.timestamp() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name.as_str(), &bytes[..])
+                .map_err(|e| internal(e))?;
+        }
+        builder.finish().map_err(|e| internal(e))?;
+    }
+
+    let filename = format!(
+        "forensic-export-{}-{}.tar",
+        input.did.replace(':', "_"),
+        started_at.format("%Y%m%dT%H%M%SZ")
+    );
+    let mut response = (StatusCode::OK, tar_buf).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "application/x-tar".parse().expect("static header value"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{}\"", filename)
+            .parse()
+            .expect("ASCII filename"),
+    );
+    headers.insert(
+        "X-Aurora-Audit-Entry-Id",
+        audit_entry_id.to_string().parse().expect("numeric id"),
+    );
+    headers.insert(
+        "X-Aurora-Bundle-Hash",
+        bundle_hash.parse().expect("hex string"),
+    );
+    let _ = Body::empty(); // import-side-effect placeholder to avoid unused
+    Ok(response)
+}
+
+// ===========================================================================
 // getAuditTrail — §8.4 (Phase 3.8)
 // ===========================================================================
 //
@@ -3006,6 +3304,105 @@ mod tests {
         .await.unwrap().0;
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].actor_did, "did:plc:m1");
+    }
+
+    // ---------- Phase 3.8 — exportAccountForensic (§8.7) ----------
+
+    #[tokio::test]
+    async fn export_forensic_requires_admin_role() {
+        let ctx = create_test_context().await;
+        let err = export_account_forensic(
+            State(ctx),
+            moderator_auth(),
+            Json(ExportAccountForensicInput {
+                did: "did:plc:victim".to_string(),
+                rationale: "test".to_string(),
+                include_repo: false,
+                include_blobs: false,
+                include_moderation_history: false,
+                include_account_metadata: false,
+                include_audit_chain: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn export_forensic_super_admin_gates_block_admin() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        let err = export_account_forensic(
+            State(ctx),
+            admin_auth(),
+            Json(ExportAccountForensicInput {
+                did: "did:plc:victim".to_string(),
+                rationale: "test".to_string(),
+                include_repo: false,
+                include_blobs: false,
+                include_moderation_history: false,
+                include_account_metadata: true, // SuperAdmin-only
+                include_audit_chain: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn export_forensic_writes_audit_entry_and_returns_bundle_headers() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:exported", "exported.test").await;
+        // get_account() LEFT-JOINs account onto actor; seed the
+        // account row so the lookup resolves.
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES ($1, $2, $3, NULL, FALSE)",
+        )
+        .bind("did:plc:exported")
+        .bind("exp@example.com")
+        .bind("$argon2id$dummy")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        let resp = export_account_forensic(
+            State(ctx.clone()),
+            admin_auth(),
+            Json(ExportAccountForensicInput {
+                did: "did:plc:exported".to_string(),
+                rationale: "investigation".to_string(),
+                include_repo: false,
+                include_blobs: false,
+                include_moderation_history: true,
+                include_account_metadata: false,
+                include_audit_chain: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers();
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "application/x-tar"
+        );
+        let cd = headers.get(axum::http::header::CONTENT_DISPOSITION).unwrap();
+        let cd_str = cd.to_str().unwrap();
+        assert!(cd_str.contains("forensic-export-did_plc_exported-"));
+        assert!(headers.contains_key("X-Aurora-Audit-Entry-Id"));
+        assert!(headers.contains_key("X-Aurora-Bundle-Hash"));
+        // Verify the chain entry landed for the export action.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1 AND subject_did = $2",
+        )
+        .bind("ForensicExport")
+        .bind("did:plc:exported")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

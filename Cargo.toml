@@ -120,6 +120,10 @@ dashmap = "6.1.0"
 moka = { version = "0.12.11", features = ["future"] }
 flate2 = "1.1.5"
 
+# TAR archive serialization for tools.aurora.admin.exportAccountForensic
+# (Phase 3.8 / chainlink #105 / docs/AURORA_ADMIN_UI_DESIGN.md §8.7).
+tar = "0.4"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"

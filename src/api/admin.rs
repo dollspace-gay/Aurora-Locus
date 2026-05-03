@@ -402,6 +402,14 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.admin.getAuditTrail",
             get(crate::api::aurora_admin::get_audit_trail),
         )
+        // Phase 3.8 (chainlink #105) — chain-of-custody forensic
+        // export. AdminServer scope; Admin+ baseline at handler with
+        // SuperAdmin gates on metadata + chain-inclusion params per
+        // design doc §8.7.
+        .route(
+            "/xrpc/tools.aurora.admin.exportAccountForensic",
+            post(crate::api::aurora_admin::export_account_forensic),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -2322,7 +2330,8 @@ fn aurora_capability_families() -> serde_json::Value {
             "triggerPasswordReset",
             "getQueueStats",
             "getModerationMetrics",
-            "getAuditTrail"
+            "getAuditTrail",
+            "exportAccountForensic"
         ],
         // Phase 3.6 (chainlink #103) — role management relocated from
         // com.atproto.admin.{grantRole,revokeRole}.
