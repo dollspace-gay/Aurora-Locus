@@ -536,6 +536,11 @@ pub struct RateLimitConfig {
     pub use_redis: bool,
     /// Redis connection URL for distributed rate limiting (e.g., redis://localhost:6379)
     pub redis_url: Option<String>,
+    /// Bypass the limiter for GET requests to admin UI static assets.
+    /// Defaults to `true`; see `crate::rate_limit::is_admin_asset_exempt`
+    /// for the exact path/method matrix. Set to `false` to opt admin
+    /// assets back into the limiter.
+    pub exempt_admin_assets: bool,
 }
 
 /// Logging configuration
@@ -685,6 +690,10 @@ impl ServerConfig {
             .parse()
             .unwrap_or(false);
         let rate_limit_redis_url = env::var("PDS_RATE_LIMIT_REDIS_URL").ok();
+        let rate_limit_exempt_admin_assets = env::var("PDS_RATE_LIMIT_EXEMPT_ADMIN_ASSETS")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true);
 
         let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
@@ -778,6 +787,7 @@ impl ServerConfig {
                 global_requests_per_minute: rate_limit_requests,
                 use_redis: rate_limit_use_redis,
                 redis_url: rate_limit_redis_url,
+                exempt_admin_assets: rate_limit_exempt_admin_assets,
             },
             logging: LoggingConfig { level: log_level },
             federation: FederationConfig {

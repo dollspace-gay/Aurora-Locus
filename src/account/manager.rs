@@ -2497,6 +2497,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 redis_url: None,
                 use_redis: false,
+                exempt_admin_assets: true,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

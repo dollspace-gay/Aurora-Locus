@@ -333,9 +333,15 @@ impl AppContext {
             None
         };
 
-        // Initialize rate limiter with Bluesky-compatible endpoint limits
+        // Initialize rate limiter with Bluesky-compatible endpoint limits.
+        // The `exempt_admin_assets` flag is the only env-driven runtime
+        // tuning currently plumbed through; the rest of the runtime quotas
+        // remain at their compiled-in defaults.
         let rate_limiter = Arc::new(RateLimiter::with_bluesky_defaults(
-            crate::rate_limit::RateLimitConfig::default(),
+            crate::rate_limit::RateLimitConfig {
+                exempt_admin_assets: config.rate_limit.exempt_admin_assets,
+                ..crate::rate_limit::RateLimitConfig::default()
+            },
         ));
 
         // Initialize mailer
