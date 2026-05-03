@@ -14,6 +14,15 @@ document.addEventListener('DOMContentLoaded', () => {
     setupNavigation();
     loadDashboardData();
     setupEventListeners();
+    // Phase 3.7B: bell badge polling kicks off as soon as session is
+    // valid. Polling pauses when the tab is hidden (Page Visibility
+    // API) to honor §5.1 "no background fetches when tab not focused"
+    // and resumes on visibility change.
+    if (adminToken) startQueueBadgePolling();
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) stopQueueBadgePolling();
+        else if (adminToken) startQueueBadgePolling();
+    });
 });
 
 // Authentication
@@ -95,8 +104,17 @@ function navigateTo(page) {
 }
 
 // Dashboard
+//
+// Phase 3.7B (chainlink #116): two-flavor dashboard per
+// docs/AURORA_ADMIN_UI_DESIGN.md §5.1. Operator flavor preserves the
+// existing instance-stats grid; Moderator flavor consumes
+// getQueueStats + getModerationMetrics from Phase 3.7A. Tab toggle
+// switches between flavors. Stat cards now use semantic delta classes
+// (.positive / .attention / .neutral) per §5.1's design.
+let dashboardActiveFlavor = 'operator';
+
 function loadDashboardData() {
-    // Load stats
+    // Operator flavor — existing path.
     fetch(`${API_BASE}/tools.aurora.ops.getStats`, {
         headers: { 'Authorization': `Bearer ${adminToken}` }
     })
@@ -107,44 +125,190 @@ function loadDashboardData() {
         return res.json();
     })
     .then(data => {
-        console.log('Stats data:', data);
         document.getElementById('stat-users').textContent = data.totalUsers || 0;
         document.getElementById('stat-posts').textContent = data.totalPosts || 0;
         document.getElementById('stat-reports').textContent = data.openReports || 0;
-
-        // Fix storage calculation - handle NaN
         const storageBytes = data.storageBytes || 0;
         const storageGB = (storageBytes / 1024 / 1024 / 1024).toFixed(2);
         document.getElementById('stat-storage').textContent = `${storageGB} GB`;
 
-        // Update the stat change indicators with real data
         const totalUsers = data.totalUsers || 0;
         const activeUsers = data.activeUsers || 0;
-        document.querySelector('#page-dashboard .stat-card:nth-child(1) .stat-change').textContent = `${activeUsers} active`;
-        document.querySelector('#page-dashboard .stat-card:nth-child(2) .stat-change').textContent = `${data.totalPosts || 0} total`;
-        document.querySelector('#page-dashboard .stat-card:nth-child(3) .stat-change').textContent = data.openReports > 0 ? 'Requires attention' : 'All clear';
+        setStatChange(1, `${activeUsers} active`, 'neutral');
+        setStatChange(2, `${data.totalPosts || 0} total`, 'neutral');
+        // Open reports: existence is "attention", absence is "positive".
+        setStatChange(3, data.openReports > 0 ? 'Requires attention' : 'All clear',
+                      data.openReports > 0 ? 'attention' : 'positive');
 
         const totalInvites = data.totalInvites || 0;
         const availableInvites = data.availableInvites || 0;
-        document.querySelector('#page-dashboard .stat-card:nth-child(4) .stat-change').textContent = `${availableInvites} of ${totalInvites} available`;
+        setStatChange(4, `${availableInvites} of ${totalInvites} available`, 'neutral');
 
-        // Initialize charts with real data
         initializeCharts(data);
     })
     .catch(err => {
         console.error('Failed to load stats:', err);
-        // Set defaults on error
         document.getElementById('stat-users').textContent = '0';
         document.getElementById('stat-posts').textContent = '0';
         document.getElementById('stat-reports').textContent = '0';
         document.getElementById('stat-storage').textContent = '0.00 GB';
     });
 
-    // Load recent activity
     loadRecentActivity();
-
-    // Initialize charts
     initializeCharts();
+    // Moderator flavor — refresh queue stats + metrics when visible.
+    refreshQueueBadge();
+    if (dashboardActiveFlavor === 'moderator') {
+        loadModeratorDashboard();
+    }
+}
+
+// Stat-change helper: applies semantic class so visual treatment
+// (color, icon) matches intent rather than arbitrary string content.
+// Per §5.1 visual contract: .positive (green), .attention (amber),
+// neutral default.
+function setStatChange(cardIndex, text, semantic) {
+    const el = document.querySelector(`#page-dashboard .stats-grid .stat-card:nth-child(${cardIndex}) .stat-change`);
+    if (!el) return;
+    el.textContent = text;
+    el.classList.remove('positive', 'attention', 'neutral');
+    el.classList.add(semantic || 'neutral');
+}
+
+// Sidebar bell badge — polled from getQueueStats per §5.1 Real-time
+// behavior + §9.6 done criterion. Polled every 30s while session
+// active; refreshed eagerly on dashboard load + on any moderation
+// action that resolves a queue item.
+let queueBadgePollHandle = null;
+function refreshQueueBadge() {
+    fetch(`${API_BASE}/tools.aurora.admin.getQueueStats`, {
+        headers: { 'Authorization': `Bearer ${adminToken}` }
+    })
+    .then(res => res.ok ? res.json() : null)
+    .then(stats => {
+        if (!stats) return;
+        const badge = document.getElementById('mod-queue-count');
+        if (badge) {
+            badge.textContent = stats.queueAttentionTotal || 0;
+            badge.classList.toggle('badge-attention', (stats.queueAttentionTotal || 0) > 0);
+        }
+        // Mirror onto the Reports nav badge if present.
+        const reports = document.getElementById('reports-count');
+        if (reports) reports.textContent = stats.openReports || 0;
+        // Update Moderator flavor stat cards if visible.
+        if (dashboardActiveFlavor === 'moderator') {
+            updateModeratorStats(stats);
+        }
+    })
+    .catch(() => { /* network/auth error — leave badge unchanged */ });
+}
+
+function startQueueBadgePolling() {
+    if (queueBadgePollHandle) return;
+    refreshQueueBadge();
+    queueBadgePollHandle = setInterval(refreshQueueBadge, 30_000);
+}
+
+function stopQueueBadgePolling() {
+    if (queueBadgePollHandle) {
+        clearInterval(queueBadgePollHandle);
+        queueBadgePollHandle = null;
+    }
+}
+
+// Moderator flavor — stat cards + metrics chart per §5.1.
+function loadModeratorDashboard() {
+    fetch(`${API_BASE}/tools.aurora.admin.getQueueStats`, {
+        headers: { 'Authorization': `Bearer ${adminToken}` }
+    })
+    .then(res => res.ok ? res.json() : null)
+    .then(stats => { if (stats) updateModeratorStats(stats); })
+    .catch(() => {});
+    // Last 30 days of metrics, daily granularity.
+    const end = new Date();
+    const start = new Date(end.getTime() - 30 * 24 * 3600 * 1000);
+    fetch(`${API_BASE}/tools.aurora.admin.getModerationMetrics`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            start: start.toISOString(),
+            end: end.toISOString(),
+            granularity: 'day',
+            metrics: ['reportsFiled', 'reportsResolved', 'actionsTaken'],
+        })
+    })
+    .then(res => res.ok ? res.json() : null)
+    .then(data => { if (data) renderModeratorMetrics(data); })
+    .catch(() => {});
+}
+
+function updateModeratorStats(stats) {
+    const targets = [
+        ['mod-stat-open-reports', stats.openReports || 0],
+        ['mod-stat-pending-appeals', stats.pendingAppeals || 0],
+        ['mod-stat-queue-total', stats.queueAttentionTotal || 0],
+        ['mod-stat-oldest-age', formatAgeSeconds(stats.oldestOpenReportAgeSeconds || 0)],
+    ];
+    for (const [id, value] of targets) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    }
+}
+
+function formatAgeSeconds(secs) {
+    if (!secs) return '—';
+    if (secs < 3600) return Math.round(secs / 60) + 'm';
+    if (secs < 86400) return Math.round(secs / 3600) + 'h';
+    return Math.round(secs / 86400) + 'd';
+}
+
+function renderModeratorMetrics(data) {
+    const container = document.getElementById('mod-metrics-chart');
+    if (!container) return;
+    if (!data.series || data.series.length === 0) {
+        container.innerHTML = '<p class="empty-state">No metrics available for this range.</p>';
+        return;
+    }
+    // Render as a compact summary table — a real Chart.js wiring
+    // lands with #108 alongside the existing Chart.js usage on the
+    // Operator flavor.
+    let html = '<table class="data-table"><thead><tr>'
+        + '<th>Metric</th><th>This period</th><th>Previous</th><th>Change</th>'
+        + '</tr></thead><tbody>';
+    for (const s of data.series) {
+        const aggregate = (s.aggregate || 0).toFixed(1);
+        const prev = s.delta ? s.delta.previousAggregate.toFixed(1) : '—';
+        let change = '—';
+        let changeClass = 'neutral';
+        if (s.delta) {
+            const pct = s.delta.changePercent;
+            const sign = pct >= 0 ? '+' : '';
+            change = `${sign}${pct.toFixed(1)}%`;
+            // Per-metric semantic interpretation: ReportsFiled
+            // increases are "attention" (more reports = something
+            // to look at), ReportsResolved increases are "positive".
+            const negSign = s.metric === 'reports_filed' ? -1 : 1;
+            changeClass = pct * negSign > 0 ? 'positive' : (pct === 0 ? 'neutral' : 'attention');
+        }
+        html += `<tr><td>${s.metric}</td><td>${aggregate}</td><td>${prev}</td>`
+            + `<td class="stat-change ${changeClass}">${change}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+}
+
+function setDashboardFlavor(flavor) {
+    dashboardActiveFlavor = flavor;
+    document.querySelectorAll('#dashboard-flavor-tabs button').forEach(b => {
+        b.classList.toggle('active', b.dataset.flavor === flavor);
+        b.setAttribute('aria-selected', b.dataset.flavor === flavor ? 'true' : 'false');
+    });
+    document.getElementById('dashboard-operator').style.display = flavor === 'operator' ? '' : 'none';
+    document.getElementById('dashboard-moderator').style.display = flavor === 'moderator' ? '' : 'none';
+    if (flavor === 'moderator') loadModeratorDashboard();
 }
 
 function loadRecentActivity() {

@@ -70,6 +70,13 @@
                     <p class="page-subtitle">Overview of your PDS instance</p>
                 </header>
 
+                <!-- Phase 3.7B (chainlink #116): Operator/Moderator flavor toggle per §5.1 -->
+                <div id="dashboard-flavor-tabs" role="tablist" aria-label="Dashboard flavor" style="display: flex; gap: 0.5rem; margin-bottom: 1rem;">
+                    <button type="button" role="tab" aria-selected="true" data-flavor="operator" class="active" onclick="setDashboardFlavor('operator')">Operator</button>
+                    <button type="button" role="tab" aria-selected="false" data-flavor="moderator" onclick="setDashboardFlavor('moderator')">Moderator</button>
+                </div>
+
+                <div id="dashboard-operator">
                 <!-- Stats Cards -->
                 <div class="stats-grid">
                     <div class="stat-card">
@@ -127,6 +134,51 @@
                     <h3>Recent Activity</h3>
                     <div class="activity-list" id="recent-activity">
                         <!-- Populated by JS -->
+                    </div>
+                </div>
+                </div><!-- /#dashboard-operator -->
+
+                <!-- Moderator flavor (§5.1) — visible when tab selected -->
+                <div id="dashboard-moderator" style="display: none;">
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-icon">📥</div>
+                            <div class="stat-content">
+                                <p class="stat-label">Open Reports</p>
+                                <p class="stat-value" id="mod-stat-open-reports">0</p>
+                                <p class="stat-change neutral">awaiting triage</p>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon">⚖️</div>
+                            <div class="stat-content">
+                                <p class="stat-label">Pending Appeals</p>
+                                <p class="stat-value" id="mod-stat-pending-appeals">0</p>
+                                <p class="stat-change neutral">awaiting review</p>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon">🛎️</div>
+                            <div class="stat-content">
+                                <p class="stat-label">Queue attention</p>
+                                <p class="stat-value" id="mod-stat-queue-total">0</p>
+                                <p class="stat-change neutral">items needing decision</p>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon">⏱️</div>
+                            <div class="stat-content">
+                                <p class="stat-label">Oldest open report</p>
+                                <p class="stat-value" id="mod-stat-oldest-age">—</p>
+                                <p class="stat-change neutral">queue age signal</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="activity-card" style="margin-top: 1rem;">
+                        <h3>Moderation metrics — last 30 days</h3>
+                        <div id="mod-metrics-chart">
+                            <p class="empty-state">Loading…</p>
+                        </div>
                     </div>
                 </div>
             </div>
