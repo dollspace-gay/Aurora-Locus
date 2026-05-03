@@ -388,7 +388,7 @@ fn build_event_details(input: &EmitEventInput, metadata: &Option<serde_json::Val
     obj.insert("rationale".to_string(), serde_json::Value::String(input.rationale.clone()));
     obj.insert(
         "action".to_string(),
-        serde_json::to_value(&action_kind_str(&input.action)).unwrap_or(serde_json::Value::Null),
+        serde_json::to_value(action_kind_str(&input.action)).unwrap_or(serde_json::Value::Null),
     );
     if let Some(m) = metadata {
         obj.insert("metadata".to_string(), m.clone());
@@ -718,6 +718,670 @@ async fn dispatch_action(
             Ok(Vec::new())
         }
     }
+}
+
+// ===========================================================================
+// Batch endpoints — §8.8–§8.13
+// ===========================================================================
+//
+// All six batch endpoints follow the same atomic pattern:
+//   1. Validate batch size (1..=50) per design doc hard cap
+//   2. Validate role
+//   3. Begin transaction on account_db
+//   4. INSERT one moderation_event row per batch (single audit semantic;
+//      subject columns NULL since the batch references many subjects;
+//      full subject list lives in details JSON)
+//   5. INSERT per-subject rows (account_moderation or label) within tx
+//   6. Commit transaction (atomicity boundary)
+//   7. Best-effort side-effect updates outside tx (takedown_ref,
+//      session purge) — failures logged, do not roll back the audit
+//      record. This matches existing single-subject takedown_account's
+//      "Don't fail the whole operation" pattern in admin.rs.
+//
+// `batchRemoveLabel` is the only endpoint with non-atomic-failure
+// semantics: subjects without the label get reported in `skipped`
+// rather than failing the whole batch (per design doc §8.13).
+
+const MAX_BATCH_SIZE: usize = 50;
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotRef {
+    /// Subject the snapshot was captured for. Always present so the
+    /// UI can map snapshots back to their subjects in the response.
+    pub subject: Subject,
+    /// Snapshot id; `None` until Phase 3.8 snapshot infrastructure
+    /// ships. The field is in the wire shape now so consumers don't
+    /// need a wire-format break when 3.8 lands.
+    pub snapshot_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAccountsInput {
+    pub dids: Vec<String>,
+    pub rationale: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAccountsOutput {
+    pub event_id: String,
+    pub audit_entry_id: Option<String>,
+    pub affected_count: u32,
+    pub snapshots: Vec<SnapshotRef>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRecordsInput {
+    pub uris: Vec<String>,
+    pub rationale: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchLabelInput {
+    pub subjects: Vec<Subject>,
+    pub label_val: String,
+    #[serde(default)]
+    pub label_neg: bool,
+    pub rationale: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchLabelOutput {
+    pub event_id: String,
+    pub audit_entry_id: Option<String>,
+    pub affected_count: u32,
+    pub snapshots: Vec<SnapshotRef>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRemoveLabelOutput {
+    pub event_id: String,
+    pub audit_entry_id: Option<String>,
+    pub affected_count: u32,
+    /// Subjects that didn't have the label — reported transparently
+    /// rather than failing the batch (§8.13 non-atomic-failure rule).
+    pub skipped: Vec<Subject>,
+    pub snapshots: Vec<SnapshotRef>,
+}
+
+fn validate_batch_size<T>(items: &[T]) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if items.is_empty() {
+        return Err(validation("batch must contain at least one subject"));
+    }
+    if items.len() > MAX_BATCH_SIZE {
+        return Err(validation(format!(
+            "batch size {} exceeds limit of {}",
+            items.len(),
+            MAX_BATCH_SIZE
+        )));
+    }
+    Ok(())
+}
+
+fn check_moderator_role(
+    auth: &AdminAuthContext,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if auth.role.can_act_as(Role::Moderator) {
+        Ok(())
+    } else {
+        Err(forbidden(&format!(
+            "batch action requires Moderator+ role; caller has {:?}",
+            auth.role
+        )))
+    }
+}
+
+/// Insert per-subject account_moderation rows + one moderation_event
+/// row in a single transaction. Returns the event id.
+async fn insert_batch_account_moderations(
+    ctx: &AppContext,
+    actor_did: &str,
+    action_db_str: &str,
+    event_type: ModerationEventType,
+    rationale: &str,
+    dids: &[String],
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    for did in dids {
+        sqlx::query(
+            "INSERT INTO account_moderation \
+             (did, action, reason, moderated_by, moderated_at) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(did)
+        .bind(action_db_str)
+        .bind(rationale)
+        .bind(actor_did)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    }
+    let details = serde_json::json!({
+        "rationale": rationale,
+        "action": event_type.as_str(),
+        "batch": true,
+        "subjects": dids,
+    });
+    let event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO moderation_event \
+         (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta) \
+         VALUES ($1, $2, NULL, NULL, NULL, $3, $4, NULL) \
+         RETURNING id",
+    )
+    .bind(event_type.as_str())
+    .bind(actor_did)
+    .bind(details.to_string())
+    .bind(&now)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(event_id)
+}
+
+fn snapshots_for_dids(dids: &[String]) -> Vec<SnapshotRef> {
+    dids.iter()
+        .map(|d| SnapshotRef {
+            subject: Subject::Repo { did: d.clone() },
+            snapshot_id: None,
+        })
+        .collect()
+}
+
+/// `tools.aurora.admin.batchTakedownAccounts` (§8.8).
+pub async fn batch_takedown_accounts(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<BatchAccountsInput>,
+) -> Result<Json<BatchAccountsOutput>, (StatusCode, Json<serde_json::Value>)> {
+    check_moderator_role(&auth)?;
+    validate_batch_size(&input.dids)?;
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    let event_id = insert_batch_account_moderations(
+        &ctx,
+        &auth.did,
+        "takedown",
+        ModerationEventType::AccountTakedown,
+        &input.rationale,
+        &input.dids,
+    )
+    .await?;
+    // Best-effort actor-table update + session purge per DID.
+    for did in &input.dids {
+        let takedown_ref = format!("batch_event_{}", event_id);
+        if let Err(e) = ctx.account_manager.takedown_account(did, &takedown_ref).await {
+            tracing::warn!("batch takedown side-effect failed for {}: {}", did, e);
+        }
+    }
+    Ok(Json(BatchAccountsOutput {
+        event_id: event_id.to_string(),
+        audit_entry_id: None,
+        affected_count: input.dids.len() as u32,
+        snapshots: snapshots_for_dids(&input.dids),
+    }))
+}
+
+/// `tools.aurora.admin.batchSuspendAccounts` (§8.9).
+pub async fn batch_suspend_accounts(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<BatchAccountsInput>,
+) -> Result<Json<BatchAccountsOutput>, (StatusCode, Json<serde_json::Value>)> {
+    check_moderator_role(&auth)?;
+    validate_batch_size(&input.dids)?;
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    let event_id = insert_batch_account_moderations(
+        &ctx,
+        &auth.did,
+        "suspend",
+        ModerationEventType::AccountSuspend,
+        &input.rationale,
+        &input.dids,
+    )
+    .await?;
+    Ok(Json(BatchAccountsOutput {
+        event_id: event_id.to_string(),
+        audit_entry_id: None,
+        affected_count: input.dids.len() as u32,
+        snapshots: snapshots_for_dids(&input.dids),
+    }))
+}
+
+/// `tools.aurora.admin.batchRestoreAccounts` (§8.10).
+pub async fn batch_restore_accounts(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<BatchAccountsInput>,
+) -> Result<Json<BatchAccountsOutput>, (StatusCode, Json<serde_json::Value>)> {
+    check_moderator_role(&auth)?;
+    validate_batch_size(&input.dids)?;
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    let event_id = insert_batch_account_moderations(
+        &ctx,
+        &auth.did,
+        "restore",
+        ModerationEventType::AccountRestore,
+        &input.rationale,
+        &input.dids,
+    )
+    .await?;
+    // Restore side-effect: clear takedown_ref.
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    for did in &input.dids {
+        if let Err(e) = sqlx::query("UPDATE actor SET takedown_ref = NULL WHERE did = $1")
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+        {
+            tracing::warn!("batch restore side-effect failed for {}: {}", did, e);
+        }
+    }
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(BatchAccountsOutput {
+        event_id: event_id.to_string(),
+        audit_entry_id: None,
+        affected_count: input.dids.len() as u32,
+        snapshots: snapshots_for_dids(&input.dids),
+    }))
+}
+
+/// `tools.aurora.admin.batchTakedownRecords` (§8.11).
+pub async fn batch_takedown_records(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<BatchRecordsInput>,
+) -> Result<Json<BatchAccountsOutput>, (StatusCode, Json<serde_json::Value>)> {
+    check_moderator_role(&auth)?;
+    validate_batch_size(&input.uris)?;
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    // Records are taken down via !takedown self-label. Single tx
+    // covers all label inserts + the moderation_event row.
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let server_did = format!("did:web:{}", ctx.config.service.hostname);
+    for uri in &input.uris {
+        sqlx::query(
+            "INSERT INTO label (uri, cid, val, neg, src, created_at, created_by) \
+             VALUES ($1, NULL, $2, FALSE, $3, $4, $5)",
+        )
+        .bind(uri)
+        .bind("!takedown")
+        .bind(&server_did)
+        .bind(&now)
+        .bind(&auth.did)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    }
+    let details = serde_json::json!({
+        "rationale": input.rationale,
+        "action": "TakedownRecord",
+        "batch": true,
+        "subjects": input.uris,
+    });
+    let event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO moderation_event \
+         (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta) \
+         VALUES ($1, $2, NULL, NULL, NULL, $3, $4, NULL) \
+         RETURNING id",
+    )
+    .bind(ModerationEventType::AccountTakedown.as_str())
+    .bind(&auth.did)
+    .bind(details.to_string())
+    .bind(&now)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    let snapshots = input
+        .uris
+        .iter()
+        .map(|uri| SnapshotRef {
+            subject: Subject::Record {
+                uri: uri.clone(),
+                cid: String::new(),
+            },
+            snapshot_id: None,
+        })
+        .collect();
+    Ok(Json(BatchAccountsOutput {
+        event_id: event_id.to_string(),
+        audit_entry_id: None,
+        affected_count: input.uris.len() as u32,
+        snapshots,
+    }))
+}
+
+/// `tools.aurora.admin.batchApplyLabel` (§8.12).
+pub async fn batch_apply_label(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<BatchLabelInput>,
+) -> Result<Json<BatchLabelOutput>, (StatusCode, Json<serde_json::Value>)> {
+    check_moderator_role(&auth)?;
+    validate_batch_size(&input.subjects)?;
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    if input.label_val.trim().is_empty() {
+        return Err(validation("label_val is required and must be non-empty"));
+    }
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let server_did = format!("did:web:{}", ctx.config.service.hostname);
+    for subject in &input.subjects {
+        let (uri, cid) = match subject {
+            Subject::Record { uri, cid } => (uri.clone(), Some(cid.clone())),
+            Subject::Repo { did } => (format!("at://{}", did), None),
+            Subject::Blob { did, cid, .. } => (format!("at://{}", did), Some(cid.clone())),
+        };
+        sqlx::query(
+            "INSERT INTO label (uri, cid, val, neg, src, created_at, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&uri)
+        .bind(&cid)
+        .bind(&input.label_val)
+        .bind(input.label_neg)
+        .bind(&server_did)
+        .bind(&now)
+        .bind(&auth.did)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    }
+    let subject_jsons: Vec<serde_json::Value> = input
+        .subjects
+        .iter()
+        .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let details = serde_json::json!({
+        "rationale": input.rationale,
+        "action": "ApplyLabel",
+        "batch": true,
+        "labelVal": input.label_val,
+        "labelNeg": input.label_neg,
+        "subjects": subject_jsons,
+    });
+    let event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO moderation_event \
+         (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta) \
+         VALUES ($1, $2, NULL, NULL, NULL, $3, $4, NULL) \
+         RETURNING id",
+    )
+    .bind(ModerationEventType::LabelCreate.as_str())
+    .bind(&auth.did)
+    .bind(details.to_string())
+    .bind(&now)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    let snapshots = input
+        .subjects
+        .iter()
+        .map(|s| SnapshotRef {
+            subject: s.clone(),
+            snapshot_id: None,
+        })
+        .collect();
+    Ok(Json(BatchLabelOutput {
+        event_id: event_id.to_string(),
+        audit_entry_id: None,
+        affected_count: input.subjects.len() as u32,
+        snapshots,
+    }))
+}
+
+/// `tools.aurora.admin.batchRemoveLabel` (§8.13).
+///
+/// Differs from the other batch endpoints: subjects without the
+/// label go into `skipped` rather than failing the batch.
+pub async fn batch_remove_label(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<BatchLabelInput>,
+) -> Result<Json<BatchRemoveLabelOutput>, (StatusCode, Json<serde_json::Value>)> {
+    check_moderator_role(&auth)?;
+    validate_batch_size(&input.subjects)?;
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    if input.label_val.trim().is_empty() {
+        return Err(validation("label_val is required and must be non-empty"));
+    }
+    // First-pass: detect which subjects currently have the label.
+    let server_did = format!("did:web:{}", ctx.config.service.hostname);
+    let mut applied_subjects = Vec::new();
+    let mut skipped = Vec::new();
+    for subject in &input.subjects {
+        let (uri, cid) = match subject {
+            Subject::Record { uri, cid } => (uri.clone(), Some(cid.clone())),
+            Subject::Repo { did } => (format!("at://{}", did), None),
+            Subject::Blob { did, cid, .. } => (format!("at://{}", did), Some(cid.clone())),
+        };
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM label \
+             WHERE uri = $1 AND val = $2 AND neg = FALSE \
+               AND ($3::text IS NULL OR cid = $3)",
+        )
+        .bind(&uri)
+        .bind(&input.label_val)
+        .bind(&cid)
+        .fetch_one(&ctx.account_db)
+        .await
+        .map_err(internal)?;
+        if count > 0 {
+            applied_subjects.push((subject.clone(), uri, cid));
+        } else {
+            skipped.push(subject.clone());
+        }
+    }
+    // Atomic write of negative labels + event for the applied subset.
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (_subject, uri, cid) in &applied_subjects {
+        sqlx::query(
+            "INSERT INTO label (uri, cid, val, neg, src, created_at, created_by) \
+             VALUES ($1, $2, $3, TRUE, $4, $5, $6)",
+        )
+        .bind(uri)
+        .bind(cid)
+        .bind(&input.label_val)
+        .bind(&server_did)
+        .bind(&now)
+        .bind(&auth.did)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    }
+    let subject_jsons: Vec<serde_json::Value> = applied_subjects
+        .iter()
+        .map(|(s, _, _)| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let skipped_jsons: Vec<serde_json::Value> = skipped
+        .iter()
+        .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let details = serde_json::json!({
+        "rationale": input.rationale,
+        "action": "RemoveLabel",
+        "batch": true,
+        "labelVal": input.label_val,
+        "subjects": subject_jsons,
+        "skipped": skipped_jsons,
+    });
+    let event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO moderation_event \
+         (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta) \
+         VALUES ($1, $2, NULL, NULL, NULL, $3, $4, NULL) \
+         RETURNING id",
+    )
+    .bind(ModerationEventType::LabelRemove.as_str())
+    .bind(&auth.did)
+    .bind(details.to_string())
+    .bind(&now)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    let snapshots = applied_subjects
+        .iter()
+        .map(|(s, _, _)| SnapshotRef {
+            subject: s.clone(),
+            snapshot_id: None,
+        })
+        .collect();
+    Ok(Json(BatchRemoveLabelOutput {
+        event_id: event_id.to_string(),
+        audit_entry_id: None,
+        affected_count: applied_subjects.len() as u32,
+        skipped,
+        snapshots,
+    }))
+}
+
+// ===========================================================================
+// triggerPasswordReset — §8.6
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerPasswordResetInput {
+    pub did: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerPasswordResetOutput {
+    pub reset_email_sent: bool,
+    /// Format: "e****@example.com" — first character + asterisks + @
+    /// + domain. Confirms the right email was used without exposing
+    /// full PII to the operator session.
+    pub masked_email: String,
+    pub audit_entry_id: String,
+}
+
+/// Mask an email: first character + asterisks + "@domain".
+/// `evan@example.com` → `e****@example.com`.
+fn mask_email(email: &str) -> String {
+    if let Some(at_idx) = email.find('@') {
+        let (local, domain) = email.split_at(at_idx);
+        let first = local.chars().next().unwrap_or('e');
+        format!("{}****{}", first, domain)
+    } else {
+        // No @ — mask conservatively.
+        "****".to_string()
+    }
+}
+
+/// `tools.aurora.admin.triggerPasswordReset` (§8.6).
+pub async fn trigger_password_reset(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<TriggerPasswordResetInput>,
+) -> Result<Json<TriggerPasswordResetOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::Admin) {
+        return Err(forbidden(&format!(
+            "triggerPasswordReset requires Admin+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    // Look up account by DID to get the email + handle.
+    let account = ctx
+        .account_manager
+        .get_account(&input.did)
+        .await
+        .map_err(|_| validation("account not found"))?;
+    let email = account
+        .email
+        .clone()
+        .ok_or_else(|| validation("account has no email on file"))?;
+    let handle = account.handle.clone().unwrap_or_else(|| input.did.clone());
+    // Generate token via existing infrastructure (uses handle-or-email
+    // identifier; we pass handle).
+    let (token, _email_returned) = ctx
+        .account_manager
+        .generate_password_reset_token(&handle)
+        .await
+        .map_err(internal)?;
+    // Send the email if mailer is configured (best-effort per existing
+    // request_password_reset pattern in src/api/server.rs).
+    let mut email_sent = false;
+    if ctx.mailer.is_configured() {
+        let base_url = ctx.service_url();
+        match ctx
+            .mailer
+            .send_password_reset_email(&email, &handle, &token, &base_url)
+            .await
+        {
+            Ok(()) => {
+                email_sent = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "triggerPasswordReset: token generated but email failed for {}: {}",
+                    input.did,
+                    e
+                );
+            }
+        }
+    } else {
+        tracing::warn!(
+            "triggerPasswordReset: mailer not configured; token generated but no email sent for {}",
+            input.did
+        );
+    }
+    // Audit log entry per §8.6 step 5.
+    let _ = ctx
+        .admin_role_manager
+        .log_action(
+            &auth.did,
+            "account.trigger_password_reset",
+            Some(&input.did),
+            Some(&input.rationale),
+            None,
+        )
+        .await;
+    // Look up the audit entry id we just wrote so we can return it.
+    let audit_entry_id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM admin_audit_log \
+         WHERE admin_did = $1 AND action = $2 AND subject_did = $3 \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(&auth.did)
+    .bind("account.trigger_password_reset")
+    .bind(&input.did)
+    .fetch_optional(&ctx.account_db)
+    .await
+    .map_err(internal)?;
+    Ok(Json(TriggerPasswordResetOutput {
+        reset_email_sent: email_sent,
+        masked_email: mask_email(&email),
+        audit_entry_id: audit_entry_id.map(|i| i.to_string()).unwrap_or_default(),
+    }))
 }
 
 // ===========================================================================
@@ -1184,5 +1848,285 @@ mod tests {
         let deny: AppealResolutionDecision =
             serde_json::from_str("\"deny\"").unwrap();
         assert_eq!(deny, AppealResolutionDecision::Deny);
+    }
+
+    // ---------- Batch endpoints (§8.8–§8.13) ----------
+
+    #[tokio::test]
+    async fn batch_takedown_accepts_valid_batch_and_writes_one_event() {
+        let ctx = create_test_context().await;
+        for i in 0..3 {
+            seed_actor(&ctx, &format!("did:plc:b{}", i), &format!("b{}.test", i)).await;
+        }
+        let resp = batch_takedown_accounts(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(BatchAccountsInput {
+                dids: vec![
+                    "did:plc:b0".to_string(),
+                    "did:plc:b1".to_string(),
+                    "did:plc:b2".to_string(),
+                ],
+                rationale: "spam ring".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.affected_count, 3);
+        assert_eq!(resp.snapshots.len(), 3);
+        // ONE moderation_event row for the batch (per design doc).
+        let event_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM moderation_event WHERE actor_did = $1")
+                .bind("did:plc:moderator")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(event_count, 1);
+        // THREE account_moderation rows (one per subject).
+        let mod_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM account_moderation WHERE moderated_by = $1 AND action = $2",
+        )
+        .bind("did:plc:moderator")
+        .bind("takedown")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(mod_count, 3);
+    }
+
+    #[tokio::test]
+    async fn batch_takedown_rejects_empty_batch() {
+        let ctx = create_test_context().await;
+        let err = batch_takedown_accounts(
+            State(ctx),
+            moderator_auth(),
+            Json(BatchAccountsInput {
+                dids: vec![],
+                rationale: "test".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_takedown_rejects_oversized_batch() {
+        let ctx = create_test_context().await;
+        let dids: Vec<String> = (0..51).map(|i| format!("did:plc:b{}", i)).collect();
+        let err = batch_takedown_accounts(
+            State(ctx),
+            moderator_auth(),
+            Json(BatchAccountsInput {
+                dids,
+                rationale: "too big".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_apply_label_writes_per_subject_label_rows() {
+        let ctx = create_test_context().await;
+        let resp = batch_apply_label(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(BatchLabelInput {
+                subjects: vec![
+                    Subject::Record {
+                        uri: "at://did:plc:r1/x/y".to_string(),
+                        cid: "bafy1".to_string(),
+                    },
+                    Subject::Record {
+                        uri: "at://did:plc:r2/x/y".to_string(),
+                        cid: "bafy2".to_string(),
+                    },
+                ],
+                label_val: "spam".to_string(),
+                label_neg: false,
+                rationale: "obvious".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.affected_count, 2);
+        let label_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM label WHERE val = $1 AND neg = FALSE")
+                .bind("spam")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(label_count, 2);
+    }
+
+    #[tokio::test]
+    async fn batch_remove_label_skips_subjects_without_label() {
+        let ctx = create_test_context().await;
+        // Apply label to one of two subjects upfront.
+        batch_apply_label(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(BatchLabelInput {
+                subjects: vec![Subject::Record {
+                    uri: "at://did:plc:has/x/y".to_string(),
+                    cid: "bafy".to_string(),
+                }],
+                label_val: "spam".to_string(),
+                label_neg: false,
+                rationale: "preseed".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let resp = batch_remove_label(
+            State(ctx),
+            moderator_auth(),
+            Json(BatchLabelInput {
+                subjects: vec![
+                    Subject::Record {
+                        uri: "at://did:plc:has/x/y".to_string(),
+                        cid: "bafy".to_string(),
+                    },
+                    Subject::Record {
+                        uri: "at://did:plc:nope/x/y".to_string(),
+                        cid: "bafy2".to_string(),
+                    },
+                ],
+                label_val: "spam".to_string(),
+                label_neg: false,
+                rationale: "remove valid".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.affected_count, 1);
+        assert_eq!(resp.skipped.len(), 1);
+        // The skipped subject is the one that didn't have the label.
+        match &resp.skipped[0] {
+            Subject::Record { uri, .. } => assert_eq!(uri, "at://did:plc:nope/x/y"),
+            _ => panic!("wrong skipped subject shape"),
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_endpoints_accept_admin_role() {
+        // Moderator is the floor role in the current Role enum
+        // (Moderator < Admin < SuperAdmin), so a "below moderator"
+        // negative test isn't expressible until a lower role lands.
+        // This positive test verifies Admin (above Moderator) passes
+        // the gate for the moderator+ batch endpoints.
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:admintest", "admintest.test").await;
+        let resp = batch_takedown_accounts(
+            State(ctx),
+            admin_auth(),
+            Json(BatchAccountsInput {
+                dids: vec!["did:plc:admintest".to_string()],
+                rationale: "admin batch".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.affected_count, 1);
+    }
+
+    // ---------- triggerPasswordReset (§8.6) ----------
+
+    #[test]
+    fn mask_email_formats_correctly() {
+        assert_eq!(mask_email("evan@example.com"), "e****@example.com");
+        assert_eq!(mask_email("a@b.co"), "a****@b.co");
+        assert_eq!(mask_email("nodomain"), "****");
+    }
+
+    #[tokio::test]
+    async fn trigger_password_reset_requires_admin_role() {
+        let ctx = create_test_context().await;
+        let err = trigger_password_reset(
+            State(ctx),
+            moderator_auth(),
+            Json(TriggerPasswordResetInput {
+                did: "did:plc:user".to_string(),
+                rationale: "lost password".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn trigger_password_reset_rejects_account_without_email() {
+        let ctx = create_test_context().await;
+        // Seed actor + account row with NULL email.
+        seed_actor(&ctx, "did:plc:noemail", "noemail.test").await;
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES ($1, NULL, $2, NULL, FALSE)",
+        )
+        .bind("did:plc:noemail")
+        .bind("$argon2id$dummy")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        let err = trigger_password_reset(
+            State(ctx),
+            admin_auth(),
+            Json(TriggerPasswordResetInput {
+                did: "did:plc:noemail".to_string(),
+                rationale: "test".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trigger_password_reset_returns_masked_email_and_audit_id() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:withemail", "withemail.test").await;
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES ($1, $2, $3, NULL, FALSE)",
+        )
+        .bind("did:plc:withemail")
+        .bind("user@example.com")
+        .bind("$argon2id$dummy")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        let resp = trigger_password_reset(
+            State(ctx.clone()),
+            admin_auth(),
+            Json(TriggerPasswordResetInput {
+                did: "did:plc:withemail".to_string(),
+                rationale: "user requested".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        // Mailer not configured in test ctx → reset_email_sent = false,
+        // but token still generated and audit logged.
+        assert!(!resp.reset_email_sent);
+        assert_eq!(resp.masked_email, "u****@example.com");
+        assert!(!resp.audit_entry_id.is_empty());
+        // Audit entry exists.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM admin_audit_log WHERE action = $1 AND subject_did = $2",
+        )
+        .bind("account.trigger_password_reset")
+        .bind("did:plc:withemail")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
     }
 }

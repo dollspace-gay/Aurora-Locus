@@ -348,6 +348,40 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.admin.emitEvent",
             post(crate::api::aurora_admin::emit_event),
         )
+        // Batch endpoints (Phase 3.5, §8.8–§8.13). Six atomic
+        // multi-subject procedures driven by BulkActionPanel
+        // (substrate primitive 4). 50-subject hard cap per design doc.
+        .route(
+            "/xrpc/tools.aurora.admin.batchTakedownAccounts",
+            post(crate::api::aurora_admin::batch_takedown_accounts),
+        )
+        .route(
+            "/xrpc/tools.aurora.admin.batchSuspendAccounts",
+            post(crate::api::aurora_admin::batch_suspend_accounts),
+        )
+        .route(
+            "/xrpc/tools.aurora.admin.batchRestoreAccounts",
+            post(crate::api::aurora_admin::batch_restore_accounts),
+        )
+        .route(
+            "/xrpc/tools.aurora.admin.batchTakedownRecords",
+            post(crate::api::aurora_admin::batch_takedown_records),
+        )
+        .route(
+            "/xrpc/tools.aurora.admin.batchApplyLabel",
+            post(crate::api::aurora_admin::batch_apply_label),
+        )
+        .route(
+            "/xrpc/tools.aurora.admin.batchRemoveLabel",
+            post(crate::api::aurora_admin::batch_remove_label),
+        )
+        // triggerPasswordReset (Phase 3.5, §8.6). Admin+ role check
+        // happens at handler level. Rationale recorded in
+        // admin_audit_log per design doc step 5.
+        .route(
+            "/xrpc/tools.aurora.admin.triggerPasswordReset",
+            post(crate::api::aurora_admin::trigger_password_reset),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -2254,9 +2288,17 @@ fn aurora_capability_families() -> serde_json::Value {
             "listAppeals",
             "getAppeal"
         ],
-        // Phase 3.5 (chainlink #102) — emitEvent unified action surface.
+        // Phase 3.5 (chainlink #102) — emitEvent unified action surface,
+        // six batch endpoints, triggerPasswordReset companion.
         "tools.aurora.admin": [
-            "emitEvent"
+            "emitEvent",
+            "batchTakedownAccounts",
+            "batchSuspendAccounts",
+            "batchRestoreAccounts",
+            "batchTakedownRecords",
+            "batchApplyLabel",
+            "batchRemoveLabel",
+            "triggerPasswordReset"
         ],
         // Phase 3.6 (chainlink #103) — role management relocated from
         // com.atproto.admin.{grantRole,revokeRole}.
