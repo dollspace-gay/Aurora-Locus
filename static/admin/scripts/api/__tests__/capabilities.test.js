@@ -7,7 +7,7 @@
 //    capabilities, capability set empty."
 //
 // No framework dependency — runs under bare Node via `node
-// static/admin/substrate/__tests__/capabilities.test.js`. Stubs
+// static/admin/scripts/api/__tests__/capabilities.test.js`. Stubs
 // `window`, `localStorage`, and `fetch` minimally so the substrate's
 // `(function(global) {})(window)` wrapper has somewhere to land.
 

@@ -1,547 +1,98 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Aurora Locus Admin Panel</title>
-    <link rel="stylesheet" href="/admin/style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aurora Locus admin</title>
+  <link rel="stylesheet" href="/admin/styles/tokens.css">
+  <link rel="stylesheet" href="/admin/styles/base.css">
+  <link rel="stylesheet" href="/admin/styles/components.css">
+  <link rel="stylesheet" href="/admin/styles/pages.css">
 </head>
 <body>
-    <div class="admin-container">
-        <!-- Sidebar Navigation -->
-        <aside class="sidebar">
-            <div class="logo">
-                <h1>Aurora Locus</h1>
-                <p class="subtitle">Admin Panel</p>
-            </div>
+  <a href="#content" class="skip-to-content">Skip to content</a>
 
-            <nav class="nav-menu">
-                <a href="#dashboard" class="nav-item active" data-page="dashboard">
-                    <span class="icon">📊</span>
-                    Dashboard
-                </a>
-                <a href="#users" class="nav-item" data-page="users">
-                    <span class="icon">👥</span>
-                    Users
-                </a>
-                <a href="#moderation" class="nav-item" data-page="moderation">
-                    <span class="icon">🛡️</span>
-                    Moderation Queue
-                    <span class="badge" id="mod-queue-count">0</span>
-                </a>
-                <a href="#reports" class="nav-item" data-page="reports">
-                    <span class="icon">🚨</span>
-                    Reports
-                    <span class="badge" id="reports-count">0</span>
-                </a>
-                <a href="#events" class="nav-item" data-page="events">
-                    <span class="icon">📜</span>
-                    Mod Events
-                </a>
-                <a href="#appeals" class="nav-item" data-page="appeals">
-                    <span class="icon">⚖️</span>
-                    Appeals
-                </a>
-                <a href="#audit" class="nav-item" data-page="audit">
-                    <span class="icon">🔗</span>
-                    Audit
-                </a>
-                <a href="#invites" class="nav-item" data-page="invites">
-                    <span class="icon">✉️</span>
-                    Invite Codes
-                </a>
-                <a href="#settings" class="nav-item" data-page="settings">
-                    <span class="icon">⚙️</span>
-                    Settings
-                </a>
-            </nav>
+  <div class="admin-container">
+    <aside class="sidebar" id="sidebar" aria-label="Primary navigation">
+      <!-- Sidebar mounts here via app.js -->
+    </aside>
 
-            <div class="sidebar-footer">
-                <div class="admin-info">
-                    <p class="admin-name" id="admin-name">Admin</p>
-                    <p class="admin-role">Administrator</p>
-                </div>
-                <button class="btn-logout" id="sidebar-theme-toggle" onclick="cycleSidebarTheme()" aria-label="Toggle theme" style="margin-bottom: 0.5rem;">🖥 System</button>
-                <button class="btn-logout" onclick="logout()">Logout</button>
-            </div>
-        </aside>
+    <main id="content" class="main-content" tabindex="-1">
+      <!-- Per-page modules render here via the router -->
+    </main>
+  </div>
 
-        <!-- Main Content Area -->
-        <main class="main-content">
-            <!-- Dashboard Page -->
-            <div id="page-dashboard" class="page active">
-                <header class="page-header">
-                    <h2>Dashboard</h2>
-                    <p class="page-subtitle">Overview of your PDS instance</p>
-                </header>
+  <div id="modal-overlay" class="modal-overlay"></div>
+  <div id="modal-root"></div>
+  <div id="toast-root" aria-live="polite" aria-atomic="true"></div>
+  <div id="palette-root"></div>
 
-                <!-- Phase 3.7B (chainlink #116): Operator/Moderator flavor toggle per §5.1 -->
-                <div id="dashboard-flavor-tabs" role="tablist" aria-label="Dashboard flavor" style="display: flex; gap: 0.5rem; margin-bottom: 1rem;">
-                    <button type="button" role="tab" aria-selected="true" data-flavor="operator" class="active" onclick="setDashboardFlavor('operator')">Operator</button>
-                    <button type="button" role="tab" aria-selected="false" data-flavor="moderator" onclick="setDashboardFlavor('moderator')">Moderator</button>
-                </div>
+  <!-- Chart.js retained from previous build for Dashboard sparklines -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-                <div id="dashboard-operator">
-                <!-- Stats Cards -->
-                <div class="stats-grid">
-                    <div class="stat-card">
-                        <div class="stat-icon">👥</div>
-                        <div class="stat-content">
-                            <p class="stat-label">Total Users</p>
-                            <p class="stat-value" id="stat-users">0</p>
-                            <p class="stat-change positive">+12 this week</p>
-                        </div>
-                    </div>
+  <!-- Foundation: state + dom + i18n + format + a11y + icons -->
+  <script src="/admin/scripts/lib/dom.js"></script>
+  <script src="/admin/scripts/lib/icons.js"></script>
+  <script src="/admin/scripts/lib/i18n.js"></script>
+  <script src="/admin/scripts/lib/format.js"></script>
+  <script src="/admin/scripts/lib/a11y.js"></script>
+  <script src="/admin/scripts/state/session.js"></script>
+  <script src="/admin/scripts/state/settings.js"></script>
 
-                    <div class="stat-card">
-                        <div class="stat-icon">📝</div>
-                        <div class="stat-content">
-                            <p class="stat-label">Total Posts</p>
-                            <p class="stat-value" id="stat-posts">0</p>
-                            <p class="stat-change positive">+243 today</p>
-                        </div>
-                    </div>
+  <!-- API substrate -->
+  <script src="/admin/scripts/api/client.js"></script>
+  <script src="/admin/scripts/api/capabilities.js"></script>
+  <script src="/admin/scripts/api/endpoints.js"></script>
+  <script src="/admin/scripts/api/subscription.js"></script>
 
-                    <div class="stat-card">
-                        <div class="stat-icon">🛡️</div>
-                        <div class="stat-content">
-                            <p class="stat-label">Pending Reports</p>
-                            <p class="stat-value" id="stat-reports">0</p>
-                            <p class="stat-change">Requires attention</p>
-                        </div>
-                    </div>
+  <!-- Substrate components (substrate primitives 1, 3, 4, 5, 7, 8, 10–12, 14–15, 20) -->
+  <script src="/admin/scripts/components/EntityRef.js"></script>
+  <script src="/admin/scripts/components/Modal.js"></script>
+  <script src="/admin/scripts/components/Toast.js"></script>
+  <script src="/admin/scripts/components/StatusBadge.js"></script>
+  <script src="/admin/scripts/components/Drawer.js"></script>
+  <script src="/admin/scripts/components/EmptyState.js"></script>
+  <script src="/admin/scripts/components/PaginationStrip.js"></script>
+  <script src="/admin/scripts/components/CalendarWidget.js"></script>
+  <script src="/admin/scripts/components/FilterStrip.js"></script>
+  <script src="/admin/scripts/components/ThemeToggle.js"></script>
+  <script src="/admin/scripts/components/CommandPalette.js"></script>
+  <script src="/admin/scripts/components/ActionPanel.js"></script>
+  <script src="/admin/scripts/components/BulkActionPanel.js"></script>
 
-                    <div class="stat-card">
-                        <div class="stat-icon">💾</div>
-                        <div class="stat-content">
-                            <p class="stat-label">Storage Used</p>
-                            <p class="stat-value" id="stat-storage">0 GB</p>
-                            <p class="stat-change">of 100 GB</p>
-                        </div>
-                    </div>
-                </div>
+  <!-- Routing -->
+  <script src="/admin/scripts/routing/routes.js"></script>
+  <script src="/admin/scripts/routing/router.js"></script>
 
-                <!-- Charts -->
-                <div class="charts-grid">
-                    <div class="chart-card">
-                        <h3>User Growth</h3>
-                        <canvas id="userGrowthChart"></canvas>
-                    </div>
+  <!-- Pages (each registers itself with the router on load) -->
+  <script src="/admin/scripts/pages/Dashboard.js"></script>
+  <script src="/admin/scripts/pages/Queue.js"></script>
+  <script src="/admin/scripts/pages/Reports.js"></script>
+  <script src="/admin/scripts/pages/ReportDetail.js"></script>
+  <script src="/admin/scripts/pages/Appeals.js"></script>
+  <script src="/admin/scripts/pages/AppealDetail.js"></script>
+  <script src="/admin/scripts/pages/Events.js"></script>
+  <script src="/admin/scripts/pages/EventDetail.js"></script>
+  <script src="/admin/scripts/pages/Audit.js"></script>
+  <script src="/admin/scripts/pages/AuditEntryDetail.js"></script>
+  <script src="/admin/scripts/pages/Accounts.js"></script>
+  <script src="/admin/scripts/pages/AccountDetail.js"></script>
+  <script src="/admin/scripts/pages/RecordDetail.js"></script>
+  <script src="/admin/scripts/pages/BlobDetail.js"></script>
+  <script src="/admin/scripts/pages/Invites.js"></script>
+  <script src="/admin/scripts/pages/InviteDetail.js"></script>
+  <script src="/admin/scripts/pages/Sequencer.js"></script>
+  <script src="/admin/scripts/pages/Federation.js"></script>
+  <script src="/admin/scripts/pages/BlobOps.js"></script>
+  <script src="/admin/scripts/pages/RateLimits.js"></script>
+  <script src="/admin/scripts/pages/SystemHealth.js"></script>
+  <script src="/admin/scripts/pages/Server.js"></script>
+  <script src="/admin/scripts/pages/SettingsGeneral.js"></script>
+  <script src="/admin/scripts/pages/SettingsUiModes.js"></script>
+  <script src="/admin/scripts/pages/SettingsRoles.js"></script>
+  <script src="/admin/scripts/pages/SettingsRolesMembers.js"></script>
 
-                    <div class="chart-card">
-                        <h3>Activity Overview</h3>
-                        <canvas id="activityChart"></canvas>
-                    </div>
-                </div>
-
-                <!-- Recent Activity -->
-                <div class="activity-card">
-                    <h3>Recent Activity</h3>
-                    <div class="activity-list" id="recent-activity">
-                        <!-- Populated by JS -->
-                    </div>
-                </div>
-                </div><!-- /#dashboard-operator -->
-
-                <!-- Moderator flavor (§5.1) — visible when tab selected -->
-                <div id="dashboard-moderator" style="display: none;">
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-icon">📥</div>
-                            <div class="stat-content">
-                                <p class="stat-label">Open Reports</p>
-                                <p class="stat-value" id="mod-stat-open-reports">0</p>
-                                <p class="stat-change neutral">awaiting triage</p>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon">⚖️</div>
-                            <div class="stat-content">
-                                <p class="stat-label">Pending Appeals</p>
-                                <p class="stat-value" id="mod-stat-pending-appeals">0</p>
-                                <p class="stat-change neutral">awaiting review</p>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon">🛎️</div>
-                            <div class="stat-content">
-                                <p class="stat-label">Queue attention</p>
-                                <p class="stat-value" id="mod-stat-queue-total">0</p>
-                                <p class="stat-change neutral">items needing decision</p>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon">⏱️</div>
-                            <div class="stat-content">
-                                <p class="stat-label">Oldest open report</p>
-                                <p class="stat-value" id="mod-stat-oldest-age">—</p>
-                                <p class="stat-change neutral">queue age signal</p>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="activity-card" style="margin-top: 1rem;">
-                        <h3>Moderation metrics — last 30 days</h3>
-                        <div id="mod-metrics-chart">
-                            <p class="empty-state">Loading…</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Users Page -->
-            <div id="page-users" class="page">
-                <header class="page-header">
-                    <h2>User Management</h2>
-                    <div class="header-actions">
-                        <input type="text" class="search-input" placeholder="Search users..." id="user-search">
-                        <button class="btn-primary" onclick="exportUsers()">Export</button>
-                    </div>
-                </header>
-
-                <div class="table-card">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th scope="col" aria-label="Bulk select"><span class="visually-hidden">Bulk select</span></th>
-                                <th>Handle</th>
-                                <th>DID</th>
-                                <th>Email</th>
-                                <th>Created</th>
-                                <th>Status</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="users-table">
-                            <!-- Populated by JS -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Moderation Queue Page -->
-            <div id="page-moderation" class="page">
-                <header class="page-header">
-                    <h2>Moderation Queue</h2>
-                    <div class="header-actions">
-                        <select class="filter-select" id="mod-filter">
-                            <option value="all">All Items</option>
-                            <option value="pending">Pending</option>
-                            <option value="reviewed">Reviewed</option>
-                        </select>
-                    </div>
-                </header>
-
-                <div class="moderation-queue" id="moderation-queue">
-                    <!-- Populated by JS -->
-                </div>
-            </div>
-
-            <!-- Reports Page -->
-            <div id="page-reports" class="page">
-                <header class="page-header">
-                    <h2>Content Reports</h2>
-                    <div class="header-actions">
-                        <select class="filter-select" id="report-filter">
-                            <option value="open">Open</option>
-                            <option value="resolved">Resolved</option>
-                            <option value="all">All</option>
-                        </select>
-                    </div>
-                </header>
-
-                <div class="reports-list" id="reports-list">
-                    <!-- Populated by JS -->
-                </div>
-            </div>
-
-            <!-- Mod Events Page (chainlink #100 / Phase 3.3 + #106 / Phase 3.9) -->
-            <div id="page-events" class="page">
-                <header class="page-header">
-                    <h2>Moderation Events</h2>
-                    <p class="page-subtitle">
-                        Cross-instance event log via tools.aurora.moderator.queryEvents.
-                        Click an event for full context.
-                    </p>
-                    <!-- Phase 3.9: real-time indicator (substrate primitive 19) -->
-                    <div id="events-rt-indicator" class="rt-indicator-slot"></div>
-                </header>
-                <div class="filter-bar" style="margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap;">
-                    <input type="text" id="events-filter-actor" placeholder="Filter by actor DID" style="flex: 1; min-width: 200px;">
-                    <input type="text" id="events-filter-subject" placeholder="Filter by subject DID" style="flex: 1; min-width: 200px;">
-                    <input type="text" id="events-filter-type" placeholder="Filter by event type" style="flex: 1; min-width: 160px;">
-                    <button class="btn-primary" onclick="loadEvents()">Apply</button>
-                </div>
-                <div id="events-table-container">
-                    <p class="empty-state">Click Apply to load events.</p>
-                </div>
-                <div style="margin-top: 16px; display: flex; gap: 8px;">
-                    <button class="btn-secondary" id="events-prev-btn" onclick="loadEventsPrev()" disabled>Previous</button>
-                    <button class="btn-secondary" id="events-next-btn" onclick="loadEventsNext()" disabled>Next</button>
-                </div>
-            </div>
-
-            <!-- Audit Page (chainlink #105 / Phase 3.8 + #106 / Phase 3.9) -->
-            <div id="page-audit" class="page">
-                <header class="page-header">
-                    <h2>Audit Trail</h2>
-                    <p class="page-subtitle">
-                        Hash-chained audit log via tools.aurora.admin.getAuditTrail.
-                        Click an entry for full chain-walk context.
-                    </p>
-                    <div id="audit-rt-indicator" class="rt-indicator-slot"></div>
-                </header>
-                <div class="filter-bar" style="margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap;">
-                    <input type="text" id="audit-filter-actor" placeholder="Filter by actor DID" style="flex: 1; min-width: 200px;">
-                    <input type="text" id="audit-filter-subject" placeholder="Filter by subject DID" style="flex: 1; min-width: 200px;">
-                    <input type="text" id="audit-filter-action" placeholder="Filter by action" style="flex: 1; min-width: 160px;">
-                    <label style="display: flex; align-items: center; gap: 4px;">
-                        <input type="checkbox" id="audit-verified-only">
-                        Verified only
-                    </label>
-                    <button class="btn-primary" onclick="loadAudit()">Apply</button>
-                </div>
-                <div id="audit-table-container">
-                    <p class="empty-state">Click Apply to load audit entries.</p>
-                </div>
-                <div style="margin-top: 16px; display: flex; gap: 8px;">
-                    <button class="btn-secondary" id="audit-prev-btn" onclick="loadAuditPrev()" disabled>Previous</button>
-                    <button class="btn-secondary" id="audit-next-btn" onclick="loadAuditNext()" disabled>Next</button>
-                </div>
-            </div>
-
-            <!-- Appeals Page (chainlink #101 / Phase 3.4) -->
-            <div id="page-appeals" class="page">
-                <header class="page-header">
-                    <h2>Moderation Appeals</h2>
-                    <p class="page-subtitle">
-                        Cross-instance appeals log via tools.aurora.moderator.listAppeals.
-                        Click an appeal for the full timeline.
-                    </p>
-                </header>
-                <div class="filter-bar" style="margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap;">
-                    <select id="appeals-filter-status" style="min-width: 160px;">
-                        <option value="">All statuses</option>
-                        <option value="pending">Pending</option>
-                        <option value="under_review">Under Review</option>
-                        <option value="approved">Approved</option>
-                        <option value="denied">Denied</option>
-                        <option value="escalated">Escalated</option>
-                    </select>
-                    <input type="text" id="appeals-filter-appellant" placeholder="Filter by appellant DID" style="flex: 1; min-width: 200px;">
-                    <input type="text" id="appeals-filter-reviewer" placeholder="Filter by reviewer DID" style="flex: 1; min-width: 200px;">
-                    <button class="btn-primary" onclick="loadAppeals()">Apply</button>
-                </div>
-                <div id="appeals-table-container">
-                    <p class="empty-state">Click Apply to load appeals.</p>
-                </div>
-                <div style="margin-top: 16px; display: flex; gap: 8px;">
-                    <button class="btn-secondary" id="appeals-prev-btn" onclick="loadAppealsPrev()" disabled>Previous</button>
-                    <button class="btn-secondary" id="appeals-next-btn" onclick="loadAppealsNext()" disabled>Next</button>
-                </div>
-            </div>
-
-            <!-- Invite Codes Page -->
-            <div id="page-invites" class="page">
-                <header class="page-header">
-                    <h2>Invite Codes</h2>
-                    <div class="header-actions">
-                        <button class="btn-primary" onclick="generateInvites()">Generate Codes</button>
-                    </div>
-                </header>
-
-                <div class="invite-stats">
-                    <div class="stat-item">
-                        <span class="label">Total Codes:</span>
-                        <span class="value" id="invite-total">0</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="label">Available:</span>
-                        <span class="value" id="invite-available">0</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="label">Used:</span>
-                        <span class="value" id="invite-used">0</span>
-                    </div>
-                </div>
-
-                <div class="table-card">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th scope="col" aria-label="Bulk select"><span class="visually-hidden">Bulk select</span></th>
-                                <th>Code</th>
-                                <th>Uses</th>
-                                <th>Created By</th>
-                                <th>Created At</th>
-                                <th>Status</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="invites-table">
-                            <!-- Populated by JS -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Settings Page -->
-            <div id="page-settings" class="page">
-                <header class="page-header">
-                    <h2>Settings</h2>
-                    <p class="page-subtitle">Configure your PDS instance</p>
-                </header>
-
-                <div class="settings-grid">
-                    <div class="settings-card">
-                        <h3>General Settings</h3>
-                        <form id="general-settings-form">
-                            <div class="form-group">
-                                <label>Instance Name</label>
-                                <input type="text" id="setting-name" value="Aurora Locus PDS">
-                            </div>
-                            <div class="form-group">
-                                <label>Service URL</label>
-                                <input type="text" id="setting-url" value="https://pds.example.com">
-                            </div>
-                            <div class="form-group">
-                                <label>Max Blob Size (MB)</label>
-                                <input type="number" id="setting-blob-size" value="5">
-                            </div>
-                            <button type="submit" class="btn-primary">Save Changes</button>
-                        </form>
-                    </div>
-
-                    <div class="settings-card">
-                        <h3>Registration Settings</h3>
-                        <form id="registration-settings-form">
-                            <div class="form-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="setting-invite-required">
-                                    Require Invite Codes
-                                </label>
-                            </div>
-                            <div class="form-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="setting-email-verification">
-                                    Require Email Verification
-                                </label>
-                            </div>
-                            <button type="submit" class="btn-primary">Save Changes</button>
-                        </form>
-                    </div>
-
-                    <div class="settings-card">
-                        <h3>Moderation Settings</h3>
-                        <form id="moderation-settings-form">
-                            <div class="form-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="setting-auto-report">
-                                    Enable Automatic Content Filtering
-                                </label>
-                            </div>
-                            <div class="form-group">
-                                <label>Report Threshold</label>
-                                <input type="number" id="setting-report-threshold" value="3">
-                            </div>
-                            <button type="submit" class="btn-primary">Save Changes</button>
-                        </form>
-                    </div>
-
-                    <!-- Aurora capability probe (chainlink #99 / Phase 3.2) -->
-                    <div class="settings-card">
-                        <h3>Aurora Capabilities</h3>
-                        <p class="settings-help">
-                            Discover which Aurora extensions this instance supports.
-                            Returns the static capability list at compile time.
-                        </p>
-                        <button type="button" class="btn-primary" onclick="loadCapabilities()">Probe Capabilities</button>
-                        <pre id="capabilities-output" class="capabilities-output" style="display: none; margin-top: 12px; max-height: 400px; overflow-y: auto; padding: 12px; background: #1a1a1a; color: #e6e6e6; border-radius: 4px; font-family: monospace; font-size: 12px;"></pre>
-                    </div>
-
-                    <!-- Phase 3.10 — UI & modes (chainlink #117 / §5.5.2) -->
-                    <div class="settings-card" id="ui-modes-card">
-                        <h3>UI & modes</h3>
-                        <p class="settings-help">Theme, language, deployment moderation mode.</p>
-
-                        <fieldset style="border: 1px solid var(--border-color); padding: 0.75rem; margin-top: 0.75rem;">
-                            <legend>Theme</legend>
-                            <label><input type="radio" name="ui-theme" value="light" onchange="setUiTheme(this.value)"> Light</label>
-                            <label style="margin-left: 0.75rem;"><input type="radio" name="ui-theme" value="dark" onchange="setUiTheme(this.value)"> Dark</label>
-                            <label style="margin-left: 0.75rem;"><input type="radio" name="ui-theme" value="system" onchange="setUiTheme(this.value)"> System</label>
-                            <p class="settings-help">System uses your operating system preference.</p>
-                        </fieldset>
-
-                        <fieldset style="border: 1px solid var(--border-color); padding: 0.75rem; margin-top: 0.75rem;">
-                            <legend>Language</legend>
-                            <select id="ui-language" onchange="setUiLanguage(this.value)">
-                                <option value="en">English</option>
-                            </select>
-                            <p class="settings-help">Other languages may be available as locale files are added.</p>
-                        </fieldset>
-
-                        <fieldset style="border: 1px solid var(--border-color); padding: 0.75rem; margin-top: 0.75rem;">
-                            <legend>Moderation mode <span class="role-tag">SuperAdmin only</span></legend>
-                            <label><input type="radio" name="mod-mode" value="full" disabled> Full</label>
-                            <label style="margin-left: 0.75rem;"><input type="radio" name="mod-mode" value="reduced" disabled> Reduced</label>
-                            <label style="margin-left: 0.75rem;"><input type="radio" name="mod-mode" value="disabled" disabled> Disabled</label>
-                            <p>Current: <strong id="mod-mode-current">Loading…</strong></p>
-                            <label style="display: block; margin-top: 0.5rem;">
-                                Redirect URL (when disabled)
-                                <input type="text" id="mod-mode-redirect" style="width: 100%;" placeholder="https://moderation.example.com" disabled>
-                            </label>
-                            <label style="display: block; margin-top: 0.5rem;">
-                                Rationale (required for write)
-                                <textarea id="mod-mode-rationale" rows="2" style="width: 100%;" disabled></textarea>
-                            </label>
-                            <p class="settings-help">
-                                Changing this affects all operators and is recorded in the audit chain.
-                            </p>
-                            <button type="button" class="btn-primary" id="mod-mode-save" onclick="saveModerationMode()" disabled>Save mode change</button>
-                        </fieldset>
-                    </div>
-                </div>
-            </div>
-        </main>
-    </div>
-
-    <!-- Modals -->
-    <div id="modal-overlay" class="modal-overlay" onclick="closeModal()"></div>
-
-    <!-- User Details Modal -->
-    <div id="modal-user-details" class="modal">
-        <div class="modal-header">
-            <h3>User Details</h3>
-            <button class="modal-close" onclick="closeModal()">&times;</button>
-        </div>
-        <div class="modal-body" id="user-details-content">
-            <!-- Populated by JS -->
-        </div>
-    </div>
-
-    <!-- Report Details Modal -->
-    <div id="modal-report-details" class="modal">
-        <div class="modal-header">
-            <h3>Report Details</h3>
-            <button class="modal-close" onclick="closeModal()">&times;</button>
-        </div>
-        <div class="modal-body" id="report-details-content">
-            <!-- Populated by JS -->
-        </div>
-        <div class="modal-footer">
-            <button class="btn-secondary" onclick="closeModal()">Close</button>
-            <button class="btn-danger" onclick="takedownContent()">Takedown</button>
-            <button class="btn-primary" onclick="resolveReport()">Resolve</button>
-        </div>
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <!-- Phase 3.5 substrate primitives (chainlink #102) -->
-    <!-- Load order matters: capabilities feeds the others. -->
-    <script src="/admin/substrate/capabilities.js"></script>
-    <script src="/admin/substrate/i18n.js"></script>
-    <script src="/admin/substrate/action-panel.js"></script>
-    <script src="/admin/substrate/bulk-action-panel.js"></script>
-    <script src="/admin/substrate/subscription.js"></script>
-    <script src="/admin/script.js"></script>
+  <!-- App entry point — runs after all pages have registered -->
+  <script src="/admin/scripts/app.js"></script>
 </body>
 </html>

@@ -1,0 +1,187 @@
+/* Aurora Locus admin — design tokens
+ *
+ * Per docs/AURORA_ADMIN_UI_DESIGN.md §7. Light mode is the :root default;
+ * dark mode overrides via [data-theme="dark"]. Every component refers to
+ * these tokens rather than hardcoded values.
+ */
+
+:root {
+  /* Primary */
+  --primary-color: #3b82f6;
+  --primary-dark: #2563eb;
+  --primary-light: #60a5fa;
+
+  /* Surfaces */
+  --background: #f8fafc;
+  --surface: #ffffff;
+  --surface-elevated: #ffffff;
+
+  /* Text */
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-tertiary: #94a3b8;
+  --text-on-primary: #ffffff;
+
+  /* Borders */
+  --border-color: #e2e8f0;
+  --border-color-strong: #cbd5e1;
+
+  /* Sidebar */
+  --sidebar-bg: #1e293b;
+  --sidebar-text: #cbd5e1;
+  --sidebar-active: #3b82f6;
+  --sidebar-hover: #334155;
+
+  /* Semantic colors */
+  --success-color: #10b981;
+  --warning-color: #f59e0b;
+  --danger-color: #ef4444;
+  --attention-color: #f59e0b;
+
+  /* Status badge backgrounds (soft tints) */
+  --status-active-bg: #dcfce7;
+  --status-active-fg: #166534;
+  --status-suspended-bg: #fef3c7;
+  --status-suspended-fg: #92400e;
+  --status-takedown-bg: #fee2e2;
+  --status-takedown-fg: #991b1b;
+  --status-pending-bg: #dbeafe;
+  --status-pending-fg: #1e40af;
+  --status-deactivated-bg: #f3f4f6;
+  --status-deactivated-fg: #374151;
+  --status-verified-bg: #ecfdf5;
+  --status-verified-fg: #047857;
+  --status-pre-chain-bg: #fef3c7;
+  --status-pre-chain-fg: #78350f;
+
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+               'Helvetica Neue', Arial, system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+               'Courier New', monospace;
+
+  --font-size-xs: 0.75rem;
+  --font-size-sm: 0.875rem;
+  --font-size-base: 1rem;
+  --font-size-lg: 1.125rem;
+  --font-size-xl: 1.25rem;
+  --font-size-2xl: 1.5rem;
+
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  --line-height-tight: 1.25;
+  --line-height-normal: 1.5;
+  --line-height-relaxed: 1.625;
+
+  /* Spacing */
+  --space-0: 0;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+
+  /* Radii */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.75rem;
+  --radius-full: 9999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1),
+               0 2px 4px -2px rgba(0, 0, 0, 0.05);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1),
+               0 4px 6px -4px rgba(0, 0, 0, 0.05);
+  --shadow-focus: 0 0 0 3px rgba(59, 130, 246, 0.4);
+
+  /* Motion */
+  --transition-fast: 100ms ease;
+  --transition-normal: 200ms ease;
+  --transition-slow: 400ms ease;
+
+  /* Layout */
+  --sidebar-width: 260px;
+  --content-max-width: 1400px;
+  --rail-width: 320px;
+
+  /* Z-index */
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-modal: 1000;
+  --z-toast: 2000;
+  --z-palette: 3000;
+}
+
+[data-theme="dark"] {
+  /* Primary - lightened for dark backgrounds */
+  --primary-color: #60a5fa;
+  --primary-dark: #3b82f6;
+  --primary-light: #93c5fd;
+
+  /* Surfaces - dark grays, not pure black */
+  --background: #0a0e14;
+  --surface: #151b23;
+  --surface-elevated: #1c242e;
+
+  /* Text - off-white, not pure white */
+  --text-primary: #e6edf3;
+  --text-secondary: #9ba8b8;
+  --text-tertiary: #6e7681;
+  --text-on-primary: #0a0e14;
+
+  /* Borders - subtle in dark mode */
+  --border-color: #2d3748;
+  --border-color-strong: #475569;
+
+  /* Sidebar - even darker than surface */
+  --sidebar-bg: #0a0e14;
+  --sidebar-text: #cbd5e1;
+  --sidebar-active: #3b82f6;
+  --sidebar-hover: #1c242e;
+
+  /* Semantic colors - lightened slightly for contrast */
+  --success-color: #34d399;
+  --warning-color: #fbbf24;
+  --danger-color: #f87171;
+  --attention-color: #fbbf24;
+
+  /* Status badge backgrounds - dark tinted */
+  --status-active-bg: #064e3b;
+  --status-active-fg: #6ee7b7;
+  --status-suspended-bg: #78350f;
+  --status-suspended-fg: #fcd34d;
+  --status-takedown-bg: #7f1d1d;
+  --status-takedown-fg: #fca5a5;
+  --status-pending-bg: #1e3a8a;
+  --status-pending-fg: #93c5fd;
+  --status-deactivated-bg: #1f2937;
+  --status-deactivated-fg: #9ca3af;
+  --status-verified-bg: #064e3b;
+  --status-verified-fg: #6ee7b7;
+  --status-pre-chain-bg: #451a03;
+  --status-pre-chain-fg: #fbbf24;
+
+  /* Shadows deeper in dark mode */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4),
+               0 2px 4px -2px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5),
+               0 4px 6px -4px rgba(0, 0, 0, 0.4);
+  --shadow-focus: 0 0 0 3px rgba(96, 165, 250, 0.5);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
