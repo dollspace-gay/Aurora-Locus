@@ -382,6 +382,18 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.admin.triggerPasswordReset",
             post(crate::api::aurora_admin::trigger_password_reset),
         )
+        // Phase 3.7 (chainlink #104) — moderation aggregations.
+        // Auth: AdminModeration scope, Moderator+ role enforced at
+        // handler level. Powers Dashboard Moderator flavor + bell
+        // badge. Per §8.2 / §8.3.
+        .route(
+            "/xrpc/tools.aurora.admin.getQueueStats",
+            get(crate::api::aurora_admin::get_queue_stats),
+        )
+        .route(
+            "/xrpc/tools.aurora.admin.getModerationMetrics",
+            post(crate::api::aurora_admin::get_moderation_metrics),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -2290,6 +2302,7 @@ fn aurora_capability_families() -> serde_json::Value {
         ],
         // Phase 3.5 (chainlink #102) — emitEvent unified action surface,
         // six batch endpoints, triggerPasswordReset companion.
+        // Phase 3.7 (chainlink #104) — moderation aggregations.
         "tools.aurora.admin": [
             "emitEvent",
             "batchTakedownAccounts",
@@ -2298,7 +2311,9 @@ fn aurora_capability_families() -> serde_json::Value {
             "batchTakedownRecords",
             "batchApplyLabel",
             "batchRemoveLabel",
-            "triggerPasswordReset"
+            "triggerPasswordReset",
+            "getQueueStats",
+            "getModerationMetrics"
         ],
         // Phase 3.6 (chainlink #103) — role management relocated from
         // com.atproto.admin.{grantRole,revokeRole}.
