@@ -13,7 +13,7 @@
       '<div id="roles-list"><p class="empty-state">Loading…</p></div>';
     try {
       const data = await global.AuroraEndpoints.atproto.listRoles();
-      renderRoles(data, isSuper);
+      renderRoles(groupRoles(data), isSuper);
     } catch (e) {
       document.getElementById('roles-list').innerHTML =
         '<p class="empty-state">Could not load roles: ' + esc(e && e.message) + '</p>';
@@ -21,19 +21,37 @@
     return {};
   }
 
-  function renderRoles(data, isSuper) {
-    const roles = (data && data.roles) || [
-      { name: 'Moderators', members: [], description: 'Acts on subjects-as-content' },
-      { name: 'Administrators', members: [], description: 'Acts on accounts-as-infrastructure' },
-      { name: 'SuperAdmins', members: [], description: 'Acts on authority itself' },
+  // The com.atproto.admin.listRoles handler returns a flat array of
+  // active assignment rows: {roles: [{did, role, granted_by, ...}, ...]}.
+  // The page renders authority *tiers* (Moderators/Administrators/
+  // SuperAdmins) with their members, so group the flat assignments by
+  // role tier here. If the server ever pre-groups (members[] present on
+  // the first entry), pass it through unchanged.
+  function groupRoles(data) {
+    const flat = (data && Array.isArray(data.roles)) ? data.roles : [];
+    if (flat.length > 0 && Array.isArray(flat[0].members)) {
+      return flat;
+    }
+    const tiers = [
+      { key: 'moderator', name: 'Moderators', description: 'Acts on subjects-as-content', members: [] },
+      { key: 'admin', name: 'Administrators', description: 'Acts on accounts-as-infrastructure', members: [] },
+      { key: 'superadmin', name: 'SuperAdmins', description: 'Acts on authority itself', members: [] },
     ];
+    for (const row of flat) {
+      const tier = tiers.find((t) => t.key === row.role);
+      if (tier) tier.members.push({ did: row.did, handle: row.handle });
+    }
+    return tiers;
+  }
+
+  function renderRoles(roles, isSuper) {
     const c = document.getElementById('roles-list');
     c.innerHTML = roles.map((role) => {
-      const memberCount = (role.members || role.members_count || 0) + (Array.isArray(role.members) ? 0 : 0);
       const members = Array.isArray(role.members) ? role.members : [];
+      const memberCount = members.length;
       const memberSlug = String(role.name || role.role || '').toLowerCase().replace(/\s+/g, '-');
       return '<div class="role-card">' +
-             '  <h3>' + esc(role.name || role.role || 'Role') + ' <small style="font-weight:normal; color: var(--text-secondary);">[' + (memberCount || members.length) + ' member' + ((memberCount || members.length) === 1 ? '' : 's') + ']</small></h3>' +
+             '  <h3>' + esc(role.name || role.role || 'Role') + ' <small style="font-weight:normal; color: var(--text-secondary);">[' + memberCount + ' member' + (memberCount === 1 ? '' : 's') + ']</small></h3>' +
              (role.description ? '<p class="settings-help">' + esc(role.description) + '</p>' : '') +
              '<div class="role-members">' +
              (members.length === 0 ? '<p class="settings-help">No members.</p>' :
