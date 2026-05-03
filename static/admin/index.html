@@ -403,6 +403,11 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Phase 3.5 substrate primitives (chainlink #102) -->
+    <!-- Load order matters: capabilities feeds the others. -->
+    <script src="/admin/substrate/capabilities.js"></script>
+    <script src="/admin/substrate/action-panel.js"></script>
+    <script src="/admin/substrate/bulk-action-panel.js"></script>
     <script src="/admin/script.js"></script>
 </body>
 </html>

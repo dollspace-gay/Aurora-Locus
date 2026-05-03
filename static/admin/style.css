@@ -645,3 +645,162 @@ body {
         gap: 1rem;
     }
 }
+
+/* ============================================================
+   Phase 3.5 substrate (chainlink #102 / §6.3, §6.4)
+   ActionPanel + BulkActionPanel shared styles. Visual contract
+   per docs/AURORA_ADMIN_UI_DESIGN.md §6.3:
+   - Card surface: white, --radius-md (12px), padding 1.5rem
+   - Inline within drawer or modal — never page-wide
+   ============================================================ */
+
+.action-panel-card {
+    background: #fff;
+    border: 1px solid var(--border-color, #e0e0e0);
+    border-radius: 12px;
+    padding: 1.5rem;
+    max-width: 540px;
+    margin: 0 auto;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+}
+
+.action-panel-title {
+    margin: 0 0 1rem 0;
+    font-size: 1.25rem;
+    color: var(--text-primary, #1a1a1a);
+}
+
+.action-panel-row {
+    margin-bottom: 1rem;
+}
+
+.action-panel-label {
+    display: block;
+    font-weight: 600;
+    color: var(--text-primary, #1a1a1a);
+    margin-bottom: 0.375rem;
+    font-size: 0.875rem;
+}
+
+.action-panel-label-inline {
+    margin-left: 0.5rem;
+    color: var(--text-primary, #1a1a1a);
+    font-size: 0.875rem;
+}
+
+.action-panel-action,
+.action-panel-card select,
+.action-panel-card input[type="text"],
+.action-panel-card input[type="number"],
+.action-panel-card textarea {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border-color, #e0e0e0);
+    border-radius: 6px;
+    font-size: 0.875rem;
+    font-family: inherit;
+    box-sizing: border-box;
+}
+
+.action-panel-rationale {
+    min-height: 5rem;
+    max-height: 16rem;
+    resize: vertical;
+}
+
+.action-panel-subject {
+    background: var(--bg-secondary, #f7f7f7);
+    border-radius: 6px;
+    padding: 0.75rem;
+    margin-bottom: 1rem;
+}
+
+.action-panel-subject-value {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8125rem;
+    color: var(--text-secondary, #555);
+    word-break: break-all;
+}
+
+.action-panel-hint {
+    margin-top: 0.25rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary, #777);
+}
+
+.action-panel-high-impact {
+    background: rgba(255, 193, 7, 0.08);
+    border-left: 3px solid #ffc107;
+    padding: 0.75rem;
+    border-radius: 6px;
+}
+
+.action-panel-ack {
+    display: flex;
+    align-items: center;
+}
+
+.action-panel-status {
+    margin-bottom: 1rem;
+    padding: 0 0.25rem;
+    font-size: 0.875rem;
+    color: var(--text-primary, #1a1a1a);
+    min-height: 1.25em;
+}
+
+.action-panel-status-error {
+    color: #b00020;
+}
+
+.action-panel-buttons {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+}
+
+.action-panel-card button[disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* BulkActionPanel-specific */
+.bulk-subjects-list {
+    max-height: 14rem;
+    overflow-y: auto;
+    margin: 0.25rem 0 0 1.25rem;
+    padding: 0;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8125rem;
+    color: var(--text-secondary, #555);
+}
+
+.bulk-subjects-list li {
+    margin: 0.125rem 0;
+    word-break: break-all;
+}
+
+.bulk-subjects-overflow {
+    list-style: none;
+    margin-left: -1.25rem !important;
+    color: var(--text-secondary, #777);
+    font-style: italic;
+}
+
+.bulk-cap-warning {
+    margin: 0.75rem 0;
+    padding: 0.625rem 0.875rem;
+    background: rgba(255, 193, 7, 0.12);
+    border-left: 3px solid #ffc107;
+    border-radius: 4px;
+    font-size: 0.8125rem;
+    color: var(--text-primary, #1a1a1a);
+}
+
+/* Reduced-motion respect — substrate has no motion of its own,
+   but action-panel buttons inherit from base; no overrides needed.
+   This block reserved for future motion additions. */
+@media (prefers-reduced-motion: reduce) {
+    .action-panel-card {
+        transition: none;
+    }
+}
