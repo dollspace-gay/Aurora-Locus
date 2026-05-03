@@ -410,6 +410,14 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.admin.exportAccountForensic",
             post(crate::api::aurora_admin::export_account_forensic),
         )
+        // Phase 3.9 (chainlink #106) — real-time subscription via
+        // WebSocket. Auth: AdminModeration scope, Moderator+ role.
+        // Polling-driven (5s tick) over moderation_event with
+        // heartbeat at 30s; wire protocol per §8.5 message shapes.
+        .route(
+            "/xrpc/tools.aurora.admin.subscribeModEvents",
+            get(crate::api::aurora_subscribe::subscribe_mod_events),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -2331,7 +2339,8 @@ fn aurora_capability_families() -> serde_json::Value {
             "getQueueStats",
             "getModerationMetrics",
             "getAuditTrail",
-            "exportAccountForensic"
+            "exportAccountForensic",
+            "subscribeModEvents"
         ],
         // Phase 3.6 (chainlink #103) — role management relocated from
         // com.atproto.admin.{grantRole,revokeRole}.

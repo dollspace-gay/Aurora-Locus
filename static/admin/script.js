@@ -78,6 +78,16 @@ function navigateTo(page) {
     });
     document.getElementById(`page-${page}`).classList.add('active');
 
+    // Phase 3.9: tear down page-bound subscriptions when leaving.
+    if (currentPage === 'events' && page !== 'events' && eventsSubscription) {
+        eventsSubscription.unsubscribe();
+        eventsSubscription = null;
+    }
+    if (currentPage === 'audit' && page !== 'audit' && auditSubscription) {
+        auditSubscription.unsubscribe();
+        auditSubscription = null;
+    }
+
     currentPage = page;
 
     // Load page data
@@ -1270,10 +1280,55 @@ function saveSettings(formId) {
 let eventsCursorStack = [];      // page history for "Previous"
 let eventsNextCursor = null;     // cursor for "Next"
 
+// Phase 3.9 subscription handle for the Mod Events page. Established
+// on first load and torn down when the page is navigated away from.
+let eventsSubscription = null;
+
 function loadEvents() {
     eventsCursorStack = [];
     eventsNextCursor = null;
     fetchEventsPage(null);
+    // Establish subscription if not already running. New events
+    // arrive while operator is on the page and prepend to the table
+    // with a brief highlight per §6.18 + §5.3.6.
+    if (!eventsSubscription) {
+        const indicator = document.getElementById('events-rt-indicator');
+        eventsSubscription = AuroraSubscription.subscribe(
+            'subscribe-mod-events',
+            {},
+            {
+                onEvent: (event) => prependLiveEvent(event),
+                onConnected: () => {},
+                onDisconnected: () => {},
+                onError: (e) => console.warn('subscribeModEvents error:', e),
+            }
+        );
+        if (indicator) AuroraSubscription.attachIndicator(indicator, eventsSubscription);
+    }
+}
+
+// Real-time event arrival: prepend to existing table with a brief
+// fade-in highlight per §5.3.6. If the operator is mid-pagination
+// (cursor non-null), don't disturb the visible page.
+function prependLiveEvent(event) {
+    if (eventsCursorStack.length > 0) return; // operator on a non-first page
+    const container = document.getElementById('events-table-container');
+    const tbody = container?.querySelector('table.data-table tbody');
+    if (!tbody) return;
+    const when = new Date(event.createdAt).toLocaleString();
+    const actor = event.actorDid || '';
+    let subject = '—';
+    if (event.subjectDid) subject = 'repo: ' + event.subjectDid;
+    else if (event.subjectUri) subject = 'record: ' + event.subjectUri;
+    const tr = document.createElement('tr');
+    tr.className = 'rt-fadein';
+    tr.innerHTML = `<td>${when}</td><td>${event.eventType}</td><td>${actor}</td>` +
+                   `<td>${subject}</td><td><a href="javascript:void(0)" onclick="loadEventDetail(${event.id})">${event.id}</a></td>`;
+    tbody.insertBefore(tr, tbody.firstChild);
+    // Cap visible row count to avoid runaway growth.
+    while (tbody.children.length > 100) {
+        tbody.removeChild(tbody.lastChild);
+    }
 }
 
 function loadEventsNext() {
@@ -1525,11 +1580,34 @@ setInterval(() => {
 
 let auditCursorStack = [];
 let auditNextCursor = null;
+let auditSubscription = null;
 
 function loadAudit() {
     auditCursorStack = [];
     auditNextCursor = null;
     fetchAuditPage(null);
+    if (!auditSubscription) {
+        // The Audit page subscribes to mod events with the audit
+        // chain entries piggy-backed (Phase 3.9 sends only Event
+        // messages for now; audit-entry pushing lands when the
+        // server's subscribe handler grows include_audit_chain
+        // support per §8.5). The indicator still reflects the
+        // connection state so operators see "Live" vs "Reconnecting".
+        const indicator = document.getElementById('audit-rt-indicator');
+        auditSubscription = AuroraSubscription.subscribe(
+            'subscribe-mod-events',
+            {},
+            {
+                onEvent: () => {
+                    // Audit entries flow alongside events; refresh
+                    // page to pick up new chain rows.
+                    if (auditCursorStack.length === 0) loadAudit();
+                },
+                onError: (e) => console.warn('audit subscription error:', e),
+            }
+        );
+        if (indicator) AuroraSubscription.attachIndicator(indicator, auditSubscription);
+    }
 }
 
 function loadAuditNext() {

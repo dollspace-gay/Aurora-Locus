@@ -922,3 +922,77 @@ input[type="checkbox"][disabled] {
     background: #c62828;
     color: #fff;
 }
+
+/* Phase 3.9 substrate (chainlink #106) — real-time indicator (§6.19) */
+
+.rt-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    font-size: 0.8125rem;
+    color: var(--text-secondary, #555);
+}
+
+.rt-indicator-slot {
+    margin-left: auto;
+    align-self: center;
+}
+
+.rt-dot {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #999;
+}
+
+.rt-dot-connected {
+    background: #2e7d32;
+    animation: rt-pulse 2s ease-in-out infinite;
+}
+
+.rt-dot-reconnecting {
+    background: #e6a700;
+    animation: rt-spin 1s linear infinite;
+}
+
+.rt-dot-offline {
+    background: #c62828;
+}
+
+.rt-dot-polling {
+    background: #757575;
+}
+
+@keyframes rt-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.55; transform: scale(0.85); }
+}
+
+@keyframes rt-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .rt-dot-connected,
+    .rt-dot-reconnecting {
+        animation: none;
+    }
+}
+
+/* New-event fade-in animation per §5.3.6 / §6.18 */
+.rt-fadein {
+    animation: rt-fadein 1.4s ease-out;
+}
+
+@keyframes rt-fadein {
+    0% { background: rgba(46, 125, 50, 0.18); }
+    100% { background: transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .rt-fadein {
+        animation: none;
+    }
+}

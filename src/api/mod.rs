@@ -3,6 +3,7 @@ pub mod admin;
 pub mod appview;
 pub mod aurora_admin;
 pub mod aurora_moderator;
+pub mod aurora_subscribe;
 pub mod blob;
 pub mod federation;
 pub mod firehose;

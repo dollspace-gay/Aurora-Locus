@@ -253,7 +253,7 @@
                 </div>
             </div>
 
-            <!-- Mod Events Page (chainlink #100 / Phase 3.3) -->
+            <!-- Mod Events Page (chainlink #100 / Phase 3.3 + #106 / Phase 3.9) -->
             <div id="page-events" class="page">
                 <header class="page-header">
                     <h2>Moderation Events</h2>
@@ -261,6 +261,8 @@
                         Cross-instance event log via tools.aurora.moderator.queryEvents.
                         Click an event for full context.
                     </p>
+                    <!-- Phase 3.9: real-time indicator (substrate primitive 19) -->
+                    <div id="events-rt-indicator" class="rt-indicator-slot"></div>
                 </header>
                 <div class="filter-bar" style="margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap;">
                     <input type="text" id="events-filter-actor" placeholder="Filter by actor DID" style="flex: 1; min-width: 200px;">
@@ -277,7 +279,7 @@
                 </div>
             </div>
 
-            <!-- Audit Page (chainlink #105 / Phase 3.8) -->
+            <!-- Audit Page (chainlink #105 / Phase 3.8 + #106 / Phase 3.9) -->
             <div id="page-audit" class="page">
                 <header class="page-header">
                     <h2>Audit Trail</h2>
@@ -285,6 +287,7 @@
                         Hash-chained audit log via tools.aurora.admin.getAuditTrail.
                         Click an entry for full chain-walk context.
                     </p>
+                    <div id="audit-rt-indicator" class="rt-indicator-slot"></div>
                 </header>
                 <div class="filter-bar" style="margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap;">
                     <input type="text" id="audit-filter-actor" placeholder="Filter by actor DID" style="flex: 1; min-width: 200px;">
@@ -494,6 +497,7 @@
     <script src="/admin/substrate/capabilities.js"></script>
     <script src="/admin/substrate/action-panel.js"></script>
     <script src="/admin/substrate/bulk-action-panel.js"></script>
+    <script src="/admin/substrate/subscription.js"></script>
     <script src="/admin/script.js"></script>
 </body>
 </html>
