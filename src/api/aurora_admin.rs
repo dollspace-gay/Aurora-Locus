@@ -2334,6 +2334,208 @@ pub async fn get_audit_trail(
 }
 
 // ===========================================================================
+// getRuntimeSetting / setRuntimeSetting — §8.16 (Phase 3.10)
+// ===========================================================================
+//
+// Two endpoints for the runtime settings infrastructure. Read is
+// public-at-any-role for the moderation-mode key (other operators
+// need to know what mode they're operating in); write is SuperAdmin
+// only. Writes are audit-chained per §8.16.
+//
+// Recovery path: AURORA_RECOVERY_MODE=true env var bypasses runtime
+// settings on startup. The check is at AppContext construction —
+// when recovery is set, the live moderation-mode read returns
+// "full" regardless of the runtime_settings row, so an operator
+// who deployed into a misconfigured "disabled" state can boot with
+// the env var set, fix the runtime row, and unset the env var.
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetRuntimeSettingParams {
+    pub key: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetRuntimeSettingOutput {
+    pub key: String,
+    pub value: serde_json::Value,
+    pub source: &'static str,
+    pub last_modified: Option<String>,
+    pub last_modified_by: Option<String>,
+}
+
+const MODERATION_MODE_KEY: &str = "moderation-mode";
+const MODERATION_MODE_REDIRECT_KEY: &str = "moderation-mode-redirect-url";
+const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
+
+fn default_for_key(key: &str) -> serde_json::Value {
+    match key {
+        MODERATION_MODE_KEY => serde_json::Value::String("full".to_string()),
+        MODERATION_MODE_REDIRECT_KEY => serde_json::Value::String(String::new()),
+        _ => serde_json::Value::Null,
+    }
+}
+
+pub async fn get_runtime_setting(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    axum::extract::Query(params): axum::extract::Query<GetRuntimeSettingParams>,
+) -> Result<Json<GetRuntimeSettingOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    // Per §8.16: most settings require Admin+, but moderation-mode
+    // is readable at any role since every operator needs to know
+    // what mode they're in.
+    if params.key != MODERATION_MODE_KEY && !auth.role.can_act_as(Role::Admin) {
+        return Err(forbidden(&format!(
+            "key '{}' requires Admin+ role; caller has {:?}",
+            params.key, auth.role
+        )));
+    }
+    // Recovery-mode override for moderation-mode reads.
+    let recovery_active = std::env::var(RECOVERY_MODE_ENV)
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if recovery_active && params.key == MODERATION_MODE_KEY {
+        return Ok(Json(GetRuntimeSettingOutput {
+            key: params.key,
+            value: serde_json::Value::String("full".to_string()),
+            source: "RecoveryMode",
+            last_modified: None,
+            last_modified_by: None,
+        }));
+    }
+    let row = sqlx::query(
+        "SELECT value, last_modified, last_modified_by FROM runtime_settings WHERE key = $1",
+    )
+    .bind(&params.key)
+    .fetch_optional(&ctx.account_db)
+    .await
+    .map_err(internal)?;
+    use sqlx::Row as _;
+    if let Some(r) = row {
+        let value_str: String = r.try_get("value").map_err(internal)?;
+        let value = serde_json::from_str(&value_str)
+            .unwrap_or(serde_json::Value::String(value_str));
+        let last_modified: String = r.try_get("last_modified").map_err(internal)?;
+        let last_modified_by: String = r.try_get("last_modified_by").map_err(internal)?;
+        Ok(Json(GetRuntimeSettingOutput {
+            key: params.key,
+            value,
+            source: "Runtime",
+            last_modified: Some(last_modified),
+            last_modified_by: Some(last_modified_by),
+        }))
+    } else {
+        Ok(Json(GetRuntimeSettingOutput {
+            key: params.key.clone(),
+            value: default_for_key(&params.key),
+            source: "Default",
+            last_modified: None,
+            last_modified_by: None,
+        }))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRuntimeSettingInput {
+    pub key: String,
+    pub value: serde_json::Value,
+    pub rationale: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRuntimeSettingOutput {
+    pub key: String,
+    pub previous_value: serde_json::Value,
+    pub new_value: serde_json::Value,
+    pub audit_entry_id: String,
+}
+
+pub async fn set_runtime_setting(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<SetRuntimeSettingInput>,
+) -> Result<Json<SetRuntimeSettingOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "setRuntimeSetting requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    // Validate moderation-mode value if that's the key being set.
+    if input.key == MODERATION_MODE_KEY {
+        let s = input.value.as_str().unwrap_or("");
+        if !["full", "reduced", "disabled"].contains(&s) {
+            return Err(validation("moderation-mode must be one of: full, reduced, disabled"));
+        }
+    }
+    // Read previous value for the diff returned in output.
+    let prev_row = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(&input.key)
+        .fetch_optional(&ctx.account_db)
+        .await
+        .map_err(internal)?;
+    use sqlx::Row as _;
+    let previous_value = if let Some(r) = prev_row {
+        let s: String = r.try_get("value").map_err(internal)?;
+        serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+    } else {
+        default_for_key(&input.key)
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let value_json =
+        serde_json::to_string(&input.value).map_err(|e| internal(e))?;
+    // Upsert (DELETE then INSERT for cross-backend portability — sqlx
+    // ON CONFLICT syntax differs between SQLite and Postgres).
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    sqlx::query("DELETE FROM runtime_settings WHERE key = $1")
+        .bind(&input.key)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    sqlx::query(
+        "INSERT INTO runtime_settings (key, value, last_modified, last_modified_by) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(&input.key)
+    .bind(&value_json)
+    .bind(&now)
+    .bind(&auth.did)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    // Audit chain entry per §8.16 ("All writes audit-chained").
+    let audit_entry_id = audit_chain::append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "SetRuntimeSetting",
+            subject: None,
+            rationale: &format!("{} → {}: {}", input.key, value_json, input.rationale),
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
+    Ok(Json(SetRuntimeSettingOutput {
+        key: input.key,
+        previous_value,
+        new_value: input.value,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -3403,6 +3605,124 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ---------- Phase 3.10 — runtime settings (§8.16) ----------
+
+    fn super_admin_auth() -> AdminAuthContext {
+        use crate::admin::roles::Role;
+        AdminAuthContext {
+            did: "did:plc:superadmin".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:superadmin".to_string(),
+                session_id: "test_session".to_string(),
+                is_app_password: false,
+            },
+            role: Role::SuperAdmin,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_runtime_setting_returns_default_for_unknown_row() {
+        let ctx = create_test_context().await;
+        let resp = get_runtime_setting(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetRuntimeSettingParams {
+                key: "moderation-mode".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.source, "Default");
+        assert_eq!(resp.value, serde_json::Value::String("full".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_runtime_setting_admin_required_for_non_mode_keys() {
+        let ctx = create_test_context().await;
+        let err = get_runtime_setting(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetRuntimeSettingParams {
+                key: "some-other-key".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_requires_super_admin() {
+        let ctx = create_test_context().await;
+        let err = set_runtime_setting(
+            State(ctx),
+            admin_auth(),
+            Json(SetRuntimeSettingInput {
+                key: "moderation-mode".to_string(),
+                value: serde_json::Value::String("reduced".to_string()),
+                rationale: "test".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_writes_value_and_audit_entry() {
+        let ctx = create_test_context().await;
+        let resp = set_runtime_setting(
+            State(ctx.clone()),
+            super_admin_auth(),
+            Json(SetRuntimeSettingInput {
+                key: "moderation-mode".to_string(),
+                value: serde_json::Value::String("reduced".to_string()),
+                rationale: "switching to reduced for moderator team change".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.previous_value, serde_json::Value::String("full".to_string()));
+        assert_eq!(resp.new_value, serde_json::Value::String("reduced".to_string()));
+        assert!(!resp.audit_entry_id.is_empty());
+        // Verify the runtime row landed.
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM runtime_settings WHERE key = $1")
+                .bind("moderation-mode")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(stored, "\"reduced\"");
+        // Verify the audit chain entry landed.
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1",
+        )
+        .bind("SetRuntimeSetting")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 1);
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_rejects_invalid_mode_value() {
+        let ctx = create_test_context().await;
+        let err = set_runtime_setting(
+            State(ctx),
+            super_admin_auth(),
+            Json(SetRuntimeSettingInput {
+                key: "moderation-mode".to_string(),
+                value: serde_json::Value::String("invalid-mode".to_string()),
+                rationale: "test".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

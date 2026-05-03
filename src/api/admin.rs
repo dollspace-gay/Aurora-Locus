@@ -418,6 +418,18 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.admin.subscribeModEvents",
             get(crate::api::aurora_subscribe::subscribe_mod_events),
         )
+        // Phase 3.10 (chainlink #117) — runtime settings infrastructure.
+        // Two-tier config (runtime > file). Read at most-Admin-or-key-
+        // dependent role; write SuperAdmin only with audit-chained
+        // rationale per design doc §8.16.
+        .route(
+            "/xrpc/tools.aurora.admin.getRuntimeSetting",
+            get(crate::api::aurora_admin::get_runtime_setting),
+        )
+        .route(
+            "/xrpc/tools.aurora.admin.setRuntimeSetting",
+            post(crate::api::aurora_admin::set_runtime_setting),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -2340,7 +2352,9 @@ fn aurora_capability_families() -> serde_json::Value {
             "getModerationMetrics",
             "getAuditTrail",
             "exportAccountForensic",
-            "subscribeModEvents"
+            "subscribeModEvents",
+            "getRuntimeSetting",
+            "setRuntimeSetting"
         ],
         // Phase 3.6 (chainlink #103) — role management relocated from
         // com.atproto.admin.{grantRole,revokeRole}.

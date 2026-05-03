@@ -996,3 +996,41 @@ input[type="checkbox"][disabled] {
         animation: none;
     }
 }
+
+/* Phase 3.10 + #108 foundation — dark mode CSS variables (§7).
+   When data-theme="dark" on the document root, the variables below
+   override the defaults from :root. v0.2 ships a contrast-conservative
+   dark palette; #108's accessibility audit verifies WCAG 2.2 AA. */
+
+[data-theme="dark"] {
+    --background: #0f172a;
+    --surface: #1e293b;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --border-color: #334155;
+    /* Sidebar already dark; lighten slightly so it doesn't merge with body. */
+    --sidebar-bg: #0b1220;
+    --sidebar-hover: #1e293b;
+}
+
+[data-theme="dark"] body,
+[data-theme="dark"] .stat-card,
+[data-theme="dark"] .chart-card,
+[data-theme="dark"] .activity-card,
+[data-theme="dark"] .table-card,
+[data-theme="dark"] .modal,
+[data-theme="dark"] .action-panel-card,
+[data-theme="dark"] .settings-card {
+    background: var(--surface);
+    color: var(--text-primary);
+}
+
+[data-theme="dark"] .data-table th {
+    background: #131c2e;
+    color: var(--text-primary);
+}
+
+[data-theme="dark"] code {
+    background: #131c2e;
+    color: #f1f5f9;
+}

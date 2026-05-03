@@ -456,6 +456,48 @@
                         <button type="button" class="btn-primary" onclick="loadCapabilities()">Probe Capabilities</button>
                         <pre id="capabilities-output" class="capabilities-output" style="display: none; margin-top: 12px; max-height: 400px; overflow-y: auto; padding: 12px; background: #1a1a1a; color: #e6e6e6; border-radius: 4px; font-family: monospace; font-size: 12px;"></pre>
                     </div>
+
+                    <!-- Phase 3.10 — UI & modes (chainlink #117 / §5.5.2) -->
+                    <div class="settings-card" id="ui-modes-card">
+                        <h3>UI & modes</h3>
+                        <p class="settings-help">Theme, language, deployment moderation mode.</p>
+
+                        <fieldset style="border: 1px solid var(--border-color); padding: 0.75rem; margin-top: 0.75rem;">
+                            <legend>Theme</legend>
+                            <label><input type="radio" name="ui-theme" value="light" onchange="setUiTheme(this.value)"> Light</label>
+                            <label style="margin-left: 0.75rem;"><input type="radio" name="ui-theme" value="dark" onchange="setUiTheme(this.value)"> Dark</label>
+                            <label style="margin-left: 0.75rem;"><input type="radio" name="ui-theme" value="system" onchange="setUiTheme(this.value)"> System</label>
+                            <p class="settings-help">System uses your operating system preference.</p>
+                        </fieldset>
+
+                        <fieldset style="border: 1px solid var(--border-color); padding: 0.75rem; margin-top: 0.75rem;">
+                            <legend>Language</legend>
+                            <select id="ui-language" onchange="setUiLanguage(this.value)">
+                                <option value="en">English</option>
+                            </select>
+                            <p class="settings-help">Other languages may be available as locale files are added.</p>
+                        </fieldset>
+
+                        <fieldset style="border: 1px solid var(--border-color); padding: 0.75rem; margin-top: 0.75rem;">
+                            <legend>Moderation mode <span class="role-tag">SuperAdmin only</span></legend>
+                            <label><input type="radio" name="mod-mode" value="full" disabled> Full</label>
+                            <label style="margin-left: 0.75rem;"><input type="radio" name="mod-mode" value="reduced" disabled> Reduced</label>
+                            <label style="margin-left: 0.75rem;"><input type="radio" name="mod-mode" value="disabled" disabled> Disabled</label>
+                            <p>Current: <strong id="mod-mode-current">Loading…</strong></p>
+                            <label style="display: block; margin-top: 0.5rem;">
+                                Redirect URL (when disabled)
+                                <input type="text" id="mod-mode-redirect" style="width: 100%;" placeholder="https://moderation.example.com" disabled>
+                            </label>
+                            <label style="display: block; margin-top: 0.5rem;">
+                                Rationale (required for write)
+                                <textarea id="mod-mode-rationale" rows="2" style="width: 100%;" disabled></textarea>
+                            </label>
+                            <p class="settings-help">
+                                Changing this affects all operators and is recorded in the audit chain.
+                            </p>
+                            <button type="button" class="btn-primary" id="mod-mode-save" onclick="saveModerationMode()" disabled>Save mode change</button>
+                        </fieldset>
+                    </div>
                 </div>
             </div>
         </main>

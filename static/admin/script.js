@@ -113,6 +113,10 @@ function navigateTo(page) {
         case 'audit':
             loadAudit();
             break;
+        case 'settings':
+            // Phase 3.10: load UI & modes alongside existing settings.
+            loadUiModes();
+            break;
     }
 }
 
@@ -1862,3 +1866,122 @@ function submitForensicExport() {
     })
     .catch(err => alert('Export failed: ' + err.message));
 }
+
+// =====================================================================
+// Phase 3.10 (chainlink #117) — UI & modes settings page per
+// docs/AURORA_ADMIN_UI_DESIGN.md §5.5.2.
+// =====================================================================
+
+function loadUiModes() {
+    // Theme — restore from localStorage; default 'system'.
+    const theme = localStorage.getItem('ui.theme') || 'system';
+    const themeRadio = document.querySelector(`input[name="ui-theme"][value="${theme}"]`);
+    if (themeRadio) themeRadio.checked = true;
+    applyUiTheme(theme);
+
+    // Language — restore.
+    const lang = localStorage.getItem('ui.language') || 'en';
+    const langSel = document.getElementById('ui-language');
+    if (langSel) langSel.value = lang;
+
+    // Moderation mode — fetch from server.
+    fetch(`${API_BASE}/tools.aurora.admin.getRuntimeSetting?key=moderation-mode`, {
+        headers: { 'Authorization': `Bearer ${adminToken}` }
+    })
+    .then(res => res.ok ? res.json() : null)
+    .then(data => {
+        if (!data) return;
+        const value = (data.value && typeof data.value === 'string') ? data.value : 'full';
+        const cur = document.getElementById('mod-mode-current');
+        if (cur) cur.textContent = value + (data.source === 'RecoveryMode' ? ' (recovery override)' : '');
+        const radio = document.querySelector(`input[name="mod-mode"][value="${value}"]`);
+        if (radio) radio.checked = true;
+    })
+    .catch(() => {});
+    fetch(`${API_BASE}/tools.aurora.admin.getRuntimeSetting?key=moderation-mode-redirect-url`, {
+        headers: { 'Authorization': `Bearer ${adminToken}` }
+    })
+    .then(res => res.ok ? res.json() : null)
+    .then(data => {
+        if (!data) return;
+        const v = (typeof data.value === 'string') ? data.value : '';
+        const input = document.getElementById('mod-mode-redirect');
+        if (input) input.value = v;
+    })
+    .catch(() => {});
+
+    // Enable mode-change controls only for SuperAdmin sessions per §5.5.2.
+    const isSuperAdmin = (currentUser?.role === 'superadmin');
+    document.querySelectorAll('input[name="mod-mode"]').forEach(r => { r.disabled = !isSuperAdmin; });
+    document.getElementById('mod-mode-redirect').disabled = !isSuperAdmin;
+    document.getElementById('mod-mode-rationale').disabled = !isSuperAdmin;
+    document.getElementById('mod-mode-save').disabled = !isSuperAdmin;
+}
+
+function setUiTheme(theme) {
+    localStorage.setItem('ui.theme', theme);
+    applyUiTheme(theme);
+}
+
+function applyUiTheme(theme) {
+    let resolved = theme;
+    if (theme === 'system') {
+        resolved = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    document.documentElement.setAttribute('data-theme', resolved);
+}
+
+function setUiLanguage(lang) {
+    localStorage.setItem('ui.language', lang);
+    // Page reload to apply new language. v0.2 ships English-only so
+    // this is effectively a no-op; the wiring is in place per §5.5.2.
+}
+
+function saveModerationMode() {
+    const selected = document.querySelector('input[name="mod-mode"]:checked');
+    if (!selected) { alert('Select a mode.'); return; }
+    const rationale = document.getElementById('mod-mode-rationale').value.trim();
+    if (!rationale) { alert('Rationale is required.'); return; }
+    if (!confirm(`Switch moderation mode to "${selected.value}"? This affects all operators on this deployment.`)) return;
+    const redirect = document.getElementById('mod-mode-redirect').value.trim();
+    Promise.all([
+        fetch(`${API_BASE}/tools.aurora.admin.setRuntimeSetting`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${adminToken}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ key: 'moderation-mode', value: selected.value, rationale: rationale }),
+        }),
+        // Save redirect URL alongside (separate setting).
+        fetch(`${API_BASE}/tools.aurora.admin.setRuntimeSetting`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${adminToken}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ key: 'moderation-mode-redirect-url', value: redirect, rationale: rationale }),
+        }),
+    ])
+    .then(async ([modeRes, urlRes]) => {
+        if (!modeRes.ok) {
+            let msg = 'HTTP ' + modeRes.status;
+            try { const j = await modeRes.json(); msg += ': ' + (j.message || j.error || ''); } catch (e) {}
+            throw new Error(msg);
+        }
+        alert('Mode change saved. Sidebar may re-render to reflect new visibility.');
+        loadUiModes();
+    })
+    .catch(err => alert('Save failed: ' + err.message));
+}
+
+// Apply persisted theme on page load before any rendering.
+(function applyInitialTheme() {
+    try {
+        const theme = localStorage.getItem('ui.theme') || 'system';
+        const resolved = (theme === 'system')
+            ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+            : theme;
+        document.documentElement.setAttribute('data-theme', resolved);
+    } catch (e) { /* no localStorage — leave default */ }
+})();
