@@ -127,6 +127,10 @@ tar = "0.4"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+# Direct access to the same query-string format axum's Query extractor
+# uses, so PaginationParams deserialization can be exercised end-to-end
+# in unit tests (mirrors the over-the-wire path of /xrpc handlers).
+serde_urlencoded = "0.7"
 # Phase 4.4 (chainlink #91): real-Postgres integration tests for
 # multi-instance leader election and LISTEN/NOTIFY cache invalidation.
 testcontainers = "0.23"

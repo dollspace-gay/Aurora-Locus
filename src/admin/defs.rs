@@ -112,8 +112,99 @@ pub struct PaginatedResponse<T> {
 pub struct PaginationParams {
     #[serde(default)]
     pub cursor: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_u32_lenient")]
     pub limit: Option<u32>,
+}
+
+/// Accept either a JSON number or a string-encoded integer for an
+/// `Option<u32>` query parameter. This is needed because axum's
+/// `Query<T>` extractor delegates to `serde_urlencoded`, whose
+/// string-to-number coercion happens at the format level and is
+/// bypassed when a struct uses `#[serde(flatten)]` (the inner struct
+/// is fed through serde's internal `Content` buffer, which keeps the
+/// raw string form). Without this helper, `?limit=25` on a flattened
+/// `PaginationParams` fails with "invalid type: string \"25\",
+/// expected u32".
+///
+/// Behavior:
+/// - missing key → `None`
+/// - JSON `null` / unit → `None`
+/// - integer (any signed/unsigned form that fits) → `Some(n)`
+/// - string parseable as u32 → `Some(n)`
+/// - anything else → deserialization error with the original value
+pub fn deserialize_optional_u32_lenient<'de, D>(d: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Visitor};
+    use std::fmt;
+
+    struct LenientU32;
+
+    impl<'de> Visitor<'de> for LenientU32 {
+        type Value = Option<u32>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an optional u32 (number or string-encoded integer)")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, d: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            d.deserialize_any(LenientU32)
+        }
+
+        fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+            v.parse::<u32>()
+                .map(Some)
+                .map_err(|e| E::custom(format!("invalid u32 \"{}\": {}", v, e)))
+        }
+
+        fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
+            self.visit_str(&v)
+        }
+
+        fn visit_u8<E>(self, v: u8) -> Result<Self::Value, E> {
+            Ok(Some(v as u32))
+        }
+
+        fn visit_u16<E>(self, v: u16) -> Result<Self::Value, E> {
+            Ok(Some(v as u32))
+        }
+
+        fn visit_u32<E>(self, v: u32) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_u64<E: Error>(self, v: u64) -> Result<Self::Value, E> {
+            u32::try_from(v)
+                .map(Some)
+                .map_err(|_| E::custom(format!("u32 overflow: {}", v)))
+        }
+
+        fn visit_i32<E: Error>(self, v: i32) -> Result<Self::Value, E> {
+            u32::try_from(v)
+                .map(Some)
+                .map_err(|_| E::custom(format!("u32 negative or overflow: {}", v)))
+        }
+
+        fn visit_i64<E: Error>(self, v: i64) -> Result<Self::Value, E> {
+            u32::try_from(v)
+                .map(Some)
+                .map_err(|_| E::custom(format!("u32 negative or overflow: {}", v)))
+        }
+    }
+
+    d.deserialize_option(LenientU32)
 }
 
 impl PaginationParams {
@@ -359,5 +450,93 @@ mod tests {
             AuroraAdminError::OutdatedCursor.http_status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Lenient u32 deserialization for query-string limits.
+    //
+    // Reproduces the original symptom and verifies the helper covers
+    // both bare-struct and `#[serde(flatten)]` cases — the latter is
+    // where axum's default Query extractor breaks because flatten
+    // sends every value through serde's internal Content buffer as a
+    // string.
+    // ---------------------------------------------------------------
+
+    #[derive(Debug, Deserialize)]
+    struct Outer {
+        #[serde(flatten)]
+        pagination: PaginationParams,
+    }
+
+    #[test]
+    fn pagination_limit_accepts_string_form_via_query_string() {
+        // The original bug: `?limit=25` over a flattened pagination
+        // struct fails before this helper because the inner u32 sees a
+        // borrowed "25" string. With the lenient helper this round-
+        // trips correctly.
+        let parsed: Outer = serde_urlencoded::from_str("limit=25").expect("limit=25 parses");
+        assert_eq!(parsed.pagination.limit, Some(25));
+    }
+
+    #[test]
+    fn pagination_limit_accepts_explicit_zero_string() {
+        let parsed: Outer = serde_urlencoded::from_str("limit=0").expect("limit=0 parses");
+        assert_eq!(parsed.pagination.limit, Some(0));
+    }
+
+    #[test]
+    fn pagination_limit_missing_yields_none() {
+        let parsed: Outer = serde_urlencoded::from_str("").expect("empty parses");
+        assert_eq!(parsed.pagination.limit, None);
+        assert_eq!(parsed.pagination.cursor, None);
+    }
+
+    #[test]
+    fn pagination_limit_rejects_non_integer_string() {
+        let result: Result<Outer, _> = serde_urlencoded::from_str("limit=abc");
+        assert!(result.is_err(), "non-integer limit must error");
+    }
+
+    #[test]
+    fn pagination_limit_rejects_negative_string() {
+        let result: Result<Outer, _> = serde_urlencoded::from_str("limit=-5");
+        assert!(result.is_err(), "negative limit must error");
+    }
+
+    #[test]
+    fn pagination_limit_accepts_native_json_number() {
+        // Direct deserialization (not over a query string) — the
+        // helper must still accept native u32/u64 values so it does
+        // not regress the JSON-body case.
+        let parsed: PaginationParams =
+            serde_json::from_str(r#"{"limit": 25}"#).expect("native int parses");
+        assert_eq!(parsed.limit, Some(25));
+    }
+
+    #[test]
+    fn pagination_limit_accepts_json_string_form() {
+        let parsed: PaginationParams =
+            serde_json::from_str(r#"{"limit": "25"}"#).expect("string int parses");
+        assert_eq!(parsed.limit, Some(25));
+    }
+
+    #[test]
+    fn pagination_limit_rejects_json_overflow() {
+        let too_big = (u32::MAX as u64) + 1;
+        let json = format!(r#"{{"limit": {}}}"#, too_big);
+        let result: Result<PaginationParams, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "u32 overflow must error");
+    }
+
+    #[test]
+    fn pagination_limit_with_cursor_round_trips_via_query_string() {
+        // The three impacted endpoints (queryEvents, getAuditTrail,
+        // listAppeals) all flatten PaginationParams alongside their
+        // own filter fields. Ensure the cursor + limit combination
+        // works from a real query string.
+        let parsed: Outer =
+            serde_urlencoded::from_str("limit=25&cursor=abc").expect("combined parses");
+        assert_eq!(parsed.pagination.limit, Some(25));
+        assert_eq!(parsed.pagination.cursor.as_deref(), Some("abc"));
     }
 }
