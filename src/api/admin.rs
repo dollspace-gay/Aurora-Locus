@@ -333,6 +333,21 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.moderator.getAppeal",
             get(crate::api::aurora_moderator::get_appeal),
         )
+        // ---- tools.aurora.admin.* (chainlink #102 / Phase 3.5) ----
+        //
+        // Admin-tier action surface. emitEvent is the unified dispatch
+        // for moderation actions per AURORA_ADMIN_UI_DESIGN.md §8.1;
+        // per-action endpoints under com.atproto.admin.* stay live
+        // for protocol-compatibility but the UI consumes emitEvent
+        // exclusively post-3.5 (§9.2).
+        //
+        // Auth: AdminModeration scope (namespace middleware); within-
+        // tier role checks happen at handler level (Moderator+ for
+        // content actions, Admin+ for account-infrastructure actions).
+        .route(
+            "/xrpc/tools.aurora.admin.emitEvent",
+            post(crate::api::aurora_admin::emit_event),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -2239,7 +2254,10 @@ fn aurora_capability_families() -> serde_json::Value {
             "listAppeals",
             "getAppeal"
         ],
-        "tools.aurora.admin": [],
+        // Phase 3.5 (chainlink #102) — emitEvent unified action surface.
+        "tools.aurora.admin": [
+            "emitEvent"
+        ],
         // Phase 3.6 (chainlink #103) — role management relocated from
         // com.atproto.admin.{grantRole,revokeRole}.
         "tools.aurora.superadmin": [
