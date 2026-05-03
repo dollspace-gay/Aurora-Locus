@@ -42,6 +42,10 @@
                     <span class="icon">⚖️</span>
                     Appeals
                 </a>
+                <a href="#audit" class="nav-item" data-page="audit">
+                    <span class="icon">🔗</span>
+                    Audit
+                </a>
                 <a href="#invites" class="nav-item" data-page="invites">
                     <span class="icon">✉️</span>
                     Invite Codes
@@ -270,6 +274,34 @@
                 <div style="margin-top: 16px; display: flex; gap: 8px;">
                     <button class="btn-secondary" id="events-prev-btn" onclick="loadEventsPrev()" disabled>Previous</button>
                     <button class="btn-secondary" id="events-next-btn" onclick="loadEventsNext()" disabled>Next</button>
+                </div>
+            </div>
+
+            <!-- Audit Page (chainlink #105 / Phase 3.8) -->
+            <div id="page-audit" class="page">
+                <header class="page-header">
+                    <h2>Audit Trail</h2>
+                    <p class="page-subtitle">
+                        Hash-chained audit log via tools.aurora.admin.getAuditTrail.
+                        Click an entry for full chain-walk context.
+                    </p>
+                </header>
+                <div class="filter-bar" style="margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap;">
+                    <input type="text" id="audit-filter-actor" placeholder="Filter by actor DID" style="flex: 1; min-width: 200px;">
+                    <input type="text" id="audit-filter-subject" placeholder="Filter by subject DID" style="flex: 1; min-width: 200px;">
+                    <input type="text" id="audit-filter-action" placeholder="Filter by action" style="flex: 1; min-width: 160px;">
+                    <label style="display: flex; align-items: center; gap: 4px;">
+                        <input type="checkbox" id="audit-verified-only">
+                        Verified only
+                    </label>
+                    <button class="btn-primary" onclick="loadAudit()">Apply</button>
+                </div>
+                <div id="audit-table-container">
+                    <p class="empty-state">Click Apply to load audit entries.</p>
+                </div>
+                <div style="margin-top: 16px; display: flex; gap: 8px;">
+                    <button class="btn-secondary" id="audit-prev-btn" onclick="loadAuditPrev()" disabled>Previous</button>
+                    <button class="btn-secondary" id="audit-next-btn" onclick="loadAuditNext()" disabled>Next</button>
                 </div>
             </div>
 

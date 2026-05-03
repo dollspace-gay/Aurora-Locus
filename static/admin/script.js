@@ -100,6 +100,9 @@ function navigateTo(page) {
         case 'appeals':
             loadAppeals();
             break;
+        case 'audit':
+            loadAudit();
+            break;
     }
 }
 
@@ -595,8 +598,9 @@ function viewUser(did) {
                 <details style="margin-top: 1rem;">
                     <summary><strong>Account management</strong> <span class="role-tag">Admin+</span></summary>
                     <div id="user-mgmt-action-panel" style="margin-top: 0.75rem;"></div>
-                    <div style="margin-top: 0.75rem;">
+                    <div style="margin-top: 0.75rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
                         <button class="btn-secondary" onclick="openPasswordResetModal('${user.did}','${user.handle || ''}')">Send password reset</button>
+                        <button class="btn-secondary" onclick="openForensicExportModal('${user.did}','${user.handle || ''}')">Generate forensic export</button>
                     </div>
                 </details>
             </div>
@@ -1512,3 +1516,271 @@ setInterval(() => {
         loadReports();
     }
 }, 30000); // Every 30 seconds
+
+// =====================================================================
+// Phase 3.8D (chainlink #105) — Audit page + Audit entry detail +
+// Forensic export modal per docs/AURORA_ADMIN_UI_DESIGN.md §5.3.8,
+// §5.3.9, §5.2 forensic export modal.
+// =====================================================================
+
+let auditCursorStack = [];
+let auditNextCursor = null;
+
+function loadAudit() {
+    auditCursorStack = [];
+    auditNextCursor = null;
+    fetchAuditPage(null);
+}
+
+function loadAuditNext() {
+    if (auditNextCursor) {
+        auditCursorStack.push(auditNextCursor);
+        fetchAuditPage(auditNextCursor);
+    }
+}
+
+function loadAuditPrev() {
+    if (auditCursorStack.length > 1) {
+        auditCursorStack.pop();
+        const prev = auditCursorStack[auditCursorStack.length - 1] || null;
+        fetchAuditPage(prev);
+    } else if (auditCursorStack.length === 1) {
+        auditCursorStack = [];
+        fetchAuditPage(null);
+    }
+}
+
+function fetchAuditPage(cursor) {
+    const params = new URLSearchParams();
+    const actor = document.getElementById('audit-filter-actor')?.value.trim() || '';
+    const subject = document.getElementById('audit-filter-subject')?.value.trim() || '';
+    const action = document.getElementById('audit-filter-action')?.value.trim() || '';
+    if (actor) params.set('actorDid', actor);
+    if (subject) params.set('subjectDid', subject);
+    if (action) params.set('action', action);
+    if (cursor) params.set('cursor', cursor);
+    params.set('limit', '25');
+
+    const container = document.getElementById('audit-table-container');
+    container.innerHTML = '<p class="empty-state">Loading…</p>';
+
+    fetch(`${API_BASE}/tools.aurora.admin.getAuditTrail?${params.toString()}`, {
+        headers: { 'Authorization': `Bearer ${adminToken}` }
+    })
+    .then(res => {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+    })
+    .then(data => renderAuditTable(data))
+    .catch(err => {
+        container.innerHTML = `<p class="empty-state">Error: ${err.message}</p>`;
+    });
+}
+
+function renderAuditTable(data) {
+    const container = document.getElementById('audit-table-container');
+    let items = data.items || [];
+    auditNextCursor = data.cursor || null;
+
+    document.getElementById('audit-prev-btn').disabled = auditCursorStack.length === 0;
+    document.getElementById('audit-next-btn').disabled = !auditNextCursor;
+
+    const verifiedOnly = document.getElementById('audit-verified-only')?.checked;
+    if (verifiedOnly) items = items.filter(e => e.verified);
+
+    if (items.length === 0) {
+        container.innerHTML = '<p class="empty-state">No audit entries match these filters.</p>';
+        return;
+    }
+
+    let html = '<table class="data-table"><thead><tr>'
+        + '<th>Seq</th><th>When</th><th>Actor</th><th>Action</th>'
+        + '<th>Subject</th><th>Verified</th><th></th>'
+        + '</tr></thead><tbody>';
+    for (const e of items) {
+        const when = new Date(e.timestamp).toLocaleString();
+        const subj = e.subjectRef
+            ? (e.subjectRef.did || e.subjectRef.uri || e.subjectRef.cid || '—')
+            : '—';
+        const verifiedBadge = e.verified
+            ? '<span class="status-badge status-active" title="Hash matches stored chain hash">✓ verified</span>'
+            : '<span class="status-badge status-suspended" title="Hash does not match — possibly tampered or pre-chain">✗ unverified</span>';
+        html += `<tr><td>${e.sequence}</td><td>${when}</td>`
+            + `<td><code>${e.actorDid}</code></td><td>${e.action}</td>`
+            + `<td><code>${subj}</code></td><td>${verifiedBadge}</td>`
+            + `<td><a href="javascript:void(0)" onclick="showAuditEntryDetail('${e.id}')">View</a></td></tr>`;
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+    // Cache items by id so chain-walk can navigate without refetching.
+    window._auditItemsCache = window._auditItemsCache || {};
+    items.forEach(e => { window._auditItemsCache[e.id] = e; });
+}
+
+// Audit entry detail modal — shows the full entry + chain-walk
+// previous-hash navigation per §5.3.9.
+function showAuditEntryDetail(entryId) {
+    const cached = (window._auditItemsCache || {})[entryId];
+    if (!cached) {
+        alert('Entry not in current page cache. Reload the audit table.');
+        return;
+    }
+    let modal = document.getElementById('modal-audit-entry');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'modal-audit-entry';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-header">
+                <h3>Audit entry detail</h3>
+                <button class="modal-close" onclick="closeAuditDetailModal()" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body" id="audit-entry-content"></div>
+        `;
+        document.body.appendChild(modal);
+    }
+    const subjStr = cached.subjectRef
+        ? JSON.stringify(cached.subjectRef, null, 2)
+        : 'none';
+    const cascadeStr = cached.cascadeSubjects && cached.cascadeSubjects.length > 0
+        ? JSON.stringify(cached.cascadeSubjects, null, 2)
+        : 'none';
+    const prevHash = cached.previousHash;
+    const prevHashSection = prevHash
+        ? `<p><strong>Previous hash:</strong> <code>${prevHash}</code> ` +
+          `<a href="javascript:void(0)" onclick="walkChainTo('${prevHash}')">[walk to previous]</a></p>`
+        : '<p><strong>Previous hash:</strong> none (first entry in chain)</p>';
+    document.getElementById('audit-entry-content').innerHTML = `
+        <dl style="font-size: 0.875rem;">
+            <dt>Sequence</dt><dd>${cached.sequence}</dd>
+            <dt>Timestamp</dt><dd>${cached.timestamp}</dd>
+            <dt>Actor DID</dt><dd><code>${cached.actorDid}</code></dd>
+            <dt>Action</dt><dd>${cached.action}</dd>
+            <dt>Rationale</dt><dd>${cached.rationale}</dd>
+            <dt>Subject</dt><dd><pre style="white-space: pre-wrap; margin: 0;">${subjStr}</pre></dd>
+            <dt>Cascade subjects</dt><dd><pre style="white-space: pre-wrap; margin: 0;">${cascadeStr}</pre></dd>
+            <dt>Snapshot ID</dt><dd>${cached.snapshotId || 'none'}</dd>
+            <dt>Event ID</dt><dd>${cached.eventId || 'none'}</dd>
+            <dt>Current hash</dt><dd><code style="word-break: break-all;">${cached.currentHash}</code></dd>
+        </dl>
+        ${prevHashSection}
+        <p><strong>Verified:</strong> ${cached.verified ? '✓ Yes — recomputed hash matches stored value' : '✗ No — hash divergent or pre-chain sentinel'}</p>
+    `;
+    document.getElementById('modal-overlay').classList.add('active');
+    modal.classList.add('active');
+}
+
+function closeAuditDetailModal() {
+    document.getElementById('modal-audit-entry')?.classList.remove('active');
+    document.getElementById('modal-overlay').classList.remove('active');
+}
+
+// Chain-walk: search the cached page (and re-fetch if needed) for an
+// entry whose currentHash matches the supplied previousHash.
+function walkChainTo(previousHash) {
+    const items = window._auditItemsCache || {};
+    const target = Object.values(items).find(e => e.currentHash === previousHash);
+    if (target) {
+        showAuditEntryDetail(target.id);
+        return;
+    }
+    // Not in current page — surface a message rather than auto-navigating.
+    // Fully implementing chain-walk across pages requires server-side
+    // by-hash lookup which lands with #108 polish.
+    alert('Previous entry not in current page. Use filters to narrow to the previous range, then walk.');
+}
+
+// Forensic export modal (§5.2 forensic export modal +
+// substrate primitive 21 in design doc).
+function openForensicExportModal(did, handle) {
+    let modal = document.getElementById('modal-forensic-export');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'modal-forensic-export';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-header">
+                <h3>Generate forensic export</h3>
+                <button class="modal-close" onclick="closeForensicModal()" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p><strong>Subject:</strong> <span id="forensic-subject"></span></p>
+                <fieldset style="border: 1px solid var(--border-color); padding: 0.75rem; margin: 0.75rem 0;">
+                    <legend>Include</legend>
+                    <label style="display: block;"><input type="checkbox" id="forensic-include-repo" checked> Repository content (CAR file) — deferred to v0.3</label>
+                    <label style="display: block;"><input type="checkbox" id="forensic-include-blobs" checked> Blobs — deferred to v0.3</label>
+                    <label style="display: block;"><input type="checkbox" id="forensic-include-mod"  checked> Moderation history</label>
+                    <label style="display: block;"><input type="checkbox" id="forensic-include-meta"> Account metadata <span class="role-tag">SuperAdmin only</span></label>
+                    <label style="display: block;"><input type="checkbox" id="forensic-include-audit"> Audit chain entries <span class="role-tag">SuperAdmin only</span></label>
+                </fieldset>
+                <label style="display: block;">Rationale (required)</label>
+                <textarea id="forensic-rationale" rows="3" style="width: 100%;" aria-required="true"></textarea>
+                <p class="action-panel-hint" style="margin-top: 0.5rem;">
+                    This export will be recorded in the audit chain with a tamper-evident hash.
+                    The bundle will contain account data; treat as sensitive.
+                </p>
+                <div class="action-panel-buttons" style="margin-top: 0.75rem;">
+                    <button class="btn-secondary" onclick="closeForensicModal()">Cancel</button>
+                    <button class="btn-danger" onclick="submitForensicExport()">Generate export</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+    }
+    document.getElementById('forensic-subject').textContent = (handle ? '@' + handle + ' — ' : '') + did;
+    document.getElementById('forensic-rationale').value = '';
+    window._forensicTargetDid = did;
+    document.getElementById('modal-overlay').classList.add('active');
+    modal.classList.add('active');
+}
+
+function closeForensicModal() {
+    document.getElementById('modal-forensic-export')?.classList.remove('active');
+    document.getElementById('modal-overlay').classList.remove('active');
+}
+
+function submitForensicExport() {
+    const did = window._forensicTargetDid;
+    if (!did) return;
+    const rationale = document.getElementById('forensic-rationale').value.trim();
+    if (!rationale) { alert('Rationale is required.'); return; }
+    const body = {
+        did: did,
+        rationale: rationale,
+        includeRepo: document.getElementById('forensic-include-repo').checked,
+        includeBlobs: document.getElementById('forensic-include-blobs').checked,
+        includeModerationHistory: document.getElementById('forensic-include-mod').checked,
+        includeAccountMetadata: document.getElementById('forensic-include-meta').checked,
+        includeAuditChain: document.getElementById('forensic-include-audit').checked,
+    };
+    fetch(`${API_BASE}/tools.aurora.admin.exportAccountForensic`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+    })
+    .then(async res => {
+        if (!res.ok) {
+            let msg = 'HTTP ' + res.status;
+            try { const j = await res.json(); msg += ': ' + (j.message || j.error || ''); } catch (e) {}
+            throw new Error(msg);
+        }
+        const auditId = res.headers.get('X-Aurora-Audit-Entry-Id');
+        const bundleHash = res.headers.get('X-Aurora-Bundle-Hash');
+        const blob = await res.blob();
+        // Trigger browser download
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `forensic-export-${did.replace(/:/g, '_')}-${new Date().toISOString().replace(/[:.]/g, '')}.tar`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        closeForensicModal();
+        alert(`Export complete.\nAudit entry: ${auditId}\nBundle hash: ${bundleHash}`);
+    })
+    .catch(err => alert('Export failed: ' + err.message));
+}
