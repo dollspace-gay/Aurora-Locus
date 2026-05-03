@@ -28,7 +28,8 @@
 use crate::{
     admin::{
         appeals::{AppealManager, AppealStatus},
-        defs::{AuroraAdminError, Subject},
+        audit_chain::{self, AppendEntryParams, AuditEntry},
+        defs::{AuroraAdminError, CursorPosition, PaginatedResponse, PaginationParams, Subject},
         events::{LogEventParams, ModerationEventLogger, ModerationEventType},
         moderation::{ApplyActionParams, ModerationAction},
         reports::ReportStatus,
@@ -347,9 +348,18 @@ pub async fn emit_event(
         return Err(validation("rationale is required and must be non-empty"));
     }
 
-    // Snapshot capture flag: accepted but no-op in 3.5 (§9.3).
-    let _ = input.snapshot_capture;
     let metadata = input.metadata.clone();
+
+    // Step 3 (§8.1): capture snapshot before the action lands. Phase
+    // 3.8 makes this real; pre-3.8 callers passing snapshot_capture=
+    // true got None back, post-3.8 they get a real snapshot id.
+    let snapshot_id = if input.snapshot_capture {
+        audit_chain::capture_snapshot(&ctx.account_db, &input.subject)
+            .await
+            .map_err(internal_pds)?
+    } else {
+        None
+    };
 
     let cascading_actions = dispatch_action(&ctx, &auth, &input).await?;
 
@@ -372,12 +382,28 @@ pub async fn emit_event(
         .await
         .map_err(internal)?;
 
+    // Step 5 (§8.1): write audit chain entry referencing snapshot +
+    // event. Hash linkage gives tamper-evident replay.
+    let action_str = action_kind_str(&input.action);
+    let audit_entry_id = audit_chain::append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: action_str,
+            subject: Some(&input.subject),
+            rationale: &input.rationale,
+            snapshot_id,
+            event_id: Some(event.id),
+            cascade_subjects: &[],
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
+
     Ok(Json(EmitEventOutput {
         event_id: event.id.to_string(),
-        // Phase 3.8 will populate this when the audit chain ships.
-        audit_entry_id: None,
-        // Phase 3.8 will populate this when snapshot infrastructure lands.
-        snapshot_id: None,
+        audit_entry_id: Some(audit_entry_id.to_string()),
+        snapshot_id: snapshot_id.map(|id| id.to_string()),
         cascading_actions,
     }))
 }
@@ -1792,6 +1818,224 @@ fn internal_pds(e: PdsError) -> (StatusCode, Json<serde_json::Value>) {
 }
 
 // ===========================================================================
+// getAuditTrail — §8.4 (Phase 3.8)
+// ===========================================================================
+//
+// Hash-chained audit log query. Cursor-paginated newest-first. Each
+// entry carries a `verified` flag computed by re-hashing the entry's
+// stored fields and comparing to current_hash; a divergent recompute
+// surfaces tampering at query time.
+//
+// Pre-Phase-3.8 events have no chain entry; per §8.4 they show up
+// with current_hash="pre-chain" sentinel and verified=false. v0.2's
+// Audit page displays both surfaces in a unified feed (per §3.4
+// "the audit page is a 'unified' surface"), with the
+// `getAuditLog`-derived rows clearly marked unverified.
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAuditTrailParams {
+    #[serde(default)]
+    pub actor_did: Option<String>,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub subject_did: Option<String>,
+    #[serde(default)]
+    pub subject_uri: Option<String>,
+    #[serde(default)]
+    pub after_created: Option<String>,
+    #[serde(default)]
+    pub before_created: Option<String>,
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+}
+
+pub async fn get_audit_trail(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    axum::extract::Query(params): axum::extract::Query<GetAuditTrailParams>,
+) -> Result<Json<PaginatedResponse<AuditEntry>>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::Moderator) {
+        return Err(forbidden(&format!(
+            "getAuditTrail requires Moderator+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+    let limit = params.pagination.effective_limit() as i64;
+    let cursor = params.pagination.decode_cursor().map_err(|_| {
+        let e = AuroraAdminError::OutdatedCursor;
+        (e.http_status(), Json(serde_json::json!({"error": e.code()})))
+    })?;
+
+    let mut clauses: Vec<&'static str> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(a) = &params.actor_did {
+        clauses.push("actor_did = ?");
+        binds.push(a.clone());
+    }
+    if let Some(a) = &params.action {
+        clauses.push("action = ?");
+        binds.push(a.clone());
+    }
+    if let Some(s) = &params.subject_did {
+        clauses.push("subject_did = ?");
+        binds.push(s.clone());
+    }
+    if let Some(s) = &params.subject_uri {
+        clauses.push("subject_uri = ?");
+        binds.push(s.clone());
+    }
+    if let Some(a) = &params.after_created {
+        clauses.push("created_at >= ?");
+        binds.push(a.clone());
+    }
+    if let Some(b) = &params.before_created {
+        clauses.push("created_at <= ?");
+        binds.push(b.clone());
+    }
+    if let Some(c) = &cursor {
+        clauses.push("(created_at < ? OR (created_at = ? AND id < ?))");
+        binds.push(c.after_created.to_rfc3339());
+        binds.push(c.after_created.to_rfc3339());
+    }
+
+    // Renumber `?` → `$N` for Postgres compatibility (mirrors
+    // aurora_moderator's renumber_placeholders pattern).
+    let mut idx = 1usize;
+    let clauses_pg: Vec<String> = clauses
+        .iter()
+        .map(|clause| {
+            let mut out = String::with_capacity(clause.len() + 8);
+            for c in clause.chars() {
+                if c == '?' {
+                    out.push_str(&format!("${}", idx));
+                    idx += 1;
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        })
+        .collect();
+
+    let where_sql = if clauses_pg.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses_pg.join(" AND "))
+    };
+    let limit_idx = binds.len() + if cursor.is_some() { 2 } else { 1 };
+    let sql = format!(
+        "SELECT id, sequence, created_at, actor_did, action, subject_did, subject_uri, \
+                subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
+                cascade_subjects \
+         FROM audit_chain_entry{} \
+         ORDER BY created_at DESC, id DESC \
+         LIMIT ${}",
+        where_sql, limit_idx
+    );
+
+    let mut q = sqlx::query(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    if let Some(c) = &cursor {
+        q = q.bind(c.after_id);
+    }
+    q = q.bind(limit + 1);
+
+    let rows = q.fetch_all(&ctx.account_db).await.map_err(internal)?;
+    let has_more = rows.len() as i64 > limit;
+    let page_rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
+
+    use sqlx::Row as _;
+    let mut items = Vec::with_capacity(page_rows.len());
+    let mut last_at = None;
+    let mut last_id = None;
+    for row in page_rows {
+        let id: i64 = row.try_get("id").map_err(internal)?;
+        let sequence: i64 = row.try_get("sequence").map_err(internal)?;
+        let created_at_str: String = row.try_get("created_at").map_err(internal)?;
+        let timestamp = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+            .map_err(|e| internal(e))?
+            .with_timezone(&chrono::Utc);
+        let actor_did: String = row.try_get("actor_did").map_err(internal)?;
+        let action: String = row.try_get("action").map_err(internal)?;
+        let subject_did: Option<String> = row.try_get("subject_did").ok().flatten();
+        let subject_uri: Option<String> = row.try_get("subject_uri").ok().flatten();
+        let subject_cid: Option<String> = row.try_get("subject_cid").ok().flatten();
+        let rationale: String = row.try_get("rationale").map_err(internal)?;
+        let snapshot_id: Option<i64> = row.try_get("snapshot_id").ok().flatten();
+        let event_id: Option<i64> = row.try_get("event_id").ok().flatten();
+        let current_hash: String = row.try_get("current_hash").map_err(internal)?;
+        let previous_hash: Option<String> = row.try_get("previous_hash").ok().flatten();
+        let cascade_str: Option<String> = row.try_get("cascade_subjects").ok().flatten();
+        let cascade_subjects: Vec<Subject> = cascade_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        let verified = audit_chain::verify_entry(
+            sequence,
+            &created_at_str,
+            &actor_did,
+            &action,
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+            &rationale,
+            snapshot_id,
+            event_id,
+            previous_hash.as_deref(),
+            cascade_str.as_deref(),
+            &current_hash,
+        );
+        let subject_ref = Subject::from_columns(
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+        );
+        last_at = Some(timestamp);
+        last_id = Some(id);
+        items.push(AuditEntry {
+            id: id.to_string(),
+            sequence,
+            timestamp,
+            actor_did,
+            action,
+            subject_ref,
+            rationale,
+            snapshot_id: snapshot_id.map(|i| i.to_string()),
+            event_id: event_id.map(|i| i.to_string()),
+            current_hash,
+            previous_hash,
+            verified,
+            cascade_subjects,
+        });
+    }
+
+    let next_cursor = if has_more {
+        match (last_at, last_id) {
+            (Some(t), Some(i)) => Some(
+                CursorPosition {
+                    after_created: t,
+                    after_id: i,
+                }
+                .encode(),
+            ),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    Ok(Json(PaginatedResponse {
+        items,
+        cursor: next_cursor,
+    }))
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1940,8 +2184,10 @@ mod tests {
         .unwrap()
         .0;
         assert!(!resp.event_id.is_empty());
-        assert!(resp.audit_entry_id.is_none(), "Phase 3.5 returns None until 3.8");
-        assert!(resp.snapshot_id.is_none(), "Phase 3.5 returns None until 3.8");
+        // Phase 3.8 makes these meaningful — emitEvent now writes a
+        // chain entry + snapshot for snapshottable subjects.
+        assert!(resp.audit_entry_id.is_some(), "Phase 3.8 populates audit_entry_id");
+        assert!(resp.snapshot_id.is_some(), "Phase 3.8 captures snapshot for Repo subjects");
         assert!(resp.cascading_actions.is_empty());
         // Verify the moderation_event row landed.
         let count: i64 =
@@ -2641,6 +2887,125 @@ mod tests {
         assert_eq!(d.previous_aggregate, 5.0);
         assert_eq!(d.change_absolute, -3.0);
         assert!(d.change_percent < 0.0);
+    }
+
+    // ---------- Phase 3.8 — getAuditTrail (§8.4) ----------
+
+    #[tokio::test]
+    async fn emit_event_writes_chain_entry_and_snapshot() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        let resp = emit_event(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(EmitEventInput {
+                action: ModEventAction::TakedownAccount,
+                subject: repo_subject("did:plc:victim"),
+                rationale: "spam".to_string(),
+                snapshot_capture: true,
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        // Phase 3.8 fills these — Phase 3.5 returned None.
+        assert!(resp.audit_entry_id.is_some(), "Phase 3.8 should populate audit_entry_id");
+        assert!(resp.snapshot_id.is_some(), "Phase 3.8 should populate snapshot_id");
+        // Verify the chain row landed.
+        let chain_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE actor_did = $1",
+        )
+        .bind("did:plc:moderator")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(chain_count, 1);
+    }
+
+    #[tokio::test]
+    async fn get_audit_trail_returns_entries_with_verified_true() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        emit_event(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(EmitEventInput {
+                action: ModEventAction::TakedownAccount,
+                subject: repo_subject("did:plc:victim"),
+                rationale: "spam".to_string(),
+                snapshot_capture: true,
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: None,
+                subject_uri: None,
+                after_created: None,
+                before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.items.len(), 1);
+        let entry = &resp.items[0];
+        assert!(entry.verified, "fresh entry should be verified");
+        assert_eq!(entry.actor_did, "did:plc:moderator");
+        assert_eq!(entry.action, "TakedownAccount");
+        assert!(entry.snapshot_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_audit_trail_filters_by_actor_did() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:s1", "s1.test").await;
+        // Two events from different actors via direct chain inserts.
+        crate::admin::audit_chain::append_entry(
+            &ctx.account_db,
+            crate::admin::audit_chain::AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownAccount",
+                subject: Some(&repo_subject("did:plc:s1")),
+                rationale: "first",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+            },
+        ).await.unwrap();
+        crate::admin::audit_chain::append_entry(
+            &ctx.account_db,
+            crate::admin::audit_chain::AppendEntryParams {
+                actor_did: "did:plc:m2",
+                action: "RestoreAccount",
+                subject: Some(&repo_subject("did:plc:s1")),
+                rationale: "second",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+            },
+        ).await.unwrap();
+        let resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: Some("did:plc:m1".to_string()),
+                action: None, subject_did: None, subject_uri: None,
+                after_created: None, before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await.unwrap().0;
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].actor_did, "did:plc:m1");
     }
 
     #[tokio::test]

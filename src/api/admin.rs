@@ -394,6 +394,14 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.admin.getModerationMetrics",
             post(crate::api::aurora_admin::get_moderation_metrics),
         )
+        // Phase 3.8 (chainlink #105) — hash-chained audit trail.
+        // Auth: AdminModeration scope, Moderator+ role at handler.
+        // Per design doc §8.4: cursor-paginated newest-first; verified
+        // flag computed at query time by re-hashing entry content.
+        .route(
+            "/xrpc/tools.aurora.admin.getAuditTrail",
+            get(crate::api::aurora_admin::get_audit_trail),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -2313,7 +2321,8 @@ fn aurora_capability_families() -> serde_json::Value {
             "batchRemoveLabel",
             "triggerPasswordReset",
             "getQueueStats",
-            "getModerationMetrics"
+            "getModerationMetrics",
+            "getAuditTrail"
         ],
         // Phase 3.6 (chainlink #103) — role management relocated from
         // com.atproto.admin.{grantRole,revokeRole}.

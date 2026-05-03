@@ -7,6 +7,7 @@
 //! account moderation, labeling, and invite codes.
 
 pub mod appeals;
+pub mod audit_chain;
 pub mod defs;
 pub mod events;
 pub mod invites;
