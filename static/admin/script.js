@@ -324,10 +324,25 @@ function loadUsers() {
     .catch(err => console.error('Failed to load users:', err));
 }
 
+// Phase 3.5D (chainlink #114): multi-select substrate for Users.
+// Tracks DIDs of selected rows; renderUsersTable wires checkboxes
+// + bulk-action bar via the BulkActionPanel substrate primitive.
+let usersSelected = new Set();
+
 function renderUsersTable(users) {
     const tbody = document.getElementById('users-table');
+    // Drop selections for users no longer in the page (filter changes,
+    // pagination, etc.).
+    const visibleDids = new Set(users.map(u => u.did));
+    usersSelected = new Set([...usersSelected].filter(d => visibleDids.has(d)));
     tbody.innerHTML = users.map(user => `
         <tr>
+            <td>
+                <input type="checkbox" class="bulk-select-user"
+                       data-did="${user.did}"
+                       ${usersSelected.has(user.did) ? 'checked' : ''}
+                       aria-label="Select ${user.handle}">
+            </td>
             <td>${user.handle}</td>
             <td><code>${user.did}</code></td>
             <td>${user.email || 'N/A'}</td>
@@ -335,12 +350,62 @@ function renderUsersTable(users) {
             <td><span class="status-badge status-${user.status || 'active'}">${user.status || 'Active'}</span></td>
             <td>
                 <button class="btn-sm btn-primary" onclick="viewUser('${user.did}')">View</button>
-                <button class="btn-sm btn-secondary" onclick="suspendUser('${user.did}')">Suspend</button>
             </td>
         </tr>
     `).join('');
+    // Wire checkbox change handlers
+    tbody.querySelectorAll('.bulk-select-user').forEach(cb => {
+        cb.addEventListener('change', e => {
+            const did = e.target.dataset.did;
+            if (e.target.checked) usersSelected.add(did);
+            else usersSelected.delete(did);
+            updateUsersBulkBar();
+        });
+    });
+    updateUsersBulkBar();
 }
 
+function updateUsersBulkBar() {
+    let bar = document.getElementById('users-bulk-bar');
+    if (!bar) {
+        // Inject the bulk-action bar above the table on first render.
+        const card = document.querySelector('#page-users .table-card');
+        if (!card) return;
+        bar = document.createElement('div');
+        bar.id = 'users-bulk-bar';
+        bar.className = 'bulk-action-bar';
+        bar.setAttribute('role', 'toolbar');
+        bar.setAttribute('aria-label', 'Bulk actions for selected users');
+        card.parentNode.insertBefore(bar, card);
+    }
+    const n = usersSelected.size;
+    if (n === 0) {
+        bar.innerHTML = '';
+        bar.style.display = 'none';
+        return;
+    }
+    bar.style.display = '';
+    bar.innerHTML = `
+        <span><strong>${n}</strong> selected</span>
+        <button class="btn-sm btn-danger" onclick="openBulkActionModal('users','BatchTakedownAccounts')">Bulk takedown</button>
+        <button class="btn-sm btn-secondary" onclick="openBulkActionModal('users','BatchSuspendAccounts')">Bulk suspend</button>
+        <button class="btn-sm btn-secondary" onclick="openBulkActionModal('users','BatchRestoreAccounts')">Bulk restore</button>
+        <button class="btn-sm btn-secondary" onclick="clearUsersSelection()">Clear</button>
+    `;
+}
+
+function clearUsersSelection() {
+    usersSelected.clear();
+    document.querySelectorAll('.bulk-select-user').forEach(cb => { cb.checked = false; });
+    updateUsersBulkBar();
+}
+
+// Phase 3.5D — viewUser opens the user-details modal with two
+// composed action drawers (Pattern A: account management, Pattern B:
+// account-scoped moderation). Both drawers consume the ActionPanel
+// substrate primitive (substrate primitive 3, §6.3); ActionPanel
+// routes through the capability-routed substrate to emitEvent
+// post-3.5 per §6.17.
 function viewUser(did) {
     fetch(`${API_BASE}/com.atproto.admin.getAccount?did=${did}`, {
         headers: { 'Authorization': `Bearer ${adminToken}` }
@@ -358,8 +423,22 @@ function viewUser(did) {
                 <p><strong>Followers:</strong> ${user.followersCount || 0}</p>
                 <p><strong>Following:</strong> ${user.followingCount || 0}</p>
             </div>
+            <div class="user-details-actions" style="margin-top: 1.5rem;">
+                <details open>
+                    <summary><strong>Moderation actions</strong> <span class="role-tag">Moderator+</span></summary>
+                    <div id="user-mod-action-panel" style="margin-top: 0.75rem;"></div>
+                </details>
+                <details style="margin-top: 1rem;">
+                    <summary><strong>Account management</strong> <span class="role-tag">Admin+</span></summary>
+                    <div id="user-mgmt-action-panel" style="margin-top: 0.75rem;"></div>
+                    <div style="margin-top: 0.75rem;">
+                        <button class="btn-secondary" onclick="openPasswordResetModal('${user.did}','${user.handle || ''}')">Send password reset</button>
+                    </div>
+                </details>
+            </div>
         `;
         showModal('modal-user-details');
+        mountUserActionPanels(user);
     })
     .catch(err => {
         alert('Failed to load user details');
@@ -367,28 +446,162 @@ function viewUser(did) {
     });
 }
 
-function suspendUser(did) {
-    if (!confirm('Are you sure you want to suspend this user?')) return;
+// Pattern A + B action panels for the User Details modal. Pattern A
+// (account-mgmt) lists Admin+ actions; Pattern B (moderation) lists
+// Moderator+ actions. Both use the same ActionPanel primitive, just
+// with different availableActions arrays.
+function mountUserActionPanels(user) {
+    const subject = {
+        '$type': 'com.atproto.admin.defs#repoRef',
+        did: user.did,
+    };
+    // Pattern B — moderation actions drawer (Moderator+).
+    const modPanel = new ActionPanel({
+        subject: subject,
+        availableActions: [
+            'TakedownAccount',
+            'SuspendAccount',
+            'RestoreAccount',
+            'ApplyLabel',
+            'RemoveLabel',
+            'SendEmail',
+        ],
+        defaultAction: 'TakedownAccount',
+        requiresRationale: true,
+        highImpactActions: ['TakedownAccount'],
+        userRole: currentUser?.role || 'moderator',
+        onCancel: () => { /* drawer stays open; no-op */ },
+    });
+    modPanel.mount(document.getElementById('user-mod-action-panel'));
+    // Pattern A — account management drawer (Admin+). The Admin gate
+    // is display-side; server is authoritative per §3.1.
+    const mgmtPanel = new ActionPanel({
+        subject: subject,
+        availableActions: ['DeleteAccount'],
+        defaultAction: 'DeleteAccount',
+        requiresRationale: true,
+        highImpactActions: ['DeleteAccount'],
+        userRole: currentUser?.role || 'moderator',
+        onCancel: () => { /* drawer stays open */ },
+    });
+    mgmtPanel.mount(document.getElementById('user-mgmt-action-panel'));
+}
 
-    fetch(`${API_BASE}/com.atproto.admin.updateSubjectStatus`, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${adminToken}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            subject: { did },
-            takedown: { applied: true }
-        })
+// Two-track password reset flow (§5.2 Credentials sub-section). Single-
+// click button opens a small confirmation modal with rationale field;
+// calls tools.aurora.admin.triggerPasswordReset on confirm.
+function openPasswordResetModal(did, handle) {
+    const rationale = prompt(
+        'Send password reset email to ' + (handle || did) + '?\n\n' +
+        'Rationale (required, recorded in audit log):'
+    );
+    if (rationale == null) return;
+    if (!rationale.trim()) {
+        alert('Rationale is required.');
+        return;
+    }
+    AuroraCapabilities.callEndpoint('trigger-password-reset', {
+        did: did,
+        rationale: rationale,
     })
-    .then(() => {
-        alert('User suspended successfully');
-        loadUsers();
+    .then(result => {
+        const sent = result.resetEmailSent
+            ? 'Password reset email sent to ' + result.maskedEmail
+            : 'Token generated but email not sent (mailer not configured); masked: ' + result.maskedEmail;
+        alert(sent);
     })
     .catch(err => {
-        alert('Failed to suspend user');
-        console.error(err);
+        alert('Password reset failed: ' + (err.message || err));
     });
+}
+
+// Phase 3.5D — bulk action modal for multi-select pages. Renders
+// BulkActionPanel substrate primitive into the existing modal-overlay
+// infrastructure with a temporary container.
+function openBulkActionModal(source, defaultAction) {
+    const subjects = collectBulkSubjects(source);
+    if (subjects.length === 0) {
+        alert('No subjects selected.');
+        return;
+    }
+    const containerId = 'bulk-action-container';
+    let modal = document.getElementById('modal-bulk-action');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'modal-bulk-action';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-header">
+                <h3>Bulk action</h3>
+                <button class="modal-close" onclick="closeBulkActionModal()" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body" id="${containerId}"></div>
+        `;
+        document.body.appendChild(modal);
+    }
+    const availableActions = bulkActionsForSource(source);
+    const panel = new BulkActionPanel({
+        subjects: subjects,
+        availableActions: availableActions,
+        onCancel: () => closeBulkActionModal(),
+    });
+    document.getElementById(containerId).innerHTML = '';
+    panel.mount(document.getElementById(containerId));
+    // Pre-select the requested action if it's in the available list.
+    if (availableActions.indexOf(defaultAction) !== -1) {
+        panel.state.action = defaultAction;
+        panel.render();
+    }
+    document.getElementById('modal-overlay').classList.add('active');
+    modal.classList.add('active');
+    window._activeBulkPanel = panel;
+}
+
+function closeBulkActionModal() {
+    const modal = document.getElementById('modal-bulk-action');
+    if (modal) modal.classList.remove('active');
+    document.getElementById('modal-overlay').classList.remove('active');
+    if (window._activeBulkPanel) {
+        window._activeBulkPanel.unmount();
+        window._activeBulkPanel = null;
+    }
+    // Refresh underlying page data after a bulk action completes.
+    if (currentPage === 'users') loadUsers();
+    else if (currentPage === 'moderation') loadModerationQueue();
+    else if (currentPage === 'reports') loadReports();
+    else if (currentPage === 'invites') loadInvites();
+}
+
+function collectBulkSubjects(source) {
+    if (source === 'users') {
+        return [...usersSelected].map(did => ({
+            '$type': 'com.atproto.admin.defs#repoRef',
+            did: did,
+        }));
+    }
+    if (source === 'queue') {
+        return [...modQueueSelected].map(did => ({
+            '$type': 'com.atproto.admin.defs#repoRef',
+            did: did,
+        }));
+    }
+    if (source === 'reports') {
+        return [...reportsSelected].map(did => ({
+            '$type': 'com.atproto.admin.defs#repoRef',
+            did: did,
+        }));
+    }
+    return [];
+}
+
+function bulkActionsForSource(source) {
+    if (source === 'users') {
+        return ['BatchTakedownAccounts', 'BatchSuspendAccounts', 'BatchRestoreAccounts', 'BatchApplyLabel', 'BatchRemoveLabel'];
+    }
+    if (source === 'queue' || source === 'reports') {
+        return ['BatchTakedownAccounts', 'BatchSuspendAccounts', 'BatchApplyLabel'];
+    }
+    return [];
 }
 
 // Moderation Queue
@@ -404,14 +617,28 @@ function loadModerationQueue() {
     .catch(err => console.error('Failed to load moderation queue:', err));
 }
 
+// Phase 3.5D: multi-select substrate for moderation queue. Each
+// queue item references an account-shaped subject; checkboxes
+// collect the subject DIDs for BulkActionPanel.
+let modQueueSelected = new Set();
+
 function renderModerationQueue(items) {
     const container = document.getElementById('moderation-queue');
-    container.innerHTML = items.map(item => `
+    const visible = new Set(items.map(i => i.subjectDid || i.subject?.did).filter(Boolean));
+    modQueueSelected = new Set([...modQueueSelected].filter(d => visible.has(d)));
+    container.innerHTML = items.map(item => {
+        const subjDid = item.subjectDid || item.subject?.did || '';
+        const checked = modQueueSelected.has(subjDid) ? 'checked' : '';
+        const cbDisabled = subjDid ? '' : 'disabled aria-label="No subject DID for this item"';
+        return `
         <div class="mod-item">
             <div class="mod-header">
+                <input type="checkbox" class="bulk-select-mod"
+                       data-did="${subjDid}" ${checked} ${cbDisabled}
+                       aria-label="Select queue item ${item.id}">
                 <div>
                     <strong>${item.reasonType || 'Unknown'}</strong>
-                    <p>By: ${item.reportedBy}</p>
+                    <p>By: ${item.reportedBy || ''}</p>
                 </div>
                 <span class="status-badge status-pending">Pending</span>
             </div>
@@ -423,7 +650,51 @@ function renderModerationQueue(items) {
                 <button class="btn-sm btn-danger" onclick="takedownContent('${item.id}')">Takedown</button>
             </div>
         </div>
-    `).join('');
+    `;
+    }).join('');
+    container.querySelectorAll('.bulk-select-mod').forEach(cb => {
+        cb.addEventListener('change', e => {
+            const did = e.target.dataset.did;
+            if (!did) return;
+            if (e.target.checked) modQueueSelected.add(did);
+            else modQueueSelected.delete(did);
+            updateModQueueBulkBar();
+        });
+    });
+    updateModQueueBulkBar();
+}
+
+function updateModQueueBulkBar() {
+    let bar = document.getElementById('mod-queue-bulk-bar');
+    const page = document.querySelector('#page-moderation .moderation-queue');
+    if (!page) return;
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'mod-queue-bulk-bar';
+        bar.className = 'bulk-action-bar';
+        bar.setAttribute('role', 'toolbar');
+        bar.setAttribute('aria-label', 'Bulk actions for selected queue items');
+        page.parentNode.insertBefore(bar, page);
+    }
+    const n = modQueueSelected.size;
+    if (n === 0) {
+        bar.innerHTML = '';
+        bar.style.display = 'none';
+        return;
+    }
+    bar.style.display = '';
+    bar.innerHTML = `
+        <span><strong>${n}</strong> subject${n === 1 ? '' : 's'} selected</span>
+        <button class="btn-sm btn-danger" onclick="openBulkActionModal('queue','BatchTakedownAccounts')">Bulk takedown</button>
+        <button class="btn-sm btn-secondary" onclick="openBulkActionModal('queue','BatchSuspendAccounts')">Bulk suspend</button>
+        <button class="btn-sm btn-secondary" onclick="clearModQueueSelection()">Clear</button>
+    `;
+}
+
+function clearModQueueSelection() {
+    modQueueSelected.clear();
+    document.querySelectorAll('.bulk-select-mod').forEach(cb => { cb.checked = false; });
+    updateModQueueBulkBar();
 }
 
 // Reports
@@ -440,17 +711,31 @@ function loadReports() {
     .catch(err => console.error('Failed to load reports:', err));
 }
 
+// Phase 3.5D: multi-select substrate for reports list. Reports
+// reference subject DIDs; checkboxes feed BulkActionPanel.
+let reportsSelected = new Set();
+
 function renderReports(reports) {
     const container = document.getElementById('reports-list');
-    container.innerHTML = reports.map(report => `
+    const visible = new Set(reports.map(r => r.subjectDid || r.subject?.did || (typeof r.subject === 'string' ? r.subject : null)).filter(Boolean));
+    reportsSelected = new Set([...reportsSelected].filter(d => visible.has(d)));
+    container.innerHTML = reports.map(report => {
+        const subjDid = report.subjectDid || report.subject?.did
+            || (typeof report.subject === 'string' && report.subject.startsWith('did:') ? report.subject : '');
+        const checked = reportsSelected.has(subjDid) ? 'checked' : '';
+        const cbDisabled = subjDid ? '' : 'disabled aria-label="No DID-shaped subject for this report"';
+        return `
         <div class="report-item">
             <div class="report-header">
+                <input type="checkbox" class="bulk-select-report"
+                       data-did="${subjDid}" ${checked} ${cbDisabled}
+                       aria-label="Select report ${report.id}">
                 <div>
-                    <strong>${report.reasonType}</strong>
-                    <p>Reporter: @${report.reportedBy}</p>
-                    <p>Subject: ${report.subject}</p>
+                    <strong>${report.reasonType || ''}</strong>
+                    <p>Reporter: @${report.reportedBy || ''}</p>
+                    <p>Subject: ${report.subject || ''}</p>
                 </div>
-                <span class="status-badge status-${report.status}">${report.status}</span>
+                <span class="status-badge status-${report.status || 'open'}">${report.status || 'open'}</span>
             </div>
             <div class="report-content">
                 ${report.reason || 'No reason provided'}
@@ -459,7 +744,52 @@ function renderReports(reports) {
                 <button class="btn-sm btn-primary" onclick="viewReport('${report.id}')">View Details</button>
             </div>
         </div>
-    `).join('');
+    `;
+    }).join('');
+    container.querySelectorAll('.bulk-select-report').forEach(cb => {
+        cb.addEventListener('change', e => {
+            const did = e.target.dataset.did;
+            if (!did) return;
+            if (e.target.checked) reportsSelected.add(did);
+            else reportsSelected.delete(did);
+            updateReportsBulkBar();
+        });
+    });
+    updateReportsBulkBar();
+}
+
+function updateReportsBulkBar() {
+    let bar = document.getElementById('reports-bulk-bar');
+    const list = document.querySelector('#page-reports .reports-list');
+    if (!list) return;
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'reports-bulk-bar';
+        bar.className = 'bulk-action-bar';
+        bar.setAttribute('role', 'toolbar');
+        bar.setAttribute('aria-label', 'Bulk actions for selected reports');
+        list.parentNode.insertBefore(bar, list);
+    }
+    const n = reportsSelected.size;
+    if (n === 0) {
+        bar.innerHTML = '';
+        bar.style.display = 'none';
+        return;
+    }
+    bar.style.display = '';
+    bar.innerHTML = `
+        <span><strong>${n}</strong> subject${n === 1 ? '' : 's'} selected</span>
+        <button class="btn-sm btn-danger" onclick="openBulkActionModal('reports','BatchTakedownAccounts')">Bulk takedown</button>
+        <button class="btn-sm btn-secondary" onclick="openBulkActionModal('reports','BatchSuspendAccounts')">Bulk suspend</button>
+        <button class="btn-sm btn-secondary" onclick="openBulkActionModal('reports','BatchApplyLabel')">Bulk label</button>
+        <button class="btn-sm btn-secondary" onclick="clearReportsSelection()">Clear</button>
+    `;
+}
+
+function clearReportsSelection() {
+    reportsSelected.clear();
+    document.querySelectorAll('.bulk-select-report').forEach(cb => { cb.checked = false; });
+    updateReportsBulkBar();
 }
 
 function viewReport(reportId) {
@@ -500,20 +830,102 @@ function loadInvites() {
     .catch(err => console.error('Failed to load invites:', err));
 }
 
+// Phase 3.5D: Pattern E (invite-code actions) bulk variant on Invites
+// page per §9.2. Uses the existing com.atproto.admin.disableInviteCodes
+// (plural, transactional all-or-nothing per Phase 1.3) rather than a
+// new batch endpoint — Phase 3.5 §8 only adds account/record/label
+// batch endpoints, not invite-code batch.
+let invitesSelected = new Set();
+
 function renderInvites(codes) {
     const tbody = document.getElementById('invites-table');
+    const visible = new Set(codes.map(c => c.code));
+    invitesSelected = new Set([...invitesSelected].filter(c => visible.has(c)));
     tbody.innerHTML = codes.map(code => `
         <tr>
+            <td>
+                <input type="checkbox" class="bulk-select-invite"
+                       data-code="${code.code}"
+                       ${invitesSelected.has(code.code) ? 'checked' : ''}
+                       ${code.disabled ? 'disabled aria-label="Already disabled"' : 'aria-label="Select invite code"'}>
+            </td>
             <td><code>${code.code}</code></td>
             <td>${code.uses || 0} / ${code.available || 1}</td>
             <td>@${code.created_by || 'system'}</td>
             <td>${new Date(code.created_at).toLocaleDateString()}</td>
             <td><span class="status-badge status-${code.disabled ? 'suspended' : 'active'}">${code.disabled ? 'Disabled' : 'Active'}</span></td>
             <td>
-                <button class="btn-sm btn-danger" onclick="disableInvite('${code.code}')">Disable</button>
+                <button class="btn-sm btn-danger" onclick="disableInvite('${code.code}')" ${code.disabled ? 'disabled' : ''}>Disable</button>
             </td>
         </tr>
     `).join('');
+    tbody.querySelectorAll('.bulk-select-invite').forEach(cb => {
+        cb.addEventListener('change', e => {
+            const code = e.target.dataset.code;
+            if (e.target.checked) invitesSelected.add(code);
+            else invitesSelected.delete(code);
+            updateInvitesBulkBar();
+        });
+    });
+    updateInvitesBulkBar();
+}
+
+function updateInvitesBulkBar() {
+    let bar = document.getElementById('invites-bulk-bar');
+    const card = document.querySelector('#page-invites .table-card');
+    if (!card) return;
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'invites-bulk-bar';
+        bar.className = 'bulk-action-bar';
+        bar.setAttribute('role', 'toolbar');
+        bar.setAttribute('aria-label', 'Bulk actions for selected invite codes');
+        card.parentNode.insertBefore(bar, card);
+    }
+    const n = invitesSelected.size;
+    if (n === 0) {
+        bar.innerHTML = '';
+        bar.style.display = 'none';
+        return;
+    }
+    bar.style.display = '';
+    bar.innerHTML = `
+        <span><strong>${n}</strong> code${n === 1 ? '' : 's'} selected</span>
+        <button class="btn-sm btn-danger" onclick="bulkDisableInvites()">Disable selected</button>
+        <button class="btn-sm btn-secondary" onclick="clearInvitesSelection()">Clear</button>
+    `;
+}
+
+function clearInvitesSelection() {
+    invitesSelected.clear();
+    document.querySelectorAll('.bulk-select-invite').forEach(cb => { cb.checked = false; });
+    updateInvitesBulkBar();
+}
+
+function bulkDisableInvites() {
+    const codes = [...invitesSelected];
+    if (codes.length === 0) return;
+    if (!confirm('Disable ' + codes.length + ' invite code' + (codes.length === 1 ? '' : 's') + '?')) return;
+    fetch(API_BASE + '/com.atproto.admin.disableInviteCodes', {
+        method: 'POST',
+        headers: {
+            'Authorization': 'Bearer ' + adminToken,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ codes: codes }),
+    })
+    .then(res => {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json().catch(() => ({}));
+    })
+    .then(() => {
+        alert('Disabled ' + codes.length + ' invite code' + (codes.length === 1 ? '' : 's'));
+        invitesSelected.clear();
+        loadInvites();
+    })
+    .catch(err => {
+        alert('Bulk disable failed: ' + err.message);
+    });
 }
 
 function updateInviteStats(codes) {
