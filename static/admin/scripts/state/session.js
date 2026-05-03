@@ -32,8 +32,18 @@
     notify();
   }
 
+  // Role resolution order:
+  //   1. currentUser.role  (live in-memory copy if getSession returned a role)
+  //   2. localStorage.adminRole  (set by the OAuth callback in login.js)
+  //   3. 'moderator'  (least-privileged fallback)
+  // The standard com.atproto.server.getSession lexicon does not include an
+  // admin tier, so step 1 is usually undefined and step 2 is the actual
+  // source of truth post-OAuth.
   function role() {
-    return (currentUser && currentUser.role) || 'moderator';
+    if (currentUser && currentUser.role) return currentUser.role;
+    const stored = localStorage.getItem('adminRole');
+    if (stored) return stored;
+    return 'moderator';
   }
 
   // Per Section 4.2 — role tier comparison.
