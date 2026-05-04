@@ -2040,15 +2040,18 @@ impl AccountManager {
 
         let created_by: String = row.get("created_by");
 
-        // Check if requester is creator or admin
-        let is_admin = self
-            .config
-            .authentication
-            .admin_dids
-            .contains(&requesting_did.to_string());
-        if created_by != requesting_did && !is_admin {
+        // Creator-only at this layer. Admin-flavored invite-disable
+        // (operator disabling another account's code) belongs at the
+        // admin XRPC handler tier where AdminAuthContext gates entry
+        // — see src/api/admin.rs::disable_invite_code, which routes
+        // through invite_manager and never calls this method. The
+        // PDS_ADMIN_DIDS env var does not by itself confer authority
+        // to bypass the creator check here.
+        if created_by != requesting_did {
             return Err(PdsError::Authorization(
-                "Only the creator or an admin can disable this invite code".to_string(),
+                "Only the creator can disable this invite code at the account layer; \
+                 admin-flavored disable goes through tools.aurora.* / com.atproto.admin.*"
+                    .to_string(),
             ));
         }
 

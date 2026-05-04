@@ -147,7 +147,11 @@ PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY=<your-secret>
 
 ### First Admin User
 
-After starting the server, create the first admin user:
+After starting the server, create the first admin user. This is a
+one-time bootstrap — admin authority comes from the `admin_role`
+table only, not from any environment variable. After the first
+SuperAdmin exists, all subsequent role grants flow through
+`tools.aurora.superadmin.grantRole`, which writes to the audit chain.
 
 ```bash
 # Register account
@@ -159,7 +163,7 @@ curl -X POST http://localhost:3000/xrpc/com.atproto.server.createAccount \
     "password": "secure-password"
   }'
 
-# Grant SuperAdmin role (requires database access)
+# Grant SuperAdmin role (one-time bootstrap; requires direct database access)
 sqlite3 data/accounts.db "INSERT INTO admin_role (did, role, granted_by, granted_at)
   VALUES ('did:plc:...', 'superadmin', 'system', datetime('now'));"
 ```

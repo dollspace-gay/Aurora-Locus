@@ -254,29 +254,25 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
 
         tracing::debug!("AdminAuthContext: Checking admin role for DID: {}", did);
 
-        // Check if DID is in configured admin DIDs list
-        let is_configured_admin = state.config.authentication.admin_dids.contains(&did);
-
-        // Try to get role from database
-        let role = if let Some(admin_role) = state.admin_role_manager.get_role(&did).await? {
-            // User has a role in the database
-            tracing::info!(
-                "AdminAuthContext: User {} has role {} from database",
-                did,
-                admin_role.role.as_str()
-            );
-            admin_role.role
-        } else if is_configured_admin {
-            // User is in configured admin DIDs, grant SuperAdmin
-            tracing::info!(
-                "AdminAuthContext: User {} is configured admin, granting SuperAdmin",
-                did
-            );
-            Role::SuperAdmin
-        } else {
-            // User is not an admin
-            tracing::warn!("AdminAuthContext: User {} is not an admin", did);
-            return Err(PdsError::Authorization("Admin role required".to_string()));
+        // Authority comes from the admin_role table only. The
+        // PDS_ADMIN_DIDS env var is a bootstrap convenience for
+        // operator-side configuration (warnings, OAuth allow-list at
+        // first-login time per the assessment doc §1.1) and does not
+        // by itself confer any role — every grant must be a recorded
+        // audit-chain decision.
+        let role = match state.admin_role_manager.get_role(&did).await? {
+            Some(admin_role) => {
+                tracing::info!(
+                    "AdminAuthContext: User {} has role {} from database",
+                    did,
+                    admin_role.role.as_str()
+                );
+                admin_role.role
+            }
+            None => {
+                tracing::warn!("AdminAuthContext: User {} is not an admin", did);
+                return Err(PdsError::Authorization("Admin role required".to_string()));
+            }
         };
 
         Ok(AdminAuthContext { did, session, role })
