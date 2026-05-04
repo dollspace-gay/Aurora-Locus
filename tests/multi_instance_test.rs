@@ -102,8 +102,13 @@ impl Instance {
         // Sequencer + leader election (Postgres path mirrors AppContext::new).
         let mut seq = Sequencer::with_relay(pool.clone(), SequencerConfig::default(), None);
         seq.attach_leader_flag(Arc::new(AtomicBool::new(false)));
+        // PostgresLockProvider::new takes the connection URL (not a
+        // pool clone) since chainlink #103 / Session 4 — the lock
+        // connection is dedicated, opened directly via
+        // AnyConnection::connect rather than borrowed from the
+        // application pool. Match that signature here.
         let provider = Arc::new(PostgresLockProvider::new(
-            pool.clone(),
+            url.to_string(),
             SEQUENCER_LEADER_LOCK_KEY,
         ));
         let mut election = LeaderElection::new(provider, seq.leader_flag());
