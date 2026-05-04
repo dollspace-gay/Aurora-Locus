@@ -24,6 +24,60 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{AnyPool, Row};
+use std::sync::OnceLock;
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Process-local serialization guard for chain appends. Combined
+/// with the per-call transaction and (on Postgres) the advisory
+/// lock inside that transaction, this gives correct behavior under
+/// concurrent multi-writer load on both backends:
+///
+/// - SQLite: the engine serializes WRITES at the database level,
+///   but a `BEGIN DEFERRED` transaction running SELECT-head + INSERT
+///   can't atomically upgrade SHARED → RESERVED if another writer
+///   already holds RESERVED, so it returns SQLITE_BUSY. Per-process
+///   mutex ahead of the transaction makes the SELECT-head + INSERT
+///   sequence single-flighted within the process; SQLite's own write
+///   lock takes care of cross-process serialization (in v0.2 SQLite
+///   deployments are single-instance anyway).
+///
+/// - Postgres: this mutex is mostly cheap-no-op overhead because
+///   pg_advisory_xact_lock already serializes appenders inside the
+///   transaction. It serves as a small in-process queue ahead of
+///   the network round-trip — useful for keeping appenders fair
+///   under bursty load — but the cross-process correctness comes
+///   from the advisory lock, not this mutex.
+fn append_serialize_guard() -> &'static AsyncMutex<()> {
+    static GUARD: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| AsyncMutex::new(()))
+}
+
+/// Stable advisory-lock key for the audit_chain_entry table. Held
+/// inside a Postgres transaction during `append_entry` to serialize
+/// the read-head + insert-next-row sequence; without this, two
+/// concurrent appends both observe head = (N, hash X) and both
+/// compute next = (N+1, prev_hash=X), producing a UNIQUE-constraint
+/// race that loses one entry per collision.
+///
+/// Derivation matches `SEQUENCER_LEADER_LOCK_KEY` (same const-time
+/// SHA-256 → first 8 bytes BE → i64 pattern) but over a different
+/// input string so the keyspaces don't collide.
+///
+/// SQLite gets serialization for free via its database-level write
+/// lock; the advisory-lock query is skipped on SQLite. The
+/// surrounding transaction provides equivalent ordering on both
+/// backends.
+pub const AUDIT_CHAIN_LOCK_KEY: i64 = audit_chain_lock_key();
+
+const fn audit_chain_lock_key() -> i64 {
+    // SHA-256("aurora.audit_chain") first 8 bytes (big-endian) as i64.
+    // Pre-computed for const-time evaluation. Verified by
+    // `audit_chain_lock_key_matches_runtime_hash` against a fresh
+    // runtime computation, AND by `audit_chain_lock_key_distinct_from_leader`
+    // against the sequencer leader lock so the two keyspaces don't
+    // collide.
+    i64::from_be_bytes([0x2a, 0x28, 0x50, 0x8f, 0x76, 0xb6, 0x8d, 0x08])
+}
 
 /// One audit chain entry. Ships in `getAuditTrail` responses and is
 /// what the Audit page renders rows for.
@@ -178,15 +232,55 @@ pub struct AppendEntryParams<'a> {
     pub cascade_subjects: &'a [Subject],
 }
 
+/// Append an entry to the chain.
+///
+/// Concurrency: the SELECT-head + INSERT-next sequence runs inside
+/// a single transaction. On Postgres we additionally take
+/// `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` as the
+/// transaction's first statement so concurrent appenders serialize
+/// at the lock rather than racing on the chain head and colliding
+/// on the `UNIQUE(sequence)` constraint. The lock auto-releases at
+/// COMMIT. On SQLite the lock query is skipped — SQLite's
+/// database-level write lock already serializes writes at
+/// transaction granularity, which is the property we need.
+///
+/// ADMIN_MOD_PHASE_3 §6.1's "concurrency commitment" was specifying
+/// either advisory-lock or SERIALIZABLE-isolation as acceptable
+/// solutions; this implementation picks advisory-lock to match the
+/// codebase's existing leader-election pattern (clear semantics, no
+/// retry-on-serialization-failure logic).
 pub async fn append_entry(
     db: &AnyPool,
     params: AppendEntryParams<'_>,
 ) -> Result<i64, PdsError> {
+    // In-process serialization (see `append_serialize_guard` doc).
+    // Held across the entire transaction so SELECT-head + INSERT-next
+    // can't be interrupted by another in-process appender.
+    let _guard = append_serialize_guard().lock().await;
+
+    let mut tx = db.begin().await?;
+
+    // Postgres: serialize concurrent appenders behind a single
+    // advisory lock keyed on AUDIT_CHAIN_LOCK_KEY. The lock auto-
+    // releases at COMMIT (or ROLLBACK on error). Best-effort —
+    // SQLite would error on the function call ("no such function
+    // pg_advisory_xact_lock"), so we ignore failures here. The
+    // surrounding transaction provides write-serialization on both
+    // backends; the advisory lock is purely a Postgres refinement
+    // that lets multiple admins block briefly rather than races
+    // returning UNIQUE-violation errors.
+    let _ = sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(AUDIT_CHAIN_LOCK_KEY)
+        .execute(&mut *tx)
+        .await;
+
     // Determine sequence + previous hash from the chain head.
+    // Inside the transaction so this read sees the same snapshot
+    // the subsequent INSERT will write into.
     let head: Option<(i64, String)> = sqlx::query_as::<_, (i64, String)>(
         "SELECT sequence, current_hash FROM audit_chain_entry ORDER BY sequence DESC LIMIT 1",
     )
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await?;
     let (seq, prev_hash) = match head {
         Some((s, h)) => (s + 1, Some(h)),
@@ -248,8 +342,9 @@ pub async fn append_entry(
     .bind(&current_hash)
     .bind(&prev_hash)
     .bind(&cascade_json)
-    .fetch_one(db)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -926,5 +1021,194 @@ mod tests {
             .unwrap();
         assert!(content.contains("\"handle\":\"s.test\""));
         assert!(content.contains("\"takedownRef\":\"ticket-1\""));
+    }
+
+    // ---- Lock-key derivation + collision verification ----
+
+    #[test]
+    fn audit_chain_lock_key_matches_runtime_hash() {
+        // Verify the const lock key matches the first 8 bytes of
+        // SHA-256("aurora.audit_chain"). Mirrors the same pattern
+        // `test_lock_key_derivation_matches_runtime_hash` uses for
+        // the leader-election key. If this fires, the const bytes
+        // need to be updated to match the actual hash.
+        let mut h = Sha256::new();
+        h.update(b"aurora.audit_chain");
+        let digest = h.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        let expected = i64::from_be_bytes(bytes);
+        assert_eq!(AUDIT_CHAIN_LOCK_KEY, expected);
+    }
+
+    #[test]
+    fn audit_chain_lock_key_distinct_from_leader() {
+        // Both keys live in the same Postgres advisory-lock keyspace.
+        // If they collide, the leader election and the audit-chain
+        // append would interfere with each other (a held leader lock
+        // would block all chain appends, etc.). The two derivation
+        // strings differ; this test pins the assumption.
+        use crate::sequencer::leader_election::SEQUENCER_LEADER_LOCK_KEY;
+        assert_ne!(
+            AUDIT_CHAIN_LOCK_KEY, SEQUENCER_LEADER_LOCK_KEY,
+            "audit-chain lock key must not collide with sequencer leader key"
+        );
+    }
+
+    // ---- Concurrency stress test ----
+    //
+    // Spawns N concurrent tasks that all call `append_entry` and
+    // verifies each task succeeded, exactly N rows landed,
+    // sequences are contiguous from 1..=N, and verify_chain_range
+    // passes across the whole window.
+    //
+    // Without the transaction wrapping + advisory-lock contract in
+    // append_entry, two tasks racing through SELECT-head would both
+    // compute next-sequence = N+1, the second INSERT would fail with
+    // a UNIQUE-violation error, and the test would see < N rows
+    // (with the failing tasks returning Err). With the contract,
+    // both backends serialize at the writer level (Postgres via
+    // pg_advisory_xact_lock; SQLite via its database-level write
+    // lock + the surrounding transaction).
+    //
+    // The pool helper here uses shared-cache in-memory SQLite with a
+    // unique per-test database name so multiple connections within
+    // this pool share the same database without colluding with other
+    // tests' pools (those use anonymous `sqlite::memory:` and stay
+    // private per connection). PRAGMA busy_timeout via after_connect
+    // bounds the SQLITE_BUSY wait under contention.
+
+    async fn open_concurrent_test_pool(max_connections: u32) -> AnyPool {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        // Unique tempfile-backed SQLite database so two concurrent
+        // tests don't share state. File-backed (rather than
+        // shared-cache in-memory) because sqlx::Any only recognizes
+        // `sqlite:` and `postgres:` URL schemes — the SQLite-native
+        // `file:foo?mode=memory&cache=shared` URI rides through but
+        // requires a different prefix style. tempfile gives us
+        // per-test isolation for free.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let pool = AnyPoolOptions::new()
+            .max_connections(max_connections)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    // 5s busy_timeout per connection. SQLite's
+                    // database-level write lock is what serializes
+                    // concurrent appenders on this backend; the
+                    // timeout gives concurrent transactions enough
+                    // headroom to queue up cleanly under load.
+                    let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+                        .execute(conn)
+                        .await;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        // Leak the tempdir so it lives as long as the pool — sqlx
+        // keeps the file open via the connection, and dropping the
+        // dir would yank the file out from under it.
+        std::mem::forget(dir);
+        sqlx::query(
+            "CREATE TABLE audit_chain_entry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sequence INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                actor_did TEXT NOT NULL,
+                action TEXT NOT NULL,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                rationale TEXT NOT NULL,
+                snapshot_id INTEGER,
+                event_id INTEGER,
+                current_hash TEXT NOT NULL,
+                previous_hash TEXT,
+                cascade_subjects TEXT,
+                UNIQUE(sequence)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_entry_serializes_concurrent_writers() {
+        let db = open_concurrent_test_pool(8).await;
+        let n: usize = 20;
+
+        // Spawn N concurrent appenders, each with a distinct
+        // rationale string so the resulting rows are easy to
+        // distinguish if anything diverges.
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let pool = db.clone();
+            let handle = tokio::spawn(async move {
+                let subject = Subject::Repo {
+                    did: format!("did:plc:s{}", i),
+                };
+                append_entry(
+                    &pool,
+                    AppendEntryParams {
+                        actor_did: "did:plc:m1",
+                        action: "TakedownAccount",
+                        subject: Some(&subject),
+                        rationale: &format!("concurrent-{}", i),
+                        snapshot_id: None,
+                        event_id: None,
+                        cascade_subjects: &[],
+                    },
+                )
+                .await
+            });
+            handles.push(handle);
+        }
+
+        // All N must complete successfully — no UNIQUE-constraint
+        // surprises, no silent drops.
+        let mut ok_count = 0;
+        for h in handles {
+            match h.await.expect("task joins") {
+                Ok(_) => ok_count += 1,
+                Err(e) => panic!("append_entry returned Err under concurrent load: {}", e),
+            }
+        }
+        assert_eq!(ok_count, n, "all {} concurrent appends must succeed", n);
+
+        // Exactly N rows landed.
+        let row_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_chain_entry")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(row_count as usize, n);
+
+        // Sequences are contiguous 1..=N. The interleaving order is
+        // arbitrary (any of the N tasks could be first); we only
+        // require that each integer in the range appears exactly once.
+        let sequences: Vec<i64> = sqlx::query_scalar(
+            "SELECT sequence FROM audit_chain_entry ORDER BY sequence ASC",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        let expected: Vec<i64> = (1..=n as i64).collect();
+        assert_eq!(sequences, expected, "sequences must be 1..=N with no gaps");
+
+        // Linkage holds end-to-end: every row's previous_hash
+        // matches the prior row's current_hash. This is the
+        // chain-level invariant the lock+transaction is supposed to
+        // preserve. Without the lock, a UNIQUE-violation would have
+        // already torpedoed the test above; this is the further
+        // assurance that nothing weird happened to the linkage.
+        verify_chain_range(&db, 1, n as i64)
+            .await
+            .expect("clean chain after concurrent appends");
     }
 }
