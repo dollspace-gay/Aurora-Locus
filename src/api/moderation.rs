@@ -162,21 +162,65 @@ async fn create_report(
 // Helper Functions
 // ============================================================================
 
-/// Parse ATProto reason type to internal ReportReason
+/// Canonical ATProto reason-type prefix. Inputs starting with this
+/// prefix go through exact-match handling against our internal
+/// ReportReason set. Any other NSID-shaped reason input
+/// (`<namespace>#reason<Suffix>`) is routed through the extended
+/// vocabulary below.
+const ATPROTO_REASON_PREFIX: &str = "com.atproto.moderation.defs#reason";
+
+/// One rule in the extended report-reason vocabulary. Substring
+/// matches on the lowercased suffix produced by stripping the
+/// `#reason` boundary; the first matching rule supplies the
+/// internal-category target string.
+struct ExtendedReasonRule {
+    /// Substrings to look for (any-match) in the lowercased suffix.
+    needles: &'static [&'static str],
+    /// Internal-category target. Must be one of the values
+    /// `parse_reason_type`'s final match arm accepts: spam,
+    /// misleading, sexual, rude, violation, other.
+    target: &'static str,
+}
+
+/// Extended report-reason vocabulary, expressed as data. External
+/// moderation systems define their own NSIDs with reason vocabularies
+/// that don't line up one-to-one with the canonical com.atproto
+/// reason set; this table smooths registered suffixes into our
+/// internal categories. The code in `map_extended_reason` does not
+/// privilege any specific external system — it iterates this table
+/// linearly and the table is the entire input. Adding a new
+/// vocabulary is a data change, not a code change.
+const EXTENDED_REASON_VOCABULARY: &[ExtendedReasonRule] = &[
+    ExtendedReasonRule { needles: &["spam"], target: "spam" },
+    ExtendedReasonRule {
+        needles: &["misleading", "impersonation", "scam", "bot"],
+        target: "misleading",
+    },
+    ExtendedReasonRule { needles: &["sexual"], target: "sexual" },
+    ExtendedReasonRule {
+        needles: &["harassment", "hate", "doxxing", "troll"],
+        target: "rude",
+    },
+    ExtendedReasonRule {
+        needles: &["violence", "child", "rule", "selfharm"],
+        target: "violation",
+    },
+];
+
+/// Parse ATProto reason type to internal ReportReason. Three input
+/// shapes are accepted:
+///
+/// 1. Canonical: `com.atproto.moderation.defs#reasonSpam` etc. The
+///    suffix after the prefix is lowercased and matched exactly.
+/// 2. Extended-vocabulary: any other `<namespace>#reason<Suffix>`
+///    NSID-shape. The suffix runs through substring-keyed
+///    classification per `EXTENDED_REASON_VOCABULARY`.
+/// 3. Short form: bare strings like "spam", "violation".
 fn parse_reason_type(reason_type: &str) -> Result<ReportReason, String> {
-    // Handle full ATProto format (com.atproto.moderation.defs#reasonSpam)
-    // and short format (spam, violation, etc.)
-    let reason = if reason_type.starts_with("com.atproto.moderation.defs#reason") {
-        reason_type
-            .strip_prefix("com.atproto.moderation.defs#reason")
-            .unwrap_or(reason_type)
-            .to_lowercase()
-    } else if reason_type.starts_with("tools.ozone.report.defs#reason") {
-        // Map Ozone reason types to our internal types
-        let ozone_reason = reason_type
-            .strip_prefix("tools.ozone.report.defs#reason")
-            .unwrap_or(reason_type);
-        map_ozone_reason(ozone_reason)
+    let reason = if let Some(suffix) = reason_type.strip_prefix(ATPROTO_REASON_PREFIX) {
+        suffix.to_lowercase()
+    } else if let Some(suffix) = strip_extended_reason_prefix(reason_type) {
+        map_extended_reason(suffix)
     } else {
         reason_type.to_lowercase()
     };
@@ -192,44 +236,34 @@ fn parse_reason_type(reason_type: &str) -> Result<ReportReason, String> {
     }
 }
 
-/// Map Ozone-specific reason types to our internal types
-fn map_ozone_reason(ozone_reason: &str) -> String {
-    // Map detailed Ozone reasons to our simpler categories
-    match ozone_reason.to_lowercase().as_str() {
-        // Spam/Misleading category
-        s if s.contains("spam") => "spam".to_string(),
-        s if s.contains("misleading")
-            || s.contains("impersonation")
-            || s.contains("scam")
-            || s.contains("bot") =>
-        {
-            "misleading".to_string()
-        }
-
-        // Sexual content category
-        s if s.contains("sexual") => "sexual".to_string(),
-
-        // Harassment/Rude category
-        s if s.contains("harassment")
-            || s.contains("hate")
-            || s.contains("doxxing")
-            || s.contains("troll") =>
-        {
-            "rude".to_string()
-        }
-
-        // Violation category (violence, child safety, rules)
-        s if s.contains("violence")
-            || s.contains("child")
-            || s.contains("rule")
-            || s.contains("selfharm") =>
-        {
-            "violation".to_string()
-        }
-
-        // Default to other
-        _ => "other".to_string(),
+/// Detect a non-canonical reason-type NSID and return whatever
+/// follows the `#reason` boundary. Returns None for the canonical
+/// com.atproto prefix (handled by the caller separately) and for
+/// inputs that aren't NSID-shaped at all.
+fn strip_extended_reason_prefix(s: &str) -> Option<&str> {
+    if s.starts_with(ATPROTO_REASON_PREFIX) {
+        return None;
     }
+    let (_, suffix) = s.split_once("#reason")?;
+    if suffix.is_empty() {
+        None
+    } else {
+        Some(suffix)
+    }
+}
+
+/// Map an extended-vocabulary suffix to an internal category by
+/// substring matching against `EXTENDED_REASON_VOCABULARY`. Returns
+/// "other" when no rule matches, mirroring the wide catch-all
+/// behavior of the canonical "Other" reason.
+fn map_extended_reason(suffix: &str) -> String {
+    let lower = suffix.to_lowercase();
+    for rule in EXTENDED_REASON_VOCABULARY {
+        if rule.needles.iter().any(|needle| lower.contains(needle)) {
+            return rule.target.to_string();
+        }
+    }
+    "other".to_string()
 }
 
 /// Extract DID from an AT URI (at://did:plc:xxx/collection/rkey)
@@ -293,23 +327,51 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_reason_type_ozone() {
-        // Ozone spam reasons
+    fn test_parse_reason_type_extended_vocabulary() {
+        // Any `<namespace>#reason<Suffix>` NSID-shape that isn't the
+        // canonical com.atproto prefix flows through the extended
+        // vocabulary's substring matcher. Test fixtures use generic
+        // namespace placeholders rather than naming any specific
+        // external system — the contract is "extended NSIDs get
+        // substring-classified," not "this one external system gets
+        // privileged handling."
+
+        // Spam-family substrings → Spam.
         assert!(matches!(
-            parse_reason_type("tools.ozone.report.defs#reasonMisleadingSpam"),
+            parse_reason_type("external.test.report.defs#reasonMisleadingSpam"),
             Ok(ReportReason::Spam)
         ));
 
-        // Ozone harassment reasons
+        // Harassment-family substrings → Rude.
         assert!(matches!(
-            parse_reason_type("tools.ozone.report.defs#reasonHarassmentTargeted"),
+            parse_reason_type("external.test.report.defs#reasonHarassmentTargeted"),
             Ok(ReportReason::Rude)
         ));
 
-        // Ozone sexual reasons
+        // Sexual-family substrings → Sexual.
         assert!(matches!(
-            parse_reason_type("tools.ozone.report.defs#reasonSexualUnlabeled"),
+            parse_reason_type("external.test.report.defs#reasonSexualUnlabeled"),
             Ok(ReportReason::Sexual)
+        ));
+
+        // Violation-family substrings → Violation.
+        assert!(matches!(
+            parse_reason_type("external.test.report.defs#reasonRuleViolation"),
+            Ok(ReportReason::Violation)
+        ));
+
+        // No matching needle → Other (the catch-all rule).
+        assert!(matches!(
+            parse_reason_type("external.test.report.defs#reasonUnknownThing"),
+            Ok(ReportReason::Other)
+        ));
+
+        // The canonical com.atproto prefix is NOT routed through the
+        // extended path — it goes through exact-match. Confirm the
+        // strip_extended_reason_prefix helper short-circuits.
+        assert!(matches!(
+            parse_reason_type("com.atproto.moderation.defs#reasonSpam"),
+            Ok(ReportReason::Spam)
         ));
     }
 
