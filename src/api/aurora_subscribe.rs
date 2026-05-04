@@ -55,8 +55,20 @@ pub struct SubscribeModEventsParams {
     pub actor_did: Option<String>,
     #[serde(default)]
     pub subject_did: Option<String>,
+    /// Filter by subject record URI (§8.5). Distinct from
+    /// `subject_did` because record-level moderation events carry a
+    /// URI but no DID-as-subject.
     #[serde(default)]
-    pub action_filter: Option<String>,
+    pub subject_uri: Option<String>,
+    /// Filter by event-type. Multiple values are OR-combined into an
+    /// `action IN (...)` clause; an empty Vec or omitted field is
+    /// treated as "no action filter."
+    ///
+    /// Wire-format note: §8.5 specifies a list shape. v0.2 had this
+    /// field as `Option<String>` (scalar) — a wire-format breaking
+    /// change for any client that was sending the scalar shape.
+    #[serde(default)]
+    pub action_filter: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,19 +208,36 @@ async fn fetch_new_events(
     after_id: i64,
     params: &SubscribeModEventsParams,
 ) -> Result<Vec<(i64, serde_json::Value)>, sqlx::Error> {
-    let mut clauses: Vec<&'static str> = vec!["id > ?"];
+    // Normalize the action filter once: an empty Vec is equivalent to
+    // None, since `IN ()` is invalid SQL. Filtering at the boundary
+    // means the SQL builder below sees only "no filter" or "filter
+    // with N>=1 values."
+    let action_filter: Option<&[String]> = params
+        .action_filter
+        .as_deref()
+        .filter(|v| !v.is_empty());
+
+    let mut clauses: Vec<String> = vec!["id > ?".to_string()];
     let mut binds: Vec<String> = vec![after_id.to_string()];
     if let Some(a) = &params.actor_did {
-        clauses.push("actor_did = ?");
+        clauses.push("actor_did = ?".to_string());
         binds.push(a.clone());
     }
     if let Some(s) = &params.subject_did {
-        clauses.push("subject_did = ?");
+        clauses.push("subject_did = ?".to_string());
         binds.push(s.clone());
     }
-    if let Some(a) = &params.action_filter {
-        clauses.push("event_type = ?");
-        binds.push(a.clone());
+    if let Some(u) = &params.subject_uri {
+        clauses.push("subject_uri = ?".to_string());
+        binds.push(u.clone());
+    }
+    if let Some(actions) = action_filter {
+        // Build `event_type IN (?, ?, ?)` with one placeholder per
+        // value. The renumbering loop below converts `?` → `$N`
+        // uniformly, so we don't need a backend-specific code path.
+        let placeholders: Vec<&str> = actions.iter().map(|_| "?").collect();
+        clauses.push(format!("event_type IN ({})", placeholders.join(", ")));
+        binds.extend(actions.iter().cloned());
     }
     // Renumber `?` to `$N` for cross-backend compat.
     let mut idx = 1usize;
