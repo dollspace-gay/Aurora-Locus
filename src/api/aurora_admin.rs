@@ -3187,6 +3187,12 @@ mod tests {
         .0;
         assert_eq!(resp.affected_count, 3);
         assert_eq!(resp.snapshots.len(), 3);
+        // Audit chain entry id surfaces on the response (Block 1
+        // wired all six batch endpoints through append_entry).
+        assert!(
+            resp.audit_entry_id.is_some(),
+            "batch_takedown_accounts populates audit_entry_id"
+        );
         // ONE moderation_event row for the batch (per design doc).
         let event_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM moderation_event WHERE actor_did = $1")
@@ -3205,6 +3211,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(mod_count, 3);
+        // ONE chain entry — §3.4 "one decision = one chain entry"
+        // framing means a batch is a single operator decision even
+        // when N subjects were affected. The per-DID list lives in
+        // cascade_subjects on the same row.
+        let chain_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE actor_did = $1 AND action = $2",
+        )
+        .bind("did:plc:moderator")
+        .bind("account.batch_takedown")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(chain_count, 1);
     }
 
     #[tokio::test]
@@ -3266,6 +3285,10 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(resp.affected_count, 2);
+        assert!(
+            resp.audit_entry_id.is_some(),
+            "batch_apply_label populates audit_entry_id"
+        );
         let label_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM label WHERE val = $1 AND neg = FALSE")
                 .bind("spam")
@@ -3273,6 +3296,15 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(label_count, 2);
+        let chain_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE actor_did = $1 AND action = $2",
+        )
+        .bind("did:plc:moderator")
+        .bind("label.batch_apply")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(chain_count, 1);
     }
 
     #[tokio::test]
@@ -3295,7 +3327,7 @@ mod tests {
         .await
         .unwrap();
         let resp = batch_remove_label(
-            State(ctx),
+            State(ctx.clone()),
             moderator_auth(),
             Json(BatchLabelInput {
                 subjects: vec![
@@ -3318,20 +3350,44 @@ mod tests {
         .0;
         assert_eq!(resp.affected_count, 1);
         assert_eq!(resp.skipped.len(), 1);
+        assert!(
+            resp.audit_entry_id.is_some(),
+            "batch_remove_label populates audit_entry_id"
+        );
         // The skipped subject is the one that didn't have the label.
         match &resp.skipped[0] {
             Subject::Record { uri, .. } => assert_eq!(uri, "at://did:plc:nope/x/y"),
             _ => panic!("wrong skipped subject shape"),
         }
+        // ONE chain entry for the remove decision. The preseed
+        // batch_apply_label call earlier in this test produced its
+        // own chain entry, so we filter by the action string to
+        // distinguish.
+        let chain_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE actor_did = $1 AND action = $2",
+        )
+        .bind("did:plc:moderator")
+        .bind("label.batch_remove")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(chain_count, 1);
     }
 
     #[tokio::test]
-    async fn batch_endpoints_accept_admin_role() {
+    async fn batch_takedown_accepts_admin_role() {
         // Moderator is the floor role in the current Role enum
         // (Moderator < Admin < SuperAdmin), so a "below moderator"
         // negative test isn't expressible until a lower role lands.
         // This positive test verifies Admin (above Moderator) passes
-        // the gate for the moderator+ batch endpoints.
+        // the gate. The role-gate logic is identical across all six
+        // batch endpoints (a single check_moderator_role(&auth)? at
+        // each handler's head) so exercising one is sufficient
+        // shape coverage for the role gate; per-endpoint coverage of
+        // the chain-write surface lives on the existing happy-path
+        // tests above. The previous name was plural but the body
+        // only ever exercised batch_takedown_accounts; renamed to
+        // match the actual scope.
         let ctx = create_test_context().await;
         seed_actor(&ctx, "did:plc:admintest", "admintest.test").await;
         let resp = batch_takedown_accounts(
