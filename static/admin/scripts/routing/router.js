@@ -106,7 +106,11 @@
     if (currentMounted && currentMounted.instance && typeof currentMounted.instance.unmount === 'function') {
       try { currentMounted.instance.unmount(); } catch (e) { /* ignore */ }
     }
-    if (mainEl) mainEl.innerHTML = '';
+    // Tear-down: drop any previous render. Use replaceChildren() rather
+    // than `innerHTML = ''` so the whole module is consistent in not
+    // assigning to innerHTML — see the renderMessage helper below for
+    // the rationale (URL-derived content goes through textContent only).
+    if (mainEl) mainEl.replaceChildren();
     try {
       const instance = await Promise.resolve(page.mount({
         params: match.params,
@@ -126,26 +130,75 @@
     }
   }
 
-  function mountNotFound(path, msg) {
+  // Render a banner page (heading + paragraph) into mainEl using DOM
+  // construction primitives only. Every dynamic value reaches the page
+  // through `textContent`, never through `innerHTML`, so URL-derived
+  // and exception-derived inputs cannot inject markup. Three call
+  // sites (mountNotFound / mountForbidden / mountError) all flow
+  // through here; the "untrusted text + maybe an inline-styled span"
+  // shape is uniform.
+  //
+  // The previous implementation interpolated raw strings into an
+  // innerHTML template literal — a textbook XSS sink because the hash
+  // and any error message might originate in attacker-controlled URLs.
+  // A successful XSS in the admin UI hands the attacker the operator's
+  // localStorage.adminToken and from there every admin XRPC the
+  // operator has scope for. Treat all inputs here as hostile.
+  function renderMessage(headingText, bodyParts) {
     if (!mainEl) return;
-    mainEl.innerHTML =
-      '<header class="page-header"><h2>Page not found</h2></header>' +
-      '<p class="empty-state">' + (msg || 'No route matches: <code>#' + (path || '') + '</code>') + '</p>';
+    mainEl.replaceChildren();
+    const header = document.createElement('header');
+    header.className = 'page-header';
+    const h2 = document.createElement('h2');
+    h2.textContent = headingText;
+    header.appendChild(h2);
+    const p = document.createElement('p');
+    p.className = 'empty-state';
+    for (const part of bodyParts) {
+      if (part == null) continue;
+      if (typeof part === 'string') {
+        p.appendChild(document.createTextNode(part));
+      } else if (part.tag && typeof part.text === 'string') {
+        // Wrapped fragment: e.g. {tag:'code', text:path} renders as
+        // <code>{escape(path)}</code>. The tag is from a static
+        // call-site literal here; only `text` is dynamic.
+        const span = document.createElement(part.tag);
+        span.textContent = part.text;
+        p.appendChild(span);
+      }
+    }
+    mainEl.appendChild(header);
+    mainEl.appendChild(p);
+  }
+
+  function mountNotFound(path, msg) {
+    if (msg) {
+      renderMessage('Page not found', [msg]);
+    } else {
+      renderMessage('Page not found', [
+        'No route matches: ',
+        { tag: 'code', text: '#' + (path || '') },
+      ]);
+    }
   }
 
   function mountForbidden(route) {
-    if (!mainEl) return;
-    mainEl.innerHTML =
-      '<header class="page-header"><h2>Access denied</h2></header>' +
-      '<p class="empty-state">This page requires the <strong>' +
-      (route.requires || 'higher') + '</strong> role.</p>';
+    // route.requires is a static string from the routes table, not
+    // URL-derived; treating it as text is still the right move
+    // because (a) the same render path covers both trusted and
+    // untrusted inputs, removing one branch per call site, and (b)
+    // future contributors don't have to remember which side of the
+    // trusted/untrusted line each variable is on.
+    renderMessage('Access denied', [
+      'This page requires the ',
+      { tag: 'strong', text: route.requires || 'higher' },
+      ' role.',
+    ]);
   }
 
   function mountError(err) {
-    if (!mainEl) return;
-    mainEl.innerHTML =
-      '<header class="page-header"><h2>Page error</h2></header>' +
-      '<p class="empty-state">' + (err && err.message ? err.message : String(err)) + '</p>';
+    const message = err && err.message ? String(err.message) : String(err);
+    renderMessage('Page error', [message]);
   }
 
   function updateSidebarActive(hashPath) {
