@@ -1,6 +1,6 @@
 //! Cross-instance cache invalidation via Postgres LISTEN/NOTIFY.
 //!
-//! Implements the design from `docs/POSTGRES_PHASE_4_DESIGN.md` §4 for
+//! Implements the design from `docs/AURORA_DESIGN.md` §5.4.2 for
 //! propagating cache invalidations across multiple Aurora-Locus
 //! instances sharing one Postgres backend (chainlink #90).
 //!

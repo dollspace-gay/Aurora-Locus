@@ -11,7 +11,7 @@ pub struct ServerConfig {
     pub service: ServiceConfig,
     pub storage: StorageConfig,
     /// Shared-database backend selection (per
-    /// POSTGRES_BACKEND_ASSESSMENT.md §6 Phase 2 / chainlink #75).
+    /// docs/AURORA_DESIGN.md §5.2 / chainlink #75).
     /// Per-actor `ActorStore` always uses SQLite; this only controls
     /// `account_db` and `did_cache_db`.
     #[serde(default)]
@@ -54,7 +54,7 @@ pub struct DatabaseConfig {
     /// Standby retry interval for the sequencer leader-election loop
     /// (Phase 4.2 / chainlink #89). Postgres-only — SQLite deployments
     /// skip leader election entirely. See
-    /// docs/POSTGRES_PHASE_4_DESIGN.md §3.2.
+    /// docs/AURORA_DESIGN.md §5.4.1.
     pub leader_retry_interval_ms: u64,
 }
 
@@ -63,7 +63,7 @@ impl Default for DatabaseConfig {
         Self {
             backend: DatabaseBackend::Sqlite,
             url: None,
-            // Defaults per POSTGRES_BACKEND_ASSESSMENT.md §9.3.
+            // Defaults per docs/AURORA_DESIGN.md §5.3 (connection model).
             max_connections: 25,
             min_connections: 5,
             acquire_timeout_secs: 30,

@@ -82,7 +82,7 @@ pub struct AppContext {
     /// plus (Postgres only) cross-instance NOTIFY emit. Write handlers
     /// call `cache_invalidator.invalidate_did(did)` instead of touching
     /// `local_records_cache.invalidate_did` directly. See
-    /// chainlink #90 / docs/POSTGRES_PHASE_4_DESIGN.md §4.
+    /// chainlink #90 / docs/AURORA_DESIGN.md §5.4.2.
     pub cache_invalidator: Arc<crate::cache::invalidation::CacheInvalidator>,
 }
 
@@ -289,7 +289,7 @@ impl AppContext {
         // Multi-instance leader election (Postgres only). SQLite
         // deployments are inherently single-instance and skip election;
         // the sequencer's default-true `is_leader` flag remains in place.
-        // See chainlink #89 / docs/POSTGRES_PHASE_4_DESIGN.md §3.
+        // See chainlink #89 / docs/AURORA_DESIGN.md §5.4.1.
         //
         // The election task runs for the lifetime of the process and is
         // not joined explicitly here — graceful shutdown is handled by
@@ -385,7 +385,7 @@ impl AppContext {
         // cache invalidator front door. Multi-instance Postgres
         // deployments wire a NOTIFY emitter so writes here propagate
         // to other instances; SQLite skips the emitter (single-instance
-        // by definition). See chainlink #90 / docs/POSTGRES_PHASE_4_DESIGN.md §4.
+        // by definition). See chainlink #90 / docs/AURORA_DESIGN.md §5.4.2.
         let local_records_cache = Arc::new(LocalRecordsCache::new());
         let notify_emitter: Option<Arc<dyn crate::cache::invalidation::NotifyEmitter>> =
             if matches!(

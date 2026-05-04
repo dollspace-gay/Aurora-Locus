@@ -4,7 +4,7 @@
 //! aurora-locus "instances" (constituent parts: Sequencer +
 //! LeaderElection + CacheInvalidator + Listener) in-process against
 //! the shared backend. Verifies the end-to-end semantics from
-//! docs/POSTGRES_PHASE_4_DESIGN.md §3 (leader election) and §4
+//! docs/AURORA_DESIGN.md §5.4.1 (leader election) and §5.4.2
 //! (LISTEN/NOTIFY cache invalidation).
 //!
 //! Why in-process instead of out-of-process: Postgres-side semantics

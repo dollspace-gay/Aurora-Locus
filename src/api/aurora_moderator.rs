@@ -1,8 +1,7 @@
 //! Moderator-tier read endpoints under `tools.aurora.moderator.*`.
 //!
 //! Implements Phase 3.3 (chainlink #100) and Phase 3.4 (chainlink
-//! #101) per the [design doc](../../docs/ADMIN_MOD_PHASE_3_DESIGN.md)
-//! §5.2:
+//! #101) per the [design doc](../../docs/AURORA_DESIGN.md) §4.3.1:
 //!
 //! - `queryEvents` — paginated query of moderation events
 //! - `getEvent` — single event by ID

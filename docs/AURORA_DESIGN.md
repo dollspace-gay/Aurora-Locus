@@ -288,7 +288,7 @@ Wire format: ATProto error envelope `{"error": "<CodeName>", "message": "<option
 
 Extension entries are objects with an optional `value` field for capabilities that need to advertise structured payload (e.g., `event-variants` carrying the supported `ModEvent` variant list). Bare-name extensions like `audit-trail-v1` declare behavioral commitments without payload.
 
-> **Reconciliation (C2).** Earlier drafts of this consolidation source ([ADMIN_MOD_PHASE_3_DESIGN](../docs/) §5.1) modeled the response as `namespaces: Vec<NamespaceDescriptor>` with `NamespaceDescriptor { nsid, endpoints, version }`; the cycle-opening assessment used `families` keyed by NSID prefix plus a top-level `extensions` array. Implementation synthesized: `families` is a JSON object keyed by NSID prefix (assessment shape); a separate `extensions` array carries capability flags; top-level `implementation` and `version` are flat fields. The synthesized shape is what ships in v0.2 and is documented above.
+> **Reconciliation (C2).** An earlier Phase 3 design draft modeled the response as `namespaces: Vec<NamespaceDescriptor>` with `NamespaceDescriptor { nsid, endpoints, version }`; the cycle-opening admin/moderation assessment used `families` keyed by NSID prefix plus a top-level `extensions` array. Implementation synthesized: `families` is a JSON object keyed by NSID prefix (assessment shape); a separate `extensions` array carries capability flags; top-level `implementation` and `version` are flat fields. The synthesized shape is what ships in v0.2 and is documented above.
 
 The implementation enumerates registered routes under each Aurora namespace prefix and returns the discovered endpoint names. No schema-introspection — just naming.
 
@@ -308,7 +308,7 @@ All require `atproto:admin.moderation` scope per the Phase 2 namespace check. Li
 
 **Appeals reads (sub-phase 3.4).** `listAppeals` and `getAppeal` with full event-history timeline. The action side of appeal lifecycle (resolving an open appeal) flows through `emitEvent`'s `appealResolve` event variant for consistency; the read side benefits from dedicated endpoints because admin UI appeal screens want appeals-specific shapes.
 
-> **Reconciliation (C1).** [ADMIN_MOD_PHASE_3_DESIGN.md §5.2](#) placed the audit-chain (`getAuditTrail`), aggregations (`getModerationMetrics`, `getQueueStats`), forensic export (`exportAccountForensic`), and live-event subscription (`subscribeModEvents`) under `tools.aurora.moderator.*`. [AURORA_ADMIN_UI_DESIGN.md §8](AURORA_ADMIN_UI_DESIGN.md#84-phase-38--toolsauroraadmingetaudittrail) (and the as-built `aurora_capability_families` in `src/api/admin.rs`) places them under `tools.aurora.admin.*`. The implementation aligns with the UI design doc; this consolidated reference reflects the as-built `tools.aurora.admin.*` placement (see [§4.3.2](#§432-toolsauroraadmin) below). The earlier `tools.aurora.moderator.*` placement was superseded.
+> **Reconciliation (C1).** An earlier Phase 3 design draft placed the audit-chain (`getAuditTrail`), aggregations (`getModerationMetrics`, `getQueueStats`), forensic export (`exportAccountForensic`), and live-event subscription (`subscribeModEvents`) under `tools.aurora.moderator.*`. [AURORA_ADMIN_UI_DESIGN.md §8](AURORA_ADMIN_UI_DESIGN.md#84-phase-38--toolsauroraadmingetaudittrail) (and the as-built `aurora_capability_families` in `src/api/admin.rs`) places them under `tools.aurora.admin.*`. The implementation aligns with the UI design doc; this consolidated reference reflects the as-built `tools.aurora.admin.*` placement (see [§4.3.2](#§432-toolsauroraadmin) below). The earlier `tools.aurora.moderator.*` placement was superseded.
 
 #### §4.3.2 `tools.aurora.admin.*`
 
@@ -394,7 +394,7 @@ The live `subscribeModEvents` channel reads from `mod_event_seq`, a separate ret
 
 **OutdatedCursor.** When a client connects with a cursor older than the oldest retained `mod_event_seq.seq`, the handler emits one `OutdatedCursor { oldestAvailableSeq, message }` frame and closes the WebSocket cleanly with code 1000. The client re-bootstraps via `tools.aurora.moderator.queryEvents` for the missed window and resubscribes with a fresh cursor.
 
-> **Reconciliation (C6).** Earlier drafts of [ADMIN_MOD_PHASE_3_DESIGN.md §6.2](#) committed to the `mod_event_seq` table; pre-Session-9 implementation lacked it. Session 9 (chainlink #115) brought implementation in line with the docs; the table now exists with the schema, dual-write, retention, and OutdatedCursor semantics described above.
+> **Reconciliation (C6).** Earlier Phase 3 design drafts committed to the `mod_event_seq` table; pre-Session-9 implementation lacked it. Session 9 (chainlink #115) brought implementation in line with the docs; the table now exists with the schema, dual-write, retention, and OutdatedCursor semantics described above.
 
 #### §4.4.5 Storage event vocabulary
 

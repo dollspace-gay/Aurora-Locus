@@ -419,7 +419,7 @@ impl InviteCodeManager {
     /// Includes disabled codes in the result. The legacy `includeDisabled`
     /// filter on `getInviteCodes` was removed in Phase 1.10 (not in spec);
     /// disabled-only filtering will relocate to a `tools.aurora.ops.*`
-    /// endpoint per ADMIN_MODERATION_ASSESSMENT.md Phase 2.
+    /// endpoint per docs/AURORA_DESIGN.md §4.3.4 (operator-tier surface).
     ///
     /// Returns a `Vec<(InviteCode, use_count)>`. The tuple's `i64` is the
     /// number of rows in `invite_code_use` for that code; callers building

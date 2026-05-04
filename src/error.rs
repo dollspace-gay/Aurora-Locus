@@ -83,7 +83,7 @@ pub enum PdsError {
 
     /// Sequencer leader is on a different instance — caller should retry
     /// (load balancer will route to the leader on retry). Mapped to HTTP
-    /// 503 Service Unavailable. See chainlink #89 / docs/POSTGRES_PHASE_4_DESIGN.md §3.1.
+    /// 503 Service Unavailable. See chainlink #89 / docs/AURORA_DESIGN.md §5.4.1.
     #[error("Sequencer leader is on a different instance: {0}")]
     NotLeader(String),
 }

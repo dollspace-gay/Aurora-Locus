@@ -1,6 +1,6 @@
 //! Sequencer leader election via Postgres advisory locks.
 //!
-//! Implements the design from `docs/POSTGRES_PHASE_4_DESIGN.md` §3 for
+//! Implements the design from `docs/AURORA_DESIGN.md` §5.4.1 for
 //! multi-instance Aurora-Locus deployments against one Postgres backend.
 //!
 //! - One process holds a session-scoped advisory lock — that's the *leader*.

@@ -18,7 +18,7 @@ This design doc is the spec. Implementation across the remaining v0.2 sub-phases
 
 Three top-level navigation domains structuring the UI:
 
-- **Moderation** — queue, reports, appeals, mod events, audit. Visible only when the operator's session has a moderator role and only when the deployment's `AURORA_ADMIN_UI_MODERATION_MODE` runtime setting permits it.
+- **Moderation** — queue, reports, appeals, mod events, audit. Visible only when the operator's session has a moderator role and only when the deployment's `moderation-mode` runtime setting permits it.
 - **Operations** — accounts, account detail, invites, sequencer, federation, blob ops, rate limits, system health, server (capabilities + version + config). Always visible to operators with appropriate role; the only domain visible in `reduced` mode.
 - **Settings** — general, UI & modes (theme toggle, moderation mode, language), roles, capabilities probe.
 
@@ -335,7 +335,9 @@ When the UI references "external moderator tools" or "external clients" or "conf
 
 Concrete consequences:
 
-- The moderation mode setting (`AURORA_ADMIN_UI_MODERATION_MODE`) takes values `full`, `reduced`, `disabled`. It does not take values like "external-tool-X-paired" or "running-with-Y-system." Operators choose modes based on their deployment posture; the UI doesn't infer the deployment from external signals.
+- The moderation mode setting (`moderation-mode`, a runtime-settings table key configured via `tools.aurora.admin.setRuntimeSetting`) takes values `full`, `reduced`, `disabled`. It does not take values like "external-tool-X-paired" or "running-with-Y-system." Operators choose modes based on their deployment posture; the UI doesn't infer the deployment from external signals.
+
+> **Reconciliation.** Earlier drafts of this section referenced `AURORA_ADMIN_UI_MODERATION_MODE` as an env var. As-built, moderation mode is a runtime-settings table key (`moderation-mode`) configured via `tools.aurora.admin.setRuntimeSetting` (see [docs/AURORA_DESIGN.md §4.3.2](AURORA_DESIGN.md) for the runtime-settings endpoint pair); `AURORA_RECOVERY_MODE` is a separate env var read at startup for the recovery override path (per §4.3 below). This section uses the as-built names.
 - The capability detection system (`tools.aurora.describeCapabilities`) reports what *Aurora-Locus* exposes. It does not probe for or report on external systems.
 - The external labels panel (substrate primitive 13) accepts a configured list of labeler service DIDs. It treats them uniformly. It does not have a special "this is the well-known labeler" path.
 - File names, class names, NSIDs, route paths, log lines, and string keys never contain names of external systems.
@@ -427,7 +429,7 @@ Domain group labels are uppercase, letterspaced, dimmed-white text rendered abov
 
 ## 4.2 Mode-aware visibility
 
-The sidebar's visible domains depend on the deployment's `AURORA_ADMIN_UI_MODERATION_MODE` setting (Phase 3.10) and the operator's session role.
+The sidebar's visible domains depend on the deployment's `moderation-mode` runtime setting (Phase 3.10) and the operator's session role.
 
 The mode setting takes three values:
 
@@ -668,7 +670,7 @@ This section specifies every page in the v0.2 UI. Each page specification follow
 
 - **Route** — the hash route(s) that resolve to the page
 - **Role gating** — minimum role required to reach the page; per-element gating noted inline
-- **Mode visibility** — which `AURORA_ADMIN_UI_MODERATION_MODE` values render the page
+- **Mode visibility** — which `moderation-mode` values render the page
 - **Purpose** — one paragraph stating what the page exists for
 - **Endpoint mapping** — table of UI elements ↔ endpoints
 - **Layout** — the page's visual structure
