@@ -956,17 +956,17 @@ async fn insert_batch_account_moderations(
         "batch": true,
         "subjects": dids,
     });
-    let event_id: i64 = sqlx::query_scalar(
-        "INSERT INTO moderation_event \
-         (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta) \
-         VALUES ($1, $2, NULL, NULL, NULL, $3, $4, NULL) \
-         RETURNING id",
+    let event_id = crate::admin::events::insert_moderation_event_in_tx(
+        &mut tx,
+        event_type.as_str(),
+        actor_did,
+        None,
+        None,
+        None,
+        &details.to_string(),
+        &now,
+        None,
     )
-    .bind(event_type.as_str())
-    .bind(actor_did)
-    .bind(details.to_string())
-    .bind(&now)
-    .fetch_one(&mut *tx)
     .await
     .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
@@ -1289,17 +1289,17 @@ pub async fn batch_takedown_records(
         "batch": true,
         "subjects": input.uris,
     });
-    let event_id: i64 = sqlx::query_scalar(
-        "INSERT INTO moderation_event \
-         (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta) \
-         VALUES ($1, $2, NULL, NULL, NULL, $3, $4, NULL) \
-         RETURNING id",
+    let event_id = crate::admin::events::insert_moderation_event_in_tx(
+        &mut tx,
+        ModerationEventType::AccountTakedown.as_str(),
+        &auth.did,
+        None,
+        None,
+        None,
+        &details.to_string(),
+        &now,
+        None,
     )
-    .bind(ModerationEventType::AccountTakedown.as_str())
-    .bind(&auth.did)
-    .bind(details.to_string())
-    .bind(&now)
-    .fetch_one(&mut *tx)
     .await
     .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
@@ -1406,17 +1406,17 @@ pub async fn batch_apply_label(
         "labelNeg": input.label_neg,
         "subjects": subject_jsons,
     });
-    let event_id: i64 = sqlx::query_scalar(
-        "INSERT INTO moderation_event \
-         (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta) \
-         VALUES ($1, $2, NULL, NULL, NULL, $3, $4, NULL) \
-         RETURNING id",
+    let event_id = crate::admin::events::insert_moderation_event_in_tx(
+        &mut tx,
+        ModerationEventType::LabelCreate.as_str(),
+        &auth.did,
+        None,
+        None,
+        None,
+        &details.to_string(),
+        &now,
+        None,
     )
-    .bind(ModerationEventType::LabelCreate.as_str())
-    .bind(&auth.did)
-    .bind(details.to_string())
-    .bind(&now)
-    .fetch_one(&mut *tx)
     .await
     .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
@@ -1546,17 +1546,17 @@ pub async fn batch_remove_label(
         "subjects": subject_jsons,
         "skipped": skipped_jsons,
     });
-    let event_id: i64 = sqlx::query_scalar(
-        "INSERT INTO moderation_event \
-         (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta) \
-         VALUES ($1, $2, NULL, NULL, NULL, $3, $4, NULL) \
-         RETURNING id",
+    let event_id = crate::admin::events::insert_moderation_event_in_tx(
+        &mut tx,
+        ModerationEventType::LabelRemove.as_str(),
+        &auth.did,
+        None,
+        None,
+        None,
+        &details.to_string(),
+        &now,
+        None,
     )
-    .bind(ModerationEventType::LabelRemove.as_str())
-    .bind(&auth.did)
-    .bind(details.to_string())
-    .bind(&now)
-    .fetch_one(&mut *tx)
     .await
     .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
