@@ -46,7 +46,7 @@ A small set of new endpoints in the `tools.aurora.admin.*` namespace, sequenced 
 
 - `triggerPasswordReset` — admin-initiated user-mediated password reset
 - `exportAccountForensic` — chain-of-custody forensic bundle export
-- Six batch endpoints for atomic multi-subject moderation actions
+- Six batch endpoints for multi-subject moderation actions (chain-entry atomic; per-subject best-effort with a `failures` array — see chainlink #112 for the two-tier model)
 - Phase 3.5/3.7/3.8/3.9 endpoints already planned in their respective design docs, here specified for UI integration
 
 ## 1.2 What is preserved from the current UI
@@ -2779,10 +2779,11 @@ BulkActionPanel:
 
 ### Implementation notes
 
-- Calls one of the six batch endpoints (`batchTakedownAccounts`, `batchSuspendAccounts`, etc.) atomically
-- Single audit chain entry per batch with all subjects referenced (per section 8 batch endpoint specs)
-- Snapshot-at-decision captures per-subject (one snapshot per affected subject, all referenced from the single chain entry)
-- On atomic failure (any subject in batch fails), entire batch rolls back; UI surfaces the failure with explicit "Batch failed: [error]" — does not partially apply
+- Calls one of the six batch endpoints (`batchTakedownAccounts`, `batchSuspendAccounts`, etc.).
+- Atomicity is two-tier (chainlink #112): the chain entry recording the operator decision is atomic — the moderation_event row and the corresponding `audit_chain_entry` row land together in a single transaction, or neither lands. Per-subject actor-state mutations (account_moderation rows, takedown_ref updates) are best-effort; failures are surfaced in the response's `failures` array and do not roll back the chain entry. True end-to-end per-subject atomicity is a v0.3 candidate (chainlink #113).
+- Single audit chain entry per batch with all subjects referenced (per section 8 batch endpoint specs).
+- Snapshot-at-decision captures per-subject (one snapshot per affected subject, all referenced from the single chain entry via `cascade_snapshot_ids`).
+- UI surfaces partial-success: when the response's `failures` array is non-empty the batch summary distinguishes "applied" (`affected_count`) from "requested" (`cascade_subjects.length`) and lists the failing subjects with their per-subject reason. The chain entry still landed and operators can reconcile via `getAuditTrail`.
 
 ## 6.5 FilterStrip
 
@@ -4339,8 +4340,14 @@ struct BatchTakedownAccountsInput {
 struct BatchTakedownAccountsOutput {
     event_id: String,                 // single event for the batch
     audit_entry_id: String,           // single chain entry for the batch
-    affected_count: u32,
+    affected_count: u32,              // count whose actor-table mutation applied
     snapshots: Vec<SnapshotRef>,      // one snapshot per affected DID
+    failures: Vec<BatchFailure>,      // per-subject failures; empty on full success
+}
+
+struct BatchFailure {
+    subject: String,                  // DID for account batches; URI for records
+    reason: String,                   // operator-readable failure reason
 }
 ```
 
@@ -4348,37 +4355,40 @@ struct BatchTakedownAccountsOutput {
 
 1. Validate batch size ≤ 50.
 2. Validate operator's role.
-3. Capture snapshot per subject before action.
-4. Apply takedown atomically — all 50 succeed or all roll back.
+3. Capture snapshot per subject before action (recorded in chain row's `cascade_snapshot_ids`, paired by index with `cascade_subjects`).
+4. Apply takedown with **two-tier atomicity** (chainlink #112): the chain entry is atomic — moderation_event row + chain entry land together or neither lands. Per-subject actor-state mutations (account_moderation rows, takedown_ref updates) are best-effort; per-subject failures land in `failures` without rolling back the chain entry. True end-to-end per-subject atomicity is a v0.3 candidate (chainlink #113).
 5. Write single audit chain entry referencing all subjects with shared rationale.
-6. Return single event_id and audit_entry_id with snapshot references per subject.
+6. Return single event_id and audit_entry_id with snapshot references per subject and any per-subject failures.
 
 ### Notes
 
 - 50-subject hard cap. Larger batches require multiple calls. UI surfaces this expectation in the BulkActionPanel.
 - Single audit entry is intentional — operator made one decision affecting many subjects, audit reflects that semantically.
+- `affected_count` may be less than `cascade_subjects.length` on the chain row when `failures` is non-empty. The chain entry records operator intent (every requested subject); `affected_count` records actuated subjects. The two are reconciled via `getAuditTrail`.
 
 ## 8.9 New endpoint — `tools.aurora.admin.batchSuspendAccounts`
 
-Atomic multi-account suspension.
+Multi-account suspension; same atomicity model as `batchTakedownAccounts` (chainlink #112).
 
 ### Specification
 
 - Same shape as `batchTakedownAccounts`, with `suspend` semantics.
 - Same auth, phase, behavior pattern.
+- Today the suspension record is the moderation_event row itself — there is no separate per-DID actor-table side-effect, so `failures` is always empty in v0.2. Field is in the response shape for parity.
 
 ## 8.10 New endpoint — `tools.aurora.admin.batchRestoreAccounts`
 
-Atomic multi-account restoration (reverses takedown or suspension).
+Multi-account restoration (reverses takedown or suspension); same atomicity model as `batchTakedownAccounts` (chainlink #112).
 
 ### Specification
 
 - Same shape as `batchTakedownAccounts`, with `restore` semantics.
 - Same auth, phase, behavior pattern.
+- Per-DID `UPDATE actor SET takedown_ref = NULL` failures land in `failures`; the chain entry still records the full set of requested subjects.
 
 ## 8.11 New endpoint — `tools.aurora.admin.batchTakedownRecords`
 
-Atomic multi-record takedown.
+Multi-record takedown.
 
 ### Specification
 
@@ -4399,11 +4409,11 @@ struct BatchTakedownRecordsInput {
 
 ### Output / Behavior
 
-Same shape as `batchTakedownAccounts` adapted to record subjects. Single audit entry, snapshots per record.
+Same shape as `batchTakedownAccounts` adapted to record subjects. Single audit entry, snapshots per record. The label INSERTs and the moderation_event row commit together inside one transaction; today there is no partial-failure surface, so `failures` is always empty in v0.2.
 
 ## 8.12 New endpoint — `tools.aurora.admin.batchApplyLabel`
 
-Atomic multi-subject label application.
+Multi-subject label application.
 
 ### Specification
 
@@ -4426,16 +4436,17 @@ struct BatchApplyLabelInput {
 
 ### Output / Behavior
 
-Same shape pattern. Single audit entry, snapshots per subject.
+Same shape pattern. Single audit entry, snapshots per subject. Per-row INSERTs run inside a single transaction; `failures` is always empty in v0.2 (any failure aborts the whole batch with 500).
 
 ## 8.13 New endpoint — `tools.aurora.admin.batchRemoveLabel`
 
-Atomic multi-subject label removal.
+Multi-subject label removal.
 
 ### Specification
 
-- Same shape as `batchApplyLabel` with `remove` semantics.
-- Subject must currently have the label; subjects without it are reported in a `skipped` field rather than failing the whole batch.
+- Same shape as `batchApplyLabel` with `remove` semantics, plus a `skipped` array.
+- Subject must currently have the label; subjects without it are reported in `skipped` rather than failing the whole batch (a separate dimension from `failures`).
+- Per-row negative-label INSERTs run inside a single transaction; `failures` is always empty in v0.2.
 
 ```rust
 struct BatchRemoveLabelOutput {

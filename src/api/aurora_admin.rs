@@ -779,10 +779,31 @@ pub struct SnapshotRef {
     /// Subject the snapshot was captured for. Always present so the
     /// UI can map snapshots back to their subjects in the response.
     pub subject: Subject,
-    /// Snapshot id; `None` until Phase 3.8 snapshot infrastructure
-    /// ships. The field is in the wire shape now so consumers don't
-    /// need a wire-format break when 3.8 lands.
+    /// Snapshot id; populated for batch entries via per-subject
+    /// `audit_snapshot` rows captured before the mutation runs (CR-2 /
+    /// chainlink #111). Single-subject endpoints continue to use the
+    /// scalar `audit_chain_entry.snapshot_id` instead.
     pub snapshot_id: Option<String>,
+}
+
+/// Per-subject failure reported in batch responses. Surfaces the
+/// disposition documented under chainlink #112: chain-entry atomicity
+/// is at the moderation_event level (the chain row + the
+/// moderation_event row land together, or neither lands), but
+/// per-subject actor-state mutations are best-effort. Failures are
+/// reported here without rolling back the chain entry. True
+/// end-to-end per-subject atomicity is tracked under chainlink #113
+/// (v0.3).
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchFailure {
+    /// Identifier for the subject that failed. For account batches,
+    /// the DID; for record batches, the URI; for label batches, a
+    /// flattened subject identifier (DID for repo subjects, URI
+    /// otherwise).
+    pub subject: String,
+    /// Operator-readable reason the per-subject mutation didn't apply.
+    pub reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -797,8 +818,21 @@ pub struct BatchAccountsInput {
 pub struct BatchAccountsOutput {
     pub event_id: String,
     pub audit_entry_id: Option<String>,
+    /// Count of subjects whose actor-table mutation actually applied.
+    /// May be less than `cascade_subjects.len()` on the chain row when
+    /// per-subject side-effects fail — the chain entry records
+    /// operator intent (all requested subjects); `failures` records
+    /// which ones didn't fully apply. See chainlink #112 for the
+    /// design-doc framing of this two-tier atomicity.
     pub affected_count: u32,
     pub snapshots: Vec<SnapshotRef>,
+    /// Per-subject failures in the actor-table mutation pass. Empty
+    /// for handlers whose mutation is fully atomic (record/label
+    /// batches run inside a single transaction). For account batches
+    /// (takedown/restore) this surfaces the DIDs whose actor-row
+    /// update couldn't be applied even though the chain entry landed.
+    #[serde(default)]
+    pub failures: Vec<BatchFailure>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -825,6 +859,12 @@ pub struct BatchLabelOutput {
     pub audit_entry_id: Option<String>,
     pub affected_count: u32,
     pub snapshots: Vec<SnapshotRef>,
+    /// Per-subject failures in the actor-table mutation pass. Always
+    /// empty for label batches today (the per-row INSERTs run inside
+    /// a single transaction); the field is present for shape-parity
+    /// across batch responses per chainlink #112.
+    #[serde(default)]
+    pub failures: Vec<BatchFailure>,
 }
 
 #[derive(Debug, Serialize)]
@@ -837,6 +877,12 @@ pub struct BatchRemoveLabelOutput {
     /// rather than failing the batch (§8.13 non-atomic-failure rule).
     pub skipped: Vec<Subject>,
     pub snapshots: Vec<SnapshotRef>,
+    /// Per-subject failures in the actor-table mutation pass. Always
+    /// empty for label batches today (single-transaction semantics);
+    /// surfaced for shape-parity across batch responses per
+    /// chainlink #112.
+    #[serde(default)]
+    pub failures: Vec<BatchFailure>,
 }
 
 fn validate_batch_size<T>(items: &[T]) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -1022,11 +1068,21 @@ pub async fn batch_takedown_accounts(
         &input.dids,
     )
     .await?;
-    // Best-effort actor-table update + session purge per DID.
+    // Best-effort actor-table update + session purge per DID. Per
+    // chainlink #112 the chain row records operator intent (every DID
+    // in cascade_subjects); per-subject failures here surface in the
+    // `failures` response field without rolling back the batch. True
+    // end-to-end per-subject atomicity is a v0.3 candidate
+    // (chainlink #113).
+    let mut failures: Vec<BatchFailure> = Vec::new();
     for did in &input.dids {
         let takedown_ref = format!("batch_event_{}", event_id);
         if let Err(e) = ctx.account_manager.takedown_account(did, &takedown_ref).await {
             tracing::warn!("batch takedown side-effect failed for {}: {}", did, e);
+            failures.push(BatchFailure {
+                subject: did.clone(),
+                reason: e.to_string(),
+            });
         }
     }
     let audit_entry_id = append_batch_chain_entry(
@@ -1038,11 +1094,13 @@ pub async fn batch_takedown_accounts(
         &snapshot_ids,
     )
     .await?;
+    let affected_count = (input.dids.len() - failures.len()) as u32;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
         audit_entry_id: Some(audit_entry_id.to_string()),
-        affected_count: input.dids.len() as u32,
+        affected_count,
         snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
+        failures,
     }))
 }
 
@@ -1081,6 +1139,9 @@ pub async fn batch_suspend_accounts(
         audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.dids.len() as u32,
         snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
+        // No per-DID actor-table side-effects today: the
+        // moderation_event row IS the suspension record.
+        failures: Vec::new(),
     }))
 }
 
@@ -1105,7 +1166,10 @@ pub async fn batch_restore_accounts(
         &input.dids,
     )
     .await?;
-    // Restore side-effect: clear takedown_ref.
+    // Restore side-effect: clear takedown_ref. Per-DID UPDATE
+    // failures are captured in `failures` rather than aborting the
+    // batch (chainlink #112).
+    let mut failures: Vec<BatchFailure> = Vec::new();
     let mut tx = ctx.account_db.begin().await.map_err(internal)?;
     for did in &input.dids {
         if let Err(e) = sqlx::query("UPDATE actor SET takedown_ref = NULL WHERE did = $1")
@@ -1114,6 +1178,10 @@ pub async fn batch_restore_accounts(
             .await
         {
             tracing::warn!("batch restore side-effect failed for {}: {}", did, e);
+            failures.push(BatchFailure {
+                subject: did.clone(),
+                reason: e.to_string(),
+            });
         }
     }
     tx.commit().await.map_err(internal)?;
@@ -1126,11 +1194,13 @@ pub async fn batch_restore_accounts(
         &snapshot_ids,
     )
     .await?;
+    let affected_count = (input.dids.len() - failures.len()) as u32;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
         audit_entry_id: Some(audit_entry_id.to_string()),
-        affected_count: input.dids.len() as u32,
+        affected_count,
         snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
+        failures,
     }))
 }
 
@@ -1267,6 +1337,10 @@ pub async fn batch_takedown_records(
         audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.uris.len() as u32,
         snapshots,
+        // Record-takedown writes labels + the moderation_event row in
+        // a single transaction; any per-row failure aborts the whole
+        // batch with 500. No partial-success surface today.
+        failures: Vec::new(),
     }))
 }
 
@@ -1369,6 +1443,9 @@ pub async fn batch_apply_label(
         audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.subjects.len() as u32,
         snapshots,
+        // Label-apply runs all per-subject INSERTs in a single
+        // transaction; per-row failures abort the batch.
+        failures: Vec::new(),
     }))
 }
 
@@ -1509,6 +1586,10 @@ pub async fn batch_remove_label(
         affected_count: applied_subjects.len() as u32,
         skipped,
         snapshots,
+        // Label-remove runs all per-subject negative-label INSERTs in
+        // a single transaction; per-row failures abort the batch.
+        // `skipped` (subjects without the label) is its own dimension.
+        failures: Vec::new(),
     }))
 }
 
@@ -3437,6 +3518,67 @@ mod tests {
             };
             assert_eq!(snap_subject_did.as_deref(), Some(expected_did.as_str()));
         }
+    }
+
+    #[tokio::test]
+    async fn batch_takedown_partial_success_lands_chain_entry_with_full_intent() {
+        // P-1 / chainlink #112: when a per-subject side-effect fails,
+        // the handler returns 200 with affected_count reflecting the
+        // successful subset and failures listing the failing subject.
+        // The chain entry still records operator intent (every
+        // requested subject in cascade_subjects) — partial-success is
+        // surfaced at the response layer, not the chain.
+        use sqlx::Row as _;
+        let ctx = create_test_context().await;
+        // Seed two valid actors; the third DID is intentionally not
+        // seeded so account_manager.takedown_account returns NotFound
+        // and we exercise the failure-capture path.
+        seed_actor(&ctx, "did:plc:p0", "p0.test").await;
+        seed_actor(&ctx, "did:plc:p1", "p1.test").await;
+        let resp = batch_takedown_accounts(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(BatchAccountsInput {
+                dids: vec![
+                    "did:plc:p0".to_string(),
+                    "did:plc:p1".to_string(),
+                    "did:plc:doesnotexist".to_string(),
+                ],
+                rationale: "partial-success exercise".to_string(),
+            }),
+        )
+        .await
+        .expect("batch returns 200 even with per-subject failures")
+        .0;
+
+        // affected_count counts only the successfully-applied subset.
+        assert_eq!(resp.affected_count, 2);
+        // failures records the missing DID with a NotFound reason.
+        assert_eq!(resp.failures.len(), 1);
+        assert_eq!(resp.failures[0].subject, "did:plc:doesnotexist");
+        assert!(
+            resp.failures[0].reason.contains("not found")
+                || resp.failures[0].reason.contains("NotFound"),
+            "failure reason should mention not-found; got: {}",
+            resp.failures[0].reason
+        );
+
+        // Operator intent on the chain row covers all three subjects.
+        let row = sqlx::query(
+            "SELECT cascade_subjects FROM audit_chain_entry \
+             WHERE action = 'account.batch_takedown'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        let cascade_subjects_json: String = row.try_get("cascade_subjects").unwrap();
+        let cascade_subjects: Vec<Subject> =
+            serde_json::from_str(&cascade_subjects_json).unwrap();
+        assert_eq!(
+            cascade_subjects.len(),
+            3,
+            "chain entry preserves full operator intent regardless of per-subject failures"
+        );
     }
 
     #[tokio::test]
