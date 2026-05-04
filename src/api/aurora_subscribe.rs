@@ -7,21 +7,35 @@
 //! and streams JSON-framed messages:
 //!
 //! ```json
-//! { "$type": "hello",      "instanceVersion": "...", "sequence": <last_event_id> }
-//! { "$type": "event",      "event": {...},           "sequence": <event_id> }
-//! { "$type": "auditEntry", "sequence": <chain_seq>, "timestamp": "...", ... }
-//! { "$type": "heartbeat",  "sequence": <last_event_id> }
-//! { "$type": "error",      "code": "...", "message": "..." }
+//! { "$type": "hello",          "instanceVersion": "...", "sequence": <last_seq> }
+//! { "$type": "event",          "event": {...},           "sequence": <seq> }
+//! { "$type": "auditEntry",     "sequence": <chain_seq>, "timestamp": "...", ... }
+//! { "$type": "heartbeat",      "sequence": <last_seq> }
+//! { "$type": "outdatedCursor", "oldestAvailableSeq": <seq>, "message": "..." }
+//! { "$type": "error",          "code": "...", "message": "..." }
 //! ```
 //!
-//! Polling-driven: the server polls the `moderation_event` table on
-//! a 5-second tick and pushes any newly-inserted rows since the
-//! last seen sequence. When `include_audit_chain` is requested AND
-//! the caller's role permits chain visibility, the same tick also
-//! polls `audit_chain_entry` and merges new rows into the stream
-//! by timestamp order (sequence as tiebreaker). Phase 3.9+
-//! optimization can swap in LISTEN/NOTIFY-driven push transparently
-//! — the wire protocol stays the same.
+//! Polling-driven: the server polls the retention-bounded
+//! `mod_event_seq` table on a 5-second tick and pushes any newly-
+//! inserted rows since the last seen `seq`. The unbounded
+//! `moderation_event` table is the historical aggregate (queried via
+//! `tools.aurora.moderator.queryEvents`); the streaming surface uses
+//! `mod_event_seq` so storage stays bounded by operator-configured
+//! retention (chainlink #115 / §3.5).
+//!
+//! When `include_audit_chain` is requested AND the caller's role
+//! permits chain visibility, the same tick also polls
+//! `audit_chain_entry` and merges new rows into the stream by
+//! timestamp order (sequence as tiebreaker). Phase 3.9+ optimization
+//! can swap in LISTEN/NOTIFY-driven push transparently — the wire
+//! protocol stays the same.
+//!
+//! `OutdatedCursor` (§8.5): if the caller's `cursor` is older than
+//! the oldest row in `mod_event_seq` (i.e., events have been pruned
+//! since the last subscription), the handler emits one
+//! `OutdatedCursor` frame on connect and closes cleanly. The client
+//! re-bootstraps via `queryEvents` and resubscribes with a fresh
+//! cursor.
 //!
 //! Heartbeat every 30s when no events flow (per §8.5) so clients
 //! can detect dead connections.
@@ -142,6 +156,22 @@ enum SubscribeMessage<'a> {
     },
     #[serde(rename = "heartbeat")]
     Heartbeat { sequence: i64 },
+    /// Per §8.5: emitted when the caller's `cursor` is older than the
+    /// oldest available row in `mod_event_seq`. The client missed
+    /// events that have been pruned by the retention cleanup job
+    /// (chainlink #115). After this frame the server closes the
+    /// WebSocket cleanly; the client re-bootstraps via
+    /// `tools.aurora.moderator.queryEvents` for the missed window
+    /// and resubscribes with a fresh cursor (or omits cursor to
+    /// start from the current tail).
+    #[serde(rename = "outdatedCursor", rename_all = "camelCase")]
+    OutdatedCursor {
+        /// The lowest `seq` currently retained in `mod_event_seq`.
+        /// Resuming from this value (or any value ≥ it) avoids the
+        /// outdated-cursor failure on the next connect.
+        oldest_available_seq: i64,
+        message: &'a str,
+    },
     #[serde(rename = "error")]
     Error { code: &'a str, message: &'a str },
 }
@@ -189,6 +219,50 @@ async fn handle_subscription(
     auth: AdminAuthContext,
 ) {
     let (mut sender, mut receiver) = socket.split();
+
+    // OutdatedCursor detection (chainlink #115 / §8.5). When the
+    // caller sends an explicit cursor older than the oldest retained
+    // mod_event_seq.seq, they've missed events that the cleanup job
+    // pruned. Emit one OutdatedCursor frame and close cleanly so the
+    // client knows to re-bootstrap via queryEvents.
+    //
+    // Only checked when a cursor was supplied. Callers who omit
+    // cursor get the current tail (current_event_id below); there's
+    // no gap to signal in that case.
+    if let Some(client_cursor) = params.cursor {
+        match oldest_available_event_seq(&ctx).await {
+            Ok(Some(oldest)) if client_cursor < oldest - 1 => {
+                let msg = SubscribeMessage::OutdatedCursor {
+                    oldest_available_seq: oldest,
+                    message: "cursor is older than the retention window; \
+                              re-bootstrap via queryEvents and resubscribe \
+                              with a fresh cursor",
+                };
+                let _ = send_msg(&mut sender, &msg).await;
+                // Clean WebSocket close (1000) — frame has communicated
+                // the issue, the close is graceful.
+                let _ = sender
+                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1000,
+                        reason: "outdated cursor".into(),
+                    })))
+                    .await;
+                return;
+            }
+            // Empty table → any cursor is fine (nothing to deliver
+            // until new events land). Or the cursor is within range.
+            // Either way, fall through to normal flow.
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "subscribeModEvents: oldest_available_event_seq query failed: {}",
+                    e
+                );
+                // Don't fail the subscription on the precheck — the
+                // poll loop will surface the SQL error if it persists.
+            }
+        }
+    }
 
     // Determine starting event cursor: caller-provided or current-tail.
     let mut event_cursor: i64 = match params.cursor {
@@ -390,13 +464,30 @@ struct EventStreamRow {
     payload: serde_json::Value,
 }
 
+/// Current tail of the live subscription channel. Returns
+/// `MAX(seq)` from `mod_event_seq` (the retention-bounded mirror,
+/// chainlink #115), or 0 when the table is empty. Clients that
+/// connect without a cursor resume from this value so they don't
+/// re-receive any historical events.
 async fn current_event_id(ctx: &AppContext) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query("SELECT MAX(id) AS max_id FROM moderation_event")
+    let row = sqlx::query("SELECT MAX(seq) AS max_seq FROM mod_event_seq")
         .fetch_optional(&ctx.account_db)
         .await?;
     Ok(row
-        .and_then(|r| r.try_get::<Option<i64>, _>("max_id").ok().flatten())
+        .and_then(|r| r.try_get::<Option<i64>, _>("max_seq").ok().flatten())
         .unwrap_or(0))
+}
+
+/// Lowest `seq` currently retained in `mod_event_seq`. Returns
+/// `None` when the table is empty (no events to compare against —
+/// any cursor is fine because there's nothing to deliver yet).
+/// Used by the OutdatedCursor detection path on connect: if the
+/// caller's cursor is below the floor, they've missed pruned events.
+async fn oldest_available_event_seq(ctx: &AppContext) -> Result<Option<i64>, sqlx::Error> {
+    let row = sqlx::query("SELECT MIN(seq) AS min_seq FROM mod_event_seq")
+        .fetch_optional(&ctx.account_db)
+        .await?;
+    Ok(row.and_then(|r| r.try_get::<Option<i64>, _>("min_seq").ok().flatten()))
 }
 
 async fn current_chain_sequence(ctx: &AppContext) -> Result<i64, sqlx::Error> {
@@ -484,20 +575,25 @@ async fn fetch_new_chain_entries(
 
 async fn fetch_new_events(
     ctx: &AppContext,
-    after_id: i64,
+    after_seq: i64,
     params: &SubscribeModEventsParams,
 ) -> Result<Vec<EventStreamRow>, sqlx::Error> {
-    // Normalize the action filter once: an empty Vec is equivalent to
-    // None, since `IN ()` is invalid SQL. Filtering at the boundary
-    // means the SQL builder below sees only "no filter" or "filter
-    // with N>=1 values."
+    // Source: mod_event_seq (the retention-bounded mirror, chainlink
+    // #115). Read columns map 1:1 to the wire payload — `meta` is
+    // not mirrored on this table because the wire format doesn't
+    // carry it. Cursor is `seq`, distinct from `moderation_event.id`.
+    //
+    // Normalize the action filter once: an empty Vec is equivalent
+    // to None, since `IN ()` is invalid SQL. Filtering at the
+    // boundary means the SQL builder below sees only "no filter"
+    // or "filter with N>=1 values."
     let action_filter: Option<&[String]> = params
         .action_filter
         .as_deref()
         .filter(|v| !v.is_empty());
 
-    let mut clauses: Vec<String> = vec!["id > ?".to_string()];
-    let mut binds: Vec<String> = vec![after_id.to_string()];
+    let mut clauses: Vec<String> = vec!["seq > ?".to_string()];
+    let mut binds: Vec<String> = vec![after_seq.to_string()];
     if let Some(a) = &params.actor_did {
         clauses.push("actor_did = ?".to_string());
         binds.push(a.clone());
@@ -511,11 +607,11 @@ async fn fetch_new_events(
         binds.push(u.clone());
     }
     if let Some(actions) = action_filter {
-        // Build `event_type IN (?, ?, ?)` with one placeholder per
+        // Build `action IN (?, ?, ?)` with one placeholder per
         // value. The renumbering loop below converts `?` → `$N`
         // uniformly, so we don't need a backend-specific code path.
         let placeholders: Vec<&str> = actions.iter().map(|_| "?").collect();
-        clauses.push(format!("event_type IN ({})", placeholders.join(", ")));
+        clauses.push(format!("action IN ({})", placeholders.join(", ")));
         binds.extend(actions.iter().cloned());
     }
     // Renumber `?` to `$N` for cross-backend compat.
@@ -537,17 +633,17 @@ async fn fetch_new_events(
         .collect();
     let limit_idx = binds.len() + 1;
     let sql = format!(
-        "SELECT id, event_type, actor_did, subject_did, subject_uri, subject_cid, \
-                details, created_at \
-         FROM moderation_event WHERE {} ORDER BY id ASC LIMIT ${}",
+        "SELECT seq, moderation_event_id, actor_did, action, subject_did, \
+                subject_uri, subject_cid, detail, created_at \
+         FROM mod_event_seq WHERE {} ORDER BY seq ASC LIMIT ${}",
         clauses_pg.join(" AND "),
         limit_idx
     );
     let mut q = sqlx::query(&sql);
-    // First bind: after_id (we wrote it as a string for uniform binding;
-    // SQL coerces. Re-parse here as i64 to bind correctly.)
-    q = q.bind(after_id);
-    // Skip the first bind in the binds Vec since we already bound after_id above.
+    // First bind: after_seq (we wrote it as a string for uniform
+    // binding; SQL coerces. Re-parse here as i64 to bind correctly.)
+    q = q.bind(after_seq);
+    // Skip the first bind in the binds Vec since we already bound after_seq above.
     for b in binds.iter().skip(1) {
         q = q.bind(b);
     }
@@ -555,31 +651,38 @@ async fn fetch_new_events(
     let rows = q.fetch_all(&ctx.account_db).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i64 = row.try_get("id")?;
-        let event_type: String = row.try_get("event_type")?;
+        let seq: i64 = row.try_get("seq")?;
+        let moderation_event_id: i64 = row.try_get("moderation_event_id")?;
+        let action: String = row.try_get("action")?;
         let actor_did: String = row.try_get("actor_did")?;
         let subject_did: Option<String> = row.try_get("subject_did").ok().flatten();
         let subject_uri: Option<String> = row.try_get("subject_uri").ok().flatten();
         let subject_cid: Option<String> = row.try_get("subject_cid").ok().flatten();
-        let details_str: String = row.try_get("details")?;
+        let detail_str: Option<String> = row.try_get("detail").ok().flatten();
         let created_at_str: String = row.try_get("created_at")?;
         let created_at = match DateTime::parse_from_rfc3339(&created_at_str) {
             Ok(dt) => dt.with_timezone(&Utc),
             Err(_) => continue, // skip unparseable rows defensively
         };
+        // Wire payload preserves the v0.2 shape callers depend on.
+        // `id` is now the moderation_event row id (consistent with
+        // what queryEvents returns); `seq` lives at the message
+        // envelope level (`SubscribeMessage::Event.sequence`).
         let payload = serde_json::json!({
-            "id": id,
-            "eventType": event_type,
+            "id": moderation_event_id,
+            "eventType": action,
             "actorDid": actor_did,
             "subjectDid": subject_did,
             "subjectUri": subject_uri,
             "subjectCid": subject_cid,
-            "details": serde_json::from_str::<serde_json::Value>(&details_str)
-                .unwrap_or(serde_json::Value::String(details_str)),
+            "details": detail_str
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .unwrap_or(serde_json::Value::Null),
             "createdAt": created_at_str,
         });
         out.push(EventStreamRow {
-            id,
+            id: seq,
             created_at,
             payload,
         });
@@ -638,6 +741,7 @@ mod tests {
             SubscribeMessage::AuditEntry { .. } => "auditEntry",
             SubscribeMessage::Hello { .. } => "hello",
             SubscribeMessage::Heartbeat { .. } => "heartbeat",
+            SubscribeMessage::OutdatedCursor { .. } => "outdatedCursor",
             SubscribeMessage::Error { .. } => "error",
         }
     }
@@ -936,5 +1040,174 @@ mod tests {
             }
             other => panic!("expected AuditEntry, got {:?}", message_kind(other)),
         }
+    }
+
+    // ---- chainlink #115 commit 3: read-source migration tests ----
+
+    /// Insert a `mod_event_seq` row directly. Bypasses
+    /// `insert_moderation_event_in_tx` deliberately — the read-source
+    /// tests need controlled fixture rows independent of the dual-
+    /// write helper. Returns the inserted seq.
+    async fn write_seq_row_only(
+        ctx: &AppContext,
+        action: &str,
+        actor_did: &str,
+        subject_did: Option<&str>,
+        created_at: chrono::DateTime<Utc>,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO mod_event_seq \
+             (moderation_event_id, actor_did, action, subject_did, detail, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING seq",
+        )
+        .bind(1_i64)
+        .bind(actor_did)
+        .bind(action)
+        .bind(subject_did)
+        .bind("{}")
+        .bind(created_at.to_rfc3339())
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap()
+    }
+
+    /// Insert directly into `moderation_event` (bypassing the dual-
+    /// write helper) — used by the migration sanity test to confirm
+    /// the subscription handler reads from `mod_event_seq` and NOT
+    /// from `moderation_event`.
+    async fn write_moderation_event_only(
+        ctx: &AppContext,
+        event_type: &str,
+        actor_did: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO moderation_event \
+             (event_type, actor_did, details, created_at) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(event_type)
+        .bind(actor_did)
+        .bind("{}")
+        .bind(Utc::now().to_rfc3339())
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fetch_new_events_reads_from_mod_event_seq_not_moderation_event() {
+        // Migration sanity (chainlink #115 commit 3): if the handler
+        // reads from mod_event_seq, then a row that lands in
+        // moderation_event ONLY (bypassing the dual-write) must NOT
+        // be delivered to subscribers. This is what pins the
+        // read-source migration — pre-fix the test would fail because
+        // moderation_event is the source.
+        let ctx = create_test_context().await;
+        // moderation_event has 1 row; mod_event_seq has 0.
+        write_moderation_event_only(&ctx, "TakedownAccount", "did:plc:m1").await;
+        let params = SubscribeModEventsParams::default();
+        let events = fetch_new_events(&ctx, 0, &params).await.unwrap();
+        assert_eq!(
+            events.len(),
+            0,
+            "subscription must not deliver moderation_event-only rows"
+        );
+
+        // Now write through the canonical path → both tables.
+        let logger = crate::admin::events::ModerationEventLogger::new(ctx.account_db.clone());
+        logger
+            .log_event(crate::admin::events::LogEventParams {
+                event_type: crate::admin::events::ModerationEventType::AccountSuspend,
+                actor_did: "did:plc:m1",
+                subject_did: Some("did:plc:s1"),
+                subject_uri: None,
+                subject_cid: None,
+                details: serde_json::json!({"reason": "test"}),
+                meta: None,
+            })
+            .await
+            .unwrap();
+        // After dual-write, fetch sees the row.
+        let events = fetch_new_events(&ctx, 0, &params).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["eventType"], "account_suspend");
+    }
+
+    #[tokio::test]
+    async fn outdated_cursor_detected_when_below_oldest_retained_seq() {
+        // Populate mod_event_seq with seq=1..3 (an older window),
+        // then simulate cleanup having removed seq=1..2 by deleting
+        // those rows. Subscribe with cursor=0 (older than the oldest
+        // remaining seq). The detection helper must see the gap.
+        let ctx = create_test_context().await;
+        let now = Utc::now();
+        for i in 0..3 {
+            write_seq_row_only(
+                &ctx,
+                "TakedownAccount",
+                "did:plc:m1",
+                Some("did:plc:s"),
+                now - chrono::Duration::seconds(10 - i),
+            )
+            .await;
+        }
+        // Simulate retention cleanup pruning the first two rows.
+        sqlx::query("DELETE FROM mod_event_seq WHERE seq <= 2")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let oldest = oldest_available_event_seq(&ctx).await.unwrap();
+        assert_eq!(oldest, Some(3), "after pruning seq<=2, MIN(seq) is 3");
+
+        // Cursor 0 < oldest(3) - 1 → outdated.
+        let client_cursor = 0i64;
+        assert!(
+            client_cursor < oldest.unwrap() - 1,
+            "cursor 0 < 3-1=2 → outdated"
+        );
+
+        // Cursor 2 == oldest(3) - 1 → still safe (the next row to
+        // deliver is seq=3 which exists). The OutdatedCursor frame
+        // detection condition is `client_cursor < oldest - 1` exactly.
+        let client_cursor = 2i64;
+        assert!(
+            !(client_cursor < oldest.unwrap() - 1),
+            "cursor 2 == oldest-1 is the boundary; not outdated"
+        );
+    }
+
+    #[tokio::test]
+    async fn outdated_cursor_skipped_when_mod_event_seq_empty() {
+        // Edge case (chainlink #115 commit 3): empty table → any
+        // cursor is fine because there's nothing to deliver until
+        // new events land. The detection helper returns None; the
+        // handler falls through to normal subscription flow.
+        let ctx = create_test_context().await;
+        let oldest = oldest_available_event_seq(&ctx).await.unwrap();
+        assert_eq!(
+            oldest, None,
+            "empty mod_event_seq must yield None oldest_available_seq"
+        );
+        // Confirm fetch returns zero rows so the subscription is a
+        // pure heartbeat-only stream.
+        let events = fetch_new_events(&ctx, 12345, &SubscribeModEventsParams::default())
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outdated_cursor_serializes_with_camel_case_fields() {
+        // Wire format pin (chainlink #115 commit 3): the
+        // OutdatedCursor frame uses the §8.5 shape exactly so admin
+        // UI clients can parse it without case-folding fallbacks.
+        let msg = SubscribeMessage::OutdatedCursor {
+            oldest_available_seq: 42,
+            message: "cursor older than retention window",
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"$type\":\"outdatedCursor\""));
+        assert!(json.contains("\"oldestAvailableSeq\":42"));
+        assert!(json.contains("\"message\":\"cursor older than retention window\""));
     }
 }
