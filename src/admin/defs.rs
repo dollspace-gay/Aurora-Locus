@@ -58,7 +58,7 @@ impl Subject {
         }
     }
 
-    /// Construct a Subject from the moderation_event/admin_audit_log
+    /// Construct a Subject from the moderation_event/audit_chain_entry
     /// flat-column representation (subject_did + subject_uri +
     /// subject_cid). Returns `None` if no subject info is present
     /// (i.e., event has no subject, like a server-level event).

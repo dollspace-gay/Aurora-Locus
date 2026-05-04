@@ -21,18 +21,3 @@ pub use labels::LabelManager;
 pub use moderation::ModerationManager;
 pub use reports::ReportManager;
 pub use roles::{AdminRoleManager, Role};
-
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-
-/// Admin action audit log entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditLogEntry {
-    pub id: i64,
-    pub admin_did: String,
-    pub action: String,
-    pub subject_did: Option<String>,
-    pub details: Option<String>,
-    pub timestamp: DateTime<Utc>,
-    pub ip_address: Option<String>,
-}
