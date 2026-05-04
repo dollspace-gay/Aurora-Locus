@@ -36,9 +36,16 @@ async function handleOAuthCallback(code, state) {
 
         const data = await response.json();
 
-        // Store tokens in localStorage
+        // Store tokens in localStorage.
+        //
+        // adminRefreshToken is intentionally NOT stored: a real
+        // refresh-token flow is planned for v0.3's token-lifecycle
+        // design pass (see admin UI audit findings #2, #4, #12). The
+        // server may still emit `refresh_token` in the response —
+        // we just discard it client-side until the consumer exists.
+        // Storing without consuming would expand the localStorage
+        // attack surface for zero current value.
         localStorage.setItem('adminToken', data.access_token);
-        localStorage.setItem('adminRefreshToken', data.refresh_token);
         localStorage.setItem('adminDid', data.did);
         localStorage.setItem('adminRole', data.role || 'admin');
 
