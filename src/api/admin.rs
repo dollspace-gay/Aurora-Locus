@@ -204,9 +204,15 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/tools.aurora.ops.listBackgroundJobs",
             get(list_background_jobs),
         )
+        // POST: this is an action that triggers health-check execution
+        // (with side effects in the form of probe RPCs / DB queries),
+        // not an idempotent property read. The other ops actions
+        // (cleanupNonceStores, runBlobGC, pauseSequencer, etc.) all
+        // use POST; this entry was an outlier that the admin UI's
+        // SystemHealth page hit with POST and got a 405 in return.
         .route(
             "/xrpc/tools.aurora.ops.runHealthChecks",
-            get(run_health_checks),
+            post(run_health_checks),
         )
         .route(
             "/xrpc/tools.aurora.ops.getVersionInfo",
@@ -2365,14 +2371,43 @@ fn aurora_capability_families() -> serde_json::Value {
     })
 }
 
-/// Static extension list, reflecting what's structurally present in
-/// this build. Extensions added incrementally by future sub-phases:
-///   - "event-variants" (Phase 3.5: ModEvent variant names)
-///   - "hash-chained-audit" (Phase 3.8: getAuditTrail verified flag)
-///   - "realtime-events" (Phase 3.9: subscribeModEvents WebSocket)
+/// Static capability advertisement reflecting what's structurally
+/// present in this build. The `name` strings are the canonical
+/// vocabulary from §8.15 and double as the keys clients use to gate
+/// UI affordances. A capability is advertised iff its underlying
+/// endpoint(s) are actually registered as routes in this binary.
+///
+/// Two §8.15 capabilities are intentionally omitted because the
+/// corresponding endpoints are not yet shipped:
+///   - `invite-lineage-v1`     (no shipped endpoint as of v0.2 cycle)
+///   - `reporter-context-v1`   (no shipped endpoint as of v0.2 cycle)
+/// Add them here when their handlers land.
 fn aurora_capability_extensions() -> Vec<CapabilityExtension> {
-    // Empty for Phase 3.2 — sub-phases 3.5/3.8/3.9 will append.
-    Vec::new()
+    vec![
+        // Phase 3.2 — capability probe ships alongside getSubjectContext.
+        CapabilityExtension { name: "subject-context-v1", value: None },
+        // Phase 3.3 — moderator-tier reads.
+        CapabilityExtension { name: "moderator-activity-v1", value: None },
+        CapabilityExtension { name: "subject-history-v1", value: None },
+        // Phase 3.4 — appeals reads.
+        CapabilityExtension { name: "appeals-v1", value: None },
+        // Phase 2.3.8 — operator instance metrics.
+        CapabilityExtension { name: "instance-metrics-v1", value: None },
+        // Phase 3.5 — emitEvent unified action surface + batch suite.
+        CapabilityExtension { name: "mod-events-emit-v1", value: None },
+        CapabilityExtension { name: "batch-takedown-v1", value: None },
+        CapabilityExtension { name: "trigger-password-reset-v1", value: None },
+        // Phase 3.7 — moderation aggregations.
+        CapabilityExtension { name: "moderation-metrics-v1", value: None },
+        CapabilityExtension { name: "queue-stats-v1", value: None },
+        // Phase 3.8 — hash-chained audit + forensic export.
+        CapabilityExtension { name: "audit-trail-v1", value: None },
+        CapabilityExtension { name: "forensic-export-v1", value: None },
+        // Phase 3.9 — live event tail (HTTP-polling-driven in v0.2).
+        CapabilityExtension { name: "mod-events-stream-v1", value: None },
+        // Phase 3.10 — runtime settings read/write.
+        CapabilityExtension { name: "runtime-settings-v1", value: None },
+    ]
 }
 
 /// `tools.aurora.describeCapabilities` — top-level probe.
@@ -6355,23 +6390,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_describe_capabilities_extensions_initially_empty() {
-        // Phase 3.2 ships with no extensions; the list grows as
-        // sub-phases 3.5/3.8/3.9 land. This test catches accidental
-        // additions before their backing infrastructure is ready —
-        // an extension advertised before the sub-phase lands would
-        // mislead clients.
+    async fn test_describe_capabilities_advertises_shipped_canonical_set() {
+        // Phase 3.5–3.10 each shipped capability families; this test
+        // pins the §8.15 canonical vocabulary the server advertises
+        // so the admin UI's Server → Capabilities page renders the
+        // correct ✓/✗ matrix. Capabilities whose endpoints have not
+        // shipped (`invite-lineage-v1`, `reporter-context-v1`) are
+        // intentionally absent — gating affordances on absent
+        // capabilities is the entire point of the probe.
         let ctx = create_test_context().await;
         let resp = describe_capabilities(State(ctx), admin_test_auth())
             .await
             .unwrap()
             .0;
-        assert!(
-            resp.extensions.is_empty(),
-            "extensions list should be empty until sub-phases 3.5/3.8/3.9 ship; \
-             got {:?}",
-            resp.extensions.iter().map(|e| e.name).collect::<Vec<_>>()
-        );
+        let names: Vec<&str> = resp.extensions.iter().map(|e| e.name).collect();
+        let expected = [
+            "subject-context-v1",
+            "moderator-activity-v1",
+            "subject-history-v1",
+            "appeals-v1",
+            "instance-metrics-v1",
+            "mod-events-emit-v1",
+            "batch-takedown-v1",
+            "trigger-password-reset-v1",
+            "moderation-metrics-v1",
+            "queue-stats-v1",
+            "audit-trail-v1",
+            "forensic-export-v1",
+            "mod-events-stream-v1",
+            "runtime-settings-v1",
+        ];
+        for cap in expected {
+            assert!(
+                names.contains(&cap),
+                "missing capability {}; advertised set = {:?}",
+                cap,
+                names
+            );
+        }
+        // Guard against accidentally advertising capabilities whose
+        // endpoints aren't shipped yet.
+        for forbidden in ["invite-lineage-v1", "reporter-context-v1"] {
+            assert!(
+                !names.contains(&forbidden),
+                "{} must not be advertised — its endpoints aren't shipped",
+                forbidden
+            );
+        }
     }
 
     // ---- Phase 1.7: account/did deprecation-alias rollout ---------------
