@@ -395,6 +395,7 @@ pub async fn emit_event(
             snapshot_id,
             event_id: Some(event.id),
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -916,13 +917,83 @@ async fn insert_batch_account_moderations(
     Ok(event_id)
 }
 
-fn snapshots_for_dids(dids: &[String]) -> Vec<SnapshotRef> {
+fn snapshots_for_dids(
+    dids: &[String],
+    snapshot_ids: &[Option<i64>],
+) -> Vec<SnapshotRef> {
+    // Caller may pass an empty slice meaning "no snapshots captured"
+    // (legacy path); otherwise lengths must match. Out-of-bounds reads
+    // here are a programming bug, not a runtime input concern.
     dids.iter()
-        .map(|d| SnapshotRef {
+        .enumerate()
+        .map(|(i, d)| SnapshotRef {
             subject: Subject::Repo { did: d.clone() },
-            snapshot_id: None,
+            snapshot_id: snapshot_ids
+                .get(i)
+                .copied()
+                .flatten()
+                .map(|id| id.to_string()),
         })
         .collect()
+}
+
+/// Capture a snapshot for each DID in the batch. Returns one
+/// `Option<i64>` per DID (None if the subject wasn't snapshottable —
+/// e.g., the DID didn't resolve to an actor row at capture time;
+/// `capture_snapshot` falls back to a content-blank snapshot anyway,
+/// so this almost always returns Some). Per disposition CR-2 / §3.4,
+/// snapshots are captured BEFORE the mutation so the recorded state
+/// is the pre-decision state.
+async fn capture_snapshots_for_repo_subjects(
+    ctx: &AppContext,
+    dids: &[String],
+) -> Result<Vec<Option<i64>>, (StatusCode, Json<serde_json::Value>)> {
+    let mut ids = Vec::with_capacity(dids.len());
+    for did in dids {
+        let s = Subject::Repo { did: did.clone() };
+        let id = audit_chain::capture_snapshot(&ctx.account_db, &s)
+            .await
+            .map_err(internal_pds)?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Capture a snapshot for each record URI in the batch. Record cids
+/// are not in the batch input; we use empty-string cid in the
+/// captured Subject (matches the chain row's subject_cid behavior).
+async fn capture_snapshots_for_record_uris(
+    ctx: &AppContext,
+    uris: &[String],
+) -> Result<Vec<Option<i64>>, (StatusCode, Json<serde_json::Value>)> {
+    let mut ids = Vec::with_capacity(uris.len());
+    for uri in uris {
+        let s = Subject::Record {
+            uri: uri.clone(),
+            cid: String::new(),
+        };
+        let id = audit_chain::capture_snapshot(&ctx.account_db, &s)
+            .await
+            .map_err(internal_pds)?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Capture a snapshot for each Subject in the batch. Used by label
+/// batches where the subjects are full Subject values.
+async fn capture_snapshots_for_subjects(
+    ctx: &AppContext,
+    subjects: &[Subject],
+) -> Result<Vec<Option<i64>>, (StatusCode, Json<serde_json::Value>)> {
+    let mut ids = Vec::with_capacity(subjects.len());
+    for s in subjects {
+        let id = audit_chain::capture_snapshot(&ctx.account_db, s)
+            .await
+            .map_err(internal_pds)?;
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 /// `tools.aurora.admin.batchTakedownAccounts` (§8.8).
@@ -936,6 +1007,12 @@ pub async fn batch_takedown_accounts(
     if input.rationale.trim().is_empty() {
         return Err(validation("rationale is required and must be non-empty"));
     }
+    // Per CR-2 / §3.4: snapshot per subject BEFORE the mutation runs
+    // so the chain entry's cascade_snapshot_ids point at pre-decision
+    // state. The mutation may invalidate the actor row (takedown
+    // changes takedown_ref), so post-mutation capture would yield
+    // post-state — defeating the forensic purpose.
+    let snapshot_ids = capture_snapshots_for_repo_subjects(&ctx, &input.dids).await?;
     let event_id = insert_batch_account_moderations(
         &ctx,
         &auth.did,
@@ -952,14 +1029,20 @@ pub async fn batch_takedown_accounts(
             tracing::warn!("batch takedown side-effect failed for {}: {}", did, e);
         }
     }
-    let audit_entry_id =
-        append_batch_chain_entry(&ctx, &auth.did, "account.batch_takedown", &input, event_id)
-            .await?;
+    let audit_entry_id = append_batch_chain_entry(
+        &ctx,
+        &auth.did,
+        "account.batch_takedown",
+        &input,
+        event_id,
+        &snapshot_ids,
+    )
+    .await?;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
         audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.dids.len() as u32,
-        snapshots: snapshots_for_dids(&input.dids),
+        snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
     }))
 }
 
@@ -974,6 +1057,7 @@ pub async fn batch_suspend_accounts(
     if input.rationale.trim().is_empty() {
         return Err(validation("rationale is required and must be non-empty"));
     }
+    let snapshot_ids = capture_snapshots_for_repo_subjects(&ctx, &input.dids).await?;
     let event_id = insert_batch_account_moderations(
         &ctx,
         &auth.did,
@@ -983,14 +1067,20 @@ pub async fn batch_suspend_accounts(
         &input.dids,
     )
     .await?;
-    let audit_entry_id =
-        append_batch_chain_entry(&ctx, &auth.did, "account.batch_suspend", &input, event_id)
-            .await?;
+    let audit_entry_id = append_batch_chain_entry(
+        &ctx,
+        &auth.did,
+        "account.batch_suspend",
+        &input,
+        event_id,
+        &snapshot_ids,
+    )
+    .await?;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
         audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.dids.len() as u32,
-        snapshots: snapshots_for_dids(&input.dids),
+        snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
     }))
 }
 
@@ -1005,6 +1095,7 @@ pub async fn batch_restore_accounts(
     if input.rationale.trim().is_empty() {
         return Err(validation("rationale is required and must be non-empty"));
     }
+    let snapshot_ids = capture_snapshots_for_repo_subjects(&ctx, &input.dids).await?;
     let event_id = insert_batch_account_moderations(
         &ctx,
         &auth.did,
@@ -1026,26 +1117,36 @@ pub async fn batch_restore_accounts(
         }
     }
     tx.commit().await.map_err(internal)?;
-    let audit_entry_id =
-        append_batch_chain_entry(&ctx, &auth.did, "account.batch_restore", &input, event_id)
-            .await?;
+    let audit_entry_id = append_batch_chain_entry(
+        &ctx,
+        &auth.did,
+        "account.batch_restore",
+        &input,
+        event_id,
+        &snapshot_ids,
+    )
+    .await?;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
         audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.dids.len() as u32,
-        snapshots: snapshots_for_dids(&input.dids),
+        snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
     }))
 }
 
 /// Append a batch-action chain entry. Subjects from a `BatchAccountsInput`
 /// land in `cascade_subjects` so the chain's "one decision = one entry"
 /// framing (§3.4) is preserved while still recording every affected DID.
+/// Per CR-2 / chainlink #111, `cascade_snapshot_ids` carries the
+/// per-subject snapshot ids in lock-step with `cascade_subjects` so each
+/// DID has a recorded pre-decision state.
 async fn append_batch_chain_entry(
     ctx: &AppContext,
     actor_did: &str,
     action: &'static str,
     input: &BatchAccountsInput,
     event_id: i64,
+    snapshot_ids: &[Option<i64>],
 ) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
     let cascade: Vec<Subject> = input
         .dids
@@ -1062,6 +1163,7 @@ async fn append_batch_chain_entry(
             snapshot_id: None,
             event_id: Some(event_id),
             cascade_subjects: &cascade,
+            cascade_snapshot_ids: snapshot_ids,
         },
     )
     .await
@@ -1079,6 +1181,9 @@ pub async fn batch_takedown_records(
     if input.rationale.trim().is_empty() {
         return Err(validation("rationale is required and must be non-empty"));
     }
+    // Capture per-record snapshots BEFORE the mutation runs so the
+    // chain's snapshot linkage points at pre-takedown state.
+    let snapshot_ids = capture_snapshots_for_record_uris(&ctx, &input.uris).await?;
     // Records are taken down via !takedown self-label. Single tx
     // covers all label inserts + the moderation_event row.
     let mut tx = ctx.account_db.begin().await.map_err(internal)?;
@@ -1121,12 +1226,17 @@ pub async fn batch_takedown_records(
     let snapshots = input
         .uris
         .iter()
-        .map(|uri| SnapshotRef {
+        .enumerate()
+        .map(|(i, uri)| SnapshotRef {
             subject: Subject::Record {
                 uri: uri.clone(),
                 cid: String::new(),
             },
-            snapshot_id: None,
+            snapshot_id: snapshot_ids
+                .get(i)
+                .copied()
+                .flatten()
+                .map(|id| id.to_string()),
         })
         .collect();
     let cascade: Vec<Subject> = input
@@ -1147,6 +1257,7 @@ pub async fn batch_takedown_records(
             snapshot_id: None,
             event_id: Some(event_id),
             cascade_subjects: &cascade,
+            cascade_snapshot_ids: &snapshot_ids,
         },
     )
     .await
@@ -1173,6 +1284,7 @@ pub async fn batch_apply_label(
     if input.label_val.trim().is_empty() {
         return Err(validation("label_val is required and must be non-empty"));
     }
+    let snapshot_ids = capture_snapshots_for_subjects(&ctx, &input.subjects).await?;
     let mut tx = ctx.account_db.begin().await.map_err(internal)?;
     let now = chrono::Utc::now().to_rfc3339();
     let server_did = format!("did:web:{}", ctx.config.service.hostname);
@@ -1227,9 +1339,14 @@ pub async fn batch_apply_label(
     let snapshots = input
         .subjects
         .iter()
-        .map(|s| SnapshotRef {
+        .enumerate()
+        .map(|(i, s)| SnapshotRef {
             subject: s.clone(),
-            snapshot_id: None,
+            snapshot_id: snapshot_ids
+                .get(i)
+                .copied()
+                .flatten()
+                .map(|id| id.to_string()),
         })
         .collect();
     let audit_entry_id = audit_chain::append_entry(
@@ -1242,6 +1359,7 @@ pub async fn batch_apply_label(
             snapshot_id: None,
             event_id: Some(event_id),
             cascade_subjects: &input.subjects,
+            cascade_snapshot_ids: &snapshot_ids,
         },
     )
     .await
@@ -1272,8 +1390,12 @@ pub async fn batch_remove_label(
         return Err(validation("label_val is required and must be non-empty"));
     }
     // First-pass: detect which subjects currently have the label.
+    // We pair each applied subject with its captured snapshot id so the
+    // chain row's cascade_snapshot_ids stays in lock-step with
+    // cascade_subjects (skipped subjects are not in either array).
     let server_did = format!("did:web:{}", ctx.config.service.hostname);
-    let mut applied_subjects = Vec::new();
+    let mut applied_subjects: Vec<(Subject, String, Option<String>, Option<i64>)> =
+        Vec::new();
     let mut skipped = Vec::new();
     for subject in &input.subjects {
         let (uri, cid) = match subject {
@@ -1293,7 +1415,12 @@ pub async fn batch_remove_label(
         .await
         .map_err(internal)?;
         if count > 0 {
-            applied_subjects.push((subject.clone(), uri, cid));
+            // Snapshot only for subjects we'll actually act on so the
+            // chain's cascade_snapshot_ids matches cascade_subjects.
+            let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, subject)
+                .await
+                .map_err(internal_pds)?;
+            applied_subjects.push((subject.clone(), uri, cid, snapshot_id));
         } else {
             skipped.push(subject.clone());
         }
@@ -1301,7 +1428,7 @@ pub async fn batch_remove_label(
     // Atomic write of negative labels + event for the applied subset.
     let mut tx = ctx.account_db.begin().await.map_err(internal)?;
     let now = chrono::Utc::now().to_rfc3339();
-    for (_subject, uri, cid) in &applied_subjects {
+    for (_subject, uri, cid, _snap) in &applied_subjects {
         sqlx::query(
             "INSERT INTO label (uri, cid, val, neg, src, created_at, created_by) \
              VALUES ($1, $2, $3, TRUE, $4, $5, $6)",
@@ -1318,7 +1445,7 @@ pub async fn batch_remove_label(
     }
     let subject_jsons: Vec<serde_json::Value> = applied_subjects
         .iter()
-        .map(|(s, _, _)| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
+        .map(|(s, _, _, _)| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
         .collect();
     let skipped_jsons: Vec<serde_json::Value> = skipped
         .iter()
@@ -1348,14 +1475,18 @@ pub async fn batch_remove_label(
     tx.commit().await.map_err(internal)?;
     let snapshots = applied_subjects
         .iter()
-        .map(|(s, _, _)| SnapshotRef {
+        .map(|(s, _, _, snap)| SnapshotRef {
             subject: s.clone(),
-            snapshot_id: None,
+            snapshot_id: snap.map(|id| id.to_string()),
         })
         .collect();
     let cascade: Vec<Subject> = applied_subjects
         .iter()
-        .map(|(s, _, _)| s.clone())
+        .map(|(s, _, _, _)| s.clone())
+        .collect();
+    let cascade_snapshot_ids: Vec<Option<i64>> = applied_subjects
+        .iter()
+        .map(|(_, _, _, snap)| *snap)
         .collect();
     let audit_entry_id = audit_chain::append_entry(
         &ctx.account_db,
@@ -1367,6 +1498,7 @@ pub async fn batch_remove_label(
             snapshot_id: None,
             event_id: Some(event_id),
             cascade_subjects: &cascade,
+            cascade_snapshot_ids: &cascade_snapshot_ids,
         },
     )
     .await
@@ -1497,6 +1629,7 @@ pub async fn trigger_password_reset(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -2198,6 +2331,7 @@ pub async fn export_account_forensic(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -2362,7 +2496,7 @@ pub async fn get_audit_trail(
     let sql = format!(
         "SELECT id, sequence, created_at, actor_did, action, subject_did, subject_uri, \
                 subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                cascade_subjects \
+                cascade_subjects, cascade_snapshot_ids \
          FROM audit_chain_entry{} \
          ORDER BY created_at DESC, id DESC \
          LIMIT ${}",
@@ -2408,6 +2542,8 @@ pub async fn get_audit_trail(
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
+        let cascade_snapshot_ids_str: Option<String> =
+            row.try_get("cascade_snapshot_ids").ok().flatten();
 
         let verified = audit_chain::verify_entry(
             sequence,
@@ -2422,6 +2558,7 @@ pub async fn get_audit_trail(
             event_id,
             previous_hash.as_deref(),
             cascade_str.as_deref(),
+            cascade_snapshot_ids_str.as_deref(),
             &current_hash,
         );
         let subject_ref = Subject::from_columns(
@@ -2681,6 +2818,7 @@ pub async fn set_runtime_setting(
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -3227,6 +3365,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_takedown_captures_per_subject_snapshots() {
+        // CR-2 / chainlink #111: each batch entry must carry a
+        // `cascade_snapshot_ids` JSON list whose i-th element is the
+        // snapshot id for `cascade_subjects[i]`. Verify both the chain
+        // row's column and the wire response's per-snapshot ids are
+        // populated and resolve to actual audit_snapshot rows.
+        use sqlx::Row as _;
+        let ctx = create_test_context().await;
+        for i in 0..3 {
+            seed_actor(&ctx, &format!("did:plc:c{}", i), &format!("c{}.test", i)).await;
+        }
+        let resp = batch_takedown_accounts(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(BatchAccountsInput {
+                dids: vec![
+                    "did:plc:c0".to_string(),
+                    "did:plc:c1".to_string(),
+                    "did:plc:c2".to_string(),
+                ],
+                rationale: "snapshot-pairing test".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        // Wire shape: every SnapshotRef carries a populated snapshot_id.
+        assert_eq!(resp.snapshots.len(), 3);
+        for snap in &resp.snapshots {
+            assert!(
+                snap.snapshot_id.is_some(),
+                "every batch SnapshotRef must carry a populated snapshot_id"
+            );
+        }
+
+        // Chain row column: cascade_snapshot_ids is a JSON list of
+        // length 3 in lock-step with cascade_subjects.
+        let row = sqlx::query(
+            "SELECT cascade_subjects, cascade_snapshot_ids FROM audit_chain_entry \
+             WHERE action = 'account.batch_takedown'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        let cascade_subjects_json: String = row.try_get("cascade_subjects").unwrap();
+        let cascade_snapshot_ids_json: String = row.try_get("cascade_snapshot_ids").unwrap();
+        let cascade_subjects: Vec<Subject> =
+            serde_json::from_str(&cascade_subjects_json).unwrap();
+        let cascade_snapshot_ids: Vec<Option<i64>> =
+            serde_json::from_str(&cascade_snapshot_ids_json).unwrap();
+        assert_eq!(cascade_subjects.len(), 3);
+        assert_eq!(cascade_snapshot_ids.len(), 3);
+
+        // Every snapshot id resolves to an actual audit_snapshot row,
+        // and the snapshot's subject_did matches the corresponding
+        // cascade subject. This is the §3.4 forensic linkage being
+        // exercised end-to-end.
+        for (subj, snap_id_opt) in cascade_subjects.iter().zip(cascade_snapshot_ids.iter()) {
+            let snap_id = snap_id_opt.expect("each cascade subject has a snapshot id");
+            let snap_subject_did: Option<String> = sqlx::query_scalar(
+                "SELECT subject_did FROM audit_snapshot WHERE id = $1",
+            )
+            .bind(snap_id)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap();
+            let expected_did = match subj {
+                Subject::Repo { did } => did.clone(),
+                _ => panic!("expected Repo subject"),
+            };
+            assert_eq!(snap_subject_did.as_deref(), Some(expected_did.as_str()));
+        }
+    }
+
+    #[tokio::test]
     async fn batch_takedown_rejects_empty_batch() {
         let ctx = create_test_context().await;
         let err = batch_takedown_accounts(
@@ -3694,6 +3907,7 @@ mod tests {
                 snapshot_id: None,
                 event_id: None,
                 cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
             },
         ).await.unwrap();
         crate::admin::audit_chain::append_entry(
@@ -3706,6 +3920,7 @@ mod tests {
                 snapshot_id: None,
                 event_id: None,
                 cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
             },
         ).await.unwrap();
         let resp = get_audit_trail(

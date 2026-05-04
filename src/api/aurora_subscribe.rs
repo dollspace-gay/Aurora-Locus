@@ -419,7 +419,7 @@ async fn fetch_new_chain_entries(
     let rows = sqlx::query(
         "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                 subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                cascade_subjects \
+                cascade_subjects, cascade_snapshot_ids \
          FROM audit_chain_entry WHERE sequence > $1 ORDER BY sequence ASC LIMIT $2",
     )
     .bind(after_seq)
@@ -446,6 +446,8 @@ async fn fetch_new_chain_entries(
         let current_hash: String = row.try_get("current_hash")?;
         let previous_hash: Option<String> = row.try_get("previous_hash").ok().flatten();
         let cascade_str: Option<String> = row.try_get("cascade_subjects").ok().flatten();
+        let cascade_snapshot_ids_str: Option<String> =
+            row.try_get("cascade_snapshot_ids").ok().flatten();
 
         let verified = crate::admin::audit_chain::verify_entry(
             sequence,
@@ -460,6 +462,7 @@ async fn fetch_new_chain_entries(
             event_id,
             previous_hash.as_deref(),
             cascade_str.as_deref(),
+            cascade_snapshot_ids_str.as_deref(),
             &current_hash,
         );
 
@@ -823,6 +826,7 @@ mod tests {
                 snapshot_id: None,
                 event_id: None,
                 cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
             },
         )
         .await

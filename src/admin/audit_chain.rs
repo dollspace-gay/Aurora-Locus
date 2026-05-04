@@ -219,9 +219,9 @@ async fn fetch_account_snapshot(db: &AnyPool, did: &str) -> Result<SnapshotConte
 
 /// Append a new entry to the chain. Computes the SHA-256 over a
 /// canonical JSON of (sequence, timestamp, actor, action, subject,
-/// rationale, snapshot_id, event_id, previous_hash) — re-hashing
-/// later in the same way reproduces `current_hash`, which is the
-/// verification primitive.
+/// rationale, snapshot_id, event_id, previous_hash, cascade_subjects,
+/// cascade_snapshot_ids) — re-hashing later in the same way
+/// reproduces `current_hash`, which is the verification primitive.
 pub struct AppendEntryParams<'a> {
     pub actor_did: &'a str,
     pub action: &'a str,
@@ -230,6 +230,14 @@ pub struct AppendEntryParams<'a> {
     pub snapshot_id: Option<i64>,
     pub event_id: Option<i64>,
     pub cascade_subjects: &'a [Subject],
+    /// Per-subject snapshot ids paired by index with `cascade_subjects`.
+    /// Empty for single-subject entries (where the scalar `snapshot_id`
+    /// applies). For batch entries, one element per cascade subject;
+    /// element is `None` if the subject was not snapshottable. Must be
+    /// either empty or the same length as `cascade_subjects`. Recorded
+    /// in `cascade_snapshot_ids` and included in the canonical hash so
+    /// chain verification covers the snapshot linkage.
+    pub cascade_snapshot_ids: &'a [Option<i64>],
 }
 
 /// Append an entry to the chain.
@@ -302,8 +310,37 @@ pub async fn append_entry(
                 .map_err(|e| PdsError::Internal(e.to_string()))?,
         )
     };
+    // cascade_snapshot_ids must be either empty (no per-subject
+    // snapshots — pre-CR-2 chain rows or single-subject entries) or
+    // exactly the same length as cascade_subjects. Index `i` of one
+    // pairs with index `i` of the other.
+    if !params.cascade_snapshot_ids.is_empty()
+        && params.cascade_snapshot_ids.len() != params.cascade_subjects.len()
+    {
+        return Err(PdsError::Internal(format!(
+            "cascade_snapshot_ids length {} does not match cascade_subjects length {}",
+            params.cascade_snapshot_ids.len(),
+            params.cascade_subjects.len(),
+        )));
+    }
+    let cascade_snapshot_ids_json = if params.cascade_snapshot_ids.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(params.cascade_snapshot_ids)
+                .map_err(|e| PdsError::Internal(e.to_string()))?,
+        )
+    };
     // Canonical content for hashing — order matters; future schema
     // additions append new fields rather than reorder existing ones.
+    // cascade_snapshot_ids is appended at the tail per the additive
+    // policy. Pre-CR-2 entries hash with cascade_snapshot_ids = None,
+    // which is what the JSON form serializes to for an empty input;
+    // their stored hashes still verify because the legacy code-path
+    // produced JSON without that field at all. We accept that:
+    // re-running verification on legacy rows uses the new canonical
+    // form, but legacy rows would never be in the cascade-snapshot-ids
+    // population since the field defaults to empty.
     let canon = serde_json::json!({
         "sequence": seq,
         "timestamp": now_str,
@@ -317,6 +354,7 @@ pub async fn append_entry(
         "event_id": params.event_id,
         "previous_hash": prev_hash,
         "cascade_subjects": cascade_json,
+        "cascade_snapshot_ids": cascade_snapshot_ids_json,
     });
     let canon_str = serde_json::to_string(&canon)
         .map_err(|e| PdsError::Internal(e.to_string()))?;
@@ -326,8 +364,9 @@ pub async fn append_entry(
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO audit_chain_entry \
          (sequence, created_at, actor_did, action, subject_did, subject_uri, subject_cid, \
-          rationale, snapshot_id, event_id, current_hash, previous_hash, cascade_subjects) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
+          rationale, snapshot_id, event_id, current_hash, previous_hash, cascade_subjects, \
+          cascade_snapshot_ids) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
     )
     .bind(seq)
     .bind(&now_str)
@@ -342,6 +381,7 @@ pub async fn append_entry(
     .bind(&current_hash)
     .bind(&prev_hash)
     .bind(&cascade_json)
+    .bind(&cascade_snapshot_ids_json)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -444,7 +484,7 @@ pub async fn verify_chain_range(
     let rows = sqlx::query(
         "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                 subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                cascade_subjects \
+                cascade_subjects, cascade_snapshot_ids \
          FROM audit_chain_entry \
          WHERE sequence >= $1 AND sequence <= $2 \
          ORDER BY sequence ASC",
@@ -527,6 +567,8 @@ pub async fn verify_chain_range(
         let event_id: Option<i64> = row.try_get("event_id").ok().flatten();
         let stored_prev: Option<String> = row.try_get("previous_hash").ok().flatten();
         let cascade_str: Option<String> = row.try_get("cascade_subjects").ok().flatten();
+        let cascade_snapshot_ids_str: Option<String> =
+            row.try_get("cascade_snapshot_ids").ok().flatten();
 
         // Linkage check: the row's stored previous_hash must equal the
         // prior non-sentinel row's current_hash. The very first non-
@@ -555,6 +597,7 @@ pub async fn verify_chain_range(
             event_id,
             stored_prev.as_deref(),
             cascade_str.as_deref(),
+            cascade_snapshot_ids_str.as_deref(),
             &current_hash,
         );
         if !row_ok {
@@ -599,6 +642,7 @@ pub async fn verify_chain_range(
 /// Recompute an entry's hash from its stored fields and compare to
 /// `current_hash`. Used by getAuditTrail to set the `verified` flag
 /// per row at query time.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_entry(
     sequence: i64,
     timestamp: &str,
@@ -612,6 +656,7 @@ pub fn verify_entry(
     event_id: Option<i64>,
     previous_hash: Option<&str>,
     cascade_subjects: Option<&str>,
+    cascade_snapshot_ids: Option<&str>,
     expected_hash: &str,
 ) -> bool {
     let canon = serde_json::json!({
@@ -627,6 +672,7 @@ pub fn verify_entry(
         "event_id": event_id,
         "previous_hash": previous_hash,
         "cascade_subjects": cascade_subjects,
+        "cascade_snapshot_ids": cascade_snapshot_ids,
     });
     let canon_str = match serde_json::to_string(&canon) {
         Ok(s) => s,
@@ -669,6 +715,7 @@ mod tests {
                 current_hash TEXT NOT NULL,
                 previous_hash TEXT,
                 cascade_subjects TEXT,
+                cascade_snapshot_ids TEXT,
                 UNIQUE(sequence)
             )",
         )
@@ -725,7 +772,7 @@ mod tests {
                 rationale: "spam",
                 snapshot_id: None,
                 event_id: None,
-                cascade_subjects: &[],
+                cascade_subjects: &[], cascade_snapshot_ids: &[],
             },
         )
         .await
@@ -749,12 +796,12 @@ mod tests {
         append_entry(&db, AppendEntryParams {
             actor_did: "did:plc:m1", action: "TakedownAccount",
             subject: Some(&subject), rationale: "first",
-            snapshot_id: None, event_id: None, cascade_subjects: &[],
+            snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
         }).await.unwrap();
         append_entry(&db, AppendEntryParams {
             actor_did: "did:plc:m1", action: "RestoreAccount",
             subject: Some(&subject), rationale: "second",
-            snapshot_id: None, event_id: None, cascade_subjects: &[],
+            snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
         }).await.unwrap();
         let entries: Vec<(i64, String, Option<String>)> =
             sqlx::query_as("SELECT sequence, current_hash, previous_hash FROM audit_chain_entry ORDER BY sequence ASC")
@@ -776,12 +823,12 @@ mod tests {
         let id = append_entry(&db, AppendEntryParams {
             actor_did: "did:plc:m1", action: "SuspendAccount",
             subject: Some(&subject), rationale: "rationale text",
-            snapshot_id: Some(42), event_id: Some(7), cascade_subjects: &[],
+            snapshot_id: Some(42), event_id: Some(7), cascade_subjects: &[], cascade_snapshot_ids: &[],
         }).await.unwrap();
         let row = sqlx::query(
             "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                     subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                    cascade_subjects \
+                    cascade_subjects, cascade_snapshot_ids \
              FROM audit_chain_entry WHERE id = $1",
         )
         .bind(id)
@@ -801,6 +848,7 @@ mod tests {
             row.try_get::<Option<i64>, _>("event_id").unwrap(),
             row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
             &row.try_get::<String, _>("current_hash").unwrap(),
         );
         assert!(verified, "fresh entry should verify against its stored hash");
@@ -815,7 +863,7 @@ mod tests {
         let id = append_entry(&db, AppendEntryParams {
             actor_did: "did:plc:m1", action: "TakedownAccount",
             subject: Some(&subject), rationale: "original rationale",
-            snapshot_id: None, event_id: None, cascade_subjects: &[],
+            snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
         }).await.unwrap();
         // Simulate tamper: rewrite rationale in place after the chain
         // entry was sealed. Verification should fail because the
@@ -829,7 +877,7 @@ mod tests {
         let row = sqlx::query(
             "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                     subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                    cascade_subjects \
+                    cascade_subjects, cascade_snapshot_ids \
              FROM audit_chain_entry WHERE id = $1",
         )
         .bind(id)
@@ -849,6 +897,7 @@ mod tests {
             row.try_get::<Option<i64>, _>("event_id").unwrap(),
             row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
             &row.try_get::<String, _>("current_hash").unwrap(),
         );
         assert!(!verified, "tampered entry must fail verification");
@@ -868,7 +917,7 @@ mod tests {
                 rationale: &format!("rationale-{}", i),
                 snapshot_id: None,
                 event_id: None,
-                cascade_subjects: &[],
+                cascade_subjects: &[], cascade_snapshot_ids: &[],
             }).await.unwrap();
         }
         verify_chain_range(&db, 1, 3).await.expect("clean chain verifies");
@@ -884,7 +933,7 @@ mod tests {
             append_entry(&db, AppendEntryParams {
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("orig-{}", i),
-                snapshot_id: None, event_id: None, cascade_subjects: &[],
+                snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
             }).await.unwrap();
         }
         // Tamper with row 2's rationale only — current_hash NOT updated,
@@ -910,7 +959,7 @@ mod tests {
             append_entry(&db, AppendEntryParams {
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("orig-{}", i),
-                snapshot_id: None, event_id: None, cascade_subjects: &[],
+                snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
             }).await.unwrap();
         }
         // Attacker recomputes a per-row-consistent hash for row 2 over
@@ -919,7 +968,8 @@ mod tests {
         // but with a new rationale.
         let row = sqlx::query(
             "SELECT created_at, actor_did, action, subject_did, subject_uri, subject_cid, \
-                    rationale, snapshot_id, event_id, previous_hash, cascade_subjects \
+                    rationale, snapshot_id, event_id, previous_hash, cascade_subjects, \
+                    cascade_snapshot_ids \
              FROM audit_chain_entry WHERE sequence = 2",
         )
         .fetch_one(&db).await.unwrap();
@@ -937,6 +987,7 @@ mod tests {
             "event_id": row.try_get::<Option<i64>, _>("event_id").unwrap(),
             "previous_hash": row.try_get::<Option<String>, _>("previous_hash").unwrap(),
             "cascade_subjects": row.try_get::<Option<String>, _>("cascade_subjects").unwrap(),
+            "cascade_snapshot_ids": row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap(),
         });
         let canon_str = serde_json::to_string(&canon).unwrap();
         let mut hasher = Sha256::new();
@@ -978,7 +1029,7 @@ mod tests {
             append_entry(&db, AppendEntryParams {
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("post-{}", i),
-                snapshot_id: None, event_id: None, cascade_subjects: &[],
+                snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
             }).await.unwrap();
         }
         // Sentinel skipped; real rows verify cleanly.
@@ -1129,6 +1180,7 @@ mod tests {
                 current_hash TEXT NOT NULL,
                 previous_hash TEXT,
                 cascade_subjects TEXT,
+                cascade_snapshot_ids TEXT,
                 UNIQUE(sequence)
             )",
         )
@@ -1162,7 +1214,7 @@ mod tests {
                         rationale: &format!("concurrent-{}", i),
                         snapshot_id: None,
                         event_id: None,
-                        cascade_subjects: &[],
+                        cascade_subjects: &[], cascade_snapshot_ids: &[],
                     },
                 )
                 .await

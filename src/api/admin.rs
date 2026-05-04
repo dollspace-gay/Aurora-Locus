@@ -505,6 +505,7 @@ async fn create_invite_code(
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -863,6 +864,7 @@ async fn grant_role(
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -937,6 +939,7 @@ async fn revoke_role(
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1105,6 +1108,7 @@ async fn update_account_email(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1170,6 +1174,7 @@ async fn update_account_handle(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1237,6 +1242,7 @@ async fn update_account_password(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1296,6 +1302,7 @@ async fn admin_delete_account(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1524,6 +1531,7 @@ async fn update_account_signing_key(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1589,6 +1597,7 @@ async fn takedown_account(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1653,6 +1662,7 @@ async fn suspend_account(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1702,6 +1712,7 @@ async fn restore_account(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1791,6 +1802,7 @@ async fn apply_label(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1840,6 +1852,7 @@ async fn remove_label(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -1966,6 +1979,7 @@ async fn update_report_status(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -2120,6 +2134,7 @@ async fn send_email(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -3278,6 +3293,7 @@ async fn update_subject_status(
                 snapshot_id,
                 event_id: None,
                 cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
             },
         )
         .await
@@ -3739,6 +3755,7 @@ async fn disable_invite_code(
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -3800,6 +3817,7 @@ async fn disable_invite_codes(
                 snapshot_id: None,
                 event_id: None,
                 cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
             },
         )
         .await
@@ -3866,6 +3884,7 @@ async fn enable_account_invites(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -3914,6 +3933,7 @@ async fn disable_account_invites(
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -4896,6 +4916,7 @@ async fn pause_sequencer(
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -4929,6 +4950,7 @@ async fn resume_sequencer(
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -4993,6 +5015,7 @@ async fn reset_sequencer_cursor(
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -5067,6 +5090,7 @@ async fn rebuild_sequencer(
                 snapshot_id: None,
                 event_id: None,
                 cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
             },
         )
         .await
@@ -5102,6 +5126,7 @@ async fn rebuild_sequencer(
                 snapshot_id: None,
                 event_id: None,
                 cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
             },
         )
         .await
@@ -5273,6 +5298,7 @@ async fn cleanup_rate_limit_state(
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
@@ -5496,6 +5522,7 @@ async fn trigger_pds_discovery(
                         snapshot_id: None,
                         event_id: None,
                         cascade_subjects: &[],
+                        cascade_snapshot_ids: &[],
                     },
                 )
                 .await
@@ -5605,6 +5632,7 @@ async fn cleanup_nonce_stores(
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
         },
     )
     .await
