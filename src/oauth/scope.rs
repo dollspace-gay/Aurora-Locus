@@ -603,6 +603,105 @@ mod tests {
             );
         }
     }
+
+    // ---- Operator-flavored carve-outs under tools.aurora.admin.* -----
+    // Per UI design doc §8.6 (triggerPasswordReset), §8.7
+    // (exportAccountForensic), and §8.16 (get/setRuntimeSetting) — these
+    // four NSIDs accept either AdminServer or AdminModeration even though
+    // the namespace default is AdminModeration. Mirrors the
+    // com.atproto.admin.* mixed-flavor rule and is documented next to
+    // the constant table in this module.
+
+    const TOOLS_ADMIN_OPERATOR_FLAVORED: &[&str] = &[
+        "/xrpc/tools.aurora.admin.triggerPasswordReset",
+        "/xrpc/tools.aurora.admin.exportAccountForensic",
+        "/xrpc/tools.aurora.admin.getRuntimeSetting",
+        "/xrpc/tools.aurora.admin.setRuntimeSetting",
+    ];
+
+    #[test]
+    fn test_operator_flavored_lookup_returns_both_scopes() {
+        for path in TOOLS_ADMIN_OPERATOR_FLAVORED {
+            let req = required_scopes_for_path(path)
+                .unwrap_or_else(|| panic!("expected scope mapping for {}", path));
+            assert_eq!(
+                req,
+                &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration],
+                "{} must accept either AdminServer or AdminModeration",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_flavored_accept_admin_server_only() {
+        // AdminServer alone reaches the four operator-flavored NSIDs even
+        // though the namespace default is AdminModeration.
+        let server_only: ScopeSet = "atproto:admin.server".parse().unwrap();
+        for path in TOOLS_ADMIN_OPERATOR_FLAVORED {
+            assert!(
+                enforce_namespace_scope(path, &server_only).is_ok(),
+                "AdminServer should reach {}",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_flavored_accept_admin_moderation_only() {
+        let mod_only: ScopeSet = "atproto:admin.moderation".parse().unwrap();
+        for path in TOOLS_ADMIN_OPERATOR_FLAVORED {
+            assert!(
+                enforce_namespace_scope(path, &mod_only).is_ok(),
+                "AdminModeration should reach {}",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_flavored_accept_admin_wildcard() {
+        let wildcard: ScopeSet = "atproto:admin.*".parse().unwrap();
+        for path in TOOLS_ADMIN_OPERATOR_FLAVORED {
+            assert!(
+                enforce_namespace_scope(path, &wildcard).is_ok(),
+                "AdminAll should reach {}",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_flavored_reject_non_admin_scopes() {
+        // ScopeSet with only Read should not reach the operator-flavored
+        // NSIDs, just as it shouldn't reach any admin namespace.
+        let read_only: ScopeSet = "atproto:read".parse().unwrap();
+        for path in TOOLS_ADMIN_OPERATOR_FLAVORED {
+            assert!(
+                enforce_namespace_scope(path, &read_only).is_err(),
+                "non-admin scope should not reach {}",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_flavored_does_not_leak_to_other_admin_nsids() {
+        // The carve-out is specific-NSID — other tools.aurora.admin.*
+        // endpoints continue to require AdminModeration only.
+        let server_only: ScopeSet = "atproto:admin.server".parse().unwrap();
+        for path in [
+            "/xrpc/tools.aurora.admin.emitEvent",
+            "/xrpc/tools.aurora.admin.batchTakedownAccounts",
+            "/xrpc/tools.aurora.admin.getAuditTrail",
+        ] {
+            assert!(
+                enforce_namespace_scope(path, &server_only).is_err(),
+                "AdminServer should NOT reach {} (still moderation-tier)",
+                path
+            );
+        }
+    }
 }
 
 /// Middleware helper functions for scope checking
@@ -707,6 +806,17 @@ pub fn require_all_scopes(token_scopes: &str, required: &[AtProtoScope]) -> PdsR
 //   moderation-flavored, and the lexicon-level distinction wasn't drawn
 //   in upstream's design)
 //
+// Operator-flavored carve-out under tools.aurora.admin.* — the namespace
+// default is AdminModeration, but four NSIDs are operator-flavored per
+// docs/AURORA_ADMIN_UI_DESIGN.md §8.6 (triggerPasswordReset), §8.7
+// (exportAccountForensic), and §8.16 (get/setRuntimeSetting). Those four
+// accept either AdminServer OR AdminModeration, mirroring the
+// com.atproto.admin.* mixed-flavor accept rule. The mechanism is a
+// specific-NSID lookup that runs BEFORE the prefix match; the assessment
+// doc's §4.1 namespace → scope mapping holds at the namespace level
+// (AdminModeration is sufficient), and the per-endpoint contract from
+// the UI design doc is the additional accept of AdminServer.
+//
 // Returns None for paths outside the admin namespaces — those routes are
 // not subject to namespace-level scope enforcement.
 // ============================================================================
@@ -715,6 +825,28 @@ const TOOLS_OPS_REQUIRED: &[AtProtoScope] = &[AtProtoScope::AdminServer];
 const TOOLS_MODERATION_REQUIRED: &[AtProtoScope] = &[AtProtoScope::AdminModeration];
 const COM_ADMIN_REQUIRED: &[AtProtoScope] =
     &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration];
+
+/// Operator-flavored NSIDs under `tools.aurora.admin.*` — these accept
+/// either AdminServer or AdminModeration, per UI design doc §8.6/§8.7/§8.16.
+/// Looked up BEFORE the namespace prefix match in `required_scopes_for_path`.
+const TOOLS_ADMIN_OPERATOR_NSIDS: &[(&str, &[AtProtoScope])] = &[
+    (
+        "tools.aurora.admin.triggerPasswordReset",
+        &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration],
+    ),
+    (
+        "tools.aurora.admin.exportAccountForensic",
+        &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration],
+    ),
+    (
+        "tools.aurora.admin.getRuntimeSetting",
+        &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration],
+    ),
+    (
+        "tools.aurora.admin.setRuntimeSetting",
+        &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration],
+    ),
+];
 
 /// Look up the required scope set for a given XRPC path.
 ///
@@ -732,6 +864,14 @@ pub fn required_scopes_for_path(path: &str) -> Option<&'static [AtProtoScope]> {
     // Accept paths with or without the /xrpc/ prefix so callers can pass
     // either an axum req.uri().path() or a bare NSID.
     let nsid = path.strip_prefix("/xrpc/").unwrap_or(path);
+
+    // Specific-NSID overrides first — operator-flavored carve-outs under
+    // tools.aurora.admin.* per the UI design doc.
+    for (target, scopes) in TOOLS_ADMIN_OPERATOR_NSIDS {
+        if nsid == *target {
+            return Some(scopes);
+        }
+    }
 
     if nsid.starts_with("tools.aurora.ops.") {
         Some(TOOLS_OPS_REQUIRED)
