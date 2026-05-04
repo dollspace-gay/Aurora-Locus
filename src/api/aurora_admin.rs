@@ -2118,45 +2118,32 @@ pub async fn export_account_forensic(
         },
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| internal(e))?;
-    let mut manifest_hasher = Sha256::new();
-    manifest_hasher.update(&manifest_bytes);
-    let bundle_hash = hex::encode(manifest_hasher.finalize());
 
-    // Audit chain entry for the export itself per §8.7 step 6.
-    let subject = Subject::Repo {
-        did: input.did.clone(),
-    };
-    let snapshot_id =
-        audit_chain::capture_snapshot(&ctx.account_db, &subject)
-            .await
-            .map_err(internal_pds)?;
-    let audit_entry_id = audit_chain::append_entry(
-        &ctx.account_db,
-        AppendEntryParams {
-            actor_did: &auth.did,
-            action: "ForensicExport",
-            subject: Some(&subject),
-            rationale: &format!("{} (bundle hash: {})", input.rationale, bundle_hash),
-            snapshot_id,
-            event_id: None,
-            cascade_subjects: &[],
-        },
-    )
-    .await
-    .map_err(internal_pds)?;
-
-    // audit-trail.json — this export's own chain entry, always included.
+    // audit-trail.json — included unconditionally as the bundle's own
+    // chain anchor. The chain entry id and bundle hash both live in
+    // response headers (and getAuditTrail) rather than in this file,
+    // because either field would create a chicken-and-egg cycle: the
+    // bundle hash must cover the whole tar (including this file), and
+    // the chain entry id is only known after the chain row is
+    // appended which itself records the bundle hash. The chainAnchor
+    // sentinel makes that indirection explicit so consumers know
+    // where to look.
     let trail = serde_json::json!({
-        "auditEntryId": audit_entry_id,
-        "bundleHash": bundle_hash,
         "exportedAt": started_at.to_rfc3339(),
+        "chainAnchor": "see X-Aurora-Audit-Entry-Id response header for the chain entry id; \
+                        the chain row's rationale records the SHA-256 bundle hash over the \
+                        complete tar bytes",
     });
     files.push((
         "audit-trail.json".to_string(),
         serde_json::to_vec_pretty(&trail).map_err(|e| internal(e))?,
     ));
 
-    // TAR assembly
+    // TAR assembly — must complete before bundle hashing so the hash
+    // covers every byte the operator is asserting authority over per
+    // §3.4 chain-of-custody. Earlier shapes hashed only manifest.json,
+    // which left the per-file payloads and audit-trail.json outside
+    // the chain commitment.
     let mut tar_buf: Vec<u8> = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut tar_buf);
@@ -2181,6 +2168,40 @@ pub async fn export_account_forensic(
         }
         builder.finish().map_err(|e| internal(e))?;
     }
+
+    // Bundle hash over the complete tar bytes. This is what the chain
+    // entry commits to and what consumers verify the downloaded tar
+    // against (compare SHA-256(downloaded_bytes) to the chain row's
+    // rationale, or to the X-Aurora-Bundle-Hash response header for a
+    // freshly issued export).
+    let mut tar_hasher = Sha256::new();
+    tar_hasher.update(&tar_buf);
+    let bundle_hash = hex::encode(tar_hasher.finalize());
+
+    // Audit chain entry for the export itself per §8.7 step 6. Now
+    // happens AFTER tar assembly so the recorded hash covers the
+    // actual bytes shipped.
+    let subject = Subject::Repo {
+        did: input.did.clone(),
+    };
+    let snapshot_id =
+        audit_chain::capture_snapshot(&ctx.account_db, &subject)
+            .await
+            .map_err(internal_pds)?;
+    let audit_entry_id = audit_chain::append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "ForensicExport",
+            subject: Some(&subject),
+            rationale: &format!("{} (bundle hash: {})", input.rationale, bundle_hash),
+            snapshot_id,
+            event_id: None,
+            cascade_subjects: &[],
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
 
     let filename = format!(
         "forensic-export-{}-{}.tar",
@@ -3693,6 +3714,7 @@ mod tests {
 
     #[tokio::test]
     async fn export_forensic_writes_audit_entry_and_returns_bundle_headers() {
+        use sha2::{Digest, Sha256};
         let ctx = create_test_context().await;
         seed_actor(&ctx, "did:plc:exported", "exported.test").await;
         // get_account() LEFT-JOINs account onto actor; seed the
@@ -3723,26 +3745,204 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let headers = resp.headers();
+
+        // Snapshot headers BEFORE consuming the body — once we read the
+        // body we lose the response object.
+        let headers = resp.headers().clone();
         assert_eq!(
             headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
             "application/x-tar"
         );
-        let cd = headers.get(axum::http::header::CONTENT_DISPOSITION).unwrap();
-        let cd_str = cd.to_str().unwrap();
+        let cd_str = headers
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(cd_str.contains("forensic-export-did_plc_exported-"));
-        assert!(headers.contains_key("X-Aurora-Audit-Entry-Id"));
-        assert!(headers.contains_key("X-Aurora-Bundle-Hash"));
-        // Verify the chain entry landed for the export action.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1 AND subject_did = $2",
+        let audit_entry_id_header = headers
+            .get("X-Aurora-Audit-Entry-Id")
+            .expect("X-Aurora-Audit-Entry-Id present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let bundle_hash_header = headers
+            .get("X-Aurora-Bundle-Hash")
+            .expect("X-Aurora-Bundle-Hash present")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Read the response body bytes so we can verify the bundle
+        // hash covers the actual tar shipped, not just the manifest.
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body collects");
+
+        // SHA-256 of the complete tar bytes must match the
+        // X-Aurora-Bundle-Hash header — this is what §3.4
+        // chain-of-custody actually requires.
+        let mut hasher = Sha256::new();
+        hasher.update(&body_bytes);
+        let computed = hex::encode(hasher.finalize());
+        assert_eq!(
+            computed, bundle_hash_header,
+            "X-Aurora-Bundle-Hash must equal SHA-256 of the complete tar bytes"
+        );
+
+        // Open the tar and inspect the in-bundle audit-trail.json.
+        // The cycle-break dictates that file MUST NOT contain the
+        // bundle hash itself (would force a self-referencing hash)
+        // and MUST NOT contain the chain entry id (would require the
+        // chain entry to land before the tar is hashed). Both of
+        // those facts are surfaced via response headers / getAuditTrail.
+        let mut archive = tar::Archive::new(&body_bytes[..]);
+        let mut found_audit_trail = false;
+        let mut found_manifest = false;
+        for entry in archive.entries().expect("archive iterates") {
+            let mut entry = entry.expect("entry readable");
+            let path = entry.path().expect("path readable").to_path_buf();
+            let name = path.to_string_lossy();
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            entry.read_to_end(&mut buf).expect("entry body readable");
+            if name == "audit-trail.json" {
+                found_audit_trail = true;
+                let json: serde_json::Value =
+                    serde_json::from_slice(&buf).expect("audit-trail.json parses");
+                assert!(
+                    json.get("exportedAt").is_some(),
+                    "audit-trail.json must include exportedAt"
+                );
+                assert!(
+                    json.get("chainAnchor").is_some(),
+                    "audit-trail.json must include the chainAnchor sentinel"
+                );
+                assert!(
+                    json.get("bundleHash").is_none(),
+                    "audit-trail.json must NOT include bundleHash — the in-tar copy would \
+                     create a self-referencing hash cycle (the field lives in the response \
+                     header and the chain row's rationale instead)"
+                );
+                assert!(
+                    json.get("auditEntryId").is_none(),
+                    "audit-trail.json must NOT include auditEntryId — the chain entry id \
+                     is only known after the tar is hashed"
+                );
+            } else if name == "manifest.json" {
+                found_manifest = true;
+                let json: serde_json::Value =
+                    serde_json::from_slice(&buf).expect("manifest.json parses");
+                assert_eq!(
+                    json.get("did").and_then(|v| v.as_str()),
+                    Some("did:plc:exported")
+                );
+                assert!(json.get("exportedAt").is_some());
+                assert!(json.get("exportedBy").is_some());
+                assert!(json.get("rationale").is_some());
+                assert!(json.get("parameters").is_some());
+                assert!(json.get("fileHashes").is_some());
+            }
+        }
+        assert!(found_audit_trail, "tar must contain audit-trail.json");
+        assert!(found_manifest, "tar must contain manifest.json");
+
+        // Verify the chain entry landed for the export action AND
+        // that its rationale embeds the bundle hash that matches the
+        // header — closes the tamper-detection loop end-to-end.
+        let chain_row: (i64, String) = sqlx::query_as(
+            "SELECT id, rationale FROM audit_chain_entry \
+             WHERE action = $1 AND subject_did = $2 \
+             ORDER BY id DESC LIMIT 1",
         )
         .bind("ForensicExport")
         .bind("did:plc:exported")
         .fetch_one(&ctx.account_db)
         .await
         .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(chain_row.0.to_string(), audit_entry_id_header);
+        assert!(
+            chain_row.1.contains(&format!("(bundle hash: {})", bundle_hash_header)),
+            "chain row rationale must embed the same bundle hash that's in the response header; \
+             rationale={}, header={}",
+            chain_row.1,
+            bundle_hash_header,
+        );
+    }
+
+    #[tokio::test]
+    async fn export_forensic_bundle_hash_responds_to_input_changes() {
+        // Tamper-detection sanity check: two exports of the same
+        // account but different rationale produce different bundle
+        // hashes, because the manifest (which embeds rationale) is
+        // inside the tar and the hash covers the tar. This is the
+        // counterpart to the "hash covers manifest only" bug — a
+        // rationale change WAS being caught before the fix
+        // (manifest contained it), but a payload-only swap (e.g.
+        // post-hoc tar surgery) was NOT. We can't easily inject a
+        // post-hoc swap inside a unit test, but exercising the
+        // sensitivity to input variation gives a stable contract pin
+        // that the hash is computed over content that varies with
+        // the payload.
+        use sha2::{Digest, Sha256};
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:tamper", "tamper.test").await;
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES ($1, $2, $3, NULL, FALSE)",
+        )
+        .bind("did:plc:tamper")
+        .bind("t@example.com")
+        .bind("$argon2id$dummy")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+
+        async fn export_with(
+            ctx: &AppContext,
+            rationale: &str,
+        ) -> (Vec<u8>, String) {
+            let resp = export_account_forensic(
+                State(ctx.clone()),
+                admin_auth(),
+                Json(ExportAccountForensicInput {
+                    did: "did:plc:tamper".to_string(),
+                    rationale: rationale.to_string(),
+                    include_repo: false,
+                    include_blobs: false,
+                    include_moderation_history: false,
+                    include_account_metadata: false,
+                    include_audit_chain: false,
+                }),
+            )
+            .await
+            .unwrap();
+            let header = resp
+                .headers()
+                .get("X-Aurora-Bundle-Hash")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (bytes, header)
+        }
+
+        let (bytes_a, header_a) = export_with(&ctx, "investigation A").await;
+        let (bytes_b, header_b) = export_with(&ctx, "investigation B").await;
+
+        assert_ne!(bytes_a, bytes_b, "different rationale → different tar");
+        assert_ne!(header_a, header_b, "different tar → different bundle hash");
+
+        // Both headers match the SHA-256 of their respective bodies.
+        for (bytes, header) in [(bytes_a, header_a), (bytes_b, header_b)] {
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            assert_eq!(hex::encode(h.finalize()), header);
+        }
     }
 
     // ---------- Phase 3.10 — runtime settings (§8.16) ----------
