@@ -415,8 +415,10 @@ async fn restore_postgres(
     // held. If it is, an aurora-locus instance is live against this
     // database; restoring would race with its writes.
     println!("\n🔍 Pre-flight: checking for active aurora-locus instances...");
+    // Dedicated lock connection rather than a pool-borrowed one
+    // (POSTGRES_PHASE_4 §5.1). Threaded the URL through.
     let provider = PostgresLockProvider::new(
-        ctx.account_db.clone(),
+        postgres_url(ctx)?,
         SEQUENCER_LEADER_LOCK_KEY,
     );
     let lock_was_free = provider.try_acquire().await;

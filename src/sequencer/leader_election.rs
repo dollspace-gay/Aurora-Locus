@@ -24,8 +24,7 @@
 
 use crate::error::{PdsError, PdsResult};
 use async_trait::async_trait;
-use sqlx::pool::PoolConnection;
-use sqlx::{Any, AnyPool};
+use sqlx::{AnyConnection, Connection};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,19 +76,34 @@ pub trait LockProvider: Send + Sync {
     async fn is_held(&self) -> bool;
 }
 
-/// Postgres-backed lock provider. Holds a dedicated `PoolConnection` for
-/// the lifetime of the leader role; the lock auto-releases on connection
-/// drop, which is how we get free failure detection.
+/// Postgres-backed lock provider. Holds a dedicated connection (NOT
+/// borrowed from the pool) for the lifetime of the leader role; the
+/// lock auto-releases on connection drop, which is how we get free
+/// failure detection.
+///
+/// Per POSTGRES_PHASE_4 §5.1, the leader's advisory-lock connection
+/// must be separate from the application pool — pool sizing assumes
+/// `pool_size + 2` total connections per instance, where the +2 are
+/// the lock connection (here) and the LISTEN connection (in
+/// `cache::invalidation`). A pool-borrowed connection would
+/// invisibly steal a pool slot for the leader's lifetime, which is
+/// the entire process lifetime once acquired — that's the bug this
+/// type avoids by directly connecting via `AnyConnection::connect`,
+/// mirroring the listener's `PgListener::connect` pattern.
 pub struct PostgresLockProvider {
-    pool: AnyPool,
-    held_connection: Mutex<Option<PoolConnection<Any>>>,
+    db_url: String,
+    held_connection: Mutex<Option<AnyConnection>>,
     lock_key: i64,
 }
 
 impl PostgresLockProvider {
-    pub fn new(pool: AnyPool, lock_key: i64) -> Self {
+    /// `db_url` is the Postgres connection string used to open the
+    /// dedicated lock connection. Callers thread this through from
+    /// `config.database.url`; for SQLite deployments this provider
+    /// never gets constructed.
+    pub fn new(db_url: String, lock_key: i64) -> Self {
         Self {
-            pool,
+            db_url,
             held_connection: Mutex::new(None),
             lock_key,
         }
@@ -103,27 +117,38 @@ impl LockProvider for PostgresLockProvider {
         if guard.is_some() {
             return true;
         }
-        let mut conn = match self.pool.acquire().await {
+        // Open a fresh connection dedicated to this provider — never
+        // returned to a pool. The connection's lifetime equals the
+        // leader-role lifetime; on shutdown or unexpected drop the
+        // session-scoped advisory lock auto-releases.
+        let mut conn = match AnyConnection::connect(&self.db_url).await {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "leader_election: pool acquire failed");
+                warn!(error = %e, "leader_election: dedicated connect failed");
                 return false;
             }
         };
         let acquired: bool =
             match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
                 .bind(self.lock_key)
-                .fetch_one(&mut *conn)
+                .fetch_one(&mut conn)
                 .await
             {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(error = %e, "leader_election: pg_try_advisory_lock failed");
+                    // Drop conn explicitly so we don't leak it on failure.
+                    let _ = conn.close().await;
                     return false;
                 }
             };
         if acquired {
             *guard = Some(conn);
+        } else {
+            // Lock held elsewhere — release the connection so we don't
+            // hold an idle session-scoped connection on the database
+            // for no reason.
+            let _ = conn.close().await;
         }
         acquired
     }
@@ -133,12 +158,16 @@ impl LockProvider for PostgresLockProvider {
         if let Some(mut conn) = guard.take() {
             if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
                 .bind(self.lock_key)
-                .execute(&mut *conn)
+                .execute(&mut conn)
                 .await
             {
                 warn!(error = %e, "leader_election: pg_advisory_unlock failed");
             }
-            // PoolConnection drops here, returning to the pool.
+            // Close the dedicated connection cleanly. Postgres also
+            // releases on connection drop (session-scoped advisory
+            // lock), but explicit close gives a more deterministic
+            // shutdown and shows up in pg_stat_activity faster.
+            let _ = conn.close().await;
         }
     }
 

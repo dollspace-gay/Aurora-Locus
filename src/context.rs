@@ -308,8 +308,19 @@ impl AppContext {
             };
             // Standby until first acquire tick.
             seq.attach_leader_flag(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            // Threading the URL (rather than the pool) into the
+            // provider gives it a dedicated lock connection separate
+            // from the application pool, per
+            // POSTGRES_PHASE_4 §5.1's pool_size+2 sizing rule. The
+            // +2 are the lock connection (this one) and the LISTEN
+            // connection (cache::invalidation).
+            let leader_db_url = config.database.url.clone().ok_or_else(|| {
+                PdsError::Validation(
+                    "PDS_DB_URL is required for Postgres backend leader election".to_string(),
+                )
+            })?;
             let provider = Arc::new(PostgresLockProvider::new(
-                account_db.clone(),
+                leader_db_url,
                 SEQUENCER_LEADER_LOCK_KEY,
             ));
             let mut election = LeaderElection::new(provider, seq.leader_flag());
