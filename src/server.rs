@@ -7,9 +7,11 @@ use crate::{
     rate_limit::rate_limit_middleware,
 };
 use axum::{
+    extract::Request,
     http::{header, Method, StatusCode},
     middleware,
-    response::{Json, Response},
+    middleware::Next,
+    response::{IntoResponse, Json, Response},
     routing::get,
     Router,
 };
@@ -31,9 +33,34 @@ pub fn build_router(ctx: AppContext) -> Router {
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
-    // Static file serving for admin panel
-    // Must come AFTER API routes to not conflict with /oauth/admin/* endpoints
-    let admin_static = Router::new().nest_service("/admin", ServeDir::new("static/admin"));
+    // Static file serving for admin panel.
+    // Must come AFTER API routes to not conflict with /oauth/admin/* endpoints.
+    //
+    // /admin/debug.html is a developer affordance that renders the
+    // bearer token from localStorage as visible page text. It must
+    // not be reachable in production deployments — anyone with screen
+    // access (shoulder-surfing, screen-share, malicious browser
+    // extension reading DOM) would harvest the bearer token directly.
+    // The opt-in PDS_ENABLE_DEBUG_PAGES env var keeps the page
+    // available locally for development while 404'ing it everywhere
+    // else. Default off; set to "true" or "1" to enable.
+    let debug_pages_enabled = std::env::var("PDS_ENABLE_DEBUG_PAGES")
+        .ok()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let admin_static = Router::new()
+        .nest_service("/admin", ServeDir::new("static/admin"))
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            // Capture into the async closure by value — bool is Copy
+            // so this is a zero-cost copy per request.
+            let enabled = debug_pages_enabled;
+            async move {
+                if !enabled && req.uri().path() == "/admin/debug.html" {
+                    return (StatusCode::NOT_FOUND, "Not found").into_response();
+                }
+                next.run(req).await
+            }
+        }));
 
     // Build router with middleware
     Router::new()
