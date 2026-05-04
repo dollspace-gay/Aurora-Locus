@@ -397,12 +397,58 @@ impl FromRequestParts<AppContext> for OAuthAuthContext {
         let access_token = extract_bearer_token(&parts.headers)
             .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
 
-        // TODO: Validate DPoP proof if present
-        // For now, we'll just validate the access token
-        // DPoP validation will be added in the next step
-
         // Try to find OAuth token in database
         let token_info = validate_oauth_token(state, &access_token).await?;
+
+        // DPoP proof-of-possession check (RFC 9449 §7).
+        //
+        // Tokens that were issued bound to a DPoP key carry a non-NULL
+        // `dpop_thumbprint`. On every resource request for those
+        // tokens, the request MUST present a DPoP proof whose JWK
+        // hashes to the same thumbprint, and whose `ath` claim is
+        // `base64url(SHA-256(access_token))` to bind the proof to
+        // this specific token (§4.3).
+        //
+        // Bearer-only tokens (no thumbprint) accept the request
+        // without a DPoP header — backward compat for clients that
+        // never opted in.
+        if let Some(bound_thumbprint) = token_info.dpop_thumbprint.as_deref() {
+            let dpop_proof = parts
+                .headers
+                .get("dpop")
+                .ok_or_else(|| {
+                    PdsError::Authentication(
+                        "DPoP proof required for DPoP-bound token".to_string(),
+                    )
+                })?
+                .to_str()
+                .map_err(|_| {
+                    PdsError::Authentication("Invalid DPoP header value".to_string())
+                })?;
+
+            // Reconstruct the request method/URI the way the proof
+            // would have committed to them. parts.uri here is the
+            // path-and-query the server received; htu in proof is the
+            // canonical request URI minus query string. Build absolute
+            // URL from service_url() so the comparison can match what
+            // a well-formed client computed.
+            let method = parts.method.as_str().to_string();
+            let uri = format!(
+                "{}{}",
+                state.service_url(),
+                parts.uri.path()
+            );
+            let expected_ath = crate::federation::dpop::compute_ath(&access_token);
+            let proof_thumbprint = state
+                .dpop_verifier
+                .verify_dpop_proof(dpop_proof, &method, &uri, Some(&expected_ath))
+                .await?;
+            if proof_thumbprint != bound_thumbprint {
+                return Err(PdsError::Authentication(
+                    "DPoP proof key does not match the token's bound thumbprint".to_string(),
+                ));
+            }
+        }
 
         // Parse scopes
         let scopes = token_info

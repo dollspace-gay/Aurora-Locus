@@ -55,10 +55,20 @@ pub struct AppContext {
     pub pds_discovery: Option<Arc<PdsDiscovery>>,
     pub federated_search: Option<Arc<FederatedSearch>>,
     pub nonce_store: Option<Arc<NonceStore>>,
-    // DPoP support (Phase 4)
+    /// DPoP §8 nonce challenge store. Federation-gated because the
+    /// `/xrpc/com.atproto.federation.getDpopNonce` endpoint is the
+    /// only thing that issues server-side nonces. The DPoP verifier
+    /// (next field) holds its own Arc to the same store when
+    /// federation is enabled, or to a dedicated store otherwise — the
+    /// keyspaces don't conflict.
     pub dpop_nonce_store: Option<Arc<DPopNonceStore>>,
-    #[allow(dead_code)] // Future DPoP verification
-    pub dpop_verifier: Option<Arc<DPopVerifier>>,
+    /// DPoP verifier — always present. Used by the OAuth token
+    /// endpoint at issuance and by `OAuthAuthContext` on every
+    /// resource request that has a DPoP-bound token. RFC 9449 §4.3
+    /// `ath` binding is checked at the resource-request site; the
+    /// JTI replay set is shared with the federation §8 challenge
+    /// store when federation is enabled (see field above).
+    pub dpop_verifier: Arc<DPopVerifier>,
     // Rate limiter
     pub rate_limiter: Arc<RateLimiter>,
     // Distributed rate limiter (Redis-backed, for multi-instance deployments)
@@ -246,14 +256,27 @@ impl AppContext {
             None
         };
 
-        // Initialize DPoP support (Phase 4)
-        let (dpop_nonce_store, dpop_verifier) = if config.federation.enabled {
-            tracing::info!("Initializing DPoP support for client-to-PDS authentication");
-            let dpop_nonce = Arc::new(DPopNonceStore::new());
-            let dpop_verify = Arc::new(DPopVerifier::new(Arc::clone(&dpop_nonce)));
-            (Some(dpop_nonce), Some(dpop_verify))
+        // Initialize DPoP support. Verifier is always constructed —
+        // DPoP is an OAuth concern, not federation-gated. The
+        // §8 server-issued nonce store is federation-gated because
+        // only the federation-namespace endpoint issues those nonces;
+        // when federation is off the verifier still has its own JTI
+        // replay tracker (separate Arc), which is what RFC 9449 §11.1
+        // requires regardless of the §8 challenge flow.
+        let dpop_nonce_store: Option<Arc<DPopNonceStore>> = if config.federation.enabled {
+            tracing::info!(
+                "Initializing DPoP §8 nonce challenge store (federation enabled)"
+            );
+            Some(Arc::new(DPopNonceStore::new()))
         } else {
-            (None, None)
+            None
+        };
+        let dpop_verifier = {
+            let store_for_verifier = match &dpop_nonce_store {
+                Some(s) => Arc::clone(s),
+                None => Arc::new(DPopNonceStore::new()),
+            };
+            Arc::new(DPopVerifier::new(store_for_verifier))
         };
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database)
