@@ -776,6 +776,8 @@ async fn get_users(
 struct GrantRoleRequest {
     did: String,
     role: String,
+    #[serde(default)]
+    rationale: Option<String>,
 }
 
 /// Grant admin role to a user
@@ -784,6 +786,8 @@ async fn grant_role(
     auth: AdminAuthContext,
     Json(req): Json<GrantRoleRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::admin::audit_chain::{append_entry, AppendEntryParams};
+    use crate::admin::defs::Subject;
     use crate::admin::roles::Role;
 
     // SuperAdmin only — relocated to tools.aurora.superadmin.* in
@@ -800,6 +804,19 @@ async fn grant_role(
         ));
     }
 
+    // Rationale required — every role grant is an audit-chain
+    // decision and must carry operator-supplied context. Pattern
+    // matches §8.6's `rationale-required` for triggerPasswordReset.
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "rationale-required".to_string(),
+        ))?;
+
     // Parse role
     let role: Role = req
         .role
@@ -809,35 +826,51 @@ async fn grant_role(
     // Grant role
     let admin_role = ctx
         .admin_role_manager
-        .grant_role(&req.did, role, &auth.did, None)
+        .grant_role(&req.did, role, &auth.did, Some(rationale.to_string()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Log action
-    let _ = ctx
-        .admin_role_manager
-        .log_action(
-            &auth.did,
-            "role.grant",
-            Some(&req.did),
-            Some(&req.role),
-            None,
-        )
-        .await;
+    // Audit chain entry — replaces the legacy admin_audit_log path.
+    // Subject is the target DID; the role being granted lives in the
+    // rationale + the moderation_event details rather than as a
+    // first-class chain field (chain schema is intentionally narrow).
+    let subject = Subject::Repo {
+        did: req.did.clone(),
+    };
+    let chain_rationale = format!("{} (role={})", rationale, req.role);
+    let audit_entry_id = append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "role.grant",
+            subject: Some(&subject),
+            rationale: &chain_rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
         "did": req.did,
         "role": req.role,
         "admin_role": admin_role,
+        "audit_entry_id": audit_entry_id.to_string(),
     })))
 }
 
 #[derive(Deserialize)]
 struct RevokeRoleRequest {
     did: String,
-    #[serde(default)]
-    reason: Option<String>,
+    /// Operator rationale for the revocation. Required — every role
+    /// revoke is an audit-chain decision. The historical `reason`
+    /// field continues to deserialize for backward compatibility but
+    /// the chain-required field is `rationale`.
+    #[serde(default, alias = "reason")]
+    rationale: Option<String>,
 }
 
 /// Revoke admin role from a user
@@ -846,6 +879,8 @@ async fn revoke_role(
     auth: AdminAuthContext,
     Json(req): Json<RevokeRoleRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::admin::audit_chain::{append_entry, AppendEntryParams};
+    use crate::admin::defs::Subject;
     use crate::admin::roles::Role;
 
     // SuperAdmin only — same rationale as grant_role above
@@ -860,27 +895,44 @@ async fn revoke_role(
         ));
     }
 
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "rationale-required".to_string(),
+        ))?;
+
     // Revoke role (revoke_role doesn't take a specific role, revokes the active role)
     ctx.admin_role_manager
-        .revoke_role(&req.did, &auth.did, req.reason.clone())
+        .revoke_role(&req.did, &auth.did, Some(rationale.to_string()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Log action
-    let _ = ctx
-        .admin_role_manager
-        .log_action(
-            &auth.did,
-            "role.revoke",
-            Some(&req.did),
-            req.reason.as_deref(),
-            None,
-        )
-        .await;
+    let subject = Subject::Repo {
+        did: req.did.clone(),
+    };
+    let audit_entry_id = append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "role.revoke",
+            subject: Some(&subject),
+            rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
         "did": req.did,
+        "audit_entry_id": audit_entry_id.to_string(),
     })))
 }
 
@@ -6321,6 +6373,7 @@ mod tests {
         let req = GrantRoleRequest {
             did: "did:plc:nominee".to_string(),
             role: "moderator".to_string(),
+            rationale: Some("test grant".to_string()),
         };
         let (status, body) = grant_role(State(ctx), admin_test_auth(), Json(req))
             .await
@@ -6338,7 +6391,7 @@ mod tests {
         let ctx = create_test_context().await;
         let req = RevokeRoleRequest {
             did: "did:plc:victim".to_string(),
-            reason: None,
+            rationale: Some("test revoke".to_string()),
         };
         let (status, body) = revoke_role(State(ctx), admin_test_auth(), Json(req))
             .await
@@ -6354,6 +6407,7 @@ mod tests {
         let req = GrantRoleRequest {
             did: "did:plc:newmod".to_string(),
             role: "moderator".to_string(),
+            rationale: Some("trial period".to_string()),
         };
         let resp = grant_role(State(ctx.clone()), superadmin_test_auth(), Json(req))
             .await
@@ -6367,6 +6421,62 @@ mod tests {
             json.get("role").and_then(|v| v.as_str()),
             Some("moderator")
         );
+        assert!(
+            json.get("audit_entry_id").is_some(),
+            "grantRole must return the chain entry id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grant_role_rejects_missing_rationale() {
+        let ctx = create_test_context().await;
+        let req = GrantRoleRequest {
+            did: "did:plc:newmod".to_string(),
+            role: "moderator".to_string(),
+            rationale: None,
+        };
+        let (status, body) = grant_role(State(ctx), superadmin_test_auth(), Json(req))
+            .await
+            .expect_err("missing rationale must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "rationale-required");
+    }
+
+    #[tokio::test]
+    async fn test_grant_role_writes_to_audit_chain() {
+        let ctx = create_test_context().await;
+        let req = GrantRoleRequest {
+            did: "did:plc:newmod".to_string(),
+            role: "moderator".to_string(),
+            rationale: Some("on-call rotation".to_string()),
+        };
+        grant_role(State(ctx.clone()), superadmin_test_auth(), Json(req))
+            .await
+            .expect("SuperAdmin grant succeeds");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry \
+             WHERE action = $1 AND subject_did = $2",
+        )
+        .bind("role.grant")
+        .bind("did:plc:newmod")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "grant_role must write exactly one chain entry");
+    }
+
+    #[tokio::test]
+    async fn test_revoke_role_rejects_missing_rationale() {
+        let ctx = create_test_context().await;
+        let req = RevokeRoleRequest {
+            did: "did:plc:nobody".to_string(),
+            rationale: None,
+        };
+        let (status, body) = revoke_role(State(ctx), superadmin_test_auth(), Json(req))
+            .await
+            .expect_err("missing rationale must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "rationale-required");
     }
 
     #[tokio::test]

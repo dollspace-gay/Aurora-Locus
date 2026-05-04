@@ -29,7 +29,7 @@ use crate::{
     admin::{
         appeals::{AppealManager, AppealStatus},
         audit_chain::{self, AppendEntryParams, AuditEntry},
-        defs::{AuroraAdminError, CursorPosition, PaginatedResponse, PaginationParams, Subject},
+        defs::{AuroraAdminError, CursorPosition, PaginationParams, Subject},
         events::{LogEventParams, ModerationEventLogger, ModerationEventType},
         moderation::{ApplyActionParams, ModerationAction},
         reports::ReportStatus,
@@ -952,9 +952,12 @@ pub async fn batch_takedown_accounts(
             tracing::warn!("batch takedown side-effect failed for {}: {}", did, e);
         }
     }
+    let audit_entry_id =
+        append_batch_chain_entry(&ctx, &auth.did, "account.batch_takedown", &input, event_id)
+            .await?;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: None,
+        audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.dids.len() as u32,
         snapshots: snapshots_for_dids(&input.dids),
     }))
@@ -980,9 +983,12 @@ pub async fn batch_suspend_accounts(
         &input.dids,
     )
     .await?;
+    let audit_entry_id =
+        append_batch_chain_entry(&ctx, &auth.did, "account.batch_suspend", &input, event_id)
+            .await?;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: None,
+        audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.dids.len() as u32,
         snapshots: snapshots_for_dids(&input.dids),
     }))
@@ -1020,12 +1026,46 @@ pub async fn batch_restore_accounts(
         }
     }
     tx.commit().await.map_err(internal)?;
+    let audit_entry_id =
+        append_batch_chain_entry(&ctx, &auth.did, "account.batch_restore", &input, event_id)
+            .await?;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: None,
+        audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.dids.len() as u32,
         snapshots: snapshots_for_dids(&input.dids),
     }))
+}
+
+/// Append a batch-action chain entry. Subjects from a `BatchAccountsInput`
+/// land in `cascade_subjects` so the chain's "one decision = one entry"
+/// framing (§3.4) is preserved while still recording every affected DID.
+async fn append_batch_chain_entry(
+    ctx: &AppContext,
+    actor_did: &str,
+    action: &'static str,
+    input: &BatchAccountsInput,
+    event_id: i64,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    let cascade: Vec<Subject> = input
+        .dids
+        .iter()
+        .map(|d| Subject::Repo { did: d.clone() })
+        .collect();
+    audit_chain::append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did,
+            action,
+            subject: None,
+            rationale: &input.rationale,
+            snapshot_id: None,
+            event_id: Some(event_id),
+            cascade_subjects: &cascade,
+        },
+    )
+    .await
+    .map_err(internal_pds)
 }
 
 /// `tools.aurora.admin.batchTakedownRecords` (§8.11).
@@ -1089,9 +1129,31 @@ pub async fn batch_takedown_records(
             snapshot_id: None,
         })
         .collect();
+    let cascade: Vec<Subject> = input
+        .uris
+        .iter()
+        .map(|uri| Subject::Record {
+            uri: uri.clone(),
+            cid: String::new(),
+        })
+        .collect();
+    let audit_entry_id = audit_chain::append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "record.batch_takedown",
+            subject: None,
+            rationale: &input.rationale,
+            snapshot_id: None,
+            event_id: Some(event_id),
+            cascade_subjects: &cascade,
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: None,
+        audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.uris.len() as u32,
         snapshots,
     }))
@@ -1170,9 +1232,23 @@ pub async fn batch_apply_label(
             snapshot_id: None,
         })
         .collect();
+    let audit_entry_id = audit_chain::append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "label.batch_apply",
+            subject: None,
+            rationale: &input.rationale,
+            snapshot_id: None,
+            event_id: Some(event_id),
+            cascade_subjects: &input.subjects,
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
     Ok(Json(BatchLabelOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: None,
+        audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.subjects.len() as u32,
         snapshots,
     }))
@@ -1277,9 +1353,27 @@ pub async fn batch_remove_label(
             snapshot_id: None,
         })
         .collect();
+    let cascade: Vec<Subject> = applied_subjects
+        .iter()
+        .map(|(s, _, _)| s.clone())
+        .collect();
+    let audit_entry_id = audit_chain::append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "label.batch_remove",
+            subject: None,
+            rationale: &input.rationale,
+            snapshot_id: None,
+            event_id: Some(event_id),
+            cascade_subjects: &cascade,
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
     Ok(Json(BatchRemoveLabelOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: None,
+        audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: applied_subjects.len() as u32,
         skipped,
         snapshots,
@@ -1382,33 +1476,35 @@ pub async fn trigger_password_reset(
             input.did
         );
     }
-    // Audit log entry per §8.6 step 5.
-    let _ = ctx
-        .admin_role_manager
-        .log_action(
-            &auth.did,
-            "account.trigger_password_reset",
-            Some(&input.did),
-            Some(&input.rationale),
-            None,
-        )
-        .await;
-    // Look up the audit entry id we just wrote so we can return it.
-    let audit_entry_id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM admin_audit_log \
-         WHERE admin_did = $1 AND action = $2 AND subject_did = $3 \
-         ORDER BY id DESC LIMIT 1",
+    // Audit chain entry per §8.6 step 5 — replaces the legacy
+    // admin_audit_log write so the chain is the system of record for
+    // every account-affecting decision.
+    let subject = Subject::Repo {
+        did: input.did.clone(),
+    };
+    let snapshot_id =
+        audit_chain::capture_snapshot(&ctx.account_db, &subject)
+            .await
+            .ok()
+            .flatten();
+    let audit_entry_id = audit_chain::append_entry(
+        &ctx.account_db,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "account.trigger_password_reset",
+            subject: Some(&subject),
+            rationale: &input.rationale,
+            snapshot_id,
+            event_id: None,
+            cascade_subjects: &[],
+        },
     )
-    .bind(&auth.did)
-    .bind("account.trigger_password_reset")
-    .bind(&input.did)
-    .fetch_optional(&ctx.account_db)
     .await
-    .map_err(internal)?;
+    .map_err(internal_pds)?;
     Ok(Json(TriggerPasswordResetOutput {
         reset_email_sent: email_sent,
         masked_email: mask_email(&email),
-        audit_entry_id: audit_entry_id.map(|i| i.to_string()).unwrap_or_default(),
+        audit_entry_id: audit_entry_id.to_string(),
     }))
 }
 
@@ -2149,11 +2245,29 @@ pub struct GetAuditTrailParams {
     pub pagination: PaginationParams,
 }
 
+/// Wraps the paginated audit-entry list with chain-level verification
+/// status. Per-row `verified` flags catch row-local tampering;
+/// `chain_verified` catches the case where an attacker rewrote a prior
+/// entry's content AND its `current_hash` consistently — per-row would
+/// pass on every row but the linkage between entries breaks.
+/// `chain_verified_through` is the highest sequence covered by the
+/// verification window and is meaningful only when `chain_verified` is
+/// true.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAuditTrailOutput {
+    pub items: Vec<AuditEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub chain_verified: bool,
+    pub chain_verified_through: i64,
+}
+
 pub async fn get_audit_trail(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     axum::extract::Query(params): axum::extract::Query<GetAuditTrailParams>,
-) -> Result<Json<PaginatedResponse<AuditEntry>>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<GetAuditTrailOutput>, (StatusCode, Json<serde_json::Value>)> {
     use crate::admin::roles::Role;
     if !auth.role.can_act_as(Role::Moderator) {
         return Err(forbidden(&format!(
@@ -2327,9 +2441,32 @@ pub async fn get_audit_trail(
     } else {
         None
     };
-    Ok(Json(PaginatedResponse {
+
+    // Chain-level verification: walk the entire chain (sentinel rows
+    // are skipped internally) and confirm every entry's previous_hash
+    // matches the prior entry's current_hash. Per-row `verified` flags
+    // already caught row-local tampering above; this catches the
+    // consistent-rewrite case where current_hash was rewritten in step
+    // with the content but the linkage was missed.
+    let head_seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sequence), 0) FROM audit_chain_entry",
+    )
+    .fetch_one(&ctx.account_db)
+    .await
+    .unwrap_or(0i64);
+    let chain_verified = if head_seq == 0 {
+        true
+    } else {
+        audit_chain::verify_chain_range(&ctx.account_db, 1, head_seq)
+            .await
+            .is_ok()
+    };
+
+    Ok(Json(GetAuditTrailOutput {
         items,
         cursor: next_cursor,
+        chain_verified,
+        chain_verified_through: if chain_verified { head_seq } else { 0 },
     }))
 }
 
@@ -3756,9 +3893,10 @@ mod tests {
         assert!(!resp.reset_email_sent);
         assert_eq!(resp.masked_email, "u****@example.com");
         assert!(!resp.audit_entry_id.is_empty());
-        // Audit entry exists.
+        // Chain entry exists — replaces the legacy admin_audit_log
+        // write per Block 1's "chain is the system of record."
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM admin_audit_log WHERE action = $1 AND subject_did = $2",
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1 AND subject_did = $2",
         )
         .bind("account.trigger_password_reset")
         .bind("did:plc:withemail")
