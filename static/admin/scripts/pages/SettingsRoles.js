@@ -86,7 +86,7 @@
       const rationale = div.querySelector('#grant-r').value.trim();
       if (!target || !rationale) { global.AuroraToast.warning('Target and rationale required.'); return; }
       try {
-        await global.AuroraEndpoints.superadmin.grantRole({ subject: target, role: roleSlug, rationale: rationale });
+        await global.AuroraEndpoints.superadmin.grantRole({ did: target, role: roleSlug, rationale: rationale });
         global.AuroraToast.success('Role granted.');
         handle.close();
         await mountReload();

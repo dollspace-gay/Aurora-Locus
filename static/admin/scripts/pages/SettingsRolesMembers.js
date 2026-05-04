@@ -67,7 +67,7 @@
     const rationale = prompt('Rationale (required, recorded in audit log):');
     if (!rationale) return;
     try {
-      await global.AuroraEndpoints.superadmin.revokeRole({ subject: did, role: role, rationale: rationale });
+      await global.AuroraEndpoints.superadmin.revokeRole({ did: did, role: role, rationale: rationale });
       global.AuroraToast.success('Role revoked.');
       if (global.AuroraRouter) global.AuroraRouter.dispatch();
     } catch (e) {
@@ -91,7 +91,7 @@
       const rationale = div.querySelector('#rmm-grant-r').value.trim();
       if (!target || !rationale) { global.AuroraToast.warning('Target and rationale required.'); return; }
       try {
-        await global.AuroraEndpoints.superadmin.grantRole({ subject: target, role: role, rationale: rationale });
+        await global.AuroraEndpoints.superadmin.grantRole({ did: target, role: role, rationale: rationale });
         global.AuroraToast.success('Role granted.');
         handle.close();
         if (global.AuroraRouter) global.AuroraRouter.dispatch();
