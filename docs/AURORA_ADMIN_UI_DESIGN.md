@@ -4313,6 +4313,14 @@ Bundle contents:
 - Streaming response avoids loading the entire bundle into memory server-side; large blob inventories don't need bounded memory.
 - The "audit-trail.json" is always included in bundles — it contains this export's own audit entry, so the bundle is self-describing about its provenance.
 
+### Implementation status (v0.2)
+
+v0.2 ships **metadata-only forensic export**. The bundle contains: account metadata (`manifest.json`), moderation history (`moderation-history.json`), audit chain entries for the subject when `includeAuditChain` is set (`audit-entries.json`), and `audit-trail.json` (chain anchor reference only). CAR data and blob bytes are NOT included in v0.2; the `includeRepo` and `includeBlobs` parameters are accepted but their content is recorded as "deferred" in the manifest's `deferredContents` field. The bundle is assembled in-memory and shipped as a single response body; streaming and full-content inclusion are deferred to v0.3.
+
+Operators can verify bundle integrity by recomputing SHA-256 over the response body and comparing to the `X-Aurora-Bundle-Hash` header at issuance time, or by querying the chain entry's rationale for the canonical hash record.
+
+v0.3 will revisit: streaming response body for large bundles, CAR data inclusion, blob byte inclusion, and the bundle-shape decisions that those expansions imply.
+
 ## 8.8 New endpoint — `tools.aurora.admin.batchTakedownAccounts`
 
 Atomic multi-account takedown.
