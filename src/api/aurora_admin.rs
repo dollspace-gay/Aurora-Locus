@@ -262,14 +262,24 @@ fn subject_columns(subject: &Subject) -> (Option<&str>, Option<&str>, Option<&st
 }
 
 /// Validate operator role against action requirements (§8.1 step 1).
-/// Account-infrastructure actions (delete, password reset) require
-/// Admin+; content actions accept Moderator+.
+/// Account-infrastructure actions require Admin+; content actions
+/// accept Moderator+.
+///
+/// Per chainlink #114 / §3.2's Admin-tier definition, sending email
+/// to a user is an Admin-tier capability ("passwords, emails,
+/// handles, signing keys, deletion") even when emitted via this
+/// unified action surface. A Moderator emitting `SendEmail` would
+/// reach an account-contact channel that the role tier doesn't
+/// otherwise permit, so we gate it at Admin+ here.
 fn check_role(
     auth: &AdminAuthContext,
     action: &ModEventAction,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     use crate::admin::roles::Role;
-    let admin_required = matches!(action, ModEventAction::DeleteAccount);
+    let admin_required = matches!(
+        action,
+        ModEventAction::DeleteAccount | ModEventAction::SendEmail { .. },
+    );
     let needed = if admin_required {
         Role::Admin
     } else {
@@ -3145,6 +3155,96 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn emit_event_send_email_requires_admin_role() {
+        // P-2 / chainlink #114: SendEmail is an Admin-tier capability
+        // per §3.2 (account-contact channel sits alongside passwords,
+        // emails, handles, signing keys, deletion). A Moderator
+        // emitting SendEmail must hit 403; an Admin emitting the same
+        // event must succeed.
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:recip", "recip.test").await;
+
+        // Moderator → 403
+        let err = emit_event(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(EmitEventInput {
+                action: ModEventAction::SendEmail {
+                    template: None,
+                    subject: "test subject".to_string(),
+                    body: "test body".to_string(),
+                },
+                subject: repo_subject("did:plc:recip"),
+                rationale: "Moderator may not emit SendEmail".to_string(),
+                snapshot_capture: false,
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // Admin → role check passes. Downstream validation may still
+        // reject (e.g., "recipient account not found" if the test
+        // fixture is sparse) but the failure mode must not be 403 —
+        // the role gate is what this test pins. Anything other than
+        // FORBIDDEN means role check let the call through.
+        let result = emit_event(
+            State(ctx.clone()),
+            admin_auth(),
+            Json(EmitEventInput {
+                action: ModEventAction::SendEmail {
+                    template: None,
+                    subject: "test subject".to_string(),
+                    body: "test body".to_string(),
+                },
+                subject: repo_subject("did:plc:recip"),
+                rationale: "Admin may emit SendEmail".to_string(),
+                snapshot_capture: false,
+                metadata: None,
+            }),
+        )
+        .await;
+        match result {
+            Ok(_) => {}
+            Err((status, _)) => assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "Admin must clear the role gate; got 403 which means the gate rejected"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_event_moderator_can_still_apply_label_after_send_email_tightening() {
+        // Regression check that tightening SendEmail to Admin+ did not
+        // accidentally tighten the other moderator-flavored events.
+        // ApplyLabel must continue to accept Moderator+.
+        let ctx = create_test_context().await;
+        let resp = emit_event(
+            State(ctx),
+            moderator_auth(),
+            Json(EmitEventInput {
+                action: ModEventAction::ApplyLabel {
+                    val: "regression".to_string(),
+                    neg: false,
+                },
+                subject: Subject::Record {
+                    uri: "at://did:plc:abc/app.bsky.feed.post/xyz".to_string(),
+                    cid: "bafyreigh".to_string(),
+                },
+                rationale: "moderator-flavored event still allowed".to_string(),
+                snapshot_capture: false,
+                metadata: None,
+            }),
+        )
+        .await
+        .expect("ApplyLabel still allowed for Moderator after P-2 tightening")
+        .0;
+        assert!(!resp.event_id.is_empty());
     }
 
     #[tokio::test]
