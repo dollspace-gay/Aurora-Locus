@@ -7,18 +7,21 @@
 //! and streams JSON-framed messages:
 //!
 //! ```json
-//! { "$type": "hello",     "instanceVersion": "...", "sequence": <last_event_id> }
-//! { "$type": "event",     "event": {...},            "sequence": <event_id> }
-//! { "$type": "heartbeat", "sequence": <last_event_id> }
-//! { "$type": "error",     "code": "...", "message": "..." }
+//! { "$type": "hello",      "instanceVersion": "...", "sequence": <last_event_id> }
+//! { "$type": "event",      "event": {...},           "sequence": <event_id> }
+//! { "$type": "auditEntry", "sequence": <chain_seq>, "timestamp": "...", ... }
+//! { "$type": "heartbeat",  "sequence": <last_event_id> }
+//! { "$type": "error",      "code": "...", "message": "..." }
 //! ```
 //!
 //! Polling-driven: the server polls the `moderation_event` table on
 //! a 5-second tick and pushes any newly-inserted rows since the
-//! last seen sequence. This is simpler than a notify-channel
-//! integration and gives sub-10s end-to-end latency for v0.2.
-//! Phase 3.9+ optimization can swap in LISTEN/NOTIFY-driven push
-//! transparently — the wire protocol stays the same.
+//! last seen sequence. When `include_audit_chain` is requested AND
+//! the caller's role permits chain visibility, the same tick also
+//! polls `audit_chain_entry` and merges new rows into the stream
+//! by timestamp order (sequence as tiebreaker). Phase 3.9+
+//! optimization can swap in LISTEN/NOTIFY-driven push transparently
+//! — the wire protocol stays the same.
 //!
 //! Heartbeat every 30s when no events flow (per §8.5) so clients
 //! can detect dead connections.
@@ -26,6 +29,14 @@
 //! Auth: AdminModeration scope, Moderator+ role. The WebSocket
 //! upgrade carries the bearer token in the standard Authorization
 //! header; see attached_role for the role check.
+//!
+//! Audit chain visibility role gate mirrors `getAuditTrail` (§8.4):
+//! Moderator+ permits chain row visibility. If the caller's role
+//! doesn't qualify, AuditEntry messages are SILENTLY omitted from
+//! the stream even when `include_audit_chain: true` is requested
+//! — per §3.6 stealth/non-enumeration framing, an error here would
+//! tell the operator something about the role-tier hierarchy they
+//! may not need to know.
 
 use crate::{
     auth::AdminAuthContext,
@@ -38,6 +49,7 @@ use axum::{
     },
     response::Response,
 };
+use chrono::{DateTime, Utc};
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
@@ -48,9 +60,24 @@ use tokio::time::{interval, MissedTickBehavior};
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscribeModEventsParams {
-    /// Resume from sequence position (event id).
+    /// Resume from sequence position (event id) for the
+    /// moderation_event stream. Distinct from `audit_chain_cursor`
+    /// because event ids and chain sequences are independent
+    /// monotonic counters.
     #[serde(default)]
     pub cursor: Option<i64>,
+    /// Resume from chain sequence for the audit_chain_entry stream.
+    /// Only meaningful when `include_audit_chain` is true; otherwise
+    /// ignored. Default `None` means "start from current chain head"
+    /// (matching how `cursor` defaults for events).
+    ///
+    /// Two separate cursors rather than one combined cursor keeps
+    /// the wire format backward-compatible: existing v0.2 clients
+    /// that send a single `cursor` keep working untouched. Clients
+    /// opting into audit chain pass the second field; on reconnect
+    /// they remember both independently.
+    #[serde(default)]
+    pub audit_chain_cursor: Option<i64>,
     #[serde(default)]
     pub actor_did: Option<String>,
     #[serde(default)]
@@ -63,12 +90,18 @@ pub struct SubscribeModEventsParams {
     /// Filter by event-type. Multiple values are OR-combined into an
     /// `action IN (...)` clause; an empty Vec or omitted field is
     /// treated as "no action filter."
-    ///
-    /// Wire-format note: §8.5 specifies a list shape. v0.2 had this
-    /// field as `Option<String>` (scalar) — a wire-format breaking
-    /// change for any client that was sending the scalar shape.
     #[serde(default)]
     pub action_filter: Option<Vec<String>>,
+    /// Opt into audit-chain-entry messages alongside moderation
+    /// events. Per §8.5, default is false. When true, the server
+    /// also polls `audit_chain_entry` each tick and emits
+    /// `AuditEntry` messages interleaved with `Event` messages by
+    /// timestamp order. The visibility role gate (Moderator+,
+    /// mirroring getAuditTrail per §8.4) applies; insufficient role
+    /// silently drops chain entries without erroring (§3.6
+    /// non-enumeration).
+    #[serde(default)]
+    pub include_audit_chain: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +117,28 @@ enum SubscribeMessage<'a> {
     Event {
         event: serde_json::Value,
         sequence: i64,
+    },
+    /// Audit chain row, shape mirrors `getAuditTrail`'s per-row
+    /// payload so consumers don't have to know whether they got a
+    /// row from polling or from the stream. `verified` is the
+    /// per-row hash recompute (same primitive getAuditTrail uses);
+    /// chain-level verification stays an explicit getAuditTrail
+    /// request because it walks the whole chain.
+    #[serde(rename = "auditEntry", rename_all = "camelCase")]
+    AuditEntry {
+        sequence: i64,
+        timestamp: DateTime<Utc>,
+        actor_did: String,
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subject_did: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subject_uri: Option<String>,
+        rationale: String,
+        current_hash: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_hash: Option<String>,
+        verified: bool,
     },
     #[serde(rename = "heartbeat")]
     Heartbeat { sequence: i64 },
@@ -114,26 +169,52 @@ pub async fn subscribe_mod_events(
             ))
             .expect("static response body");
     }
-    ws.on_upgrade(move |socket| handle_subscription(socket, params, ctx))
+    ws.on_upgrade(move |socket| handle_subscription(socket, params, ctx, auth))
+}
+
+/// Whether `role` is permitted to see audit-chain rows. Mirrors the
+/// `getAuditTrail` (§8.4) gate exactly so the streaming and polled
+/// surfaces stay in lockstep — if a future tightening raises the
+/// chain-visibility floor, both paths move together by updating
+/// this one helper.
+fn can_see_audit_chain(role: crate::admin::roles::Role) -> bool {
+    use crate::admin::roles::Role;
+    role.can_act_as(Role::Moderator)
 }
 
 async fn handle_subscription(
     socket: WebSocket,
     params: SubscribeModEventsParams,
     ctx: AppContext,
+    auth: AdminAuthContext,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Determine starting cursor: caller-provided or current-tail.
-    let mut cursor: i64 = match params.cursor {
+    // Determine starting event cursor: caller-provided or current-tail.
+    let mut event_cursor: i64 = match params.cursor {
         Some(c) => c,
         None => current_event_id(&ctx).await.unwrap_or(0),
     };
 
-    // Hello
+    // Audit-chain side. Only relevant when the caller opted in AND
+    // their role permits chain visibility (silent gate per §3.6 —
+    // we don't emit AuditEntry messages and we don't error).
+    let chain_enabled = params.include_audit_chain && can_see_audit_chain(auth.role);
+    let mut chain_cursor: i64 = if chain_enabled {
+        match params.audit_chain_cursor {
+            Some(c) => c,
+            None => current_chain_sequence(&ctx).await.unwrap_or(0),
+        }
+    } else {
+        0
+    };
+
+    // Hello uses the event cursor — that's the v0.2 wire shape and
+    // existing clients depend on it. Chain cursor is internal state
+    // resumed via the audit_chain_cursor query param.
     let hello = SubscribeMessage::Hello {
         instance_version: env!("CARGO_PKG_VERSION"),
-        sequence: cursor,
+        sequence: event_cursor,
     };
     if send_msg(&mut sender, &hello).await.is_err() {
         return;
@@ -148,20 +229,14 @@ async fn handle_subscription(
     loop {
         tokio::select! {
             _ = poll_tick.tick() => {
-                match fetch_new_events(&ctx, cursor, &params).await {
-                    Ok(events) => {
-                        for (id, event_json) in events {
-                            let msg = SubscribeMessage::Event {
-                                event: event_json,
-                                sequence: id,
-                            };
-                            if send_msg(&mut sender, &msg).await.is_err() {
-                                return;
-                            }
-                            cursor = id;
-                            last_send = std::time::Instant::now();
-                        }
-                    }
+                let messages = match collect_tick_messages(
+                    &ctx,
+                    &params,
+                    event_cursor,
+                    chain_cursor,
+                    chain_enabled,
+                ).await {
+                    Ok(m) => m,
                     Err(e) => {
                         tracing::warn!("subscribeModEvents poll error: {}", e);
                         let err = SubscribeMessage::Error {
@@ -171,11 +246,31 @@ async fn handle_subscription(
                         let _ = send_msg(&mut sender, &err).await;
                         return;
                     }
+                };
+                for msg in messages {
+                    // Advance the appropriate cursor BEFORE attempting
+                    // the send so a mid-stream disconnect doesn't
+                    // re-deliver the same row on reconnect (the
+                    // alternative — advance after send succeeds —
+                    // would re-deliver one row per disconnect).
+                    match &msg {
+                        SubscribeMessage::Event { sequence, .. } => {
+                            event_cursor = *sequence;
+                        }
+                        SubscribeMessage::AuditEntry { sequence, .. } => {
+                            chain_cursor = *sequence;
+                        }
+                        _ => {}
+                    }
+                    if send_msg(&mut sender, &msg).await.is_err() {
+                        return;
+                    }
+                    last_send = std::time::Instant::now();
                 }
             }
             _ = heartbeat_tick.tick() => {
                 if last_send.elapsed() >= Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
-                    let hb = SubscribeMessage::Heartbeat { sequence: cursor };
+                    let hb = SubscribeMessage::Heartbeat { sequence: event_cursor };
                     if send_msg(&mut sender, &hb).await.is_err() {
                         return;
                     }
@@ -194,6 +289,107 @@ async fn handle_subscription(
     }
 }
 
+/// Collect messages for a single poll tick: events plus optionally
+/// audit-chain entries, merged in timestamp order with sequence as
+/// tiebreaker. Pulled out as its own function so the SQL paths and
+/// the merge logic stay separately testable from the WebSocket.
+async fn collect_tick_messages(
+    ctx: &AppContext,
+    params: &SubscribeModEventsParams,
+    after_event: i64,
+    after_chain: i64,
+    chain_enabled: bool,
+) -> Result<Vec<SubscribeMessage<'static>>, sqlx::Error> {
+    let events = fetch_new_events(ctx, after_event, params).await?;
+    let chain_rows = if chain_enabled {
+        fetch_new_chain_entries(ctx, after_chain).await?
+    } else {
+        Vec::new()
+    };
+    Ok(merge_event_and_chain_streams(events, chain_rows))
+}
+
+/// Merge two locally-ordered streams (events by id ASC, chain by
+/// sequence ASC) into a single output in timestamp ascending order.
+/// On equal timestamps, the event side wins — moderation_event rows
+/// are typically written before their corresponding audit_chain_entry
+/// rows in the same transaction, so this matches causal order.
+fn merge_event_and_chain_streams(
+    events: Vec<EventStreamRow>,
+    chain_rows: Vec<ChainStreamRow>,
+) -> Vec<SubscribeMessage<'static>> {
+    let mut out: Vec<SubscribeMessage<'static>> =
+        Vec::with_capacity(events.len() + chain_rows.len());
+    let mut ei = 0;
+    let mut ci = 0;
+    while ei < events.len() || ci < chain_rows.len() {
+        let take_event = match (events.get(ei), chain_rows.get(ci)) {
+            (Some(e), Some(c)) => {
+                // Compare DateTime<Utc> values directly to avoid
+                // RFC3339 format mismatches between sources (Z vs
+                // +00:00, etc.). Equal timestamps tip toward events
+                // as documented above.
+                e.created_at <= c.timestamp
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_event {
+            let e = events[ei].clone();
+            out.push(SubscribeMessage::Event {
+                event: e.payload,
+                sequence: e.id,
+            });
+            ei += 1;
+        } else {
+            let c = chain_rows[ci].clone();
+            out.push(SubscribeMessage::AuditEntry {
+                sequence: c.sequence,
+                timestamp: c.timestamp,
+                actor_did: c.actor_did,
+                action: c.action,
+                subject_did: c.subject_did,
+                subject_uri: c.subject_uri,
+                rationale: c.rationale,
+                current_hash: c.current_hash,
+                previous_hash: c.previous_hash,
+                verified: c.verified,
+            });
+            ci += 1;
+        }
+    }
+    out
+}
+
+/// Owned audit-chain row used by the merge step. Mirrors the slice
+/// of `audit_chain::AuditEntry` fields the wire format actually
+/// carries.
+#[derive(Debug, Clone)]
+struct ChainStreamRow {
+    sequence: i64,
+    timestamp: DateTime<Utc>,
+    actor_did: String,
+    action: String,
+    subject_did: Option<String>,
+    subject_uri: Option<String>,
+    rationale: String,
+    current_hash: String,
+    previous_hash: Option<String>,
+    verified: bool,
+}
+
+/// Owned moderation-event row used by the merge step. Timestamp
+/// is parsed to `DateTime<Utc>` here rather than left as a string
+/// so the merge step can compare against `ChainStreamRow.timestamp`
+/// without RFC3339 format mismatches (`Z` vs `+00:00` etc.).
+#[derive(Debug, Clone)]
+struct EventStreamRow {
+    id: i64,
+    created_at: DateTime<Utc>,
+    payload: serde_json::Value,
+}
+
 async fn current_event_id(ctx: &AppContext) -> Result<i64, sqlx::Error> {
     let row = sqlx::query("SELECT MAX(id) AS max_id FROM moderation_event")
         .fetch_optional(&ctx.account_db)
@@ -203,11 +399,91 @@ async fn current_event_id(ctx: &AppContext) -> Result<i64, sqlx::Error> {
         .unwrap_or(0))
 }
 
+async fn current_chain_sequence(ctx: &AppContext) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query("SELECT MAX(sequence) AS max_seq FROM audit_chain_entry")
+        .fetch_optional(&ctx.account_db)
+        .await?;
+    Ok(row
+        .and_then(|r| r.try_get::<Option<i64>, _>("max_seq").ok().flatten())
+        .unwrap_or(0))
+}
+
+/// Fetch chain entries with sequence > `after_seq`, in sequence-ascending
+/// order, capped by `MAX_EVENTS_PER_POLL`. Mirrors the field layout the
+/// `AuditEntry` wire variant ships, including a per-row hash recompute
+/// to populate `verified` (matches getAuditTrail's per-row primitive).
+async fn fetch_new_chain_entries(
+    ctx: &AppContext,
+    after_seq: i64,
+) -> Result<Vec<ChainStreamRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
+                subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
+                cascade_subjects \
+         FROM audit_chain_entry WHERE sequence > $1 ORDER BY sequence ASC LIMIT $2",
+    )
+    .bind(after_seq)
+    .bind(MAX_EVENTS_PER_POLL)
+    .fetch_all(&ctx.account_db)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let sequence: i64 = row.try_get("sequence")?;
+        let created_at_str: String = row.try_get("created_at")?;
+        let timestamp = match DateTime::parse_from_rfc3339(&created_at_str) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => continue, // skip unparseable rows defensively
+        };
+        let actor_did: String = row.try_get("actor_did")?;
+        let action: String = row.try_get("action")?;
+        let subject_did: Option<String> = row.try_get("subject_did").ok().flatten();
+        let subject_uri: Option<String> = row.try_get("subject_uri").ok().flatten();
+        let subject_cid: Option<String> = row.try_get("subject_cid").ok().flatten();
+        let rationale: String = row.try_get("rationale")?;
+        let snapshot_id: Option<i64> = row.try_get("snapshot_id").ok().flatten();
+        let event_id: Option<i64> = row.try_get("event_id").ok().flatten();
+        let current_hash: String = row.try_get("current_hash")?;
+        let previous_hash: Option<String> = row.try_get("previous_hash").ok().flatten();
+        let cascade_str: Option<String> = row.try_get("cascade_subjects").ok().flatten();
+
+        let verified = crate::admin::audit_chain::verify_entry(
+            sequence,
+            &created_at_str,
+            &actor_did,
+            &action,
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+            &rationale,
+            snapshot_id,
+            event_id,
+            previous_hash.as_deref(),
+            cascade_str.as_deref(),
+            &current_hash,
+        );
+
+        out.push(ChainStreamRow {
+            sequence,
+            timestamp,
+            actor_did,
+            action,
+            subject_did,
+            subject_uri,
+            rationale,
+            current_hash,
+            previous_hash,
+            verified,
+        });
+    }
+    Ok(out)
+}
+
 async fn fetch_new_events(
     ctx: &AppContext,
     after_id: i64,
     params: &SubscribeModEventsParams,
-) -> Result<Vec<(i64, serde_json::Value)>, sqlx::Error> {
+) -> Result<Vec<EventStreamRow>, sqlx::Error> {
     // Normalize the action filter once: an empty Vec is equivalent to
     // None, since `IN ()` is invalid SQL. Filtering at the boundary
     // means the SQL builder below sees only "no filter" or "filter
@@ -283,8 +559,12 @@ async fn fetch_new_events(
         let subject_uri: Option<String> = row.try_get("subject_uri").ok().flatten();
         let subject_cid: Option<String> = row.try_get("subject_cid").ok().flatten();
         let details_str: String = row.try_get("details")?;
-        let created_at: String = row.try_get("created_at")?;
-        let json = serde_json::json!({
+        let created_at_str: String = row.try_get("created_at")?;
+        let created_at = match DateTime::parse_from_rfc3339(&created_at_str) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => continue, // skip unparseable rows defensively
+        };
+        let payload = serde_json::json!({
             "id": id,
             "eventType": event_type,
             "actorDid": actor_did,
@@ -293,9 +573,13 @@ async fn fetch_new_events(
             "subjectCid": subject_cid,
             "details": serde_json::from_str::<serde_json::Value>(&details_str)
                 .unwrap_or(serde_json::Value::String(details_str)),
-            "createdAt": created_at,
+            "createdAt": created_at_str,
         });
-        out.push((id, json));
+        out.push(EventStreamRow {
+            id,
+            created_at,
+            payload,
+        });
     }
     Ok(out)
 }
@@ -309,4 +593,344 @@ where
         Err(_) => return Err(()),
     };
     sender.send(Message::Text(payload)).await.map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::audit_chain::{append_entry, AppendEntryParams};
+    use crate::admin::defs::Subject;
+    use crate::admin::roles::Role;
+
+    // ---- Pure merge / role-gate tests (no DB) ----
+
+    fn chain_row(seq: i64, ts: &str, action: &str) -> ChainStreamRow {
+        ChainStreamRow {
+            sequence: seq,
+            timestamp: DateTime::parse_from_rfc3339(ts)
+                .unwrap()
+                .with_timezone(&Utc),
+            actor_did: "did:plc:m1".to_string(),
+            action: action.to_string(),
+            subject_did: Some("did:plc:s".to_string()),
+            subject_uri: None,
+            rationale: "test".to_string(),
+            current_hash: "h".to_string(),
+            previous_hash: None,
+            verified: true,
+        }
+    }
+
+    fn event_row(id: i64, ts: &str) -> EventStreamRow {
+        EventStreamRow {
+            id,
+            created_at: DateTime::parse_from_rfc3339(ts).unwrap().with_timezone(&Utc),
+            payload: serde_json::json!({ "id": id, "createdAt": ts }),
+        }
+    }
+
+    fn message_kind(msg: &SubscribeMessage<'static>) -> &'static str {
+        match msg {
+            SubscribeMessage::Event { .. } => "event",
+            SubscribeMessage::AuditEntry { .. } => "auditEntry",
+            SubscribeMessage::Hello { .. } => "hello",
+            SubscribeMessage::Heartbeat { .. } => "heartbeat",
+            SubscribeMessage::Error { .. } => "error",
+        }
+    }
+
+    #[test]
+    fn can_see_audit_chain_gate_matches_get_audit_trail() {
+        // §8.4 getAuditTrail requires Moderator+. The streaming gate
+        // mirrors it exactly. If §8.4 ever tightens, this test will
+        // notice as soon as the helper is updated.
+        assert!(can_see_audit_chain(Role::Moderator));
+        assert!(can_see_audit_chain(Role::Admin));
+        assert!(can_see_audit_chain(Role::SuperAdmin));
+    }
+
+    #[test]
+    fn merge_orders_by_timestamp_with_event_tiebreaker() {
+        // Events @ T+0 and T+2; chain entries @ T+1 and T+2.
+        // Expected order:
+        //   event(id=1, t+0)
+        //   chain(seq=10, t+1)
+        //   event(id=2, t+2)        ← tiebreak prefers event
+        //   chain(seq=11, t+2)
+        let events = vec![
+            event_row(1, "2026-05-04T00:00:00Z"),
+            event_row(2, "2026-05-04T00:00:02Z"),
+        ];
+        let chain_rows = vec![
+            chain_row(10, "2026-05-04T00:00:01Z", "TakedownAccount"),
+            chain_row(11, "2026-05-04T00:00:02Z", "RestoreAccount"),
+        ];
+        let merged = merge_event_and_chain_streams(events, chain_rows);
+        let kinds: Vec<&'static str> = merged.iter().map(message_kind).collect();
+        assert_eq!(kinds, ["event", "auditEntry", "event", "auditEntry"]);
+    }
+
+    #[test]
+    fn merge_handles_chain_only_stream() {
+        let merged = merge_event_and_chain_streams(
+            vec![],
+            vec![
+                chain_row(1, "2026-05-04T00:00:00Z", "A"),
+                chain_row(2, "2026-05-04T00:00:01Z", "B"),
+            ],
+        );
+        let kinds: Vec<_> = merged.iter().map(message_kind).collect();
+        assert_eq!(kinds, ["auditEntry", "auditEntry"]);
+    }
+
+    #[test]
+    fn merge_handles_event_only_stream() {
+        let merged = merge_event_and_chain_streams(
+            vec![event_row(1, "2026-05-04T00:00:00Z")],
+            vec![],
+        );
+        let kinds: Vec<_> = merged.iter().map(message_kind).collect();
+        assert_eq!(kinds, ["event"]);
+    }
+
+    #[test]
+    fn audit_entry_serializes_with_camel_case_fields() {
+        // Wire format must match getAuditTrail's per-row shape so
+        // consumers can render without knowing source.
+        let msg = SubscribeMessage::AuditEntry {
+            sequence: 42,
+            timestamp: DateTime::parse_from_rfc3339("2026-05-04T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            actor_did: "did:plc:m1".to_string(),
+            action: "TakedownAccount".to_string(),
+            subject_did: Some("did:plc:s".to_string()),
+            subject_uri: None,
+            rationale: "spam".to_string(),
+            current_hash: "h".to_string(),
+            previous_hash: Some("p".to_string()),
+            verified: true,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"$type\":\"auditEntry\""));
+        assert!(json.contains("\"sequence\":42"));
+        assert!(json.contains("\"actorDid\":\"did:plc:m1\""));
+        assert!(json.contains("\"currentHash\":\"h\""));
+        assert!(json.contains("\"previousHash\":\"p\""));
+        assert!(json.contains("\"verified\":true"));
+        // None-valued Option fields are skipped on the wire.
+        assert!(!json.contains("\"subjectUri\""));
+    }
+
+    // ---- DB-backed tests for fetch_new_chain_entries + collect_tick ----
+    //
+    // Mirror create_test_context's pattern from aurora_admin's tests
+    // module; using AppContext directly keeps the SQL paths exercised
+    // end-to-end against a real (in-memory) sqlite instance.
+
+    async fn create_test_context() -> AppContext {
+        use crate::config::*;
+        use std::path::PathBuf;
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap().keep();
+        let db_path = dir.join("test.db");
+        let config = ServerConfig {
+            service: ServiceConfig {
+                hostname: "localhost".to_string(),
+                port: 2583,
+                service_did: "did:web:localhost".to_string(),
+                version: "0.1.0-test".to_string(),
+                blob_upload_limit: 5_242_880,
+            },
+            storage: StorageConfig {
+                data_directory: dir.clone(),
+                account_db: db_path.clone(),
+                sequencer_db: dir.join("sequencer.db"),
+                did_cache_db: dir.join("did_cache.db"),
+                actor_store_directory: dir.join("actors"),
+                blobstore: BlobstoreConfig::Disk {
+                    location: dir.join("blobs"),
+                    tmp_location: dir.join("temp"),
+                },
+            },
+            database: Default::default(),
+            authentication: AuthConfig {
+                jwt_secret: "test-secret-key-aurora-subscribe-32xx".to_string(),
+                repo_signing_key: "a".repeat(64),
+                plc_rotation_key: "b".repeat(64),
+                admin_dids: vec![],
+                oauth: OAuthConfig {
+                    client_id: "http://localhost:3000/client-metadata.json".to_string(),
+                    redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
+                    pds_url: "https://bsky.social".to_string(),
+                },
+                jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
+                oauth_migration_guide_url:
+                    "https://docs.atproto.com/guides/oauth-migration".to_string(),
+                oauth_features: Default::default(),
+            },
+            identity: IdentityConfig {
+                did_plc_url: "https://plc.directory".to_string(),
+                service_handle_domains: vec![".localhost".to_string()],
+                did_cache_stale_ttl: 3600,
+                did_cache_max_ttl: 86400,
+            },
+            email: None,
+            invites: InviteConfig {
+                required: false,
+                interval: 604800,
+                epoch: "2024-01-01T00:00:00Z".to_string(),
+            },
+            rate_limit: RateLimitConfig {
+                enabled: false,
+                global_requests_per_minute: 3000,
+                use_redis: false,
+                redis_url: None,
+                exempt_admin_assets: true,
+            },
+            logging: LoggingConfig {
+                level: "info".to_string(),
+            },
+            federation: FederationConfig {
+                enabled: false,
+                relay_urls: vec![],
+                appview_url: None,
+                firehose_enabled: false,
+                crawl_enabled: false,
+                public_url: Some("http://localhost:2583".to_string()),
+                auto_stream_events: false,
+            },
+            validation_mode: PathBuf::from("required")
+                .into_os_string()
+                .to_string_lossy()
+                .parse()
+                .unwrap_or(crate::validation::ValidationMode::Required),
+        };
+        AppContext::new(config).await.unwrap()
+    }
+
+    async fn write_test_chain_entry(ctx: &AppContext, action: &'static str) -> i64 {
+        let subject = Subject::Repo {
+            did: "did:plc:s".to_string(),
+        };
+        append_entry(
+            &ctx.account_db,
+            AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action,
+                subject: Some(&subject),
+                rationale: "test rationale",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fetch_new_chain_entries_returns_rows_after_cursor() {
+        let ctx = create_test_context().await;
+        write_test_chain_entry(&ctx, "TakedownAccount").await;
+        write_test_chain_entry(&ctx, "RestoreAccount").await;
+        let rows = fetch_new_chain_entries(&ctx, 0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].action, "TakedownAccount");
+        assert_eq!(rows[1].action, "RestoreAccount");
+        assert!(rows[0].verified, "fresh chain entry must verify");
+    }
+
+    #[tokio::test]
+    async fn fetch_new_chain_entries_resumes_from_cursor() {
+        let ctx = create_test_context().await;
+        write_test_chain_entry(&ctx, "TakedownAccount").await;
+        write_test_chain_entry(&ctx, "RestoreAccount").await;
+        // Resume past the first row → should only see the second.
+        let rows = fetch_new_chain_entries(&ctx, 1).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sequence, 2);
+        assert_eq!(rows[0].action, "RestoreAccount");
+    }
+
+    #[tokio::test]
+    async fn collect_tick_emits_audit_entries_when_chain_enabled() {
+        let ctx = create_test_context().await;
+        write_test_chain_entry(&ctx, "TakedownAccount").await;
+        let params = SubscribeModEventsParams {
+            include_audit_chain: true,
+            ..Default::default()
+        };
+        let messages = collect_tick_messages(&ctx, &params, 0, 0, true)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(message_kind(&messages[0]), "auditEntry");
+    }
+
+    #[tokio::test]
+    async fn collect_tick_omits_audit_entries_when_chain_disabled() {
+        let ctx = create_test_context().await;
+        write_test_chain_entry(&ctx, "TakedownAccount").await;
+        // include_audit_chain: false → chain_enabled gets set false
+        // upstream → collect_tick must skip the chain fetch entirely.
+        let params = SubscribeModEventsParams {
+            include_audit_chain: false,
+            ..Default::default()
+        };
+        let messages = collect_tick_messages(&ctx, &params, 0, 0, false)
+            .await
+            .unwrap();
+        assert!(
+            messages.is_empty(),
+            "no events written, chain disabled → empty tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_tick_silently_omits_audit_entries_for_insufficient_role() {
+        // Per §3.6, an operator who passes include_audit_chain=true
+        // but whose role doesn't satisfy can_see_audit_chain MUST
+        // get a stream with no AuditEntry messages and no error.
+        // The handler enforces this by setting chain_enabled = false
+        // when can_see_audit_chain returns false. That path is what
+        // we exercise here: chain_enabled=false even though the
+        // params asked for chain.
+        let ctx = create_test_context().await;
+        write_test_chain_entry(&ctx, "TakedownAccount").await;
+        let params = SubscribeModEventsParams {
+            include_audit_chain: true,
+            ..Default::default()
+        };
+        let messages = collect_tick_messages(&ctx, &params, 0, 0, false)
+            .await
+            .unwrap();
+        // Chain entries written; chain_enabled passed false (mimicking
+        // the role-gate having fired) → still no AuditEntry messages.
+        assert!(messages.iter().all(|m| message_kind(m) != "auditEntry"));
+    }
+
+    #[tokio::test]
+    async fn collect_tick_resume_cursor_does_not_redeliver_chain_entries() {
+        let ctx = create_test_context().await;
+        write_test_chain_entry(&ctx, "TakedownAccount").await;
+        write_test_chain_entry(&ctx, "RestoreAccount").await;
+        let params = SubscribeModEventsParams {
+            include_audit_chain: true,
+            ..Default::default()
+        };
+        // First tick from cursor=0 → both rows.
+        let first_tick = collect_tick_messages(&ctx, &params, 0, 0, true).await.unwrap();
+        assert_eq!(first_tick.len(), 2);
+        // Resume from chain_cursor=1 (after first row) → only second row.
+        let resume = collect_tick_messages(&ctx, &params, 0, 1, true).await.unwrap();
+        assert_eq!(resume.len(), 1);
+        match &resume[0] {
+            SubscribeMessage::AuditEntry { sequence, action, .. } => {
+                assert_eq!(*sequence, 2);
+                assert_eq!(action, "RestoreAccount");
+            }
+            other => panic!("expected AuditEntry, got {:?}", message_kind(other)),
+        }
+    }
 }
