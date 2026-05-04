@@ -607,10 +607,12 @@ mod tests {
     // ---- Operator-flavored carve-outs under tools.aurora.admin.* -----
     // Per UI design doc §8.6 (triggerPasswordReset), §8.7
     // (exportAccountForensic), and §8.16 (get/setRuntimeSetting) — these
-    // four NSIDs accept either AdminServer or AdminModeration even though
-    // the namespace default is AdminModeration. Mirrors the
-    // com.atproto.admin.* mixed-flavor rule and is documented next to
-    // the constant table in this module.
+    // four NSIDs require AdminServer scope. The namespace default for
+    // tools.aurora.admin.* is AdminModeration; the per-NSID carve-out
+    // is the AdminServer requirement itself. AdminAll wildcard still
+    // satisfies via implicit-includes; AdminModeration alone does NOT
+    // satisfy these four (an earlier shape accepted either, which
+    // widened the contract beyond the design).
 
     const TOOLS_ADMIN_OPERATOR_FLAVORED: &[&str] = &[
         "/xrpc/tools.aurora.admin.triggerPasswordReset",
@@ -620,14 +622,14 @@ mod tests {
     ];
 
     #[test]
-    fn test_operator_flavored_lookup_returns_both_scopes() {
+    fn test_operator_flavored_lookup_returns_admin_server_only() {
         for path in TOOLS_ADMIN_OPERATOR_FLAVORED {
             let req = required_scopes_for_path(path)
                 .unwrap_or_else(|| panic!("expected scope mapping for {}", path));
             assert_eq!(
                 req,
-                &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration],
-                "{} must accept either AdminServer or AdminModeration",
+                &[AtProtoScope::AdminServer],
+                "{} must require AdminServer (and only AdminServer at the per-NSID level)",
                 path
             );
         }
@@ -635,8 +637,7 @@ mod tests {
 
     #[test]
     fn test_operator_flavored_accept_admin_server_only() {
-        // AdminServer alone reaches the four operator-flavored NSIDs even
-        // though the namespace default is AdminModeration.
+        // AdminServer alone reaches the four operator-flavored NSIDs.
         let server_only: ScopeSet = "atproto:admin.server".parse().unwrap();
         for path in TOOLS_ADMIN_OPERATOR_FLAVORED {
             assert!(
@@ -648,12 +649,16 @@ mod tests {
     }
 
     #[test]
-    fn test_operator_flavored_accept_admin_moderation_only() {
+    fn test_operator_flavored_reject_admin_moderation_alone() {
+        // The AdminServer requirement is what distinguishes these
+        // four from the rest of tools.aurora.admin.*. A token holding
+        // only AdminModeration must NOT reach them — that was the
+        // prior over-acceptance bug.
         let mod_only: ScopeSet = "atproto:admin.moderation".parse().unwrap();
         for path in TOOLS_ADMIN_OPERATOR_FLAVORED {
             assert!(
-                enforce_namespace_scope(path, &mod_only).is_ok(),
-                "AdminModeration should reach {}",
+                enforce_namespace_scope(path, &mod_only).is_err(),
+                "AdminModeration alone must NOT reach operator-flavored NSID {}",
                 path
             );
         }
@@ -826,25 +831,36 @@ const TOOLS_MODERATION_REQUIRED: &[AtProtoScope] = &[AtProtoScope::AdminModerati
 const COM_ADMIN_REQUIRED: &[AtProtoScope] =
     &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration];
 
-/// Operator-flavored NSIDs under `tools.aurora.admin.*` — these accept
-/// either AdminServer or AdminModeration, per UI design doc §8.6/§8.7/§8.16.
-/// Looked up BEFORE the namespace prefix match in `required_scopes_for_path`.
+/// Operator-flavored NSIDs under `tools.aurora.admin.*` — these
+/// require AdminServer scope per UI design doc §8.6/§8.7/§8.16. The
+/// carve-out is the AdminServer requirement itself: the namespace
+/// default for `tools.aurora.admin.*` is AdminModeration, but the
+/// design pulls these four out as operator concerns and the scope
+/// requirement reflects that. Looked up BEFORE the namespace prefix
+/// match in `required_scopes_for_path` so the per-NSID rule wins.
+///
+/// AtProtoScope::AdminAll (the wildcard `atproto:admin.*`) still
+/// implicitly satisfies via `AtProtoScope::includes`, so a token
+/// holding the wildcard scope reaches all four. Tokens holding only
+/// AdminModeration are correctly rejected — earlier shapes accepted
+/// either, which widened the scope contract beyond what the design
+/// specifies.
 const TOOLS_ADMIN_OPERATOR_NSIDS: &[(&str, &[AtProtoScope])] = &[
     (
         "tools.aurora.admin.triggerPasswordReset",
-        &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration],
+        &[AtProtoScope::AdminServer],
     ),
     (
         "tools.aurora.admin.exportAccountForensic",
-        &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration],
+        &[AtProtoScope::AdminServer],
     ),
     (
         "tools.aurora.admin.getRuntimeSetting",
-        &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration],
+        &[AtProtoScope::AdminServer],
     ),
     (
         "tools.aurora.admin.setRuntimeSetting",
-        &[AtProtoScope::AdminServer, AtProtoScope::AdminModeration],
+        &[AtProtoScope::AdminServer],
     ),
 ];
 
