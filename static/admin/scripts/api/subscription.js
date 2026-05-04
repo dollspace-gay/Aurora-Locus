@@ -1,143 +1,144 @@
 // Subscription substrate (substrate primitive 18) +
 // Real-time indicator (substrate primitive 19).
 //
-// Per docs/AURORA_ADMIN_UI_DESIGN.md §6.18 + §6.19. Manages WebSocket
-// connection lifecycle, reconnection backoff, sequence-cursor resume.
-// Surfaces connection state via the real-time indicator widget that
-// pages embed in their headers.
+// Per docs/AURORA_ADMIN_UI_DESIGN.md §6.18 + §6.19. v0.2 ships the
+// substrate as HTTP polling against the existing read endpoints
+// (queryEvents). Browsers cannot send custom Authorization headers on
+// WebSocket connections — only Sec-WebSocket-Protocol — so the
+// previously-coded WebSocket path could never authenticate against
+// AdminAuthContext, leaving the indicator stuck in 'reconnecting'.
+// Polling sidesteps that, uses the same Bearer-token machinery as
+// every other admin call, and lets the indicator reach a stable
+// 'polling' state.
 //
-// API:
+// The external API is preserved so consumer pages don't change:
+//
 //   const sub = AuroraSubscription.subscribe(feature, filters, handlers)
 //   sub.unsubscribe()
 //
 // `feature` is a high-level capability name routed via
-// AuroraCapabilities (substrate primitive 21). For Phase 3.9 only
-// 'subscribe-mod-events' is wired; future features (subscribeAudit
-// etc.) extend the map without component changes.
+// AuroraCapabilities (substrate primitive 21). v0.2 ships
+// 'subscribe-mod-events' only (other features extend the map without
+// component changes).
 //
-// Reconnect backoff: 1s → 2s → 4s → 8s → 16s (capped). Resets on
-// successful connection.
+// Real-time indicator states (per §6.19):
+//   'connecting'  — initial; one tick before the first poll resolves
+//   'polling'     — at least one poll has succeeded; live tail active
+//   'offline'     — repeated poll failures or explicit unsubscribe
 //
-// Real-time indicator:
-//   AuroraSubscription.attachIndicator(el, sub)
-//   ('Connected' | 'Reconnecting…' | 'Offline' | 'Polling fallback')
+// Backoff on errors: 1× → 2× → 4× → 8× the base interval. Resets on
+// success.
 //
 // Vanilla JS, no framework dependencies (per §12.9).
 
 (function (global) {
   'use strict';
 
-  const FEATURE_TO_NSID = {
-    'subscribe-mod-events': 'tools.aurora.admin.subscribeModEvents',
+  // Map from logical feature name to the read endpoint used to drive
+  // the polling tail. The endpoint must accept query-string filters
+  // and return `{items: [{id, ...}]}` ordered newest-first.
+  const FEATURE_ENDPOINTS = {
+    'subscribe-mod-events': function (filters) {
+      return global.AuroraEndpoints.moderator.queryEvents(
+        Object.assign({ limit: 25 }, filters || {})
+      );
+    },
   };
 
-  function authToken() {
-    return localStorage.getItem('adminToken') || '';
-  }
-
-  function wsUrlFor(nsid, filters) {
-    // The WebSocket route is the same XRPC path; switch http(s)→ws(s).
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const params = new URLSearchParams();
-    if (filters && typeof filters === 'object') {
-      for (const k of Object.keys(filters)) {
-        if (filters[k] != null && filters[k] !== '') {
-          params.set(k, filters[k]);
-        }
-      }
-    }
-    const qs = params.toString();
-    return `${proto}//${window.location.host}/xrpc/${nsid}${qs ? '?' + qs : ''}`;
-  }
+  const POLL_INTERVAL_MS = 10000;
+  const MAX_BACKOFF_MS = 80000;
+  // Allow a couple of consecutive failures before flipping the
+  // indicator to 'offline' — flaky single requests shouldn't spam
+  // state transitions.
+  const FAILURES_BEFORE_OFFLINE = 3;
 
   function Subscription(feature, filters, handlers) {
     this.feature = feature;
     this.filters = Object.assign({}, filters || {});
     this.handlers = handlers || {};
-    this.ws = null;
-    this.cursor = filters && filters.cursor;
-    this.backoffMs = 1000;
-    this.maxBackoffMs = 16000;
     this.disposed = false;
     this.indicators = new Set();
+    this.lastSeenId = null;
+    this.consecutiveFailures = 0;
+    this.intervalMs = POLL_INTERVAL_MS;
+    this.timer = null;
     this._setState('connecting');
-    this._connect();
+    // Kick off the first poll immediately so the indicator can leave
+    // 'connecting' on the next tick rather than after the full
+    // interval.
+    this._tick();
   }
 
-  Subscription.prototype._connect = function () {
+  Subscription.prototype._scheduleNext = function (delay) {
     if (this.disposed) return;
-    const nsid = FEATURE_TO_NSID[this.feature];
-    if (!nsid) {
+    this.timer = setTimeout(() => this._tick(), delay);
+  };
+
+  Subscription.prototype._tick = async function () {
+    if (this.disposed) return;
+    const fetchFn = FEATURE_ENDPOINTS[this.feature];
+    if (!fetchFn) {
       this._setState('offline');
       if (this.handlers.onError) this.handlers.onError({ code: 'UnknownFeature' });
       return;
     }
-    const filters = Object.assign({}, this.filters);
-    if (this.cursor != null) filters.cursor = this.cursor;
-    const url = wsUrlFor(nsid, filters);
-    let ws;
     try {
-      // axum's WebSocket extractor handles the upgrade; the WS handshake
-      // can carry a bearer token via Sec-WebSocket-Protocol header,
-      // since browsers don't allow custom Authorization on ws:// — we
-      // pass the token as a sub-protocol hint and the handler reads
-      // it from the auth context that is wired through axum.
-      // For browsers without subprotocol auth, the token still needs
-      // to be valid via cookie/session. v0.2 admin UI runs against a
-      // local PDS where the auth flow is consistent across HTTP +
-      // WebSocket.
-      const proto = authToken() ? ['Bearer.' + authToken()] : undefined;
-      ws = new WebSocket(url, proto);
+      const data = await fetchFn(this.filters);
+      this._onPollSuccess(data);
     } catch (e) {
-      this._setState('offline');
-      this._scheduleReconnect();
-      return;
+      this._onPollFailure(e);
     }
-    this.ws = ws;
-    ws.onopen = () => {
-      this._setState('connected');
-      this.backoffMs = 1000;
-      if (this.handlers.onConnected) this.handlers.onConnected();
-    };
-    ws.onmessage = (evt) => {
-      let msg;
-      try { msg = JSON.parse(evt.data); } catch (e) { return; }
-      const t = msg.$type;
-      if (t === 'event' && msg.event) {
-        if (msg.sequence != null) this.cursor = msg.sequence;
-        if (this.handlers.onEvent) this.handlers.onEvent(msg.event, msg.sequence);
-      } else if (t === 'hello') {
-        if (msg.sequence != null && this.cursor == null) this.cursor = msg.sequence;
-        if (this.handlers.onHello) this.handlers.onHello(msg);
-      } else if (t === 'heartbeat') {
-        if (this.handlers.onHeartbeat) this.handlers.onHeartbeat(msg.sequence);
-      } else if (t === 'error') {
-        if (this.handlers.onError) this.handlers.onError(msg);
-      }
-    };
-    ws.onclose = () => {
-      if (this.disposed) return;
-      this._setState('reconnecting');
-      if (this.handlers.onDisconnected) this.handlers.onDisconnected();
-      this._scheduleReconnect();
-    };
-    ws.onerror = () => {
-      // onclose will follow; let the close handler manage reconnect.
-    };
+    this._scheduleNext(this.intervalMs);
   };
 
-  Subscription.prototype._scheduleReconnect = function () {
-    if (this.disposed) return;
-    const delay = this.backoffMs;
-    this.backoffMs = Math.min(this.backoffMs * 2, this.maxBackoffMs);
-    setTimeout(() => this._connect(), delay);
+  Subscription.prototype._onPollSuccess = function (data) {
+    const wasOffline = this.state !== 'polling';
+    this.consecutiveFailures = 0;
+    this.intervalMs = POLL_INTERVAL_MS;
+    const items = (data && Array.isArray(data.items)) ? data.items : [];
+    if (this.lastSeenId == null) {
+      // First successful poll establishes the watermark. Emit a
+      // synthesized 'hello' so consumers that care can mirror the
+      // previous WebSocket bootstrap shape.
+      this.lastSeenId = items.length > 0 ? items[0].id : 0;
+      if (this.handlers.onHello) {
+        this.handlers.onHello({ sequence: this.lastSeenId });
+      }
+    } else {
+      // Items are newest-first. Emit only those strictly newer than
+      // the last seen id, in chronological (id-ascending) order so
+      // consumers see them as they would on a live stream.
+      const fresh = items.filter((it) => it && typeof it.id === 'number' && it.id > this.lastSeenId);
+      fresh.sort((a, b) => a.id - b.id);
+      for (const evt of fresh) {
+        if (this.handlers.onEvent) this.handlers.onEvent(evt, evt.id);
+        this.lastSeenId = evt.id;
+      }
+    }
+    this._setState('polling');
+    if (wasOffline && this.handlers.onConnected) this.handlers.onConnected();
+  };
+
+  Subscription.prototype._onPollFailure = function (err) {
+    this.consecutiveFailures += 1;
+    if (this.handlers.onError) {
+      this.handlers.onError({ code: 'PollFailure', message: err && err.message });
+    }
+    if (this.consecutiveFailures >= FAILURES_BEFORE_OFFLINE) {
+      const wasPolling = this.state === 'polling';
+      this._setState('offline');
+      if (wasPolling && this.handlers.onDisconnected) this.handlers.onDisconnected();
+      // Exponential backoff on persistent failure to avoid hammering
+      // a degraded server.
+      this.intervalMs = Math.min(this.intervalMs * 2, MAX_BACKOFF_MS);
+    }
   };
 
   Subscription.prototype.unsubscribe = function () {
     this.disposed = true;
-    if (this.ws) {
-      try { this.ws.close(); } catch (e) {}
-      this.ws = null;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
     }
     this.indicators.clear();
     this._setState('offline');
@@ -154,17 +155,15 @@
   // surface for state transitions.
   function renderIndicator(el, state) {
     const variants = {
-      connected: { dot: 'rt-dot-connected', label: 'Live', live: 'Live event stream connected' },
-      reconnecting: { dot: 'rt-dot-reconnecting', label: 'Reconnecting…', live: 'Reconnecting' },
       connecting: { dot: 'rt-dot-reconnecting', label: 'Connecting…', live: 'Connecting' },
+      polling: { dot: 'rt-dot-polling', label: 'Live (polling)', live: 'Live event tail active' },
       offline: { dot: 'rt-dot-offline', label: 'Offline', live: 'Disconnected' },
-      polling: { dot: 'rt-dot-polling', label: 'Polling every 10s', live: 'Polling fallback active' },
     };
     const v = variants[state] || variants.offline;
     el.classList.add('rt-indicator');
     el.setAttribute('aria-live', 'polite');
-    el.innerHTML = `<span class="rt-dot ${v.dot}" aria-hidden="true"></span>` +
-                   `<span class="rt-label">${v.label}</span>`;
+    el.innerHTML = '<span class="rt-dot ' + v.dot + '" aria-hidden="true"></span>' +
+                   '<span class="rt-label">' + v.label + '</span>';
     // Provide an SR-only summary distinct from the visible label.
     const sr = document.createElement('span');
     sr.className = 'visually-hidden';
