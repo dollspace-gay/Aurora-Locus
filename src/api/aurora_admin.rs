@@ -2709,19 +2709,27 @@ pub async fn get_audit_trail(
     .fetch_one(&ctx.account_db)
     .await
     .unwrap_or(0i64);
-    let chain_verified = if head_seq == 0 {
-        true
+    // Per CR-8 / chainlink #120: when verification fails, surface
+    // `failing_sequence - 1` as `chain_verified_through` so operators
+    // investigating chain failures get a row-level pointer rather
+    // than an undifferentiated 0. saturating_sub(1) handles the
+    // edge case where seq=1 itself failed (nothing was verified
+    // through; chain_verified_through = 0 is correct).
+    let verification_result = if head_seq == 0 {
+        Ok(())
     } else {
-        audit_chain::verify_chain_range(&ctx.account_db, 1, head_seq)
-            .await
-            .is_ok()
+        audit_chain::verify_chain_range(&ctx.account_db, 1, head_seq).await
+    };
+    let (chain_verified, chain_verified_through) = match verification_result {
+        Ok(()) => (true, head_seq),
+        Err(e) => (false, e.failing_sequence.saturating_sub(1)),
     };
 
     Ok(Json(GetAuditTrailOutput {
         items,
         cursor: next_cursor,
         chain_verified,
-        chain_verified_through: if chain_verified { head_seq } else { 0 },
+        chain_verified_through,
     }))
 }
 
@@ -4214,6 +4222,109 @@ mod tests {
         .await.unwrap().0;
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].actor_did, "did:plc:m1");
+    }
+
+    // CR-8 / chainlink #120: chainVerifiedThrough must surface the
+    // failing sequence on chain verification failure, not collapse
+    // every failure mode into 0. The handler computes
+    // `failing_sequence - 1` (saturating) so operators get a row-level
+    // pointer to where the chain diverged.
+    #[tokio::test]
+    async fn chain_verified_through_reports_head_seq_on_clean_chain() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:s1", "s1.test").await;
+        for i in 0..3 {
+            crate::admin::audit_chain::append_entry(
+                &ctx.account_db,
+                crate::admin::audit_chain::AppendEntryParams {
+                    actor_did: "did:plc:moderator",
+                    action: "TakedownAccount",
+                    subject: Some(&repo_subject("did:plc:s1")),
+                    rationale: &format!("entry-{}", i),
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: None,
+                subject_uri: None,
+                after_created: None,
+                before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(resp.chain_verified, "clean chain should verify");
+        assert_eq!(
+            resp.chain_verified_through, 3,
+            "clean chain should report head sequence as verified-through"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_verified_through_reports_failing_sequence_minus_one_on_tampered_chain() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:s1", "s1.test").await;
+        for i in 0..3 {
+            crate::admin::audit_chain::append_entry(
+                &ctx.account_db,
+                crate::admin::audit_chain::AppendEntryParams {
+                    actor_did: "did:plc:moderator",
+                    action: "TakedownAccount",
+                    subject: Some(&repo_subject("did:plc:s1")),
+                    rationale: &format!("entry-{}", i),
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // Tamper sequence 2 the same way audit_chain's own
+        // verify_chain_range_detects_per_row_tamper test does:
+        // mutate the row's content without recomputing current_hash.
+        sqlx::query("UPDATE audit_chain_entry SET rationale = 'tampered' WHERE sequence = 2")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: None,
+                subject_uri: None,
+                after_created: None,
+                before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(
+            !resp.chain_verified,
+            "tampered chain should fail verification"
+        );
+        assert_eq!(
+            resp.chain_verified_through, 1,
+            "failing_sequence=2 should yield chain_verified_through=1"
+        );
     }
 
     // ---------- Phase 3.8 — exportAccountForensic (§8.7) ----------
