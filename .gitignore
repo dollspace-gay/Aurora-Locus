@@ -18,3 +18,14 @@ Cargo.lock
 # Beads database
 .beads/
 .chainlink/
+
+# Runtime data
+data/
+data.backup/
+
+# Local tooling
+.claude/
+
+# Python
+__pycache__/
+*.pyc
