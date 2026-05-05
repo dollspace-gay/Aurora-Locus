@@ -196,7 +196,35 @@ impl ModerationEventLogger {
     /// [`insert_moderation_event_in_tx`] so every `moderation_event`
     /// row also gets a `mod_event_seq` row in the same transaction —
     /// the dual-write invariant chainlink #115 requires.
+    ///
+    /// Pool-API wrapper around [`Self::log_event_in_tx`] that opens
+    /// its own transaction. Use `log_event_in_tx` directly when the
+    /// event must land atomically with another mutation (LB-1 /
+    /// chainlink #122).
     pub async fn log_event(&self, params: LogEventParams<'_>) -> PdsResult<ModerationEvent> {
+        let mut tx = self.db.begin().await?;
+        let event = Self::log_event_in_tx(&mut tx, params).await?;
+        tx.commit().await?;
+        Ok(event)
+    }
+
+    /// Log a moderation event inside an existing transaction.
+    ///
+    /// Per LB-1 / chainlink #122: handlers that pair an event log
+    /// with an underlying mutation (or with an audit-chain append)
+    /// run all three writes inside one transaction so the surfaces
+    /// can't tear at process death. Caller commits.
+    ///
+    /// `&self` isn't taken — the function is associated rather than
+    /// methodical because the only state `ModerationEventLogger`
+    /// owns is its `db` pool, which the caller already used to open
+    /// `tx`. Keeping it static avoids forcing handlers to clone or
+    /// borrow the logger when they already have a transaction in
+    /// hand.
+    pub async fn log_event_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        params: LogEventParams<'_>,
+    ) -> PdsResult<ModerationEvent> {
         let LogEventParams {
             event_type,
             actor_did,
@@ -218,9 +246,8 @@ impl ModerationEventLogger {
             .transpose()
             .map_err(|e| PdsError::Internal(format!("Failed to serialize meta: {}", e)))?;
 
-        let mut tx = self.db.begin().await?;
         let id = insert_moderation_event_in_tx(
-            &mut tx,
+            tx,
             event_type.as_str(),
             actor_did,
             subject_did,
@@ -231,7 +258,6 @@ impl ModerationEventLogger {
             meta_json.as_deref(),
         )
         .await?;
-        tx.commit().await?;
 
         tracing::info!(
             "Logged moderation event: {:?} by {} (subject_did: {:?}, subject_uri: {:?})",

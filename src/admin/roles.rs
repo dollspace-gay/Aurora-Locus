@@ -110,16 +110,39 @@ impl AdminRoleManager {
         granted_by: &str,
         notes: Option<String>,
     ) -> PdsResult<AdminRole> {
+        let mut tx = self.db.begin().await?;
+        let granted = Self::grant_role_in_tx(&mut tx, did, role, granted_by, notes).await?;
+        tx.commit().await?;
+        Ok(granted)
+    }
+
+    /// Grant admin role inside an existing transaction. LB-1 /
+    /// chainlink #122 atomic-with-chain entry point.
+    pub async fn grant_role_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        role: Role,
+        granted_by: &str,
+        notes: Option<String>,
+    ) -> PdsResult<AdminRole> {
         let now = Utc::now();
 
-        // Check if role already exists and is active
-        if let Some(existing) = self.get_role(did).await? {
-            if !existing.revoked {
-                return Err(PdsError::Conflict(format!(
-                    "User already has active role: {}",
-                    existing.role.as_str()
-                )));
-            }
+        // Check if role already exists and is active. Read inside
+        // the same tx so the check + insert are linearizable —
+        // otherwise two concurrent grants could both pass the
+        // "no existing active role" check.
+        let existing: Option<(String, bool)> = sqlx::query_as(
+            "SELECT role, revoked FROM admin_roles WHERE did = $1 \
+             AND NOT revoked ORDER BY granted_at DESC LIMIT 1",
+        )
+        .bind(did)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some((existing_role, _)) = existing {
+            return Err(PdsError::Conflict(format!(
+                "User already has active role: {}",
+                existing_role
+            )));
         }
 
         let id: i64 = sqlx::query_scalar(
@@ -134,7 +157,7 @@ impl AdminRoleManager {
         .bind(granted_by)
         .bind(now.to_rfc3339())
         .bind(&notes)
-        .fetch_one(&self.db)
+        .fetch_one(&mut **tx)
         .await?;
 
         Ok(AdminRole {
@@ -157,6 +180,20 @@ impl AdminRoleManager {
         revoked_by: &str,
         reason: Option<String>,
     ) -> PdsResult<()> {
+        let mut tx = self.db.begin().await?;
+        Self::revoke_role_in_tx(&mut tx, did, revoked_by, reason).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Revoke admin role inside an existing transaction. LB-1 /
+    /// chainlink #122 atomic-with-chain entry point.
+    pub async fn revoke_role_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        revoked_by: &str,
+        reason: Option<String>,
+    ) -> PdsResult<()> {
         let now = Utc::now();
 
         let result = sqlx::query(
@@ -173,7 +210,7 @@ impl AdminRoleManager {
         .bind(revoked_by)
         .bind(&reason)
         .bind(did)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await?;
 
         if result.rows_affected() == 0 {

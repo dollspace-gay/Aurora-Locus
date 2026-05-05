@@ -839,23 +839,35 @@ async fn grant_role(
         .parse()
         .map_err(|e: PdsError| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // Grant role
-    let admin_role = ctx
-        .admin_role_manager
-        .grant_role(&req.did, role, &auth.did, Some(rationale.to_string()))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Audit chain entry — replaces the legacy admin_audit_log path.
-    // Subject is the target DID; the role being granted lives in the
-    // rationale + the moderation_event details rather than as a
-    // first-class chain field (chain schema is intentionally narrow).
     let subject = Subject::Repo {
         did: req.did.clone(),
     };
     let chain_rationale = format!("{} (role={})", rationale, req.role);
-    let audit_entry_id = audit_chain::append_entry(
-        &ctx.account_db,
+
+    // LB-1 / chainlink #122: grant + chain in one transaction so a
+    // crash between the two leaves neither row, not a role grant
+    // without an audit-chain breadcrumb.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let admin_role = crate::admin::AdminRoleManager::grant_role_in_tx(
+        &mut tx,
+        &req.did,
+        role,
+        &auth.did,
+        Some(rationale.to_string()),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Audit chain entry — replaces the legacy admin_audit_log path.
+    // Subject is the target DID; the role being granted lives in the
+    // rationale + the moderation_event details rather than as a
+    // first-class chain field (chain schema is intentionally narrow).
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "role.grant",
@@ -869,6 +881,9 @@ async fn grant_role(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -920,17 +935,27 @@ async fn revoke_role(
             "rationale-required".to_string(),
         ))?;
 
-    // Revoke role (revoke_role doesn't take a specific role, revokes the active role)
-    ctx.admin_role_manager
-        .revoke_role(&req.did, &auth.did, Some(rationale.to_string()))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     let subject = Subject::Repo {
         did: req.did.clone(),
     };
-    let audit_entry_id = audit_chain::append_entry(
-        &ctx.account_db,
+
+    // LB-1 / chainlink #122: revoke + chain in one transaction.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::admin::AdminRoleManager::revoke_role_in_tx(
+        &mut tx,
+        &req.did,
+        &auth.did,
+        Some(rationale.to_string()),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "role.revoke",
@@ -944,6 +969,9 @@ async fn revoke_role(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -3853,8 +3881,29 @@ async fn enable_account_invites(
     let canonical_did =
         resolve_account_or_did(&ctx, req.account.as_deref(), req.did.as_deref()).await?;
 
-    ctx.account_manager
-        .enable_account_invites(&canonical_did)
+    let subject = Subject::Repo {
+        did: canonical_did.clone(),
+    };
+    // Snapshot the pre-mutation actor state outside the tx — the
+    // snapshot is immutable evidence of state-at-decision; whether
+    // the chain entry lands is a separate question. Snapshot rows
+    // that aren't referenced from any chain row are vestigial but
+    // harmless.
+    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rationale = req.note.clone().unwrap_or_default();
+
+    // LB-1 / chainlink #122: the actor mutation and chain entry
+    // run in one transaction, with the in-process append guard
+    // held across the commit so concurrent appenders serialize.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::account::AccountManager::enable_account_invites_in_tx(&mut tx, &canonical_did)
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
@@ -3866,16 +3915,8 @@ async fn enable_account_invites(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-
-    let subject = Subject::Repo {
-        did: canonical_did.clone(),
-    };
-    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rationale = req.note.clone().unwrap_or_default();
-    audit_chain::append_entry(
-        &ctx.account_db,
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.invites.enable",
@@ -3889,6 +3930,9 @@ async fn enable_account_invites(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
 }
@@ -3902,8 +3946,23 @@ async fn disable_account_invites(
     let canonical_did =
         resolve_account_or_did(&ctx, req.account.as_deref(), req.did.as_deref()).await?;
 
-    ctx.account_manager
-        .disable_account_invites(&canonical_did)
+    let subject = Subject::Repo {
+        did: canonical_did.clone(),
+    };
+    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rationale = req.note.clone().unwrap_or_default();
+
+    // LB-1 / chainlink #122 — see enable_account_invites for
+    // the atomicity rationale.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::account::AccountManager::disable_account_invites_in_tx(&mut tx, &canonical_did)
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
@@ -3915,16 +3974,8 @@ async fn disable_account_invites(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-
-    let subject = Subject::Repo {
-        did: canonical_did.clone(),
-    };
-    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rationale = req.note.clone().unwrap_or_default();
-    audit_chain::append_entry(
-        &ctx.account_db,
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.invites.disable",
@@ -3938,6 +3989,9 @@ async fn disable_account_invites(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
 }

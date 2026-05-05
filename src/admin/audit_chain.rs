@@ -240,46 +240,73 @@ pub struct AppendEntryParams<'a> {
     pub cascade_snapshot_ids: &'a [Option<i64>],
 }
 
-/// Append an entry to the chain.
+/// In-process serialization guard for audit-chain appends.
 ///
-/// Concurrency: the SELECT-head + INSERT-next sequence runs inside
-/// a single transaction. On Postgres we additionally take
-/// `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` as the
-/// transaction's first statement so concurrent appenders serialize
-/// at the lock rather than racing on the chain head and colliding
-/// on the `UNIQUE(sequence)` constraint. The lock auto-releases at
-/// COMMIT. On SQLite the lock query is skipped — SQLite's
-/// database-level write lock already serializes writes at
-/// transaction granularity, which is the property we need.
+/// Per LB-1 / chainlink #122: when callers do their own
+/// transaction management (so the chain entry lands atomically
+/// with the underlying mutation via `append_entry_in_tx`), the
+/// in-process AsyncMutex that single-flights chain appends must
+/// be held _across_ the caller's `tx.commit()`. Otherwise, a
+/// second appender could observe the same chain head between
+/// guard-release-on-_in_tx-return and commit-on-caller, racing
+/// for the same `seq` value.
 ///
-/// ADMIN_MOD_PHASE_3 §6.1's "concurrency commitment" was specifying
-/// either advisory-lock or SERIALIZABLE-isolation as acceptable
-/// solutions; this implementation picks advisory-lock to match the
-/// codebase's existing leader-election pattern (clear semantics, no
-/// retry-on-serialization-failure logic).
-pub async fn append_entry(
-    db: &AnyPool,
+/// Acquire before opening the caller's transaction; drop after
+/// `tx.commit()` (an explicit `drop(guard)` works, but normal
+/// scope-end is fine — the only thing that matters is that the
+/// guard outlives the commit).
+///
+/// `append_entry` (the pool-API wrapper that opens its own tx)
+/// continues to acquire the guard internally, so existing call
+/// sites are unaffected.
+pub struct AppendChainGuard {
+    _inner: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl AppendChainGuard {
+    /// Acquire the guard. Returns once the lock is held.
+    pub async fn acquire() -> Self {
+        Self {
+            _inner: append_serialize_guard().lock().await,
+        }
+    }
+}
+
+/// Append an entry to the chain inside an existing transaction.
+///
+/// This is the LB-1 / chainlink #122 "atomic" entry point: the
+/// caller's transaction wraps both the underlying mutation
+/// (e.g., `UPDATE actor SET takedown_ref = ...`) and this chain
+/// append, so a crash between mutation and chain-append leaves
+/// neither row instead of an audit-blind mutation. Pre-LB-1, the
+/// pool-API `append_entry` opened its own transaction and the
+/// two writes could be torn at process death.
+///
+/// Concurrency: the caller is responsible for holding an
+/// [`AppendChainGuard`] across their own `tx.commit()`. Inside
+/// this function we additionally take
+/// `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` so concurrent
+/// appenders serialize at the Postgres lock rather than racing on
+/// the chain head. The advisory lock auto-releases at COMMIT
+/// (caller-managed). On SQLite the advisory-lock query is
+/// best-effort (it errors silently on SQLite, which gets
+/// serialization for free via its DB-level write lock); the
+/// in-process guard is what actually serializes SQLite appenders.
+pub async fn append_entry_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     params: AppendEntryParams<'_>,
 ) -> Result<i64, PdsError> {
-    // In-process serialization (see `append_serialize_guard` doc).
-    // Held across the entire transaction so SELECT-head + INSERT-next
-    // can't be interrupted by another in-process appender.
-    let _guard = append_serialize_guard().lock().await;
-
-    let mut tx = db.begin().await?;
-
     // Postgres: serialize concurrent appenders behind a single
-    // advisory lock keyed on AUDIT_CHAIN_LOCK_KEY. The lock auto-
-    // releases at COMMIT (or ROLLBACK on error). Best-effort —
-    // SQLite would error on the function call ("no such function
-    // pg_advisory_xact_lock"), so we ignore failures here. The
-    // surrounding transaction provides write-serialization on both
-    // backends; the advisory lock is purely a Postgres refinement
-    // that lets multiple admins block briefly rather than races
-    // returning UNIQUE-violation errors.
+    // advisory lock keyed on AUDIT_CHAIN_LOCK_KEY. Best-effort —
+    // SQLite errors on the function call ("no such function
+    // pg_advisory_xact_lock") and we ignore that. The caller's
+    // transaction provides write-serialization on both backends;
+    // the advisory lock is a Postgres refinement that lets
+    // multiple admins block briefly rather than collide on
+    // UNIQUE(sequence).
     let _ = sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(AUDIT_CHAIN_LOCK_KEY)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await;
 
     // Determine sequence + previous hash from the chain head.
@@ -288,7 +315,7 @@ pub async fn append_entry(
     let head: Option<(i64, String)> = sqlx::query_as::<_, (i64, String)>(
         "SELECT sequence, current_hash FROM audit_chain_entry ORDER BY sequence DESC LIMIT 1",
     )
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let (seq, prev_hash) = match head {
         Some((s, h)) => (s + 1, Some(h)),
@@ -391,8 +418,38 @@ pub async fn append_entry(
     .bind(&prev_hash)
     .bind(&cascade_json)
     .bind(&cascade_snapshot_ids_json)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
+    Ok(id)
+}
+
+/// Append an entry to the chain. Pool-API wrapper around
+/// [`append_entry_in_tx`] that opens its own transaction and
+/// commits — for callers without an enclosing mutation transaction.
+///
+/// Concurrency: holds an [`AppendChainGuard`] across the whole
+/// transaction so the SELECT-head + INSERT-next sequence is
+/// single-flighted in-process; on Postgres,
+/// `pg_advisory_xact_lock` (taken inside the transaction by
+/// `append_entry_in_tx`) provides cross-process serialization.
+///
+/// ADMIN_MOD_PHASE_3 §6.1's "concurrency commitment" specified
+/// either advisory-lock or SERIALIZABLE-isolation as acceptable
+/// solutions; this implementation picks advisory-lock to match the
+/// codebase's existing leader-election pattern.
+///
+/// LB-1 / chainlink #122: prefer [`append_entry_in_tx`] from
+/// handlers that mutate other tables in the same audit decision —
+/// the chain entry then lands atomically with the underlying
+/// mutation. This wrapper is for chain-only writes (fewer in
+/// practice; mostly tests and infrastructure events).
+pub async fn append_entry(
+    db: &AnyPool,
+    params: AppendEntryParams<'_>,
+) -> Result<i64, PdsError> {
+    let _guard = AppendChainGuard::acquire().await;
+    let mut tx = db.begin().await?;
+    let id = append_entry_in_tx(&mut tx, params).await?;
     tx.commit().await?;
     Ok(id)
 }
@@ -764,6 +821,138 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    // LB-1 / chainlink #122: atomicity regression. The per-tx
+    // entry point `append_entry_in_tx` must roll back together
+    // with the caller's underlying mutation when the caller's tx
+    // is rolled back. Pre-LB-1, `append_entry` opened its own tx
+    // and committed before returning — so a caller's later error
+    // couldn't unwind the chain entry, leaving the chain row
+    // out of sync with whatever the caller's mutation should
+    // have done.
+    #[tokio::test]
+    async fn append_entry_in_tx_rolls_back_with_caller_mutation() {
+        let db = open_test_pool().await;
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at) \
+             VALUES ('did:plc:victim', 'v.test', '2026-05-04T00:00:00Z')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let subject = Subject::Repo {
+            did: "did:plc:victim".to_string(),
+        };
+
+        // Run the underlying mutation + chain append inside one
+        // tx; deliberately roll back without commit. Both writes
+        // must be undone together.
+        {
+            let _guard = AppendChainGuard::acquire().await;
+            let mut tx = db.begin().await.unwrap();
+            sqlx::query(
+                "UPDATE actor SET handle = 'tampered' WHERE did = 'did:plc:victim'",
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            let chain_id = append_entry_in_tx(
+                &mut tx,
+                AppendEntryParams {
+                    actor_did: "did:plc:m1",
+                    action: "TakedownAccount",
+                    subject: Some(&subject),
+                    rationale: "would be rolled back",
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(chain_id > 0, "chain insert succeeded inside tx");
+            tx.rollback().await.unwrap();
+        }
+
+        let handle: String =
+            sqlx::query_scalar("SELECT handle FROM actor WHERE did = 'did:plc:victim'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            handle, "v.test",
+            "underlying mutation must roll back when tx is rolled back"
+        );
+        let chain_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_chain_entry")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            chain_count, 0,
+            "chain entry must roll back when tx is rolled back"
+        );
+    }
+
+    // The flip side: when the caller's tx commits, both the
+    // underlying mutation and the chain entry land. This is the
+    // happy path the atomicity contract guarantees.
+    #[tokio::test]
+    async fn append_entry_in_tx_commits_with_caller_mutation() {
+        let db = open_test_pool().await;
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at) \
+             VALUES ('did:plc:victim', 'v.test', '2026-05-04T00:00:00Z')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let subject = Subject::Repo {
+            did: "did:plc:victim".to_string(),
+        };
+
+        let _guard = AppendChainGuard::acquire().await;
+        let mut tx = db.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE actor SET handle = 'updated' WHERE did = 'did:plc:victim'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let chain_id = append_entry_in_tx(
+            &mut tx,
+            AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownAccount",
+                subject: Some(&subject),
+                rationale: "atomic commit",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let handle: String =
+            sqlx::query_scalar("SELECT handle FROM actor WHERE did = 'did:plc:victim'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(handle, "updated", "mutation committed");
+        let chain_seq: i64 =
+            sqlx::query_scalar("SELECT sequence FROM audit_chain_entry WHERE id = $1")
+                .bind(chain_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(chain_seq, 1, "chain entry committed");
     }
 
     #[tokio::test]

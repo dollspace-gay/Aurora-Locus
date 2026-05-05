@@ -373,14 +373,28 @@ pub async fn emit_event(
 
     let cascading_actions = dispatch_action(&ctx, &auth, &input).await?;
 
-    // Step 6 (§8.1): emit to moderation_event log so subscribers and
-    // queryEvents see this action.
-    let event_log = ModerationEventLogger::new(ctx.account_db.clone());
+    // Steps 5 + 6 (§8.1): emit to moderation_event log AND write
+    // audit chain entry. Both writes run in a single transaction
+    // (LB-1 / chainlink #122) so a crash between log and chain
+    // can't leave a moderation_event without its chain row, which
+    // would silently violate the §3.4 "every administrative action
+    // gets a chain row" invariant.
+    //
+    // Caveat: `dispatch_action` above runs the underlying mutation
+    // (account takedown, label apply, etc.) through a manager that
+    // doesn't accept a transaction — pre-existing tear window
+    // remains for "mutation lands but log+chain don't." Migrating
+    // every manager API to accept `&mut tx` is a larger v0.3 task
+    // tracked under chainlink #122-followup.
     let event_type = event_type_for(&input.action);
     let (subject_did, subject_uri, subject_cid) = subject_columns(&input.subject);
     let details = build_event_details(&input, &metadata);
-    let event = event_log
-        .log_event(LogEventParams {
+    let action_str = action_kind_str(&input.action);
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let event = ModerationEventLogger::log_event_in_tx(
+        &mut tx,
+        LogEventParams {
             event_type,
             actor_did: &auth.did,
             subject_did,
@@ -388,15 +402,12 @@ pub async fn emit_event(
             subject_cid,
             details: details.clone(),
             meta: metadata,
-        })
-        .await
-        .map_err(internal)?;
-
-    // Step 5 (§8.1): write audit chain entry referencing snapshot +
-    // event. Hash linkage gives tamper-evident replay.
-    let action_str = action_kind_str(&input.action);
-    let audit_entry_id = audit_chain::append_entry(
-        &ctx.account_db,
+        },
+    )
+    .await
+    .map_err(internal)?;
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: action_str,
@@ -410,6 +421,7 @@ pub async fn emit_event(
     )
     .await
     .map_err(internal_pds)?;
+    tx.commit().await.map_err(internal)?;
 
     Ok(Json(EmitEventOutput {
         event_id: event.id.to_string(),

@@ -2075,9 +2075,21 @@ impl AccountManager {
     ///
     /// Allows the account to create and use invite codes.
     pub async fn enable_account_invites(&self, did: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        Self::enable_account_invites_in_tx(&mut tx, did).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Enable invite code creation for an account inside an existing
+    /// transaction. LB-1 / chainlink #122 atomic-with-chain entry point.
+    pub async fn enable_account_invites_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+    ) -> PdsResult<()> {
         let result = sqlx::query("UPDATE account SET invites_disabled = FALSE WHERE did = $1")
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
 
@@ -2093,9 +2105,21 @@ impl AccountManager {
     ///
     /// Prevents the account from creating new invite codes.
     pub async fn disable_account_invites(&self, did: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        Self::disable_account_invites_in_tx(&mut tx, did).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Disable invite code creation for an account inside an existing
+    /// transaction. LB-1 / chainlink #122 atomic-with-chain entry point.
+    pub async fn disable_account_invites_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+    ) -> PdsResult<()> {
         let result = sqlx::query("UPDATE account SET invites_disabled = TRUE WHERE did = $1")
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
 
