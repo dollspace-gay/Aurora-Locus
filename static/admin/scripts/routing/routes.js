@@ -48,7 +48,6 @@
     { pattern: 'ops/blob-ops', page: 'opsBlobOps', requires: 'admin' },
     { pattern: 'ops/rate-limits', page: 'opsRateLimits', requires: 'admin' },
     { pattern: 'ops/system-health', page: 'opsSystemHealth', requires: 'admin' },
-    { pattern: 'ops/server', page: 'opsServer' },
 
     // Settings domain
     { pattern: 'settings', page: 'settingsGeneral' }, // default settings view
@@ -101,7 +100,6 @@
         { label: 'Blob ops', route: 'ops/blob-ops', icon: 'image', requires: 'admin' },
         { label: 'Rate limits', route: 'ops/rate-limits', icon: 'gauge', requires: 'admin' },
         { label: 'System health', route: 'ops/system-health', icon: 'heart-pulse', requires: 'admin' },
-        { label: 'Server', route: 'ops/server', icon: 'server' },
       ],
     },
     {

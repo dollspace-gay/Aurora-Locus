@@ -1,5 +1,5 @@
-// Server page (route: #ops/server) — hosts capabilities probe + version info.
-// Per docs/AURORA_ADMIN_UI_DESIGN.md §5.4.6.6. Aliases #settings/capabilities.
+// Capabilities page (route: #settings/capabilities) — hosts capabilities
+// probe + version info. Per docs/AURORA_ADMIN_UI_DESIGN.md §5.4.6.6.
 
 (function (global) {
   'use strict';
@@ -93,7 +93,6 @@
 
   function esc(s) { return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s); }
   if (global.AuroraRouter) {
-    global.AuroraRouter.register('opsServer', { mount: mount });
     global.AuroraRouter.register('settingsCapabilities', { mount: mount });
   }
 })(window);

@@ -19,7 +19,7 @@ This design doc is the spec. Implementation across the remaining v0.2 sub-phases
 Three top-level navigation domains structuring the UI:
 
 - **Moderation** — queue, reports, appeals, mod events, audit. Visible only when the operator's session has a moderator role and only when the deployment's `moderation-mode` runtime setting permits it.
-- **Operations** — accounts, account detail, invites, sequencer, federation, blob ops, rate limits, system health, server (capabilities + version + config). Always visible to operators with appropriate role; the only domain visible in `reduced` mode.
+- **Operations** — accounts, account detail, invites, sequencer, federation, blob ops, rate limits, system health. Always visible to operators with appropriate role; the only domain visible in `reduced` mode.
 - **Settings** — general, UI & modes (theme toggle, moderation mode, language), roles, capabilities probe.
 
 Account detail is a shared destination both Moderation and Operations link into; per-drawer role gating determines what's visible to whom.
@@ -128,15 +128,14 @@ The complete list of pages shipping in v0.2:
 - Blob ops (storage stats, blob inventory, GC controls)
 - Rate limits (config + status + cleanup)
 - System health (consolidated health/metrics page)
-- Server (capabilities probe, version info, server config)
 
 **Settings domain:**
 - General (instance name, service URL, basic config)
 - UI & modes (theme toggle, moderation mode setting, language selector)
 - Roles (member list per role, grant/revoke for SuperAdmin)
-- Capabilities (alias to Operations → Server → Capabilities for top-level discoverability)
+- Capabilities (capabilities probe, version + build info)
 
-Total: 28 distinct pages plus inline drawers and modals.
+Total: 27 distinct pages plus inline drawers and modals.
 
 ### 2.1.2 Substrate primitives
 
@@ -410,7 +409,6 @@ The sidebar's structure top to bottom:
 │  Blob ops                   │
 │  Rate limits                │
 │  System health              │
-│  Server                     │
 │                             │
 │  SETTINGS                   │
 │  General                    │
@@ -501,7 +499,6 @@ The full route table:
 | `#ops/blob-ops` | Blob ops page |
 | `#ops/rate-limits` | Rate limits page |
 | `#ops/system-health` | System health page |
-| `#ops/server` | Server (capabilities + version + config) |
 
 ### Settings domain
 
@@ -511,7 +508,7 @@ The full route table:
 | `#settings/ui-modes` | UI & modes settings |
 | `#settings/roles` | Roles list |
 | `#settings/roles/:role` | Members list for a specific role |
-| `#settings/capabilities` | Capabilities probe (alias for `#ops/server`) |
+| `#settings/capabilities` | Capabilities probe + build info |
 
 ### Special routes
 
@@ -1986,7 +1983,7 @@ Read on load; no auto-refresh.
 
 ### 5.4.6 Operations sub-pages
 
-The remaining Operations sub-pages (Sequencer, Federation, Blob ops, Rate limits, System health, Server) share enough structure that they are specified collectively with per-page differences noted. Each is a single-column page with read-only metrics and a small set of admin actions.
+The remaining Operations sub-pages (Sequencer, Federation, Blob ops, Rate limits, System health) share enough structure that they are specified collectively with per-page differences noted. Each is a single-column page with read-only metrics and a small set of admin actions.
 
 #### Common pattern
 
@@ -2044,13 +2041,6 @@ The remaining Operations sub-pages (Sequencer, Federation, Blob ops, Rate limits
 - **Surfaces:** consolidated health dashboard — multiple sub-cards each surfacing one health domain
 - **Actions:** run health checks on demand; cleanup nonce stores
 - **Polling:** every 30 seconds across all panels
-
-#### 5.4.6.6 Server (`#ops/server`)
-
-- **Endpoints:** `tools.aurora.describeCapabilities`, `getVersionInfo`
-- **Surfaces:** capabilities probe (raw output, formatted), version + build info, server config (read-only display of the runtime configuration)
-- **Actions:** none (read-only)
-- **Polling:** none (configuration is static within a deployment)
 
 #### Notes on Operations sub-pages
 
@@ -2146,7 +2136,7 @@ Standard patterns. Form validation errors render inline below the relevant field
 
 #### Notes
 
-- The current `static/admin/index.html` Settings page contains four cards (General, Registration, Moderation Settings, Aurora Capabilities). The General page in v0.2 absorbs the General and Registration cards and keeps the same logical structure. Moderation Settings moves to UI & modes (5.5.2). Aurora Capabilities moves to its own page (5.5.5) which is also reachable from Operations → Server.
+- The current `static/admin/index.html` Settings page contains four cards (General, Registration, Moderation Settings, Aurora Capabilities). The General page in v0.2 absorbs the General and Registration cards and keeps the same logical structure. Moderation Settings moves to UI & modes (5.5.2). Aurora Capabilities moves to its own page (5.5.5).
 - Many of the existing Moderation Settings card's settings ("Enable Automatic Content Filtering", "Report Threshold") are placeholder-grade scaffolding — they don't map to actual server-side behavior in the current Aurora-Locus build. They're not preserved in v0.2 unless they connect to real backing endpoints. Section 12 (migration from current static/admin/) specifies which scaffolded controls are removed vs preserved.
 
 ### 5.5.2 UI & modes
@@ -2379,7 +2369,7 @@ Standard patterns.
 
 The capabilities probe surface.
 
-- **Route:** `#settings/capabilities` (and aliased from `#ops/server`)
+- **Route:** `#settings/capabilities`
 - **Role gating:** Any authenticated operator
 - **Mode visibility:** Always visible
 
@@ -2457,7 +2447,6 @@ None.
 
 #### Notes
 
-- The page is identical whether accessed via `#settings/capabilities` or `#ops/server`. Both routes resolve to the same surface; the breadcrumb differs by entry path.
 - Capability strings on this page must match the canonical strings the substrate primitive 21 uses. Section 8 commits the capability vocabulary as a fixed list in the design doc; new capabilities require design-doc update before being added.
 
 ## 5.6 Modal and dialog patterns
@@ -4745,7 +4734,7 @@ Three operating principles for assigning UI work to phases:
 - Command palette (substrate primitive 18 — `Cmd/Ctrl+K`) full implementation
 - i18n-ready scaffolding (substrate primitive 19) — `t()` helper, `en.json`, locale-aware formatting
 - FilterStrip with calendar widget (substrate primitive 20) full implementation
-- All remaining Operations sub-pages (Sequencer, Federation, Blob ops, Rate limits, System health, Server) implementation
+- All remaining Operations sub-pages (Sequencer, Federation, Blob ops, Rate limits, System health) implementation
 - All remaining Settings pages (General, Roles, Capabilities) implementation
 - Account detail's full drawer pattern with role gating
 - Record detail page implementation
@@ -5698,11 +5687,11 @@ static/admin/
 │   │   ├── BlobOps.js
 │   │   ├── RateLimits.js
 │   │   ├── SystemHealth.js
-│   │   ├── Server.js
+│   │   ├── Capabilities.js
 │   │   ├── SettingsGeneral.js
 │   │   ├── SettingsUiModes.js
 │   │   ├── SettingsRoles.js
-│   │   └── SettingsCapabilities.js
+│   │   └── SettingsRolesMembers.js
 │   └── lib/
 │       ├── icons.js        (Lucide SVG inline icon set)
 │       ├── i18n.js         (string helper, locale management)
