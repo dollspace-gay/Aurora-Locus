@@ -296,10 +296,19 @@ pub async fn append_entry(
     };
     let now = Utc::now();
     let now_str = now.to_rfc3339();
+    // Per CR-1 / chainlink #121: `record_uri` on Blob subjects must
+    // round-trip through the chain row's flat columns. Pre-fix we
+    // dropped it on the floor (`..` pattern), and read-back through
+    // `Subject::from_columns` saw `(Some(did), None, Some(cid))` and
+    // — without a Blob arm for that shape — returned `None`. Now we
+    // preserve `record_uri` in `subject_uri` when present, and
+    // `from_columns` has a dedicated arm for the no-record_uri case.
     let (subject_did, subject_uri, subject_cid) = match params.subject {
         Some(Subject::Repo { did }) => (Some(did.clone()), None, None),
         Some(Subject::Record { uri, cid }) => (None, Some(uri.clone()), Some(cid.clone())),
-        Some(Subject::Blob { did, cid, .. }) => (Some(did.clone()), None, Some(cid.clone())),
+        Some(Subject::Blob { did, cid, record_uri }) => {
+            (Some(did.clone()), record_uri.clone(), Some(cid.clone()))
+        }
         None => (None, None, None),
     };
     let cascade_json = if params.cascade_subjects.is_empty() {
@@ -812,6 +821,173 @@ mod tests {
         assert_eq!(entries[0].0, 1);
         assert_eq!(entries[1].0, 2);
         assert_eq!(entries[1].2.as_deref(), Some(entries[0].1.as_str()));
+    }
+
+    // CR-1 / chainlink #121: Blob subjects must round-trip
+    // `record_uri` through the chain row's flat columns. Pre-fix
+    // the producer destructured `Subject::Blob { did, cid, .. }`
+    // and dropped record_uri on the floor; reconstruction via
+    // `Subject::from_columns` then saw `(Some, None, Some)` which
+    // had no matching arm and fell through to `None`, losing the
+    // subject identity entirely.
+    #[tokio::test]
+    async fn audit_chain_blob_subject_roundtrips_with_record_uri() {
+        let db = open_test_pool().await;
+        let subject = Subject::Blob {
+            did: "did:plc:victim".to_string(),
+            cid: "bafkreiabc".to_string(),
+            record_uri: Some("at://did:plc:victim/app.bsky.feed.post/3kxyz".to_string()),
+        };
+        let id = append_entry(
+            &db,
+            AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownRecord",
+                subject: Some(&subject),
+                rationale: "blob with record_uri",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+        let (subject_did, subject_uri, subject_cid): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT subject_did, subject_uri, subject_cid FROM audit_chain_entry WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(subject_did.as_deref(), Some("did:plc:victim"));
+        assert_eq!(
+            subject_uri.as_deref(),
+            Some("at://did:plc:victim/app.bsky.feed.post/3kxyz"),
+            "record_uri must persist into subject_uri column"
+        );
+        assert_eq!(subject_cid.as_deref(), Some("bafkreiabc"));
+        let reconstructed = Subject::from_columns(
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+        );
+        assert_eq!(reconstructed, Some(subject));
+    }
+
+    #[tokio::test]
+    async fn audit_chain_blob_subject_roundtrips_without_record_uri() {
+        let db = open_test_pool().await;
+        let subject = Subject::Blob {
+            did: "did:plc:victim".to_string(),
+            cid: "bafkreidef".to_string(),
+            record_uri: None,
+        };
+        let id = append_entry(
+            &db,
+            AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownRecord",
+                subject: Some(&subject),
+                rationale: "blob without record_uri",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+        let (subject_did, subject_uri, subject_cid): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT subject_did, subject_uri, subject_cid FROM audit_chain_entry WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(subject_did.as_deref(), Some("did:plc:victim"));
+        assert_eq!(subject_uri, None, "no record_uri → no subject_uri");
+        assert_eq!(subject_cid.as_deref(), Some("bafkreidef"));
+        let reconstructed = Subject::from_columns(
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+        );
+        assert_eq!(reconstructed, Some(subject));
+    }
+
+    // Backwards compatibility: chain rows written before CR-1 stored
+    // Blob subjects as (subject_did, NULL, subject_cid). The
+    // `Subject::from_columns` reconstructor must still recognize
+    // that shape as a Blob (with record_uri = None) rather than
+    // returning None and losing the subject identity. This test
+    // simulates a legacy row by inserting directly via SQL,
+    // bypassing the post-fix `append_entry` path.
+    #[tokio::test]
+    async fn audit_chain_legacy_blob_row_reads_back_as_blob() {
+        let db = open_test_pool().await;
+        // Anchor the chain head with one regular entry so the
+        // legacy row can chain off it. We bypass append_entry's
+        // hash logic by inserting directly with previous_hash =
+        // current_hash of seed entry, but for the from_columns
+        // assertion we actually only care about the three subject
+        // columns — read back via SELECT.
+        let id = append_entry(
+            &db,
+            AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownAccount",
+                subject: Some(&Subject::Repo {
+                    did: "did:plc:seed".to_string(),
+                }),
+                rationale: "seed",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+        // Mutate the seed row to look like a legacy Blob entry.
+        // (subject_did, subject_uri, subject_cid) =
+        //   (Some, None, Some) is the pre-CR-1 Blob shape.
+        sqlx::query(
+            "UPDATE audit_chain_entry \
+             SET subject_did = 'did:plc:legacy', \
+                 subject_uri = NULL, \
+                 subject_cid = 'bafkreilegacyblob', \
+                 action = 'TakedownRecord' \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+        let (subject_did, subject_uri, subject_cid): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT subject_did, subject_uri, subject_cid FROM audit_chain_entry WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let reconstructed = Subject::from_columns(
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+        );
+        assert_eq!(
+            reconstructed,
+            Some(Subject::Blob {
+                did: "did:plc:legacy".to_string(),
+                cid: "bafkreilegacyblob".to_string(),
+                record_uri: None,
+            }),
+            "legacy (Some, None, Some) row must read back as Blob with record_uri=None"
+        );
     }
 
     #[tokio::test]

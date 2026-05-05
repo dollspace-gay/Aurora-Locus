@@ -62,16 +62,33 @@ impl Subject {
     /// flat-column representation (subject_did + subject_uri +
     /// subject_cid). Returns `None` if no subject info is present
     /// (i.e., event has no subject, like a server-level event).
+    ///
+    /// Disambiguation rules (per CR-1 / chainlink #121):
+    /// - `(Some, Some, Some)` → `Blob` with `record_uri` populated.
+    /// - `(Some, None, Some)` → `Blob` with `record_uri = None`.
+    ///   Covers two cases: (a) callers who legitimately don't know
+    ///   the originating record, and (b) legacy chain rows written
+    ///   before the producer preserved `record_uri` (pre-CR-1).
+    /// - `(None, Some, Some)` → `Record`. The absence of `subject_did`
+    ///   is what distinguishes Record from a Blob with `record_uri`;
+    ///   Record's URI carries the DID as the authority component.
+    /// - `(Some, None, None)` → `Repo`.
+    /// - Any other shape → `None` (no subject, or invalid combination).
     pub fn from_columns(
         subject_did: Option<&str>,
         subject_uri: Option<&str>,
         subject_cid: Option<&str>,
     ) -> Option<Self> {
         match (subject_did, subject_uri, subject_cid) {
-            (Some(did), Some(_uri), Some(cid)) => Some(Subject::Blob {
+            (Some(did), Some(uri), Some(cid)) => Some(Subject::Blob {
                 did: did.to_string(),
                 cid: cid.to_string(),
-                record_uri: subject_uri.map(String::from),
+                record_uri: Some(uri.to_string()),
+            }),
+            (Some(did), None, Some(cid)) => Some(Subject::Blob {
+                did: did.to_string(),
+                cid: cid.to_string(),
+                record_uri: None,
             }),
             (None, Some(uri), Some(cid)) => Some(Subject::Record {
                 uri: uri.to_string(),
@@ -358,13 +375,27 @@ mod tests {
                 cid: "baf".to_string(),
             })
         );
-        // Blob: did + cid (uri optional, used as record_uri context)
+        // Blob with record_uri: did + uri + cid all populated
         assert_eq!(
             Subject::from_columns(Some("did:plc:c"), Some("at://x"), Some("baf")),
             Some(Subject::Blob {
                 did: "did:plc:c".to_string(),
                 cid: "baf".to_string(),
                 record_uri: Some("at://x".to_string()),
+            })
+        );
+        // Blob without record_uri (and legacy pre-CR-1 chain rows):
+        // did + cid populated, uri NULL → still a Blob, record_uri = None.
+        // Without this arm the (Some, None, Some) shape would fall
+        // through to the catch-all and return None, losing the subject
+        // identity for any chain row written before record_uri was
+        // preserved through the producer (chainlink #121).
+        assert_eq!(
+            Subject::from_columns(Some("did:plc:legacy"), None, Some("bafkreilegacy")),
+            Some(Subject::Blob {
+                did: "did:plc:legacy".to_string(),
+                cid: "bafkreilegacy".to_string(),
+                record_uri: None,
             })
         );
         // No subject info at all → None
