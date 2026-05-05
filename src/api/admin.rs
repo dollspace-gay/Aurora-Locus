@@ -475,28 +475,33 @@ async fn create_invite_code(
     auth: AdminAuthContext,
     Json(req): Json<CreateInviteCodeRequest>,
 ) -> Result<Json<InviteCode>, (StatusCode, String)> {
-    // Create invite code
     let uses = req.uses.unwrap_or(1);
     let expires_in = req.expires_days.map(Duration::days);
 
-    let code = ctx
-        .invite_manager
-        .create_invite(
-            &auth.did,
-            uses,
-            expires_in,
-            req.note.clone(),
-            req.for_account.clone(),
-        )
+    // LB-1 Session 12 / chainlink #129: invite_code INSERT + chain
+    // entry in one transaction.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
+    let code = crate::admin::invites::InviteCodeManager::create_invite_in_tx(
+        &mut tx,
+        &auth.did,
+        uses,
+        expires_in,
+        req.note.clone(),
+        req.for_account.clone(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let rationale = format!(
         "created invite code {} (uses: {})",
         code.code, code.available
     );
-    audit_chain::append_entry(
-        &ctx.account_db,
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "invite.create",
@@ -510,6 +515,9 @@ async fn create_invite_code(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(code))
 }
@@ -1188,8 +1196,23 @@ async fn update_account_handle(
         return Err((StatusCode::BAD_REQUEST, "Invalid handle format".to_string()));
     }
 
-    ctx.account_manager
-        .update_handle(&req.did, &req.handle)
+    let subject = Subject::Repo {
+        did: req.did.clone(),
+    };
+    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rationale = format!("change handle to {}", req.handle);
+
+    // LB-1 Session 12 / chainlink #129: handle UPDATE + chain entry
+    // in one transaction so a crash between the two leaves neither row.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::account::AccountManager::update_handle_in_tx(&mut tx, &req.did, &req.handle)
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
@@ -1199,20 +1222,14 @@ async fn update_account_handle(
                 )
             } else if matches!(e, PdsError::Validation(_)) {
                 (StatusCode::CONFLICT, e.to_string())
+            } else if matches!(e, PdsError::Conflict(_)) {
+                (StatusCode::CONFLICT, e.to_string())
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-
-    let subject = Subject::Repo {
-        did: req.did.clone(),
-    };
-    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rationale = format!("change handle to {}", req.handle);
-    audit_chain::append_entry(
-        &ctx.account_db,
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.update_handle",
@@ -1226,6 +1243,9 @@ async fn update_account_handle(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
 }
@@ -1257,8 +1277,24 @@ async fn update_account_password(
         ));
     }
 
-    ctx.account_manager
-        .update_password(&req.did, &req.password)
+    // Rationale is fixed text — under no circumstances does the password
+    // value (raw or otherwise) get committed to the chain.
+    let subject = Subject::Repo {
+        did: req.did.clone(),
+    };
+    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // LB-1 Session 12 / chainlink #129: password UPDATE +
+    // session/refresh_token DELETE + chain entry in one transaction.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::account::AccountManager::update_password_in_tx(&mut tx, &req.did, &req.password)
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
@@ -1270,17 +1306,8 @@ async fn update_account_password(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-
-    // Rationale is fixed text — under no circumstances does the password
-    // value (raw or otherwise) get committed to the chain.
-    let subject = Subject::Repo {
-        did: req.did.clone(),
-    };
-    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    audit_chain::append_entry(
-        &ctx.account_db,
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.reset_password",
@@ -1294,6 +1321,9 @@ async fn update_account_password(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
 }
@@ -1323,9 +1353,18 @@ async fn admin_delete_account(
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rationale = format!("permanently delete account {}", req.did);
 
-    ctx.account_manager
-        .delete_account_permanent(&req.did)
+    // LB-1 Session 12 / chainlink #129: cascade DELETE + chain entry
+    // in one transaction so the audit row lands together with the
+    // account vanishing.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::account::AccountManager::delete_account_permanent_in_tx(&mut tx, &req.did)
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
@@ -1337,10 +1376,8 @@ async fn admin_delete_account(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-
-    let rationale = format!("permanently delete account {}", req.did);
-    audit_chain::append_entry(
-        &ctx.account_db,
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.delete",
@@ -1354,6 +1391,9 @@ async fn admin_delete_account(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
 }
@@ -1568,8 +1608,22 @@ async fn update_account_signing_key(
         .await
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let rationale = format!("rotate signing key to {}", req.signing_key);
-    audit_chain::append_entry(
-        &ctx.account_db,
+
+    // LB-1 Session 12 / chainlink #129: signing-key rotation's actor
+    // mutations live in actor_store (separate DB) and the PLC
+    // directory (HTTP), with the operator's repo_signing_key as the
+    // only signing material in account_db (read-only here). The chain
+    // entry is the only account_db write and the tx wrapper is
+    // structurally consistent with the rest of Session 12 (no other
+    // writes share the tx).
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.update_signing_key",
@@ -1583,6 +1637,9 @@ async fn update_account_signing_key(
     )
     .await
     .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     tracing::info!(
         admin = %auth.did,
@@ -1611,22 +1668,7 @@ async fn takedown_account(
     auth: AdminAuthContext,
     Json(req): Json<TakedownAccountRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::admin::moderation::{ApplyActionParams, ModerationAction};
-
-    // Apply takedown action
-    let record = ctx
-        .moderation_manager
-        .apply_action(ApplyActionParams {
-            did: &req.did,
-            action: ModerationAction::Takedown,
-            reason: &req.reason,
-            moderated_by: &auth.did,
-            expires_in: None,
-            report_id: None,
-            notes: req.notes.clone(),
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    use crate::admin::moderation::{ApplyActionParams, ModerationAction, ModerationManager};
 
     let subject = Subject::Repo {
         did: req.did.clone(),
@@ -1634,8 +1676,39 @@ async fn takedown_account(
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    audit_chain::append_entry(
-        &ctx.account_db,
+
+    // LB-1 Session 12 / chainlink #129: moderation row + actor
+    // takedown UPDATE + chain entry all in one transaction.
+    // ModerationManager::apply_action_in_tx threads the tx through
+    // to AccountManager::takedown_account_in_tx for the actor mutation.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let record = ModerationManager::apply_action_in_tx(
+        &mut tx,
+        ApplyActionParams {
+            did: &req.did,
+            action: ModerationAction::Takedown,
+            reason: &req.reason,
+            moderated_by: &auth.did,
+            expires_in: None,
+            report_id: None,
+            notes: req.notes.clone(),
+        },
+    )
+    .await
+    .map_err(|e| {
+        if matches!(e, PdsError::NotFound(_)) {
+            (StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    })?;
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.takedown",
@@ -1649,6 +1722,9 @@ async fn takedown_account(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1674,14 +1750,29 @@ async fn suspend_account(
     auth: AdminAuthContext,
     Json(req): Json<SuspendAccountRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::admin::moderation::{ApplyActionParams, ModerationAction};
+    use crate::admin::moderation::{ApplyActionParams, ModerationAction, ModerationManager};
 
     let expires_in = req.duration_days.map(Duration::days);
+    let subject = Subject::Repo {
+        did: req.did.clone(),
+    };
+    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Apply suspension
-    let record = ctx
-        .moderation_manager
-        .apply_action(ApplyActionParams {
+    // LB-1 Session 12 / chainlink #129: suspend has no per-DID actor
+    // mutation today (the moderation_event row IS the suspension
+    // record), but the chain entry + moderation_event INSERT still
+    // benefit from being atomic.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let record = ModerationManager::apply_action_in_tx(
+        &mut tx,
+        ApplyActionParams {
             did: &req.did,
             action: ModerationAction::Suspend,
             reason: &req.reason,
@@ -1689,18 +1780,12 @@ async fn suspend_account(
             expires_in,
             report_id: None,
             notes: req.notes.clone(),
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let subject = Subject::Repo {
-        did: req.did.clone(),
-    };
-    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    audit_chain::append_entry(
-        &ctx.account_db,
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.suspend",
@@ -1714,6 +1799,9 @@ async fn suspend_account(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1737,11 +1825,7 @@ async fn restore_account(
     auth: AdminAuthContext,
     Json(req): Json<RestoreAccountRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Reverse moderation action
-    ctx.moderation_manager
-        .reverse_action(req.moderation_id, &auth.did, &req.reason)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    use crate::admin::moderation::ModerationManager;
 
     let subject = Subject::Repo {
         did: req.did.clone(),
@@ -1749,8 +1833,28 @@ async fn restore_account(
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    audit_chain::append_entry(
-        &ctx.account_db,
+
+    // LB-1 Session 12 / chainlink #129: moderation reversal +
+    // actor activate (clears takedown_ref) + chain entry in one
+    // transaction. ModerationManager::reverse_action_in_tx threads
+    // the tx through to AccountManager::activate_account_in_tx.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    ModerationManager::reverse_action_in_tx(&mut tx, req.moderation_id, &auth.did, &req.reason)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.restore",
@@ -1764,6 +1868,9 @@ async fn restore_account(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1816,18 +1923,6 @@ async fn apply_label(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let expires_in = req.expires_days.map(Duration::days);
 
-    let label = ctx
-        .label_manager
-        .apply_label(
-            &req.uri,
-            req.cid.as_deref(),
-            &req.val,
-            &auth.did,
-            expires_in,
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     // Empty-cid case = label applies to the URI version-agnostically;
     // the chain row keeps subject_uri populated and subject_cid as the
     // empty string so the Record variant is well-formed.
@@ -1839,8 +1934,29 @@ async fn apply_label(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let rationale = format!("apply label '{}' to {}", req.val, req.uri);
-    audit_chain::append_entry(
-        &ctx.account_db,
+    let server_did = format!("did:web:{}", ctx.config.service.hostname);
+
+    // LB-1 Session 12 / chainlink #129: label INSERT + chain entry
+    // in one transaction.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let label = crate::admin::LabelManager::apply_label_in_tx(
+        &mut tx,
+        &server_did,
+        &req.uri,
+        req.cid.as_deref(),
+        &req.val,
+        &auth.did,
+        expires_in,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "label.apply",
@@ -1854,6 +1970,9 @@ async fn apply_label(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1875,12 +1994,6 @@ async fn remove_label(
     auth: AdminAuthContext,
     Json(req): Json<RemoveLabelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let label = ctx
-        .label_manager
-        .remove_label(&req.uri, req.cid.as_deref(), &req.val, &auth.did)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     let subject = Subject::Record {
         uri: req.uri.clone(),
         cid: req.cid.clone().unwrap_or_default(),
@@ -1889,8 +2002,28 @@ async fn remove_label(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let rationale = format!("remove label '{}' from {}", req.val, req.uri);
-    audit_chain::append_entry(
-        &ctx.account_db,
+    let server_did = format!("did:web:{}", ctx.config.service.hostname);
+
+    // LB-1 Session 12 / chainlink #129: negative-label INSERT +
+    // chain entry in one transaction.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let label = crate::admin::LabelManager::remove_label_in_tx(
+        &mut tx,
+        &server_did,
+        &req.uri,
+        req.cid.as_deref(),
+        &req.val,
+        &auth.did,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "label.remove",
@@ -1904,6 +2037,9 @@ async fn remove_label(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1995,12 +2131,6 @@ async fn update_report_status(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Update status
-    ctx.report_manager
-        .update_status(req.report_id, status, &auth.did, req.resolution.as_deref())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     let subject = report.as_ref().and_then(|r| {
         Subject::from_columns(
             r.subject_did.as_deref(),
@@ -2016,8 +2146,32 @@ async fn update_report_status(
         None
     };
     let rationale = req.resolution.clone().unwrap_or_default();
-    audit_chain::append_entry(
-        &ctx.account_db,
+
+    // LB-1 Session 12 / chainlink #129: report UPDATE + chain entry
+    // in one transaction.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::admin::ReportManager::update_status_in_tx(
+        &mut tx,
+        req.report_id,
+        status,
+        &auth.did,
+        req.resolution.as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        if matches!(e, PdsError::NotFound(_)) {
+            (StatusCode::NOT_FOUND, e.to_string())
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    })?;
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "report.update",
@@ -2031,6 +2185,9 @@ async fn update_report_status(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -2145,17 +2302,6 @@ async fn send_email(
 
     let effective_subject = req.subject.as_deref().unwrap_or(DEFAULT_EMPTY_SUBJECT);
 
-    // Send the email
-    ctx.mailer
-        .send_admin_email(&to_email, effective_subject, &req.content)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to send email: {}", e),
-            )
-        })?;
-
     // Aurora's permissive extension: when senderDid is omitted, attribute
     // the action to the authenticated admin.
     let sender = req.sender_did.as_deref().unwrap_or(&auth.did);
@@ -2171,8 +2317,29 @@ async fn send_email(
         (None, Some(c)) => c.to_string(),
         (None, None) => effective_subject.to_string(),
     };
-    audit_chain::append_entry(
-        &ctx.account_db,
+
+    // LB-1 Session 12 / chainlink #129: chain-first ordering. Pre-fix
+    // the mailer dispatched first and the chain entry wrote after; if
+    // the chain append failed, the email was sent without an audit
+    // trail (a §3.4 violation: operator's intent un-recorded). Now
+    // the chain entry records intent first inside its own transaction;
+    // the mailer side effect runs post-commit best-effort. If the
+    // mailer fails the audit entry remains as evidence of the
+    // operator's request, and the operator can retry via the chain id.
+    //
+    // Behavior change: mailer failure no longer aborts the handler
+    // with 500; instead the response signals the failure via
+    // `sent: false`. Spec-compliant clients reading `sent` see the
+    // outcome unchanged on success and a clear failure signal on
+    // mailer error.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: sender,
             action: "email.send",
@@ -2186,16 +2353,39 @@ async fn send_email(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Mailer dispatch (post-commit best-effort). On failure the chain
+    // entry remains as evidence of the operator's request and the
+    // response signals the failure via `sent: false`.
+    let sent = match ctx
+        .mailer
+        .send_admin_email(&to_email, effective_subject, &req.content)
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                "send_email: chain entry recorded but mailer failed for {}: {}",
+                req.recipient_did,
+                e
+            );
+            false
+        }
+    };
 
     tracing::info!(
-        "Admin {} sent email to {} ({}): {}",
+        "Admin {} sent email to {} ({}): {} (sent={})",
         auth.did,
         req.recipient_did,
         to_email,
-        effective_subject
+        effective_subject,
+        sent
     );
 
-    Ok(Json(SendEmailResponse { sent: true }))
+    Ok(Json(SendEmailResponse { sent }))
 }
 
 // ============================================================================
@@ -3261,25 +3451,50 @@ async fn update_subject_status(
     // call produces exactly one chain row whose rationale lists the
     // patches applied. Account branch may have both takedown and
     // deactivated effects; the chain entry coalesces them.
-    let (response_takedown, chain_subject, effects) = match &subject {
-        SubjectUnion::RepoRef { did } => {
-            let (resp, fx) = apply_account_status(
-                &ctx,
-                &auth,
-                did,
-                takedown.as_ref(),
-                deactivated.as_ref(),
-            )
-            .await
-            .map_err(|(s, m)| (s, m).into_response())?;
-            (
-                resp,
-                Subject::Repo {
-                    did: did.clone(),
-                },
-                fx,
-            )
-        }
+    //
+    // Compute chain_subject upfront so we can capture the snapshot
+    // BEFORE opening the wrapping tx. Otherwise on a single-connection
+    // pool (SQLite test config) the snapshot's connection acquisition
+    // deadlocks against the held tx connection.
+    let chain_subject = match &subject {
+        SubjectUnion::RepoRef { did } => Subject::Repo { did: did.clone() },
+        SubjectUnion::RepoBlobRef { did, cid, .. } => Subject::Blob {
+            did: did.clone(),
+            cid: cid.clone(),
+            record_uri: None,
+        },
+        SubjectUnion::StrongRef { uri, cid } => Subject::Record {
+            uri: uri.clone(),
+            cid: cid.clone(),
+        },
+    };
+    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &chain_subject)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+
+    // LB-1 Session 12 / chainlink #129: account branch + chain entry
+    // wrapped in one transaction. Blob branch's quarantine writes
+    // live in a separate store layer (BlobQuarantine manages its own
+    // tx) so the wrapping tx covers only the chain entry on that
+    // path — the blob quarantine remains atomic at its own layer per
+    // §3.4's "primary mutation" reading.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+
+    let (response_takedown, effects) = match &subject {
+        SubjectUnion::RepoRef { did } => apply_account_status_in_tx(
+            &mut tx,
+            &auth,
+            did,
+            takedown.as_ref(),
+            deactivated.as_ref(),
+        )
+        .await
+        .map_err(|(s, m)| (s, m).into_response())?,
 
         SubjectUnion::RepoBlobRef { did, cid, .. } => {
             // Blobs don't have a deactivation concept — reject so the
@@ -3290,23 +3505,22 @@ async fn update_subject_status(
                      only takedown applies to blobs",
                 ));
             }
+            // Drop the held tx so the blob quarantine layer's own tx
+            // can acquire the pool connection (single-connection
+            // pools deadlock otherwise). After the quarantine call
+            // we reopen a tx for the chain entry.
+            tx.rollback()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
             let (resp, fx) =
                 apply_blob_status(&ctx, &auth, did, cid, takedown.as_ref()).await?;
-            (
-                resp,
-                Subject::Blob {
-                    did: did.clone(),
-                    cid: cid.clone(),
-                    record_uri: None,
-                },
-                fx,
-            )
+            tx = ctx.account_db.begin().await.map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            })?;
+            (resp, fx)
         }
 
         SubjectUnion::StrongRef { .. } => {
-            // Same reasoning: records aren't deactivable as a concept.
-            // Reject deactivated before falling through to the takedown
-            // 501 so the caller gets a precise error.
             if deactivated.is_some() {
                 return Err(xrpc_invalid_request_error(
                     "deactivated patch is not applicable to record subjects; \
@@ -3326,12 +3540,9 @@ async fn update_subject_status(
     // no-op (the response still echoes current takedown state, which is
     // useful, but there's no decision to record).
     if !effects.is_empty() {
-        let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &chain_subject)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
         let rationale = effects.join("; ");
-        audit_chain::append_entry(
-            &ctx.account_db,
+        audit_chain::append_entry_in_tx(
+            &mut tx,
             AppendEntryParams {
                 actor_did: &auth.did,
                 action: "subject.update_status",
@@ -3346,6 +3557,10 @@ async fn update_subject_status(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
 
     Ok(Json(UpdateSubjectStatusResponse {
         subject,
@@ -3397,8 +3612,8 @@ fn xrpc_blob_not_found_error(cid: &str) -> axum::response::Response {
 /// entry. Per §3.4, the chain row belongs at the handler level so the
 /// "one decision = one chain entry" framing holds even when both patches
 /// are present.
-async fn apply_account_status(
-    ctx: &AppContext,
+async fn apply_account_status_in_tx<'c>(
+    tx: &mut sqlx::Transaction<'c, sqlx::Any>,
     auth: &AdminAuthContext,
     did: &str,
     takedown: Option<&StatusAttr>,
@@ -3410,13 +3625,10 @@ async fn apply_account_status(
         if td.applied {
             // Use the caller-supplied `ref` if present, otherwise generate one
             // from the admin DID + timestamp so audit trails always have a key.
-            // Format puts timestamp first to keep the DID's colons
-            // unambiguous to downstream parsers.
             let takedown_ref = td.ref_field.clone().unwrap_or_else(|| {
                 format!("auto-{}-{}", chrono::Utc::now().timestamp(), auth.did)
             });
-            ctx.account_manager
-                .takedown_account(did, &takedown_ref)
+            crate::account::AccountManager::takedown_account_in_tx(tx, did, &takedown_ref)
                 .await
                 .map_err(map_account_err(did))?;
             effects.push(render_status_effect(
@@ -3425,8 +3637,7 @@ async fn apply_account_status(
                 Some(&takedown_ref),
             ));
         } else {
-            ctx.account_manager
-                .activate_account(did)
+            crate::account::AccountManager::activate_account_in_tx(tx, did)
                 .await
                 .map_err(map_account_err(did))?;
             effects.push(render_status_effect(
@@ -3439,13 +3650,11 @@ async fn apply_account_status(
 
     if let Some(d) = deactivated {
         if d.applied {
-            ctx.account_manager
-                .deactivate_account(did)
+            crate::account::AccountManager::deactivate_account_in_tx(tx, did)
                 .await
                 .map_err(map_account_err(did))?;
         } else {
-            ctx.account_manager
-                .reactivate_account(did)
+            crate::account::AccountManager::reactivate_account_in_tx(tx, did)
                 .await
                 .map_err(map_account_err(did))?;
         }
@@ -3457,15 +3666,19 @@ async fn apply_account_status(
     }
 
     // Read fresh state so the response reflects post-patch reality.
-    let account = ctx
-        .account_manager
-        .get_account(did)
-        .await
-        .map_err(map_account_err(did))?;
+    // Reading from the same tx (via SELECT ... FROM actor) sees the
+    // patches we just applied.
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT takedown_ref FROM actor WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let takedown_ref = row.and_then(|(t,)| t);
     Ok((
         Some(StatusAttr {
-            applied: account.takedown_ref.is_some(),
-            ref_field: account.takedown_ref,
+            applied: takedown_ref.is_some(),
+            ref_field: takedown_ref,
         }),
         effects,
     ))
@@ -3786,14 +3999,27 @@ async fn disable_invite_code(
     auth: AdminAuthContext,
     Json(req): Json<DisableInviteCodeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    ctx.invite_manager
-        .disable_code(&req.code)
+    let rationale = format!("disable invite code {}", req.code);
+
+    // LB-1 Session 12 / chainlink #129: invite_code UPDATE + chain
+    // entry in one transaction.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let rationale = format!("disable invite code {}", req.code);
-    audit_chain::append_entry(
-        &ctx.account_db,
+    crate::admin::invites::InviteCodeManager::disable_code_in_tx(&mut tx, &req.code)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                (StatusCode::NOT_FOUND, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "invite.disable",
@@ -3807,6 +4033,9 @@ async fn disable_invite_code(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -3837,39 +4066,55 @@ async fn disable_invite_codes(
     auth: AdminAuthContext,
     Json(req): Json<DisableInviteCodesRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    ctx.invite_manager
-        .disable_codes_batch(&req.codes, &req.accounts)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Empty input is a successful no-op per the lexicon — skip the chain
-    // entry in that case so we don't pollute the chain with non-decisions.
-    if !req.codes.is_empty() || !req.accounts.is_empty() {
-        let rationale = format!(
-            "disable {} invite code(s){}",
-            req.codes.len(),
-            if !req.accounts.is_empty() {
-                format!(" + all codes for {} account(s)", req.accounts.len())
-            } else {
-                String::new()
-            }
-        );
-        audit_chain::append_entry(
-            &ctx.account_db,
-            AppendEntryParams {
-                actor_did: &auth.did,
-                action: "invite.disable_batch",
-                subject: None,
-                rationale: &rationale,
-                snapshot_id: None,
-                event_id: None,
-                cascade_subjects: &[],
-                cascade_snapshot_ids: &[],
-            },
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Empty input is a successful no-op per the lexicon — skip the
+    // tx entirely.
+    if req.codes.is_empty() && req.accounts.is_empty() {
+        return Ok(StatusCode::OK);
     }
+
+    let rationale = format!(
+        "disable {} invite code(s){}",
+        req.codes.len(),
+        if !req.accounts.is_empty() {
+            format!(" + all codes for {} account(s)", req.accounts.len())
+        } else {
+            String::new()
+        }
+    );
+
+    // LB-1 Session 12 / chainlink #129: batch disable + chain entry
+    // in one transaction.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::admin::invites::InviteCodeManager::disable_codes_batch_in_tx(
+        &mut tx,
+        &req.codes,
+        &req.accounts,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    audit_chain::append_entry_in_tx(
+        &mut tx,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "invite.disable_batch",
+            subject: None,
+            rationale: &rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
 }
@@ -7364,6 +7609,125 @@ mod tests {
         assert_eq!(
             count_chain_rows(&ctx, "account.takedown", Some("did:plc:victimA")).await,
             1
+        );
+    }
+
+    // LB-1 Session 12 / chainlink #129: handler-level atomicity
+    // regression for takedown_account. The handler runs the
+    // moderation row INSERT, the actor.takedown_ref UPDATE, and the
+    // chain append all in one tx; rolling back the tx must leave
+    // none of them in the database. This test exercises the
+    // contract via the in_tx primitives the handler uses.
+    #[tokio::test]
+    async fn takedown_account_atomicity_rollback_pins_invariant() {
+        use crate::admin::moderation::{ApplyActionParams, ModerationAction, ModerationManager};
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:victimT", "vt.test", None).await;
+        {
+            let _guard = audit_chain::AppendChainGuard::acquire().await;
+            let mut tx = ctx.account_db.begin().await.unwrap();
+            ModerationManager::apply_action_in_tx(
+                &mut tx,
+                ApplyActionParams {
+                    did: "did:plc:victimT",
+                    action: ModerationAction::Takedown,
+                    reason: "would be rolled back",
+                    moderated_by: "did:plc:admin",
+                    expires_in: None,
+                    report_id: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+            audit_chain::append_entry_in_tx(
+                &mut tx,
+                AppendEntryParams {
+                    actor_did: "did:plc:admin",
+                    action: "account.takedown",
+                    subject: Some(&Subject::Repo {
+                        did: "did:plc:victimT".to_string(),
+                    }),
+                    rationale: "would be rolled back",
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let mod_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM account_moderation WHERE did = 'did:plc:victimT'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(mod_count, 0);
+        let takedown: Option<String> = sqlx::query_scalar(
+            "SELECT takedown_ref FROM actor WHERE did = 'did:plc:victimT'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert!(takedown.is_none());
+        assert_eq!(
+            count_chain_rows(&ctx, "account.takedown", Some("did:plc:victimT")).await,
+            0
+        );
+    }
+
+    // LB-1 Session 12 / chainlink #129: handler-level atomicity
+    // regression for update_account_handle. Pre-fix the handle
+    // UPDATE and chain entry committed in separate transactions;
+    // post-fix they share one. Rolling back the wrapping tx must
+    // leave the handle and chain entry both unchanged.
+    #[tokio::test]
+    async fn update_account_handle_atomicity_rollback_pins_invariant() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:hh", "hh.test", None).await;
+        {
+            let _guard = audit_chain::AppendChainGuard::acquire().await;
+            let mut tx = ctx.account_db.begin().await.unwrap();
+            crate::account::AccountManager::update_handle_in_tx(
+                &mut tx,
+                "did:plc:hh",
+                "renamed.test",
+            )
+            .await
+            .unwrap();
+            audit_chain::append_entry_in_tx(
+                &mut tx,
+                AppendEntryParams {
+                    actor_did: "did:plc:admin",
+                    action: "account.update_handle",
+                    subject: Some(&Subject::Repo {
+                        did: "did:plc:hh".to_string(),
+                    }),
+                    rationale: "would be rolled back",
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let handle: Option<String> =
+            sqlx::query_scalar("SELECT handle FROM actor WHERE did = 'did:plc:hh'")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(handle.as_deref(), Some("hh.test"));
+        assert_eq!(
+            count_chain_rows(&ctx, "account.update_handle", Some("did:plc:hh")).await,
+            0
         );
     }
 

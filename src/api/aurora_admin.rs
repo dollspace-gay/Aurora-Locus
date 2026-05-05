@@ -1739,43 +1739,7 @@ pub async fn trigger_password_reset(
         .clone()
         .ok_or_else(|| validation("account has no email on file"))?;
     let handle = account.handle.clone().unwrap_or_else(|| input.did.clone());
-    // Generate token via existing infrastructure (uses handle-or-email
-    // identifier; we pass handle).
-    let (token, _email_returned) = ctx
-        .account_manager
-        .generate_password_reset_token(&handle)
-        .await
-        .map_err(internal)?;
-    // Send the email if mailer is configured (best-effort per existing
-    // request_password_reset pattern in src/api/server.rs).
-    let mut email_sent = false;
-    if ctx.mailer.is_configured() {
-        let base_url = ctx.service_url();
-        match ctx
-            .mailer
-            .send_password_reset_email(&email, &handle, &token, &base_url)
-            .await
-        {
-            Ok(()) => {
-                email_sent = true;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "triggerPasswordReset: token generated but email failed for {}: {}",
-                    input.did,
-                    e
-                );
-            }
-        }
-    } else {
-        tracing::warn!(
-            "triggerPasswordReset: mailer not configured; token generated but no email sent for {}",
-            input.did
-        );
-    }
-    // Audit chain entry per §8.6 step 5 — replaces the legacy
-    // admin_audit_log write so the chain is the system of record for
-    // every account-affecting decision.
+
     let subject = Subject::Repo {
         did: input.did.clone(),
     };
@@ -1784,8 +1748,27 @@ pub async fn trigger_password_reset(
             .await
             .ok()
             .flatten();
-    let audit_entry_id = audit_chain::append_entry(
-        &ctx.account_db,
+
+    // LB-1 Session 12 / chainlink #129: token INSERT + chain entry
+    // in one transaction. Pre-fix the email_token row could land
+    // (and become valid for password reset) even if the chain
+    // append failed — a §3.4 violation. Now both writes commit
+    // together.
+    //
+    // Mailer dispatch follows the chain-first ordering: chain entry
+    // commits first, mailer side effect runs post-commit best-effort.
+    // Mailer failure no longer leaves the operator with a token that
+    // wasn't audited.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let token = crate::account::AccountManager::generate_password_reset_token_in_tx(
+        &mut tx,
+        &input.did,
+    )
+    .await
+    .map_err(internal)?;
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.trigger_password_reset",
@@ -1799,6 +1782,35 @@ pub async fn trigger_password_reset(
     )
     .await
     .map_err(internal_pds)?;
+    tx.commit().await.map_err(internal)?;
+
+    // Mailer dispatch (post-commit best-effort).
+    let mut email_sent = false;
+    if ctx.mailer.is_configured() {
+        let base_url = ctx.service_url();
+        match ctx
+            .mailer
+            .send_password_reset_email(&email, &handle, &token, &base_url)
+            .await
+        {
+            Ok(()) => {
+                email_sent = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "triggerPasswordReset: chain entry recorded but email failed for {}: {}",
+                    input.did,
+                    e
+                );
+            }
+        }
+    } else {
+        tracing::warn!(
+            "triggerPasswordReset: mailer not configured; chain entry recorded but no email sent for {}",
+            input.did
+        );
+    }
+
     Ok(Json(TriggerPasswordResetOutput {
         reset_email_sent: email_sent,
         masked_email: mask_email(&email),
@@ -2989,8 +3001,12 @@ pub async fn set_runtime_setting(
     let now = chrono::Utc::now().to_rfc3339();
     let value_json =
         serde_json::to_string(&input.value).map_err(|e| internal(e))?;
-    // Upsert (DELETE then INSERT for cross-backend portability — sqlx
-    // ON CONFLICT syntax differs between SQLite and Postgres).
+
+    // LB-1 Session 12 / chainlink #129: runtime_settings upsert +
+    // chain entry in one transaction. Upsert uses DELETE then INSERT
+    // for cross-backend portability — sqlx ON CONFLICT syntax differs
+    // between SQLite and Postgres.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
     let mut tx = ctx.account_db.begin().await.map_err(internal)?;
     sqlx::query("DELETE FROM runtime_settings WHERE key = $1")
         .bind(&input.key)
@@ -3008,10 +3024,8 @@ pub async fn set_runtime_setting(
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
-    tx.commit().await.map_err(internal)?;
-    // Audit chain entry per §8.16 ("All writes audit-chained").
-    let audit_entry_id = audit_chain::append_entry(
-        &ctx.account_db,
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "SetRuntimeSetting",
@@ -3025,6 +3039,7 @@ pub async fn set_runtime_setting(
     )
     .await
     .map_err(internal_pds)?;
+    tx.commit().await.map_err(internal)?;
     Ok(Json(SetRuntimeSettingOutput {
         key: input.key,
         previous_value,
