@@ -147,7 +147,11 @@ PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY=<your-secret>
 
 ### First Admin User
 
-After starting the server, create the first admin user:
+After starting the server, create the first admin user. This is a
+one-time bootstrap — admin authority comes from the `admin_role`
+table only, not from any environment variable. After the first
+SuperAdmin exists, all subsequent role grants flow through
+`tools.aurora.superadmin.grantRole`, which writes to the audit chain.
 
 ```bash
 # Register account
@@ -159,7 +163,7 @@ curl -X POST http://localhost:3000/xrpc/com.atproto.server.createAccount \
     "password": "secure-password"
   }'
 
-# Grant SuperAdmin role (requires database access)
+# Grant SuperAdmin role (one-time bootstrap; requires direct database access)
 sqlite3 data/accounts.db "INSERT INTO admin_role (did, role, granted_by, granted_at)
   VALUES ('did:plc:...', 'superadmin', 'system', datetime('now'));"
 ```
@@ -218,8 +222,13 @@ sqlite3 data/accounts.db "INSERT INTO admin_role (did, role, granted_by, granted
 # Run with auto-reload
 cargo watch -x run
 
-# Run tests
-cargo test
+# Run lib tests (SQLite-backed; fast)
+cargo test --lib
+
+# Run Postgres integration tests (requires Docker; spins up
+# postgres:16-alpine via testcontainers)
+cargo test --test postgres_smoke_test -- --test-threads=1
+cargo test --test multi_instance_test -- --test-threads=1
 
 # Check code
 cargo clippy
@@ -230,6 +239,29 @@ cargo fmt
 # Build release
 cargo build --release
 ```
+
+### Dual-backend test setup
+
+Aurora-Locus supports both SQLite (default, single-instance) and
+Postgres (multi-instance) via `sqlx::Any`. CI runs both backends on
+every commit:
+
+- **SQLite job** — `cargo test --lib` covers the full test suite
+  against SQLite (default backend; ~543 tests).
+- **Postgres job** — `cargo test --test postgres_smoke_test`
+  (per-manager round-trips, 6 tests) plus `cargo test --test
+  multi_instance_test` (leader election + LISTEN/NOTIFY cache
+  invalidation, 5 tests) against a real Postgres spun up via
+  testcontainers. Catches placeholder-syntax, bool-decode, and
+  bool-literal incompatibilities that SQLite-only testing can't
+  surface.
+
+Both jobs must pass for a commit to be considered green. Local
+Postgres testing requires Docker daemon access — the test fixtures
+panic with a clear message if Docker is unreachable. Promoting the
+full lib suite to also run against Postgres (instead of just the
+smoke + integration coverage) is a future-cycle concern; see the
+header comment in `tests/postgres_smoke_test.rs` for the rationale.
 
 ## Deployment
 

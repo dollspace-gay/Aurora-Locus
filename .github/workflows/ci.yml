@@ -1,0 +1,84 @@
+# Aurora-Locus CI (chainlink #94 / Phase 5.1)
+#
+# Two jobs run on every commit:
+#
+# - `sqlite-tests` — cargo build + clippy + lib tests against the
+#   default SQLite backend. Fast (~2 min on a warm cache) and covers
+#   the full 543-test lib suite.
+#
+# - `postgres-tests` — postgres_smoke_test (one round-trip per
+#   manager group) + multi_instance_test (5 leader-election +
+#   LISTEN/NOTIFY scenarios). Both spin up an ephemeral
+#   postgres:16-alpine container per test via testcontainers-rs;
+#   GitHub Actions runners ship with Docker so no extra setup needed.
+#
+# Both jobs must pass for a commit to be considered green. The Postgres
+# job catches placeholder-syntax, bool-decode, bool-literal, and any
+# future Postgres-vs-SQLite drift that the SQLite-only lib suite
+# can't surface.
+#
+# Coverage scope decision (Phase 5.1): smoke + integration tests
+# rather than the full lib suite against Postgres. The 6 smokes
+# exercise every manager group; the 5 multi-instance tests exercise
+# leader election + cache invalidation end-to-end. Promoting to full
+# lib coverage is a future-cycle concern pending post-v0.2 experience
+# showing whether the gap matters.
+
+name: CI
+
+on:
+  push:
+    branches: [main, "skydeval/v0.2-cycle"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sqlite-tests:
+    name: SQLite tests + lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --lib
+        run: cargo build --lib
+      - name: cargo clippy
+        # `--no-deps` so we don't lint third-party crates. No `-D warnings`
+        # yet — the codebase carries a small backlog of dead_code
+        # warnings (run_migrations, is_held, etc.) from Phase 3 / 4 work
+        # that hasn't been swept; flipping to deny would block CI on
+        # known issues. Future hardening can tighten this.
+        run: cargo clippy --lib --tests --all-features --no-deps
+      - name: cargo test --lib
+        run: cargo test --lib
+
+  postgres-tests:
+    name: Postgres tests (testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # GitHub Actions runners come with Docker pre-installed and the
+      # daemon running, so testcontainers-rs (which shells out to
+      # docker for postgres:16-alpine) works without setup.
+      - name: Verify Docker daemon
+        run: docker version
+      # postgres-client provides pg_dump and psql for the
+      # backup_restore_roundtrip_on_postgres test (chainlink #95 /
+      # Phase 5.2). The test skips silently if these aren't on PATH,
+      # so installing them upgrades the test from skip to actually-run.
+      - name: Install postgres-client (for pg_dump / psql)
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      # `--test-threads=1` because each test spins up its own Postgres
+      # container; running them in parallel races on port allocation
+      # under some Docker configs. Tests are short individually
+      # (~3-7s each) so the serial cost is small.
+      - name: cargo test --test postgres_smoke_test
+        run: cargo test --test postgres_smoke_test -- --test-threads=1
+      - name: cargo test --test multi_instance_test
+        run: cargo test --test multi_instance_test -- --test-threads=1

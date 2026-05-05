@@ -1,0 +1,95 @@
+/* Aurora Locus admin — page-specific overrides
+ *
+ * Per docs/AURORA_ADMIN_UI_DESIGN.md §12.3.2. Should be small; most
+ * styling lives in components.css.
+ */
+
+/* Account detail page header */
+.detail-header {
+  margin-bottom: var(--space-6);
+}
+
+.detail-header h2 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.detail-header .meta {
+  margin-top: var(--space-2);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.detail-header .meta code {
+  font-family: var(--font-mono);
+  background: var(--background);
+  padding: 0.125rem 0.25rem;
+  border-radius: 4px;
+}
+
+/* Roles cards */
+.role-card {
+  background: var(--surface);
+  border-radius: var(--radius-md);
+  padding: var(--space-6);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: var(--space-4);
+}
+
+.role-card h3 {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-2);
+  font-size: var(--font-size-lg);
+}
+
+.role-members {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+}
+
+/* Operations sub-page common layout */
+.ops-section {
+  background: var(--surface);
+  border-radius: var(--radius-md);
+  padding: var(--space-6);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: var(--space-4);
+}
+
+.ops-section h3 {
+  margin-bottom: var(--space-4);
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+}
+
+/* Capabilities list */
+.capability-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.capability-list li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+.capability-list .cap-yes { color: var(--success-color); }
+.capability-list .cap-no { color: var(--text-tertiary); }
+
+.capability-meta {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-color);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}

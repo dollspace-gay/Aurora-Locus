@@ -9,8 +9,81 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
+
+/// Insert a moderation event PLUS its corresponding `mod_event_seq`
+/// row in the same transaction. Per chainlink #115 / §3.5, every
+/// `moderation_event` INSERT must also land a row in
+/// `mod_event_seq` so the live subscription channel has a
+/// retention-bounded source. Two writes inside one transaction
+/// guarantee both rows land or neither — silent divergence between
+/// the historical record and the streaming channel is the
+/// invariant this helper enforces.
+///
+/// `details_json` and `meta_json` are pre-serialized strings so the
+/// caller controls JSON shape (the existing helpers and direct
+/// inserts use varying detail shapes; this helper matches that).
+///
+/// Callers that already hold a transaction (the batch handlers in
+/// aurora_admin.rs) should use this helper directly. Callers that
+/// don't hold a transaction (the `ModerationEventLogger::log_event`
+/// canonical writer) open one, call the helper, and commit.
+///
+/// Returns the new `moderation_event.id` so callers can reference
+/// it from related rows (label batches, account_moderation rows).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_moderation_event_in_tx<'c>(
+    tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+    event_type: &str,
+    actor_did: &str,
+    subject_did: Option<&str>,
+    subject_uri: Option<&str>,
+    subject_cid: Option<&str>,
+    details_json: &str,
+    created_at: &str,
+    meta_json: Option<&str>,
+) -> Result<i64, sqlx::Error> {
+    let event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO moderation_event \
+         (event_type, actor_did, subject_did, subject_uri, subject_cid, \
+          details, created_at, meta) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         RETURNING id",
+    )
+    .bind(event_type)
+    .bind(actor_did)
+    .bind(subject_did)
+    .bind(subject_uri)
+    .bind(subject_cid)
+    .bind(details_json)
+    .bind(created_at)
+    .bind(meta_json)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    // mod_event_seq mirrors the subset of moderation_event that the
+    // `Event` wire variant emits. `meta` is intentionally NOT mirrored
+    // — the wire format doesn't carry it.
+    sqlx::query(
+        "INSERT INTO mod_event_seq \
+         (moderation_event_id, actor_did, action, subject_did, \
+          subject_uri, subject_cid, detail, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(event_id)
+    .bind(actor_did)
+    .bind(event_type)
+    .bind(subject_did)
+    .bind(subject_uri)
+    .bind(subject_cid)
+    .bind(details_json)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(event_id)
+}
 
 /// Moderation event types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,16 +184,47 @@ pub struct LogEventParams<'a> {
 /// Moderation event logger
 #[derive(Clone)]
 pub struct ModerationEventLogger {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl ModerationEventLogger {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
-    /// Log a moderation event
+    /// Log a moderation event. Routes the actual insert through
+    /// [`insert_moderation_event_in_tx`] so every `moderation_event`
+    /// row also gets a `mod_event_seq` row in the same transaction —
+    /// the dual-write invariant chainlink #115 requires.
+    ///
+    /// Pool-API wrapper around [`Self::log_event_in_tx`] that opens
+    /// its own transaction. Use `log_event_in_tx` directly when the
+    /// event must land atomically with another mutation (LB-1 /
+    /// chainlink #122).
     pub async fn log_event(&self, params: LogEventParams<'_>) -> PdsResult<ModerationEvent> {
+        let mut tx = self.db.begin().await?;
+        let event = Self::log_event_in_tx(&mut tx, params).await?;
+        tx.commit().await?;
+        Ok(event)
+    }
+
+    /// Log a moderation event inside an existing transaction.
+    ///
+    /// Per LB-1 / chainlink #122: handlers that pair an event log
+    /// with an underlying mutation (or with an audit-chain append)
+    /// run all three writes inside one transaction so the surfaces
+    /// can't tear at process death. Caller commits.
+    ///
+    /// `&self` isn't taken — the function is associated rather than
+    /// methodical because the only state `ModerationEventLogger`
+    /// owns is its `db` pool, which the caller already used to open
+    /// `tx`. Keeping it static avoids forcing handlers to clone or
+    /// borrow the logger when they already have a transaction in
+    /// hand.
+    pub async fn log_event_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        params: LogEventParams<'_>,
+    ) -> PdsResult<ModerationEvent> {
         let LogEventParams {
             event_type,
             actor_did,
@@ -142,21 +246,17 @@ impl ModerationEventLogger {
             .transpose()
             .map_err(|e| PdsError::Internal(format!("Failed to serialize meta: {}", e)))?;
 
-        let result = sqlx::query(
-            r#"
-            INSERT INTO moderation_event (event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+        let id = insert_moderation_event_in_tx(
+            tx,
+            event_type.as_str(),
+            actor_did,
+            subject_did,
+            subject_uri,
+            subject_cid,
+            &details_json,
+            &now.to_rfc3339(),
+            meta_json.as_deref(),
         )
-        .bind(event_type.as_str())
-        .bind(actor_did)
-        .bind(subject_did)
-        .bind(subject_uri)
-        .bind(subject_cid)
-        .bind(&details_json)
-        .bind(now.to_rfc3339())
-        .bind(&meta_json)
-        .execute(&self.db)
         .await?;
 
         tracing::info!(
@@ -168,7 +268,7 @@ impl ModerationEventLogger {
         );
 
         Ok(ModerationEvent {
-            id: result.last_insert_rowid(),
+            id,
             event_type,
             actor_did: actor_did.to_string(),
             subject_did: subject_did.map(String::from),
@@ -224,9 +324,9 @@ impl ModerationEventLogger {
             r#"
             SELECT id, event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta
             FROM moderation_event
-            WHERE actor_did = ?
+            WHERE actor_did = $1
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT $2
             "#,
         )
         .bind(actor_did)
@@ -247,9 +347,9 @@ impl ModerationEventLogger {
             r#"
             SELECT id, event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta
             FROM moderation_event
-            WHERE event_type = ?
+            WHERE event_type = $1
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT $2
             "#,
         )
         .bind(event_type.as_str())
@@ -267,7 +367,7 @@ impl ModerationEventLogger {
             SELECT id, event_type, actor_did, subject_did, subject_uri, subject_cid, details, created_at, meta
             FROM moderation_event
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT $1
             "#,
         )
         .bind(limit)
@@ -280,7 +380,7 @@ impl ModerationEventLogger {
     /// Parse database rows into ModerationEvent objects
     async fn parse_events(
         &self,
-        rows: Vec<sqlx::sqlite::SqliteRow>,
+        rows: Vec<sqlx::any::AnyRow>,
     ) -> PdsResult<Vec<ModerationEvent>> {
         let mut events = Vec::new();
 
@@ -323,9 +423,20 @@ impl ModerationEventLogger {
 mod tests {
     use super::*;
 
+    async fn open_test_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_log_and_retrieve_event() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         sqlx::query(
             r#"
@@ -339,6 +450,28 @@ mod tests {
                 details TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 meta TEXT
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // mod_event_seq is the dual-write target the helper writes
+        // alongside moderation_event. Tests that exercise log_event
+        // need both tables present; chainlink #115.
+        sqlx::query(
+            r#"
+            CREATE TABLE mod_event_seq (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                moderation_event_id INTEGER NOT NULL,
+                actor_did TEXT NOT NULL,
+                action TEXT NOT NULL,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL
             )
             "#,
         )
@@ -387,5 +520,142 @@ mod tests {
             .unwrap();
 
         assert_eq!(events.len(), 1);
+    }
+
+    /// Helper: create the same schema setup `test_log_and_retrieve_event`
+    /// uses, returning the pool. Pulled out so the dual-write tests
+    /// don't duplicate ~30 lines of CREATE TABLE.
+    async fn open_test_pool_with_schema() -> AnyPool {
+        let db = open_test_pool().await;
+        sqlx::query(
+            r#"
+            CREATE TABLE moderation_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                actor_did TEXT NOT NULL,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                details TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                meta TEXT
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE mod_event_seq (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                moderation_event_id INTEGER NOT NULL,
+                actor_did TEXT NOT NULL,
+                action TEXT NOT NULL,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn log_event_dual_writes_moderation_event_and_mod_event_seq() {
+        // chainlink #115 invariant: every moderation_event row must
+        // have a corresponding mod_event_seq row. log_event is the
+        // canonical writer; this test exercises that path end-to-end
+        // and asserts both tables receive a row.
+        let db = open_test_pool_with_schema().await;
+        let logger = ModerationEventLogger::new(db.clone());
+        let details = serde_json::json!({ "reason": "test" });
+
+        let event = logger
+            .log_event(LogEventParams {
+                event_type: ModerationEventType::AccountTakedown,
+                actor_did: "did:plc:m1",
+                subject_did: Some("did:plc:s1"),
+                subject_uri: None,
+                subject_cid: None,
+                details,
+                meta: None,
+            })
+            .await
+            .unwrap();
+
+        // moderation_event row (the historical aggregate).
+        let me_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM moderation_event WHERE id = ?",
+        )
+        .bind(event.id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(me_count, 1);
+
+        // mod_event_seq row (the live subscription channel).
+        let seq_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mod_event_seq WHERE moderation_event_id = ?",
+        )
+        .bind(event.id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(seq_count, 1, "dual-write: mod_event_seq row missing");
+
+        // Field mirror check: actor_did, action, subject_did, detail
+        // all match between the two rows.
+        let row: (String, String, Option<String>, String) = sqlx::query_as(
+            "SELECT actor_did, action, subject_did, detail FROM mod_event_seq \
+             WHERE moderation_event_id = ?",
+        )
+        .bind(event.id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "did:plc:m1");
+        assert_eq!(row.1, "account_takedown");
+        assert_eq!(row.2.as_deref(), Some("did:plc:s1"));
+        assert!(row.3.contains("\"reason\":\"test\""));
+    }
+
+    #[tokio::test]
+    async fn direct_insert_bypassing_helper_does_not_populate_mod_event_seq() {
+        // Pin the helper as the canonical write path (chainlink #115).
+        // A direct INSERT INTO moderation_event (simulating a future
+        // contributor who bypasses insert_moderation_event_in_tx)
+        // must NOT cause a mod_event_seq row to materialize. If this
+        // ever changes (e.g., the dual-write moves to a database
+        // trigger), the test will fail and the next contributor will
+        // know to update the helper-pin assumption.
+        let db = open_test_pool_with_schema().await;
+
+        let _id: i64 = sqlx::query_scalar(
+            "INSERT INTO moderation_event \
+             (event_type, actor_did, details, created_at) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind("account_takedown")
+        .bind("did:plc:m1")
+        .bind("{}")
+        .bind(Utc::now().to_rfc3339())
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+        let seq_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mod_event_seq")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            seq_count, 0,
+            "bypassing the helper must not populate mod_event_seq"
+        );
     }
 }

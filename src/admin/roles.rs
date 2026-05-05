@@ -5,7 +5,7 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
 
 /// Parse a timestamp string from the database, tolerating both RFC3339
@@ -94,11 +94,11 @@ pub struct AdminRole {
 /// Admin role manager
 #[derive(Clone)]
 pub struct AdminRoleManager {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl AdminRoleManager {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -110,22 +110,46 @@ impl AdminRoleManager {
         granted_by: &str,
         notes: Option<String>,
     ) -> PdsResult<AdminRole> {
+        let mut tx = self.db.begin().await?;
+        let granted = Self::grant_role_in_tx(&mut tx, did, role, granted_by, notes).await?;
+        tx.commit().await?;
+        Ok(granted)
+    }
+
+    /// Grant admin role inside an existing transaction. LB-1 /
+    /// chainlink #122 atomic-with-chain entry point.
+    pub async fn grant_role_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        role: Role,
+        granted_by: &str,
+        notes: Option<String>,
+    ) -> PdsResult<AdminRole> {
         let now = Utc::now();
 
-        // Check if role already exists and is active
-        if let Some(existing) = self.get_role(did).await? {
-            if !existing.revoked {
-                return Err(PdsError::Conflict(format!(
-                    "User already has active role: {}",
-                    existing.role.as_str()
-                )));
-            }
+        // Check if role already exists and is active. Read inside
+        // the same tx so the check + insert are linearizable —
+        // otherwise two concurrent grants could both pass the
+        // "no existing active role" check.
+        let existing: Option<(String, bool)> = sqlx::query_as(
+            "SELECT role, revoked FROM admin_roles WHERE did = $1 \
+             AND NOT revoked ORDER BY granted_at DESC LIMIT 1",
+        )
+        .bind(did)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some((existing_role, _)) = existing {
+            return Err(PdsError::Conflict(format!(
+                "User already has active role: {}",
+                existing_role
+            )));
         }
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO admin_roles (did, role, granted_by, granted_at, notes)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
             "#,
         )
         .bind(did)
@@ -133,10 +157,8 @@ impl AdminRoleManager {
         .bind(granted_by)
         .bind(now.to_rfc3339())
         .bind(&notes)
-        .execute(&self.db)
+        .fetch_one(&mut **tx)
         .await?;
-
-        let id = result.last_insert_rowid();
 
         Ok(AdminRole {
             id,
@@ -158,23 +180,37 @@ impl AdminRoleManager {
         revoked_by: &str,
         reason: Option<String>,
     ) -> PdsResult<()> {
+        let mut tx = self.db.begin().await?;
+        Self::revoke_role_in_tx(&mut tx, did, revoked_by, reason).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Revoke admin role inside an existing transaction. LB-1 /
+    /// chainlink #122 atomic-with-chain entry point.
+    pub async fn revoke_role_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        revoked_by: &str,
+        reason: Option<String>,
+    ) -> PdsResult<()> {
         let now = Utc::now();
 
         let result = sqlx::query(
             r#"
             UPDATE admin_roles
-            SET revoked = 1,
-                revoked_at = ?,
-                revoked_by = ?,
-                notes = COALESCE(?, notes)
-            WHERE did = ? AND revoked = 0
+            SET revoked = true,
+                revoked_at = $1,
+                revoked_by = $2,
+                notes = COALESCE($3, notes)
+            WHERE did = $4 AND NOT revoked
             "#,
         )
         .bind(now.to_rfc3339())
         .bind(revoked_by)
         .bind(&reason)
         .bind(did)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -193,7 +229,7 @@ impl AdminRoleManager {
             r#"
             SELECT id, did, role, granted_by, granted_at, revoked, revoked_at, revoked_by, notes
             FROM admin_roles
-            WHERE did = ? AND revoked = 0
+            WHERE did = $1 AND NOT revoked
             ORDER BY granted_at DESC
             LIMIT 1
             "#,
@@ -220,7 +256,7 @@ impl AdminRoleManager {
                 role,
                 granted_by: row.get("granted_by"),
                 granted_at,
-                revoked: row.get("revoked"),
+                revoked: crate::db::read_bool(&row, "revoked")?,
                 revoked_at,
                 revoked_by: row.get("revoked_by"),
                 notes: row.get("notes"),
@@ -245,7 +281,7 @@ impl AdminRoleManager {
             r#"
             SELECT id, did, role, granted_by, granted_at, revoked, revoked_at, revoked_by, notes
             FROM admin_roles
-            WHERE revoked = 0
+            WHERE NOT revoked
             ORDER BY granted_at DESC
             "#,
         )
@@ -274,7 +310,7 @@ impl AdminRoleManager {
                 role,
                 granted_by: row.get("granted_by"),
                 granted_at,
-                revoked: row.get("revoked"),
+                revoked: crate::db::read_bool(&row, "revoked")?,
                 revoked_at,
                 revoked_by: row.get("revoked_by"),
                 notes: row.get("notes"),
@@ -284,120 +320,25 @@ impl AdminRoleManager {
         Ok(roles)
     }
 
-    /// Log admin action to audit log
-    pub async fn log_action(
-        &self,
-        admin_did: &str,
-        action: &str,
-        subject_did: Option<&str>,
-        details: Option<&str>,
-        ip_address: Option<&str>,
-    ) -> PdsResult<()> {
-        let now = Utc::now();
-
-        sqlx::query(
-            r#"
-            INSERT INTO admin_audit_log (admin_did, action, subject_did, details, timestamp, ip_address)
-            VALUES (?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(admin_did)
-        .bind(action)
-        .bind(subject_did)
-        .bind(details)
-        .bind(now.to_rfc3339())
-        .bind(ip_address)
-        .execute(&self.db)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Get audit log entries with optional filters
-    ///
-    /// Returns audit log entries, optionally filtered by admin DID or action type.
-    /// Results are ordered by timestamp descending (most recent first).
-    pub async fn get_audit_logs(
-        &self,
-        admin_did: Option<&str>,
-        action: Option<&str>,
-        subject_did: Option<&str>,
-        limit: i64,
-        cursor: Option<i64>,
-    ) -> PdsResult<Vec<super::AuditLogEntry>> {
-        // Build query with optional filters
-        let mut query = String::from(
-            "SELECT id, admin_did, action, subject_did, details, timestamp, ip_address
-             FROM admin_audit_log WHERE 1=1",
-        );
-
-        if admin_did.is_some() {
-            query.push_str(" AND admin_did = ?");
-        }
-        if action.is_some() {
-            query.push_str(" AND action = ?");
-        }
-        if subject_did.is_some() {
-            query.push_str(" AND subject_did = ?");
-        }
-        if cursor.is_some() {
-            query.push_str(" AND id < ?");
-        }
-
-        query.push_str(" ORDER BY id DESC LIMIT ?");
-
-        // Execute with dynamic binding
-        let mut q = sqlx::query(&query);
-
-        if let Some(did) = admin_did {
-            q = q.bind(did);
-        }
-        if let Some(act) = action {
-            q = q.bind(act);
-        }
-        if let Some(subj) = subject_did {
-            q = q.bind(subj);
-        }
-        if let Some(cur) = cursor {
-            q = q.bind(cur);
-        }
-        q = q.bind(limit);
-
-        let rows = q.fetch_all(&self.db).await?;
-
-        let mut entries = Vec::new();
-        for row in rows {
-            let timestamp_str: String = row.get("timestamp");
-            let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
-                .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
-                .with_timezone(&Utc);
-
-            entries.push(super::AuditLogEntry {
-                id: row.get("id"),
-                admin_did: row.get("admin_did"),
-                action: row.get("action"),
-                subject_did: row.get("subject_did"),
-                details: row.get("details"),
-                timestamp,
-                ip_address: row.get("ip_address"),
-            });
-        }
-
-        Ok(entries)
-    }
-
-    /// Get count of audit log entries
-    pub async fn get_audit_log_count(&self) -> PdsResult<i64> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_audit_log")
-            .fetch_one(&self.db)
-            .await?;
-        Ok(count)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Open a single-connection SQLite-backed `AnyPool` for tests.
+    /// Single-connection cap is required because each connection to
+    /// `:memory:` SQLite has its own private database.
+    async fn open_test_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn test_role_hierarchy() {
@@ -424,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grant_and_get_role() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         // Create table
         sqlx::query(
@@ -439,23 +380,6 @@ mod tests {
                 revoked_at TEXT,
                 revoked_by TEXT,
                 notes TEXT
-            )
-            "#,
-        )
-        .execute(&db)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE admin_audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_did TEXT NOT NULL,
-                action TEXT NOT NULL,
-                subject_did TEXT,
-                details TEXT,
-                timestamp TEXT NOT NULL,
-                ip_address TEXT
             )
             "#,
         )
@@ -501,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_revoke_role() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         sqlx::query(
             r#"
@@ -515,23 +439,6 @@ mod tests {
                 revoked_at TEXT,
                 revoked_by TEXT,
                 notes TEXT
-            )
-            "#,
-        )
-        .execute(&db)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE admin_audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_did TEXT NOT NULL,
-                action TEXT NOT NULL,
-                subject_did TEXT,
-                details TEXT,
-                timestamp TEXT NOT NULL,
-                ip_address TEXT
             )
             "#,
         )

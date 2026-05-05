@@ -80,6 +80,12 @@ pub enum PdsError {
     /// Account suspended
     #[error("Account suspended: {0}")]
     AccountSuspended(String),
+
+    /// Sequencer leader is on a different instance — caller should retry
+    /// (load balancer will route to the leader on retry). Mapped to HTTP
+    /// 503 Service Unavailable. See chainlink #89 / docs/AURORA_DESIGN.md §5.4.1.
+    #[error("Sequencer leader is on a different instance: {0}")]
+    NotLeader(String),
 }
 
 /// Manual PartialEq implementation for PdsError
@@ -105,6 +111,7 @@ impl PartialEq for PdsError {
             (PdsError::Jwt(a), PdsError::Jwt(b)) => a == b,
             (PdsError::AccountTakenDown(a), PdsError::AccountTakenDown(b)) => a == b,
             (PdsError::AccountSuspended(a), PdsError::AccountSuspended(b)) => a == b,
+            (PdsError::NotLeader(a), PdsError::NotLeader(b)) => a == b,
             // Database and Io errors cannot be compared, so we use error message comparison
             (PdsError::Database(a), PdsError::Database(b)) => a.to_string() == b.to_string(),
             (PdsError::Io(a), PdsError::Io(b)) => a.to_string() == b.to_string(),
@@ -146,6 +153,11 @@ impl IntoResponse for PdsError {
             PdsError::AccountSuspended(_) => {
                 (StatusCode::FORBIDDEN, "AccountSuspended", self.to_string())
             }
+            PdsError::NotLeader(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "NotLeader",
+                self.to_string(),
+            ),
             PdsError::Database(_) | PdsError::Internal(_) | PdsError::Io(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalServerError",

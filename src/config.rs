@@ -3,13 +3,19 @@ use crate::error::{PdsError, PdsResult};
 use crate::validation::ValidationMode;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Main server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub service: ServiceConfig,
     pub storage: StorageConfig,
+    /// Shared-database backend selection (per
+    /// docs/AURORA_DESIGN.md §5.2 / chainlink #75).
+    /// Per-actor `ActorStore` always uses SQLite; this only controls
+    /// `account_db` and `did_cache_db`.
+    #[serde(default)]
+    pub database: DatabaseConfig,
     pub authentication: AuthConfig,
     pub identity: IdentityConfig,
     pub email: Option<EmailConfig>,
@@ -18,6 +24,184 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
     pub federation: FederationConfig,
     pub validation_mode: ValidationMode,
+}
+
+/// Shared-database backend selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseBackend {
+    /// SQLite (default; suitable for hobbyist and development deployments).
+    #[default]
+    Sqlite,
+    /// PostgreSQL (production deployments requiring better concurrency).
+    Postgres,
+}
+
+/// Database configuration shared by `account_db` and `did_cache_db`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    #[serde(default)]
+    pub backend: DatabaseBackend,
+    /// Connection URL: file path for SQLite, `postgres://` URL for Postgres.
+    /// When unset for SQLite, the per-database file paths in
+    /// `StorageConfig` are used (preserving the legacy default).
+    pub url: Option<String>,
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout_secs: u64,
+    pub idle_timeout_secs: Option<u64>,
+    pub max_lifetime_secs: Option<u64>,
+    /// Standby retry interval for the sequencer leader-election loop
+    /// (Phase 4.2 / chainlink #89). Postgres-only — SQLite deployments
+    /// skip leader election entirely. See
+    /// docs/AURORA_DESIGN.md §5.4.1.
+    pub leader_retry_interval_ms: u64,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            backend: DatabaseBackend::Sqlite,
+            url: None,
+            // Defaults per docs/AURORA_DESIGN.md §5.3 (connection model).
+            max_connections: 25,
+            min_connections: 5,
+            acquire_timeout_secs: 30,
+            idle_timeout_secs: None,
+            max_lifetime_secs: None,
+            leader_retry_interval_ms: 2000,
+        }
+    }
+}
+
+impl DatabaseConfig {
+    /// Construct from explicit option-typed env-var values. Pure function
+    /// over `Option<String>` inputs so tests can exercise validation
+    /// without manipulating process-global env. Mirrors the pattern used
+    /// by `BlobstoreConfig::from_env_values`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_env_values(
+        backend: Option<String>,
+        url: Option<String>,
+        max_connections: Option<String>,
+        min_connections: Option<String>,
+        acquire_timeout_secs: Option<String>,
+        idle_timeout_secs: Option<String>,
+        max_lifetime_secs: Option<String>,
+        leader_retry_interval_ms: Option<String>,
+    ) -> PdsResult<Self> {
+        let backend = match backend.as_deref().map(str::to_ascii_lowercase) {
+            None => DatabaseBackend::Sqlite,
+            Some(s) if s == "sqlite" => DatabaseBackend::Sqlite,
+            Some(s) if s == "postgres" || s == "postgresql" => DatabaseBackend::Postgres,
+            Some(other) => {
+                return Err(PdsError::Validation(format!(
+                    "PDS_DB_BACKEND must be 'sqlite' or 'postgres' (got: {:?})",
+                    other
+                )));
+            }
+        };
+
+        if backend == DatabaseBackend::Postgres {
+            let u = url.as_deref().unwrap_or("");
+            if u.is_empty() {
+                return Err(PdsError::Validation(
+                    "PDS_DB_URL is required when PDS_DB_BACKEND=postgres".to_string(),
+                ));
+            }
+            if !u.starts_with("postgres://") && !u.starts_with("postgresql://") {
+                return Err(PdsError::Validation(
+                    "PDS_DB_URL must start with 'postgres://' or 'postgresql://' \
+                     when PDS_DB_BACKEND=postgres"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let max_connections = parse_u32_env("PDS_DB_MAX_CONNECTIONS", max_connections, 25)?;
+        let min_connections = parse_u32_env("PDS_DB_MIN_CONNECTIONS", min_connections, 5)?;
+        let acquire_timeout_secs =
+            parse_u64_env("PDS_DB_ACQUIRE_TIMEOUT_SECS", acquire_timeout_secs, 30)?;
+        let idle_timeout_secs = parse_u64_env_opt("PDS_DB_IDLE_TIMEOUT_SECS", idle_timeout_secs)?;
+        let max_lifetime_secs = parse_u64_env_opt("PDS_DB_MAX_LIFETIME_SECS", max_lifetime_secs)?;
+
+        if max_connections == 0 {
+            return Err(PdsError::Validation(
+                "PDS_DB_MAX_CONNECTIONS must be greater than 0".to_string(),
+            ));
+        }
+        if min_connections > max_connections {
+            return Err(PdsError::Validation(format!(
+                "PDS_DB_MIN_CONNECTIONS ({}) must not exceed PDS_DB_MAX_CONNECTIONS ({})",
+                min_connections, max_connections
+            )));
+        }
+        if acquire_timeout_secs == 0 {
+            return Err(PdsError::Validation(
+                "PDS_DB_ACQUIRE_TIMEOUT_SECS must be greater than 0".to_string(),
+            ));
+        }
+
+        let leader_retry_interval_ms = parse_u64_env(
+            "PDS_SEQUENCER_LEADER_RETRY_MS",
+            leader_retry_interval_ms,
+            2000,
+        )?;
+        if !(500..=30_000).contains(&leader_retry_interval_ms) {
+            return Err(PdsError::Validation(format!(
+                "PDS_SEQUENCER_LEADER_RETRY_MS ({}) must be between 500 and 30000",
+                leader_retry_interval_ms
+            )));
+        }
+
+        Ok(Self {
+            backend,
+            url,
+            max_connections,
+            min_connections,
+            acquire_timeout_secs,
+            idle_timeout_secs,
+            max_lifetime_secs,
+            leader_retry_interval_ms,
+        })
+    }
+}
+
+fn parse_u32_env(name: &str, raw: Option<String>, default: u32) -> PdsResult<u32> {
+    match raw {
+        None => Ok(default),
+        Some(v) => v.parse::<u32>().map_err(|_| {
+            PdsError::Validation(format!(
+                "{name} must be a non-negative integer (got: {:?})",
+                v
+            ))
+        }),
+    }
+}
+
+fn parse_u64_env(name: &str, raw: Option<String>, default: u64) -> PdsResult<u64> {
+    match raw {
+        None => Ok(default),
+        Some(v) => v.parse::<u64>().map_err(|_| {
+            PdsError::Validation(format!(
+                "{name} must be a non-negative integer (got: {:?})",
+                v
+            ))
+        }),
+    }
+}
+
+fn parse_u64_env_opt(name: &str, raw: Option<String>) -> PdsResult<Option<u64>> {
+    match raw {
+        None => Ok(None),
+        Some(v) if v.is_empty() => Ok(None),
+        Some(v) => v.parse::<u64>().map(Some).map_err(|_| {
+            PdsError::Validation(format!(
+                "{name} must be a non-negative integer (got: {:?})",
+                v
+            ))
+        }),
+    }
 }
 
 /// Service-level configuration
@@ -55,7 +239,125 @@ pub enum BlobstoreConfig {
         access_key_id: String,
         secret_access_key: String,
         endpoint: Option<String>,
+        /// Object key prefix (Aurora extension; default `"blobs/"`).
+        #[serde(default = "default_s3_prefix")]
+        prefix: String,
+        /// Path-style addressing toggle (default `false`).
+        #[serde(default)]
+        force_path_style: bool,
+        /// Upload operation timeout in milliseconds (default `20000`).
+        #[serde(default = "default_s3_upload_timeout_ms")]
+        upload_timeout_ms: u64,
     },
+}
+
+fn default_s3_prefix() -> String {
+    "blobs/".to_string()
+}
+
+fn default_s3_upload_timeout_ms() -> u64 {
+    20_000
+}
+
+impl BlobstoreConfig {
+    /// Construct a `BlobstoreConfig` from explicit option-typed values.
+    ///
+    /// Factored out of `ServerConfig::from_env` for testability — env vars
+    /// are process-global and racy in parallel test runs, but pure
+    /// `Option<String>` inputs are not. The wrapper in `from_env` reads
+    /// env::var and threads the results into this function.
+    ///
+    /// Behavior:
+    /// - Both S3 bucket and disk location set → `Validation` error (mutual
+    ///   exclusion: operators must pick one backend).
+    /// - S3 bucket set, no disk location → S3 variant, with credentials
+    ///   required (missing access key or secret key → error naming the
+    ///   missing env var).
+    /// - No S3 bucket → Disk variant, defaulting `location` to
+    ///   `data_directory/blobs` and `tmp_location` to `data_directory/temp`
+    ///   when the disk env vars are unset.
+    // Arg count mirrors the env-var fan-in for this constructor; collapsing
+    // into a struct would obscure the call-site mapping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_env_values(
+        data_directory: &Path,
+        s3_bucket: Option<String>,
+        s3_region: Option<String>,
+        s3_endpoint: Option<String>,
+        s3_access_key_id: Option<String>,
+        s3_secret_access_key: Option<String>,
+        s3_prefix: Option<String>,
+        s3_force_path_style: Option<String>,
+        s3_upload_timeout_ms: Option<String>,
+        disk_location: Option<String>,
+        disk_tmp_location: Option<String>,
+    ) -> PdsResult<Self> {
+        if s3_bucket.is_some() && disk_location.is_some() {
+            return Err(PdsError::Validation(
+                "Configure either S3 or disk blob storage, not both. \
+                 Set PDS_BLOBSTORE_S3_BUCKET for S3 or \
+                 PDS_BLOBSTORE_DISK_LOCATION for disk."
+                    .to_string(),
+            ));
+        }
+
+        if let Some(bucket) = s3_bucket {
+            // Parse force_path_style: accept "true"/"false"/"1"/"0"
+            // case-insensitively. Default false on missing or unrecognised
+            // (rejecting unrecognised would be more strict but operators
+            // typo-prone; bsky-PDS treats anything-not-true as false).
+            let force_path_style = match s3_force_path_style.as_deref() {
+                None => false,
+                Some(v) => matches!(v.to_ascii_lowercase().as_str(), "true" | "1"),
+            };
+
+            // Parse upload_timeout_ms: required to be a valid u64 if set;
+            // unparseable input is an error rather than a silent default
+            // since timeouts are operator-meaningful.
+            let upload_timeout_ms = match s3_upload_timeout_ms {
+                None => 20_000,
+                Some(v) => v.parse::<u64>().map_err(|_| {
+                    PdsError::Validation(format!(
+                        "PDS_BLOBSTORE_S3_UPLOAD_TIMEOUT_MS must be a non-negative \
+                         integer (got: {:?})",
+                        v
+                    ))
+                })?,
+            };
+
+            return Ok(BlobstoreConfig::S3 {
+                bucket,
+                region: s3_region.unwrap_or_else(|| "us-east-1".to_string()),
+                access_key_id: s3_access_key_id.ok_or_else(|| {
+                    PdsError::Validation(
+                        "PDS_BLOBSTORE_S3_ACCESS_KEY_ID is required when \
+                         PDS_BLOBSTORE_S3_BUCKET is set"
+                            .to_string(),
+                    )
+                })?,
+                secret_access_key: s3_secret_access_key.ok_or_else(|| {
+                    PdsError::Validation(
+                        "PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY is required when \
+                         PDS_BLOBSTORE_S3_BUCKET is set"
+                            .to_string(),
+                    )
+                })?,
+                endpoint: s3_endpoint,
+                prefix: s3_prefix.unwrap_or_else(default_s3_prefix),
+                force_path_style,
+                upload_timeout_ms,
+            });
+        }
+
+        Ok(BlobstoreConfig::Disk {
+            location: disk_location
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data_directory.join("blobs")),
+            tmp_location: disk_tmp_location
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data_directory.join("temp")),
+        })
+    }
 }
 
 /// Authentication configuration
@@ -234,6 +536,11 @@ pub struct RateLimitConfig {
     pub use_redis: bool,
     /// Redis connection URL for distributed rate limiting (e.g., redis://localhost:6379)
     pub redis_url: Option<String>,
+    /// Bypass the limiter for GET requests to admin UI static assets.
+    /// Defaults to `true`; see `crate::rate_limit::is_admin_asset_exempt`
+    /// for the exact path/method matrix. Set to `false` to opt admin
+    /// assets back into the limiter.
+    pub exempt_admin_assets: bool,
 }
 
 /// Logging configuration
@@ -296,27 +603,19 @@ impl ServerConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| data_directory.join("actors"));
 
-        let blobstore = if let Ok(bucket) = env::var("PDS_BLOBSTORE_S3_BUCKET") {
-            BlobstoreConfig::S3 {
-                bucket,
-                region: env::var("PDS_BLOBSTORE_S3_REGION")
-                    .unwrap_or_else(|_| "us-east-1".to_string()),
-                access_key_id: env::var("PDS_BLOBSTORE_S3_ACCESS_KEY_ID")
-                    .map_err(|_| PdsError::Validation("S3 access key required".to_string()))?,
-                secret_access_key: env::var("PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY")
-                    .map_err(|_| PdsError::Validation("S3 secret key required".to_string()))?,
-                endpoint: env::var("PDS_BLOBSTORE_S3_ENDPOINT").ok(),
-            }
-        } else {
-            BlobstoreConfig::Disk {
-                location: env::var("PDS_BLOBSTORE_DISK_LOCATION")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| data_directory.join("blobs")),
-                tmp_location: env::var("PDS_BLOBSTORE_DISK_TMP_LOCATION")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| data_directory.join("temp")),
-            }
-        };
+        let blobstore = BlobstoreConfig::from_env_values(
+            &data_directory,
+            env::var("PDS_BLOBSTORE_S3_BUCKET").ok(),
+            env::var("PDS_BLOBSTORE_S3_REGION").ok(),
+            env::var("PDS_BLOBSTORE_S3_ENDPOINT").ok(),
+            env::var("PDS_BLOBSTORE_S3_ACCESS_KEY_ID").ok(),
+            env::var("PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY").ok(),
+            env::var("PDS_BLOBSTORE_S3_PREFIX").ok(),
+            env::var("PDS_BLOBSTORE_S3_FORCE_PATH_STYLE").ok(),
+            env::var("PDS_BLOBSTORE_S3_UPLOAD_TIMEOUT_MS").ok(),
+            env::var("PDS_BLOBSTORE_DISK_LOCATION").ok(),
+            env::var("PDS_BLOBSTORE_DISK_TMP_LOCATION").ok(),
+        )?;
 
         let jwt_secret = env::var("PDS_JWT_SECRET")
             .map_err(|_| PdsError::Validation("JWT secret required".to_string()))?;
@@ -391,6 +690,10 @@ impl ServerConfig {
             .parse()
             .unwrap_or(false);
         let rate_limit_redis_url = env::var("PDS_RATE_LIMIT_REDIS_URL").ok();
+        let rate_limit_exempt_admin_assets = env::var("PDS_RATE_LIMIT_EXEMPT_ADMIN_ASSETS")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true);
 
         let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
@@ -425,6 +728,17 @@ impl ServerConfig {
             .parse()
             .unwrap_or(false);
 
+        let database = DatabaseConfig::from_env_values(
+            env::var("PDS_DB_BACKEND").ok(),
+            env::var("PDS_DB_URL").ok(),
+            env::var("PDS_DB_MAX_CONNECTIONS").ok(),
+            env::var("PDS_DB_MIN_CONNECTIONS").ok(),
+            env::var("PDS_DB_ACQUIRE_TIMEOUT_SECS").ok(),
+            env::var("PDS_DB_IDLE_TIMEOUT_SECS").ok(),
+            env::var("PDS_DB_MAX_LIFETIME_SECS").ok(),
+            env::var("PDS_SEQUENCER_LEADER_RETRY_MS").ok(),
+        )?;
+
         Ok(ServerConfig {
             service: ServiceConfig {
                 hostname,
@@ -441,6 +755,7 @@ impl ServerConfig {
                 actor_store_directory,
                 blobstore,
             },
+            database,
             authentication: AuthConfig {
                 jwt_secret,
                 repo_signing_key,
@@ -472,6 +787,7 @@ impl ServerConfig {
                 global_requests_per_minute: rate_limit_requests,
                 use_redis: rate_limit_use_redis,
                 redis_url: rate_limit_redis_url,
+                exempt_admin_assets: rate_limit_exempt_admin_assets,
             },
             logging: LoggingConfig { level: log_level },
             federation: FederationConfig {
@@ -502,5 +818,426 @@ impl ServerConfig {
         // Admin password removed - OAuth uses DID-based authentication
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod database_tests {
+    use super::*;
+
+    #[test]
+    fn from_env_values_defaults_to_sqlite() {
+        let cfg = DatabaseConfig::from_env_values(None, None, None, None, None, None, None,
+            None,
+        )
+            .unwrap();
+        assert_eq!(cfg.backend, DatabaseBackend::Sqlite);
+        assert!(cfg.url.is_none());
+        assert_eq!(cfg.max_connections, 25);
+        assert_eq!(cfg.min_connections, 5);
+        assert_eq!(cfg.acquire_timeout_secs, 30);
+        assert!(cfg.idle_timeout_secs.is_none());
+        assert!(cfg.max_lifetime_secs.is_none());
+    }
+
+    #[test]
+    fn from_env_values_postgres_with_url() {
+        let cfg = DatabaseConfig::from_env_values(
+            Some("postgres".to_string()),
+            Some("postgres://user:pw@localhost/aurora".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        
+            None,)
+        .unwrap();
+        assert_eq!(cfg.backend, DatabaseBackend::Postgres);
+        assert_eq!(
+            cfg.url.as_deref(),
+            Some("postgres://user:pw@localhost/aurora")
+        );
+    }
+
+    #[test]
+    fn from_env_values_postgres_accepts_postgresql_scheme() {
+        let cfg = DatabaseConfig::from_env_values(
+            Some("postgresql".to_string()),
+            Some("postgresql://localhost/aurora".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        
+            None,)
+        .unwrap();
+        assert_eq!(cfg.backend, DatabaseBackend::Postgres);
+    }
+
+    #[test]
+    fn from_env_values_postgres_without_url_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            Some("postgres".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        
+            None,)
+        .expect_err("postgres without URL should be rejected");
+        assert!(err.to_string().contains("PDS_DB_URL is required"));
+    }
+
+    #[test]
+    fn from_env_values_postgres_with_wrong_scheme_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            Some("postgres".to_string()),
+            Some("mysql://localhost/aurora".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        
+            None,)
+        .expect_err("non-postgres URL should be rejected");
+        assert!(err.to_string().contains("postgres://"));
+    }
+
+    #[test]
+    fn from_env_values_invalid_backend_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            Some("mysql".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        
+            None,)
+        .expect_err("unknown backend should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("sqlite"));
+        assert!(msg.contains("postgres"));
+    }
+
+    #[test]
+    fn from_env_values_min_exceeds_max_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            None,
+            None,
+            Some("10".to_string()),
+            Some("20".to_string()),
+            None,
+            None,
+            None,
+        
+            None,)
+        .expect_err("min > max should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("MIN_CONNECTIONS"));
+        assert!(msg.contains("MAX_CONNECTIONS"));
+    }
+
+    #[test]
+    fn from_env_values_zero_max_connections_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            None,
+            None,
+            Some("0".to_string()),
+            None,
+            None,
+            None,
+            None,
+        
+            None,)
+        .expect_err("max=0 should be rejected");
+        assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn from_env_values_zero_acquire_timeout_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            Some("0".to_string()),
+            None,
+            None,
+        
+            None,)
+        .expect_err("acquire timeout=0 should be rejected");
+        assert!(err.to_string().contains("ACQUIRE_TIMEOUT_SECS"));
+    }
+
+    #[test]
+    fn from_env_values_non_numeric_timeout_rejected() {
+        let err = DatabaseConfig::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            Some("not-a-number".to_string()),
+            None,
+            None,
+        
+            None,)
+        .expect_err("non-integer timeout should be rejected");
+        assert!(err.to_string().contains("non-negative integer"));
+    }
+
+    #[test]
+    fn from_env_values_optional_timeouts_parse() {
+        let cfg = DatabaseConfig::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("60".to_string()),
+            Some("3600".to_string()),
+        
+            None,)
+        .unwrap();
+        assert_eq!(cfg.idle_timeout_secs, Some(60));
+        assert_eq!(cfg.max_lifetime_secs, Some(3600));
+    }
+}
+
+#[cfg(test)]
+mod blobstore_tests {
+    use super::*;
+
+    fn data_dir() -> PathBuf {
+        PathBuf::from("/tmp/aurora-test-data")
+    }
+
+    #[test]
+    fn from_env_values_defaults_to_disk_when_nothing_set() {
+        let cfg = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            None, None, None, None, None, None, None, None, None, None,
+        )
+        .unwrap();
+        match cfg {
+            BlobstoreConfig::Disk {
+                location,
+                tmp_location,
+            } => {
+                assert_eq!(location, data_dir().join("blobs"));
+                assert_eq!(tmp_location, data_dir().join("temp"));
+            }
+            _ => panic!("expected Disk variant"),
+        }
+    }
+
+    #[test]
+    fn from_env_values_disk_only_uses_provided_location() {
+        let cfg = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            None, None, None, None, None, None, None, None,
+            Some("/var/blobs".to_string()),
+            None,
+        )
+        .unwrap();
+        match cfg {
+            BlobstoreConfig::Disk { location, .. } => {
+                assert_eq!(location, PathBuf::from("/var/blobs"));
+            }
+            _ => panic!("expected Disk variant"),
+        }
+    }
+
+    #[test]
+    fn from_env_values_s3_only_constructs_s3_variant() {
+        let cfg = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("my-bucket".to_string()),
+            Some("eu-west-1".to_string()),
+            Some("https://s3.eu-west-1.amazonaws.com".to_string()),
+            Some("AKIAEXAMPLE".to_string()),
+            Some("secret-example".to_string()),
+            None, None, None,
+            None, None,
+        )
+        .unwrap();
+        match cfg {
+            BlobstoreConfig::S3 {
+                bucket,
+                region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+                prefix,
+                force_path_style,
+                upload_timeout_ms,
+            } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(region, "eu-west-1");
+                assert_eq!(
+                    endpoint.as_deref(),
+                    Some("https://s3.eu-west-1.amazonaws.com")
+                );
+                assert_eq!(access_key_id, "AKIAEXAMPLE");
+                assert_eq!(secret_access_key, "secret-example");
+                // Phase 3 defaults populate when env vars are unset.
+                assert_eq!(prefix, "blobs/");
+                assert!(!force_path_style);
+                assert_eq!(upload_timeout_ms, 20_000);
+            }
+            _ => panic!("expected S3 variant"),
+        }
+    }
+
+    #[test]
+    fn from_env_values_s3_defaults_region_to_us_east_1() {
+        let cfg = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("b".to_string()),
+            None, None,
+            Some("k".to_string()),
+            Some("s".to_string()),
+            None, None, None,
+            None, None,
+        )
+        .unwrap();
+        match cfg {
+            BlobstoreConfig::S3 { region, .. } => assert_eq!(region, "us-east-1"),
+            _ => panic!("expected S3 variant"),
+        }
+    }
+
+    #[test]
+    fn from_env_values_rejects_both_s3_and_disk() {
+        let err = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("bucket".to_string()),
+            None, None,
+            Some("k".to_string()),
+            Some("s".to_string()),
+            None, None, None,
+            Some("/var/blobs".to_string()),
+            None,
+        )
+        .expect_err("both backends configured should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not both"));
+        assert!(msg.contains("PDS_BLOBSTORE_S3_BUCKET"));
+        assert!(msg.contains("PDS_BLOBSTORE_DISK_LOCATION"));
+    }
+
+    #[test]
+    fn from_env_values_rejects_s3_bucket_without_access_key() {
+        let err = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("bucket".to_string()),
+            None, None, None,
+            Some("s".to_string()),
+            None, None, None,
+            None, None,
+        )
+        .expect_err("S3 bucket without access key should be rejected");
+        assert!(err.to_string().contains("PDS_BLOBSTORE_S3_ACCESS_KEY_ID"));
+    }
+
+    #[test]
+    fn from_env_values_rejects_s3_bucket_without_secret_key() {
+        let err = BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("bucket".to_string()),
+            None, None,
+            Some("k".to_string()),
+            None,
+            None, None, None,
+            None, None,
+        )
+        .expect_err("S3 bucket without secret key should be rejected");
+        assert!(err
+            .to_string()
+            .contains("PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY"));
+    }
+
+    // ---- Phase 3 (#73): force_path_style, upload_timeout_ms, prefix ------
+
+    /// Helper for Phase 3 tests — base S3 config minus the three Phase 3
+    /// fields, returns the S3 variant. Spreads each test out into the
+    /// specific knob it targets without duplicating boilerplate.
+    fn s3_with_phase3(
+        prefix: Option<String>,
+        force_path_style: Option<String>,
+        upload_timeout_ms: Option<String>,
+    ) -> PdsResult<BlobstoreConfig> {
+        BlobstoreConfig::from_env_values(
+            &data_dir(),
+            Some("bucket".to_string()),
+            None, None,
+            Some("k".to_string()),
+            Some("s".to_string()),
+            prefix,
+            force_path_style,
+            upload_timeout_ms,
+            None, None,
+        )
+    }
+
+    #[test]
+    fn from_env_values_force_path_style_true_strings() {
+        for v in &["true", "TRUE", "True", "1"] {
+            let cfg = s3_with_phase3(None, Some(v.to_string()), None).unwrap();
+            match cfg {
+                BlobstoreConfig::S3 { force_path_style, .. } => {
+                    assert!(force_path_style, "value {:?} should parse as true", v);
+                }
+                _ => panic!("expected S3"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_values_force_path_style_false_strings() {
+        for v in &["false", "FALSE", "0", "no", ""] {
+            let cfg = s3_with_phase3(None, Some(v.to_string()), None).unwrap();
+            match cfg {
+                BlobstoreConfig::S3 { force_path_style, .. } => {
+                    assert!(!force_path_style, "value {:?} should parse as false", v);
+                }
+                _ => panic!("expected S3"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_values_upload_timeout_ms_explicit() {
+        let cfg = s3_with_phase3(None, None, Some("5000".to_string())).unwrap();
+        match cfg {
+            BlobstoreConfig::S3 { upload_timeout_ms, .. } => {
+                assert_eq!(upload_timeout_ms, 5000);
+            }
+            _ => panic!("expected S3"),
+        }
+    }
+
+    #[test]
+    fn from_env_values_rejects_unparseable_upload_timeout_ms() {
+        let err = s3_with_phase3(None, None, Some("not-a-number".to_string()))
+            .expect_err("non-integer timeout should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("PDS_BLOBSTORE_S3_UPLOAD_TIMEOUT_MS"));
+        assert!(msg.contains("non-negative integer"));
+    }
+
+    #[test]
+    fn from_env_values_prefix_explicit() {
+        let cfg = s3_with_phase3(Some("custom/".to_string()), None, None).unwrap();
+        match cfg {
+            BlobstoreConfig::S3 { prefix, .. } => assert_eq!(prefix, "custom/"),
+            _ => panic!("expected S3"),
+        }
     }
 }

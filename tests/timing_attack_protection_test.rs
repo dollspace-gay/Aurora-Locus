@@ -5,19 +5,25 @@
 //! username enumeration attacks.
 
 use aurora_locus::{account::AccountManager, config::*, validation::ValidationMode};
-use sqlx::SqlitePool;
+use sqlx::any::AnyPoolOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::Instant;
 
 async fn create_test_manager() -> AccountManager {
     // Spin up the real schema in :memory: so the test stays in lock-step
-    // with the production layout. The previous hand-rolled CREATE TABLE
-    // statements drifted (e.g. they pre-dated the actor/account schema
-    // split landed in commit 87783e3) and silently broke every time the
-    // schema evolved. Using `sqlx::migrate!` means the tests rebuild
-    // automatically when migrations are added.
-    let db = SqlitePool::connect(":memory:").await.unwrap();
+    // with the production layout. Phase 3 (b851678) flipped AccountManager
+    // from SqlitePool to AnyPool; this fixture mirrors the production-side
+    // pattern (single-connection in-memory pool) used in src/admin/roles.rs
+    // tests. Resolves chainlink #87.
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(sqlx::any::install_default_drivers);
+    let db = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
     sqlx::migrate!("./migrations")
         .run(&db)
         .await
@@ -43,6 +49,7 @@ async fn create_test_manager() -> AccountManager {
                 tmp_location: PathBuf::from("./data/tmp"),
             },
         },
+        database: Default::default(),
         authentication: AuthConfig {
             jwt_secret: "test-secret-key-for-testing-only".to_string(),
             repo_signing_key: "test-key".to_string(),
@@ -74,6 +81,7 @@ async fn create_test_manager() -> AccountManager {
             global_requests_per_minute: 3000,
             redis_url: None,
             use_redis: false,
+            exempt_admin_assets: true,
         },
         logging: LoggingConfig {
             level: "info".to_string(),

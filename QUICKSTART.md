@@ -113,15 +113,13 @@ VALUES ('YOUR_DID', 'superadmin', 'system', datetime('now'));
 .exit
 ```
 
-### 3. Update OAuth Admin DIDs
+### 3. Grant the First Admin Role
 
-Edit `.env` and add your DID:
-
-```bash
-OAUTH_ADMIN_DIDS=did:plc:YOUR_DID_HERE
-```
-
-Restart the server for changes to take effect.
+Admin authority comes from the `admin_role` table; environment
+variables do not by themselves confer a role. Insert the bootstrap
+SuperAdmin row directly per README's "First Admin User" section, then
+restart the server. Subsequent role grants flow through
+`tools.aurora.superadmin.grantRole`.
 
 ### 4. Test OAuth Admin Login
 
@@ -238,7 +236,6 @@ PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=<hex-key>
 
 # OAuth
 OAUTH_KEYSET_FILE=./oauth-keyset.json
-OAUTH_ADMIN_DIDS=did:plc:your-admin-did
 
 # Storage
 PDS_DATA_DIRECTORY=./data
@@ -327,8 +324,8 @@ mkdir -p data/actors data/blobs data/tmp
 # Verify oauth-keyset.json exists and is valid
 cat oauth-keyset.json | jq .
 
-# Check OAuth admin DIDs in .env
-grep OAUTH_ADMIN_DIDS .env
+# Confirm at least one SuperAdmin row exists in the admin_role table
+sqlite3 data/accounts.db "SELECT did, role FROM admin_role WHERE NOT revoked;"
 
 # Test OAuth metadata endpoint
 curl http://localhost:3000/.well-known/oauth-authorization-server | jq .

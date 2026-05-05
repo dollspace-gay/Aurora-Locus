@@ -162,22 +162,29 @@ async fn handle_authorization_code_grant(
 
     debug!("✓ PKCE verification successful");
 
-    // Step 6: Extract and verify DPoP proof (optional for now, will be required later)
-    // For Phase 2, we'll make DPoP optional and skip verification if not present
-    // In production, this should be required for security
-    let dpop_thumbprint = match extract_dpop_proof(&headers, ctx).await {
-        Ok(thumbprint) => {
-            debug!("✓ DPoP proof verified: thumbprint={}", thumbprint);
-            Some(thumbprint)
-        }
-        Err(e) => {
-            // For now, we'll allow tokens without DPoP (development mode)
-            // In production, this should return an error
-            warn!("DPoP verification failed (allowing for development): {}", e);
+    // Step 6: Extract and verify DPoP proof.
+    // Three-state semantics per RFC 9449:
+    //   - DPoP header absent           → Bearer token flow (Ok(None))
+    //   - DPoP header present + valid  → DPoP-bound token (Ok(Some(thumbprint)))
+    //   - DPoP header present + invalid → 400 invalid_dpop_proof
+    // The previous shape silently downgraded "present but invalid"
+    // to Bearer with a `warn!("allowing for development")`. RFC 9449
+    // §5 requires invalid proofs to fail; that fail-open path is
+    // gone.
+    let dpop_thumbprint =
+        extract_and_verify_dpop_proof(&headers, ctx).await.map_err(|e| {
             crate::metrics::record_oauth_dpop_failure("verification_failed");
-            None
-        }
-    };
+            warn!("DPoP verification failed: {}", e);
+            crate::metrics::record_oauth_token_exchange(
+                "authorization_code",
+                "dpop_invalid",
+                start_time.elapsed().as_secs_f64(),
+            );
+            e
+        })?;
+    if let Some(t) = &dpop_thumbprint {
+        debug!("✓ DPoP proof verified: thumbprint={}", t);
+    }
 
     // Step 7: Generate access and refresh tokens
     let access_token = generate_token("at");
@@ -201,7 +208,7 @@ async fn handle_authorization_code_grant(
             scope, created_at, updated_at, expires_at,
             dpop_thumbprint, device_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(&token_id)
@@ -209,9 +216,9 @@ async fn handle_authorization_code_grant(
     .bind(&auth_request.client_id)
     .bind(&refresh_token)
     .bind(&auth_request.scope)
-    .bind(now)
-    .bind(now)
-    .bind(refresh_expires)
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .bind(refresh_expires.to_rfc3339())
     .bind(dpop_thumbprint)
     .bind(Option::<String>::None) // device_id (TODO: bind to device)
     .execute(&ctx.account_db)
@@ -342,81 +349,37 @@ fn verify_pkce_challenge(code_verifier: &str, code_challenge: &str) -> PdsResult
     Ok(())
 }
 
-/// Extract and verify DPoP proof from request headers
+/// Extract and verify a DPoP proof from request headers, if present.
 ///
-/// Extracts the DPoP JWT from the DPoP header and verifies it.
-/// Returns the JWK thumbprint for token binding.
+/// Three-state outcome:
+///   - `Ok(None)`           — no DPoP header sent; bearer-token flow
+///   - `Ok(Some(thumbprint))` — proof present and verified; bind the
+///                              issued token to this JWK thumbprint
+///   - `Err(_)`             — proof present but invalid; caller maps
+///                              to 400 invalid_dpop_proof
 ///
-/// # Arguments
-/// * `headers` - HTTP request headers
-/// * `ctx` - Application context (for DPoP verifier)
-///
-/// # Returns
-/// JWK thumbprint if verification succeeds
-async fn extract_dpop_proof(headers: &HeaderMap, _ctx: &AppContext) -> PdsResult<String> {
-    // Extract DPoP header
-    let dpop_header = headers
-        .get("DPoP")
-        .ok_or_else(|| PdsError::Authentication("DPoP header missing".to_string()))?
+/// The verification dispatches to `ctx.dpop_verifier`, which performs
+/// signature verification, claim validation (htm/htu/jti replay/exp),
+/// and returns the JWK thumbprint per RFC 9449. No `ath` claim is
+/// required here — issuance proofs predate the access token.
+async fn extract_and_verify_dpop_proof(
+    headers: &HeaderMap,
+    ctx: &AppContext,
+) -> PdsResult<Option<String>> {
+    let Some(raw) = headers.get("DPoP") else {
+        return Ok(None);
+    };
+    let dpop_proof = raw
         .to_str()
-        .map_err(|_| PdsError::Authentication("Invalid DPoP header".to_string()))?;
-
-    // Verify DPoP proof
-    // TODO: Use DPopVerifier from _ctx.dpop_verifier when available
-    // For now, we'll implement basic verification inline
-
-    // Parse JWT to extract JWK
-    use jsonwebtoken::decode_header;
-    let header = decode_header(dpop_header)
-        .map_err(|e| PdsError::Authentication(format!("Invalid DPoP JWT header: {}", e)))?;
-
-    // Extract JWK from header
-    let jwk = header
-        .jwk
-        .ok_or_else(|| PdsError::Authentication("DPoP JWT missing jwk field".to_string()))?;
-
-    // Compute JWK thumbprint
-    let jwk_value = serde_json::to_value(jwk)
-        .map_err(|e| PdsError::Internal(format!("Failed to serialize JWK: {}", e)))?;
-
-    let thumbprint = compute_jwk_thumbprint(&jwk_value)?;
-
-    Ok(thumbprint)
-}
-
-/// Compute JWK thumbprint (SHA-256 hash)
-///
-/// RFC 7638: JSON Web Key (JWK) Thumbprint
-fn compute_jwk_thumbprint(jwk: &serde_json::Value) -> PdsResult<String> {
-    // Extract required fields in canonical order: crv, kty, x, y
-    let kty = jwk["kty"]
-        .as_str()
-        .ok_or_else(|| PdsError::Authentication("JWK missing kty field".to_string()))?;
-    let crv = jwk["crv"]
-        .as_str()
-        .ok_or_else(|| PdsError::Authentication("JWK missing crv field".to_string()))?;
-    let x = jwk["x"]
-        .as_str()
-        .ok_or_else(|| PdsError::Authentication("JWK missing x field".to_string()))?;
-    let y = jwk["y"]
-        .as_str()
-        .ok_or_else(|| PdsError::Authentication("JWK missing y field".to_string()))?;
-
-    // Create canonical JSON representation
-    let canonical = format!(
-        r#"{{"crv":"{}","kty":"{}","x":"{}","y":"{}"}}"#,
-        crv, kty, x, y
-    );
-
-    // Compute SHA-256 hash
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.as_bytes());
-    let hash = hasher.finalize();
-
-    // Encode as base64url
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-    Ok(URL_SAFE_NO_PAD.encode(hash))
+        .map_err(|_| PdsError::Authentication("Invalid DPoP header value".to_string()))?;
+    // Token endpoint URI is the htu claim the proof must commit to.
+    // Service URL + canonical /oauth/token path.
+    let token_endpoint = format!("{}/oauth/token", ctx.service_url());
+    let thumbprint = ctx
+        .dpop_verifier
+        .verify_dpop_proof(dpop_proof, "POST", &token_endpoint, None)
+        .await?;
+    Ok(Some(thumbprint))
 }
 
 /// Generate a random token

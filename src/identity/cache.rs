@@ -4,7 +4,7 @@ use crate::{
     identity::{CachedDidDoc, CachedHandle},
 };
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 
 /// DID cache manager with two-tier TTL support
 ///
@@ -18,7 +18,7 @@ use sqlx::{Row, SqlitePool};
 /// - Should trigger background refresh
 #[derive(Clone)]
 pub struct DidCache {
-    db: SqlitePool,
+    db: AnyPool,
     /// Fresh TTL for DID documents (default: 1 hour)
     /// Data is fresh and served immediately within this period
     did_doc_stale_ttl: Duration,
@@ -37,7 +37,7 @@ impl DidCache {
     /// Defaults:
     /// - DID doc stale: 1 hour, max: 24 hours
     /// - Handle stale: 5 minutes, max: 1 hour
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self {
             db,
             did_doc_stale_ttl: Duration::hours(1),
@@ -86,7 +86,7 @@ impl DidCache {
             r#"
             SELECT did, doc, updated_at, cached_at
             FROM did_doc
-            WHERE did = ?1
+            WHERE did = $1
             "#,
         )
         .bind(did)
@@ -131,7 +131,7 @@ impl DidCache {
         sqlx::query(
             r#"
             INSERT INTO did_doc (did, doc, updated_at, cached_at)
-            VALUES (?1, ?2, ?3, ?4)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT(did) DO UPDATE SET
                 doc = excluded.doc,
                 updated_at = excluded.updated_at,
@@ -151,7 +151,7 @@ impl DidCache {
 
     /// Delete DID document from cache
     pub async fn delete_did_doc(&self, did: &str) -> PdsResult<()> {
-        sqlx::query("DELETE FROM did_doc WHERE did = ?1")
+        sqlx::query("DELETE FROM did_doc WHERE did = $1")
             .bind(did)
             .execute(&self.db)
             .await
@@ -175,7 +175,7 @@ impl DidCache {
             r#"
             SELECT handle, did, declared_at, updated_at
             FROM did_handle
-            WHERE handle = ?1
+            WHERE handle = $1
             "#,
         )
         .bind(&normalized)
@@ -223,7 +223,7 @@ impl DidCache {
         sqlx::query(
             r#"
             INSERT INTO did_handle (handle, did, updated_at)
-            VALUES (?1, ?2, ?3)
+            VALUES ($1, $2, $3)
             ON CONFLICT(handle) DO UPDATE SET
                 did = excluded.did,
                 updated_at = excluded.updated_at
@@ -243,7 +243,7 @@ impl DidCache {
     pub async fn delete_handle(&self, handle: &str) -> PdsResult<()> {
         let normalized = handle.to_lowercase();
 
-        sqlx::query("DELETE FROM did_handle WHERE handle = ?1")
+        sqlx::query("DELETE FROM did_handle WHERE handle = $1")
             .bind(&normalized)
             .execute(&self.db)
             .await
@@ -258,7 +258,7 @@ impl DidCache {
             r#"
             SELECT handle
             FROM did_handle
-            WHERE did = ?1
+            WHERE did = $1
             ORDER BY updated_at DESC
             LIMIT 1
             "#,
@@ -284,14 +284,14 @@ impl DidCache {
         let handle_cutoff = (Utc::now() - self.handle_max_ttl).to_rfc3339();
 
         // Delete DID documents past max_ttl
-        let did_result = sqlx::query("DELETE FROM did_doc WHERE cached_at < ?1")
+        let did_result = sqlx::query("DELETE FROM did_doc WHERE cached_at < $1")
             .bind(&did_doc_cutoff)
             .execute(&self.db)
             .await
             .map_err(PdsError::Database)?;
 
         // Delete handles past max_ttl
-        let handle_result = sqlx::query("DELETE FROM did_handle WHERE updated_at < ?1")
+        let handle_result = sqlx::query("DELETE FROM did_handle WHERE updated_at < $1")
             .bind(&handle_cutoff)
             .execute(&self.db)
             .await
@@ -318,8 +318,25 @@ fn parse_timestamp(s: &str) -> PdsResult<DateTime<Utc>> {
 mod tests {
     use super::*;
 
+    /// Initialise the sqlx Any driver registry once per process, then
+    /// open a SQLite-backed `AnyPool` to in-memory storage with a single
+    /// connection. The single-connection cap is required because each
+    /// connection to `:memory:` has its own private database — without
+    /// it, the schema setup query and the DidCache queries can land on
+    /// different connections and the second sees an empty database.
+    async fn open_any_memory_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     async fn create_test_cache() -> DidCache {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_any_memory_pool().await;
 
         // Create tables
         sqlx::query(
@@ -408,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stale_did_doc_detection() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_any_memory_pool().await;
 
         // Create tables
         sqlx::query(
@@ -460,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stale_handle_detection() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_any_memory_pool().await;
 
         // Create tables
         sqlx::query(
@@ -511,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_preserves_stale_entries() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_any_memory_pool().await;
 
         // `cleanup_expired` deletes from BOTH `did_doc` and `did_handle`,
         // so both tables must exist or the call panics. The original

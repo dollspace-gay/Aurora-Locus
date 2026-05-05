@@ -1,6 +1,6 @@
 [package]
 name = "aurora-locus"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Aurora Locus Contributors"]
 description = "ATProto Personal Data Server implementation in Rust"
@@ -15,13 +15,13 @@ argon2 = { version = "0.5", features = ["std"] }
 
 # HTTP Server
 axum = { version = "0.7", features = ["tokio", "ws"] }
-axum-extra = { version = "0.9", features = ["typed-header"] }
+axum-extra = { version = "0.9", features = ["typed-header", "query"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors", "compression-gzip"] }
 futures = "0.3"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "any", "chrono", "uuid"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -53,10 +53,10 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 # Random generation
 rand = "0.8"
 
-# Blob storage (S3) - Temporarily disabled due to Windows build issues
-# aws-sdk-s3 = "1"
-# aws-config = "1"
-# aws-credential-types = "1"
+# Blob storage (S3)
+aws-sdk-s3 = "1"
+aws-config = "1"
+aws-credential-types = "1"
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
@@ -120,6 +120,18 @@ dashmap = "6.1.0"
 moka = { version = "0.12.11", features = ["future"] }
 flate2 = "1.1.5"
 
+# TAR archive serialization for tools.aurora.admin.exportAccountForensic
+# (Phase 3.8 / chainlink #105 / docs/AURORA_ADMIN_UI_DESIGN.md §8.7).
+tar = "0.4"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+# Direct access to the same query-string format axum's Query extractor
+# uses, so PaginationParams deserialization can be exercised end-to-end
+# in unit tests (mirrors the over-the-wire path of /xrpc handlers).
+serde_urlencoded = "0.7"
+# Phase 4.4 (chainlink #91): real-Postgres integration tests for
+# multi-instance leader election and LISTEN/NOTIFY cache invalidation.
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }

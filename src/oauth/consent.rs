@@ -38,6 +38,15 @@ use sqlx::Row;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+
+/// Parse RFC3339 timestamp string to DateTime<Utc>. Required for sqlx::Any
+/// since chrono types don't implement Type<Any>. See chainlink #76.
+fn parse_ts(s: &str) -> Result<chrono::DateTime<chrono::Utc>, crate::error::PdsError> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| crate::error::PdsError::Internal(format!("Invalid timestamp: {}", e)))
+}
+
 /// Consent screen query parameters
 #[derive(Debug, Deserialize)]
 pub struct ConsentQuery {
@@ -261,8 +270,8 @@ pub async fn grant_authorization(
     sqlx::query(
         r#"
         UPDATE authorization_request
-        SET authorization_code = ?
-        WHERE request_id = ?
+        SET authorization_code = $1
+        WHERE request_id = $2
         "#,
     )
     .bind(&authorization_code)
@@ -320,7 +329,7 @@ pub async fn deny_authorization(
     let result = sqlx::query(
         r#"
         DELETE FROM authorization_request
-        WHERE request_id = ?
+        WHERE request_id = $1
         "#,
     )
     .bind(&form.request_id)
@@ -375,11 +384,11 @@ pub async fn mark_code_as_used(ctx: &AppContext, authorization_code: &str) -> Pd
     let result = sqlx::query(
         r#"
         UPDATE authorization_request
-        SET code_used = 1, code_used_at = ?
-        WHERE authorization_code = ? AND code_used = 0
+        SET code_used = TRUE, code_used_at = $1
+        WHERE authorization_code = $2 AND code_used = FALSE
         "#,
     )
-    .bind(now)
+    .bind(now.to_rfc3339())
     .bind(authorization_code)
     .execute(&ctx.account_db)
     .await?;
@@ -420,7 +429,7 @@ pub async fn get_request_by_code(
             authorization_code, scope, redirect_uri, state, created_at, expires_at,
             code_used, code_used_at
         FROM authorization_request
-        WHERE authorization_code = ?
+        WHERE authorization_code = $1
         "#,
     )
     .bind(authorization_code)
@@ -434,7 +443,7 @@ pub async fn get_request_by_code(
     })?;
 
     // Check if expired
-    let expires_at: chrono::DateTime<Utc> = row.get("expires_at");
+    let expires_at: chrono::DateTime<Utc> = parse_ts(&row.get::<String, _>("expires_at"))?;
     if expires_at < Utc::now() {
         return Err(PdsError::Authentication(
             "Authorization code expired".to_string(),
@@ -442,7 +451,7 @@ pub async fn get_request_by_code(
     }
 
     // Check if already used
-    let code_used: bool = row.get("code_used");
+    let code_used: bool = crate::db::read_bool(&row, "code_used")?;
     if code_used {
         return Err(PdsError::Authentication(
             "Authorization code already used".to_string(),
@@ -460,10 +469,14 @@ pub async fn get_request_by_code(
         scope: row.get("scope"),
         redirect_uri: row.get("redirect_uri"),
         state: row.get("state"),
-        created_at: row.get("created_at"),
-        expires_at: row.get("expires_at"),
-        code_used: row.get("code_used"),
-        code_used_at: row.get("code_used_at"),
+        created_at: parse_ts(&row.get::<String, _>("created_at"))?,
+        expires_at: parse_ts(&row.get::<String, _>("expires_at"))?,
+        code_used: crate::db::read_bool(&row, "code_used")?,
+        code_used_at: row
+            .get::<Option<String>, _>("code_used_at")
+            .as_deref()
+            .map(parse_ts)
+            .transpose()?,
     })
 }
 

@@ -250,6 +250,7 @@ fn validate_storage_config(config: &ServerConfig, issues: &mut Vec<ValidationIss
             access_key_id,
             secret_access_key,
             endpoint,
+            ..
         } => {
             if bucket.is_empty() {
                 issues.push(ValidationIssue::error(

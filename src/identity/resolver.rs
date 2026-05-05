@@ -755,10 +755,25 @@ impl IdentityResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::SqlitePool;
+    use sqlx::AnyPool;
+
+    /// Open a single-connection SQLite-backed `AnyPool` for tests. The
+    /// single-connection cap is required because each connection to
+    /// `:memory:` has its own private database. Mirror of the helper in
+    /// `super::cache::tests::open_any_memory_pool`.
+    async fn open_test_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
 
     async fn create_test_resolver() -> IdentityResolver {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         // Create cache tables
         sqlx::query(
@@ -870,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_custom_plc_directory_url() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         // Create cache tables
         sqlx::query(
@@ -935,7 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_plc_url_trailing_slash_handling() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         // Create cache tables
         sqlx::query(

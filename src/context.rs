@@ -3,8 +3,8 @@ use crate::{
     account::AccountManager,
     actor_store::{ActorStore, ActorStoreConfig},
     admin::{AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager, ReportManager},
-    blob_store::{BlobStore, BlobStoreConfig},
-    config::ServerConfig,
+    blob_store::{BlobBackendType, BlobStorageConfig, BlobStore, BlobStoreConfig},
+    config::{BlobstoreConfig, ServerConfig},
     db,
     error::{PdsError, PdsResult},
     federation::{
@@ -21,14 +21,16 @@ use crate::{
     read_after_write::LocalRecordsCache,
     sequencer::{Sequencer, SequencerConfig},
 };
-use sqlx::SqlitePool;
 use std::sync::Arc;
 
 /// Application context holding all shared services
 #[derive(Clone)]
 pub struct AppContext {
     pub config: Arc<ServerConfig>,
-    pub account_db: SqlitePool,
+    /// Shared-database pool for account, sequencer, OAuth tables, etc.
+    /// Backend is selected by `config.database.backend` (SQLite or
+    /// Postgres). `AnyPool` makes the dispatch transparent to consumers.
+    pub account_db: sqlx::AnyPool,
     pub account_manager: Arc<AccountManager>,
     pub actor_store: Arc<ActorStore>,
     pub blob_store: Arc<BlobStore>,
@@ -53,10 +55,20 @@ pub struct AppContext {
     pub pds_discovery: Option<Arc<PdsDiscovery>>,
     pub federated_search: Option<Arc<FederatedSearch>>,
     pub nonce_store: Option<Arc<NonceStore>>,
-    // DPoP support (Phase 4)
+    /// DPoP §8 nonce challenge store. Federation-gated because the
+    /// `/xrpc/com.atproto.federation.getDpopNonce` endpoint is the
+    /// only thing that issues server-side nonces. The DPoP verifier
+    /// (next field) holds its own Arc to the same store when
+    /// federation is enabled, or to a dedicated store otherwise — the
+    /// keyspaces don't conflict.
     pub dpop_nonce_store: Option<Arc<DPopNonceStore>>,
-    #[allow(dead_code)] // Future DPoP verification
-    pub dpop_verifier: Option<Arc<DPopVerifier>>,
+    /// DPoP verifier — always present. Used by the OAuth token
+    /// endpoint at issuance and by `OAuthAuthContext` on every
+    /// resource request that has a DPoP-bound token. RFC 9449 §4.3
+    /// `ath` binding is checked at the resource-request site; the
+    /// JTI replay set is shared with the federation §8 challenge
+    /// store when federation is enabled (see field above).
+    pub dpop_verifier: Arc<DPopVerifier>,
     // Rate limiter
     pub rate_limiter: Arc<RateLimiter>,
     // Distributed rate limiter (Redis-backed, for multi-instance deployments)
@@ -66,6 +78,12 @@ pub struct AppContext {
     pub mailer: Arc<Mailer>,
     // Read-after-write cache
     pub local_records_cache: Arc<LocalRecordsCache>,
+    /// Front door for cache invalidations — does local invalidation
+    /// plus (Postgres only) cross-instance NOTIFY emit. Write handlers
+    /// call `cache_invalidator.invalidate_did(did)` instead of touching
+    /// `local_records_cache.invalidate_did` directly. See
+    /// chainlink #90 / docs/AURORA_DESIGN.md §5.4.2.
+    pub cache_invalidator: Arc<crate::cache::invalidation::CacheInvalidator>,
 }
 
 impl AppContext {
@@ -77,15 +95,15 @@ impl AppContext {
         // Create data directories if they don't exist
         Self::ensure_directories(&config).await?;
 
-        // Initialize account database
+        // Open the shared-database pool. `db::create_any_pool` dispatches
+        // on `config.database.backend` to either SQLite (using the
+        // configured file path as the fallback) or Postgres (using the
+        // configured URL). Phase 3 (chainlink #76) collapsed the
+        // dual-pool transient that existed during the SqlitePool→AnyPool
+        // refactor into this single AnyPool.
         let account_db =
-            db::create_pool(&config.storage.account_db, db::DatabaseOptions::default()).await?;
-
-        // Run database migrations (includes OAuth tables)
-        db::run_migrations(&account_db).await?;
-
-        // Test connection
-        db::test_connection(&account_db).await?;
+            db::create_any_pool(&config.database, &config.storage.account_db).await?;
+        db::run_any_migrations(&account_db, &config.database).await?;
 
         // Initialize account manager
         let account_manager = Arc::new(AccountManager::new(
@@ -100,37 +118,49 @@ impl AppContext {
         };
         let actor_store = Arc::new(ActorStore::new(actor_store_config));
 
-        // Initialize blob store
-        let blob_store_config = BlobStoreConfig::default();
-        let blob_store = Arc::new(BlobStore::new(blob_store_config, account_db.clone())?);
+        // Initialize blob store. Convert the config-layer `BlobstoreConfig`
+        // to the storage-layer `BlobBackendType`, then hand it to
+        // `BlobStore::new` which dispatches to the disk or S3 backend.
+        let blob_store_config = build_blob_store_config(&config)?;
+        let blob_store =
+            Arc::new(BlobStore::new(blob_store_config, account_db.clone()).await?);
 
-        // Initialize identity cache database with WAL mode enabled
-        // WAL mode provides better read concurrency - reads don't block during cache writes
-        let did_cache_db = db::create_pool(
-            &config.storage.did_cache_db,
-            db::DatabaseOptions {
-                max_connections: 10,
-                enable_wal: true, // Enable WAL mode for concurrent reads during writes
+        // Initialize identity cache database. The DidCache holds an
+        // AnyPool that dispatches to the configured backend. SQLite-only
+        // tuning (WAL mode, autocheckpoint, synchronous=NORMAL) is
+        // applied via PRAGMA when the backend is SQLite; PRAGMAs are
+        // a no-op via sqlx::query on Postgres but the early-return
+        // guards against accidentally running them.
+        //
+        // The cache uses its own DatabaseConfig synthesized from the
+        // configured did_cache_db path so that operators don't have to
+        // configure a separate Postgres database for the cache — for now
+        // it always uses SQLite at the configured file path. (Future
+        // work: a separate cache backend selector if desired.)
+        let did_cache_db = {
+            let cache_config = crate::config::DatabaseConfig {
+                backend: crate::config::DatabaseBackend::Sqlite,
+                url: None,
+                ..config.database.clone()
+            };
+            db::create_any_pool(&cache_config, &config.storage.did_cache_db).await?
+        };
+        db::run_any_migrations(
+            &did_cache_db,
+            &crate::config::DatabaseConfig {
+                backend: crate::config::DatabaseBackend::Sqlite,
+                url: None,
+                ..config.database.clone()
             },
         )
         .await?;
-
-        // Run migrations for identity cache
-        db::run_migrations(&did_cache_db).await?;
-
-        // Configure WAL checkpoint settings for optimal performance
-        // autocheckpoint=1000 pages (~4MB with default 4KB page size)
-        sqlx::query("PRAGMA wal_autocheckpoint = 1000")
+        // SQLite tuning PRAGMAs (silent no-ops if Postgres ever takes over).
+        let _ = sqlx::query("PRAGMA wal_autocheckpoint = 1000")
             .execute(&did_cache_db)
-            .await
-            .map_err(PdsError::Database)?;
-
-        // Set synchronous=NORMAL for better write performance while maintaining durability
-        // NORMAL is safe with WAL mode and provides good balance of performance/safety
-        sqlx::query("PRAGMA synchronous = NORMAL")
+            .await;
+        let _ = sqlx::query("PRAGMA synchronous = NORMAL")
             .execute(&did_cache_db)
-            .await
-            .map_err(PdsError::Database)?;
+            .await;
 
         // Initialize identity resolver with separate WAL-enabled cache database
         let did_cache = DidCache::new(did_cache_db).with_did_doc_ttls(
@@ -226,22 +256,89 @@ impl AppContext {
             None
         };
 
-        // Initialize DPoP support (Phase 4)
-        let (dpop_nonce_store, dpop_verifier) = if config.federation.enabled {
-            tracing::info!("Initializing DPoP support for client-to-PDS authentication");
-            let dpop_nonce = Arc::new(DPopNonceStore::new());
-            let dpop_verify = Arc::new(DPopVerifier::new(Arc::clone(&dpop_nonce)));
-            (Some(dpop_nonce), Some(dpop_verify))
+        // Initialize DPoP support. Verifier is always constructed —
+        // DPoP is an OAuth concern, not federation-gated. The
+        // §8 server-issued nonce store is federation-gated because
+        // only the federation-namespace endpoint issues those nonces;
+        // when federation is off the verifier still has its own JTI
+        // replay tracker (separate Arc), which is what RFC 9449 §11.1
+        // requires regardless of the §8 challenge flow.
+        let dpop_nonce_store: Option<Arc<DPopNonceStore>> = if config.federation.enabled {
+            tracing::info!(
+                "Initializing DPoP §8 nonce challenge store (federation enabled)"
+            );
+            Some(Arc::new(DPopNonceStore::new()))
         } else {
-            (None, None)
+            None
+        };
+        let dpop_verifier = {
+            let store_for_verifier = match &dpop_nonce_store {
+                Some(s) => Arc::clone(s),
+                None => Arc::new(DPopNonceStore::new()),
+            };
+            Arc::new(DPopVerifier::new(store_for_verifier))
         };
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database)
-        let sequencer = Arc::new(Sequencer::with_relay(
+        let mut seq = Sequencer::with_relay(
             account_db.clone(),
             SequencerConfig::default(),
             relay_client.clone(),
-        ));
+        );
+
+        // Multi-instance leader election (Postgres only). SQLite
+        // deployments are inherently single-instance and skip election;
+        // the sequencer's default-true `is_leader` flag remains in place.
+        // See chainlink #89 / docs/AURORA_DESIGN.md §5.4.1.
+        //
+        // The election task runs for the lifetime of the process and is
+        // not joined explicitly here — graceful shutdown is handled by
+        // the runtime tearing down. A future refactor to expose a
+        // top-level shutdown handle could call LeaderElection::shutdown
+        // for explicit `pg_advisory_unlock` on cooperative termination
+        // (see chainlink #89 / design doc §3.5 and the `ShutdownHandle`
+        // open question).
+        if matches!(
+            config.database.backend,
+            crate::config::DatabaseBackend::Postgres
+        ) {
+            use crate::sequencer::{
+                LeaderElection, LeaderElectionConfig, PostgresLockProvider,
+                SEQUENCER_LEADER_LOCK_KEY,
+            };
+            // Standby until first acquire tick.
+            seq.attach_leader_flag(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            // Threading the URL (rather than the pool) into the
+            // provider gives it a dedicated lock connection separate
+            // from the application pool, per
+            // POSTGRES_PHASE_4 §5.1's pool_size+2 sizing rule. The
+            // +2 are the lock connection (this one) and the LISTEN
+            // connection (cache::invalidation).
+            let leader_db_url = config.database.url.clone().ok_or_else(|| {
+                PdsError::Validation(
+                    "PDS_DB_URL is required for Postgres backend leader election".to_string(),
+                )
+            })?;
+            let provider = Arc::new(PostgresLockProvider::new(
+                leader_db_url,
+                SEQUENCER_LEADER_LOCK_KEY,
+            ));
+            let mut election = LeaderElection::new(provider, seq.leader_flag());
+            election.spawn(LeaderElectionConfig {
+                retry_interval: std::time::Duration::from_millis(
+                    config.database.leader_retry_interval_ms,
+                ),
+            });
+            // Election handle leaks intentionally — it owns the JoinHandle
+            // and lives for the process lifetime. See comment above.
+            std::mem::forget(election);
+            tracing::info!(
+                "Sequencer leader election spawned (retry interval: {}ms)",
+                config.database.leader_retry_interval_ms
+            );
+        }
+
+        let sequencer = Arc::new(seq);
 
         // Initialize distributed rate limiter if Redis is enabled
         let distributed_rate_limiter = if config.rate_limit.use_redis {
@@ -270,16 +367,73 @@ impl AppContext {
             None
         };
 
-        // Initialize rate limiter with Bluesky-compatible endpoint limits
+        // Initialize rate limiter with Bluesky-compatible endpoint limits.
+        // The `exempt_admin_assets` flag is the only env-driven runtime
+        // tuning currently plumbed through; the rest of the runtime quotas
+        // remain at their compiled-in defaults.
         let rate_limiter = Arc::new(RateLimiter::with_bluesky_defaults(
-            crate::rate_limit::RateLimitConfig::default(),
+            crate::rate_limit::RateLimitConfig {
+                exempt_admin_assets: config.rate_limit.exempt_admin_assets,
+                ..crate::rate_limit::RateLimitConfig::default()
+            },
         ));
 
         // Initialize mailer
         let mailer = Arc::new(Mailer::new(config.email.clone())?);
 
-        // Initialize read-after-write cache (5s TTL, 10k entries)
+        // Initialize read-after-write cache (5s TTL, 10k entries) and the
+        // cache invalidator front door. Multi-instance Postgres
+        // deployments wire a NOTIFY emitter so writes here propagate
+        // to other instances; SQLite skips the emitter (single-instance
+        // by definition). See chainlink #90 / docs/AURORA_DESIGN.md §5.4.2.
         let local_records_cache = Arc::new(LocalRecordsCache::new());
+        let notify_emitter: Option<Arc<dyn crate::cache::invalidation::NotifyEmitter>> =
+            if matches!(
+                config.database.backend,
+                crate::config::DatabaseBackend::Postgres
+            ) {
+                Some(Arc::new(crate::cache::invalidation::PostgresNotifyEmitter::new(
+                    account_db.clone(),
+                )))
+            } else {
+                None
+            };
+        let cache_invalidator = Arc::new(crate::cache::invalidation::CacheInvalidator::new(
+            Arc::clone(&local_records_cache),
+            notify_emitter,
+        ));
+
+        // Spawn the LISTEN loop on Postgres so this instance receives
+        // NOTIFYs from peer instances and applies them to its local
+        // cache. SQLite skips entirely. The listener task lives for the
+        // process lifetime; like the leader-election task in Phase 4.2,
+        // we leak the handle here pending a top-level shutdown handle
+        // (chainlink #89 §3.5 follow-up).
+        if matches!(
+            config.database.backend,
+            crate::config::DatabaseBackend::Postgres
+        ) {
+            if let Some(url) = config.database.url.clone() {
+                let listener = crate::cache::invalidation::CacheInvalidationListener::spawn(
+                    url,
+                    Arc::clone(&cache_invalidator),
+                );
+                std::mem::forget(listener);
+                tracing::info!(
+                    channel = crate::cache::invalidation::CHANNEL_NAME,
+                    "Cache invalidation listener spawned"
+                );
+            } else {
+                // Validation in DatabaseConfig::from_env_values rejects
+                // postgres-without-URL, so this branch should be
+                // unreachable in practice. Logging instead of unwrap
+                // keeps the code defensive against config-loading paths
+                // that bypass validation (e.g. test fixtures).
+                tracing::warn!(
+                    "Postgres backend without URL — cache invalidation listener not spawned"
+                );
+            }
+        }
 
         Ok(Self {
             config: Arc::new(config),
@@ -307,6 +461,7 @@ impl AppContext {
             distributed_rate_limiter,
             mailer,
             local_records_cache,
+            cache_invalidator,
         })
     }
 
@@ -350,4 +505,59 @@ impl AppContext {
     pub fn service_did(&self) -> &str {
         &self.config.service.service_did
     }
+}
+
+/// Convert the configuration-layer `BlobstoreConfig` (S3 vs Disk variants
+/// loaded from env vars) into the storage-layer `BlobStoreConfig` that
+/// `BlobStore::new` consumes. Centralised here so the dispatch lives
+/// next to `AppContext::new`'s blob store construction.
+fn build_blob_store_config(config: &ServerConfig) -> PdsResult<BlobStoreConfig> {
+    // `tmp_location` and `temp_dir` are conceptually the same — the disk
+    // backend writes pending uploads to a temp directory before atomically
+    // renaming into place. We keep the config-layer name `tmp_location`
+    // and pass it through to the storage layer's `temp_dir`.
+    let (backend, temp_dir) = match &config.storage.blobstore {
+        BlobstoreConfig::Disk {
+            location,
+            tmp_location,
+        } => (
+            BlobBackendType::Disk {
+                location: location.clone(),
+            },
+            tmp_location.clone(),
+        ),
+        BlobstoreConfig::S3 {
+            bucket,
+            region,
+            access_key_id,
+            secret_access_key,
+            endpoint,
+            prefix,
+            force_path_style,
+            upload_timeout_ms,
+        } => (
+            BlobBackendType::S3 {
+                bucket: bucket.clone(),
+                region: region.clone(),
+                endpoint: endpoint.clone(),
+                access_key_id: access_key_id.clone(),
+                secret_access_key: secret_access_key.clone(),
+                prefix: prefix.clone(),
+                force_path_style: *force_path_style,
+                upload_timeout_ms: *upload_timeout_ms,
+            },
+            // S3 backend doesn't need a local temp dir for blob bodies,
+            // but the wrapper's other code paths still expect one.
+            // Reuse the configured data directory.
+            config.storage.data_directory.join("temp"),
+        ),
+    };
+
+    Ok(BlobStoreConfig {
+        storage: BlobStorageConfig {
+            backend,
+            max_blob_size: config.service.blob_upload_limit,
+            temp_dir,
+        },
+    })
 }

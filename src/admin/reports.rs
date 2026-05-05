@@ -5,7 +5,7 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
 
 /// Report reason types
@@ -110,11 +110,11 @@ pub struct Report {
 /// Report manager
 #[derive(Clone)]
 pub struct ReportManager {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl ReportManager {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -137,10 +137,11 @@ impl ReportManager {
             ));
         }
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO report (subject_did, subject_uri, subject_cid, reason_type, reason, reported_by, reported_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'open')
+            RETURNING id
             "#,
         )
         .bind(subject_did)
@@ -150,11 +151,11 @@ impl ReportManager {
         .bind(reason)
         .bind(reported_by)
         .bind(now.to_rfc3339())
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
         Ok(Report {
-            id: result.last_insert_rowid(),
+            id,
             subject_did: subject_did.map(String::from),
             subject_uri: subject_uri.map(String::from),
             subject_cid: subject_cid.map(String::from),
@@ -177,16 +178,31 @@ impl ReportManager {
         reviewed_by: &str,
         resolution: Option<&str>,
     ) -> PdsResult<()> {
+        let mut tx = self.db.begin().await?;
+        Self::update_status_in_tx(&mut tx, report_id, status, reviewed_by, resolution).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Update report status inside an existing transaction. LB-1 /
+    /// chainlink #129 atomic-with-chain entry point.
+    pub async fn update_status_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        report_id: i64,
+        status: ReportStatus,
+        reviewed_by: &str,
+        resolution: Option<&str>,
+    ) -> PdsResult<()> {
         let now = Utc::now();
 
         let result = sqlx::query(
             r#"
             UPDATE report
-            SET status = ?,
-                reviewed_by = ?,
-                reviewed_at = ?,
-                resolution = ?
-            WHERE id = ?
+            SET status = $1,
+                reviewed_by = $2,
+                reviewed_at = $3,
+                resolution = $4
+            WHERE id = $5
             "#,
         )
         .bind(status.as_str())
@@ -194,7 +210,7 @@ impl ReportManager {
         .bind(now.to_rfc3339())
         .bind(resolution)
         .bind(report_id)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -214,7 +230,7 @@ impl ReportManager {
             SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason,
                    reported_by, reported_at, status, reviewed_by, reviewed_at, resolution
             FROM report
-            WHERE id = ?
+            WHERE id = $1
             "#,
         )
         .bind(report_id)
@@ -240,9 +256,9 @@ impl ReportManager {
                 SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason,
                        reported_by, reported_at, status, reviewed_by, reviewed_at, resolution
                 FROM report
-                WHERE status = ?
+                WHERE status = $1
                 ORDER BY reported_at DESC
-                LIMIT ?
+                LIMIT $2
                 "#,
             )
             .bind(status.as_str())
@@ -254,7 +270,7 @@ impl ReportManager {
                        reported_by, reported_at, status, reviewed_by, reviewed_at, resolution
                 FROM report
                 ORDER BY reported_at DESC
-                LIMIT ?
+                LIMIT $1
                 "#,
             )
             .bind(limit.unwrap_or(100))
@@ -270,7 +286,7 @@ impl ReportManager {
         Ok(reports)
     }
 
-    fn parse_report(&self, row: sqlx::sqlite::SqliteRow) -> PdsResult<Report> {
+    fn parse_report(&self, row: sqlx::any::AnyRow) -> PdsResult<Report> {
         let reason_type_str: String = row.get("reason_type");
         let reason_type = reason_type_str.parse()?;
 
@@ -302,5 +318,80 @@ impl ReportManager {
             reviewed_at,
             resolution: row.get("resolution"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Once;
+
+    async fn open_test_pool() -> AnyPool {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE report (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                reason_type TEXT NOT NULL,
+                reason TEXT,
+                reported_by TEXT NOT NULL,
+                reported_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reviewed_by TEXT,
+                reviewed_at TEXT,
+                resolution TEXT
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    // LB-1 Session 12 / chainlink #129: ReportManager::update_status_in_tx
+    // must roll back when the caller rolls back.
+    #[tokio::test]
+    async fn update_status_in_tx_rolls_back_on_caller_rollback() {
+        let db = open_test_pool().await;
+        let manager = ReportManager::new(db.clone());
+        let report = manager
+            .submit_report(
+                Some("did:plc:victim"),
+                None,
+                None,
+                ReportReason::Spam,
+                Some("test"),
+                "did:plc:reporter",
+            )
+            .await
+            .unwrap();
+
+        {
+            let mut tx = db.begin().await.unwrap();
+            ReportManager::update_status_in_tx(
+                &mut tx,
+                report.id,
+                ReportStatus::Resolved,
+                "did:plc:moderator",
+                Some("would be rolled back"),
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let post = manager.get_report(report.id).await.unwrap().unwrap();
+        assert_eq!(post.status, ReportStatus::Open);
+        assert!(post.resolution.is_none());
     }
 }

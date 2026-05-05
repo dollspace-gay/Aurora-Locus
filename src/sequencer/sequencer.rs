@@ -9,7 +9,8 @@ use crate::{
 };
 use chrono::Utc;
 use serde_cbor;
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -36,27 +37,37 @@ impl Default for SequencerConfig {
 /// Main sequencer - manages event log
 #[derive(Clone)]
 pub struct Sequencer {
-    db: SqlitePool,
+    db: AnyPool,
     config: SequencerConfig,
     last_seq: Arc<RwLock<Option<i64>>>,
     relay_client: Option<Arc<Mutex<RelayClient>>>,
+    /// Multi-instance leadership flag (chainlink #89, design doc §3.5).
+    /// `true` = this process is the sequencer leader and may write
+    /// firehose events; `false` = standby, writes return NotLeader.
+    /// Default `true` preserves single-instance behaviour for SQLite
+    /// deployments and Postgres deployments without leader election
+    /// wired up.
+    is_leader: Arc<AtomicBool>,
 }
 
 impl Sequencer {
-    /// Create a new sequencer
+    /// Create a new sequencer (single-instance mode — `is_leader` defaults
+    /// to true).
     #[allow(dead_code)] // Public API for future use
-    pub fn new(db: SqlitePool, config: SequencerConfig) -> Self {
+    pub fn new(db: AnyPool, config: SequencerConfig) -> Self {
         Self {
             db,
             config,
             last_seq: Arc::new(RwLock::new(None)),
             relay_client: None,
+            is_leader: Arc::new(AtomicBool::new(true)),
         }
     }
 
     /// Create a new sequencer with relay client for federation
+    /// (single-instance mode — `is_leader` defaults to true).
     pub fn with_relay(
-        db: SqlitePool,
+        db: AnyPool,
         config: SequencerConfig,
         relay_client: Option<Arc<Mutex<RelayClient>>>,
     ) -> Self {
@@ -65,11 +76,46 @@ impl Sequencer {
             config,
             last_seq: Arc::new(RwLock::new(None)),
             relay_client,
+            is_leader: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Replace the internal leadership flag with a shared `Arc<AtomicBool>`
+    /// owned by [`super::LeaderElection`]. Call this once during startup
+    /// for multi-instance Postgres deployments before the sequencer sees
+    /// any writes; SQLite and single-instance deployments leave the
+    /// default-true flag in place. See chainlink #89 / design doc §3.5.
+    pub fn attach_leader_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.is_leader = flag;
+    }
+
+    /// Cheap atomic load — checked at the top of every write path.
+    pub fn is_leader(&self) -> bool {
+        self.is_leader.load(Ordering::SeqCst)
+    }
+
+    /// Returns a clone of the leadership flag handle so the leader-election
+    /// task can mutate it.
+    pub fn leader_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.is_leader)
+    }
+
+    /// Reject writes from non-leaders with `PdsError::NotLeader` (HTTP 503).
+    /// Per design doc §3.1 / §7.1: load balancers retry on the next
+    /// instance, eventually landing on the leader.
+    fn check_leader(&self) -> PdsResult<()> {
+        if self.is_leader.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(PdsError::NotLeader(
+                "sequencer leader is on a different instance; retry".to_string(),
+            ))
         }
     }
 
     /// Sequence a commit event
     pub async fn sequence_commit(&self, evt: CommitEvent) -> PdsResult<i64> {
+        self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode commit event: {}", e)))?;
 
@@ -87,6 +133,7 @@ impl Sequencer {
     /// Sequence a sync event (lightweight repo state sync for account creation/activation)
     #[allow(dead_code)] // Will be used when implementing sync events
     pub async fn sequence_sync(&self, evt: SyncEvent) -> PdsResult<i64> {
+        self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode sync event: {}", e)))?;
 
@@ -102,6 +149,7 @@ impl Sequencer {
 
     /// Sequence an identity event
     pub async fn sequence_identity(&self, evt: IdentityEvent) -> PdsResult<i64> {
+        self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode identity event: {}", e)))?;
 
@@ -118,6 +166,7 @@ impl Sequencer {
     /// Sequence an account event
     #[allow(dead_code)] // Will be used when implementing account status changes
     pub async fn sequence_account(&self, evt: AccountEvent) -> PdsResult<i64> {
+        self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)
             .map_err(|e| PdsError::Internal(format!("Failed to encode account event: {}", e)))?;
 
@@ -143,7 +192,7 @@ impl Sequencer {
         let result = sqlx::query(
             r#"
             INSERT INTO repo_seq (did, event_type, event, sequenced_at)
-            VALUES (?1, ?2, ?3, ?4)
+            VALUES ($1, $2, $3, $4)
             RETURNING seq
             "#,
         )
@@ -171,7 +220,7 @@ impl Sequencer {
         // sqlx maps that NULL onto `None` instead of falling back through
         // `.try_get(...).ok()`, which can produce `Some(0)` on some sqlx
         // versions when decoding NULL into a non-Option `i64`.
-        let result = sqlx::query("SELECT MAX(seq) as max_seq FROM repo_seq WHERE invalidated = 0")
+        let result = sqlx::query("SELECT MAX(seq) as max_seq FROM repo_seq WHERE NOT invalidated")
             .fetch_one(&self.db)
             .await
             .map_err(PdsError::Database)?;
@@ -186,7 +235,7 @@ impl Sequencer {
             r#"
             SELECT seq, did, event_type, event, invalidated, sequenced_at
             FROM repo_seq
-            WHERE seq > ?1 AND invalidated = 0
+            WHERE seq > $1 AND NOT invalidated
             ORDER BY seq ASC
             LIMIT 1
             "#,
@@ -219,9 +268,9 @@ impl Sequencer {
             r#"
             SELECT seq, did, event_type, event, invalidated, sequenced_at
             FROM repo_seq
-            WHERE seq > ?1 AND invalidated = 0
+            WHERE seq > $1 AND NOT invalidated
             ORDER BY seq ASC
-            LIMIT ?2
+            LIMIT $2
             "#,
         )
         .bind(cursor)
@@ -246,7 +295,7 @@ impl Sequencer {
         let limit = limit.unwrap_or(500).min(self.config.max_query_limit);
 
         let mut query_str = String::from(
-            "SELECT seq, did, event_type, event, invalidated, sequenced_at FROM repo_seq WHERE invalidated = 0"
+            "SELECT seq, did, event_type, event, invalidated, sequenced_at FROM repo_seq WHERE NOT invalidated"
         );
 
         let mut conditions = Vec::new();
@@ -281,7 +330,7 @@ impl Sequencer {
     }
 
     /// Convert database row to SeqRow
-    fn row_to_seq_row(&self, row: sqlx::sqlite::SqliteRow) -> PdsResult<SeqRow> {
+    fn row_to_seq_row(&self, row: sqlx::any::AnyRow) -> PdsResult<SeqRow> {
         use chrono::DateTime;
 
         Ok(SeqRow {
@@ -289,7 +338,9 @@ impl Sequencer {
             did: row.try_get("did")?,
             event_type: row.try_get("event_type")?,
             event: row.try_get("event")?,
-            invalidated: row.try_get::<i32, _>("invalidated")? != 0,
+            // BOOLEAN on Postgres, INTEGER 0/1 on SQLite — sqlx::Any
+            // requires reading SQLite INTEGER as i64 and converting; chainlink #76.
+            invalidated: crate::db::read_bool(&row, "invalidated")?,
             sequenced_at: {
                 let time_str: String = row.try_get("sequenced_at")?;
                 DateTime::parse_from_rfc3339(&time_str)
@@ -396,9 +447,9 @@ impl Sequencer {
             r#"
             SELECT seq, did, event_type, event, invalidated, sequenced_at
             FROM repo_seq
-            WHERE did = ?1 AND invalidated = 0
+            WHERE did = $1 AND NOT invalidated
             ORDER BY seq DESC
-            LIMIT ?2
+            LIMIT $2
             "#,
         )
         .bind(did)
@@ -421,10 +472,21 @@ impl Sequencer {
 
 #[cfg(test)]
 mod tests {
+    async fn open_test_pool() -> sqlx::AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     use super::*;
 
     async fn create_test_sequencer() -> Sequencer {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         // Create table
         sqlx::query(

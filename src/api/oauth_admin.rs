@@ -260,9 +260,12 @@ async fn handle_oauth_callback(
     let did = token_set.sub.clone();
     tracing::info!("OAuth authentication successful for DID: {}", did);
 
-    // Admin authorisation check.
-    let is_configured_admin = ctx.config.authentication.admin_dids.contains(&did);
-
+    // Admin authorisation check. Authority comes from the admin_role
+    // table only — PDS_ADMIN_DIDS does not by itself imply a role.
+    // The first SuperAdmin must be inserted directly into admin_role
+    // per the bootstrap path in README "First Admin User"; subsequent
+    // grants flow through tools.aurora.superadmin.grantRole and the
+    // audit chain.
     let admin_role = ctx.admin_role_manager.get_role(&did).await.map_err(|e| {
         tracing::error!("Failed to query admin role: {}", e);
         (
@@ -271,21 +274,15 @@ async fn handle_oauth_callback(
         )
     })?;
 
-    let is_admin = is_configured_admin || admin_role.is_some();
-
-    if !is_admin {
+    let Some(ref admin_role) = admin_role else {
         tracing::warn!("User {} is not an admin on this PDS", did);
         return Err((
             StatusCode::FORBIDDEN,
             "User is not authorized as an admin on this PDS".to_string(),
         ));
-    }
-
-    let role = if let Some(ref admin_role) = admin_role {
-        Some(admin_role.role.as_str().to_string())
-    } else {
-        Some("superadmin".to_string())
     };
+
+    let role = Some(admin_role.role.as_str().to_string());
 
     tracing::info!("Admin {} authenticated with role {:?}", did, role);
 

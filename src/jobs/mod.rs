@@ -83,6 +83,7 @@ impl JobScheduler {
         tokio::spawn(Self::identity_cache_cleanup_job(Arc::clone(&self)));
         tokio::spawn(Self::account_deletion_job(Arc::clone(&self)));
         tokio::spawn(Self::temp_blob_cleanup_job(Arc::clone(&self)));
+        tokio::spawn(Self::mod_event_seq_cleanup_job(Arc::clone(&self)));
 
         // Spawn monitoring tasks
         tokio::spawn(Self::health_check_job(Arc::clone(&self)));
@@ -192,6 +193,42 @@ impl JobScheduler {
                     }
                 }
                 Err(e) => error!("Failed to purge deleted accounts: {}", e),
+            }
+        }
+    }
+
+    /// Retention-bound the `mod_event_seq` table (runs every 24
+    /// hours). Per chainlink #115 / docs/AURORA_ADMIN_UI_DESIGN.md
+    /// §3.5, the live subscription channel is retention-bounded
+    /// while `moderation_event` retains forever. Window controlled
+    /// by `PDS_MOD_EVENT_RETENTION_DAYS` env var (default 7). Best-
+    /// effort: a failed run logs at warn-level; the next run picks
+    /// up the work. The table grows by one window's worth on a
+    /// missed cleanup, no operational urgency.
+    async fn mod_event_seq_cleanup_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(86400)); // Every 24 hours
+
+        loop {
+            interval.tick().await;
+            let retention = tasks::mod_event_retention_days();
+            info!(
+                "Running mod_event_seq cleanup (retention: {} days)",
+                retention
+            );
+
+            match tasks::cleanup_mod_event_seq(&scheduler.context).await {
+                Ok(count) => {
+                    if count > 0 {
+                        info!(
+                            "Cleaned up {} mod_event_seq rows older than {} days",
+                            count, retention
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    "Failed to cleanup mod_event_seq (retention {} days): {}",
+                    retention, e
+                ),
             }
         }
     }

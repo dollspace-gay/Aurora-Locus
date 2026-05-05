@@ -7,12 +7,14 @@ pub mod disk;
 pub mod mime;
 pub mod models;
 pub mod quarantine;
-// Temporarily disabled due to AWS SDK build issues on Windows
-// pub mod s3;
+pub mod s3;
 pub mod store;
 
 pub use models::*;
-// pub use s3::{S3BlobBackend, S3Config};
+// Phase 2 (#72) will wire AppContext to construct S3BlobBackend; until
+// then the re-export is unused at bin-scope. The allow lifts in Phase 2.
+#[allow(unused_imports)]
+pub use s3::{S3BlobBackend, S3Config};
 pub use store::{BlobStore, BlobStoreConfig};
 
 use crate::error::PdsResult;
@@ -74,11 +76,22 @@ pub enum BlobBackendType {
     /// Store blobs on local disk
     Disk { location: PathBuf },
 
-    /// Store blobs in S3-compatible storage
-    #[allow(dead_code)]
+    /// Store blobs in S3-compatible storage. Phase 2 (#72) added the
+    /// credential and prefix fields; Phase 3 (#73) added `force_path_style`
+    /// and `upload_timeout_ms` for parity with bsky-PDS env-var conventions.
     S3 {
         bucket: String,
         region: String,
         endpoint: Option<String>,
+        access_key_id: String,
+        secret_access_key: String,
+        /// S3 object key prefix (default `"blobs/"`).
+        prefix: String,
+        /// Path-style addressing toggle (default `false`; set `true` for
+        /// MinIO and other S3-compatible providers without virtual-host
+        /// support).
+        force_path_style: bool,
+        /// Upload operation timeout in milliseconds (default `20000`).
+        upload_timeout_ms: u64,
     },
 }

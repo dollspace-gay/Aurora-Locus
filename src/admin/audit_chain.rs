@@ -1,0 +1,1631 @@
+//! Hash-chained audit log + snapshot infrastructure (Phase 3.8 /
+//! chainlink #105 / docs/AURORA_ADMIN_UI_DESIGN.md §3.4, §8.4).
+//!
+//! Two co-equal pieces:
+//! - **audit_snapshot** — content captured at decision time. The
+//!   snapshot is what the subject looked like when an operator made
+//!   a call.
+//! - **audit_chain_entry** — append-only chain of operator decisions.
+//!   Each entry's `current_hash` is SHA-256 over its content plus
+//!   the previous entry's hash, giving tamper-evident replay.
+//!
+//! Verification: re-hash the entry content + previous_hash, compare
+//! against current_hash. If any field changes between write and
+//! later inspection, the recomputed hash diverges and the entry's
+//! `verified` flag flips false.
+//!
+//! Pre-Phase-3.8 events have neither — the historical
+//! `moderation_event` rows pre-date this infrastructure. Per §8.4
+//! they surface in `getAuditTrail` with `current_hash="pre-chain"`
+//! sentinel and `verified=false` so consumers know the difference.
+
+use crate::{admin::defs::Subject, error::PdsError};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use sqlx::{AnyPool, Row};
+use std::sync::OnceLock;
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Process-local serialization guard for chain appends. Combined
+/// with the per-call transaction and (on Postgres) the advisory
+/// lock inside that transaction, this gives correct behavior under
+/// concurrent multi-writer load on both backends:
+///
+/// - SQLite: the engine serializes WRITES at the database level,
+///   but a `BEGIN DEFERRED` transaction running SELECT-head + INSERT
+///   can't atomically upgrade SHARED → RESERVED if another writer
+///   already holds RESERVED, so it returns SQLITE_BUSY. Per-process
+///   mutex ahead of the transaction makes the SELECT-head + INSERT
+///   sequence single-flighted within the process; SQLite's own write
+///   lock takes care of cross-process serialization (in v0.2 SQLite
+///   deployments are single-instance anyway).
+///
+/// - Postgres: this mutex is mostly cheap-no-op overhead because
+///   pg_advisory_xact_lock already serializes appenders inside the
+///   transaction. It serves as a small in-process queue ahead of
+///   the network round-trip — useful for keeping appenders fair
+///   under bursty load — but the cross-process correctness comes
+///   from the advisory lock, not this mutex.
+fn append_serialize_guard() -> &'static AsyncMutex<()> {
+    static GUARD: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| AsyncMutex::new(()))
+}
+
+/// Stable advisory-lock key for the audit_chain_entry table. Held
+/// inside a Postgres transaction during `append_entry` to serialize
+/// the read-head + insert-next-row sequence; without this, two
+/// concurrent appends both observe head = (N, hash X) and both
+/// compute next = (N+1, prev_hash=X), producing a UNIQUE-constraint
+/// race that loses one entry per collision.
+///
+/// Derivation matches `SEQUENCER_LEADER_LOCK_KEY` (same const-time
+/// SHA-256 → first 8 bytes BE → i64 pattern) but over a different
+/// input string so the keyspaces don't collide.
+///
+/// SQLite gets serialization for free via its database-level write
+/// lock; the advisory-lock query is skipped on SQLite. The
+/// surrounding transaction provides equivalent ordering on both
+/// backends.
+pub const AUDIT_CHAIN_LOCK_KEY: i64 = audit_chain_lock_key();
+
+const fn audit_chain_lock_key() -> i64 {
+    // SHA-256("aurora.audit_chain") first 8 bytes (big-endian) as i64.
+    // Pre-computed for const-time evaluation. Verified by
+    // `audit_chain_lock_key_matches_runtime_hash` against a fresh
+    // runtime computation, AND by `audit_chain_lock_key_distinct_from_leader`
+    // against the sequencer leader lock so the two keyspaces don't
+    // collide.
+    i64::from_be_bytes([0x2a, 0x28, 0x50, 0x8f, 0x76, 0xb6, 0x8d, 0x08])
+}
+
+/// One audit chain entry. Ships in `getAuditTrail` responses and is
+/// what the Audit page renders rows for.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEntry {
+    pub id: String,
+    pub sequence: i64,
+    pub timestamp: DateTime<Utc>,
+    pub actor_did: String,
+    pub action: String,
+    pub subject_ref: Option<Subject>,
+    pub rationale: String,
+    pub snapshot_id: Option<String>,
+    pub event_id: Option<String>,
+    pub current_hash: String,
+    pub previous_hash: Option<String>,
+    pub verified: bool,
+    pub cascade_subjects: Vec<Subject>,
+}
+
+/// Compact subject capture for snapshot content. v0.2 ships the
+/// account-shape; record/blob shapes added in v0.3 when per-record
+/// state is more meaningful (Phase 3.7 aggregations open the door).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotContent {
+    pub kind: &'static str,
+    /// Non-empty for account snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub takedown_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deactivated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_action: Option<String>,
+    /// Non-empty for record snapshots; future-friendly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+}
+
+/// Capture a snapshot for the given subject. Returns the snapshot's
+/// row id if a meaningful snapshot was captured; `None` for subjects
+/// that aren't snapshottable yet (per §3.4: "snapshot capture is
+/// opt-out for actions that don't benefit from snapshots").
+pub async fn capture_snapshot(
+    db: &AnyPool,
+    subject: &Subject,
+) -> Result<Option<i64>, PdsError> {
+    let content = match subject {
+        Subject::Repo { did } => fetch_account_snapshot(db, did).await?,
+        Subject::Record { uri, cid } => SnapshotContent {
+            kind: "record",
+            did: None,
+            handle: None,
+            takedown_ref: None,
+            deactivated_at: None,
+            active_action: None,
+            uri: Some(uri.clone()),
+            cid: Some(cid.clone()),
+        },
+        Subject::Blob { did, cid, .. } => SnapshotContent {
+            kind: "blob",
+            did: Some(did.clone()),
+            handle: None,
+            takedown_ref: None,
+            deactivated_at: None,
+            active_action: None,
+            uri: None,
+            cid: Some(cid.clone()),
+        },
+    };
+    let content_json =
+        serde_json::to_string(&content).map_err(|e| PdsError::Internal(e.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(content_json.as_bytes());
+    let content_hash = hex::encode(hasher.finalize());
+    let now = Utc::now().to_rfc3339();
+    let (subject_did, subject_uri, subject_cid) = match subject {
+        Subject::Repo { did } => (Some(did.clone()), None, None),
+        Subject::Record { uri, cid } => (None, Some(uri.clone()), Some(cid.clone())),
+        Subject::Blob { did, cid, .. } => (Some(did.clone()), None, Some(cid.clone())),
+    };
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO audit_snapshot (captured_at, subject_did, subject_uri, subject_cid, \
+                                     content, content_hash) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    )
+    .bind(&now)
+    .bind(&subject_did)
+    .bind(&subject_uri)
+    .bind(&subject_cid)
+    .bind(&content_json)
+    .bind(&content_hash)
+    .fetch_one(db)
+    .await?;
+    Ok(Some(id))
+}
+
+async fn fetch_account_snapshot(db: &AnyPool, did: &str) -> Result<SnapshotContent, PdsError> {
+    let row = sqlx::query(
+        "SELECT handle, takedown_ref, deactivated_at FROM actor WHERE did = $1",
+    )
+    .bind(did)
+    .fetch_optional(db)
+    .await?;
+    let (handle, takedown_ref, deactivated_at) = match row {
+        Some(r) => (
+            r.try_get::<Option<String>, _>("handle").ok().flatten(),
+            r.try_get::<Option<String>, _>("takedown_ref").ok().flatten(),
+            r.try_get::<Option<String>, _>("deactivated_at").ok().flatten(),
+        ),
+        None => (None, None, None),
+    };
+    let active_action: Option<String> = sqlx::query_scalar(
+        "SELECT action FROM account_moderation \
+         WHERE did = $1 AND NOT reversed \
+         ORDER BY moderated_at DESC LIMIT 1",
+    )
+    .bind(did)
+    .fetch_optional(db)
+    .await?;
+    Ok(SnapshotContent {
+        kind: "account",
+        did: Some(did.to_string()),
+        handle,
+        takedown_ref,
+        deactivated_at,
+        active_action,
+        uri: None,
+        cid: None,
+    })
+}
+
+/// Append a new entry to the chain. Computes the SHA-256 over a
+/// canonical JSON of (sequence, timestamp, actor, action, subject,
+/// rationale, snapshot_id, event_id, previous_hash, cascade_subjects,
+/// cascade_snapshot_ids) — re-hashing later in the same way
+/// reproduces `current_hash`, which is the verification primitive.
+pub struct AppendEntryParams<'a> {
+    pub actor_did: &'a str,
+    pub action: &'a str,
+    pub subject: Option<&'a Subject>,
+    pub rationale: &'a str,
+    pub snapshot_id: Option<i64>,
+    pub event_id: Option<i64>,
+    pub cascade_subjects: &'a [Subject],
+    /// Per-subject snapshot ids paired by index with `cascade_subjects`.
+    /// Empty for single-subject entries (where the scalar `snapshot_id`
+    /// applies). For batch entries, one element per cascade subject;
+    /// element is `None` if the subject was not snapshottable. Must be
+    /// either empty or the same length as `cascade_subjects`. Recorded
+    /// in `cascade_snapshot_ids` and included in the canonical hash so
+    /// chain verification covers the snapshot linkage.
+    pub cascade_snapshot_ids: &'a [Option<i64>],
+}
+
+/// In-process serialization guard for audit-chain appends.
+///
+/// Per LB-1 / chainlink #122: when callers do their own
+/// transaction management (so the chain entry lands atomically
+/// with the underlying mutation via `append_entry_in_tx`), the
+/// in-process AsyncMutex that single-flights chain appends must
+/// be held _across_ the caller's `tx.commit()`. Otherwise, a
+/// second appender could observe the same chain head between
+/// guard-release-on-_in_tx-return and commit-on-caller, racing
+/// for the same `seq` value.
+///
+/// Acquire before opening the caller's transaction; drop after
+/// `tx.commit()` (an explicit `drop(guard)` works, but normal
+/// scope-end is fine — the only thing that matters is that the
+/// guard outlives the commit).
+///
+/// `append_entry` (the pool-API wrapper that opens its own tx)
+/// continues to acquire the guard internally, so existing call
+/// sites are unaffected.
+pub struct AppendChainGuard {
+    _inner: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl AppendChainGuard {
+    /// Acquire the guard. Returns once the lock is held.
+    pub async fn acquire() -> Self {
+        Self {
+            _inner: append_serialize_guard().lock().await,
+        }
+    }
+}
+
+/// Append an entry to the chain inside an existing transaction.
+///
+/// This is the LB-1 / chainlink #122 "atomic" entry point: the
+/// caller's transaction wraps both the underlying mutation
+/// (e.g., `UPDATE actor SET takedown_ref = ...`) and this chain
+/// append, so a crash between mutation and chain-append leaves
+/// neither row instead of an audit-blind mutation. Pre-LB-1, the
+/// pool-API `append_entry` opened its own transaction and the
+/// two writes could be torn at process death.
+///
+/// Concurrency: the caller is responsible for holding an
+/// [`AppendChainGuard`] across their own `tx.commit()`. Inside
+/// this function we additionally take
+/// `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` so concurrent
+/// appenders serialize at the Postgres lock rather than racing on
+/// the chain head. The advisory lock auto-releases at COMMIT
+/// (caller-managed). On SQLite the advisory-lock query is
+/// best-effort (it errors silently on SQLite, which gets
+/// serialization for free via its DB-level write lock); the
+/// in-process guard is what actually serializes SQLite appenders.
+pub async fn append_entry_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    params: AppendEntryParams<'_>,
+) -> Result<i64, PdsError> {
+    // Postgres: serialize concurrent appenders behind a single
+    // advisory lock keyed on AUDIT_CHAIN_LOCK_KEY. Best-effort —
+    // SQLite errors on the function call ("no such function
+    // pg_advisory_xact_lock") and we ignore that. The caller's
+    // transaction provides write-serialization on both backends;
+    // the advisory lock is a Postgres refinement that lets
+    // multiple admins block briefly rather than collide on
+    // UNIQUE(sequence).
+    let _ = sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(AUDIT_CHAIN_LOCK_KEY)
+        .execute(&mut **tx)
+        .await;
+
+    // Determine sequence + previous hash from the chain head.
+    // Inside the transaction so this read sees the same snapshot
+    // the subsequent INSERT will write into.
+    let head: Option<(i64, String)> = sqlx::query_as::<_, (i64, String)>(
+        "SELECT sequence, current_hash FROM audit_chain_entry ORDER BY sequence DESC LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (seq, prev_hash) = match head {
+        Some((s, h)) => (s + 1, Some(h)),
+        None => (1, None),
+    };
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+    // Per CR-1 / chainlink #121: `record_uri` on Blob subjects must
+    // round-trip through the chain row's flat columns. Pre-fix we
+    // dropped it on the floor (`..` pattern), and read-back through
+    // `Subject::from_columns` saw `(Some(did), None, Some(cid))` and
+    // — without a Blob arm for that shape — returned `None`. Now we
+    // preserve `record_uri` in `subject_uri` when present, and
+    // `from_columns` has a dedicated arm for the no-record_uri case.
+    let (subject_did, subject_uri, subject_cid) = match params.subject {
+        Some(Subject::Repo { did }) => (Some(did.clone()), None, None),
+        Some(Subject::Record { uri, cid }) => (None, Some(uri.clone()), Some(cid.clone())),
+        Some(Subject::Blob { did, cid, record_uri }) => {
+            (Some(did.clone()), record_uri.clone(), Some(cid.clone()))
+        }
+        None => (None, None, None),
+    };
+    let cascade_json = if params.cascade_subjects.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(params.cascade_subjects)
+                .map_err(|e| PdsError::Internal(e.to_string()))?,
+        )
+    };
+    // cascade_snapshot_ids must be either empty (no per-subject
+    // snapshots — pre-CR-2 chain rows or single-subject entries) or
+    // exactly the same length as cascade_subjects. Index `i` of one
+    // pairs with index `i` of the other.
+    if !params.cascade_snapshot_ids.is_empty()
+        && params.cascade_snapshot_ids.len() != params.cascade_subjects.len()
+    {
+        return Err(PdsError::Internal(format!(
+            "cascade_snapshot_ids length {} does not match cascade_subjects length {}",
+            params.cascade_snapshot_ids.len(),
+            params.cascade_subjects.len(),
+        )));
+    }
+    let cascade_snapshot_ids_json = if params.cascade_snapshot_ids.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(params.cascade_snapshot_ids)
+                .map_err(|e| PdsError::Internal(e.to_string()))?,
+        )
+    };
+    // Canonical content for hashing — order matters; future schema
+    // additions append new fields rather than reorder existing ones.
+    // cascade_snapshot_ids is appended at the tail per the additive
+    // policy. Pre-CR-2 entries hash with cascade_snapshot_ids = None,
+    // which is what the JSON form serializes to for an empty input;
+    // their stored hashes still verify because the legacy code-path
+    // produced JSON without that field at all. We accept that:
+    // re-running verification on legacy rows uses the new canonical
+    // form, but legacy rows would never be in the cascade-snapshot-ids
+    // population since the field defaults to empty.
+    let canon = serde_json::json!({
+        "sequence": seq,
+        "timestamp": now_str,
+        "actor_did": params.actor_did,
+        "action": params.action,
+        "subject_did": subject_did,
+        "subject_uri": subject_uri,
+        "subject_cid": subject_cid,
+        "rationale": params.rationale,
+        "snapshot_id": params.snapshot_id,
+        "event_id": params.event_id,
+        "previous_hash": prev_hash,
+        "cascade_subjects": cascade_json,
+        "cascade_snapshot_ids": cascade_snapshot_ids_json,
+    });
+    let canon_str = serde_json::to_string(&canon)
+        .map_err(|e| PdsError::Internal(e.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(canon_str.as_bytes());
+    let current_hash = hex::encode(hasher.finalize());
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO audit_chain_entry \
+         (sequence, created_at, actor_did, action, subject_did, subject_uri, subject_cid, \
+          rationale, snapshot_id, event_id, current_hash, previous_hash, cascade_subjects, \
+          cascade_snapshot_ids) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
+    )
+    .bind(seq)
+    .bind(&now_str)
+    .bind(params.actor_did)
+    .bind(params.action)
+    .bind(&subject_did)
+    .bind(&subject_uri)
+    .bind(&subject_cid)
+    .bind(params.rationale)
+    .bind(params.snapshot_id)
+    .bind(params.event_id)
+    .bind(&current_hash)
+    .bind(&prev_hash)
+    .bind(&cascade_json)
+    .bind(&cascade_snapshot_ids_json)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(id)
+}
+
+/// Append an entry to the chain. Pool-API wrapper around
+/// [`append_entry_in_tx`] that opens its own transaction and
+/// commits — for callers without an enclosing mutation transaction.
+///
+/// Concurrency: holds an [`AppendChainGuard`] across the whole
+/// transaction so the SELECT-head + INSERT-next sequence is
+/// single-flighted in-process; on Postgres,
+/// `pg_advisory_xact_lock` (taken inside the transaction by
+/// `append_entry_in_tx`) provides cross-process serialization.
+///
+/// ADMIN_MOD_PHASE_3 §6.1's "concurrency commitment" specified
+/// either advisory-lock or SERIALIZABLE-isolation as acceptable
+/// solutions; this implementation picks advisory-lock to match the
+/// codebase's existing leader-election pattern.
+///
+/// LB-1 / chainlink #122: prefer [`append_entry_in_tx`] from
+/// handlers that mutate other tables in the same audit decision —
+/// the chain entry then lands atomically with the underlying
+/// mutation. This wrapper is for chain-only writes (fewer in
+/// practice; mostly tests and infrastructure events).
+pub async fn append_entry(
+    db: &AnyPool,
+    params: AppendEntryParams<'_>,
+) -> Result<i64, PdsError> {
+    let _guard = AppendChainGuard::acquire().await;
+    let mut tx = db.begin().await?;
+    let id = append_entry_in_tx(&mut tx, params).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// What kind of failure `verify_chain_range` hit. Carried alongside
+/// the failing sequence so callers can distinguish a tampered row
+/// (PerRowMismatch) from a relinked chain (LinkageMismatch) from a
+/// missing row (Gap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainFailureKind {
+    /// The entry's content rehashes to a value other than its stored
+    /// `current_hash`. The row's fields were modified after seal.
+    PerRowMismatch,
+    /// The entry's `previous_hash` does not match the prior entry's
+    /// `current_hash`. Either the prior entry's content was modified
+    /// AND its `current_hash` was rewritten consistently (so per-row
+    /// passes) but the linkage was not, or the prior entry was
+    /// substituted with a forged row.
+    LinkageMismatch,
+    /// A sequence number in the requested range has no row. Indicates
+    /// a deletion or that the range bounds are wrong; either way the
+    /// chain in the requested window is not contiguous.
+    Gap,
+}
+
+/// Result of a chain-level verification failure. The first violation
+/// in the scanned window short-circuits — callers wanting a full audit
+/// can rerun starting after `failing_sequence` to find subsequent
+/// failures.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainVerificationError {
+    pub failing_sequence: i64,
+    pub kind: ChainFailureKind,
+}
+
+impl std::fmt::Display for ChainVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self.kind {
+            ChainFailureKind::PerRowMismatch => "per-row hash mismatch",
+            ChainFailureKind::LinkageMismatch => "linkage hash mismatch",
+            ChainFailureKind::Gap => "missing sequence",
+        };
+        write!(f, "chain verification failed at sequence {}: {}", self.failing_sequence, kind)
+    }
+}
+
+impl std::error::Error for ChainVerificationError {}
+
+/// Verify the chain is internally consistent across `[start_seq, end_seq]`.
+/// Walks the rows in ascending sequence order and checks two things per
+/// row:
+///
+/// 1. The row's content rehashes to its stored `current_hash` (per-row).
+/// 2. The row's `previous_hash` equals the prior row's `current_hash`
+///    (linkage).
+///
+/// Returns `Ok(())` if every checked entry passes both. Returns the
+/// first failure on mismatch — caller can re-scan after the failing
+/// sequence if it wants a complete picture.
+///
+/// Pre-Phase-3.8 sentinel rows (`current_hash="pre-chain"`) are skipped
+/// entirely; their linkage is undefined by design (§8.4) and verifying
+/// them as if they were real chain entries would produce false
+/// negatives.
+///
+/// `start_seq` and `end_seq` are inclusive. If `start_seq > end_seq` the
+/// function returns `Ok(())` (empty window is trivially consistent).
+pub async fn verify_chain_range(
+    db: &AnyPool,
+    start_seq: i64,
+    end_seq: i64,
+) -> Result<(), ChainVerificationError> {
+    if start_seq > end_seq {
+        return Ok(());
+    }
+    // Fetch the latest row strictly before start_seq so the linkage of
+    // the first row in the window can be checked against its
+    // predecessor. We do NOT filter sentinels here — when the
+    // immediate predecessor is a sentinel, the first real row's
+    // stored `previous_hash` is the literal string "pre-chain" and
+    // that's what we want to match against.
+    let mut prev_hash: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT current_hash FROM audit_chain_entry \
+         WHERE sequence < $1 \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(start_seq)
+    .fetch_optional(db)
+    .await
+    .map_err(|_| ChainVerificationError {
+        failing_sequence: start_seq,
+        kind: ChainFailureKind::Gap,
+    })?;
+
+    // Fetch the window in ascending order. We treat a query error as a
+    // gap because the verification semantics require all rows in the
+    // requested window to be readable.
+    let rows = sqlx::query(
+        "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
+                subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
+                cascade_subjects, cascade_snapshot_ids \
+         FROM audit_chain_entry \
+         WHERE sequence >= $1 AND sequence <= $2 \
+         ORDER BY sequence ASC",
+    )
+    .bind(start_seq)
+    .bind(end_seq)
+    .fetch_all(db)
+    .await
+    .map_err(|_| ChainVerificationError {
+        failing_sequence: start_seq,
+        kind: ChainFailureKind::Gap,
+    })?;
+
+    let mut expected_seq = start_seq;
+    for row in rows {
+        let seq: i64 = row.try_get("sequence").map_err(|_| ChainVerificationError {
+            failing_sequence: expected_seq,
+            kind: ChainFailureKind::Gap,
+        })?;
+        let current_hash: String = row.try_get("current_hash").map_err(|_| {
+            ChainVerificationError {
+                failing_sequence: seq,
+                kind: ChainFailureKind::PerRowMismatch,
+            }
+        })?;
+
+        // Sentinel rows: skip per-row + linkage checks but DO update
+        // prev_hash so the next real row's stored_prev correctly
+        // matches the literal "pre-chain" string. Sentinels still
+        // count toward gap detection — the chain must be contiguous
+        // even if some rows are sentinel.
+        if current_hash == "pre-chain" {
+            if seq != expected_seq {
+                return Err(ChainVerificationError {
+                    failing_sequence: expected_seq,
+                    kind: ChainFailureKind::Gap,
+                });
+            }
+            prev_hash = Some(current_hash);
+            expected_seq = seq + 1;
+            continue;
+        }
+
+        // Gap detection: every requested sequence must be present.
+        if seq != expected_seq {
+            return Err(ChainVerificationError {
+                failing_sequence: expected_seq,
+                kind: ChainFailureKind::Gap,
+            });
+        }
+
+        let created_at_str: String = row.try_get("created_at").map_err(|_| {
+            ChainVerificationError {
+                failing_sequence: seq,
+                kind: ChainFailureKind::PerRowMismatch,
+            }
+        })?;
+        let actor_did: String = row.try_get("actor_did").map_err(|_| {
+            ChainVerificationError {
+                failing_sequence: seq,
+                kind: ChainFailureKind::PerRowMismatch,
+            }
+        })?;
+        let action: String = row.try_get("action").map_err(|_| {
+            ChainVerificationError {
+                failing_sequence: seq,
+                kind: ChainFailureKind::PerRowMismatch,
+            }
+        })?;
+        let subject_did: Option<String> = row.try_get("subject_did").ok().flatten();
+        let subject_uri: Option<String> = row.try_get("subject_uri").ok().flatten();
+        let subject_cid: Option<String> = row.try_get("subject_cid").ok().flatten();
+        let rationale: String = row.try_get("rationale").map_err(|_| {
+            ChainVerificationError {
+                failing_sequence: seq,
+                kind: ChainFailureKind::PerRowMismatch,
+            }
+        })?;
+        let snapshot_id: Option<i64> = row.try_get("snapshot_id").ok().flatten();
+        let event_id: Option<i64> = row.try_get("event_id").ok().flatten();
+        let stored_prev: Option<String> = row.try_get("previous_hash").ok().flatten();
+        let cascade_str: Option<String> = row.try_get("cascade_subjects").ok().flatten();
+        let cascade_snapshot_ids_str: Option<String> =
+            row.try_get("cascade_snapshot_ids").ok().flatten();
+
+        // Linkage check: the row's stored previous_hash must equal the
+        // prior non-sentinel row's current_hash. The very first non-
+        // sentinel row of the chain has stored_prev == None and
+        // prev_hash == None; both branches of the cmp below handle that
+        // case correctly.
+        if stored_prev.as_deref() != prev_hash.as_deref() {
+            return Err(ChainVerificationError {
+                failing_sequence: seq,
+                kind: ChainFailureKind::LinkageMismatch,
+            });
+        }
+
+        // Per-row check: rehash content + stored previous_hash, compare
+        // to stored current_hash.
+        let row_ok = verify_entry(
+            seq,
+            &created_at_str,
+            &actor_did,
+            &action,
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+            &rationale,
+            snapshot_id,
+            event_id,
+            stored_prev.as_deref(),
+            cascade_str.as_deref(),
+            cascade_snapshot_ids_str.as_deref(),
+            &current_hash,
+        );
+        if !row_ok {
+            return Err(ChainVerificationError {
+                failing_sequence: seq,
+                kind: ChainFailureKind::PerRowMismatch,
+            });
+        }
+
+        prev_hash = Some(current_hash);
+        expected_seq = seq + 1;
+    }
+
+    // If the loop ran out of rows before reaching end_seq, the tail of
+    // the requested window is missing. Caller asked us to verify
+    // through end_seq; failing to find rows up to that point is a gap.
+    if expected_seq <= end_seq {
+        // Confirm whether end_seq actually exists: if the chain head is
+        // below end_seq, `Ok` is correct (caller asked for an
+        // open-ended window). If the head is at or above end_seq but
+        // we didn't see the row, it's a real gap.
+        let head_seq: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(sequence) FROM audit_chain_entry",
+        )
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+        if let Some(head) = head_seq {
+            if head >= expected_seq {
+                return Err(ChainVerificationError {
+                    failing_sequence: expected_seq,
+                    kind: ChainFailureKind::Gap,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Recompute an entry's hash from its stored fields and compare to
+/// `current_hash`. Used by getAuditTrail to set the `verified` flag
+/// per row at query time.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_entry(
+    sequence: i64,
+    timestamp: &str,
+    actor_did: &str,
+    action: &str,
+    subject_did: Option<&str>,
+    subject_uri: Option<&str>,
+    subject_cid: Option<&str>,
+    rationale: &str,
+    snapshot_id: Option<i64>,
+    event_id: Option<i64>,
+    previous_hash: Option<&str>,
+    cascade_subjects: Option<&str>,
+    cascade_snapshot_ids: Option<&str>,
+    expected_hash: &str,
+) -> bool {
+    let canon = serde_json::json!({
+        "sequence": sequence,
+        "timestamp": timestamp,
+        "actor_did": actor_did,
+        "action": action,
+        "subject_did": subject_did,
+        "subject_uri": subject_uri,
+        "subject_cid": subject_cid,
+        "rationale": rationale,
+        "snapshot_id": snapshot_id,
+        "event_id": event_id,
+        "previous_hash": previous_hash,
+        "cascade_subjects": cascade_subjects,
+        "cascade_snapshot_ids": cascade_snapshot_ids,
+    });
+    let canon_str = match serde_json::to_string(&canon) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(canon_str.as_bytes());
+    let computed = hex::encode(hasher.finalize());
+    computed == expected_hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::any::AnyPoolOptions;
+    use std::sync::Once;
+
+    async fn open_test_pool() -> AnyPool {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // Minimal schema for the tables we exercise.
+        sqlx::query(
+            "CREATE TABLE audit_chain_entry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sequence INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                actor_did TEXT NOT NULL,
+                action TEXT NOT NULL,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                rationale TEXT NOT NULL,
+                snapshot_id INTEGER,
+                event_id INTEGER,
+                current_hash TEXT NOT NULL,
+                previous_hash TEXT,
+                cascade_subjects TEXT,
+                cascade_snapshot_ids TEXT,
+                UNIQUE(sequence)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE audit_snapshot (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at TEXT NOT NULL,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE actor (did TEXT PRIMARY KEY, handle TEXT, takedown_ref TEXT, \
+             deactivated_at TEXT, created_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE account_moderation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                did TEXT, action TEXT, reason TEXT, moderated_by TEXT,
+                moderated_at TEXT, expires_at TEXT, reversed INTEGER NOT NULL DEFAULT 0,
+                reversed_at TEXT, report_id INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    // LB-1 / chainlink #122: atomicity regression. The per-tx
+    // entry point `append_entry_in_tx` must roll back together
+    // with the caller's underlying mutation when the caller's tx
+    // is rolled back. Pre-LB-1, `append_entry` opened its own tx
+    // and committed before returning — so a caller's later error
+    // couldn't unwind the chain entry, leaving the chain row
+    // out of sync with whatever the caller's mutation should
+    // have done.
+    #[tokio::test]
+    async fn append_entry_in_tx_rolls_back_with_caller_mutation() {
+        let db = open_test_pool().await;
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at) \
+             VALUES ('did:plc:victim', 'v.test', '2026-05-04T00:00:00Z')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let subject = Subject::Repo {
+            did: "did:plc:victim".to_string(),
+        };
+
+        // Run the underlying mutation + chain append inside one
+        // tx; deliberately roll back without commit. Both writes
+        // must be undone together.
+        {
+            let _guard = AppendChainGuard::acquire().await;
+            let mut tx = db.begin().await.unwrap();
+            sqlx::query(
+                "UPDATE actor SET handle = 'tampered' WHERE did = 'did:plc:victim'",
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            let chain_id = append_entry_in_tx(
+                &mut tx,
+                AppendEntryParams {
+                    actor_did: "did:plc:m1",
+                    action: "TakedownAccount",
+                    subject: Some(&subject),
+                    rationale: "would be rolled back",
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(chain_id > 0, "chain insert succeeded inside tx");
+            tx.rollback().await.unwrap();
+        }
+
+        let handle: String =
+            sqlx::query_scalar("SELECT handle FROM actor WHERE did = 'did:plc:victim'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            handle, "v.test",
+            "underlying mutation must roll back when tx is rolled back"
+        );
+        let chain_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_chain_entry")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            chain_count, 0,
+            "chain entry must roll back when tx is rolled back"
+        );
+    }
+
+    // The flip side: when the caller's tx commits, both the
+    // underlying mutation and the chain entry land. This is the
+    // happy path the atomicity contract guarantees.
+    #[tokio::test]
+    async fn append_entry_in_tx_commits_with_caller_mutation() {
+        let db = open_test_pool().await;
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at) \
+             VALUES ('did:plc:victim', 'v.test', '2026-05-04T00:00:00Z')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let subject = Subject::Repo {
+            did: "did:plc:victim".to_string(),
+        };
+
+        let _guard = AppendChainGuard::acquire().await;
+        let mut tx = db.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE actor SET handle = 'updated' WHERE did = 'did:plc:victim'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let chain_id = append_entry_in_tx(
+            &mut tx,
+            AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownAccount",
+                subject: Some(&subject),
+                rationale: "atomic commit",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let handle: String =
+            sqlx::query_scalar("SELECT handle FROM actor WHERE did = 'did:plc:victim'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(handle, "updated", "mutation committed");
+        let chain_seq: i64 =
+            sqlx::query_scalar("SELECT sequence FROM audit_chain_entry WHERE id = $1")
+                .bind(chain_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(chain_seq, 1, "chain entry committed");
+    }
+
+    #[tokio::test]
+    async fn first_entry_has_no_previous_hash() {
+        let db = open_test_pool().await;
+        let subject = Subject::Repo {
+            did: "did:plc:s".to_string(),
+        };
+        let id = append_entry(
+            &db,
+            AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownAccount",
+                subject: Some(&subject),
+                rationale: "spam",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[], cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(id > 0);
+        let prev: Option<String> =
+            sqlx::query_scalar("SELECT previous_hash FROM audit_chain_entry WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(prev.is_none(), "first entry should have NULL previous_hash");
+    }
+
+    #[tokio::test]
+    async fn second_entry_links_to_first() {
+        let db = open_test_pool().await;
+        let subject = Subject::Repo {
+            did: "did:plc:s".to_string(),
+        };
+        append_entry(&db, AppendEntryParams {
+            actor_did: "did:plc:m1", action: "TakedownAccount",
+            subject: Some(&subject), rationale: "first",
+            snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
+        }).await.unwrap();
+        append_entry(&db, AppendEntryParams {
+            actor_did: "did:plc:m1", action: "RestoreAccount",
+            subject: Some(&subject), rationale: "second",
+            snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
+        }).await.unwrap();
+        let entries: Vec<(i64, String, Option<String>)> =
+            sqlx::query_as("SELECT sequence, current_hash, previous_hash FROM audit_chain_entry ORDER BY sequence ASC")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, 1);
+        assert_eq!(entries[1].0, 2);
+        assert_eq!(entries[1].2.as_deref(), Some(entries[0].1.as_str()));
+    }
+
+    // CR-1 / chainlink #121: Blob subjects must round-trip
+    // `record_uri` through the chain row's flat columns. Pre-fix
+    // the producer destructured `Subject::Blob { did, cid, .. }`
+    // and dropped record_uri on the floor; reconstruction via
+    // `Subject::from_columns` then saw `(Some, None, Some)` which
+    // had no matching arm and fell through to `None`, losing the
+    // subject identity entirely.
+    #[tokio::test]
+    async fn audit_chain_blob_subject_roundtrips_with_record_uri() {
+        let db = open_test_pool().await;
+        let subject = Subject::Blob {
+            did: "did:plc:victim".to_string(),
+            cid: "bafkreiabc".to_string(),
+            record_uri: Some("at://did:plc:victim/app.bsky.feed.post/3kxyz".to_string()),
+        };
+        let id = append_entry(
+            &db,
+            AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownRecord",
+                subject: Some(&subject),
+                rationale: "blob with record_uri",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+        let (subject_did, subject_uri, subject_cid): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT subject_did, subject_uri, subject_cid FROM audit_chain_entry WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(subject_did.as_deref(), Some("did:plc:victim"));
+        assert_eq!(
+            subject_uri.as_deref(),
+            Some("at://did:plc:victim/app.bsky.feed.post/3kxyz"),
+            "record_uri must persist into subject_uri column"
+        );
+        assert_eq!(subject_cid.as_deref(), Some("bafkreiabc"));
+        let reconstructed = Subject::from_columns(
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+        );
+        assert_eq!(reconstructed, Some(subject));
+    }
+
+    #[tokio::test]
+    async fn audit_chain_blob_subject_roundtrips_without_record_uri() {
+        let db = open_test_pool().await;
+        let subject = Subject::Blob {
+            did: "did:plc:victim".to_string(),
+            cid: "bafkreidef".to_string(),
+            record_uri: None,
+        };
+        let id = append_entry(
+            &db,
+            AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownRecord",
+                subject: Some(&subject),
+                rationale: "blob without record_uri",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+        let (subject_did, subject_uri, subject_cid): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT subject_did, subject_uri, subject_cid FROM audit_chain_entry WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(subject_did.as_deref(), Some("did:plc:victim"));
+        assert_eq!(subject_uri, None, "no record_uri → no subject_uri");
+        assert_eq!(subject_cid.as_deref(), Some("bafkreidef"));
+        let reconstructed = Subject::from_columns(
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+        );
+        assert_eq!(reconstructed, Some(subject));
+    }
+
+    // Backwards compatibility: chain rows written before CR-1 stored
+    // Blob subjects as (subject_did, NULL, subject_cid). The
+    // `Subject::from_columns` reconstructor must still recognize
+    // that shape as a Blob (with record_uri = None) rather than
+    // returning None and losing the subject identity. This test
+    // simulates a legacy row by inserting directly via SQL,
+    // bypassing the post-fix `append_entry` path.
+    #[tokio::test]
+    async fn audit_chain_legacy_blob_row_reads_back_as_blob() {
+        let db = open_test_pool().await;
+        // Anchor the chain head with one regular entry so the
+        // legacy row can chain off it. We bypass append_entry's
+        // hash logic by inserting directly with previous_hash =
+        // current_hash of seed entry, but for the from_columns
+        // assertion we actually only care about the three subject
+        // columns — read back via SELECT.
+        let id = append_entry(
+            &db,
+            AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownAccount",
+                subject: Some(&Subject::Repo {
+                    did: "did:plc:seed".to_string(),
+                }),
+                rationale: "seed",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+        // Mutate the seed row to look like a legacy Blob entry.
+        // (subject_did, subject_uri, subject_cid) =
+        //   (Some, None, Some) is the pre-CR-1 Blob shape.
+        sqlx::query(
+            "UPDATE audit_chain_entry \
+             SET subject_did = 'did:plc:legacy', \
+                 subject_uri = NULL, \
+                 subject_cid = 'bafkreilegacyblob', \
+                 action = 'TakedownRecord' \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+        let (subject_did, subject_uri, subject_cid): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT subject_did, subject_uri, subject_cid FROM audit_chain_entry WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let reconstructed = Subject::from_columns(
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+        );
+        assert_eq!(
+            reconstructed,
+            Some(Subject::Blob {
+                did: "did:plc:legacy".to_string(),
+                cid: "bafkreilegacyblob".to_string(),
+                record_uri: None,
+            }),
+            "legacy (Some, None, Some) row must read back as Blob with record_uri=None"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_entry_round_trips_for_freshly_written_entry() {
+        let db = open_test_pool().await;
+        let subject = Subject::Repo {
+            did: "did:plc:victim".to_string(),
+        };
+        let id = append_entry(&db, AppendEntryParams {
+            actor_did: "did:plc:m1", action: "SuspendAccount",
+            subject: Some(&subject), rationale: "rationale text",
+            snapshot_id: Some(42), event_id: Some(7), cascade_subjects: &[], cascade_snapshot_ids: &[],
+        }).await.unwrap();
+        let row = sqlx::query(
+            "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
+                    subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
+                    cascade_subjects, cascade_snapshot_ids \
+             FROM audit_chain_entry WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let verified = verify_entry(
+            row.try_get::<i64, _>("sequence").unwrap(),
+            &row.try_get::<String, _>("created_at").unwrap(),
+            &row.try_get::<String, _>("actor_did").unwrap(),
+            &row.try_get::<String, _>("action").unwrap(),
+            row.try_get::<Option<String>, _>("subject_did").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("subject_uri").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("subject_cid").unwrap().as_deref(),
+            &row.try_get::<String, _>("rationale").unwrap(),
+            row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            row.try_get::<Option<i64>, _>("event_id").unwrap(),
+            row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("current_hash").unwrap(),
+        );
+        assert!(verified, "fresh entry should verify against its stored hash");
+    }
+
+    #[tokio::test]
+    async fn verify_entry_fails_when_rationale_tampered() {
+        let db = open_test_pool().await;
+        let subject = Subject::Repo {
+            did: "did:plc:victim".to_string(),
+        };
+        let id = append_entry(&db, AppendEntryParams {
+            actor_did: "did:plc:m1", action: "TakedownAccount",
+            subject: Some(&subject), rationale: "original rationale",
+            snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
+        }).await.unwrap();
+        // Simulate tamper: rewrite rationale in place after the chain
+        // entry was sealed. Verification should fail because the
+        // recomputed hash diverges from the stored current_hash.
+        sqlx::query("UPDATE audit_chain_entry SET rationale = $1 WHERE id = $2")
+            .bind("tampered rationale")
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap();
+        let row = sqlx::query(
+            "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
+                    subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
+                    cascade_subjects, cascade_snapshot_ids \
+             FROM audit_chain_entry WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let verified = verify_entry(
+            row.try_get::<i64, _>("sequence").unwrap(),
+            &row.try_get::<String, _>("created_at").unwrap(),
+            &row.try_get::<String, _>("actor_did").unwrap(),
+            &row.try_get::<String, _>("action").unwrap(),
+            row.try_get::<Option<String>, _>("subject_did").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("subject_uri").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("subject_cid").unwrap().as_deref(),
+            &row.try_get::<String, _>("rationale").unwrap(),
+            row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            row.try_get::<Option<i64>, _>("event_id").unwrap(),
+            row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("current_hash").unwrap(),
+        );
+        assert!(!verified, "tampered entry must fail verification");
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_passes_for_clean_chain() {
+        let db = open_test_pool().await;
+        let subject = Subject::Repo {
+            did: "did:plc:s".to_string(),
+        };
+        for i in 0..3 {
+            append_entry(&db, AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownAccount",
+                subject: Some(&subject),
+                rationale: &format!("rationale-{}", i),
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[], cascade_snapshot_ids: &[],
+            }).await.unwrap();
+        }
+        verify_chain_range(&db, 1, 3).await.expect("clean chain verifies");
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_detects_per_row_tamper() {
+        let db = open_test_pool().await;
+        let subject = Subject::Repo {
+            did: "did:plc:s".to_string(),
+        };
+        for i in 0..3 {
+            append_entry(&db, AppendEntryParams {
+                actor_did: "did:plc:m1", action: "TakedownAccount",
+                subject: Some(&subject), rationale: &format!("orig-{}", i),
+                snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
+            }).await.unwrap();
+        }
+        // Tamper with row 2's rationale only — current_hash NOT updated,
+        // so per-row recompute mismatches.
+        sqlx::query("UPDATE audit_chain_entry SET rationale = 'tampered' WHERE sequence = 2")
+            .execute(&db).await.unwrap();
+        let err = verify_chain_range(&db, 1, 3).await.expect_err("tampered chain must fail");
+        assert_eq!(err.failing_sequence, 2);
+        assert_eq!(err.kind, ChainFailureKind::PerRowMismatch);
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_detects_consistent_rewrite_via_linkage() {
+        // The test the per-row verifier alone misses: an attacker
+        // rewrites both content AND current_hash on a prior entry so
+        // per-row passes, but the next entry's previous_hash still
+        // points to the OLD current_hash → linkage breaks.
+        let db = open_test_pool().await;
+        let subject = Subject::Repo {
+            did: "did:plc:s".to_string(),
+        };
+        for i in 0..3 {
+            append_entry(&db, AppendEntryParams {
+                actor_did: "did:plc:m1", action: "TakedownAccount",
+                subject: Some(&subject), rationale: &format!("orig-{}", i),
+                snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
+            }).await.unwrap();
+        }
+        // Attacker recomputes a per-row-consistent hash for row 2 over
+        // the new content. We simulate that by reading row 2's row and
+        // recomputing the hash exactly the same way append_entry does,
+        // but with a new rationale.
+        let row = sqlx::query(
+            "SELECT created_at, actor_did, action, subject_did, subject_uri, subject_cid, \
+                    rationale, snapshot_id, event_id, previous_hash, cascade_subjects, \
+                    cascade_snapshot_ids \
+             FROM audit_chain_entry WHERE sequence = 2",
+        )
+        .fetch_one(&db).await.unwrap();
+        let new_rationale = "attacker-rewrite";
+        let canon = serde_json::json!({
+            "sequence": 2,
+            "timestamp": row.try_get::<String, _>("created_at").unwrap(),
+            "actor_did": row.try_get::<String, _>("actor_did").unwrap(),
+            "action": row.try_get::<String, _>("action").unwrap(),
+            "subject_did": row.try_get::<Option<String>, _>("subject_did").unwrap(),
+            "subject_uri": row.try_get::<Option<String>, _>("subject_uri").unwrap(),
+            "subject_cid": row.try_get::<Option<String>, _>("subject_cid").unwrap(),
+            "rationale": new_rationale,
+            "snapshot_id": row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            "event_id": row.try_get::<Option<i64>, _>("event_id").unwrap(),
+            "previous_hash": row.try_get::<Option<String>, _>("previous_hash").unwrap(),
+            "cascade_subjects": row.try_get::<Option<String>, _>("cascade_subjects").unwrap(),
+            "cascade_snapshot_ids": row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap(),
+        });
+        let canon_str = serde_json::to_string(&canon).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(canon_str.as_bytes());
+        let new_current = hex::encode(hasher.finalize());
+        sqlx::query(
+            "UPDATE audit_chain_entry SET rationale = $1, current_hash = $2 WHERE sequence = 2",
+        )
+        .bind(new_rationale)
+        .bind(&new_current)
+        .execute(&db).await.unwrap();
+        // Per-row verification of row 2 alone now passes (the attacker
+        // was careful), so the previous primitive would miss this.
+        // verify_chain_range catches it because row 3's previous_hash
+        // still points to the OLD row-2 current_hash.
+        let err = verify_chain_range(&db, 1, 3).await.expect_err(
+            "linkage tamper must fail even when per-row hashes look clean",
+        );
+        assert_eq!(err.failing_sequence, 3);
+        assert_eq!(err.kind, ChainFailureKind::LinkageMismatch);
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_skips_pre_chain_sentinel_rows() {
+        let db = open_test_pool().await;
+        // Insert a sentinel row at sequence 1 with current_hash="pre-chain".
+        // Real chain entries follow at sequence 2..4.
+        sqlx::query(
+            "INSERT INTO audit_chain_entry \
+             (sequence, created_at, actor_did, action, rationale, current_hash, previous_hash) \
+             VALUES (1, '2026-01-01T00:00:00Z', 'did:plc:legacy', 'PreChain', \
+                     'pre-Phase-3.8', 'pre-chain', NULL)",
+        )
+        .execute(&db).await.unwrap();
+        let subject = Subject::Repo { did: "did:plc:s".to_string() };
+        // Two real chain entries follow. They should chain together
+        // independently of the sentinel row above.
+        for i in 0..2 {
+            append_entry(&db, AppendEntryParams {
+                actor_did: "did:plc:m1", action: "TakedownAccount",
+                subject: Some(&subject), rationale: &format!("post-{}", i),
+                snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
+            }).await.unwrap();
+        }
+        // Sentinel skipped; real rows verify cleanly.
+        verify_chain_range(&db, 1, 3).await.expect("sentinel + real chain verifies");
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_empty_window_is_ok() {
+        let db = open_test_pool().await;
+        // No entries written.
+        verify_chain_range(&db, 1, 5).await.expect("empty chain → empty window passes");
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_inverted_window_is_ok() {
+        let db = open_test_pool().await;
+        verify_chain_range(&db, 5, 1).await.expect("inverted window is trivially consistent");
+    }
+
+    #[tokio::test]
+    async fn capture_snapshot_for_account_subject_writes_row() {
+        let db = open_test_pool().await;
+        sqlx::query("INSERT INTO actor (did, handle, takedown_ref, created_at) VALUES ($1, $2, $3, $4)")
+            .bind("did:plc:s")
+            .bind("s.test")
+            .bind("ticket-1")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&db)
+            .await
+            .unwrap();
+        let id = capture_snapshot(&db, &Subject::Repo { did: "did:plc:s".to_string() })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(id > 0);
+        let content: String = sqlx::query_scalar("SELECT content FROM audit_snapshot WHERE id = $1")
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert!(content.contains("\"handle\":\"s.test\""));
+        assert!(content.contains("\"takedownRef\":\"ticket-1\""));
+    }
+
+    // ---- Lock-key derivation + collision verification ----
+
+    #[test]
+    fn audit_chain_lock_key_matches_runtime_hash() {
+        // Verify the const lock key matches the first 8 bytes of
+        // SHA-256("aurora.audit_chain"). Mirrors the same pattern
+        // `test_lock_key_derivation_matches_runtime_hash` uses for
+        // the leader-election key. If this fires, the const bytes
+        // need to be updated to match the actual hash.
+        let mut h = Sha256::new();
+        h.update(b"aurora.audit_chain");
+        let digest = h.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        let expected = i64::from_be_bytes(bytes);
+        assert_eq!(AUDIT_CHAIN_LOCK_KEY, expected);
+    }
+
+    #[test]
+    fn audit_chain_lock_key_distinct_from_leader() {
+        // Both keys live in the same Postgres advisory-lock keyspace.
+        // If they collide, the leader election and the audit-chain
+        // append would interfere with each other (a held leader lock
+        // would block all chain appends, etc.). The two derivation
+        // strings differ; this test pins the assumption.
+        use crate::sequencer::leader_election::SEQUENCER_LEADER_LOCK_KEY;
+        assert_ne!(
+            AUDIT_CHAIN_LOCK_KEY, SEQUENCER_LEADER_LOCK_KEY,
+            "audit-chain lock key must not collide with sequencer leader key"
+        );
+    }
+
+    // ---- Concurrency stress test ----
+    //
+    // Spawns N concurrent tasks that all call `append_entry` and
+    // verifies each task succeeded, exactly N rows landed,
+    // sequences are contiguous from 1..=N, and verify_chain_range
+    // passes across the whole window.
+    //
+    // Without the transaction wrapping + advisory-lock contract in
+    // append_entry, two tasks racing through SELECT-head would both
+    // compute next-sequence = N+1, the second INSERT would fail with
+    // a UNIQUE-violation error, and the test would see < N rows
+    // (with the failing tasks returning Err). With the contract,
+    // both backends serialize at the writer level (Postgres via
+    // pg_advisory_xact_lock; SQLite via its database-level write
+    // lock + the surrounding transaction).
+    //
+    // The pool helper here uses shared-cache in-memory SQLite with a
+    // unique per-test database name so multiple connections within
+    // this pool share the same database without colluding with other
+    // tests' pools (those use anonymous `sqlite::memory:` and stay
+    // private per connection). PRAGMA busy_timeout via after_connect
+    // bounds the SQLITE_BUSY wait under contention.
+
+    async fn open_concurrent_test_pool(max_connections: u32) -> AnyPool {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        // Unique tempfile-backed SQLite database so two concurrent
+        // tests don't share state. File-backed (rather than
+        // shared-cache in-memory) because sqlx::Any only recognizes
+        // `sqlite:` and `postgres:` URL schemes — the SQLite-native
+        // `file:foo?mode=memory&cache=shared` URI rides through but
+        // requires a different prefix style. tempfile gives us
+        // per-test isolation for free.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let pool = AnyPoolOptions::new()
+            .max_connections(max_connections)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    // 5s busy_timeout per connection. SQLite's
+                    // database-level write lock is what serializes
+                    // concurrent appenders on this backend; the
+                    // timeout gives concurrent transactions enough
+                    // headroom to queue up cleanly under load.
+                    let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+                        .execute(conn)
+                        .await;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        // Leak the tempdir so it lives as long as the pool — sqlx
+        // keeps the file open via the connection, and dropping the
+        // dir would yank the file out from under it.
+        std::mem::forget(dir);
+        sqlx::query(
+            "CREATE TABLE audit_chain_entry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sequence INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                actor_did TEXT NOT NULL,
+                action TEXT NOT NULL,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                rationale TEXT NOT NULL,
+                snapshot_id INTEGER,
+                event_id INTEGER,
+                current_hash TEXT NOT NULL,
+                previous_hash TEXT,
+                cascade_subjects TEXT,
+                cascade_snapshot_ids TEXT,
+                UNIQUE(sequence)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_entry_serializes_concurrent_writers() {
+        let db = open_concurrent_test_pool(8).await;
+        let n: usize = 20;
+
+        // Spawn N concurrent appenders, each with a distinct
+        // rationale string so the resulting rows are easy to
+        // distinguish if anything diverges.
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let pool = db.clone();
+            let handle = tokio::spawn(async move {
+                let subject = Subject::Repo {
+                    did: format!("did:plc:s{}", i),
+                };
+                append_entry(
+                    &pool,
+                    AppendEntryParams {
+                        actor_did: "did:plc:m1",
+                        action: "TakedownAccount",
+                        subject: Some(&subject),
+                        rationale: &format!("concurrent-{}", i),
+                        snapshot_id: None,
+                        event_id: None,
+                        cascade_subjects: &[], cascade_snapshot_ids: &[],
+                    },
+                )
+                .await
+            });
+            handles.push(handle);
+        }
+
+        // All N must complete successfully — no UNIQUE-constraint
+        // surprises, no silent drops.
+        let mut ok_count = 0;
+        for h in handles {
+            match h.await.expect("task joins") {
+                Ok(_) => ok_count += 1,
+                Err(e) => panic!("append_entry returned Err under concurrent load: {}", e),
+            }
+        }
+        assert_eq!(ok_count, n, "all {} concurrent appends must succeed", n);
+
+        // Exactly N rows landed.
+        let row_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_chain_entry")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(row_count as usize, n);
+
+        // Sequences are contiguous 1..=N. The interleaving order is
+        // arbitrary (any of the N tasks could be first); we only
+        // require that each integer in the range appears exactly once.
+        let sequences: Vec<i64> = sqlx::query_scalar(
+            "SELECT sequence FROM audit_chain_entry ORDER BY sequence ASC",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        let expected: Vec<i64> = (1..=n as i64).collect();
+        assert_eq!(sequences, expected, "sequences must be 1..=N with no gaps");
+
+        // Linkage holds end-to-end: every row's previous_hash
+        // matches the prior row's current_hash. This is the
+        // chain-level invariant the lock+transaction is supposed to
+        // preserve. Without the lock, a UNIQUE-violation would have
+        // already torpedoed the test above; this is the further
+        // assurance that nothing weird happened to the linkage.
+        verify_chain_range(&db, 1, n as i64)
+            .await
+            .expect("clean chain after concurrent appends");
+    }
+}

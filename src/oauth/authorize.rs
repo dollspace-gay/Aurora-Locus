@@ -35,6 +35,15 @@ use sqlx::Row;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+
+/// Parse RFC3339 timestamp string to DateTime<Utc>. Required for sqlx::Any
+/// since chrono types don't implement Type<Any>. See chainlink #76.
+fn parse_ts(s: &str) -> Result<chrono::DateTime<chrono::Utc>, crate::error::PdsError> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| crate::error::PdsError::Internal(format!("Invalid timestamp: {}", e)))
+}
+
 /// Authorization endpoint handler
 ///
 /// GET /oauth/authorize
@@ -234,7 +243,7 @@ async fn create_authorization_request(
             request_id, did, client_id, code_challenge, code_challenge_method,
             scope, redirect_uri, state, created_at, expires_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(&request_id)
@@ -245,8 +254,8 @@ async fn create_authorization_request(
     .bind(&data.scope)
     .bind(&data.redirect_uri)
     .bind(&data.state)
-    .bind(now)
-    .bind(expires_at)
+    .bind(now.to_rfc3339())
+    .bind(expires_at.to_rfc3339())
     .execute(&ctx.account_db)
     .await?;
 
@@ -272,7 +281,7 @@ pub async fn get_authorization_request(
             authorization_code, scope, redirect_uri, state, created_at, expires_at,
             code_used, code_used_at
         FROM authorization_request
-        WHERE request_id = ?
+        WHERE request_id = $1
         "#,
     )
     .bind(request_id)
@@ -283,7 +292,7 @@ pub async fn get_authorization_request(
     })?;
 
     // Check if expired
-    let expires_at: chrono::DateTime<Utc> = row.get("expires_at");
+    let expires_at: chrono::DateTime<Utc> = parse_ts(&row.get::<String, _>("expires_at"))?;
     if expires_at < Utc::now() {
         return Err(PdsError::Authentication(
             "Authorization request expired".to_string(),
@@ -301,10 +310,14 @@ pub async fn get_authorization_request(
         scope: row.get("scope"),
         redirect_uri: row.get("redirect_uri"),
         state: row.get("state"),
-        created_at: row.get("created_at"),
-        expires_at: row.get("expires_at"),
-        code_used: row.get("code_used"),
-        code_used_at: row.get("code_used_at"),
+        created_at: parse_ts(&row.get::<String, _>("created_at"))?,
+        expires_at: parse_ts(&row.get::<String, _>("expires_at"))?,
+        code_used: crate::db::read_bool(&row, "code_used")?,
+        code_used_at: row
+            .get::<Option<String>, _>("code_used_at")
+            .as_deref()
+            .map(parse_ts)
+            .transpose()?,
     })
 }
 
@@ -323,10 +336,10 @@ pub async fn cleanup_expired_requests(ctx: &AppContext) -> PdsResult<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM authorization_request
-        WHERE expires_at < ?
+        WHERE expires_at < $1
         "#,
     )
-    .bind(now)
+    .bind(now.to_rfc3339())
     .execute(&ctx.account_db)
     .await?;
 

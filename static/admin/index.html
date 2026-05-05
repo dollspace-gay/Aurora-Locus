@@ -1,334 +1,98 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Aurora Locus Admin Panel</title>
-    <link rel="stylesheet" href="/admin/style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aurora Locus admin</title>
+  <link rel="stylesheet" href="/admin/styles/tokens.css">
+  <link rel="stylesheet" href="/admin/styles/base.css">
+  <link rel="stylesheet" href="/admin/styles/components.css">
+  <link rel="stylesheet" href="/admin/styles/pages.css">
 </head>
 <body>
-    <div class="admin-container">
-        <!-- Sidebar Navigation -->
-        <aside class="sidebar">
-            <div class="logo">
-                <h1>Aurora Locus</h1>
-                <p class="subtitle">Admin Panel</p>
-            </div>
+  <a href="#content" class="skip-to-content">Skip to content</a>
 
-            <nav class="nav-menu">
-                <a href="#dashboard" class="nav-item active" data-page="dashboard">
-                    <span class="icon">📊</span>
-                    Dashboard
-                </a>
-                <a href="#users" class="nav-item" data-page="users">
-                    <span class="icon">👥</span>
-                    Users
-                </a>
-                <a href="#moderation" class="nav-item" data-page="moderation">
-                    <span class="icon">🛡️</span>
-                    Moderation Queue
-                    <span class="badge" id="mod-queue-count">0</span>
-                </a>
-                <a href="#reports" class="nav-item" data-page="reports">
-                    <span class="icon">🚨</span>
-                    Reports
-                    <span class="badge" id="reports-count">0</span>
-                </a>
-                <a href="#invites" class="nav-item" data-page="invites">
-                    <span class="icon">✉️</span>
-                    Invite Codes
-                </a>
-                <a href="#settings" class="nav-item" data-page="settings">
-                    <span class="icon">⚙️</span>
-                    Settings
-                </a>
-            </nav>
+  <div class="admin-container">
+    <aside class="sidebar" id="sidebar" aria-label="Primary navigation">
+      <!-- Sidebar mounts here via app.js -->
+    </aside>
 
-            <div class="sidebar-footer">
-                <div class="admin-info">
-                    <p class="admin-name" id="admin-name">Admin</p>
-                    <p class="admin-role">Administrator</p>
-                </div>
-                <button class="btn-logout" onclick="logout()">Logout</button>
-            </div>
-        </aside>
+    <main id="content" class="main-content" tabindex="-1">
+      <!-- Per-page modules render here via the router -->
+    </main>
+  </div>
 
-        <!-- Main Content Area -->
-        <main class="main-content">
-            <!-- Dashboard Page -->
-            <div id="page-dashboard" class="page active">
-                <header class="page-header">
-                    <h2>Dashboard</h2>
-                    <p class="page-subtitle">Overview of your PDS instance</p>
-                </header>
+  <div id="modal-overlay" class="modal-overlay"></div>
+  <div id="modal-root"></div>
+  <div id="toast-root" aria-live="polite" aria-atomic="true"></div>
+  <div id="palette-root"></div>
 
-                <!-- Stats Cards -->
-                <div class="stats-grid">
-                    <div class="stat-card">
-                        <div class="stat-icon">👥</div>
-                        <div class="stat-content">
-                            <p class="stat-label">Total Users</p>
-                            <p class="stat-value" id="stat-users">0</p>
-                            <p class="stat-change positive">+12 this week</p>
-                        </div>
-                    </div>
+  <!-- Chart.js retained from previous build for Dashboard sparklines -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-                    <div class="stat-card">
-                        <div class="stat-icon">📝</div>
-                        <div class="stat-content">
-                            <p class="stat-label">Total Posts</p>
-                            <p class="stat-value" id="stat-posts">0</p>
-                            <p class="stat-change positive">+243 today</p>
-                        </div>
-                    </div>
+  <!-- Foundation: state + dom + i18n + format + a11y + icons -->
+  <script src="/admin/scripts/lib/dom.js"></script>
+  <script src="/admin/scripts/lib/icons.js"></script>
+  <script src="/admin/scripts/lib/i18n.js"></script>
+  <script src="/admin/scripts/lib/format.js"></script>
+  <script src="/admin/scripts/lib/a11y.js"></script>
+  <script src="/admin/scripts/state/session.js"></script>
+  <script src="/admin/scripts/state/settings.js"></script>
 
-                    <div class="stat-card">
-                        <div class="stat-icon">🛡️</div>
-                        <div class="stat-content">
-                            <p class="stat-label">Pending Reports</p>
-                            <p class="stat-value" id="stat-reports">0</p>
-                            <p class="stat-change">Requires attention</p>
-                        </div>
-                    </div>
+  <!-- API substrate -->
+  <script src="/admin/scripts/api/client.js"></script>
+  <script src="/admin/scripts/api/capabilities.js"></script>
+  <script src="/admin/scripts/api/endpoints.js"></script>
+  <script src="/admin/scripts/api/subscription.js"></script>
 
-                    <div class="stat-card">
-                        <div class="stat-icon">💾</div>
-                        <div class="stat-content">
-                            <p class="stat-label">Storage Used</p>
-                            <p class="stat-value" id="stat-storage">0 GB</p>
-                            <p class="stat-change">of 100 GB</p>
-                        </div>
-                    </div>
-                </div>
+  <!-- Substrate components (substrate primitives 1, 3, 4, 5, 7, 8, 10–12, 14–15, 20) -->
+  <script src="/admin/scripts/components/EntityRef.js"></script>
+  <script src="/admin/scripts/components/Modal.js"></script>
+  <script src="/admin/scripts/components/Toast.js"></script>
+  <script src="/admin/scripts/components/StatusBadge.js"></script>
+  <script src="/admin/scripts/components/Drawer.js"></script>
+  <script src="/admin/scripts/components/EmptyState.js"></script>
+  <script src="/admin/scripts/components/PaginationStrip.js"></script>
+  <script src="/admin/scripts/components/CalendarWidget.js"></script>
+  <script src="/admin/scripts/components/FilterStrip.js"></script>
+  <script src="/admin/scripts/components/ThemeToggle.js"></script>
+  <script src="/admin/scripts/components/CommandPalette.js"></script>
+  <script src="/admin/scripts/components/ActionPanel.js"></script>
+  <script src="/admin/scripts/components/BulkActionPanel.js"></script>
 
-                <!-- Charts -->
-                <div class="charts-grid">
-                    <div class="chart-card">
-                        <h3>User Growth</h3>
-                        <canvas id="userGrowthChart"></canvas>
-                    </div>
+  <!-- Routing -->
+  <script src="/admin/scripts/routing/routes.js"></script>
+  <script src="/admin/scripts/routing/router.js"></script>
 
-                    <div class="chart-card">
-                        <h3>Activity Overview</h3>
-                        <canvas id="activityChart"></canvas>
-                    </div>
-                </div>
+  <!-- Pages (each registers itself with the router on load) -->
+  <script src="/admin/scripts/pages/Dashboard.js"></script>
+  <script src="/admin/scripts/pages/Queue.js"></script>
+  <script src="/admin/scripts/pages/Reports.js"></script>
+  <script src="/admin/scripts/pages/ReportDetail.js"></script>
+  <script src="/admin/scripts/pages/Appeals.js"></script>
+  <script src="/admin/scripts/pages/AppealDetail.js"></script>
+  <script src="/admin/scripts/pages/Events.js"></script>
+  <script src="/admin/scripts/pages/EventDetail.js"></script>
+  <script src="/admin/scripts/pages/Audit.js"></script>
+  <script src="/admin/scripts/pages/AuditEntryDetail.js"></script>
+  <script src="/admin/scripts/pages/Accounts.js"></script>
+  <script src="/admin/scripts/pages/AccountDetail.js"></script>
+  <script src="/admin/scripts/pages/RecordDetail.js"></script>
+  <script src="/admin/scripts/pages/BlobDetail.js"></script>
+  <script src="/admin/scripts/pages/Invites.js"></script>
+  <script src="/admin/scripts/pages/InviteDetail.js"></script>
+  <script src="/admin/scripts/pages/Sequencer.js"></script>
+  <script src="/admin/scripts/pages/Federation.js"></script>
+  <script src="/admin/scripts/pages/BlobOps.js"></script>
+  <script src="/admin/scripts/pages/RateLimits.js"></script>
+  <script src="/admin/scripts/pages/SystemHealth.js"></script>
+  <script src="/admin/scripts/pages/Capabilities.js"></script>
+  <script src="/admin/scripts/pages/SettingsGeneral.js"></script>
+  <script src="/admin/scripts/pages/SettingsUiModes.js"></script>
+  <script src="/admin/scripts/pages/SettingsRoles.js"></script>
+  <script src="/admin/scripts/pages/SettingsRolesMembers.js"></script>
 
-                <!-- Recent Activity -->
-                <div class="activity-card">
-                    <h3>Recent Activity</h3>
-                    <div class="activity-list" id="recent-activity">
-                        <!-- Populated by JS -->
-                    </div>
-                </div>
-            </div>
-
-            <!-- Users Page -->
-            <div id="page-users" class="page">
-                <header class="page-header">
-                    <h2>User Management</h2>
-                    <div class="header-actions">
-                        <input type="text" class="search-input" placeholder="Search users..." id="user-search">
-                        <button class="btn-primary" onclick="exportUsers()">Export</button>
-                    </div>
-                </header>
-
-                <div class="table-card">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>Handle</th>
-                                <th>DID</th>
-                                <th>Email</th>
-                                <th>Created</th>
-                                <th>Status</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="users-table">
-                            <!-- Populated by JS -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Moderation Queue Page -->
-            <div id="page-moderation" class="page">
-                <header class="page-header">
-                    <h2>Moderation Queue</h2>
-                    <div class="header-actions">
-                        <select class="filter-select" id="mod-filter">
-                            <option value="all">All Items</option>
-                            <option value="pending">Pending</option>
-                            <option value="reviewed">Reviewed</option>
-                        </select>
-                    </div>
-                </header>
-
-                <div class="moderation-queue" id="moderation-queue">
-                    <!-- Populated by JS -->
-                </div>
-            </div>
-
-            <!-- Reports Page -->
-            <div id="page-reports" class="page">
-                <header class="page-header">
-                    <h2>Content Reports</h2>
-                    <div class="header-actions">
-                        <select class="filter-select" id="report-filter">
-                            <option value="open">Open</option>
-                            <option value="resolved">Resolved</option>
-                            <option value="all">All</option>
-                        </select>
-                    </div>
-                </header>
-
-                <div class="reports-list" id="reports-list">
-                    <!-- Populated by JS -->
-                </div>
-            </div>
-
-            <!-- Invite Codes Page -->
-            <div id="page-invites" class="page">
-                <header class="page-header">
-                    <h2>Invite Codes</h2>
-                    <div class="header-actions">
-                        <button class="btn-primary" onclick="generateInvites()">Generate Codes</button>
-                    </div>
-                </header>
-
-                <div class="invite-stats">
-                    <div class="stat-item">
-                        <span class="label">Total Codes:</span>
-                        <span class="value" id="invite-total">0</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="label">Available:</span>
-                        <span class="value" id="invite-available">0</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="label">Used:</span>
-                        <span class="value" id="invite-used">0</span>
-                    </div>
-                </div>
-
-                <div class="table-card">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>Code</th>
-                                <th>Uses</th>
-                                <th>Created By</th>
-                                <th>Created At</th>
-                                <th>Status</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="invites-table">
-                            <!-- Populated by JS -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Settings Page -->
-            <div id="page-settings" class="page">
-                <header class="page-header">
-                    <h2>Settings</h2>
-                    <p class="page-subtitle">Configure your PDS instance</p>
-                </header>
-
-                <div class="settings-grid">
-                    <div class="settings-card">
-                        <h3>General Settings</h3>
-                        <form id="general-settings-form">
-                            <div class="form-group">
-                                <label>Instance Name</label>
-                                <input type="text" id="setting-name" value="Aurora Locus PDS">
-                            </div>
-                            <div class="form-group">
-                                <label>Service URL</label>
-                                <input type="text" id="setting-url" value="https://pds.example.com">
-                            </div>
-                            <div class="form-group">
-                                <label>Max Blob Size (MB)</label>
-                                <input type="number" id="setting-blob-size" value="5">
-                            </div>
-                            <button type="submit" class="btn-primary">Save Changes</button>
-                        </form>
-                    </div>
-
-                    <div class="settings-card">
-                        <h3>Registration Settings</h3>
-                        <form id="registration-settings-form">
-                            <div class="form-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="setting-invite-required">
-                                    Require Invite Codes
-                                </label>
-                            </div>
-                            <div class="form-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="setting-email-verification">
-                                    Require Email Verification
-                                </label>
-                            </div>
-                            <button type="submit" class="btn-primary">Save Changes</button>
-                        </form>
-                    </div>
-
-                    <div class="settings-card">
-                        <h3>Moderation Settings</h3>
-                        <form id="moderation-settings-form">
-                            <div class="form-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="setting-auto-report">
-                                    Enable Automatic Content Filtering
-                                </label>
-                            </div>
-                            <div class="form-group">
-                                <label>Report Threshold</label>
-                                <input type="number" id="setting-report-threshold" value="3">
-                            </div>
-                            <button type="submit" class="btn-primary">Save Changes</button>
-                        </form>
-                    </div>
-                </div>
-            </div>
-        </main>
-    </div>
-
-    <!-- Modals -->
-    <div id="modal-overlay" class="modal-overlay" onclick="closeModal()"></div>
-
-    <!-- User Details Modal -->
-    <div id="modal-user-details" class="modal">
-        <div class="modal-header">
-            <h3>User Details</h3>
-            <button class="modal-close" onclick="closeModal()">&times;</button>
-        </div>
-        <div class="modal-body" id="user-details-content">
-            <!-- Populated by JS -->
-        </div>
-    </div>
-
-    <!-- Report Details Modal -->
-    <div id="modal-report-details" class="modal">
-        <div class="modal-header">
-            <h3>Report Details</h3>
-            <button class="modal-close" onclick="closeModal()">&times;</button>
-        </div>
-        <div class="modal-body" id="report-details-content">
-            <!-- Populated by JS -->
-        </div>
-        <div class="modal-footer">
-            <button class="btn-secondary" onclick="closeModal()">Close</button>
-            <button class="btn-danger" onclick="takedownContent()">Takedown</button>
-            <button class="btn-primary" onclick="resolveReport()">Resolve</button>
-        </div>
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="/admin/script.js"></script>
+  <!-- App entry point — runs after all pages have registered -->
+  <script src="/admin/scripts/app.js"></script>
 </body>
 </html>

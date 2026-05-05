@@ -10,6 +10,15 @@ use crate::{
 use axum::{async_trait, extract::FromRequestParts, http::request::Parts};
 use uuid::Uuid;
 
+
+/// Parse RFC3339 timestamp string to DateTime<Utc>. Required for sqlx::Any
+/// since chrono types don't implement Type<Any>. See chainlink #76.
+fn parse_ts(s: &str) -> Result<chrono::DateTime<chrono::Utc>, crate::error::PdsError> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| crate::error::PdsError::Internal(format!("Invalid timestamp: {}", e)))
+}
+
 /// Authentication method used for the request
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
@@ -245,29 +254,25 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
 
         tracing::debug!("AdminAuthContext: Checking admin role for DID: {}", did);
 
-        // Check if DID is in configured admin DIDs list
-        let is_configured_admin = state.config.authentication.admin_dids.contains(&did);
-
-        // Try to get role from database
-        let role = if let Some(admin_role) = state.admin_role_manager.get_role(&did).await? {
-            // User has a role in the database
-            tracing::info!(
-                "AdminAuthContext: User {} has role {} from database",
-                did,
-                admin_role.role.as_str()
-            );
-            admin_role.role
-        } else if is_configured_admin {
-            // User is in configured admin DIDs, grant SuperAdmin
-            tracing::info!(
-                "AdminAuthContext: User {} is configured admin, granting SuperAdmin",
-                did
-            );
-            Role::SuperAdmin
-        } else {
-            // User is not an admin
-            tracing::warn!("AdminAuthContext: User {} is not an admin", did);
-            return Err(PdsError::Authorization("Admin role required".to_string()));
+        // Authority comes from the admin_role table only. The
+        // PDS_ADMIN_DIDS env var is a bootstrap convenience for
+        // operator-side configuration (warnings, OAuth allow-list at
+        // first-login time per the assessment doc §1.1) and does not
+        // by itself confer any role — every grant must be a recorded
+        // audit-chain decision.
+        let role = match state.admin_role_manager.get_role(&did).await? {
+            Some(admin_role) => {
+                tracing::info!(
+                    "AdminAuthContext: User {} has role {} from database",
+                    did,
+                    admin_role.role.as_str()
+                );
+                admin_role.role
+            }
+            None => {
+                tracing::warn!("AdminAuthContext: User {} is not an admin", did);
+                return Err(PdsError::Authorization("Admin role required".to_string()));
+            }
         };
 
         Ok(AdminAuthContext { did, session, role })
@@ -392,12 +397,58 @@ impl FromRequestParts<AppContext> for OAuthAuthContext {
         let access_token = extract_bearer_token(&parts.headers)
             .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
 
-        // TODO: Validate DPoP proof if present
-        // For now, we'll just validate the access token
-        // DPoP validation will be added in the next step
-
         // Try to find OAuth token in database
         let token_info = validate_oauth_token(state, &access_token).await?;
+
+        // DPoP proof-of-possession check (RFC 9449 §7).
+        //
+        // Tokens that were issued bound to a DPoP key carry a non-NULL
+        // `dpop_thumbprint`. On every resource request for those
+        // tokens, the request MUST present a DPoP proof whose JWK
+        // hashes to the same thumbprint, and whose `ath` claim is
+        // `base64url(SHA-256(access_token))` to bind the proof to
+        // this specific token (§4.3).
+        //
+        // Bearer-only tokens (no thumbprint) accept the request
+        // without a DPoP header — backward compat for clients that
+        // never opted in.
+        if let Some(bound_thumbprint) = token_info.dpop_thumbprint.as_deref() {
+            let dpop_proof = parts
+                .headers
+                .get("dpop")
+                .ok_or_else(|| {
+                    PdsError::Authentication(
+                        "DPoP proof required for DPoP-bound token".to_string(),
+                    )
+                })?
+                .to_str()
+                .map_err(|_| {
+                    PdsError::Authentication("Invalid DPoP header value".to_string())
+                })?;
+
+            // Reconstruct the request method/URI the way the proof
+            // would have committed to them. parts.uri here is the
+            // path-and-query the server received; htu in proof is the
+            // canonical request URI minus query string. Build absolute
+            // URL from service_url() so the comparison can match what
+            // a well-formed client computed.
+            let method = parts.method.as_str().to_string();
+            let uri = format!(
+                "{}{}",
+                state.service_url(),
+                parts.uri.path()
+            );
+            let expected_ath = crate::federation::dpop::compute_ath(&access_token);
+            let proof_thumbprint = state
+                .dpop_verifier
+                .verify_dpop_proof(dpop_proof, &method, &uri, Some(&expected_ath))
+                .await?;
+            if proof_thumbprint != bound_thumbprint {
+                return Err(PdsError::Authentication(
+                    "DPoP proof key does not match the token's bound thumbprint".to_string(),
+                ));
+            }
+        }
 
         // Parse scopes
         let scopes = token_info
@@ -442,7 +493,7 @@ pub async fn validate_oauth_token(
 
     // Check if token is expired
     use sqlx::Row;
-    let expires_at: chrono::DateTime<chrono::Utc> = row.get("expires_at");
+    let expires_at: chrono::DateTime<chrono::Utc> = parse_ts(&row.get::<String, _>("expires_at"))?;
 
     if expires_at < chrono::Utc::now() {
         return Err(PdsError::Authentication(

@@ -6,7 +6,7 @@ use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize, Serializer};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 
 /// Custom serializer for DateTime that uses RFC3339 with millisecond precision
 fn serialize_datetime<S>(dt: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
@@ -30,6 +30,59 @@ where
     }
 }
 
+/// Sort ordering for paginated invite-code listings
+/// (lexicon `com.atproto.admin.getInviteCodes` parameter `sort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteSortKey {
+    /// `sort=recent` (default): order by `created_at` descending.
+    Recent,
+    /// `sort=usage`: order by total uses descending.
+    Usage,
+}
+
+impl InviteSortKey {
+    /// Parse the lexicon's `sort` query parameter. The lexicon declares
+    /// `knownValues = ["recent", "usage"]` with `default = "recent"`.
+    pub fn from_param(s: Option<&str>) -> Result<Self, String> {
+        match s {
+            None | Some("recent") => Ok(Self::Recent),
+            Some("usage") => Ok(Self::Usage),
+            Some(other) => Err(format!(
+                "invalid sort value '{other}' (expected 'recent' or 'usage')"
+            )),
+        }
+    }
+}
+
+/// Decoded pagination cursor for `list_codes_paginated`. The on-the-wire
+/// form is base64url-encoded JSON tagged with `sort` so the cursor's
+/// ordering can be validated against the request's `sort` parameter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "sort", rename_all = "snake_case")]
+pub enum InviteCursor {
+    Recent {
+        /// `created_at` of the last row returned in the previous page,
+        /// serialised as RFC3339 to keep the cursor printable / debuggable
+        /// when base64-decoded by an operator.
+        after_created_at: String,
+        after_code: String,
+    },
+    Usage {
+        after_use_count: i64,
+        after_code: String,
+    },
+}
+
+impl InviteCursor {
+    /// Which sort ordering this cursor was generated for.
+    pub fn sort_key(&self) -> InviteSortKey {
+        match self {
+            Self::Recent { .. } => InviteSortKey::Recent,
+            Self::Usage { .. } => InviteSortKey::Usage,
+        }
+    }
+}
+
 /// Invite code
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteCode {
@@ -48,11 +101,11 @@ pub struct InviteCode {
 /// Invite code manager
 #[derive(Clone)]
 pub struct InviteCodeManager {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl InviteCodeManager {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -76,6 +129,30 @@ impl InviteCodeManager {
         note: Option<String>,
         for_account: Option<String>,
     ) -> PdsResult<InviteCode> {
+        let mut tx = self.db.begin().await?;
+        let code = Self::create_invite_in_tx(
+            &mut tx,
+            created_by,
+            uses,
+            expires_in,
+            note,
+            for_account,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(code)
+    }
+
+    /// Create an invite code inside an existing transaction. LB-1 /
+    /// chainlink #129 atomic-with-chain entry point.
+    pub async fn create_invite_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        created_by: &str,
+        uses: i32,
+        expires_in: Option<chrono::Duration>,
+        note: Option<String>,
+        for_account: Option<String>,
+    ) -> PdsResult<InviteCode> {
         let code = Self::generate_code();
         let now = Utc::now();
         let expires_at = expires_in.map(|d| now + d);
@@ -83,7 +160,7 @@ impl InviteCodeManager {
         sqlx::query(
             r#"
             INSERT INTO invite_code (code, available, created_by, created_at, expires_at, note, for_account)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(&code)
@@ -93,7 +170,7 @@ impl InviteCodeManager {
         .bind(expires_at.map(|dt| dt.to_rfc3339()))
         .bind(&note)
         .bind(&for_account)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await?;
 
         Ok(InviteCode {
@@ -117,7 +194,7 @@ impl InviteCodeManager {
             r#"
             SELECT available, disabled, expires_at, for_account
             FROM invite_code
-            WHERE code = ?
+            WHERE code = $1
             "#,
         )
         .bind(code)
@@ -127,7 +204,7 @@ impl InviteCodeManager {
         let row = row.ok_or_else(|| PdsError::NotFound("Invite code not found".to_string()))?;
 
         let available: i32 = row.get("available");
-        let disabled: bool = row.get("disabled");
+        let disabled: bool = crate::db::read_bool(&row, "disabled")?;
         let for_account: Option<String> = row.get("for_account");
 
         // Validate code
@@ -165,7 +242,7 @@ impl InviteCodeManager {
             r#"
             UPDATE invite_code
             SET available = available - 1
-            WHERE code = ?
+            WHERE code = $1
             "#,
         )
         .bind(code)
@@ -175,7 +252,7 @@ impl InviteCodeManager {
         sqlx::query(
             r#"
             INSERT INTO invite_code_use (code, used_by, used_at)
-            VALUES (?, ?, ?)
+            VALUES ($1, $2, $3)
             "#,
         )
         .bind(code)
@@ -189,15 +266,27 @@ impl InviteCodeManager {
 
     /// Disable invite code
     pub async fn disable_code(&self, code: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await?;
+        Self::disable_code_in_tx(&mut tx, code).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Disable invite code inside an existing transaction. LB-1 /
+    /// chainlink #129 atomic-with-chain entry point.
+    pub async fn disable_code_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        code: &str,
+    ) -> PdsResult<()> {
         let result = sqlx::query(
             r#"
             UPDATE invite_code
-            SET disabled = 1
-            WHERE code = ?
+            SET disabled = true
+            WHERE code = $1
             "#,
         )
         .bind(code)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -207,13 +296,56 @@ impl InviteCodeManager {
         Ok(())
     }
 
+    /// Atomically disable a batch of invite codes and/or all codes issued for
+    /// a set of accounts. All updates run inside a single SQLite transaction;
+    /// either every update commits or none do.
+    ///
+    /// Codes or account DIDs that don't match any rows are silently skipped:
+    /// the semantic is "ensure these are disabled," and a missing code is
+    /// already vacuously disabled. Empty inputs are a no-op.
+    pub async fn disable_codes_batch(
+        &self,
+        codes: &[String],
+        accounts: &[String],
+    ) -> PdsResult<()> {
+        if codes.is_empty() && accounts.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.begin().await?;
+        Self::disable_codes_batch_in_tx(&mut tx, codes, accounts).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Disable a batch of invite codes inside an existing transaction.
+    /// LB-1 / chainlink #129 atomic-with-chain entry point.
+    pub async fn disable_codes_batch_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        codes: &[String],
+        accounts: &[String],
+    ) -> PdsResult<()> {
+        for code in codes {
+            sqlx::query("UPDATE invite_code SET disabled = true WHERE code = $1")
+                .bind(code)
+                .execute(&mut **tx)
+                .await?;
+        }
+        for did in accounts {
+            sqlx::query("UPDATE invite_code SET disabled = true WHERE for_account = $1")
+                .bind(did)
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Get invite code details
     pub async fn get_code(&self, code: &str) -> PdsResult<Option<InviteCode>> {
         let row = sqlx::query(
             r#"
             SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account
             FROM invite_code
-            WHERE code = ?
+            WHERE code = $1
             "#,
         )
         .bind(code)
@@ -235,7 +367,7 @@ impl InviteCodeManager {
             Ok(Some(InviteCode {
                 code: row.get("code"),
                 available: row.get("available"),
-                disabled: row.get("disabled"),
+                disabled: crate::db::read_bool(&row, "disabled")?,
                 created_by: row.get("created_by"),
                 created_at,
                 expires_at,
@@ -255,7 +387,7 @@ impl InviteCodeManager {
         // First, find the invite code that was used by this account
         let use_row = sqlx::query(
             r#"
-            SELECT code FROM invite_code_use WHERE used_by = ?
+            SELECT code FROM invite_code_use WHERE used_by = $1
             "#,
         )
         .bind(did)
@@ -278,7 +410,7 @@ impl InviteCodeManager {
             r#"
             SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account
             FROM invite_code
-            WHERE created_by = ?
+            WHERE created_by = $1
             ORDER BY created_at DESC
             "#,
         )
@@ -302,7 +434,7 @@ impl InviteCodeManager {
             codes.push(InviteCode {
                 code: row.get("code"),
                 available: row.get("available"),
-                disabled: row.get("disabled"),
+                disabled: crate::db::read_bool(&row, "disabled")?,
                 created_by: row.get("created_by"),
                 created_at,
                 expires_at,
@@ -314,12 +446,180 @@ impl InviteCodeManager {
         Ok(codes)
     }
 
+    /// Paginated invite-code listing (Phase 1.10 / chainlink #65).
+    ///
+    /// Supports the lexicon's two sort orderings:
+    /// - `Recent`: by `created_at` descending (matches `sort=recent` default).
+    /// - `Usage`: by total use count from `invite_code_use` descending,
+    ///   computed via LEFT JOIN + GROUP BY on the use table.
+    ///
+    /// Cursor pagination uses a tuple of (sort-field-value, code) so the
+    /// page boundary is unique even when many rows share a `created_at`
+    /// timestamp or use count. The cursor's `sort` discriminant must match
+    /// the request's `sort` parameter; the handler is responsible for that
+    /// check before invoking this method.
+    ///
+    /// Includes disabled codes in the result. The legacy `includeDisabled`
+    /// filter on `getInviteCodes` was removed in Phase 1.10 (not in spec);
+    /// disabled-only filtering will relocate to a `tools.aurora.ops.*`
+    /// endpoint per docs/AURORA_DESIGN.md §4.3.4 (operator-tier surface).
+    ///
+    /// Returns a `Vec<(InviteCode, use_count)>`. The tuple's `i64` is the
+    /// number of rows in `invite_code_use` for that code; callers building
+    /// the next cursor for `Usage` sort need it to seal the page boundary.
+    pub async fn list_codes_paginated(
+        &self,
+        sort: InviteSortKey,
+        cursor: Option<&InviteCursor>,
+        limit: i64,
+    ) -> PdsResult<Vec<(InviteCode, i64)>> {
+        // Validate cursor/sort compatibility upstream of the SQL so we
+        // don't fall through to a query that uses the wrong cursor variant.
+        if let Some(c) = cursor {
+            if c.sort_key() != sort {
+                return Err(PdsError::Validation(
+                    "cursor was issued for a different sort ordering".to_string(),
+                ));
+            }
+        }
+
+        match sort {
+            InviteSortKey::Recent => self.list_recent(cursor, limit).await,
+            InviteSortKey::Usage => self.list_by_usage(cursor, limit).await,
+        }
+    }
+
+    async fn list_recent(
+        &self,
+        cursor: Option<&InviteCursor>,
+        limit: i64,
+    ) -> PdsResult<Vec<(InviteCode, i64)>> {
+        // Tuple comparison via the portable `(a < ?) OR (a = ? AND b < ?)`
+        // form — SQLite supports row-value comparisons since 3.15 but the
+        // disjunction is friendlier to the query planner and EXPLAIN.
+        let base = "SELECT ic.code, ic.available, ic.disabled, ic.created_by,
+                          ic.created_at, ic.expires_at, ic.note, ic.for_account,
+                          (SELECT COUNT(*) FROM invite_code_use icu WHERE icu.code = ic.code) AS use_count
+                   FROM invite_code ic";
+        let rows = if let Some(InviteCursor::Recent {
+            after_created_at,
+            after_code,
+        }) = cursor
+        {
+            let sql = format!(
+                "{base}
+                 WHERE ic.created_at < ?
+                    OR (ic.created_at = ? AND ic.code < ?)
+                 ORDER BY ic.created_at DESC, ic.code DESC
+                 LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(after_created_at)
+                .bind(after_created_at)
+                .bind(after_code)
+                .bind(limit)
+                .fetch_all(&self.db)
+                .await?
+        } else {
+            let sql = format!(
+                "{base}
+                 ORDER BY ic.created_at DESC, ic.code DESC
+                 LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(limit)
+                .fetch_all(&self.db)
+                .await?
+        };
+
+        Self::rows_to_codes_with_count(rows)
+    }
+
+    async fn list_by_usage(
+        &self,
+        cursor: Option<&InviteCursor>,
+        limit: i64,
+    ) -> PdsResult<Vec<(InviteCode, i64)>> {
+        // `use_count` is the aggregate from invite_code_use. We compute it
+        // via a correlated subquery rather than GROUP BY so cursor filtering
+        // can sit cleanly in WHERE rather than HAVING.
+        let base = "SELECT ic.code, ic.available, ic.disabled, ic.created_by,
+                          ic.created_at, ic.expires_at, ic.note, ic.for_account,
+                          (SELECT COUNT(*) FROM invite_code_use icu WHERE icu.code = ic.code) AS use_count
+                   FROM invite_code ic";
+        let rows = if let Some(InviteCursor::Usage {
+            after_use_count,
+            after_code,
+        }) = cursor
+        {
+            let sql = format!(
+                "{base}
+                 WHERE (SELECT COUNT(*) FROM invite_code_use icu WHERE icu.code = ic.code) < ?
+                    OR ((SELECT COUNT(*) FROM invite_code_use icu WHERE icu.code = ic.code) = ?
+                        AND ic.code < ?)
+                 ORDER BY use_count DESC, ic.code DESC
+                 LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(after_use_count)
+                .bind(after_use_count)
+                .bind(after_code)
+                .bind(limit)
+                .fetch_all(&self.db)
+                .await?
+        } else {
+            let sql = format!(
+                "{base}
+                 ORDER BY use_count DESC, ic.code DESC
+                 LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(limit)
+                .fetch_all(&self.db)
+                .await?
+        };
+
+        Self::rows_to_codes_with_count(rows)
+    }
+
+    fn rows_to_codes_with_count(
+        rows: Vec<sqlx::any::AnyRow>,
+    ) -> PdsResult<Vec<(InviteCode, i64)>> {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let created_at_str: String = row.get("created_at");
+            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+                .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
+                .with_timezone(&Utc);
+            let expires_at = row
+                .try_get::<String, _>("expires_at")
+                .ok()
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            let use_count: i64 = row.get("use_count");
+            out.push((
+                InviteCode {
+                    code: row.get("code"),
+                    available: row.get("available"),
+                    disabled: crate::db::read_bool(&row, "disabled")?,
+                    created_by: row.get("created_by"),
+                    created_at,
+                    expires_at,
+                    note: row.get("note"),
+                    for_account: row.get("for_account"),
+                },
+                use_count,
+            ));
+        }
+        Ok(out)
+    }
+
     /// List all invite codes
     pub async fn list_codes(&self, include_disabled: bool) -> PdsResult<Vec<InviteCode>> {
         let query = if include_disabled {
             "SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account FROM invite_code ORDER BY created_at DESC"
         } else {
-            "SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account FROM invite_code WHERE disabled = 0 ORDER BY created_at DESC"
+            "SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account FROM invite_code WHERE NOT disabled ORDER BY created_at DESC"
         };
 
         let rows = sqlx::query(query).fetch_all(&self.db).await?;
@@ -340,7 +640,7 @@ impl InviteCodeManager {
             codes.push(InviteCode {
                 code: row.get("code"),
                 available: row.get("available"),
-                disabled: row.get("disabled"),
+                disabled: crate::db::read_bool(&row, "disabled")?,
                 created_by: row.get("created_by"),
                 created_at,
                 expires_at,
@@ -357,9 +657,20 @@ impl InviteCodeManager {
 mod tests {
     use super::*;
 
+    async fn open_test_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_create_and_use_invite() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         sqlx::query(
             r#"
@@ -427,5 +738,106 @@ mod tests {
         let code = InviteCodeManager::generate_code();
         assert!(code.starts_with("aurora-"));
         assert!(code.len() > 16);
+    }
+
+    // LB-1 Session 12 / chainlink #129: InviteCodeManager `_in_tx`
+    // variants must be rollback-safe.
+
+    async fn open_invite_pool() -> AnyPool {
+        let db = open_test_pool().await;
+        sqlx::query(
+            r#"
+            CREATE TABLE invite_code (
+                code TEXT PRIMARY KEY,
+                available INTEGER NOT NULL DEFAULT 1,
+                disabled INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                note TEXT,
+                for_account TEXT
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn create_invite_in_tx_rolls_back_on_caller_rollback() {
+        let db = open_invite_pool().await;
+        {
+            let mut tx = db.begin().await.unwrap();
+            InviteCodeManager::create_invite_in_tx(
+                &mut tx,
+                "did:plc:admin",
+                3,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invite_code")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn disable_code_in_tx_rolls_back_on_caller_rollback() {
+        let db = open_invite_pool().await;
+        let manager = InviteCodeManager::new(db.clone());
+        let code = manager
+            .create_invite("did:plc:admin", 1, None, None, None)
+            .await
+            .unwrap();
+
+        {
+            let mut tx = db.begin().await.unwrap();
+            InviteCodeManager::disable_code_in_tx(&mut tx, &code.code)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let post = manager.get_code(&code.code).await.unwrap().unwrap();
+        assert!(!post.disabled, "disable rolled back; flag remains false");
+    }
+
+    #[tokio::test]
+    async fn disable_codes_batch_in_tx_rolls_back_on_caller_rollback() {
+        let db = open_invite_pool().await;
+        let manager = InviteCodeManager::new(db.clone());
+        let c1 = manager
+            .create_invite("did:plc:admin", 1, None, None, None)
+            .await
+            .unwrap();
+        let c2 = manager
+            .create_invite("did:plc:admin", 1, None, None, None)
+            .await
+            .unwrap();
+
+        {
+            let mut tx = db.begin().await.unwrap();
+            InviteCodeManager::disable_codes_batch_in_tx(
+                &mut tx,
+                &[c1.code.clone(), c2.code.clone()],
+                &[],
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        for c in [&c1, &c2] {
+            let post = manager.get_code(&c.code).await.unwrap().unwrap();
+            assert!(!post.disabled);
+        }
     }
 }

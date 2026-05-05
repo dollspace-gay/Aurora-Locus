@@ -3,15 +3,23 @@
 /// Coordinates blob storage backends with database metadata tracking
 use crate::{
     blob_store::{
-        disk::DiskBlobBackend, BlobBackend, BlobBackendType, BlobMetadata, BlobRef,
-        BlobStorageConfig, ImageDimensions, TempBlob,
+        disk::DiskBlobBackend, s3::S3BlobBackend, s3::S3Config, BlobBackend, BlobBackendType,
+        BlobMetadata, BlobRef, BlobStorageConfig, ImageDimensions, TempBlob,
     },
     error::{PdsError, PdsResult},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+
+/// Parse an RFC3339 string from the database into a `DateTime<Utc>`.
+/// See chainlink #76 / Phase 3 design notes on chrono ↔ AnyPool.
+fn parse_timestamp(s: &str) -> PdsResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))
+}
 use image::ImageFormat;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::sync::Arc;
 use tokio::fs;
 
@@ -26,19 +34,38 @@ pub struct BlobStoreConfig {
 pub struct BlobStore {
     config: BlobStoreConfig,
     backend: Arc<dyn BlobBackend>,
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl BlobStore {
-    /// Create a new blob store
-    pub fn new(config: BlobStoreConfig, db: SqlitePool) -> PdsResult<Self> {
+    /// Create a new blob store. Async because S3 backend init performs
+    /// SDK config loading which is async; the disk path is also awaited
+    /// for uniformity even though it has no async work.
+    pub async fn new(config: BlobStoreConfig, db: AnyPool) -> PdsResult<Self> {
         let backend: Arc<dyn BlobBackend> = match &config.storage.backend {
             BlobBackendType::Disk { location } => Arc::new(DiskBlobBackend::new(location.clone())),
-            BlobBackendType::S3 { .. } => {
-                return Err(PdsError::Internal(
-                    "S3 backend not yet implemented".to_string(),
-                ));
-            }
+            BlobBackendType::S3 {
+                bucket,
+                region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+                prefix,
+                force_path_style,
+                upload_timeout_ms,
+            } => Arc::new(
+                S3BlobBackend::new(S3Config {
+                    bucket: bucket.clone(),
+                    region: region.clone(),
+                    endpoint: endpoint.clone(),
+                    access_key_id: access_key_id.clone(),
+                    secret_access_key: secret_access_key.clone(),
+                    prefix: prefix.clone(),
+                    force_path_style: *force_path_style,
+                    upload_timeout_ms: *upload_timeout_ms,
+                })
+                .await?,
+            ),
         };
 
         Ok(Self {
@@ -417,7 +444,7 @@ impl BlobStore {
         sqlx::query(
             r#"
             INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT(cid) DO NOTHING
             "#,
         )
@@ -425,7 +452,7 @@ impl BlobStore {
         .bind(mime_type)
         .bind(size)
         .bind(creator_did)
-        .bind(Utc::now())
+        .bind(Utc::now().to_rfc3339())
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -451,7 +478,7 @@ impl BlobStore {
         sqlx::query(
             r#"
             INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, width, height, thumbnail_cid)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT(cid) DO UPDATE SET
                 width = excluded.width,
                 height = excluded.height,
@@ -462,7 +489,7 @@ impl BlobStore {
         .bind(mime_type)
         .bind(size)
         .bind(creator_did)
-        .bind(Utc::now())
+        .bind(Utc::now().to_rfc3339())
         .bind(width)
         .bind(height)
         .bind(thumbnail_cid)
@@ -478,7 +505,7 @@ impl BlobStore {
         sqlx::query(
             r#"
             INSERT INTO temp_blob_metadata (cid, mime_type, size, creator_did, created_at, width, height)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT(cid) DO UPDATE SET
                 mime_type = excluded.mime_type,
                 size = excluded.size,
@@ -490,7 +517,7 @@ impl BlobStore {
         .bind(&temp_blob.mime_type)
         .bind(temp_blob.size)
         .bind(&temp_blob.creator_did)
-        .bind(temp_blob.created_at)
+        .bind(temp_blob.created_at.to_rfc3339())
         .bind(temp_blob.width)
         .bind(temp_blob.height)
         .execute(&self.db)
@@ -507,7 +534,7 @@ impl BlobStore {
             r#"
             SELECT cid, mime_type, size, creator_did, created_at, width, height
             FROM temp_blob_metadata
-            WHERE cid = ?1
+            WHERE cid = $1
             "#,
         )
         .bind(cid)
@@ -521,7 +548,7 @@ impl BlobStore {
                 mime_type: row.try_get("mime_type")?,
                 size: row.try_get("size")?,
                 creator_did: row.try_get("creator_did")?,
-                created_at: row.try_get("created_at")?,
+                created_at: parse_timestamp(&row.try_get::<String, _>("created_at")?)?,
                 width: row.try_get("width")?,
                 height: row.try_get("height")?,
             }))
@@ -532,7 +559,7 @@ impl BlobStore {
 
     /// Delete temp blob metadata from database
     async fn delete_temp_blob_metadata(&self, cid: &str) -> PdsResult<()> {
-        sqlx::query("DELETE FROM temp_blob_metadata WHERE cid = ?1")
+        sqlx::query("DELETE FROM temp_blob_metadata WHERE cid = $1")
             .bind(cid)
             .execute(&self.db)
             .await
@@ -549,11 +576,11 @@ impl BlobStore {
             r#"
             SELECT cid
             FROM temp_blob_metadata
-            WHERE created_at < ?1
+            WHERE created_at < $1
             ORDER BY created_at ASC
             "#,
         )
-        .bind(cutoff)
+        .bind(cutoff.to_rfc3339())
         .fetch_all(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -588,7 +615,7 @@ impl BlobStore {
             r#"
             SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
             FROM blob_metadata
-            WHERE cid = ?1
+            WHERE cid = $1
             "#,
         )
         .bind(cid)
@@ -602,7 +629,7 @@ impl BlobStore {
                 mime_type: row.try_get("mime_type")?,
                 size: row.try_get("size")?,
                 creator_did: row.try_get("creator_did")?,
-                created_at: row.try_get("created_at")?,
+                created_at: parse_timestamp(&row.try_get::<String, _>("created_at")?)?,
                 width: row.try_get("width")?,
                 height: row.try_get("height")?,
                 alt_text: row.try_get("alt_text")?,
@@ -615,7 +642,7 @@ impl BlobStore {
 
     /// Delete blob metadata from database
     async fn delete_metadata(&self, cid: &str) -> PdsResult<()> {
-        sqlx::query("DELETE FROM blob_metadata WHERE cid = ?1")
+        sqlx::query("DELETE FROM blob_metadata WHERE cid = $1")
             .bind(cid)
             .execute(&self.db)
             .await
@@ -630,9 +657,9 @@ impl BlobStore {
             r#"
             SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
             FROM blob_metadata
-            WHERE creator_did = ?1
+            WHERE creator_did = $1
             ORDER BY created_at DESC
-            LIMIT ?2
+            LIMIT $2
             "#,
         )
         .bind(did)
@@ -648,7 +675,7 @@ impl BlobStore {
                 mime_type: row.try_get("mime_type")?,
                 size: row.try_get("size")?,
                 creator_did: row.try_get("creator_did")?,
-                created_at: row.try_get("created_at")?,
+                created_at: parse_timestamp(&row.try_get::<String, _>("created_at")?)?,
                 width: row.try_get("width")?,
                 height: row.try_get("height")?,
                 alt_text: row.try_get("alt_text")?,
@@ -687,11 +714,11 @@ impl BlobStore {
                 SELECT rb.blob_cid, rb.record_uri
                 FROM record_blob rb
                 LEFT JOIN blob_metadata bm ON rb.blob_cid = bm.cid
-                WHERE rb.record_uri LIKE ?1
+                WHERE rb.record_uri LIKE $1
                   AND bm.cid IS NULL
-                  AND rb.blob_cid > ?2
+                  AND rb.blob_cid > $2
                 ORDER BY rb.blob_cid ASC
-                LIMIT ?3
+                LIMIT $3
                 "#,
             )
             .bind(format!("at://{}/%", did))
@@ -703,10 +730,10 @@ impl BlobStore {
                 SELECT rb.blob_cid, rb.record_uri
                 FROM record_blob rb
                 LEFT JOIN blob_metadata bm ON rb.blob_cid = bm.cid
-                WHERE rb.record_uri LIKE ?1
+                WHERE rb.record_uri LIKE $1
                   AND bm.cid IS NULL
                 ORDER BY rb.blob_cid ASC
-                LIMIT ?2
+                LIMIT $2
                 "#,
             )
             .bind(format!("at://{}/%", did))
@@ -736,13 +763,13 @@ impl BlobStore {
         sqlx::query(
             r#"
             INSERT INTO record_blob (blob_cid, record_uri, indexed_at)
-            VALUES (?1, ?2, ?3)
+            VALUES ($1, $2, $3)
             ON CONFLICT(blob_cid, record_uri) DO NOTHING
             "#,
         )
         .bind(blob_cid)
         .bind(record_uri)
-        .bind(Utc::now())
+        .bind(Utc::now().to_rfc3339())
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -754,7 +781,7 @@ impl BlobStore {
     ///
     /// Called when a record is deleted.
     pub async fn remove_record_blob_references(&self, record_uri: &str) -> PdsResult<()> {
-        sqlx::query("DELETE FROM record_blob WHERE record_uri = ?1")
+        sqlx::query("DELETE FROM record_blob WHERE record_uri = $1")
             .bind(record_uri)
             .execute(&self.db)
             .await
@@ -787,9 +814,9 @@ impl BlobStore {
         let query = if let Some(cursor) = cursor {
             sqlx::query_scalar(
                 "SELECT cid FROM blob_metadata
-                 WHERE creator_did = ?1 AND cid > ?2
+                 WHERE creator_did = $1 AND cid > $2
                  ORDER BY cid ASC
-                 LIMIT ?3",
+                 LIMIT $3",
             )
             .bind(did)
             .bind(cursor)
@@ -797,9 +824,9 @@ impl BlobStore {
         } else {
             sqlx::query_scalar(
                 "SELECT cid FROM blob_metadata
-                 WHERE creator_did = ?1
+                 WHERE creator_did = $1
                  ORDER BY cid ASC
-                 LIMIT ?2",
+                 LIMIT $2",
             )
             .bind(did)
             .bind(limit)
@@ -831,8 +858,17 @@ mod tests {
             },
         };
 
-        // Create in-memory database for testing
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        // Create in-memory database for testing. Single-connection pool
+        // is required for `:memory:` SQLite (each connection has its own
+        // private database otherwise).
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let db = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
 
         // Create blob_metadata table with new columns
         sqlx::query(
@@ -842,7 +878,7 @@ mod tests {
                 mime_type TEXT NOT NULL,
                 size INTEGER NOT NULL,
                 creator_did TEXT NOT NULL,
-                created_at DATETIME NOT NULL,
+                created_at TEXT NOT NULL,
                 width INTEGER,
                 height INTEGER,
                 alt_text TEXT,
@@ -854,7 +890,7 @@ mod tests {
         .await
         .unwrap();
 
-        BlobStore::new(config, db).unwrap()
+        BlobStore::new(config, db).await.unwrap()
     }
 
     #[tokio::test]

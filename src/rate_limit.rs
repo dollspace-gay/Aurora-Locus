@@ -88,7 +88,7 @@
 use crate::error::{PdsError, PdsResult};
 use axum::{
     extract::{Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -142,6 +142,15 @@ pub struct RateLimitConfig {
     pub handle_resolution_rps: u32,
     /// Requests per second for DID resolution (outbound HTTP to PLC directory)
     pub did_resolution_rps: u32,
+    /// Bypass the rate limiter for GET requests that target admin static
+    /// assets (HTML/JS/CSS/JSON under the configured admin asset paths).
+    /// Defaults to `true` because the page-load fan-out (~47 parallel
+    /// `<script>` and `<link>` requests per visit) exceeds the per-IP
+    /// unauthenticated quota and produces spurious 429s. Production
+    /// deployments rely on the reverse proxy for asset DDoS protection;
+    /// the PDS rate limiter is for application-layer API protection.
+    /// Setting this to `false` opts the asset paths back into the limiter.
+    pub exempt_admin_assets: bool,
 }
 
 impl Default for RateLimitConfig {
@@ -155,6 +164,7 @@ impl Default for RateLimitConfig {
             trust_proxy: false,        // Default to false for security (don't trust proxy headers)
             handle_resolution_rps: 50, // 50 req/sec for handle resolution (protect outbound)
             did_resolution_rps: 50,    // 50 req/sec for DID resolution (protect outbound)
+            exempt_admin_assets: true, // Admin UI static assets bypass the limiter by default
         }
     }
 }
@@ -452,6 +462,9 @@ pub struct RateLimiter {
     ip_limiter: Arc<GovernorLimiter<String, DashMap<String, InMemoryState>, DefaultClock>>,
     /// Whether to trust proxy headers for IP extraction
     pub trust_proxy: bool,
+    /// Whether GET requests to admin static-asset paths bypass the limiter.
+    /// See `is_admin_asset_exempt` for the matched path/method set.
+    pub exempt_admin_assets: bool,
     /// Configuration for returning rate limit info
     config: RateLimitConfig,
     /// Request counts per window for state tracking (identifier -> (window_start, count))
@@ -547,6 +560,7 @@ impl RateLimiter {
             endpoint_limiters: Arc::new(endpoint_limiters),
             ip_limiter: Arc::new(GovernorLimiter::keyed(ip_quota)),
             trust_proxy: config.trust_proxy,
+            exempt_admin_assets: config.exempt_admin_assets,
             config: config.clone(),
             request_counts: Arc::new(DashMap::new()),
             handle_resolution: Arc::new(GovernorLimiter::direct(handle_resolution_quota)),
@@ -911,6 +925,45 @@ impl RateLimiter {
     }
 }
 
+/// Determine whether a request targets an admin UI static asset that should
+/// bypass the rate limiter when the exemption is enabled.
+///
+/// The admin UI's `index.html` fans out to ~47 parallel `<script>` / `<link>`
+/// requests on first paint, which trivially exceeds the per-IP unauthenticated
+/// quota (10 req/sec) and produces spurious 429s during smoke testing. The
+/// PDS rate limiter is intended for application-layer API protection
+/// (`/xrpc/*`, auth surfaces); asset-level DDoS protection is the reverse
+/// proxy's responsibility.
+///
+/// The exemption is intentionally narrow:
+///
+/// * Method must be `GET`. Any non-GET (POST, PUT, DELETE, …) under
+///   `/admin/*` remains rate-limited so future dynamic admin endpoints
+///   inherit limiter coverage by default.
+/// * Path must be one of:
+///   - the three top-level admin HTML entry points
+///     (`/admin/index.html`, `/admin/login.html`, `/admin/debug.html`)
+///   - anything under `/admin/scripts/`, `/admin/styles/`,
+///     `/admin/i18n/`, or `/admin/login/`
+///
+/// Anything else under `/admin/*` (including bare `/admin` and any future
+/// subdirectory not listed above) stays rate-limited normally. Auth surfaces
+/// such as `/admin-oauth/*` are unaffected — the prefix `/admin/` does not
+/// match the hyphenated namespace.
+pub fn is_admin_asset_exempt(path: &str, method: &Method) -> bool {
+    if method != Method::GET {
+        return false;
+    }
+
+    matches!(
+        path,
+        "/admin/index.html" | "/admin/login.html" | "/admin/debug.html"
+    ) || path.starts_with("/admin/scripts/")
+        || path.starts_with("/admin/styles/")
+        || path.starts_with("/admin/i18n/")
+        || path.starts_with("/admin/login/")
+}
+
 /// Rate limiting middleware
 pub async fn rate_limit_middleware(
     State(ctx): State<crate::context::AppContext>,
@@ -918,6 +971,17 @@ pub async fn rate_limit_middleware(
     next: Next,
 ) -> Result<Response, StatusCode> {
     let endpoint_path = request.uri().path();
+
+    // Bypass the limiter for admin UI static assets when the exemption is
+    // enabled. This is path-and-method specific (see `is_admin_asset_exempt`)
+    // so non-GET requests and non-asset admin paths still go through the
+    // limiter. Returning early skips rate-limit header injection on purpose:
+    // these responses are not rate-limited and shouldn't advertise a counter.
+    if ctx.rate_limiter.exempt_admin_assets
+        && is_admin_asset_exempt(endpoint_path, request.method())
+    {
+        return Ok(next.run(request).await);
+    }
 
     // Extract client IP for rate limiting and logging
     let client_ip = extract_client_ip(request.headers(), ctx.rate_limiter.trust_proxy);
@@ -1770,5 +1834,141 @@ mod tests {
 
         // But other handles should still work (global limit not exhausted)
         assert!(limiter.check_handle_resolution("fresh.handle").is_ok());
+    }
+
+    #[test]
+    fn test_admin_asset_exempt_listed_html_pages() {
+        // The three top-level admin entry pages are exempt on GET.
+        assert!(is_admin_asset_exempt("/admin/index.html", &Method::GET));
+        assert!(is_admin_asset_exempt("/admin/login.html", &Method::GET));
+        assert!(is_admin_asset_exempt("/admin/debug.html", &Method::GET));
+    }
+
+    #[test]
+    fn test_admin_asset_exempt_subtree_dirs() {
+        // Anything nested under the four asset subdirectories is exempt on GET.
+        assert!(is_admin_asset_exempt(
+            "/admin/scripts/app.js",
+            &Method::GET
+        ));
+        assert!(is_admin_asset_exempt(
+            "/admin/scripts/nested/dir/file.js",
+            &Method::GET
+        ));
+        assert!(is_admin_asset_exempt(
+            "/admin/styles/app.css",
+            &Method::GET
+        ));
+        assert!(is_admin_asset_exempt(
+            "/admin/styles/themes/dark.css",
+            &Method::GET
+        ));
+        assert!(is_admin_asset_exempt("/admin/i18n/en.json", &Method::GET));
+        assert!(is_admin_asset_exempt(
+            "/admin/i18n/locales.json",
+            &Method::GET
+        ));
+        assert!(is_admin_asset_exempt(
+            "/admin/login/index.html",
+            &Method::GET
+        ));
+    }
+
+    #[test]
+    fn test_admin_asset_exempt_method_must_be_get() {
+        // Non-GET requests against asset paths stay rate-limited so future
+        // dynamic admin endpoints inherit limiter coverage by default.
+        for method in [
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+            Method::HEAD,
+            Method::OPTIONS,
+        ] {
+            assert!(
+                !is_admin_asset_exempt("/admin/scripts/app.js", &method),
+                "method {} should not be exempt",
+                method
+            );
+            assert!(
+                !is_admin_asset_exempt("/admin/index.html", &method),
+                "method {} should not be exempt for top-level html",
+                method
+            );
+        }
+    }
+
+    #[test]
+    fn test_admin_asset_exempt_only_listed_dirs() {
+        // Paths inside /admin/ that aren't in the exemption list stay limited.
+        assert!(!is_admin_asset_exempt("/admin", &Method::GET));
+        assert!(!is_admin_asset_exempt("/admin/", &Method::GET));
+        assert!(!is_admin_asset_exempt(
+            "/admin/something_else",
+            &Method::GET
+        ));
+        assert!(!is_admin_asset_exempt(
+            "/admin/api/handler",
+            &Method::GET
+        ));
+        // Bare directory prefixes without trailing slash should not match the
+        // subtree rule (avoid an /admin/scriptsblah.js style false positive).
+        assert!(!is_admin_asset_exempt("/admin/scripts", &Method::GET));
+        assert!(!is_admin_asset_exempt(
+            "/admin/scriptsblah.js",
+            &Method::GET
+        ));
+    }
+
+    #[test]
+    fn test_admin_asset_exempt_xrpc_not_affected() {
+        // API endpoints stay rate-limited regardless of method.
+        assert!(!is_admin_asset_exempt(
+            "/xrpc/com.atproto.repo.getRecord",
+            &Method::GET
+        ));
+        assert!(!is_admin_asset_exempt(
+            "/xrpc/com.atproto.server.createSession",
+            &Method::POST
+        ));
+    }
+
+    #[test]
+    fn test_admin_asset_exempt_admin_oauth_not_affected() {
+        // /admin-oauth/* is a hyphenated namespace, not under /admin/. The
+        // exemption must not match it (auth surface stays rate-limited).
+        assert!(!is_admin_asset_exempt(
+            "/admin-oauth/callback",
+            &Method::GET
+        ));
+        assert!(!is_admin_asset_exempt(
+            "/admin-oauth/scripts/foo.js",
+            &Method::GET
+        ));
+    }
+
+    #[test]
+    fn test_admin_asset_exempt_config_default_is_true() {
+        // The exemption defaults to on so the admin UI loads without 429s
+        // out of the box.
+        assert!(RateLimitConfig::default().exempt_admin_assets);
+    }
+
+    #[test]
+    fn test_admin_asset_exempt_flag_propagates_to_limiter() {
+        // The runtime RateLimiter exposes the flag so the middleware can
+        // read it without re-touching configuration.
+        let on = RateLimiter::new(RateLimitConfig {
+            exempt_admin_assets: true,
+            ..RateLimitConfig::default()
+        });
+        assert!(on.exempt_admin_assets);
+
+        let off = RateLimiter::new(RateLimitConfig {
+            exempt_admin_assets: false,
+            ..RateLimitConfig::default()
+        });
+        assert!(!off.exempt_admin_assets);
     }
 }

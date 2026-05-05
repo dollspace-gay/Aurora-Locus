@@ -9,7 +9,7 @@
 use crate::error::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AnyPool, Row};
 use std::str::FromStr;
 
 /// Quarantine reason types
@@ -79,11 +79,11 @@ pub struct QuarantineRecord {
 /// Blob quarantine manager
 #[derive(Clone)]
 pub struct BlobQuarantine {
-    db: SqlitePool,
+    db: AnyPool,
 }
 
 impl BlobQuarantine {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: AnyPool) -> Self {
         Self { db }
     }
 
@@ -107,10 +107,11 @@ impl BlobQuarantine {
             )));
         }
 
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO blob_quarantine (cid, reason, details, quarantined_by, quarantined_at, legal_reference)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
             "#,
         )
         .bind(cid)
@@ -119,11 +120,11 @@ impl BlobQuarantine {
         .bind(quarantined_by)
         .bind(now.to_rfc3339())
         .bind(legal_reference)
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
         // Update blob table to mark as taken down
-        sqlx::query("UPDATE blob SET takedown = 1 WHERE cid = ?1")
+        sqlx::query("UPDATE blob SET takedown = true WHERE cid = $1")
             .bind(cid)
             .execute(&self.db)
             .await?;
@@ -136,7 +137,7 @@ impl BlobQuarantine {
         );
 
         Ok(QuarantineRecord {
-            id: result.last_insert_rowid(),
+            id,
             cid: cid.to_string(),
             reason,
             details: details.map(String::from),
@@ -155,9 +156,9 @@ impl BlobQuarantine {
         let result = sqlx::query(
             r#"
             UPDATE blob_quarantine
-            SET restored_at = ?,
-                restored_by = ?
-            WHERE cid = ? AND restored_at IS NULL
+            SET restored_at = $1,
+                restored_by = $2
+            WHERE cid = $3 AND restored_at IS NULL
             "#,
         )
         .bind(now.to_rfc3339())
@@ -174,7 +175,7 @@ impl BlobQuarantine {
         }
 
         // Update blob table to remove takedown
-        sqlx::query("UPDATE blob SET takedown = 0 WHERE cid = ?1")
+        sqlx::query("UPDATE blob SET takedown = false WHERE cid = $1")
             .bind(cid)
             .execute(&self.db)
             .await?;
@@ -186,7 +187,7 @@ impl BlobQuarantine {
     /// Check if blob is quarantined
     pub async fn is_quarantined(&self, cid: &str) -> PdsResult<bool> {
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM blob_quarantine WHERE cid = ?1 AND restored_at IS NULL",
+            "SELECT COUNT(*) FROM blob_quarantine WHERE cid = $1 AND restored_at IS NULL",
         )
         .bind(cid)
         .fetch_one(&self.db)
@@ -202,7 +203,7 @@ impl BlobQuarantine {
             SELECT id, cid, reason, details, quarantined_by, quarantined_at,
                    restored_at, restored_by, legal_reference
             FROM blob_quarantine
-            WHERE cid = ? AND restored_at IS NULL
+            WHERE cid = $1 AND restored_at IS NULL
             "#,
         )
         .bind(cid)
@@ -225,7 +226,7 @@ impl BlobQuarantine {
             FROM blob_quarantine
             WHERE restored_at IS NULL
             ORDER BY quarantined_at DESC
-            LIMIT ?
+            LIMIT $1
             "#,
         )
         .bind(limit)
@@ -247,7 +248,7 @@ impl BlobQuarantine {
             SELECT id, cid, reason, details, quarantined_by, quarantined_at,
                    restored_at, restored_by, legal_reference
             FROM blob_quarantine
-            WHERE cid = ?
+            WHERE cid = $1
             ORDER BY quarantined_at DESC
             "#,
         )
@@ -264,7 +265,7 @@ impl BlobQuarantine {
     }
 
     /// Parse database row into QuarantineRecord
-    fn parse_quarantine_record(&self, row: sqlx::sqlite::SqliteRow) -> PdsResult<QuarantineRecord> {
+    fn parse_quarantine_record(&self, row: sqlx::any::AnyRow) -> PdsResult<QuarantineRecord> {
         let reason_str: String = row.get("reason");
         let reason = QuarantineReason::from_str(&reason_str)?;
 
@@ -297,9 +298,23 @@ impl BlobQuarantine {
 mod tests {
     use super::*;
 
+    /// Open a single-connection SQLite-backed `AnyPool` for the in-memory
+    /// test fixture. Single-connection is mandatory for `:memory:` SQLite
+    /// (each connection has its own private database otherwise).
+    async fn open_test_pool() -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_quarantine_and_restore() {
-        let db = SqlitePool::connect(":memory:").await.unwrap();
+        let db = open_test_pool().await;
 
         // Create tables
         sqlx::query(
@@ -339,7 +354,7 @@ mod tests {
 
         // Insert test blob
         sqlx::query(
-            "INSERT INTO blob (cid, did, size, mime_type, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO blob (cid, did, size, mime_type, created_at) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind("bafytest123")
         .bind("did:plc:alice")

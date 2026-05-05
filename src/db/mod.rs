@@ -6,9 +6,37 @@
 pub mod account;
 pub mod postgres;
 
+use crate::config::{DatabaseBackend, DatabaseConfig};
 use crate::error::{PdsError, PdsResult};
+use sqlx::any::AnyPoolOptions;
 use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
+use sqlx::Row;
 use std::path::Path;
+use std::time::Duration;
+
+/// Portable boolean column read across SQLite (INTEGER 0/1) and
+/// Postgres (BOOLEAN) backends via `sqlx::Any` (chainlink #96).
+///
+/// Phase 3 (b851678) standardized boolean reads on the
+/// `row.get::<i64, _>(col) != 0` pattern because SQLite migration
+/// columns are INTEGER-typed and `sqlx::Any` couldn't decode INTEGER
+/// directly into `bool` when the column type was declared INTEGER.
+/// That pattern fails on Postgres, where the same logical columns
+/// are real `BOOLEAN` and `sqlx::Any` rejects `i64` decoding from
+/// `BOOLEAN` with `ColumnDecode`.
+///
+/// `read_bool` papers over the difference: try `bool` first
+/// (Postgres BOOLEAN succeeds; SQLite INTEGER may also succeed via
+/// the Any driver's loose typing), then fall back to `i64 != 0`
+/// (legacy SQLite INTEGER columns where the bool decode refuses).
+/// Single decision point for all current and future bool reads.
+pub fn read_bool(row: &sqlx::any::AnyRow, col: &str) -> Result<bool, sqlx::Error> {
+    match row.try_get::<bool, _>(col) {
+        Ok(b) => Ok(b),
+        Err(_) => row.try_get::<i64, _>(col).map(|i| i != 0),
+    }
+}
 
 /// Database connection options
 #[derive(Debug, Clone)]
@@ -71,6 +99,88 @@ pub async fn test_connection(pool: &SqlitePool) -> PdsResult<()> {
         .map_err(PdsError::Database)?;
 
     Ok(())
+}
+
+// ============================================================================
+// Backend-dispatching pool / migration entry points (Phase 2 / chainlink #75).
+//
+// The functions below return / operate on `AnyPool`, sqlx's driver-agnostic
+// pool. Phase 3 (#76) will switch the 16 Group A+B managers from
+// `SqlitePool` to `AnyPool` per file. Until then these factories exist
+// alongside the legacy SQLite-only paths above; AppContext continues to
+// construct the legacy `SqlitePool` for now.
+// ============================================================================
+
+/// Resolve the connection URL for an `AnyPool` from a `DatabaseConfig`.
+/// SQLite gets a `sqlite://` prefix and `?mode=rwc` so the file is
+/// created if missing, matching the legacy `create_pool` behaviour.
+#[allow(dead_code)] // Phase 3 (#76) wires this into AppContext.
+fn any_url_for(config: &DatabaseConfig, fallback_sqlite_path: &Path) -> String {
+    match config.backend {
+        DatabaseBackend::Sqlite => {
+            let path = config.url.as_deref().unwrap_or_else(|| {
+                fallback_sqlite_path
+                    .to_str()
+                    .expect("SQLite path must be valid UTF-8")
+            });
+            format!("sqlite://{}?mode=rwc", path)
+        }
+        DatabaseBackend::Postgres => config
+            .url
+            .clone()
+            .expect("postgres backend requires a URL; validated at config load"),
+    }
+}
+
+/// Create a backend-dispatched `AnyPool` from a `DatabaseConfig`.
+///
+/// Calls `sqlx::any::install_default_drivers()` once on first use so the
+/// `Any` driver knows how to dispatch `sqlite://` and `postgres://` URLs
+/// to the correct concrete driver.
+#[allow(dead_code)] // Phase 3 (#76) calls this from AppContext::new.
+pub async fn create_any_pool(
+    config: &DatabaseConfig,
+    fallback_sqlite_path: &Path,
+) -> PdsResult<AnyPool> {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(sqlx::any::install_default_drivers);
+
+    if let DatabaseBackend::Sqlite = config.backend {
+        if let Some(parent) = fallback_sqlite_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+
+    let mut opts = AnyPoolOptions::new()
+        .max_connections(config.max_connections)
+        .min_connections(config.min_connections)
+        .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs));
+    if let Some(t) = config.idle_timeout_secs {
+        opts = opts.idle_timeout(Some(Duration::from_secs(t)));
+    }
+    if let Some(t) = config.max_lifetime_secs {
+        opts = opts.max_lifetime(Some(Duration::from_secs(t)));
+    }
+
+    let url = any_url_for(config, fallback_sqlite_path);
+    opts.connect(&url).await.map_err(PdsError::Database)
+}
+
+/// Run backend-appropriate migrations against an `AnyPool`. Dispatches
+/// to `migrations/` for SQLite and `migrations/postgres/` for Postgres.
+#[allow(dead_code)] // Phase 3 (#76) calls this from AppContext::new.
+pub async fn run_any_migrations(pool: &AnyPool, config: &DatabaseConfig) -> PdsResult<()> {
+    match config.backend {
+        DatabaseBackend::Sqlite => sqlx::migrate!("./migrations")
+            .run(pool)
+            .await
+            .map_err(|e| PdsError::Internal(format!("SQLite migration failed: {}", e))),
+        DatabaseBackend::Postgres => sqlx::migrate!("./migrations/postgres")
+            .run(pool)
+            .await
+            .map_err(|e| PdsError::Internal(format!("Postgres migration failed: {}", e))),
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +252,72 @@ mod tests {
             "delete",
             "DELETE mode should be used when WAL is disabled"
         );
+    }
+
+    /// Verify `read_bool` against SQLite-via-Any with INTEGER 0/1
+    /// columns — the legacy decode path that Phase 3's pattern handled.
+    /// Postgres BOOLEAN is exercised by the integration test layer
+    /// (tests/postgres_smoke_test.rs) once the helper is wired in.
+    #[tokio::test]
+    async fn test_read_bool_sqlite_integer_columns() {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Schema mirrors the production pattern: INTEGER 0/1 booleans.
+        sqlx::query("CREATE TABLE flags (id INTEGER PRIMARY KEY, on_flag INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO flags (id, on_flag) VALUES (1, 1), (2, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let row1 = sqlx::query("SELECT on_flag FROM flags WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(read_bool(&row1, "on_flag").unwrap(), "1 → true");
+
+        let row2 = sqlx::query("SELECT on_flag FROM flags WHERE id = 2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!read_bool(&row2, "on_flag").unwrap(), "0 → false");
+    }
+
+    #[tokio::test]
+    async fn test_read_bool_unknown_column_errors() {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE x (id INTEGER PRIMARY KEY, on_flag INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO x (id, on_flag) VALUES (1, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT on_flag FROM x WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // Unknown column name surfaces as a sqlx::Error from try_get.
+        assert!(read_bool(&row, "no_such_column").is_err());
     }
 
     #[tokio::test]

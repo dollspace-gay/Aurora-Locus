@@ -12,9 +12,9 @@ use crate::{
 };
 use axum::{
     extract::{Request, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use std::time::Instant;
 use tracing::{error, info, warn};
@@ -756,4 +756,236 @@ pub async fn jwt_deprecation_headers(
     }
 
     response
+}
+
+// ============================================================================
+// Namespace-keyed scope-check middleware (chainlink #84 / Phase 2.3.1).
+//
+// Runs before AdminAuthContext extraction on admin namespaces. Composition:
+//
+//   Request → namespace_scope_check_middleware → AdminAuthContext → handler
+//
+// Behaviour:
+//   - Path outside admin namespaces (com.atproto.admin.* / tools.aurora.*):
+//     no-op pass-through.
+//   - Path inside an admin namespace, OAuth-authenticated: scope-check;
+//     reject with 403 if scope is missing.
+//   - Path inside an admin namespace, session/JWT-authenticated (or no
+//     auth header): pass through. Session tokens predate the OAuth scope
+//     hierarchy and grant implicit full access; AdminAuthContext still
+//     enforces role downstream.
+//
+// The decision logic is split into a pure helper (`classify_namespace_scope`)
+// so it's testable without an AppContext; the axum wrapper does the
+// (DB-backed) OAuth-token lookup before dispatching.
+// ============================================================================
+
+/// Outcome of the namespace scope check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceScopeOutcome {
+    /// Request passes — either not an admin path, or not OAuth-authenticated
+    /// (downstream auth handles role enforcement).
+    Pass,
+    /// OAuth scope satisfies the namespace requirement.
+    Allow,
+    /// OAuth scope is insufficient — reject with 403.
+    Deny(String),
+}
+
+/// Pure decision: classify a request based on path and (optional) OAuth
+/// scope claim. See module-level docs for behaviour.
+pub fn classify_namespace_scope(
+    path: &str,
+    oauth_scope: Option<&str>,
+) -> NamespaceScopeOutcome {
+    use crate::oauth::{enforce_namespace_scope, required_scopes_for_path, ScopeSet};
+    use std::str::FromStr;
+
+    if required_scopes_for_path(path).is_none() {
+        return NamespaceScopeOutcome::Pass;
+    }
+
+    let Some(scope_str) = oauth_scope else {
+        // Admin path but no OAuth claim — session/JWT path. Let the
+        // downstream AdminAuthContext extractor handle role enforcement.
+        return NamespaceScopeOutcome::Pass;
+    };
+
+    let scopes = match ScopeSet::from_str(scope_str) {
+        Ok(s) => s,
+        Err(_) => return NamespaceScopeOutcome::Deny("Invalid scope claim".to_string()),
+    };
+
+    match enforce_namespace_scope(path, &scopes) {
+        Ok(()) => NamespaceScopeOutcome::Allow,
+        Err(e) => NamespaceScopeOutcome::Deny(e.to_string()),
+    }
+}
+
+/// Axum middleware: enforces namespace scope rules on admin paths.
+///
+/// Looks up the OAuth scope by validating the bearer token against the
+/// token table; if the token is not an OAuth token (e.g. session/JWT),
+/// `validate_oauth_token` returns Err and we treat this as the
+/// session-token case (pass-through).
+pub async fn namespace_scope_check(
+    State(ctx): State<AppContext>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+
+    let oauth_scope = match extract_bearer_token(req.headers()) {
+        Some(token) => crate::auth::validate_oauth_token(&ctx, &token)
+            .await
+            .ok()
+            .map(|t| t.scope),
+        None => None,
+    };
+
+    match classify_namespace_scope(&path, oauth_scope.as_deref()) {
+        NamespaceScopeOutcome::Pass | NamespaceScopeOutcome::Allow => next.run(req).await,
+        NamespaceScopeOutcome::Deny(msg) => {
+            warn!(path = %path, "namespace_scope_check: denied — {}", msg);
+            metrics::record_error("NamespaceScopeDenied", "middleware");
+            (StatusCode::FORBIDDEN, msg).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod namespace_scope_tests {
+    use super::*;
+
+    #[test]
+    fn non_admin_path_passes_regardless_of_scope() {
+        // Routes outside admin namespaces are not subject to namespace scope rules.
+        assert_eq!(
+            classify_namespace_scope("/xrpc/com.atproto.repo.createRecord", None),
+            NamespaceScopeOutcome::Pass
+        );
+        assert_eq!(
+            classify_namespace_scope(
+                "/xrpc/com.atproto.repo.createRecord",
+                Some("atproto:read")
+            ),
+            NamespaceScopeOutcome::Pass
+        );
+        assert_eq!(
+            classify_namespace_scope("/health", None),
+            NamespaceScopeOutcome::Pass
+        );
+    }
+
+    #[test]
+    fn session_token_admin_path_passes_through() {
+        // No OAuth claim → session/JWT path → defer to AdminAuthContext.
+        for path in [
+            "/xrpc/tools.aurora.ops.pauseSequencer",
+            "/xrpc/tools.aurora.moderator.listEvents",
+            "/xrpc/com.atproto.admin.searchAccounts",
+        ] {
+            assert_eq!(
+                classify_namespace_scope(path, None),
+                NamespaceScopeOutcome::Pass,
+                "path {} should pass for session-token (no OAuth scope)",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_admin_moderation_blocked_from_ops() {
+        let outcome = classify_namespace_scope(
+            "/xrpc/tools.aurora.ops.pauseSequencer",
+            Some("atproto:admin.moderation"),
+        );
+        assert!(
+            matches!(outcome, NamespaceScopeOutcome::Deny(_)),
+            "moderation scope on ops path should be Deny, got {:?}",
+            outcome
+        );
+    }
+
+    #[test]
+    fn oauth_admin_server_blocked_from_moderation_tier() {
+        for prefix in [
+            "tools.aurora.moderator.",
+            "tools.aurora.admin.",
+            "tools.aurora.superadmin.",
+        ] {
+            let path = format!("/xrpc/{}listEvents", prefix);
+            let outcome = classify_namespace_scope(&path, Some("atproto:admin.server"));
+            assert!(
+                matches!(outcome, NamespaceScopeOutcome::Deny(_)),
+                "server scope on {} should be Deny, got {:?}",
+                path,
+                outcome
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_admin_wildcard_satisfies_any_admin_path() {
+        for path in [
+            "/xrpc/tools.aurora.ops.pauseSequencer",
+            "/xrpc/tools.aurora.moderator.listEvents",
+            "/xrpc/tools.aurora.admin.grantRole",
+            "/xrpc/tools.aurora.superadmin.purgeAccount",
+            "/xrpc/com.atproto.admin.searchAccounts",
+        ] {
+            assert_eq!(
+                classify_namespace_scope(path, Some("atproto:admin.*")),
+                NamespaceScopeOutcome::Allow,
+                "admin.* should Allow {}",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_correct_scope_satisfies_namespace() {
+        // The "happy path" specific scopes.
+        assert_eq!(
+            classify_namespace_scope(
+                "/xrpc/tools.aurora.ops.pauseSequencer",
+                Some("atproto:admin.server")
+            ),
+            NamespaceScopeOutcome::Allow
+        );
+        assert_eq!(
+            classify_namespace_scope(
+                "/xrpc/tools.aurora.moderator.listEvents",
+                Some("atproto:admin.moderation")
+            ),
+            NamespaceScopeOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn oauth_com_atproto_admin_accepts_either_scope() {
+        // Bsky-PDS parity baseline: server OR moderation accepted.
+        let path = "/xrpc/com.atproto.admin.searchAccounts";
+        assert_eq!(
+            classify_namespace_scope(path, Some("atproto:admin.server")),
+            NamespaceScopeOutcome::Allow
+        );
+        assert_eq!(
+            classify_namespace_scope(path, Some("atproto:admin.moderation")),
+            NamespaceScopeOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn oauth_unrelated_scope_blocked_from_admin() {
+        // Defense-in-depth: a non-admin scope (e.g., atproto:read) doesn't
+        // accidentally satisfy any admin namespace.
+        assert!(matches!(
+            classify_namespace_scope(
+                "/xrpc/tools.aurora.ops.pauseSequencer",
+                Some("atproto:read atproto:write")
+            ),
+            NamespaceScopeOutcome::Deny(_)
+        ));
+    }
 }

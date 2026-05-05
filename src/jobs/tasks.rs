@@ -52,10 +52,10 @@ pub async fn purge_deleted_accounts(ctx: &AppContext) -> PdsResult<u64> {
         FROM actor a
         WHERE a.deactivated_at IS NOT NULL
           AND a.delete_after IS NOT NULL
-          AND a.delete_after < ?1
+          AND a.delete_after < $1
         "#,
     )
-    .bind(now)
+    .bind(now.to_rfc3339())
     .fetch_all(&ctx.account_db)
     .await?;
 
@@ -89,24 +89,24 @@ pub async fn purge_deleted_accounts(ctx: &AppContext) -> PdsResult<u64> {
         tracing::info!("Actor store cleanup for {} (not yet implemented)", did);
 
         // Delete all sessions and refresh tokens
-        sqlx::query("DELETE FROM session WHERE did = ?1")
+        sqlx::query("DELETE FROM session WHERE did = $1")
             .bind(&did)
             .execute(&ctx.account_db)
             .await?;
 
-        sqlx::query("DELETE FROM refresh_token WHERE did = ?1")
+        sqlx::query("DELETE FROM refresh_token WHERE did = $1")
             .bind(&did)
             .execute(&ctx.account_db)
             .await?;
 
         // Delete all email tokens
-        sqlx::query("DELETE FROM email_token WHERE did = ?1")
+        sqlx::query("DELETE FROM email_token WHERE did = $1")
             .bind(&did)
             .execute(&ctx.account_db)
             .await?;
 
         // Delete account record (permanent)
-        sqlx::query("DELETE FROM account WHERE did = ?1")
+        sqlx::query("DELETE FROM account WHERE did = $1")
             .bind(&did)
             .execute(&ctx.account_db)
             .await?;
@@ -155,6 +155,52 @@ pub async fn cleanup_orphaned_temp_blobs(ctx: &AppContext) -> PdsResult<u64> {
     }
 
     Ok(deleted_count)
+}
+
+/// Default retention window for `mod_event_seq` rows when
+/// `PDS_MOD_EVENT_RETENTION_DAYS` is unset. 7 days matches the §3.5
+/// design commitment for the live subscription channel; operators
+/// running long-lived deployments raise the env var.
+pub const DEFAULT_MOD_EVENT_RETENTION_DAYS: i64 = 7;
+
+/// Read the operator-configured retention window for `mod_event_seq`
+/// from the `PDS_MOD_EVENT_RETENTION_DAYS` env var. Falls back to
+/// [`DEFAULT_MOD_EVENT_RETENTION_DAYS`] when unset, malformed, or
+/// non-positive — operators who type a typo get the safe default
+/// rather than infinite retention or an immediate full purge.
+pub fn mod_event_retention_days() -> i64 {
+    std::env::var("PDS_MOD_EVENT_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(DEFAULT_MOD_EVENT_RETENTION_DAYS)
+}
+
+/// Compute the cutoff timestamp for `mod_event_seq` cleanup. Pulled
+/// out as its own function so the unit test can pin behavior without
+/// reaching for chrono::Utc::now() at the call site.
+pub fn mod_event_cleanup_cutoff(now: chrono::DateTime<chrono::Utc>, retention_days: i64) -> String {
+    (now - chrono::Duration::days(retention_days)).to_rfc3339()
+}
+
+/// Delete `mod_event_seq` rows older than the configured retention
+/// window. Returns the number of rows deleted. Best-effort: a SQL
+/// error is logged at warn-level by the caller and the next run picks
+/// up the work — chainlink #115 commit 2.
+///
+/// `moderation_event` is NOT pruned by this job. Per §3.4, the
+/// historical aggregate retains forever. Only the live subscription
+/// channel mirrors a recent window.
+pub async fn cleanup_mod_event_seq(ctx: &AppContext) -> PdsResult<u64> {
+    let retention_days = mod_event_retention_days();
+    let cutoff = mod_event_cleanup_cutoff(chrono::Utc::now(), retention_days);
+
+    let result = sqlx::query("DELETE FROM mod_event_seq WHERE created_at < $1")
+        .bind(&cutoff)
+        .execute(&ctx.account_db)
+        .await?;
+
+    Ok(result.rows_affected())
 }
 
 /// Trigger PDS discovery refresh (Phase 1)
@@ -330,4 +376,150 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use sqlx::any::AnyPoolOptions;
+    use sqlx::AnyPool;
+    use std::sync::Once;
+
+    /// Open an in-memory SQLite pool with the mod_event_seq table
+    /// only — the cleanup unit test doesn't need the full migration
+    /// suite, just the one table it operates on.
+    async fn open_test_pool() -> AnyPool {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE mod_event_seq (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                moderation_event_id INTEGER NOT NULL,
+                actor_did TEXT NOT NULL,
+                action TEXT NOT NULL,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    /// Insert a `mod_event_seq` row with the given created_at.
+    async fn insert_seq_row(pool: &AnyPool, action: &str, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO mod_event_seq \
+             (moderation_event_id, actor_did, action, created_at) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(1_i64)
+        .bind("did:plc:m1")
+        .bind(action)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn count_seq_rows(pool: &AnyPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM mod_event_seq")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Direct exercise of the SQL deletion path against a controlled
+    /// pool. We bypass `cleanup_mod_event_seq` (which reads the env
+    /// var and uses `Utc::now`) so the test can pin behavior with
+    /// deterministic timestamps.
+    async fn delete_old_rows(pool: &AnyPool, cutoff: &str) -> u64 {
+        sqlx::query("DELETE FROM mod_event_seq WHERE created_at < $1")
+            .bind(cutoff)
+            .execute(pool)
+            .await
+            .unwrap()
+            .rows_affected()
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_rows_older_than_retention_window() {
+        let pool = open_test_pool().await;
+        let now = Utc::now();
+        // Three rows: 1 day old (recent), 8 days old (old), 30 days
+        // old (very old).
+        insert_seq_row(&pool, "recent", &(now - Duration::days(1)).to_rfc3339()).await;
+        insert_seq_row(&pool, "old", &(now - Duration::days(8)).to_rfc3339()).await;
+        insert_seq_row(&pool, "very_old", &(now - Duration::days(30)).to_rfc3339()).await;
+
+        assert_eq!(count_seq_rows(&pool).await, 3);
+
+        // Cutoff is 7 days ago; rows from days 8 and 30 should fall.
+        let cutoff = mod_event_cleanup_cutoff(now, 7);
+        let deleted = delete_old_rows(&pool, &cutoff).await;
+        assert_eq!(deleted, 2);
+
+        // Only the recent row remains.
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT action FROM mod_event_seq ORDER BY seq ASC")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec!["recent".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_no_op_when_all_rows_within_retention() {
+        let pool = open_test_pool().await;
+        let now = Utc::now();
+        for i in 0..3 {
+            insert_seq_row(
+                &pool,
+                "recent",
+                &(now - Duration::hours(i)).to_rfc3339(),
+            )
+            .await;
+        }
+        let cutoff = mod_event_cleanup_cutoff(now, 7);
+        let deleted = delete_old_rows(&pool, &cutoff).await;
+        assert_eq!(deleted, 0);
+        assert_eq!(count_seq_rows(&pool).await, 3);
+    }
+
+    #[test]
+    fn mod_event_retention_days_falls_back_to_default_for_invalid_input() {
+        // Zero, negative, non-numeric, missing — all yield the safe
+        // default rather than 0-day retention or unset → infinite.
+        // Use unique env var names per test to avoid cross-test
+        // contamination of the global env (#[serial] not in deps).
+        std::env::remove_var("PDS_MOD_EVENT_RETENTION_DAYS");
+        assert_eq!(mod_event_retention_days(), DEFAULT_MOD_EVENT_RETENTION_DAYS);
+
+        std::env::set_var("PDS_MOD_EVENT_RETENTION_DAYS", "0");
+        assert_eq!(mod_event_retention_days(), DEFAULT_MOD_EVENT_RETENTION_DAYS);
+
+        std::env::set_var("PDS_MOD_EVENT_RETENTION_DAYS", "-5");
+        assert_eq!(mod_event_retention_days(), DEFAULT_MOD_EVENT_RETENTION_DAYS);
+
+        std::env::set_var("PDS_MOD_EVENT_RETENTION_DAYS", "not-a-number");
+        assert_eq!(mod_event_retention_days(), DEFAULT_MOD_EVENT_RETENTION_DAYS);
+
+        std::env::set_var("PDS_MOD_EVENT_RETENTION_DAYS", "30");
+        assert_eq!(mod_event_retention_days(), 30);
+
+        // Reset.
+        std::env::remove_var("PDS_MOD_EVENT_RETENTION_DAYS");
+    }
 }

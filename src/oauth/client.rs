@@ -9,10 +9,18 @@
 
 use crate::error::{PdsError, PdsResult};
 use crate::oauth::models::{AuthorizedClientInfo, ClientListResponse, OAuthClient};
-use chrono::Utc;
-use sqlx::{Row, SqlitePool};
+use chrono::{DateTime, Utc};
+use sqlx::{AnyPool, Row};
 use std::collections::HashMap;
 use tracing::{debug, warn};
+
+/// Parse an RFC3339 string from the database into a `DateTime<Utc>`.
+/// See chainlink #76 / Phase 3 design notes on chrono ↔ AnyPool.
+fn parse_timestamp(s: &str) -> PdsResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))
+}
 
 /// Client Manager
 ///
@@ -22,7 +30,7 @@ use tracing::{debug, warn};
 /// - Authorization tracking (authorized_client table)
 /// - Client revocation for security
 pub struct ClientManager {
-    db: SqlitePool,
+    db: AnyPool,
     /// Registered OAuth clients (client_id -> client config)
     clients: HashMap<String, OAuthClient>,
 }
@@ -33,7 +41,7 @@ impl ClientManager {
     /// # Arguments
     /// * `db` - Database connection pool
     /// * `clients` - List of registered OAuth clients
-    pub fn new(db: SqlitePool, clients: Vec<OAuthClient>) -> Self {
+    pub fn new(db: AnyPool, clients: Vec<OAuthClient>) -> Self {
         let client_map = clients
             .into_iter()
             .map(|c| (c.client_id.clone(), c))
@@ -131,7 +139,7 @@ impl ClientManager {
             r#"
             SELECT id, is_active
             FROM authorized_client
-            WHERE did = ? AND client_id = ?
+            WHERE did = $1 AND client_id = $2
             "#,
         )
         .bind(did)
@@ -141,19 +149,19 @@ impl ClientManager {
 
         if let Some(row) = existing {
             let id: i64 = row.get("id");
-            let is_active: bool = row.get("is_active");
+            let is_active: bool = crate::db::read_bool(&row, "is_active")?;
 
             if is_active {
                 // Update existing authorization
                 sqlx::query(
                     r#"
                     UPDATE authorized_client
-                    SET scope = ?, last_used_at = ?
-                    WHERE id = ?
+                    SET scope = $1, last_used_at = $2
+                    WHERE id = $3
                     "#,
                 )
                 .bind(scope)
-                .bind(now)
+                .bind(now.to_rfc3339())
                 .bind(id)
                 .execute(&self.db)
                 .await?;
@@ -169,12 +177,12 @@ impl ClientManager {
                 sqlx::query(
                     r#"
                     UPDATE authorized_client
-                    SET scope = ?, is_active = 1, revoked_at = NULL, last_used_at = ?
-                    WHERE id = ?
+                    SET scope = $1, is_active = true, revoked_at = NULL, last_used_at = $2
+                    WHERE id = $3
                     "#,
                 )
                 .bind(scope)
-                .bind(now)
+                .bind(now.to_rfc3339())
                 .bind(id)
                 .execute(&self.db)
                 .await?;
@@ -189,20 +197,21 @@ impl ClientManager {
         }
 
         // Create new authorization
-        let result = sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO authorized_client (
                 did, client_id, scope, first_authorized_at, last_used_at, is_active
             )
-            VALUES (?, ?, ?, ?, ?, 1)
+            VALUES ($1, $2, $3, $4, $5, 1)
+            RETURNING id
             "#,
         )
         .bind(did)
         .bind(client_id)
         .bind(scope)
-        .bind(now)
-        .bind(now)
-        .execute(&self.db)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .fetch_one(&self.db)
         .await?;
 
         debug!(
@@ -210,7 +219,7 @@ impl ClientManager {
             did, client_id
         );
 
-        Ok(result.last_insert_rowid())
+        Ok(id)
     }
 
     /// Update last used timestamp for authorized client
@@ -226,11 +235,11 @@ impl ClientManager {
         sqlx::query(
             r#"
             UPDATE authorized_client
-            SET last_used_at = ?
-            WHERE did = ? AND client_id = ? AND is_active = 1
+            SET last_used_at = $1
+            WHERE did = $2 AND client_id = $3 AND is_active = true
             "#,
         )
-        .bind(now)
+        .bind(now.to_rfc3339())
         .bind(did)
         .bind(client_id)
         .execute(&self.db)
@@ -263,9 +272,9 @@ impl ClientManager {
                 first_authorized_at,
                 last_used_at
             FROM authorized_client
-            WHERE did = ? AND is_active = 1
+            WHERE did = $1 AND is_active = true
             ORDER BY last_used_at DESC, first_authorized_at DESC
-            LIMIT ?
+            LIMIT $2
             "#,
         )
         .bind(did)
@@ -282,13 +291,20 @@ impl ClientManager {
                 // Get client configuration
                 let client_config = self.get_client(&client_id)?;
 
+                let first_authorized_at_s: String = row.get("first_authorized_at");
+                let last_used_at_s: String = row.get("last_used_at");
+                let first_authorized_at = parse_timestamp(&first_authorized_at_s).ok()?;
+                // last_used_at is Option<DateTime> in the response model; the
+                // column is NOT NULL in the schema but we tolerate parse
+                // failures by demoting to None rather than dropping the row.
+                let last_used_at = parse_timestamp(&last_used_at_s).ok();
                 Some(AuthorizedClientInfo {
                     client_id: client_id.clone(),
                     client_name: client_config.client_name.clone(),
                     logo_uri: client_config.logo_uri.clone(),
                     scopes: scope.split_whitespace().map(|s| s.to_string()).collect(),
-                    first_authorized_at: row.get("first_authorized_at"),
-                    last_used_at: row.get("last_used_at"),
+                    first_authorized_at,
+                    last_used_at,
                 })
             })
             .collect();
@@ -313,11 +329,11 @@ impl ClientManager {
         let result = sqlx::query(
             r#"
             UPDATE authorized_client
-            SET is_active = 0, revoked_at = ?
-            WHERE did = ? AND client_id = ?
+            SET is_active = false, revoked_at = $1
+            WHERE did = $2 AND client_id = $3
             "#,
         )
-        .bind(now)
+        .bind(now.to_rfc3339())
         .bind(did)
         .bind(client_id)
         .execute(&self.db)
@@ -351,7 +367,7 @@ impl ClientManager {
             r#"
             SELECT COUNT(*) as count
             FROM authorized_client
-            WHERE did = ? AND client_id = ? AND is_active = 1
+            WHERE did = $1 AND client_id = $2 AND is_active = true
             "#,
         )
         .bind(did)
@@ -417,7 +433,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_client_id() {
-        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let pool = AnyPool::connect_lazy("sqlite::memory:").unwrap();
         let client = create_test_client();
         let manager = ClientManager::new(pool, vec![client.clone()]);
 
@@ -427,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_redirect_uri() {
-        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let pool = AnyPool::connect_lazy("sqlite::memory:").unwrap();
         let client = create_test_client();
         let manager = ClientManager::new(pool, vec![client.clone()]);
 
@@ -447,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_default_scopes() {
-        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let pool = AnyPool::connect_lazy("sqlite::memory:").unwrap();
         let client = create_test_client();
         let manager = ClientManager::new(pool, vec![client.clone()]);
 
@@ -457,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_trusted_client() {
-        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let pool = AnyPool::connect_lazy("sqlite::memory:").unwrap();
         let client = create_test_client();
         let manager = ClientManager::new(pool, vec![client.clone()]);
 
