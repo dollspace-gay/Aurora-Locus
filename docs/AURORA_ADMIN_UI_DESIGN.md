@@ -4040,7 +4040,7 @@ struct DeltaInfo {
 
 - The UI's stat-change indicators (positive / attention / neutral) consume the `delta` field. Negative changes for "ReportsFiled" are positive sentiment (fewer reports = good); for "ReportsResolved" positive change is positive sentiment. The UI's display logic interprets per-metric.
 
-> **Reconciliation (applies to §8.2 and §8.3).** Earlier drafts wrapped the time range in a `TimeRange { start, end }` struct and used `u32` for count fields. As-built uses flat `start`/`end` strings and `i64` throughout. The wrapper-and-`u32` form is preserved as a v0.3 candidate (#NN); v0.2 ships the flat form for serde-urlencoded compatibility (query-string deserialization works more naturally on flat scalar fields than on nested structs).
+> **Reconciliation (applies to §8.2 and §8.3).** Earlier drafts wrapped the time range in a `TimeRange { start, end }` struct and used `u32` for count fields. As-built uses flat `start`/`end` strings and `i64` throughout. The wrapper-and-`u32` form is preserved as a v0.3 candidate (#126); v0.2 ships the flat form for serde-urlencoded compatibility (query-string deserialization works more naturally on flat scalar fields than on nested structs).
 
 ## 8.3 Phase 3.7 — `tools.aurora.admin.getQueueStats`
 
@@ -4589,7 +4589,7 @@ struct SetRuntimeSettingOutput {
 - `setRuntimeSetting` validates the key against an allowlist (currently `moderation-mode` and `moderation-mode-redirect-url`); unknown keys are rejected.
 - All writes audit-chained.
 
-> **Reconciliation.** Earlier drafts specified a three-tier model (`Runtime | File | Default`) where file-level config (env vars, yaml) provided the fallback below runtime. As-built, the file tier is unimplemented: operators wanting non-default values must write the `runtime_settings` table directly during install (via SQL) or via a SuperAdmin's `setRuntimeSetting` call after first boot. The file-tier addition is a v0.3 candidate (#NN); the `RecoveryMode` source variant is the as-built recovery-override mechanism.
+> **Reconciliation.** Earlier drafts specified a three-tier model (`Runtime | File | Default`) where file-level config (env vars, yaml) provided the fallback below runtime. As-built, the file tier is unimplemented: operators wanting non-default values must write the `runtime_settings` table directly during install (via SQL) or via a SuperAdmin's `setRuntimeSetting` call after first boot. The file-tier addition is a v0.3 candidate (#124); the `RecoveryMode` source variant is the as-built recovery-override mechanism.
 
 ### Known runtime setting keys (v0.2)
 

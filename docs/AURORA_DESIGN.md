@@ -218,7 +218,7 @@ pub enum AppealResolutionDecision { Approve, Deny }
 
 **API enum is subject-aware in v0.2.** `ModEventAction` is the wire-format shape — variants like `TakedownAccount` vs `TakedownRecord` are explicit per-subject-type rather than a compositional `Takedown` applied to any `Subject`. Clients constructing `ModEventAction` values choose the variant per the subject they're acting on.
 
-> **Reconciliation.** Earlier drafts specified a `$type`-tagged compositional `ModEvent` enum (subject-agnostic — one `Takedown` variant applied to any `Subject`, with the lexicon as source of truth for which actions apply where) plus an `AppealResolution` enum with `Uphold | Reject | Modify`. As-built, Phase 3.5 collapsed the API enum into the storage shape (`ModEventAction` is `kind`-tagged with subject-aware variants); `AppealResolutionDecision` ships with `Approve | Deny`. The compositional revisit is a v0.3 candidate (chainlink #NN); the wire-breaking nature of the change motivated its deferral.
+> **Reconciliation.** Earlier drafts specified a `$type`-tagged compositional `ModEvent` enum (subject-agnostic — one `Takedown` variant applied to any `Subject`, with the lexicon as source of truth for which actions apply where) plus an `AppealResolution` enum with `Uphold | Reject | Modify`. As-built, Phase 3.5 collapsed the API enum into the storage shape (`ModEventAction` is `kind`-tagged with subject-aware variants); `AppealResolutionDecision` ships with `Approve | Deny`. The compositional revisit is a v0.3 candidate (chainlink #125); the wire-breaking nature of the change motivated its deferral.
 
 **Why role grant/revoke aren't here** — they live at `tools.aurora.superadmin.*` ([§4.3.3](#§433-toolsaurorasuperadmin)) as dedicated endpoints rather than `ModEvent` variants. Keeping them out of `ModEvent` makes the SuperAdmin auth boundary structurally visible in the namespace.
 
@@ -294,7 +294,7 @@ Extension entries are objects with an optional `value` field for capabilities th
 
 The v0.2 implementation maintains a hand-curated capability list in `aurora_capability_families` keyed by namespace. New endpoints require an entry in that list to appear in the capability advertisement.
 
-> **Reconciliation.** Earlier drafts of this section called for runtime route enumeration (walk the Router's table at server start, build the families dict from discovered routes) to eliminate the drift maintenance burden. The static-list approach was chosen for v0.2 because axum's Router introspection is non-trivial and the runtime-discovery refactor warrants its own session. v0.3 candidate (chainlink #NN); the corpus reflects the as-shipped reality.
+> **Reconciliation.** Earlier drafts of this section called for runtime route enumeration (walk the Router's table at server start, build the families dict from discovered routes) to eliminate the drift maintenance burden. The static-list approach was chosen for v0.2 because axum's Router introspection is non-trivial and the runtime-discovery refactor warrants its own session. v0.3 candidate (chainlink #123); the corpus reflects the as-shipped reality.
 
 **§8.15 capability vocabulary** (the canonical extension names) is enumerated in [AURORA_ADMIN_UI_DESIGN.md §8.15](AURORA_ADMIN_UI_DESIGN.md). Two §8.15 capabilities are intentionally omitted from the v0.2 advertisement because the corresponding endpoints are not yet shipped (`invite-lineage-v1`, `reporter-context-v1`); they will be added when their handlers land.
 
