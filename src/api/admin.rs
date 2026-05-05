@@ -402,7 +402,7 @@ pub fn routes() -> Router<AppContext> {
         )
         .route(
             "/xrpc/tools.aurora.admin.getModerationMetrics",
-            post(crate::api::aurora_admin::get_moderation_metrics),
+            get(crate::api::aurora_admin::get_moderation_metrics),
         )
         // Phase 3.8 (chainlink #105) — hash-chained audit trail.
         // Auth: AdminModeration scope, Moderator+ role at handler.

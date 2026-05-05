@@ -2054,7 +2054,13 @@ async fn compute_metric(
 pub async fn get_moderation_metrics(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
-    Json(input): Json<GetModerationMetricsInput>,
+    // Per LB-2 / chainlink #118: this endpoint is a `query` per the
+    // XRPC convention and serves GET. `axum_extra::extract::Query`
+    // is required because `metrics` is `Vec<MetricType>` and the
+    // default `axum::extract::Query` (serde_urlencoded) collapses
+    // repeated keys to the last value — same reason
+    // `getAccountInfos` uses the extra extractor.
+    axum_extra::extract::Query(input): axum_extra::extract::Query<GetModerationMetricsInput>,
 ) -> Result<Json<GetModerationMetricsOutput>, (StatusCode, Json<serde_json::Value>)> {
     use crate::admin::roles::Role;
     if !auth.role.can_act_as(Role::Moderator) {
@@ -3958,12 +3964,17 @@ mod tests {
 
     #[tokio::test]
     async fn get_moderation_metrics_rejects_invalid_range() {
+        // Per LB-2 / chainlink #118, the endpoint is now a query (GET).
+        // Tests construct the input directly and wrap in
+        // axum_extra::extract::Query — same shape the GET extractor
+        // would produce after parsing the query string.
+        use axum_extra::extract::Query as ExtraQuery;
         let ctx = create_test_context().await;
         let now = chrono::Utc::now().to_rfc3339();
         let err = get_moderation_metrics(
             State(ctx),
             moderator_auth(),
-            Json(GetModerationMetricsInput {
+            ExtraQuery(GetModerationMetricsInput {
                 start: now.clone(),
                 end: now,
                 granularity: Granularity::Day,
@@ -3992,10 +4003,11 @@ mod tests {
         }
         let start = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
         let end = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        use axum_extra::extract::Query as ExtraQuery;
         let resp = get_moderation_metrics(
             State(ctx),
             moderator_auth(),
-            Json(GetModerationMetricsInput {
+            ExtraQuery(GetModerationMetricsInput {
                 start,
                 end,
                 granularity: Granularity::Day,
@@ -4038,10 +4050,11 @@ mod tests {
         }
         let start = (now - chrono::Duration::days(1)).to_rfc3339();
         let end = (now + chrono::Duration::seconds(60)).to_rfc3339();
+        use axum_extra::extract::Query as ExtraQuery;
         let resp = get_moderation_metrics(
             State(ctx),
             moderator_auth(),
-            Json(GetModerationMetricsInput {
+            ExtraQuery(GetModerationMetricsInput {
                 start,
                 end,
                 granularity: Granularity::Day,
