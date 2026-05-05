@@ -946,6 +946,34 @@ async fn insert_batch_account_moderations(
     dids: &[String],
 ) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
     let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let event_id = insert_batch_account_moderations_in_tx(
+        &mut tx,
+        actor_did,
+        action_db_str,
+        event_type,
+        rationale,
+        dids,
+    )
+    .await?;
+    tx.commit().await.map_err(internal)?;
+    Ok(event_id)
+}
+
+/// Insert per-DID `account_moderation` rows + the batch
+/// `moderation_event` row inside the caller-supplied transaction.
+/// LB-1 / chainlink #128: callers wrap this together with the
+/// per-subject actor mutations and `append_entry_in_tx` in one
+/// transaction so the chain entry, the moderation_event, and
+/// (where applicable) the per-subject actor-table mutations all
+/// land or all roll back.
+async fn insert_batch_account_moderations_in_tx<'c>(
+    tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+    actor_did: &str,
+    action_db_str: &str,
+    event_type: ModerationEventType,
+    rationale: &str,
+    dids: &[String],
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
     let now = chrono::Utc::now().to_rfc3339();
     for did in dids {
         sqlx::query(
@@ -958,7 +986,7 @@ async fn insert_batch_account_moderations(
         .bind(rationale)
         .bind(actor_did)
         .bind(&now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(internal)?;
     }
@@ -969,7 +997,7 @@ async fn insert_batch_account_moderations(
         "subjects": dids,
     });
     let event_id = crate::admin::events::insert_moderation_event_in_tx(
-        &mut tx,
+        tx,
         event_type.as_str(),
         actor_did,
         None,
@@ -981,7 +1009,6 @@ async fn insert_batch_account_moderations(
     )
     .await
     .map_err(internal)?;
-    tx.commit().await.map_err(internal)?;
     Ok(event_id)
 }
 

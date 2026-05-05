@@ -1259,11 +1259,39 @@ impl AccountManager {
     /// Updates the email address for an account.
     /// Returns an error if the email is already in use by another account.
     pub async fn update_email(&self, did: &str, new_email: &str) -> PdsResult<()> {
-        // Check if email is already in use by another account
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        Self::update_email_in_tx(&mut tx, did, new_email).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Update account email address inside an existing transaction.
+    /// LB-1 / chainlink #128 atomic-with-chain entry point.
+    ///
+    /// Scope: this `_in_tx` variant covers only the primary
+    /// `account` table mutation (and the in-tx uniqueness check that
+    /// guards it). Multi-store side effects associated with the
+    /// email change — e.g., invalidating outstanding email-update
+    /// tokens, queueing a confirmation email — remain outside the
+    /// transaction with their existing post-commit best-effort
+    /// handling. Per design doc §3.4 the chain-of-custody invariant
+    /// is "chain entry atomic with the underlying mutation"; that
+    /// underlying mutation is the `account` row update. The
+    /// multi-store cleanup question is a separate concern from the
+    /// LB-1 atomicity guarantee.
+    pub async fn update_email_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        new_email: &str,
+    ) -> PdsResult<()> {
+        // Check if email is already in use by another account.
+        // Inside the tx so the check + UPDATE see one snapshot —
+        // otherwise two concurrent updates could both pass the
+        // uniqueness check.
         let existing = sqlx::query("SELECT did FROM account WHERE email = $1 AND did != $2")
             .bind(new_email)
             .bind(did)
-            .fetch_optional(&self.db)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
 
@@ -1277,7 +1305,7 @@ impl AccountManager {
         sqlx::query("UPDATE account SET email = $1, email_confirmed_at = NULL WHERE did = $2")
             .bind(new_email)
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
 
@@ -1496,14 +1524,27 @@ impl AccountManager {
     /// * `Ok(())` if the takedown was successful
     /// * `Err(PdsError)` if the account doesn't exist or database operation fails
     pub async fn takedown_account(&self, did: &str, takedown_ref: &str) -> PdsResult<()> {
-        // Begin transaction
         let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        Self::takedown_account_in_tx(&mut tx, did, takedown_ref).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok(())
+    }
 
+    /// Takedown an account inside an existing transaction. LB-1 /
+    /// chainlink #128 atomic-with-chain entry point. Performs the
+    /// same three writes as the pool-API wrapper — actor takedown_ref
+    /// UPDATE + session DELETE + refresh_token DELETE — against the
+    /// caller-supplied transaction. Caller commits.
+    pub async fn takedown_account_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        takedown_ref: &str,
+    ) -> PdsResult<()> {
         // Set takedown_ref in actor table
         let result = sqlx::query("UPDATE actor SET takedown_ref = $1 WHERE did = $2")
             .bind(takedown_ref)
             .bind(did)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
 
@@ -1514,19 +1555,16 @@ impl AccountManager {
         // Delete all active sessions for this account
         sqlx::query("DELETE FROM session WHERE did = $1")
             .bind(did)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
 
         // Delete all refresh tokens for this account
         sqlx::query("DELETE FROM refresh_token WHERE did = $1")
             .bind(did)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
-
-        // Commit transaction
-        tx.commit().await.map_err(PdsError::Database)?;
 
         tracing::info!(
             "Account taken down: DID={}, takedown_ref={}, sessions and tokens revoked",
@@ -3125,5 +3163,148 @@ mod tests {
         // Verify handle unchanged
         let unchanged_account = manager.get_account(&account.did).await.unwrap();
         assert_eq!(unchanged_account.handle, Some("alice".to_string()));
+    }
+
+    // LB-1 / chainlink #128: manager `_in_tx` variants must be
+    // rollback-safe so handlers can wrap them with chain appends in
+    // a single transaction. The pool-API wrappers (`takedown_account`,
+    // `update_email`) commit unconditionally; the `_in_tx` variants
+    // must let the caller decide.
+
+    #[tokio::test]
+    async fn takedown_account_in_tx_rolls_back_on_caller_rollback() {
+        let manager = setup_test_db().await;
+        let account = manager
+            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .await
+            .unwrap();
+
+        // Confirm starting state: takedown_ref is NULL.
+        let pre: Option<String> =
+            sqlx::query_scalar("SELECT takedown_ref FROM actor WHERE did = $1")
+                .bind(&account.did)
+                .fetch_one(&manager.db)
+                .await
+                .unwrap();
+        assert!(pre.is_none(), "actor starts with no takedown_ref");
+
+        // Run the in-tx variant inside a tx that we deliberately
+        // roll back. The actor mutation must not land.
+        {
+            let mut tx = manager.db.begin().await.unwrap();
+            AccountManager::takedown_account_in_tx(&mut tx, &account.did, "test_ref")
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let post: Option<String> =
+            sqlx::query_scalar("SELECT takedown_ref FROM actor WHERE did = $1")
+                .bind(&account.did)
+                .fetch_one(&manager.db)
+                .await
+                .unwrap();
+        assert!(
+            post.is_none(),
+            "rolled-back tx must not land takedown_ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn takedown_account_in_tx_commits_on_caller_commit() {
+        let manager = setup_test_db().await;
+        let account = manager
+            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .await
+            .unwrap();
+
+        let mut tx = manager.db.begin().await.unwrap();
+        AccountManager::takedown_account_in_tx(&mut tx, &account.did, "committed_ref")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let post: Option<String> =
+            sqlx::query_scalar("SELECT takedown_ref FROM actor WHERE did = $1")
+                .bind(&account.did)
+                .fetch_one(&manager.db)
+                .await
+                .unwrap();
+        assert_eq!(post.as_deref(), Some("committed_ref"));
+    }
+
+    #[tokio::test]
+    async fn update_email_in_tx_rolls_back_on_caller_rollback() {
+        let manager = setup_test_db().await;
+        let _account = manager
+            .create_account(
+                "alice".to_string(),
+                Some("alice@old.example".to_string()),
+                "password123".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let did = manager
+            .resolve_at_identifier_to_did("alice")
+            .await
+            .unwrap();
+
+        {
+            let mut tx = manager.db.begin().await.unwrap();
+            AccountManager::update_email_in_tx(&mut tx, &did, "alice@new.example")
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let email: Option<String> = sqlx::query_scalar("SELECT email FROM account WHERE did = $1")
+            .bind(&did)
+            .fetch_one(&manager.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            email.as_deref(),
+            Some("alice@old.example"),
+            "rolled-back tx must not land email update"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_email_in_tx_uniqueness_check_inside_tx() {
+        // Two accounts. Trying to set account2's email to account1's
+        // email must fail with PdsError::Validation, even when the
+        // attempt happens inside a caller-managed tx. The check sees
+        // the pre-tx state.
+        let manager = setup_test_db().await;
+        let _alice = manager
+            .create_account(
+                "alice".to_string(),
+                Some("alice@example".to_string()),
+                "password123".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let _bob = manager
+            .create_account(
+                "bob".to_string(),
+                Some("bob@example".to_string()),
+                "password456".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let bob_did = manager.resolve_at_identifier_to_did("bob").await.unwrap();
+
+        let mut tx = manager.db.begin().await.unwrap();
+        let result =
+            AccountManager::update_email_in_tx(&mut tx, &bob_did, "alice@example").await;
+        match result {
+            Err(PdsError::Validation(_)) => {}
+            other => panic!("expected Validation error, got {:?}", other),
+        }
+        // Drop the tx without commit.
+        drop(tx);
     }
 }
