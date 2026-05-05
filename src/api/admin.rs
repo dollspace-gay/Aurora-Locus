@@ -6774,9 +6774,10 @@ mod tests {
             .0;
 
         assert_eq!(resp.implementation, "aurora-locus");
-        // version comes from CARGO_PKG_VERSION; non-empty is enough
-        // to confirm the env! macro resolved.
-        assert!(!resp.version.is_empty(), "version must be set");
+        // version comes from CARGO_PKG_VERSION; pinned to the v0.2
+        // cycle release per CR-4 / chainlink #117. Bump in lockstep
+        // with Cargo.toml when the cycle increments.
+        assert_eq!(resp.version, "0.2.0");
 
         // Families object must include the four Aurora namespaces, each
         // a JSON array (possibly empty for namespaces that haven't
