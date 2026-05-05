@@ -3988,7 +3988,8 @@ Aggregate moderation metrics for dashboard widgets and time-series charts.
 
 ```rust
 struct GetModerationMetricsInput {
-    range: TimeRange,                 // {start: ISO8601, end: ISO8601} or preset
+    start: String,                    // ISO 8601 timestamp
+    end: String,                      // ISO 8601 timestamp
     granularity: Granularity,         // Hour | Day | Week | Month
     metrics: Vec<MetricType>,         // which metrics to return
 }
@@ -4008,7 +4009,8 @@ enum MetricType {
 
 ```rust
 struct GetModerationMetricsOutput {
-    range: TimeRange,
+    start: String,
+    end: String,
     granularity: Granularity,
     series: Vec<MetricSeries>,
 }
@@ -4038,6 +4040,8 @@ struct DeltaInfo {
 
 - The UI's stat-change indicators (positive / attention / neutral) consume the `delta` field. Negative changes for "ReportsFiled" are positive sentiment (fewer reports = good); for "ReportsResolved" positive change is positive sentiment. The UI's display logic interprets per-metric.
 
+> **Reconciliation (applies to §8.2 and §8.3).** Earlier drafts wrapped the time range in a `TimeRange { start, end }` struct and used `u32` for count fields. As-built uses flat `start`/`end` strings and `i64` throughout. The wrapper-and-`u32` form is preserved as a v0.3 candidate (#NN); v0.2 ships the flat form for serde-urlencoded compatibility (query-string deserialization works more naturally on flat scalar fields than on nested structs).
+
 ## 8.3 Phase 3.7 — `tools.aurora.admin.getQueueStats`
 
 Counts of items in moderation queue states. Powers the bell badge and Dashboard moderation stat cards.
@@ -4062,13 +4066,13 @@ struct GetQueueStatsInput {
 
 ```rust
 struct GetQueueStatsOutput {
-    open_reports: u32,
-    pending_appeals: u32,
-    under_review_reports: u32,
-    under_review_appeals: u32,
-    queue_attention_total: u32,        // sum of items needing operator decision
-    average_age_open_reports_seconds: u64,
-    oldest_open_report_age_seconds: u64,
+    open_reports: i64,
+    pending_appeals: i64,
+    under_review_reports: i64,
+    under_review_appeals: i64,
+    queue_attention_total: i64,        // sum of items needing operator decision
+    average_age_open_reports_seconds: i64,
+    oldest_open_report_age_seconds: i64,
 }
 ```
 
@@ -4284,7 +4288,7 @@ Bundle contents:
 ```
 <bundle>/
 ├── manifest.json              # bundle structure, file hashes, parameters used
-├── account-state.json         # status, role, creation date, signing keys (if metadata included)
+├── account-state.json         # base state (did, handle, createdAt, takedownRef, deactivatedAt) always included; sensitive fields (email, emailConfirmedAt, invitesDisabled) gated on includeAccountMetadata
 ├── repo.car                   # if include_repo
 ├── blobs/                     # if include_blobs
 │   ├── <cid>.bin
@@ -4312,6 +4316,8 @@ Bundle contents:
 ### Notes
 
 - Bundle hash recorded in chain enables tamper detection: re-hashing the bundle later and comparing to chain entry's recorded hash detects modification.
+
+> **Reconciliation.** Earlier drafts of this section implied `account-state.json` itself was gated on `includeAccountMetadata`. As-built, the file is always present in the bundle; only its sensitive-fields subset is metadata-gated. Operational fields (handle, takedown_ref, deactivated_at) are needed for forensic legibility regardless of metadata inclusion.
 - Streaming response avoids loading the entire bundle into memory server-side; large blob inventories don't need bounded memory.
 - The "audit-trail.json" is always included in bundles — it contains this export's own audit entry, so the bundle is self-describing about its provenance.
 
@@ -4545,9 +4551,15 @@ struct GetRuntimeSettingInput {
 struct GetRuntimeSettingOutput {
     key: String,
     value: serde_json::Value,         // typed per setting key
-    source: SettingSource,            // Runtime | File | Default
+    source: SettingSource,            // Runtime | Default | RecoveryMode
     last_modified: Option<DateTime<Utc>>,
     last_modified_by: Option<String>,
+}
+
+enum SettingSource {
+    Runtime,        // value came from runtime_settings table
+    Default,        // hardcoded default for this key
+    RecoveryMode,   // AURORA_RECOVERY_MODE env var override (moderation-mode key only)
 }
 
 // Write
@@ -4572,10 +4584,12 @@ struct SetRuntimeSettingOutput {
 
 ### Behavior
 
-- Two-tier configuration per locked design: file-level config (env vars, yaml) is fallback; runtime setting takes precedence.
+- **Configuration tiers (v0.2 as-built):** Runtime values from the `runtime_settings` table take precedence; absent a runtime row, hardcoded defaults apply via `default_for_key(key)`. The `AURORA_RECOVERY_MODE` env var overrides specifically for the `moderation-mode` key during recovery scenarios.
 - Writes go to `runtime_settings` table.
-- `AURORA_RECOVERY_MODE=true` env var bypasses runtime settings on startup for emergency recovery (per Phase 3.10 design).
+- `setRuntimeSetting` validates the key against an allowlist (currently `moderation-mode` and `moderation-mode-redirect-url`); unknown keys are rejected.
 - All writes audit-chained.
+
+> **Reconciliation.** Earlier drafts specified a three-tier model (`Runtime | File | Default`) where file-level config (env vars, yaml) provided the fallback below runtime. As-built, the file tier is unimplemented: operators wanting non-default values must write the `runtime_settings` table directly during install (via SQL) or via a SuperAdmin's `setRuntimeSetting` call after first boot. The file-tier addition is a v0.3 candidate (#NN); the `RecoveryMode` source variant is the as-built recovery-override mechanism.
 
 ### Known runtime setting keys (v0.2)
 

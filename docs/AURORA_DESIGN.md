@@ -195,28 +195,30 @@ Compositional, subject-agnostic event vocabulary for the API surface. Translatio
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "$type")]
-pub enum ModEvent {
-    #[serde(rename = "tools.aurora.admin.defs#takedown")]
-    Takedown { comment: Option<String>, ref_: Option<String> },
-    #[serde(rename = "tools.aurora.admin.defs#restore")]
-    Restore { comment: Option<String> },
-    #[serde(rename = "tools.aurora.admin.defs#label")]
-    Label { create: Vec<String>, negate: Vec<String>, comment: Option<String> },
-    #[serde(rename = "tools.aurora.admin.defs#appealResolve")]
-    AppealResolve { resolution: AppealResolution, comment: Option<String> },
-    #[serde(rename = "tools.aurora.admin.defs#comment")]
+#[serde(tag = "kind")]
+pub enum ModEventAction {
+    TakedownAccount,
+    SuspendAccount,
+    DeleteAccount,
+    ApplyLabel { val: String, neg: bool },
+    RemoveLabel { val: String },
+    TakedownRecord,
+    QuarantineBlob,
+    RestoreBlob,
+    AppealResolve { resolution: AppealResolutionDecision },
     Comment { text: String },
-    #[serde(rename = "tools.aurora.admin.defs#reportOnBehalfOf")]
-    ReportOnBehalfOf { reason: ReportReason, comment: Option<String>, on_behalf_of: String },
+    SendEmail { /* ... */ },
+    // (full variant list per src/api/aurora_admin.rs:97-143)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum AppealResolution { Uphold, Reject, Modify }
+pub enum AppealResolutionDecision { Approve, Deny }
 ```
 
-**Why two enums** — the API enum is subject-agnostic and compositional (one `Takedown` variant applied to any `Subject`); the storage enum is subject-aware (`AccountTakedown`, `BlobQuarantine`) for queryability against the existing event log. The translation layer in `emitEvent` reads `ModEvent` + `Subject` and writes the appropriate `ModerationEventType` variant.
+**API enum is subject-aware in v0.2.** `ModEventAction` is the wire-format shape — variants like `TakedownAccount` vs `TakedownRecord` are explicit per-subject-type rather than a compositional `Takedown` applied to any `Subject`. Clients constructing `ModEventAction` values choose the variant per the subject they're acting on.
+
+> **Reconciliation.** Earlier drafts specified a `$type`-tagged compositional `ModEvent` enum (subject-agnostic — one `Takedown` variant applied to any `Subject`, with the lexicon as source of truth for which actions apply where) plus an `AppealResolution` enum with `Uphold | Reject | Modify`. As-built, Phase 3.5 collapsed the API enum into the storage shape (`ModEventAction` is `kind`-tagged with subject-aware variants); `AppealResolutionDecision` ships with `Approve | Deny`. The compositional revisit is a v0.3 candidate (chainlink #NN); the wire-breaking nature of the change motivated its deferral.
 
 **Why role grant/revoke aren't here** — they live at `tools.aurora.superadmin.*` ([§4.3.3](#§433-toolsaurorasuperadmin)) as dedicated endpoints rather than `ModEvent` variants. Keeping them out of `ModEvent` makes the SuperAdmin auth boundary structurally visible in the namespace.
 
@@ -290,7 +292,9 @@ Extension entries are objects with an optional `value` field for capabilities th
 
 > **Reconciliation (C2).** An earlier Phase 3 design draft modeled the response as `namespaces: Vec<NamespaceDescriptor>` with `NamespaceDescriptor { nsid, endpoints, version }`; the cycle-opening admin/moderation assessment used `families` keyed by NSID prefix plus a top-level `extensions` array. Implementation synthesized: `families` is a JSON object keyed by NSID prefix (assessment shape); a separate `extensions` array carries capability flags; top-level `implementation` and `version` are flat fields. The synthesized shape is what ships in v0.2 and is documented above.
 
-The implementation enumerates registered routes under each Aurora namespace prefix and returns the discovered endpoint names. No schema-introspection — just naming.
+The v0.2 implementation maintains a hand-curated capability list in `aurora_capability_families` keyed by namespace. New endpoints require an entry in that list to appear in the capability advertisement.
+
+> **Reconciliation.** Earlier drafts of this section called for runtime route enumeration (walk the Router's table at server start, build the families dict from discovered routes) to eliminate the drift maintenance burden. The static-list approach was chosen for v0.2 because axum's Router introspection is non-trivial and the runtime-discovery refactor warrants its own session. v0.3 candidate (chainlink #NN); the corpus reflects the as-shipped reality.
 
 **§8.15 capability vocabulary** (the canonical extension names) is enumerated in [AURORA_ADMIN_UI_DESIGN.md §8.15](AURORA_ADMIN_UI_DESIGN.md). Two §8.15 capabilities are intentionally omitted from the v0.2 advertisement because the corresponding endpoints are not yet shipped (`invite-lineage-v1`, `reporter-context-v1`); they will be added when their handlers land.
 
