@@ -20,6 +20,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - DPoP proof-of-possession now enforced on resource requests. Tokens issued with a bound DPoP thumbprint require the request to carry a DPoP proof whose JWK matches the bound thumbprint and whose `ath` claim equals base64url(SHA-256(access_token)) per RFC 9449 §4.3. Bearer-only tokens (no thumbprint) accept requests without a DPoP header — backward compat for unbound tokens. (#100)
 
 ### Changed
+- v0.2 cycle handoff document (#154)
+- Phase 5 — Production primitives (#78)
+- Phase 4 — Multi-instance support (#77)
+- Phase 3 — Query layer compatibility (Group A+B files) (#76)
 - SL-6 — Replace stale ModEventAction variant list in §4.1.2 with code reference (#153)
 - SL-5 — Tighten override-mechanism cite in endpoint inventory (#152)
 - SL-4 — Fix listAccounts line cite drift in endpoint inventory (#151)
