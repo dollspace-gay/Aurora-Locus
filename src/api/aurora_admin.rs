@@ -935,30 +935,6 @@ fn check_moderator_role(
     }
 }
 
-/// Insert per-subject account_moderation rows + one moderation_event
-/// row in a single transaction. Returns the event id.
-async fn insert_batch_account_moderations(
-    ctx: &AppContext,
-    actor_did: &str,
-    action_db_str: &str,
-    event_type: ModerationEventType,
-    rationale: &str,
-    dids: &[String],
-) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
-    let event_id = insert_batch_account_moderations_in_tx(
-        &mut tx,
-        actor_did,
-        action_db_str,
-        event_type,
-        rationale,
-        dids,
-    )
-    .await?;
-    tx.commit().await.map_err(internal)?;
-    Ok(event_id)
-}
-
 /// Insert per-DID `account_moderation` rows + the batch
 /// `moderation_event` row inside the caller-supplied transaction.
 /// LB-1 / chainlink #128: callers wrap this together with the
@@ -1108,8 +1084,17 @@ pub async fn batch_takedown_accounts(
     // changes takedown_ref), so post-mutation capture would yield
     // post-state — defeating the forensic purpose.
     let snapshot_ids = capture_snapshots_for_repo_subjects(&ctx, &input.dids).await?;
-    let event_id = insert_batch_account_moderations(
-        &ctx,
+
+    // LB-1 / chainlink #128: chain entry, moderation_event,
+    // account_moderation rows, and per-subject takedown mutations
+    // all run inside one transaction. Per-subject failures roll
+    // back via SAVEPOINT so the failing DID doesn't poison the
+    // whole batch — chainlink #112's per-subject best-effort
+    // semantics now happen inside the wrapping tx.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let event_id = insert_batch_account_moderations_in_tx(
+        &mut tx,
         &auth.did,
         "takedown",
         ModerationEventType::AccountTakedown,
@@ -1117,32 +1102,61 @@ pub async fn batch_takedown_accounts(
         &input.dids,
     )
     .await?;
-    // Best-effort actor-table update + session purge per DID. Per
-    // chainlink #112 the chain row records operator intent (every DID
-    // in cascade_subjects); per-subject failures here surface in the
-    // `failures` response field without rolling back the batch. True
-    // end-to-end per-subject atomicity is a v0.3 candidate
-    // (chainlink #113).
     let mut failures: Vec<BatchFailure> = Vec::new();
     for did in &input.dids {
         let takedown_ref = format!("batch_event_{}", event_id);
-        if let Err(e) = ctx.account_manager.takedown_account(did, &takedown_ref).await {
-            tracing::warn!("batch takedown side-effect failed for {}: {}", did, e);
-            failures.push(BatchFailure {
-                subject: did.clone(),
-                reason: e.to_string(),
-            });
+        // Per-subject SAVEPOINT: a failing takedown rolls back its
+        // own inner tx without aborting the outer batch tx, so
+        // chainlink #112's per-subject best-effort semantics
+        // survive inside the LB-1 wrapping transaction. sqlx's
+        // `Acquire::begin` on a `&mut Transaction` issues a
+        // SAVEPOINT, and `commit`/`rollback` on the returned inner
+        // handle issues `RELEASE SAVEPOINT` / `ROLLBACK TO
+        // SAVEPOINT` respectively.
+        use sqlx::Acquire;
+        let mut sp = (&mut *tx).begin().await.map_err(internal)?;
+        match crate::account::AccountManager::takedown_account_in_tx(
+            &mut sp,
+            did,
+            &takedown_ref,
+        )
+        .await
+        {
+            Ok(()) => {
+                sp.commit().await.map_err(internal)?;
+            }
+            Err(e) => {
+                tracing::warn!("batch takedown side-effect failed for {}: {}", did, e);
+                sp.rollback().await.map_err(internal)?;
+                failures.push(BatchFailure {
+                    subject: did.clone(),
+                    reason: e.to_string(),
+                });
+            }
         }
     }
-    let audit_entry_id = append_batch_chain_entry(
-        &ctx,
-        &auth.did,
-        "account.batch_takedown",
-        &input,
-        event_id,
-        &snapshot_ids,
+    let cascade: Vec<Subject> = input
+        .dids
+        .iter()
+        .map(|d| Subject::Repo { did: d.clone() })
+        .collect();
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "account.batch_takedown",
+            subject: None,
+            rationale: &input.rationale,
+            snapshot_id: None,
+            event_id: Some(event_id),
+            cascade_subjects: &cascade,
+            cascade_snapshot_ids: &snapshot_ids,
+        },
     )
-    .await?;
+    .await
+    .map_err(internal_pds)?;
+    tx.commit().await.map_err(internal)?;
+
     let affected_count = (input.dids.len() - failures.len()) as u32;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
@@ -1165,8 +1179,16 @@ pub async fn batch_suspend_accounts(
         return Err(validation("rationale is required and must be non-empty"));
     }
     let snapshot_ids = capture_snapshots_for_repo_subjects(&ctx, &input.dids).await?;
-    let event_id = insert_batch_account_moderations(
-        &ctx,
+
+    // LB-1 / chainlink #128: chain entry + moderation_event +
+    // per-DID account_moderation rows all in one transaction.
+    // Suspend has no per-subject actor-table mutation (the
+    // moderation_event row IS the suspension record), so no
+    // savepoints / failures[] needed.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let event_id = insert_batch_account_moderations_in_tx(
+        &mut tx,
         &auth.did,
         "suspend",
         ModerationEventType::AccountSuspend,
@@ -1174,22 +1196,33 @@ pub async fn batch_suspend_accounts(
         &input.dids,
     )
     .await?;
-    let audit_entry_id = append_batch_chain_entry(
-        &ctx,
-        &auth.did,
-        "account.batch_suspend",
-        &input,
-        event_id,
-        &snapshot_ids,
+    let cascade: Vec<Subject> = input
+        .dids
+        .iter()
+        .map(|d| Subject::Repo { did: d.clone() })
+        .collect();
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "account.batch_suspend",
+            subject: None,
+            rationale: &input.rationale,
+            snapshot_id: None,
+            event_id: Some(event_id),
+            cascade_subjects: &cascade,
+            cascade_snapshot_ids: &snapshot_ids,
+        },
     )
-    .await?;
+    .await
+    .map_err(internal_pds)?;
+    tx.commit().await.map_err(internal)?;
+
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
         audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.dids.len() as u32,
         snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
-        // No per-DID actor-table side-effects today: the
-        // moderation_event row IS the suspension record.
         failures: Vec::new(),
     }))
 }
@@ -1206,8 +1239,17 @@ pub async fn batch_restore_accounts(
         return Err(validation("rationale is required and must be non-empty"));
     }
     let snapshot_ids = capture_snapshots_for_repo_subjects(&ctx, &input.dids).await?;
-    let event_id = insert_batch_account_moderations(
-        &ctx,
+
+    // LB-1 / chainlink #128: chain entry, moderation_event,
+    // account_moderation rows, and per-DID takedown_ref clearing
+    // all in one transaction. Per-DID UPDATE failures roll back
+    // via SAVEPOINT so a single bad DID doesn't poison the whole
+    // batch (chainlink #112's per-subject best-effort, now
+    // inside the wrapping tx).
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let event_id = insert_batch_account_moderations_in_tx(
+        &mut tx,
         &auth.did,
         "restore",
         ModerationEventType::AccountRestore,
@@ -1215,34 +1257,52 @@ pub async fn batch_restore_accounts(
         &input.dids,
     )
     .await?;
-    // Restore side-effect: clear takedown_ref. Per-DID UPDATE
-    // failures are captured in `failures` rather than aborting the
-    // batch (chainlink #112).
     let mut failures: Vec<BatchFailure> = Vec::new();
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
     for did in &input.dids {
-        if let Err(e) = sqlx::query("UPDATE actor SET takedown_ref = NULL WHERE did = $1")
+        // Per-subject SAVEPOINT — see batch_takedown_accounts for
+        // the rationale. Same chainlink #112 best-effort framing.
+        use sqlx::Acquire;
+        let mut sp = (&mut *tx).begin().await.map_err(internal)?;
+        let res = sqlx::query("UPDATE actor SET takedown_ref = NULL WHERE did = $1")
             .bind(did)
-            .execute(&mut *tx)
-            .await
-        {
-            tracing::warn!("batch restore side-effect failed for {}: {}", did, e);
-            failures.push(BatchFailure {
-                subject: did.clone(),
-                reason: e.to_string(),
-            });
+            .execute(&mut *sp)
+            .await;
+        match res {
+            Ok(_) => {
+                sp.commit().await.map_err(internal)?;
+            }
+            Err(e) => {
+                tracing::warn!("batch restore side-effect failed for {}: {}", did, e);
+                sp.rollback().await.map_err(internal)?;
+                failures.push(BatchFailure {
+                    subject: did.clone(),
+                    reason: e.to_string(),
+                });
+            }
         }
     }
-    tx.commit().await.map_err(internal)?;
-    let audit_entry_id = append_batch_chain_entry(
-        &ctx,
-        &auth.did,
-        "account.batch_restore",
-        &input,
-        event_id,
-        &snapshot_ids,
+    let cascade: Vec<Subject> = input
+        .dids
+        .iter()
+        .map(|d| Subject::Repo { did: d.clone() })
+        .collect();
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "account.batch_restore",
+            subject: None,
+            rationale: &input.rationale,
+            snapshot_id: None,
+            event_id: Some(event_id),
+            cascade_subjects: &cascade,
+            cascade_snapshot_ids: &snapshot_ids,
+        },
     )
-    .await?;
+    .await
+    .map_err(internal_pds)?;
+    tx.commit().await.map_err(internal)?;
+
     let affected_count = (input.dids.len() - failures.len()) as u32;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
@@ -1251,42 +1311,6 @@ pub async fn batch_restore_accounts(
         snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
         failures,
     }))
-}
-
-/// Append a batch-action chain entry. Subjects from a `BatchAccountsInput`
-/// land in `cascade_subjects` so the chain's "one decision = one entry"
-/// framing (§3.4) is preserved while still recording every affected DID.
-/// Per CR-2 / chainlink #111, `cascade_snapshot_ids` carries the
-/// per-subject snapshot ids in lock-step with `cascade_subjects` so each
-/// DID has a recorded pre-decision state.
-async fn append_batch_chain_entry(
-    ctx: &AppContext,
-    actor_did: &str,
-    action: &'static str,
-    input: &BatchAccountsInput,
-    event_id: i64,
-    snapshot_ids: &[Option<i64>],
-) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
-    let cascade: Vec<Subject> = input
-        .dids
-        .iter()
-        .map(|d| Subject::Repo { did: d.clone() })
-        .collect();
-    audit_chain::append_entry(
-        &ctx.account_db,
-        AppendEntryParams {
-            actor_did,
-            action,
-            subject: None,
-            rationale: &input.rationale,
-            snapshot_id: None,
-            event_id: Some(event_id),
-            cascade_subjects: &cascade,
-            cascade_snapshot_ids: snapshot_ids,
-        },
-    )
-    .await
-    .map_err(internal_pds)
 }
 
 /// `tools.aurora.admin.batchTakedownRecords` (§8.11).
@@ -1303,8 +1327,12 @@ pub async fn batch_takedown_records(
     // Capture per-record snapshots BEFORE the mutation runs so the
     // chain's snapshot linkage points at pre-takedown state.
     let snapshot_ids = capture_snapshots_for_record_uris(&ctx, &input.uris).await?;
-    // Records are taken down via !takedown self-label. Single tx
-    // covers all label inserts + the moderation_event row.
+
+    // LB-1 / chainlink #128: per-URI label INSERTs +
+    // moderation_event + chain entry all in one transaction.
+    // Record-takedown is intentionally all-or-nothing — per-row
+    // failures abort the whole batch (no failures[] surface).
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
     let mut tx = ctx.account_db.begin().await.map_err(internal)?;
     let now = chrono::Utc::now().to_rfc3339();
     let server_did = format!("did:web:{}", ctx.config.service.hostname);
@@ -1341,7 +1369,31 @@ pub async fn batch_takedown_records(
     )
     .await
     .map_err(internal)?;
+    let cascade: Vec<Subject> = input
+        .uris
+        .iter()
+        .map(|uri| Subject::Record {
+            uri: uri.clone(),
+            cid: String::new(),
+        })
+        .collect();
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "record.batch_takedown",
+            subject: None,
+            rationale: &input.rationale,
+            snapshot_id: None,
+            event_id: Some(event_id),
+            cascade_subjects: &cascade,
+            cascade_snapshot_ids: &snapshot_ids,
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
     tx.commit().await.map_err(internal)?;
+
     let snapshots = input
         .uris
         .iter()
@@ -1358,37 +1410,11 @@ pub async fn batch_takedown_records(
                 .map(|id| id.to_string()),
         })
         .collect();
-    let cascade: Vec<Subject> = input
-        .uris
-        .iter()
-        .map(|uri| Subject::Record {
-            uri: uri.clone(),
-            cid: String::new(),
-        })
-        .collect();
-    let audit_entry_id = audit_chain::append_entry(
-        &ctx.account_db,
-        AppendEntryParams {
-            actor_did: &auth.did,
-            action: "record.batch_takedown",
-            subject: None,
-            rationale: &input.rationale,
-            snapshot_id: None,
-            event_id: Some(event_id),
-            cascade_subjects: &cascade,
-            cascade_snapshot_ids: &snapshot_ids,
-        },
-    )
-    .await
-    .map_err(internal_pds)?;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
         audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.uris.len() as u32,
         snapshots,
-        // Record-takedown writes labels + the moderation_event row in
-        // a single transaction; any per-row failure aborts the whole
-        // batch with 500. No partial-success surface today.
         failures: Vec::new(),
     }))
 }
@@ -1408,6 +1434,12 @@ pub async fn batch_apply_label(
         return Err(validation("label_val is required and must be non-empty"));
     }
     let snapshot_ids = capture_snapshots_for_subjects(&ctx, &input.subjects).await?;
+
+    // LB-1 / chainlink #128: per-subject label INSERTs +
+    // moderation_event + chain entry all in one transaction.
+    // Label-apply is intentionally all-or-nothing — per-row
+    // failures abort the whole batch (no failures[] surface).
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
     let mut tx = ctx.account_db.begin().await.map_err(internal)?;
     let now = chrono::Utc::now().to_rfc3339();
     let server_did = format!("did:web:{}", ctx.config.service.hostname);
@@ -1458,22 +1490,8 @@ pub async fn batch_apply_label(
     )
     .await
     .map_err(internal)?;
-    tx.commit().await.map_err(internal)?;
-    let snapshots = input
-        .subjects
-        .iter()
-        .enumerate()
-        .map(|(i, s)| SnapshotRef {
-            subject: s.clone(),
-            snapshot_id: snapshot_ids
-                .get(i)
-                .copied()
-                .flatten()
-                .map(|id| id.to_string()),
-        })
-        .collect();
-    let audit_entry_id = audit_chain::append_entry(
-        &ctx.account_db,
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "label.batch_apply",
@@ -1487,13 +1505,26 @@ pub async fn batch_apply_label(
     )
     .await
     .map_err(internal_pds)?;
+    tx.commit().await.map_err(internal)?;
+
+    let snapshots = input
+        .subjects
+        .iter()
+        .enumerate()
+        .map(|(i, s)| SnapshotRef {
+            subject: s.clone(),
+            snapshot_id: snapshot_ids
+                .get(i)
+                .copied()
+                .flatten()
+                .map(|id| id.to_string()),
+        })
+        .collect();
     Ok(Json(BatchLabelOutput {
         event_id: event_id.to_string(),
         audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: input.subjects.len() as u32,
         snapshots,
-        // Label-apply runs all per-subject INSERTs in a single
-        // transaction; per-row failures abort the batch.
         failures: Vec::new(),
     }))
 }
@@ -1551,7 +1582,13 @@ pub async fn batch_remove_label(
             skipped.push(subject.clone());
         }
     }
-    // Atomic write of negative labels + event for the applied subset.
+    // LB-1 / chainlink #128: negative-label INSERTs +
+    // moderation_event + chain entry all in one transaction.
+    // Label-remove is all-or-nothing for the applied subset;
+    // skipped subjects are a separate dimension reported in the
+    // response and are not part of the chain entry's
+    // cascade_subjects.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
     let mut tx = ctx.account_db.begin().await.map_err(internal)?;
     let now = chrono::Utc::now().to_rfc3339();
     for (_subject, uri, cid, _snap) in &applied_subjects {
@@ -1598,7 +1635,6 @@ pub async fn batch_remove_label(
     )
     .await
     .map_err(internal)?;
-    tx.commit().await.map_err(internal)?;
     let snapshots = applied_subjects
         .iter()
         .map(|(s, _, _, snap)| SnapshotRef {
@@ -1614,8 +1650,8 @@ pub async fn batch_remove_label(
         .iter()
         .map(|(_, _, _, snap)| *snap)
         .collect();
-    let audit_entry_id = audit_chain::append_entry(
-        &ctx.account_db,
+    let audit_entry_id = audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "label.batch_remove",
@@ -1629,15 +1665,14 @@ pub async fn batch_remove_label(
     )
     .await
     .map_err(internal_pds)?;
+    tx.commit().await.map_err(internal)?;
+
     Ok(Json(BatchRemoveLabelOutput {
         event_id: event_id.to_string(),
         audit_entry_id: Some(audit_entry_id.to_string()),
         affected_count: applied_subjects.len() as u32,
         skipped,
         snapshots,
-        // Label-remove runs all per-subject negative-label INSERTs in
-        // a single transaction; per-row failures abort the batch.
-        // `skipped` (subjects without the label) is its own dimension.
         failures: Vec::new(),
     }))
 }
@@ -3755,6 +3790,168 @@ mod tests {
             3,
             "chain entry preserves full operator intent regardless of per-subject failures"
         );
+
+        // LB-1 / chainlink #128: per-subject SAVEPOINT means the
+        // failing subject's rollback does NOT poison the
+        // successful subjects. Verify the actor-table mutations
+        // for p0 and p1 actually landed (takedown_ref non-NULL).
+        let p0_takedown: Option<String> =
+            sqlx::query_scalar("SELECT takedown_ref FROM actor WHERE did = 'did:plc:p0'")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert!(
+            p0_takedown.is_some(),
+            "p0 takedown_ref must land — savepoint isolates the failing subject"
+        );
+        let p1_takedown: Option<String> =
+            sqlx::query_scalar("SELECT takedown_ref FROM actor WHERE did = 'did:plc:p1'")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert!(
+            p1_takedown.is_some(),
+            "p1 takedown_ref must land — savepoint isolates the failing subject"
+        );
+    }
+
+    // LB-1 / chainlink #128 parallel test for batch_restore_accounts.
+    // The handler clears `takedown_ref` per DID inside savepoints.
+    // SQLite's UPDATE on a non-existent row returns 0 rows_affected
+    // rather than an error, so to exercise the savepoint failure
+    // path we'd need a deliberately-broken row. Instead this test
+    // pins the happy-path atomicity: chain entry + per-DID UPDATE +
+    // moderation_event row all commit together. Combined with the
+    // takedown partial-success test above, we have coverage of both
+    // savepoint-bearing batch handlers.
+    #[tokio::test]
+    async fn batch_restore_lands_chain_entry_atomically_with_actor_updates() {
+        use sqlx::Row as _;
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:r0", "r0.test").await;
+        seed_actor(&ctx, "did:plc:r1", "r1.test").await;
+        // Pre-seed takedown_ref so we can observe the clear.
+        sqlx::query("UPDATE actor SET takedown_ref = 'pre' WHERE did IN ('did:plc:r0', 'did:plc:r1')")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+
+        let resp = batch_restore_accounts(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(BatchAccountsInput {
+                dids: vec!["did:plc:r0".to_string(), "did:plc:r1".to_string()],
+                rationale: "restore".to_string(),
+            }),
+        )
+        .await
+        .expect("batch returns 200")
+        .0;
+        assert_eq!(resp.affected_count, 2);
+        assert!(resp.failures.is_empty());
+
+        // Both takedown_ref values cleared.
+        let r0: Option<String> =
+            sqlx::query_scalar("SELECT takedown_ref FROM actor WHERE did = 'did:plc:r0'")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert!(r0.is_none(), "r0 takedown_ref cleared");
+        let r1: Option<String> =
+            sqlx::query_scalar("SELECT takedown_ref FROM actor WHERE did = 'did:plc:r1'")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert!(r1.is_none(), "r1 takedown_ref cleared");
+
+        // Chain entry covers both DIDs.
+        let row = sqlx::query(
+            "SELECT cascade_subjects FROM audit_chain_entry \
+             WHERE action = 'account.batch_restore'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        let cascade_json: String = row.try_get("cascade_subjects").unwrap();
+        let cascade: Vec<Subject> = serde_json::from_str(&cascade_json).unwrap();
+        assert_eq!(cascade.len(), 2);
+
+        // moderation_event landed (one row per batch).
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM moderation_event WHERE event_type = 'account_restore'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(event_count, 1);
+
+        // account_moderation rows: one per DID.
+        let am_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM account_moderation WHERE action = 'restore'")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(am_count, 2);
+    }
+
+    // LB-1 / chainlink #128: pin the all-or-nothing atomicity of
+    // batch_apply_label. Two valid subjects in one batch land
+    // together: chain entry + moderation_event + per-subject label
+    // rows all commit, or none of them do. This is the wrapping
+    // tx's atomicity contract — exercised here on the happy path.
+    #[tokio::test]
+    async fn batch_apply_label_lands_chain_event_and_labels_atomically() {
+        use sqlx::Row as _;
+        let ctx = create_test_context().await;
+        let resp = batch_apply_label(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(BatchLabelInput {
+                subjects: vec![
+                    Subject::Record {
+                        uri: "at://did:plc:s0/app.bsky.feed.post/a".to_string(),
+                        cid: "bafkreia".to_string(),
+                    },
+                    Subject::Record {
+                        uri: "at://did:plc:s1/app.bsky.feed.post/b".to_string(),
+                        cid: "bafkreib".to_string(),
+                    },
+                ],
+                label_val: "porn".to_string(),
+                label_neg: false,
+                rationale: "atomic batch".to_string(),
+            }),
+        )
+        .await
+        .expect("batch returns 200")
+        .0;
+        assert_eq!(resp.affected_count, 2);
+
+        // Two label rows, one moderation_event, one chain entry — all
+        // sharing the wrapping tx.
+        let label_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM label WHERE val = 'porn'")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(label_count, 2);
+        let chain_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = 'label.batch_apply'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(chain_count, 1);
+        // cascade_subjects records both subjects.
+        let row = sqlx::query(
+            "SELECT cascade_subjects FROM audit_chain_entry WHERE action = 'label.batch_apply'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        let cascade_json: String = row.try_get("cascade_subjects").unwrap();
+        let cascade: Vec<Subject> = serde_json::from_str(&cascade_json).unwrap();
+        assert_eq!(cascade.len(), 2);
     }
 
     #[tokio::test]
