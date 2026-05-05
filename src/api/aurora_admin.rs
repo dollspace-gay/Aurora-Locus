@@ -79,10 +79,17 @@ fn default_true() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct EmitEventOutput {
     pub event_id: String,
-    /// `None` until Phase 3.8 audit chain ships.
-    pub audit_entry_id: Option<String>,
-    /// `None` in Phase 3.5; populated when snapshot infrastructure
-    /// lands in Phase 3.8.
+    /// Audit chain entry id for this action. Always populated on
+    /// success — `emit_event` writes the chain entry inside the same
+    /// transaction as the moderation_event row (LB-1 / chainlink
+    /// #122), so a successful response always corresponds to a landed
+    /// chain row. Per §3.4: snapshots-and-audit-chain are co-equal
+    /// substrate; an emitted event without a chain entry would
+    /// silently violate that invariant.
+    pub audit_entry_id: String,
+    /// `None` when `snapshot_capture: false` was passed or the action
+    /// targets a non-snapshottable subject; otherwise the captured
+    /// snapshot's id.
     pub snapshot_id: Option<String>,
     /// Event ids of actions cascaded server-side. The canonical
     /// example is appeal-approval triggering an automatic reversal
@@ -425,7 +432,7 @@ pub async fn emit_event(
 
     Ok(Json(EmitEventOutput {
         event_id: event.id.to_string(),
-        audit_entry_id: Some(audit_entry_id.to_string()),
+        audit_entry_id: audit_entry_id.to_string(),
         snapshot_id: snapshot_id.map(|id| id.to_string()),
         cascading_actions,
     }))
@@ -839,7 +846,12 @@ pub struct BatchAccountsInput {
 #[serde(rename_all = "camelCase")]
 pub struct BatchAccountsOutput {
     pub event_id: String,
-    pub audit_entry_id: Option<String>,
+    /// Audit chain entry id for the operator's batch decision.
+    /// Populated unconditionally on success — every batch handler
+    /// runs the chain append + moderation_event row inside one
+    /// transaction (chainlink #112's two-tier atomicity), so a
+    /// returned response always corresponds to a landed chain row.
+    pub audit_entry_id: String,
     /// Count of subjects whose actor-table mutation actually applied.
     /// May be less than `cascade_subjects.len()` on the chain row when
     /// per-subject side-effects fail — the chain entry records
@@ -878,7 +890,9 @@ pub struct BatchLabelInput {
 #[serde(rename_all = "camelCase")]
 pub struct BatchLabelOutput {
     pub event_id: String,
-    pub audit_entry_id: Option<String>,
+    /// Audit chain entry id for the operator's batch decision.
+    /// Always populated on success — see `BatchAccountsOutput`.
+    pub audit_entry_id: String,
     pub affected_count: u32,
     pub snapshots: Vec<SnapshotRef>,
     /// Per-subject failures in the actor-table mutation pass. Always
@@ -893,7 +907,9 @@ pub struct BatchLabelOutput {
 #[serde(rename_all = "camelCase")]
 pub struct BatchRemoveLabelOutput {
     pub event_id: String,
-    pub audit_entry_id: Option<String>,
+    /// Audit chain entry id for the operator's batch decision.
+    /// Always populated on success — see `BatchAccountsOutput`.
+    pub audit_entry_id: String,
     pub affected_count: u32,
     /// Subjects that didn't have the label — reported transparently
     /// rather than failing the batch (§8.13 non-atomic-failure rule).
@@ -1160,7 +1176,7 @@ pub async fn batch_takedown_accounts(
     let affected_count = (input.dids.len() - failures.len()) as u32;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: Some(audit_entry_id.to_string()),
+        audit_entry_id: audit_entry_id.to_string(),
         affected_count,
         snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
         failures,
@@ -1220,7 +1236,7 @@ pub async fn batch_suspend_accounts(
 
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: Some(audit_entry_id.to_string()),
+        audit_entry_id: audit_entry_id.to_string(),
         affected_count: input.dids.len() as u32,
         snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
         failures: Vec::new(),
@@ -1306,7 +1322,7 @@ pub async fn batch_restore_accounts(
     let affected_count = (input.dids.len() - failures.len()) as u32;
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: Some(audit_entry_id.to_string()),
+        audit_entry_id: audit_entry_id.to_string(),
         affected_count,
         snapshots: snapshots_for_dids(&input.dids, &snapshot_ids),
         failures,
@@ -1412,7 +1428,7 @@ pub async fn batch_takedown_records(
         .collect();
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: Some(audit_entry_id.to_string()),
+        audit_entry_id: audit_entry_id.to_string(),
         affected_count: input.uris.len() as u32,
         snapshots,
         failures: Vec::new(),
@@ -1522,7 +1538,7 @@ pub async fn batch_apply_label(
         .collect();
     Ok(Json(BatchLabelOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: Some(audit_entry_id.to_string()),
+        audit_entry_id: audit_entry_id.to_string(),
         affected_count: input.subjects.len() as u32,
         snapshots,
         failures: Vec::new(),
@@ -1669,7 +1685,7 @@ pub async fn batch_remove_label(
 
     Ok(Json(BatchRemoveLabelOutput {
         event_id: event_id.to_string(),
-        audit_entry_id: Some(audit_entry_id.to_string()),
+        audit_entry_id: audit_entry_id.to_string(),
         affected_count: applied_subjects.len() as u32,
         skipped,
         snapshots,
@@ -3200,7 +3216,7 @@ mod tests {
         assert!(!resp.event_id.is_empty());
         // Phase 3.8 makes these meaningful — emitEvent now writes a
         // chain entry + snapshot for snapshottable subjects.
-        assert!(resp.audit_entry_id.is_some(), "Phase 3.8 populates audit_entry_id");
+        assert!(!resp.audit_entry_id.is_empty(), "emitEvent populates audit_entry_id");
         assert!(resp.snapshot_id.is_some(), "Phase 3.8 captures snapshot for Repo subjects");
         assert!(resp.cascading_actions.is_empty());
         // Verify the moderation_event row landed.
@@ -3635,7 +3651,7 @@ mod tests {
         // Audit chain entry id surfaces on the response (Block 1
         // wired all six batch endpoints through append_entry).
         assert!(
-            resp.audit_entry_id.is_some(),
+            !resp.audit_entry_id.is_empty(),
             "batch_takedown_accounts populates audit_entry_id"
         );
         // ONE moderation_event row for the batch (per design doc).
@@ -4029,7 +4045,7 @@ mod tests {
         .0;
         assert_eq!(resp.affected_count, 2);
         assert!(
-            resp.audit_entry_id.is_some(),
+            !resp.audit_entry_id.is_empty(),
             "batch_apply_label populates audit_entry_id"
         );
         let label_count: i64 =
@@ -4094,7 +4110,7 @@ mod tests {
         assert_eq!(resp.affected_count, 1);
         assert_eq!(resp.skipped.len(), 1);
         assert!(
-            resp.audit_entry_id.is_some(),
+            !resp.audit_entry_id.is_empty(),
             "batch_remove_label populates audit_entry_id"
         );
         // The skipped subject is the one that didn't have the label.
@@ -4374,8 +4390,8 @@ mod tests {
         .await
         .unwrap()
         .0;
-        // Phase 3.8 fills these — Phase 3.5 returned None.
-        assert!(resp.audit_entry_id.is_some(), "Phase 3.8 should populate audit_entry_id");
+        // Phase 3.8 fills these — Phase 3.5 returned None for both.
+        assert!(!resp.audit_entry_id.is_empty(), "emitEvent populates audit_entry_id");
         assert!(resp.snapshot_id.is_some(), "Phase 3.8 should populate snapshot_id");
         // Verify the chain row landed.
         let chain_count: i64 = sqlx::query_scalar(

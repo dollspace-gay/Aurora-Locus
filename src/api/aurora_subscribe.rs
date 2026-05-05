@@ -9,11 +9,19 @@
 //! ```json
 //! { "$type": "hello",          "instanceVersion": "...", "sequence": <last_seq> }
 //! { "$type": "event",          "event": {...},           "sequence": <seq> }
-//! { "$type": "auditEntry",     "sequence": <chain_seq>, "timestamp": "...", ... }
+//! { "$type": "auditEntry",     "entry": {...AuditEntry...}, "sequence": <chain_seq> }
 //! { "$type": "heartbeat",      "sequence": <last_seq> }
 //! { "$type": "outdatedCursor", "oldestAvailableSeq": <seq>, "message": "..." }
 //! { "$type": "error",          "code": "...", "message": "..." }
 //! ```
+//!
+//! The `entry` payload of the `auditEntry` frame is the same
+//! `audit_chain::AuditEntry` shape returned in `getAuditTrail`'s
+//! `items` array (§8.4). Sharing the type means consumers parse one
+//! schema regardless of whether the row arrived via polling or via
+//! the live tail. The envelope-level `sequence` is the chain
+//! sequence (matching `entry.sequence`) and is what subscribers
+//! cursor on for resume.
 //!
 //! Polling-driven: the server polls the retention-bounded
 //! `mod_event_seq` table on a 5-second tick and pushes any newly-
@@ -53,6 +61,7 @@
 //! may not need to know.
 
 use crate::{
+    admin::{audit_chain::AuditEntry, defs::Subject},
     auth::AdminAuthContext,
     AppContext,
 };
@@ -132,28 +141,21 @@ enum SubscribeMessage<'a> {
         event: serde_json::Value,
         sequence: i64,
     },
-    /// Audit chain row, shape mirrors `getAuditTrail`'s per-row
-    /// payload so consumers don't have to know whether they got a
-    /// row from polling or from the stream. `verified` is the
-    /// per-row hash recompute (same primitive getAuditTrail uses);
-    /// chain-level verification stays an explicit getAuditTrail
-    /// request because it walks the whole chain.
+    /// Audit chain row. Per §8.5, the wire shape is
+    /// `{ entry: AuditEntry, sequence: u64 }` — `entry` is the same
+    /// `audit_chain::AuditEntry` returned by `getAuditTrail`'s
+    /// `items` so consumers parse one schema regardless of source.
+    /// The envelope-level `sequence` mirrors `entry.sequence` and is
+    /// what subscribers cursor on for resume; the duplication is
+    /// intentional per spec so consumers can cursor without
+    /// inspecting the payload.
+    ///
+    /// `verified` (inside `entry`) is the per-row hash recompute —
+    /// same primitive getAuditTrail uses. Chain-level verification
+    /// stays an explicit getAuditTrail request because it walks the
+    /// whole chain.
     #[serde(rename = "auditEntry", rename_all = "camelCase")]
-    AuditEntry {
-        sequence: i64,
-        timestamp: DateTime<Utc>,
-        actor_did: String,
-        action: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        subject_did: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        subject_uri: Option<String>,
-        rationale: String,
-        current_hash: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_hash: Option<String>,
-        verified: bool,
-    },
+    AuditEntry { entry: AuditEntry, sequence: i64 },
     #[serde(rename = "heartbeat")]
     Heartbeat { sequence: i64 },
     /// Per §8.5: emitted when the caller's `cursor` is older than the
@@ -390,7 +392,7 @@ async fn collect_tick_messages(
 /// rows in the same transaction, so this matches causal order.
 fn merge_event_and_chain_streams(
     events: Vec<EventStreamRow>,
-    chain_rows: Vec<ChainStreamRow>,
+    chain_rows: Vec<AuditEntry>,
 ) -> Vec<SubscribeMessage<'static>> {
     let mut out: Vec<SubscribeMessage<'static>> =
         Vec::with_capacity(events.len() + chain_rows.len());
@@ -417,40 +419,13 @@ fn merge_event_and_chain_streams(
             });
             ei += 1;
         } else {
-            let c = chain_rows[ci].clone();
-            out.push(SubscribeMessage::AuditEntry {
-                sequence: c.sequence,
-                timestamp: c.timestamp,
-                actor_did: c.actor_did,
-                action: c.action,
-                subject_did: c.subject_did,
-                subject_uri: c.subject_uri,
-                rationale: c.rationale,
-                current_hash: c.current_hash,
-                previous_hash: c.previous_hash,
-                verified: c.verified,
-            });
+            let entry = chain_rows[ci].clone();
+            let sequence = entry.sequence;
+            out.push(SubscribeMessage::AuditEntry { entry, sequence });
             ci += 1;
         }
     }
     out
-}
-
-/// Owned audit-chain row used by the merge step. Mirrors the slice
-/// of `audit_chain::AuditEntry` fields the wire format actually
-/// carries.
-#[derive(Debug, Clone)]
-struct ChainStreamRow {
-    sequence: i64,
-    timestamp: DateTime<Utc>,
-    actor_did: String,
-    action: String,
-    subject_did: Option<String>,
-    subject_uri: Option<String>,
-    rationale: String,
-    current_hash: String,
-    previous_hash: Option<String>,
-    verified: bool,
 }
 
 /// Owned moderation-event row used by the merge step. Timestamp
@@ -500,15 +475,16 @@ async fn current_chain_sequence(ctx: &AppContext) -> Result<i64, sqlx::Error> {
 }
 
 /// Fetch chain entries with sequence > `after_seq`, in sequence-ascending
-/// order, capped by `MAX_EVENTS_PER_POLL`. Mirrors the field layout the
-/// `AuditEntry` wire variant ships, including a per-row hash recompute
-/// to populate `verified` (matches getAuditTrail's per-row primitive).
+/// order, capped by `MAX_EVENTS_PER_POLL`. Returns `audit_chain::AuditEntry`
+/// values directly so the subscribe wire shape matches getAuditTrail's
+/// `items` exactly. Per-row hash recompute populates `verified`
+/// (matches getAuditTrail's per-row primitive).
 async fn fetch_new_chain_entries(
     ctx: &AppContext,
     after_seq: i64,
-) -> Result<Vec<ChainStreamRow>, sqlx::Error> {
+) -> Result<Vec<AuditEntry>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
+        "SELECT id, sequence, created_at, actor_did, action, subject_did, subject_uri, \
                 subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
                 cascade_subjects, cascade_snapshot_ids \
          FROM audit_chain_entry WHERE sequence > $1 ORDER BY sequence ASC LIMIT $2",
@@ -520,6 +496,7 @@ async fn fetch_new_chain_entries(
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
+        let id: i64 = row.try_get("id")?;
         let sequence: i64 = row.try_get("sequence")?;
         let created_at_str: String = row.try_get("created_at")?;
         let timestamp = match DateTime::parse_from_rfc3339(&created_at_str) {
@@ -557,17 +534,30 @@ async fn fetch_new_chain_entries(
             &current_hash,
         );
 
-        out.push(ChainStreamRow {
+        let subject_ref = Subject::from_columns(
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+        );
+        let cascade_subjects: Vec<Subject> = cascade_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        out.push(AuditEntry {
+            id: id.to_string(),
             sequence,
             timestamp,
             actor_did,
             action,
-            subject_did,
-            subject_uri,
+            subject_ref,
             rationale,
+            snapshot_id: snapshot_id.map(|i| i.to_string()),
+            event_id: event_id.map(|i| i.to_string()),
             current_hash,
             previous_hash,
             verified,
+            cascade_subjects,
         });
     }
     Ok(out)
@@ -710,20 +700,25 @@ mod tests {
 
     // ---- Pure merge / role-gate tests (no DB) ----
 
-    fn chain_row(seq: i64, ts: &str, action: &str) -> ChainStreamRow {
-        ChainStreamRow {
+    fn chain_row(seq: i64, ts: &str, action: &str) -> AuditEntry {
+        AuditEntry {
+            id: seq.to_string(),
             sequence: seq,
             timestamp: DateTime::parse_from_rfc3339(ts)
                 .unwrap()
                 .with_timezone(&Utc),
             actor_did: "did:plc:m1".to_string(),
             action: action.to_string(),
-            subject_did: Some("did:plc:s".to_string()),
-            subject_uri: None,
+            subject_ref: Some(Subject::Repo {
+                did: "did:plc:s".to_string(),
+            }),
             rationale: "test".to_string(),
+            snapshot_id: None,
+            event_id: None,
             current_hash: "h".to_string(),
             previous_hash: None,
             verified: true,
+            cascade_subjects: Vec::new(),
         }
     }
 
@@ -801,32 +796,91 @@ mod tests {
     }
 
     #[test]
-    fn audit_entry_serializes_with_camel_case_fields() {
-        // Wire format must match getAuditTrail's per-row shape so
-        // consumers can render without knowing source.
+    fn audit_entry_serializes_with_wrapped_entry_field_per_spec() {
+        // §8.5: AuditEntry { entry: AuditEntry, sequence: u64 } —
+        // entry payload is the same shape as getAuditTrail's items,
+        // including id / subjectRef / snapshotId / eventId /
+        // cascadeSubjects. Pinning the wrapped shape so future
+        // refactors don't silently flatten or drop fields.
         let msg = SubscribeMessage::AuditEntry {
+            entry: AuditEntry {
+                id: "100".to_string(),
+                sequence: 42,
+                timestamp: DateTime::parse_from_rfc3339("2026-05-04T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                actor_did: "did:plc:m1".to_string(),
+                action: "TakedownAccount".to_string(),
+                subject_ref: Some(Subject::Repo {
+                    did: "did:plc:s".to_string(),
+                }),
+                rationale: "spam".to_string(),
+                snapshot_id: Some("7".to_string()),
+                event_id: Some("13".to_string()),
+                current_hash: "h".to_string(),
+                previous_hash: Some("p".to_string()),
+                verified: true,
+                cascade_subjects: Vec::new(),
+            },
+            sequence: 42,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        // Envelope.
+        assert!(json.contains("\"$type\":\"auditEntry\""));
+        assert!(json.contains("\"sequence\":42"));
+        // Wrapped entry (camelCase per audit_chain::AuditEntry).
+        assert!(json.contains("\"entry\":{"));
+        assert!(json.contains("\"id\":\"100\""));
+        assert!(json.contains("\"actorDid\":\"did:plc:m1\""));
+        assert!(json.contains("\"currentHash\":\"h\""));
+        assert!(json.contains("\"previousHash\":\"p\""));
+        assert!(json.contains("\"snapshotId\":\"7\""));
+        assert!(json.contains("\"eventId\":\"13\""));
+        assert!(json.contains("\"verified\":true"));
+        assert!(json.contains("\"cascadeSubjects\":[]"));
+        // subject_ref present and wrapped per Subject's $type
+        // discriminator.
+        assert!(json.contains("\"subjectRef\":{"));
+        assert!(json.contains("\"$type\":\"com.atproto.admin.defs#repoRef\""));
+        assert!(json.contains("\"did\":\"did:plc:s\""));
+    }
+
+    #[test]
+    fn audit_entry_wire_shape_matches_get_audit_trail_items() {
+        // Cross-surface parity (§8.5 commit): the JSON shape for
+        // `entry` here must equal the JSON shape getAuditTrail emits
+        // per-item. Pinning by serializing one AuditEntry and
+        // comparing against the entry-extracted JSON from a wrapped
+        // SubscribeMessage::AuditEntry.
+        let entry = AuditEntry {
+            id: "100".to_string(),
             sequence: 42,
             timestamp: DateTime::parse_from_rfc3339("2026-05-04T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
             actor_did: "did:plc:m1".to_string(),
             action: "TakedownAccount".to_string(),
-            subject_did: Some("did:plc:s".to_string()),
-            subject_uri: None,
+            subject_ref: Some(Subject::Repo {
+                did: "did:plc:s".to_string(),
+            }),
             rationale: "spam".to_string(),
+            snapshot_id: None,
+            event_id: None,
             current_hash: "h".to_string(),
-            previous_hash: Some("p".to_string()),
+            previous_hash: None,
             verified: true,
+            cascade_subjects: Vec::new(),
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"$type\":\"auditEntry\""));
-        assert!(json.contains("\"sequence\":42"));
-        assert!(json.contains("\"actorDid\":\"did:plc:m1\""));
-        assert!(json.contains("\"currentHash\":\"h\""));
-        assert!(json.contains("\"previousHash\":\"p\""));
-        assert!(json.contains("\"verified\":true"));
-        // None-valued Option fields are skipped on the wire.
-        assert!(!json.contains("\"subjectUri\""));
+        let standalone = serde_json::to_value(&entry).unwrap();
+        let wrapped = serde_json::to_value(&SubscribeMessage::AuditEntry {
+            entry,
+            sequence: 42,
+        })
+        .unwrap();
+        assert_eq!(
+            wrapped["entry"], standalone,
+            "subscribe entry payload must equal getAuditTrail's per-item shape"
+        );
     }
 
     // ---- DB-backed tests for fetch_new_chain_entries + collect_tick ----
@@ -1034,9 +1088,10 @@ mod tests {
         let resume = collect_tick_messages(&ctx, &params, 0, 1, true).await.unwrap();
         assert_eq!(resume.len(), 1);
         match &resume[0] {
-            SubscribeMessage::AuditEntry { sequence, action, .. } => {
+            SubscribeMessage::AuditEntry { entry, sequence } => {
                 assert_eq!(*sequence, 2);
-                assert_eq!(action, "RestoreAccount");
+                assert_eq!(entry.sequence, 2);
+                assert_eq!(entry.action, "RestoreAccount");
             }
             other => panic!("expected AuditEntry, got {:?}", message_kind(other)),
         }
