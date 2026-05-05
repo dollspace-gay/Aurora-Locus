@@ -1537,7 +1537,7 @@ None — events are immutable history. The page is read-only.
 
 ### 5.3.8 Audit
 
-The unified audit feed — verified chain entries plus pre-chain entries in one chronological stream.
+The unified audit feed — every administrative decision in one chronological stream, each entry cryptographically verifiable.
 
 - **Route:** `#mod/audit`
 - **Role gating:** Moderator+
@@ -1545,13 +1545,15 @@ The unified audit feed — verified chain entries plus pre-chain entries in one 
 
 #### Purpose
 
-Audit is the comprehensive accountability surface. It merges parity-floor `getAuditLog` data and Phase 3.8 hash-chained `getAuditTrail` data into one feed. Each row carries a verification badge: verified (in chain) or pre-chain (predates the chain). Operators investigating "what happened" reach for Audit; auditors verifying cryptographic accountability reach for the verified subset.
+Audit is the comprehensive accountability surface. In v0.2 every entry is a hash-chained `audit_chain_entry` row carrying a `verified` badge derived from re-hashing the row content. The page is the operator's first stop when investigating "what happened" and the auditor's surface for cryptographic accountability.
+
+The page is shaped as a unified feed that surfaces both `com.atproto.admin.getAuditLog` and `tools.aurora.admin.getAuditTrail` for forward-compatibility — both endpoints read from the same `audit_chain_entry` backing table in v0.2 (per [AURORA_DESIGN.md §4.4.1](AURORA_DESIGN.md), the legacy `admin_audit_log` table was dropped by `migrations/0004_drop_admin_audit_log.sql`), so the merge is structural rather than data-bearing today. The two-endpoint shape is preserved as a hook for future deployments that may restore legacy pre-chain data.
 
 #### Endpoint mapping
 
 | Element | Endpoint | Notes |
 |---|---|---|
-| Audit feed | `com.atproto.admin.getAuditLog` + `tools.aurora.admin.getAuditTrail` (Phase 3.8) | Merged client-side, sorted by timestamp |
+| Audit feed | `com.atproto.admin.getAuditLog` + `tools.aurora.admin.getAuditTrail` (Phase 3.8) | Both endpoints read the same `audit_chain_entry` table in v0.2; merge is forward-compat structural |
 | Filter chips | actor, action type, subject, date range, verified-only toggle | |
 | Bulk export | None in v0.2 | Consider for v0.3 |
 
@@ -1559,7 +1561,7 @@ Audit is the comprehensive accountability surface. It merges parity-floor `getAu
 
 Tabular pattern. Columns: timestamp, verified badge, actor, action, subject, hash (truncated, click to copy).
 
-The "verified-only" toggle in FilterStrip filters to chain entries only.
+The "verified-only" toggle in FilterStrip filters to chain entries only. In v0.2 every entry is already a chain entry, so the toggle is effectively a no-op — preserved as a forward-compatibility hook for future deployments where legacy pre-chain rows might appear (see [§8.4](#84-phase-38--toolsauroraadmingetaudittrail)).
 
 #### Real-time behavior
 
@@ -1582,8 +1584,8 @@ Standard patterns. The "no audit data" empty state is unlikely on any production
 
 #### Notes
 
-- Merging the two endpoints client-side is computationally simple but pagination is awkward because cursor schemes differ. v0.2 implementation: fetch a bounded recent window from both, merge, paginate the merged result client-side. Bounded means "most recent N where N is sufficient for typical operator browsing." Operators needing deeper audit history use the verified-only filter (which uses `getAuditTrail`'s native pagination cleanly).
-- The cursor-merge complexity is acceptable for v0.2 because the Audit page is forensic, not operational — operators don't reach for it dozens of times per shift. v0.3 may normalize cursor schemes server-side and simplify the merge.
+- The "merge two endpoints client-side" pattern is preserved in the page-level shape but is a no-op for data in v0.2: both `getAuditLog` and `getAuditTrail` resolve to the same `audit_chain_entry` rows. The cursor-scheme divergence the merge would otherwise navigate is also moot today; the page can use either endpoint's native pagination directly. The two-endpoint structure carries forward as a forward-compatibility hook so a future deployment could restore legacy pre-chain rows under `getAuditLog` without page-level rework.
+- The Audit page is forensic, not operational — operators don't reach for it dozens of times per shift. v0.3 may normalize the wire-format relationship between the two endpoints (deprecate one, fold one into the other, or keep both for protocol compatibility), at which point the page-level shape may simplify.
 
 ### 5.3.9 Audit entry detail
 
@@ -1658,8 +1660,8 @@ Similar to Event detail but emphasizing the chain structure. Includes a "Verify 
 #### Empty / loading / error states
 
 - **404:** audit entry does not exist
-- **Pre-chain entry:** "This entry predates the cryptographic chain (sentinel: pre-chain). No hash verification available." Display content as best as possible
-- **Hash mismatch on recompute:** explicit "Hash mismatch — entry may be corrupted" warning with surrounding context. This is the case the chain exists to detect; UI surfaces it loudly when found
+- **Pre-chain entry (forward-compat only):** does not occur in v0.2 deployments — `migrations/0004_drop_admin_audit_log.sql` dropped the legacy table outright rather than producing `current_hash="pre-chain"` sentinel rows (see [§8.4](#84-phase-38--toolsauroraadmingetaudittrail)). Reserved for future deployments that may restore legacy data; if such a row is ever loaded, the UI displays "This entry predates the cryptographic chain (sentinel: pre-chain). No hash verification available." and renders content as best as possible.
+- **Hash mismatch on recompute:** explicit "Hash mismatch — entry may be corrupted" warning with surrounding context. This is the case the chain exists to detect; UI surfaces it loudly when found.
 
 #### Notes
 

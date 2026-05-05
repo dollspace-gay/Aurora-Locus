@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - DPoP proof-of-possession now enforced on resource requests. Tokens issued with a bound DPoP thumbprint require the request to carry a DPoP proof whose JWK matches the bound thumbprint and whose `ath` claim equals base64url(SHA-256(access_token)) per RFC 9449 §4.3. Bearer-only tokens (no thumbprint) accept requests without a DPoP header — backward compat for unbound tokens. (#100)
 
 ### Changed
+- P1 follow-up — Bring §5.3.8 Audit page prose into line with v0.2 no-sentinel-rows reality (#142)
 - S5 — Resolve §3.6 self-violation: remove named external-tooling references in design doc (#141)
 - S3 — Rewrite src/oauth/scope.rs:818 comment to match AdminServer-only behavior (#140)
 - S1 — Update listRecentEvents route comment to past tense post-Phase-3 (#139)
