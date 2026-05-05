@@ -20,6 +20,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - DPoP proof-of-possession now enforced on resource requests. Tokens issued with a bound DPoP thumbprint require the request to carry a DPoP proof whose JWK matches the bound thumbprint and whose `ath` claim equals base64url(SHA-256(access_token)) per RFC 9449 §4.3. Bearer-only tokens (no thumbprint) accept requests without a DPoP header — backward compat for unbound tokens. (#100)
 
 ### Changed
+- S5 — Resolve §3.6 self-violation: remove named external-tooling references in design doc (#141)
+- S3 — Rewrite src/oauth/scope.rs:818 comment to match AdminServer-only behavior (#140)
+- S1 — Update listRecentEvents route comment to past tense post-Phase-3 (#139)
+- P1 — Clarify pre-chain sentinel as defensive-only in v0.2 (#138)
+- F4 — Rewrite §3 lexicon-shape audit against as-shipped state (#137)
+- F1 — Update §8.4 GetAuditTrailOutput shape: rename entries → items and document chain-level fields (#136)
 - S2 — Remove src/api/admin_panel.rs.bak from tree (#135)
 - P2 — Verify and tighten EmitEventOutput.audit_entry_id post-Phase-3.8 (#134)
 - F3 — Tighten batch endpoint audit_entry_id type from Option<String> to String (#133)

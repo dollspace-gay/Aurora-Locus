@@ -100,57 +100,59 @@ The assessment's five-phase plan (Phase 1 schema → Phase 2 backend selection �
 
 ## §3 Lexicon shape audit
 
-**Scope.** Eleven `com.atproto.admin.*` endpoints that Aurora-Locus already implemented at name-parity with bsky-PDS, audited for **shape** parity per [§2.1](#§21-admin-and-moderation-parity). Conducted against the atproto monorepo's published lexicons at the 2025-Q1 reference target.
+**Scope.** Eleven `com.atproto.admin.*` endpoints that Aurora-Locus already implemented at name-parity with bsky-PDS, audited at cycle open for **shape** parity per [§2.1](#§21-admin-and-moderation-parity). The original audit was conducted against the atproto monorepo's published lexicons at the 2025-Q1 reference target. The cycle's Phase 1 sub-phases (#61–#65) closed the audited drifts; this section documents the as-shipped state.
 
-**Aurora-Locus surface convention.** Lexicons are not stored as JSON files in this repo; request and response shapes are inline in Rust handlers in `src/api/admin.rs`. The "lexicon surface" enumerated below is the route table at [src/api/admin.rs:38-350](../src/api/admin.rs#L38-L350) plus handler modules under `src/api/`. Each endpoint cites the relevant request/response struct line range from the audit.
+**Aurora-Locus surface convention.** Lexicons are not stored as JSON files in this repo; request and response shapes are inline in Rust handlers in `src/api/admin.rs`. The "lexicon surface" enumerated below is the route table at [src/api/admin.rs:38-350](../src/api/admin.rs#L38-L350) plus handler modules under `src/api/`. Each endpoint cites the relevant request/response struct line range as currently shipped.
 
 **Verdict legend:**
 
-- **Clean** — every input/output field matches the lexicon in name, type, and required-ness; no extra fields beyond the spec.
-- **Minor drift** — extra response payload on a procedure that has no declared output, or one isolated additive field. Wire-level breakage is unlikely; clients ignoring extras still work.
-- **Major drift** — at least one of: input field renamed, required/optional flipped on a declared field, declared input parameter missing, declared output field replaced, fundamentally different request body shape.
+- **Clean** — every input/output field matches the lexicon in name, type, and required-ness; no extra fields beyond the spec, no extra response payload on procedures that declare none.
+- **Mostly clean** — input/output fields match the lexicon, with one documented Aurora extension that is omitted from the wire when not populated (so spec-strict consumers see a spec-shaped payload).
+- **Outstanding drift** — material wire-breaking divergence. None remain after the Phase 1 work.
 
-### §3.1 Per-endpoint findings
+### §3.1 Per-endpoint findings (as-shipped)
 
-**deleteAccount** ([src/api/admin.rs:715-751](../src/api/admin.rs#L715-L751)) — *Minor drift.* Lexicon declares no output; Aurora returns `{success, did, message}`. Cosmetic.
+**deleteAccount** ([src/api/admin.rs:1331-1399](../src/api/admin.rs#L1331-L1399)) — *Clean.* Returns `Result<StatusCode, ...>` with no response body, matching the lexicon's no-output declaration.
 
-**disableAccountInvites** ([src/api/admin.rs:1830-1834](../src/api/admin.rs#L1830-L1834), [1869-1898](../src/api/admin.rs#L1869-L1898)) — *Major drift.* Input field named `did` instead of `account`; optional `note` field not accepted. Wire-breaking. Shares request struct with `enableAccountInvites`.
+**disableAccountInvites** ([src/api/admin.rs:4122-4137](../src/api/admin.rs#L4122-L4137), [4205-…](../src/api/admin.rs#L4205)) — *Clean.* Phase 1.7 (#62) introduced `account` (at-identifier) as the primary input field per lexicon; legacy `did` field retained for back-compat with deprecation note. Optional `note` field accepted and persisted to the chain rationale. Returns OK no body.
 
-**enableAccountInvites** — *Major drift.* Same divergence as `disableAccountInvites`.
+**enableAccountInvites** ([src/api/admin.rs:4122-4137](../src/api/admin.rs#L4122-L4137), [4140-4202](../src/api/admin.rs#L4140-L4202)) — *Clean.* Same shape as `disableAccountInvites`; shares the `AccountInvitesRequest` struct.
 
-**getAccountInfos** ([src/api/admin.rs:1376-1433](../src/api/admin.rs#L1376-L1433), [1439-1534](../src/api/admin.rs#L1439-L1534)) — *Major drift.* Two material problems: (1) input encoding — Aurora parses `dids` as comma-separated string; bsky-PDS clients send repeated query params (`?dids=a&dids=b`). (2) `accountView.handle` declared optional in Aurora; lexicon requires it. Plus several `Option<T>` fields serialised as always-present with sentinel values rather than omitted (`invites`, `invitesDisabled`, `threatSignatures`).
+**getAccountInfos** ([src/api/admin.rs:2582-2589](../src/api/admin.rs#L2582-L2589), [2641-2750](../src/api/admin.rs#L2641-L2750)) — *Clean.* Phase 1.9 (#64) replaced the legacy comma-separated single-string `dids` encoding with the lexicon-conformant repeated-param form (`?dids=a&dids=b`) via `axum_extra::extract::Query`. `accountView.handle` flipped from `Option<String>` to `String` (the underlying `actor.handle` column is `NOT NULL`).
 
-**getInviteCodes** ([src/api/admin.rs:273-282](../src/api/admin.rs#L273-L282), [285-298](../src/api/admin.rs#L285-L298)) — *Major drift.* Aurora exposes `includeDisabled` instead of the lexicon's `sort`/`limit`/`cursor` pagination triple. The `codes` array shape is compatible but the control surface is entirely different.
+**getInviteCodes** ([src/api/admin.rs:525-543](../src/api/admin.rs#L525-L543), [605-637](../src/api/admin.rs#L605-L637)) — *Clean.* Phase 1.10 (#65) wired the lexicon's `sort` (`recent`/`usage`) + `limit` (1–500, default 100) + `cursor` (typed, base64url) parameters. Legacy `includeDisabled` removed; disabled-only filtering relocates to `tools.aurora.ops.*` per the assessment doc.
 
-**getSubjectStatus** ([src/api/admin.rs:1610-1634](../src/api/admin.rs#L1610-L1634), [1663-1779](../src/api/admin.rs#L1663-L1779)) — *Minor drift.* Subject union implemented correctly via polymorphic struct with `$type` discriminator. `takedown`/`deactivated` always serialised (with `applied: false` when unset) rather than omitted — wire-compatible but spec-divergent. Aurora-only `suspended` field is the most significant addition; either it relocates to `tools.aurora.*` or folds into `takedown` semantics.
+**getSubjectStatus** ([src/api/admin.rs:3789-3812](../src/api/admin.rs#L3789-L3812), [3842-…](../src/api/admin.rs#L3842)) — *Mostly clean.* Subject union implemented correctly via polymorphic struct with `$type` discriminator. `takedown` and `deactivated` now use `skip_serializing_if = "Option::is_none"` and are omitted from the wire when not populated. Aurora-only `suspended` field remains as a documented extension on the response struct, also omitted when None — spec-strict consumers see a payload with no extra fields when the account isn't suspended. The `suspended` extension is the only remaining v0.2 deviation from spec; v0.3 candidate to either relocate to `tools.aurora.*` or fold into `takedown` semantics.
 
-**sendEmail** ([src/api/admin.rs:1149-1170](../src/api/admin.rs#L1149-L1170), [1176-1229](../src/api/admin.rs#L1176-L1229)) — *Major drift.* `subject` flipped optional→required; `senderDid` flipped required→optional (Aurora falls back to authenticated admin's DID, which is a safer default but spec-divergent).
+**sendEmail** ([src/api/admin.rs:2247-2266](../src/api/admin.rs#L2247-L2266), [2279-…](../src/api/admin.rs#L2279)) — *Clean.* Phase 1.8 (#63) flipped `subject` from required→optional per the lexicon (placeholder used at SMTP layer when omitted). `senderDid` is documented as an Aurora-permissive extension: spec marks it required, Aurora defaults to the authenticated admin's DID when omitted; spec-compliant callers pass an explicit value. The Aurora extension is opt-in by the *caller*, not produced on the wire by the *server*, so consumers reading server output are unaffected.
 
-**updateAccountEmail** ([src/api/admin.rs:572-578](../src/api/admin.rs#L572-L578), [581-617](../src/api/admin.rs#L581-L617)) — *Major drift.* Two issues stack: input field renamed `account` → `did`; type narrowed from `at-identifier` (handle OR DID) to DID-only via `starts_with("did:")` validation.
+**updateAccountEmail** ([src/api/admin.rs:1086-1099](../src/api/admin.rs#L1086-L1099), [1102-…](../src/api/admin.rs#L1102)) — *Clean.* Phase 1.7 (#62) introduced `account` (at-identifier) as primary input; legacy `did` retained for back-compat with deprecation note. Returns OK no body.
 
-**updateAccountHandle** ([src/api/admin.rs:619-625](../src/api/admin.rs#L619-L625), [628-665](../src/api/admin.rs#L628-L665)) — *Minor drift.* Field names match. Only deviation: extra response body. Closest-to-clean of the eleven.
+**updateAccountHandle** ([src/api/admin.rs:1176-1181](../src/api/admin.rs#L1176-L1181), [1184-1251](../src/api/admin.rs#L1184-L1251)) — *Clean.* Field names match lexicon; returns OK no body.
 
-**updateAccountPassword** ([src/api/admin.rs:667-673](../src/api/admin.rs#L667-L673), [676-713](../src/api/admin.rs#L676-L713)) — *Minor drift.* Same extra-response-body issue.
+**updateAccountPassword** ([src/api/admin.rs:1253-1259](../src/api/admin.rs#L1253-L1259), [1262-1329](../src/api/admin.rs#L1262-L1329)) — *Clean.* Field names match lexicon; returns OK no body.
 
-**updateSubjectStatus** ([src/api/admin.rs:1536-1544](../src/api/admin.rs#L1536-L1544), [1546-1608](../src/api/admin.rs#L1546-L1608)) — *Major drift.* The most divergent of the eleven. Aurora's `action`-verb model (`suspend`/`takedown`/`restore`) is structurally different from the lexicon's declarative status-patch model (set `takedown.applied = true`, etc.). Already known and tracked under chainlink #61 ("updateSubjectStatus polymorphism").
+**updateSubjectStatus** ([src/api/admin.rs:3401-3422](../src/api/admin.rs#L3401-L3422), [3437-…](../src/api/admin.rs#L3437)) — *Clean.* Phase 1.6 (#61) replaced the imperative-action model (`suspend`/`takedown`/`restore` verb) with the lexicon's declarative status-patch model (`{takedown?: StatusAttr, deactivated?: StatusAttr}`). Subject dispatch covers `repoRef` (both patches), `repoBlobRef` (`takedown` only; `deactivated` rejected as inapplicable), and `strongRef` (`takedown` returns 501 pending a record-takedown setter; `deactivated` rejected as inapplicable to records). Response echoes `subject + takedown?` per spec; `deactivated` is intentionally not echoed since the lexicon doesn't carry it on the response.
 
-### §3.2 Summary
+### §3.2 Summary (as-shipped)
 
 | Verdict bucket | Endpoints | Count |
 |---|---|---|
-| Clean (full shape parity) | (none) | 0 |
-| Minor drift (extra response payload, isolated field gap) | `deleteAccount`, `getSubjectStatus`, `updateAccountHandle`, `updateAccountPassword` | 4 |
-| Major drift (input/output shape divergence) | `disableAccountInvites`, `enableAccountInvites`, `getAccountInfos`, `getInviteCodes`, `sendEmail`, `updateAccountEmail`, `updateSubjectStatus` | 7 |
+| Clean (full shape parity) | `deleteAccount`, `disableAccountInvites`, `enableAccountInvites`, `getAccountInfos`, `getInviteCodes`, `sendEmail`, `updateAccountEmail`, `updateAccountHandle`, `updateAccountPassword`, `updateSubjectStatus` | 10 |
+| Mostly clean (one omitted-when-None Aurora extension) | `getSubjectStatus` (`suspended` field) | 1 |
+| Outstanding drift | (none) | 0 |
 
-### §3.3 Recurring drift patterns
+### §3.3 Recurring drift patterns (resolution status)
 
-1. **Procedures emit non-spec response bodies** (5 of 7 procedures audited). `{success: true, ...}`-style envelopes returned where the lexicon declares no output schema. Wire-compatible for any client that ignores the body, but cosmetically inconsistent.
-2. **`account` (at-identifier) parameters renamed to `did` (DID-only string)** — affects `disableAccountInvites`, `enableAccountInvites`, `updateAccountEmail`. Wire-breaking; likely a translation artefact from an early Rust port that preferred Rust-friendly names.
-3. **`Option<T>` fields serialised as always-present with sentinel values** instead of omitted. Most visible in `getSubjectStatus` and `getAccountInfos`. Wire-compatible for permissive clients; spec-divergent for strict ones.
-4. **Pagination is largely unimplemented** on query endpoints that the spec says should support it (`getInviteCodes` lacks sort/limit/cursor; `listInviteCodes` accepts limit/cursor but ignores them).
-5. **`updateSubjectStatus` is structurally divergent**, not just shape-divergent. The `action`-verb vs status-patch model is a design difference that requires real refactor work, not a rename — landed via chainlink #61.
+The five drift patterns enumerated at cycle open have all been substantially or entirely resolved by Phase 1:
 
-**Format-validation note.** None of Aurora's request structs enforce the lexicon's `format=did|handle|at-uri|cid|datetime` constraints at the serde layer; validation is done ad hoc in handlers (e.g. `starts_with("did:")`). This is not a shape divergence but it does mean Aurora will accept inputs that bsky-PDS would reject, and reject some it shouldn't.
+1. **Procedures emitting non-spec response bodies.** *Resolved.* All audited procedures now return `Result<StatusCode, ...>` (OK with no body) per spec. The legacy `{success, did, message}`-style envelopes were dropped during Phase 1 alongside the LB-1 chain-entry refactor (#122) which restructured every admin handler.
+2. **`account` (at-identifier) parameters renamed to `did` (DID-only string).** *Resolved* on `disableAccountInvites`, `enableAccountInvites`, `updateAccountEmail` via Phase 1.7 (#62). Each accepts `account` (lexicon-conformant, handle or DID) as the primary input with `did` retained as a deprecated back-compat field documented for removal in a later minor version.
+3. **`Option<T>` fields serialised as always-present with sentinel values.** *Resolved.* `getSubjectStatus` and `getAccountInfos` now use `skip_serializing_if = "Option::is_none"` consistently. The two endpoints' response shapes match the lexicon's omission semantics.
+4. **Pagination unimplemented on `getInviteCodes`.** *Resolved* via Phase 1.10 (#65). Sort/limit/cursor triple wired with typed `InviteCursor` enum that pins ordering. (`listInviteCodes` was the operator-flavored cousin and relocated to `tools.aurora.ops.*` during Phase 2.3 with proper pagination.)
+5. **`updateSubjectStatus` structural divergence.** *Resolved* via Phase 1.6 (#61). The declarative status-patch model fully replaced the action-verb model.
+
+**Format-validation note.** Aurora's request structs still don't enforce the lexicon's `format=did|handle|at-uri|cid|datetime` constraints at the serde layer; validation continues to be done ad hoc in handlers (e.g. `starts_with("did:")`). This isn't a shape divergence and it isn't user-visible on responses — it just means Aurora may accept inputs bsky-PDS would reject and vice versa at the format-validation layer. Tracked as a v0.3 candidate alongside the broader serde-layer-format-validation discussion.
 
 ---
 
@@ -374,7 +376,7 @@ A new `audit_chain_entry` table was introduced alongside `admin_audit_log` for t
 
 **Concurrency.** `append_entry` uses three layers: in-process `tokio::sync::Mutex` ahead of the transaction, `BEGIN`/`COMMIT` transaction wrap, and (on Postgres) `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` as the transaction's first statement. Without these, two concurrent appends both observe the same chain head, both compute the same next-sequence, and the second `INSERT` fails on the `UNIQUE(sequence)` constraint while the underlying mutation has already executed — silent chain entry loss under bursty load. See chainlink #106.
 
-**Pre-Phase-3.8 sentinel rows.** `verify_chain_range` skips rows where `current_hash = "pre-chain"` — their linkage is undefined by design and verifying them as if they were real chain entries would produce false negatives. Sentinels still count toward gap detection (the chain must be contiguous).
+**Pre-Phase-3.8 sentinel rows (defensive-only in v0.2).** `verify_chain_range` skips rows where `current_hash = "pre-chain"` — their linkage is undefined by design and verifying them as if they were real chain entries would produce false negatives. Sentinels still count toward gap detection (the chain must be contiguous). **In v0.2 deployments, no sentinel rows exist.** `migrations/0004_drop_admin_audit_log.sql` dropped the legacy `admin_audit_log` table outright rather than migrating its rows into `audit_chain_entry` as `current_hash="pre-chain"` placeholders (the migration's preamble cites the rationale: v0.2 has not shipped to upstream and internal deployments rebuild from migration scratch). The skip path remains correct and continues to ship as a future-compatibility hook for any later restoration of legacy data, but consumers writing against the chain in v0.2 will not encounter sentinel rows. See [AURORA_ADMIN_UI_DESIGN.md §8.4](AURORA_ADMIN_UI_DESIGN.md) for the wire-format-side note.
 
 #### §4.4.3 Snapshot capture (audit_snapshot)
 
@@ -650,7 +652,7 @@ The v0.2 cycle delivered the following phases against the upstream baseline `c2d
 
 **Workstream B — Postgres backend** ([§5](#§5-postgres-backend-phase-4), [§7](#§7-sqlitepostgres-coupling-work)). 16 files refactored from `SqlitePool` to `AnyPool`. Postgres schema translated. Multi-instance support via leader election + LISTEN/NOTIFY. Backup/restore wrappers + WAL archiving operator guides. CI runs against both SQLite and Postgres.
 
-**Admin/moderation Phase 1 (parity)** ([§3](#§3-lexicon-shape-audit)). Five parity-gap endpoints shipped. Lexicon-shape audit drove the per-endpoint cleanup work; the four minor-drift endpoints remain (extra response payload, isolated field gaps) — wire-compatible cosmetic divergences left as v0.3 cleanup candidates.
+**Admin/moderation Phase 1 (parity)** ([§3](#§3-lexicon-shape-audit)). Five parity-gap endpoints shipped, plus per-endpoint cleanup driven by the cycle-opening lexicon-shape audit. Of the eleven endpoints audited, ten now ship clean and one (`getSubjectStatus`) is mostly clean with a single Aurora extension (`suspended`) that is omitted from the wire when not populated. The cycle closed every wire-breaking drift the audit identified; the only residual deviation is the `suspended` extension, scoped as a v0.3 candidate to either relocate to `tools.aurora.*` or fold into `takedown` semantics.
 
 **Admin/moderation Phase 2 (namespace cleanup)** ([§4.3.4](#§434-toolsauroraops)). ~30 operator-flavored endpoints relocated from `com.atproto.admin.*` to `tools.aurora.ops.*`. `com.atproto.admin.*` is now the slim parity surface bsky-PDS exposes; operator extensions are visible and well-organized under their own namespace.
 

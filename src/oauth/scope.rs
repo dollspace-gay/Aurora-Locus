@@ -815,12 +815,14 @@ pub fn require_all_scopes(token_scopes: &str, required: &[AtProtoScope]) -> PdsR
 // default is AdminModeration, but four NSIDs are operator-flavored per
 // docs/AURORA_ADMIN_UI_DESIGN.md §8.6 (triggerPasswordReset), §8.7
 // (exportAccountForensic), and §8.16 (get/setRuntimeSetting). Those four
-// accept either AdminServer OR AdminModeration, mirroring the
-// com.atproto.admin.* mixed-flavor accept rule. The mechanism is a
-// specific-NSID lookup that runs BEFORE the prefix match; the assessment
-// doc's §4.1 namespace → scope mapping holds at the namespace level
-// (AdminModeration is sufficient), and the per-endpoint contract from
-// the UI design doc is the additional accept of AdminServer.
+// require AdminServer scope explicitly. The carve-out runs BEFORE the
+// namespace prefix match (see required_scopes_for_path lines 884-890),
+// overriding the tools.aurora.admin.* default of AdminModeration because
+// these endpoints are operator-flavored (password reset, forensic export,
+// runtime settings) rather than moderation-flavored. AdminModeration alone
+// is insufficient — the per-NSID rule replaces (rather than augments) the
+// namespace default. Pinned by test at line 624-636. The wildcard
+// AdminAll scope still implicitly satisfies via AtProtoScope::includes.
 //
 // Returns None for paths outside the admin namespaces — those routes are
 // not subject to namespace-level scope enforcement.

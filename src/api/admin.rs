@@ -33,10 +33,15 @@ use serde::{Deserialize, Serialize};
 ///   net-new ones (`listAccounts`, `getInstanceMetrics`). Scope-checked
 ///   to `atproto:admin.server` via the namespace middleware (e9b66b9).
 ///
-/// `listRecentEvents` intentionally stays at `com.atproto.admin.*` —
-/// moderation-flavored stream review, not operator infrastructure. It
-/// will likely move under `tools.aurora.moderator.*` when admin/mod
-/// Phase 3 lands.
+/// `listRecentEvents` stays at `com.atproto.admin.*` — moderation-
+/// flavored stream review, not operator infrastructure. Phase 3
+/// considered relocating it under `tools.aurora.moderator.*` alongside
+/// the other moderator-tier reads (`queryEvents`, `queryStatuses`),
+/// but kept the legacy at:// path as the cleaner choice for the
+/// streaming review surface: existing parity-tier consumers continue
+/// reaching it without an NSID rename, and the richer per-event reads
+/// that benefit from the new `tools.aurora.moderator.*` shape ship
+/// there alongside the unrelocated stream.
 pub fn routes() -> Router<AppContext> {
     Router::new()
         // ---- com.atproto.admin.* (moderation/admin tier) ----

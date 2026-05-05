@@ -223,7 +223,7 @@ Three things this UI does not now and does not intend to do:
 
 ### 2.3.1 Network-level moderation authority
 
-This UI is for PDS administration. It does not apply network-wide labels, does not function as a labeling service for federation, does not act on behalf of external moderation services. Aurora-Locus operators who want to run a labeler service can do so via separate tooling (Ozone or alternatives); this UI does not duplicate that surface.
+This UI is for PDS administration. It does not apply network-wide labels, does not function as a labeling service for federation, does not act on behalf of external moderation services. Aurora-Locus operators who want to run a labeler service can do so via separate tooling of their choosing; this UI does not duplicate that surface.
 
 ### 2.3.2 End-user account self-service
 
@@ -349,7 +349,7 @@ A direct consequence: this design doc, the resulting code, the strings file, the
 
 This UI exposes the full administrative surface a PDS legitimately controls: account lifecycle, record takedowns, blob operations, audit, and the local resolution of reports and appeals. The actual *network reach* of those actions varies by deployment posture.
 
-On networks where the PDS is paired with an external labeling authority (Ozone on bsky, or comparable arrangements elsewhere), label-application from this UI has bounded effect — local annotation on this PDS rather than network-wide signal. Account-level actions remain real (the account is unreachable on this PDS). Record takedowns remain real (the records are removed from this PDS's storage). But network-visible labels propagate from the labeler, not from the PDS.
+On networks where the PDS is paired with an external labeling authority, label-application from this UI has bounded effect — local annotation on this PDS rather than network-wide signal. Account-level actions remain real (the account is unreachable on this PDS). Record takedowns remain real (the records are removed from this PDS's storage). But network-visible labels propagate from the labeler, not from the PDS.
 
 On independent deployments where the PDS is also the labeler (or where the network's labeler is configured to pair with this PDS's labels), the same operations have full network effect. Same UI, different deployment context, different practical authority.
 
@@ -3938,7 +3938,7 @@ struct SubjectRef {
 ```rust
 struct EmitEventOutput {
     event_id: String,
-    audit_entry_id: Option<String>,    // None if pre-chain
+    audit_entry_id: String,            // always populated; chain entry lands in the same tx as the moderation_event row
     snapshot_id: Option<String>,       // None if snapshot_capture was false or not applicable
     cascading_actions: Vec<String>,    // event_ids of actions cascaded server-side (e.g., appeal-approval triggering restore)
 }
@@ -4105,8 +4105,10 @@ struct GetAuditTrailInput {
 
 ```rust
 struct GetAuditTrailOutput {
-    entries: Vec<AuditEntry>,
+    items: Vec<AuditEntry>,
     cursor: Option<String>,           // for pagination
+    chain_verified: bool,             // chain-level recompute walked through chain_verified_through
+    chain_verified_through: i64,      // highest sequence covered by the verification window
 }
 
 struct AuditEntry {
@@ -4121,22 +4123,26 @@ struct AuditEntry {
     event_id: Option<String>,         // reference to mod_event if applicable
     current_hash: String,             // SHA-256 over entry content
     previous_hash: Option<String>,    // points to prev entry; None for first or pre-chain sentinel
-    verified: bool,                   // false for pre-chain sentinel rows
+    verified: bool,                   // per-row: stored hash matches recomputed hash
     cascade_subjects: Vec<SubjectRef>, // for batch operations and cascades
 }
 ```
+
+The `items` field follows the Phase 3 [`PaginatedResponse<T>`](AURORA_DESIGN.md) convention used by every paginated `tools.aurora.*` endpoint; reusing the same field name across the namespace keeps consumers writing one paginator helper rather than per-endpoint name dispatch.
 
 ### Behavior
 
 - Returns audit entries matching filters in reverse chronological order (newest first).
 - `previous_hash` field links entries into chain.
-- Pre-chain entries (those predating Phase 3.8) return with `current_hash: "pre-chain"` sentinel and `verified: false`.
-- Hash verification can be performed by re-hashing entry content and comparing against `current_hash`.
+- Hash verification can be performed by re-hashing entry content and comparing against `current_hash`. Per-row results land in each entry's `verified` field.
+- Chain-level verification (`chain_verified` + `chain_verified_through`) walks the response window and confirms each row's `previous_hash` matches the prior row's `current_hash`. Per-row `verified` flags catch row-local tampering; `chain_verified` catches the consistent-rewrite attack where an attacker rewrote a prior entry's content AND its `current_hash` together — per-row would pass on every row but the linkage between entries breaks. `chain_verified_through` is the highest sequence covered by the verification window and is meaningful only when `chain_verified` is true. Specified at [AURORA_DESIGN.md §4.4.2](AURORA_DESIGN.md) (chain semantics) and [§4.3.2](AURORA_DESIGN.md) (response shape).
+- The `current_hash = "pre-chain"` sentinel is reserved for legacy rows predating the chain; in v0.2 deployments no such rows exist (see Notes below). Consumers may treat this case as defensive-only.
 
 ### Notes
 
 - Chain walk: client navigates "previous in chain" by querying for the entry whose `current_hash` matches the current entry's `previous_hash`.
 - Forensic export (`exportAccountForensic`) writes its own audit entries here. The chain encompasses all administrative actions, not just moderation actions.
+- **Pre-chain sentinel rows do not exist in v0.2.** The `current_hash = "pre-chain"` sentinel is the wire-format placeholder for chain entries predating the Phase 3.8 hash chain. The legacy `admin_audit_log` table was dropped by `migrations/0004_drop_admin_audit_log.sql` rather than migrated as sentinel rows, so no v0.2 deployment produces or stores them. The sentinel-handling commitment is preserved as a future-compatibility hook only — consumers writing against this endpoint in v0.2 will not encounter `current_hash: "pre-chain"` rows in any response.
 
 ## 8.5 Phase 3.9 — `tools.aurora.admin.subscribeModEvents`
 
