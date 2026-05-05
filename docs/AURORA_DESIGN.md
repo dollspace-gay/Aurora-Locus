@@ -122,7 +122,7 @@ The assessment's five-phase plan (Phase 1 schema → Phase 2 backend selection �
 
 **getInviteCodes** ([src/api/admin.rs:525-543](../src/api/admin.rs#L525-L543), [605-637](../src/api/admin.rs#L605-L637)) — *Clean.* Phase 1.10 (#65) wired the lexicon's `sort` (`recent`/`usage`) + `limit` (1–500, default 100) + `cursor` (typed, base64url) parameters. Legacy `includeDisabled` removed; disabled-only filtering relocates to `tools.aurora.ops.*` per the assessment doc.
 
-**getSubjectStatus** ([src/api/admin.rs:3789-3812](../src/api/admin.rs#L3789-L3812), [3842-…](../src/api/admin.rs#L3842)) — *Mostly clean.* Subject union implemented correctly via polymorphic struct with `$type` discriminator. `takedown` and `deactivated` now use `skip_serializing_if = "Option::is_none"` and are omitted from the wire when not populated. Aurora-only `suspended` field remains as a documented extension on the response struct, also omitted when None — spec-strict consumers see a payload with no extra fields when the account isn't suspended. The `suspended` extension is the only remaining v0.2 deviation from spec; v0.3 candidate to either relocate to `tools.aurora.*` or fold into `takedown` semantics.
+**getSubjectStatus** ([src/api/admin.rs:3789-3812](../src/api/admin.rs#L3789-L3812), [3842-…](../src/api/admin.rs#L3842)) — *Mostly clean (residual: `suspended` Aurora extension, blob-branch 501).* Subject union implemented correctly via polymorphic struct with `$type` discriminator. `takedown` and `deactivated` now use `skip_serializing_if = "Option::is_none"` and are omitted from the wire when not populated. Aurora-only `suspended` field remains as a documented extension on the response struct, also omitted when None — spec-strict consumers see a payload with no extra fields when the account isn't suspended. The `suspended` extension is the v0.3 candidate to either relocate to `tools.aurora.*` or fold into `takedown` semantics. The blob branch (`?blob=<cid>`) returns 501 NOT_IMPLEMENTED at [src/api/admin.rs:3882-3887](../src/api/admin.rs#L3882-L3887) because per-blob status state isn't tracked yet — analogous to `tools.aurora.moderator.queryStatuses`'s `subject_type=Record|Blob` short-circuit. Per [§8.2](#§82-deferred-to-v03), `subject_status` only tracks repo-level state today; per-record/per-blob status is a v0.3 candidate, at which point the 501 branch fills in.
 
 **sendEmail** ([src/api/admin.rs:2247-2266](../src/api/admin.rs#L2247-L2266), [2279-…](../src/api/admin.rs#L2279)) — *Clean.* Phase 1.8 (#63) flipped `subject` from required→optional per the lexicon (placeholder used at SMTP layer when omitted). `senderDid` is documented as an Aurora-permissive extension: spec marks it required, Aurora defaults to the authenticated admin's DID when omitted; spec-compliant callers pass an explicit value. The Aurora extension is opt-in by the *caller*, not produced on the wire by the *server*, so consumers reading server output are unaffected.
 
@@ -139,7 +139,7 @@ The assessment's five-phase plan (Phase 1 schema → Phase 2 backend selection �
 | Verdict bucket | Endpoints | Count |
 |---|---|---|
 | Clean (full shape parity) | `deleteAccount`, `disableAccountInvites`, `enableAccountInvites`, `getAccountInfos`, `getInviteCodes`, `sendEmail`, `updateAccountEmail`, `updateAccountHandle`, `updateAccountPassword`, `updateSubjectStatus` | 10 |
-| Mostly clean (one omitted-when-None Aurora extension) | `getSubjectStatus` (`suspended` field) | 1 |
+| Mostly clean (residual: `suspended` Aurora extension + blob-branch 501) | `getSubjectStatus` | 1 |
 | Outstanding drift | (none) | 0 |
 
 ### §3.3 Recurring drift patterns (resolution status)
@@ -196,25 +196,25 @@ pub enum SubjectType {
 Compositional, subject-agnostic event vocabulary for the API surface. Translation to/from the storage enum `ModerationEventType` (12 subject-aware variants — see [§4.4.5](#§445-storage-event-vocabulary)) happens at write time in `emitEvent` and at read time in `getAuditTrail` / event subscriptions.
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ModEventAction {
+    // Representative variants — the full list will continue to evolve in v0.3.
+    // See src/api/aurora_admin.rs::ModEventAction for the as-shipped enum
+    // (currently includes Takedown/Suspend/Restore/DeleteAccount,
+    // ApplyLabel/RemoveLabel, TakedownRecord, Quarantine/Restore/DeleteBlob,
+    // Resolve/DismissReport, Resolve/EscalateAppeal, SendEmail,
+    // UpdateSubjectStatus). Wire format: `{"kind": "TakedownAccount"}`
+    // for unit variants; `{"kind": "ApplyLabel", "val": "spam", "neg": false}`
+    // for variants with inline data.
     TakedownAccount,
-    SuspendAccount,
-    DeleteAccount,
     ApplyLabel { val: String, neg: bool },
-    RemoveLabel { val: String },
-    TakedownRecord,
-    QuarantineBlob,
-    RestoreBlob,
-    AppealResolve { resolution: AppealResolutionDecision },
-    Comment { text: String },
-    SendEmail { /* ... */ },
-    // (full variant list per src/api/aurora_admin.rs:97-143)
+    ResolveAppeal { #[serde(rename = "appealId")] appeal_id: i64, resolution: AppealResolutionDecision },
+    // ... see code reference above
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum AppealResolutionDecision { Approve, Deny }
 ```
 
@@ -509,7 +509,7 @@ Postgres LISTEN/NOTIFY: the writing instance issues `NOTIFY aurora_cache_invalid
 
 **Listener — dedicated connection.** Each process opens one dedicated long-lived Postgres connection, issues `LISTEN aurora_cache_invalidate`, and processes notifications in a Tokio task that loops on `connection.notifications().recv()`. The connection is *not* drawn from the main `AnyPool` because pool connections cycle and `LISTEN` on a connection returned to the pool stops delivering notifications.
 
-**Connection drop recovery.** During disconnect, no NOTIFYs are received; caches may serve stale data for the duration of the disconnect. Recovery is automatic via the listener reconnect loop (1s, 2s, 4s exponential backoff capped at 30s). Notifications emitted during the disconnected window are lost; the TTL fallback in each invalidatable cache (LocalRecordsCache: 5 seconds) covers this case.
+**Connection drop recovery.** During disconnect, no NOTIFYs are received; caches may serve stale data for the duration of the disconnect. Recovery is automatic via the listener reconnect loop (six-step exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, then capped at 30s). Notifications emitted during the disconnected window are lost; the TTL fallback in each invalidatable cache (LocalRecordsCache: 5 seconds) covers this case.
 
 #### §5.4.3 Cache types requiring invalidation
 
@@ -584,7 +584,7 @@ Workstream A replaced the bundled 36,809-line `Rust-Atproto-SDK` directory with 
 
 Migration complete. The bundled `Rust-Atproto-SDK/` directory was removed; the `atproto = { path = "./Rust-Atproto-SDK" }` dependency was dropped from `Cargo.toml`; `cargo check --all-features` shows no remaining `atproto::` references.
 
-Concurrent with the migration: dependency bumps (`axum 0.7 → 0.8`, `jsonwebtoken 9 → 10`), MSRV bump to 1.85 (proto-blue's required edition is 2024).
+Concurrent with the migration: `jsonwebtoken 9 → 10` dependency bump, MSRV bump to 1.85 (proto-blue's required edition is 2024). `axum` stays at `0.7` — the cycle's earlier draft proposed bumping to `0.8` but the upgrade was deferred when the proto-blue work was sufficient on its own.
 
 Full per-file translation detail is in commit history (`#1` through `#14` in chainlink, plus the proto-blue migration baseline at `c2d6fd2`). The original per-file mapping doc was absorbed into this consolidated reference; the cycle's mechanical work doesn't need the line-by-line record preserved.
 

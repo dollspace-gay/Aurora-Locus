@@ -4194,7 +4194,7 @@ enum SubscribeModEventsMessage {
 
 ### Notes
 
-- Subscription respects the audit chain inclusion gate (per architecture principle 3.4) — if the operator's role doesn't permit audit chain visibility, AuditEntry messages don't ship even with `include_audit_chain: true`.
+- Subscription respects the audit chain inclusion gate (per architecture principle 3.4) — if the operator's role doesn't permit audit chain visibility, AuditEntry messages don't ship even with `include_audit_chain: true`. **In v0.2 deployments the per-message gate is structurally always-true:** the connection-level upgrade at [src/api/aurora_subscribe.rs:191-201](../src/api/aurora_subscribe.rs#L191-L201) already requires Moderator+, and `can_see_audit_chain` (lines 207-213) returns `role.can_act_as(Role::Moderator)`. Every connected caller in v0.2 satisfies the per-message check; the helper exists as a forward-compatibility hook for future role tiers below Moderator that could connect to the stream but shouldn't see chain entries.
 - For the Subject detail subscription banner pattern (section 5.2): the page subscribes with `subject_did` filter set, so it only receives events affecting that subject.
 
 ## 8.6 New endpoint — `tools.aurora.admin.triggerPasswordReset`
@@ -4316,7 +4316,9 @@ Bundle contents:
 
 > **Reconciliation.** Earlier drafts of this section implied `account-state.json` itself was gated on `includeAccountMetadata`. As-built, the file is always present in the bundle; only its sensitive-fields subset is metadata-gated. Operational fields (handle, takedown_ref, deactivated_at) are needed for forensic legibility regardless of metadata inclusion.
 - Streaming response avoids loading the entire bundle into memory server-side; large blob inventories don't need bounded memory.
-- The "audit-trail.json" is always included in bundles — it contains this export's own audit entry, so the bundle is self-describing about its provenance.
+- The "audit-trail.json" is always included in bundles. In v0.2 the file's content is a redirect-string (`chainAnchor`) pointing to the `X-Aurora-Audit-Entry-Id` response header (for the chain entry id) and the chain row's rationale (where the canonical SHA-256 bundle hash is recorded). The bundle is self-describing about its provenance via this indirection rather than by carrying the chain-entry id and bundle hash inline. See the reconciliation note below.
+
+> **Reconciliation.** Earlier drafts of this section implied `audit-trail.json` would carry the chain entry id and bundle hash inline ("this export's own audit entry"). As-built, the file ships a redirect-string instead, because either field would create a chicken-and-egg cycle: the bundle hash must cover all bytes including this file (so the hash isn't known until after tar assembly), and the chain entry id is only known after the chain row is appended (which itself records the bundle hash). The redirect-string pattern resolves the cycle by deferring both fields to the response headers (`X-Aurora-Audit-Entry-Id`, `X-Aurora-Bundle-Hash`) and the chain row's rationale. See the `chainAnchor` sentinel and rationale at [src/api/aurora_admin.rs:2454-2472](../src/api/aurora_admin.rs#L2454-L2472).
 
 ### Implementation status (v0.2)
 

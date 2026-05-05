@@ -15,10 +15,15 @@
 //! the UI consumes `emitEvent` exclusively post-3.5" note.
 //!
 //! Snapshot capture (the `snapshot_capture` flag on `EmitEventInput`)
-//! is accepted but is a no-op until Phase 3.8 lands the snapshot
-//! infrastructure (see §9.3 cross-phase dependencies). The output
-//! type carries `snapshot_id: Option<String>` for forward-compat;
-//! 3.5 always returns `None` there.
+//! is honored. Phase 3.8 shipped the snapshot infrastructure (see
+//! `audit_chain::capture_snapshot` and AURORA_DESIGN.md §4.4.3); the
+//! `emit_event` handler invokes `capture_snapshot` before
+//! `dispatch_action` when the flag is true and the subject is
+//! snapshottable. The captured row's id is referenced from the
+//! audit chain entry written in the same transaction. Output's
+//! `snapshot_id` is populated when capture succeeded and left
+//! `None` when capture was opted out or skipped (e.g.,
+//! non-snapshottable subjects).
 //!
 //! Auth: `AdminModeration` scope at the namespace middleware level
 //! (per Phase 2.2 substrate). Within-tier role checks happen at the

@@ -102,8 +102,12 @@ post-cycle the `tools.aurora.admin.*` namespace is heavily populated.
 `tools.aurora.admin.*` operator-flavored endpoints
 (`triggerPasswordReset`, `exportAccountForensic`, `getRuntimeSetting`,
 `setRuntimeSetting`) require `AdminServer` scope per UI design
-§8.6/§8.7/§8.16; see [AURORA_DESIGN.md §4.3.2](AURORA_DESIGN.md) for
-the per-NSID override mechanism.
+§8.6/§8.7/§8.16. The override is a per-NSID lookup that runs before
+the namespace prefix match, **replacing** (not augmenting) the
+namespace default — `AdminModeration` alone is insufficient. See
+[src/oauth/scope.rs:848-865](../src/oauth/scope.rs#L848-L865) for the
+operator-NSID table and [AURORA_DESIGN.md §4.3.4](AURORA_DESIGN.md)
+for the auth-tier framing the override implements.
 
 | NSID | Type | Description | Auth (within-tier) | Last commit | Shipped |
 |---|---|---|---|---|---|
@@ -190,14 +194,14 @@ endpoints (listAccounts with broader filters, getInstanceMetrics).
    reflects accumulated parity work rather than scope drift.
 
 2. **`com.atproto.admin.listAccounts` is an alias to `getUsers`**
-   ([src/api/admin.rs:45](../src/api/admin.rs#L45)). Both routes wire
+   ([src/api/admin.rs:54](../src/api/admin.rs#L54)). Both routes wire
    to the same handler. The operator-flavored `listAccounts` (broader
    filters) is at `tools.aurora.ops.listAccounts` instead. UI should
    not display both — pick one or treat them as a single endpoint
    with two URLs.
 
 3. **`com.atproto.admin.listRoles` kept at moderation tier
-   intentionally** ([src/api/admin.rs:97-102](../src/api/admin.rs#L97-L102)).
+   intentionally** ([src/api/admin.rs:107-111](../src/api/admin.rs#L107-L111)).
    Phase 3.6 relocated `grantRole` and `revokeRole` to
    `tools.aurora.superadmin.*` but explicitly left `listRoles` at
    `com.atproto.admin.*` so Moderators can see who has what role

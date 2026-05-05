@@ -20,6 +20,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - DPoP proof-of-possession now enforced on resource requests. Tokens issued with a bound DPoP thumbprint require the request to carry a DPoP proof whose JWK matches the bound thumbprint and whose `ath` claim equals base64url(SHA-256(access_token)) per RFC 9449 §4.3. Bearer-only tokens (no thumbprint) accept requests without a DPoP header — backward compat for unbound tokens. (#100)
 
 ### Changed
+- SL-6 — Replace stale ModEventAction variant list in §4.1.2 with code reference (#153)
+- SL-5 — Tighten override-mechanism cite in endpoint inventory (#152)
+- SL-4 — Fix listAccounts line cite drift in endpoint inventory (#151)
+- SL-3 — Add Phase 4 / Phase 3.10 env vars to .env.example (#150)
+- SL-2 — Update aurora_admin.rs module docstring; Phase 3.8 has shipped (#149)
+- P-3 — Document getSubjectStatus blob-branch 501 in §3.1 (#147)
+- P-2 — Note §8.5 audit-chain visibility gate is structurally always-true in v0.2 (#146)
+- CR-4 — Document audit-trail.json redirect-string pattern in §8.7 (#145)
+- SL-1 — Fix stale §4.5 cite in src/cache/invalidation.rs:244 (#148)
+- CR-3 — Update §5.4.2 LISTEN/NOTIFY backoff schedule to as-built six-step (#144)
+- CR-1 — Drop stale axum 0.7→0.8 dependency bump claim from §6.3 (#143)
 - P1 follow-up — Bring §5.3.8 Audit page prose into line with v0.2 no-sentinel-rows reality (#142)
 - S5 — Resolve §3.6 self-violation: remove named external-tooling references in design doc (#141)
 - S3 — Rewrite src/oauth/scope.rs:818 comment to match AdminServer-only behavior (#140)

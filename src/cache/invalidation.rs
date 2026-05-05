@@ -241,7 +241,8 @@ async fn run_listener_loop(
 ) {
     use sqlx::postgres::PgListener;
 
-    // Reconnect backoff schedule (design doc §4.5): 1s, 2s, 4s, capped at 30s.
+    // Reconnect backoff schedule (design doc §5.4.2): six-step exponential
+    // 1s, 2s, 4s, 8s, 16s, 30s, then capped at 30s.
     let backoffs = [
         Duration::from_secs(1),
         Duration::from_secs(2),
