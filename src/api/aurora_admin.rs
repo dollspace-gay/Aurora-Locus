@@ -2759,6 +2759,17 @@ pub struct GetRuntimeSettingOutput {
 
 const MODERATION_MODE_KEY: &str = "moderation-mode";
 const MODERATION_MODE_REDIRECT_KEY: &str = "moderation-mode-redirect-url";
+
+/// Allowlist of runtime-setting keys this v0.2 build accepts. Per
+/// CR-2 / chainlink #119, setRuntimeSetting rejects any other key
+/// with 400 — the inventory's "validates known keys" framing
+/// (docs/AURORA_ENDPOINT_INVENTORY.md) is enforced here. Adding a
+/// new runtime-setting key in a future cycle is one append to this
+/// constant plus the corresponding default in `default_for_key`.
+const KNOWN_RUNTIME_KEYS: &[&str] = &[
+    MODERATION_MODE_KEY,
+    MODERATION_MODE_REDIRECT_KEY,
+];
 const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
 fn default_for_key(key: &str) -> serde_json::Value {
@@ -2860,6 +2871,18 @@ pub async fn set_runtime_setting(
     }
     if input.rationale.trim().is_empty() {
         return Err(validation("rationale is required and must be non-empty"));
+    }
+    // Allowlist check (CR-2 / chainlink #119). The inventory's
+    // "validates known keys" framing requires this guard; without
+    // it, any string would persist to runtime_settings and the
+    // setting table would accumulate junk. The §8.16 design treats
+    // the runtime-settings keyspace as a finite known vocabulary,
+    // not free-form storage.
+    if !KNOWN_RUNTIME_KEYS.contains(&input.key.as_str()) {
+        return Err(validation(format!(
+            "unknown runtime setting key '{}'; known keys: {:?}",
+            input.key, KNOWN_RUNTIME_KEYS,
+        )));
     }
     // Validate moderation-mode value if that's the key being set.
     if input.key == MODERATION_MODE_KEY {
@@ -4587,6 +4610,68 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_known_key_succeeds() {
+        // CR-2 / chainlink #119 happy path: setting a known key from
+        // KNOWN_RUNTIME_KEYS clears the allowlist guard and writes
+        // the row. moderation-mode-redirect-url has no value-shape
+        // restriction beyond being a string.
+        let ctx = create_test_context().await;
+        let resp = set_runtime_setting(
+            State(ctx.clone()),
+            super_admin_auth(),
+            Json(SetRuntimeSettingInput {
+                key: "moderation-mode-redirect-url".to_string(),
+                value: serde_json::Value::String("https://example.org/maintenance".to_string()),
+                rationale: "operator-configured redirect for reduced-mode".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            resp.new_value,
+            serde_json::Value::String("https://example.org/maintenance".to_string())
+        );
+        let stored: String = sqlx::query_scalar(
+            "SELECT value FROM runtime_settings WHERE key = $1",
+        )
+        .bind("moderation-mode-redirect-url")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(stored, "\"https://example.org/maintenance\"");
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_unknown_key_rejected() {
+        // CR-2 / chainlink #119: arbitrary keys must be rejected with
+        // 400 before any database write. Pre-fix, the runtime_settings
+        // table would accumulate junk keys silently.
+        let ctx = create_test_context().await;
+        let err = set_runtime_setting(
+            State(ctx.clone()),
+            super_admin_auth(),
+            Json(SetRuntimeSettingInput {
+                key: "test-feature-flag".to_string(),
+                value: serde_json::Value::String("anything".to_string()),
+                rationale: "exercise the allowlist".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // Confirm no row landed.
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runtime_settings WHERE key = $1",
+        )
+        .bind("test-feature-flag")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(row_count, 0);
     }
 
     #[tokio::test]
