@@ -129,6 +129,30 @@ impl InviteCodeManager {
         note: Option<String>,
         for_account: Option<String>,
     ) -> PdsResult<InviteCode> {
+        let mut tx = self.db.begin().await?;
+        let code = Self::create_invite_in_tx(
+            &mut tx,
+            created_by,
+            uses,
+            expires_in,
+            note,
+            for_account,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(code)
+    }
+
+    /// Create an invite code inside an existing transaction. LB-1 /
+    /// chainlink #129 atomic-with-chain entry point.
+    pub async fn create_invite_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        created_by: &str,
+        uses: i32,
+        expires_in: Option<chrono::Duration>,
+        note: Option<String>,
+        for_account: Option<String>,
+    ) -> PdsResult<InviteCode> {
         let code = Self::generate_code();
         let now = Utc::now();
         let expires_at = expires_in.map(|d| now + d);
@@ -146,7 +170,7 @@ impl InviteCodeManager {
         .bind(expires_at.map(|dt| dt.to_rfc3339()))
         .bind(&note)
         .bind(&for_account)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await?;
 
         Ok(InviteCode {
@@ -242,6 +266,18 @@ impl InviteCodeManager {
 
     /// Disable invite code
     pub async fn disable_code(&self, code: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await?;
+        Self::disable_code_in_tx(&mut tx, code).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Disable invite code inside an existing transaction. LB-1 /
+    /// chainlink #129 atomic-with-chain entry point.
+    pub async fn disable_code_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        code: &str,
+    ) -> PdsResult<()> {
         let result = sqlx::query(
             r#"
             UPDATE invite_code
@@ -250,7 +286,7 @@ impl InviteCodeManager {
             "#,
         )
         .bind(code)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -275,24 +311,31 @@ impl InviteCodeManager {
         if codes.is_empty() && accounts.is_empty() {
             return Ok(());
         }
-
         let mut tx = self.db.begin().await?;
+        Self::disable_codes_batch_in_tx(&mut tx, codes, accounts).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 
+    /// Disable a batch of invite codes inside an existing transaction.
+    /// LB-1 / chainlink #129 atomic-with-chain entry point.
+    pub async fn disable_codes_batch_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        codes: &[String],
+        accounts: &[String],
+    ) -> PdsResult<()> {
         for code in codes {
             sqlx::query("UPDATE invite_code SET disabled = true WHERE code = $1")
                 .bind(code)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
         }
-
         for did in accounts {
             sqlx::query("UPDATE invite_code SET disabled = true WHERE for_account = $1")
                 .bind(did)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
         }
-
-        tx.commit().await?;
         Ok(())
     }
 
@@ -695,5 +738,106 @@ mod tests {
         let code = InviteCodeManager::generate_code();
         assert!(code.starts_with("aurora-"));
         assert!(code.len() > 16);
+    }
+
+    // LB-1 Session 12 / chainlink #129: InviteCodeManager `_in_tx`
+    // variants must be rollback-safe.
+
+    async fn open_invite_pool() -> AnyPool {
+        let db = open_test_pool().await;
+        sqlx::query(
+            r#"
+            CREATE TABLE invite_code (
+                code TEXT PRIMARY KEY,
+                available INTEGER NOT NULL DEFAULT 1,
+                disabled INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                note TEXT,
+                for_account TEXT
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn create_invite_in_tx_rolls_back_on_caller_rollback() {
+        let db = open_invite_pool().await;
+        {
+            let mut tx = db.begin().await.unwrap();
+            InviteCodeManager::create_invite_in_tx(
+                &mut tx,
+                "did:plc:admin",
+                3,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invite_code")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn disable_code_in_tx_rolls_back_on_caller_rollback() {
+        let db = open_invite_pool().await;
+        let manager = InviteCodeManager::new(db.clone());
+        let code = manager
+            .create_invite("did:plc:admin", 1, None, None, None)
+            .await
+            .unwrap();
+
+        {
+            let mut tx = db.begin().await.unwrap();
+            InviteCodeManager::disable_code_in_tx(&mut tx, &code.code)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let post = manager.get_code(&code.code).await.unwrap().unwrap();
+        assert!(!post.disabled, "disable rolled back; flag remains false");
+    }
+
+    #[tokio::test]
+    async fn disable_codes_batch_in_tx_rolls_back_on_caller_rollback() {
+        let db = open_invite_pool().await;
+        let manager = InviteCodeManager::new(db.clone());
+        let c1 = manager
+            .create_invite("did:plc:admin", 1, None, None, None)
+            .await
+            .unwrap();
+        let c2 = manager
+            .create_invite("did:plc:admin", 1, None, None, None)
+            .await
+            .unwrap();
+
+        {
+            let mut tx = db.begin().await.unwrap();
+            InviteCodeManager::disable_codes_batch_in_tx(
+                &mut tx,
+                &[c1.code.clone(), c2.code.clone()],
+                &[],
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        for c in [&c1, &c2] {
+            let post = manager.get_code(&c.code).await.unwrap().unwrap();
+            assert!(!post.disabled);
+        }
     }
 }

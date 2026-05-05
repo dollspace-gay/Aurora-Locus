@@ -99,6 +99,25 @@ impl ModerationManager {
 
     /// Apply moderation action to an account
     pub async fn apply_action(&self, params: ApplyActionParams<'_>) -> PdsResult<ModerationRecord> {
+        let mut tx = self.db.begin().await?;
+        let record = Self::apply_action_in_tx(&mut tx, params).await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    /// Apply moderation action inside an existing transaction. LB-1 /
+    /// chainlink #129 atomic-with-chain entry point.
+    ///
+    /// For Takedown actions, the actor's `takedown_ref` UPDATE happens
+    /// inside the same transaction via [`AccountManager::takedown_account_in_tx`].
+    /// Pre-LB-1, the account-level takedown was best-effort with a
+    /// "moderation record is already created" log line on failure;
+    /// post-LB-1 the two writes are atomic — if the actor UPDATE fails
+    /// the moderation_event row also rolls back.
+    pub async fn apply_action_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        params: ApplyActionParams<'_>,
+    ) -> PdsResult<ModerationRecord> {
         let ApplyActionParams {
             did,
             action,
@@ -112,8 +131,6 @@ impl ModerationManager {
         let now = Utc::now();
         let expires_at = expires_in.map(|d| now + d);
 
-        // RETURNING id is portable (SQLite 3.35+, Postgres). AnyPool's
-        // last_insert_id() is unreliable on SQLite.
         let id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO account_moderation
@@ -130,21 +147,16 @@ impl ModerationManager {
         .bind(expires_at.map(|dt| dt.to_rfc3339()))
         .bind(report_id)
         .bind(&notes)
-        .fetch_one(&self.db)
+        .fetch_one(&mut **tx)
         .await?;
 
-        // Apply account-level action if it's a takedown
+        // Apply account-level action if it's a takedown. Now in-tx: a
+        // failure here aborts the transaction including the
+        // account_moderation INSERT above, so the two stay consistent.
         if action == ModerationAction::Takedown {
-            // Use moderation ID as takedown_ref for audit trail
             let takedown_ref = format!("mod_{}", id);
-            if let Err(e) = self
-                .account_manager
-                .takedown_account(did, &takedown_ref)
-                .await
-            {
-                tracing::error!("Failed to apply account takedown for {}: {}", did, e);
-                // Don't fail the whole operation - moderation record is already created
-            }
+            crate::account::AccountManager::takedown_account_in_tx(tx, did, &takedown_ref)
+                .await?;
         }
 
         Ok(ModerationRecord {
@@ -171,6 +183,25 @@ impl ModerationManager {
         reversed_by: &str,
         reason: &str,
     ) -> PdsResult<()> {
+        let mut tx = self.db.begin().await?;
+        Self::reverse_action_in_tx(&mut tx, moderation_id, reversed_by, reason).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reverse a moderation action inside an existing transaction.
+    /// LB-1 / chainlink #129 atomic-with-chain entry point.
+    ///
+    /// When reversing a takedown, the actor's `takedown_ref` clear
+    /// happens inside the same transaction via
+    /// [`AccountManager::activate_account_in_tx`]. Pre-LB-1 it was
+    /// best-effort.
+    pub async fn reverse_action_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        moderation_id: i64,
+        reversed_by: &str,
+        reason: &str,
+    ) -> PdsResult<()> {
         let now = Utc::now();
 
         let result = sqlx::query(
@@ -187,7 +218,7 @@ impl ModerationManager {
         .bind(reversed_by)
         .bind(reason)
         .bind(moderation_id)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -197,10 +228,11 @@ impl ModerationManager {
             )));
         }
 
-        // Get the action type that was reversed
+        // Read the action type that was reversed (in-tx for snapshot
+        // consistency).
         let row = sqlx::query("SELECT action, did FROM account_moderation WHERE id = $1")
             .bind(moderation_id)
-            .fetch_optional(&self.db)
+            .fetch_optional(&mut **tx)
             .await?
             .ok_or_else(|| {
                 PdsError::NotFound(format!("Moderation record {} not found", moderation_id))
@@ -209,12 +241,11 @@ impl ModerationManager {
         let action_str: String = row.get("action");
         let did: String = row.get("did");
 
-        // If reversing a takedown, activate the account
+        // If reversing a takedown, activate the account inside the
+        // same tx. Atomic: actor UPDATE failure aborts the moderation
+        // reversal too.
         if action_str == "takedown" {
-            if let Err(e) = self.account_manager.activate_account(&did).await {
-                tracing::error!("Failed to activate account {}: {}", did, e);
-                // Don't fail - moderation reversal is already recorded
-            }
+            crate::account::AccountManager::activate_account_in_tx(tx, &did).await?;
         }
 
         Ok(())
@@ -474,6 +505,25 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+        // LB-1 Session 12: apply_action's takedown branch now writes
+        // to actor.takedown_ref + DELETEs from session/refresh_token,
+        // all in the same transaction as the moderation row. Tests
+        // need those tables.
+        sqlx::query(
+            "CREATE TABLE actor (did TEXT PRIMARY KEY, handle TEXT, takedown_ref TEXT, \
+             deactivated_at TEXT, delete_after TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE session (id INTEGER PRIMARY KEY, did TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE refresh_token (id INTEGER PRIMARY KEY, did TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
 
         // Create minimal account manager for tests
         let config = create_test_config();
@@ -481,6 +531,13 @@ mod tests {
             db.clone(),
             Arc::new(config),
         ));
+
+        // LB-1 Session 12 / chainlink #129: takedown side-effect now
+        // runs in-tx; the actor row must exist before apply_action.
+        sqlx::query("INSERT INTO actor (did, handle) VALUES ('did:plc:spam123', 'spam.test')")
+            .execute(&db)
+            .await
+            .unwrap();
 
         let manager = ModerationManager::new(db, account_manager);
 
@@ -545,6 +602,25 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+        // LB-1 Session 12: apply_action's takedown branch now writes
+        // to actor.takedown_ref + DELETEs from session/refresh_token,
+        // all in the same transaction as the moderation row. Tests
+        // need those tables.
+        sqlx::query(
+            "CREATE TABLE actor (did TEXT PRIMARY KEY, handle TEXT, takedown_ref TEXT, \
+             deactivated_at TEXT, delete_after TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE session (id INTEGER PRIMARY KEY, did TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE refresh_token (id INTEGER PRIMARY KEY, did TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
 
         // Create minimal account manager for tests
         let config = create_test_config();
@@ -607,6 +683,25 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+        // LB-1 Session 12: apply_action's takedown branch now writes
+        // to actor.takedown_ref + DELETEs from session/refresh_token,
+        // all in the same transaction as the moderation row. Tests
+        // need those tables.
+        sqlx::query(
+            "CREATE TABLE actor (did TEXT PRIMARY KEY, handle TEXT, takedown_ref TEXT, \
+             deactivated_at TEXT, delete_after TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE session (id INTEGER PRIMARY KEY, did TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE refresh_token (id INTEGER PRIMARY KEY, did TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
 
         // Create minimal account manager for tests
         let config = create_test_config();
@@ -614,6 +709,12 @@ mod tests {
             db.clone(),
             Arc::new(config),
         ));
+
+        // Seed actor row for the in-tx takedown side effect.
+        sqlx::query("INSERT INTO actor (did, handle) VALUES ('did:plc:false', 'false.test')")
+            .execute(&db)
+            .await
+            .unwrap();
 
         let manager = ModerationManager::new(db, account_manager);
 
@@ -638,5 +739,175 @@ mod tests {
 
         // Should no longer be taken down
         assert!(!manager.is_taken_down("did:plc:false").await.unwrap());
+    }
+
+    // LB-1 Session 12 / chainlink #129: ModerationManager `_in_tx`
+    // variants must be rollback-safe and must thread the transaction
+    // through to AccountManager so the actor-table mutation rolls
+    // back together with the moderation_event INSERT.
+
+    async fn build_moderation_test_pool() -> (AnyPool, Arc<AccountManager>) {
+        {
+            use std::sync::Once;
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(sqlx::any::install_default_drivers);
+        }
+        let db = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE actor (
+                did TEXT PRIMARY KEY,
+                handle TEXT,
+                takedown_ref TEXT,
+                deactivated_at TEXT,
+                delete_after TEXT
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE account_moderation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                did TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                moderated_by TEXT NOT NULL,
+                moderated_at TEXT NOT NULL,
+                expires_at TEXT,
+                reversed INTEGER NOT NULL DEFAULT 0,
+                reversed_at TEXT,
+                reversed_by TEXT,
+                reversal_reason TEXT,
+                report_id INTEGER,
+                notes TEXT
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE session (id INTEGER PRIMARY KEY, did TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE refresh_token (id INTEGER PRIMARY KEY, did TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO actor (did, handle) VALUES ('did:plc:victim', 'v.test')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let config = create_test_config();
+        let account_manager = Arc::new(AccountManager::new(db.clone(), Arc::new(config)));
+        (db, account_manager)
+    }
+
+    #[tokio::test]
+    async fn apply_action_in_tx_rolls_back_with_actor_mutation() {
+        let (db, _) = build_moderation_test_pool().await;
+        // takedown via the in-tx variant; rollback; assert neither
+        // the moderation_event row nor the actor.takedown_ref landed.
+        {
+            let mut tx = db.begin().await.unwrap();
+            ModerationManager::apply_action_in_tx(
+                &mut tx,
+                ApplyActionParams {
+                    did: "did:plc:victim",
+                    action: ModerationAction::Takedown,
+                    reason: "test",
+                    moderated_by: "did:plc:admin",
+                    expires_in: None,
+                    report_id: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let mod_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM account_moderation")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(mod_count, 0, "moderation_event rolled back");
+        let takedown: Option<String> = sqlx::query_scalar(
+            "SELECT takedown_ref FROM actor WHERE did = 'did:plc:victim'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(
+            takedown.is_none(),
+            "actor.takedown_ref rolled back together with moderation row"
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_action_in_tx_rolls_back_with_actor_activate() {
+        let (db, _) = build_moderation_test_pool().await;
+        // Pre-seed: takedown the account via the existing in_tx path,
+        // commit, then exercise reverse_action_in_tx with rollback.
+        let mut setup_tx = db.begin().await.unwrap();
+        let record = ModerationManager::apply_action_in_tx(
+            &mut setup_tx,
+            ApplyActionParams {
+                did: "did:plc:victim",
+                action: ModerationAction::Takedown,
+                reason: "initial",
+                moderated_by: "did:plc:admin",
+                expires_in: None,
+                report_id: None,
+                notes: None,
+            },
+        )
+        .await
+        .unwrap();
+        setup_tx.commit().await.unwrap();
+        // Confirm takedown_ref is set.
+        let takedown_pre: Option<String> = sqlx::query_scalar(
+            "SELECT takedown_ref FROM actor WHERE did = 'did:plc:victim'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(takedown_pre.is_some());
+
+        // Now reverse_action_in_tx + rollback. takedown_ref should
+        // remain set (the activate UPDATE rolled back too).
+        {
+            let mut tx = db.begin().await.unwrap();
+            ModerationManager::reverse_action_in_tx(
+                &mut tx,
+                record.id,
+                "did:plc:superadmin",
+                "false positive",
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let takedown_post: Option<String> = sqlx::query_scalar(
+            "SELECT takedown_ref FROM actor WHERE did = 'did:plc:victim'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(
+            takedown_post.is_some(),
+            "actor.takedown_ref must NOT clear when reverse rolled back"
+        );
     }
 }

@@ -621,15 +621,78 @@ impl AccountManager {
             }
         }
 
-        // Update handle in actor table (not account table)
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        Self::update_handle_unchecked_in_tx(&mut tx, did, new_handle).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok(old_handle)
+    }
+
+    /// Update handle inside an existing transaction. LB-1 / chainlink #129
+    /// atomic-with-chain entry point. Returns the old handle.
+    ///
+    /// Caller is responsible for handle-format validation upstream of
+    /// this call — the in-tx variant skips the
+    /// `crate::identity::validate_handle` check (which needs access to
+    /// `&self.config` for the allowed service-handle-domain list) and
+    /// trusts the caller. The conflict check + UPDATE both run inside
+    /// the transaction so the read of `actor` and the subsequent
+    /// UPDATE see the same snapshot.
+    pub async fn update_handle_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        new_handle: &str,
+    ) -> PdsResult<String> {
+        // Read old handle inside tx so the snapshot is consistent
+        // with the subsequent UPDATE.
+        let old_row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT handle FROM actor WHERE did = $1")
+                .bind(did)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(PdsError::Database)?;
+        let old_handle = old_row
+            .ok_or_else(|| PdsError::NotFound(format!("Account not found: {}", did)))?
+            .0
+            .unwrap_or_default();
+
+        if old_handle == new_handle {
+            return Ok(old_handle);
+        }
+
+        // Check if new handle is already taken by another account.
+        let conflict: Option<(String,)> =
+            sqlx::query_as("SELECT did FROM actor WHERE handle = $1 AND did != $2")
+                .bind(new_handle)
+                .bind(did)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(PdsError::Database)?;
+        if conflict.is_some() {
+            return Err(PdsError::Conflict(format!(
+                "Handle {} already taken",
+                new_handle
+            )));
+        }
+
+        Self::update_handle_unchecked_in_tx(tx, did, new_handle).await?;
+        Ok(old_handle)
+    }
+
+    /// Apply the actual UPDATE without re-running validation. Used by
+    /// `update_handle` (which validates upfront) and
+    /// `update_handle_in_tx` (which validates inside the tx).
+    async fn update_handle_unchecked_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        new_handle: &str,
+    ) -> PdsResult<()> {
         sqlx::query("UPDATE actor SET handle = $1 WHERE did = $2")
             .bind(new_handle)
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
-
-        Ok(old_handle)
+        Ok(())
     }
 
     /// Check if email exists
@@ -977,18 +1040,32 @@ impl AccountManager {
         &self,
         identifier: &str,
     ) -> PdsResult<(String, String)> {
-        // Find account by email or handle
+        // Find account by email or handle (read outside tx for simplicity).
         let account = self.get_account_by_identifier(identifier).await?;
-
         if account.email.is_none() {
             return Err(PdsError::Validation(
                 "Account does not have an email address".to_string(),
             ));
         }
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        let token =
+            Self::generate_password_reset_token_in_tx(&mut tx, &account.did).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok((token, account.email.unwrap()))
+    }
 
+    /// Generate and store a password-reset token for `did` inside an
+    /// existing transaction. LB-1 / chainlink #129 atomic-with-chain
+    /// entry point. Caller is responsible for verifying the account
+    /// exists and has an email upstream of this call. Returns the
+    /// generated token.
+    pub async fn generate_password_reset_token_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+    ) -> PdsResult<String> {
         let token = Uuid::new_v4().to_string();
         let now = Utc::now();
-        let expires_at = now + Duration::hours(1); // Password reset tokens expire in 1 hour
+        let expires_at = now + Duration::hours(1);
 
         sqlx::query(
             r#"
@@ -997,16 +1074,16 @@ impl AccountManager {
             "#,
         )
         .bind(&token)
-        .bind(&account.did)
+        .bind(did)
         .bind("reset_password")
         .bind(now.to_rfc3339())
         .bind(expires_at.to_rfc3339())
         .bind(false)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await
         .map_err(PdsError::Database)?;
 
-        Ok((token, account.email.unwrap()))
+        Ok(token)
     }
 
     /// Reset password using reset token
@@ -1324,15 +1401,40 @@ impl AccountManager {
     /// bypasses the normal password reset flow. All sessions are invalidated
     /// as a security measure.
     pub async fn update_password(&self, did: &str, new_password: &str) -> PdsResult<()> {
-        // Hash new password
         let password_hash = crate::auth::PasswordHasher::hash(new_password)
             .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        Self::update_password_hash_in_tx(&mut tx, did, &password_hash).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok(())
+    }
 
-        // Update password in database
+    /// Update password inside an existing transaction. LB-1 / chainlink #129
+    /// atomic-with-chain entry point. Performs the hash before opening
+    /// the tx so the (slow) Argon2 work doesn't extend the transaction's
+    /// lifetime.
+    pub async fn update_password_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        new_password: &str,
+    ) -> PdsResult<()> {
+        let password_hash = crate::auth::PasswordHasher::hash(new_password)
+            .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
+        Self::update_password_hash_in_tx(tx, did, &password_hash).await
+    }
+
+    /// Apply the password UPDATE + session/refresh_token DELETE inside
+    /// the caller's transaction. Used by both pool-API and `_in_tx`
+    /// variants.
+    async fn update_password_hash_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        password_hash: &str,
+    ) -> PdsResult<()> {
         let result = sqlx::query("UPDATE account SET password_hash = $1 WHERE did = $2")
-            .bind(&password_hash)
+            .bind(password_hash)
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
 
@@ -1343,14 +1445,14 @@ impl AccountManager {
         // Invalidate all sessions for this account (security best practice)
         sqlx::query("DELETE FROM session WHERE did = $1")
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
 
         // Also delete all refresh tokens
         sqlx::query("DELETE FROM refresh_token WHERE did = $1")
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
 
@@ -1367,54 +1469,35 @@ impl AccountManager {
     /// Permanently removes the account from the database.
     /// This should only be called after token validation.
     pub async fn delete_account_permanent(&self, did: &str) -> PdsResult<()> {
-        // Begin transaction
         let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
-
-        // Delete from all related tables
-        sqlx::query("DELETE FROM session WHERE did = $1")
-            .bind(did)
-            .execute(&mut *tx)
-            .await
-            .map_err(PdsError::Database)?;
-
-        sqlx::query("DELETE FROM refresh_token WHERE did = $1")
-            .bind(did)
-            .execute(&mut *tx)
-            .await
-            .map_err(PdsError::Database)?;
-
-        sqlx::query("DELETE FROM app_password WHERE did = $1")
-            .bind(did)
-            .execute(&mut *tx)
-            .await
-            .map_err(PdsError::Database)?;
-
-        sqlx::query("DELETE FROM email_token WHERE did = $1")
-            .bind(did)
-            .execute(&mut *tx)
-            .await
-            .map_err(PdsError::Database)?;
-
-        sqlx::query("DELETE FROM plc_keys WHERE did = $1")
-            .bind(did)
-            .execute(&mut *tx)
-            .await
-            .map_err(PdsError::Database)?;
-
-        sqlx::query("DELETE FROM account WHERE did = $1")
-            .bind(did)
-            .execute(&mut *tx)
-            .await
-            .map_err(PdsError::Database)?;
-
-        sqlx::query("DELETE FROM actor WHERE did = $1")
-            .bind(did)
-            .execute(&mut *tx)
-            .await
-            .map_err(PdsError::Database)?;
-
-        // Commit transaction
+        Self::delete_account_permanent_in_tx(&mut tx, did).await?;
         tx.commit().await.map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Permanently delete an account inside an existing transaction.
+    /// LB-1 / chainlink #129 atomic-with-chain entry point.
+    pub async fn delete_account_permanent_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+    ) -> PdsResult<()> {
+        // Delete from all related tables
+        for table in [
+            "session",
+            "refresh_token",
+            "app_password",
+            "email_token",
+            "plc_keys",
+            "account",
+            "actor",
+        ] {
+            let sql = format!("DELETE FROM {} WHERE did = $1", table);
+            sqlx::query(&sql)
+                .bind(did)
+                .execute(&mut **tx)
+                .await
+                .map_err(PdsError::Database)?;
+        }
 
         tracing::info!("Account permanently deleted: DID={}", did);
 
@@ -1461,32 +1544,36 @@ impl AccountManager {
     /// # Arguments
     /// * `did` - The DID of the account to deactivate
     pub async fn deactivate_account(&self, did: &str) -> PdsResult<()> {
-        let now = Utc::now();
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        Self::deactivate_account_in_tx(&mut tx, did).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok(())
+    }
 
-        // Set deactivated_at to NOW (not future deletion date)
-        // Keep delete_after as NULL (this distinguishes temporary deactivation from deletion)
+    /// Deactivate an account inside an existing transaction. LB-1 /
+    /// chainlink #129 atomic-with-chain entry point.
+    pub async fn deactivate_account_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+    ) -> PdsResult<()> {
+        let now = Utc::now();
         sqlx::query("UPDATE actor SET deactivated_at = $1, delete_after = NULL WHERE did = $2")
             .bind(now.to_rfc3339())
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
-
-        // Revoke all sessions (force logout)
         sqlx::query("DELETE FROM session WHERE did = $1")
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
-
         sqlx::query("DELETE FROM refresh_token WHERE did = $1")
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
-
         tracing::info!("Account temporarily deactivated for DID: {}", did);
-
         Ok(())
     }
 
@@ -1498,15 +1585,24 @@ impl AccountManager {
     /// # Arguments
     /// * `did` - The DID of the account to reactivate
     pub async fn reactivate_account(&self, did: &str) -> PdsResult<()> {
-        // Clear deactivated_at to restore account
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        Self::reactivate_account_in_tx(&mut tx, did).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Reactivate an account inside an existing transaction. LB-1 /
+    /// chainlink #129 atomic-with-chain entry point.
+    pub async fn reactivate_account_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+    ) -> PdsResult<()> {
         sqlx::query("UPDATE actor SET deactivated_at = NULL WHERE did = $1")
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
-
         tracing::info!("Account reactivated for DID: {}", did);
-
         Ok(())
     }
 
@@ -1587,18 +1683,27 @@ impl AccountManager {
     /// * `Ok(())` if the activation was successful
     /// * `Err(PdsError)` if the account doesn't exist or database operation fails
     pub async fn activate_account(&self, did: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        Self::activate_account_in_tx(&mut tx, did).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Activate an account inside an existing transaction (clear
+    /// takedown_ref). LB-1 / chainlink #129 atomic-with-chain entry point.
+    pub async fn activate_account_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+    ) -> PdsResult<()> {
         let result = sqlx::query("UPDATE actor SET takedown_ref = NULL WHERE did = $1")
             .bind(did)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
-
         if result.rows_affected() == 0 {
             return Err(PdsError::NotFound(format!("Actor {} not found", did)));
         }
-
-        tracing::info!("Account activated (takedown cleared): DID={}", did);
-
+        tracing::info!("Account activated for DID: {}", did);
         Ok(())
     }
 
@@ -3306,5 +3411,173 @@ mod tests {
         }
         // Drop the tx without commit.
         drop(tx);
+    }
+
+    // LB-1 Session 12 / chainlink #129: rollback tests for the new
+    // AccountManager `_in_tx` variants. Each test opens a transaction,
+    // calls the variant, deliberately rolls back, and asserts the
+    // mutation didn't land.
+
+    #[tokio::test]
+    async fn update_handle_in_tx_rolls_back_on_caller_rollback() {
+        let manager = setup_test_db().await;
+        let _account = manager
+            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .await
+            .unwrap();
+        let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
+
+        {
+            let mut tx = manager.db.begin().await.unwrap();
+            AccountManager::update_handle_in_tx(&mut tx, &did, "alice-renamed")
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let account = manager.get_account(&did).await.unwrap();
+        assert_eq!(account.handle.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn update_password_in_tx_rolls_back_on_caller_rollback() {
+        let manager = setup_test_db().await;
+        let _account = manager
+            .create_account("alice".to_string(), None, "original-password".to_string(), None)
+            .await
+            .unwrap();
+        let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
+
+        let original_hash: String = sqlx::query_scalar(
+            "SELECT password_hash FROM account WHERE did = $1",
+        )
+        .bind(&did)
+        .fetch_one(&manager.db)
+        .await
+        .unwrap();
+
+        {
+            let mut tx = manager.db.begin().await.unwrap();
+            AccountManager::update_password_in_tx(&mut tx, &did, "new-password-x")
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let post_hash: String = sqlx::query_scalar(
+            "SELECT password_hash FROM account WHERE did = $1",
+        )
+        .bind(&did)
+        .fetch_one(&manager.db)
+        .await
+        .unwrap();
+        assert_eq!(post_hash, original_hash, "password hash unchanged after rollback");
+    }
+
+    #[tokio::test]
+    async fn delete_account_permanent_in_tx_rolls_back_on_caller_rollback() {
+        let manager = setup_test_db().await;
+        let _account = manager
+            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .await
+            .unwrap();
+        let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
+
+        {
+            let mut tx = manager.db.begin().await.unwrap();
+            AccountManager::delete_account_permanent_in_tx(&mut tx, &did)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        // Account still exists post-rollback.
+        let account = manager.get_account(&did).await.unwrap();
+        assert_eq!(account.handle.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn activate_deactivate_reactivate_in_tx_roll_back_on_caller_rollback() {
+        let manager = setup_test_db().await;
+        let _account = manager
+            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .await
+            .unwrap();
+        let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
+
+        // Pre-seed takedown_ref so activate has something to clear.
+        sqlx::query("UPDATE actor SET takedown_ref = 'pre' WHERE did = $1")
+            .bind(&did)
+            .execute(&manager.db)
+            .await
+            .unwrap();
+
+        // activate_in_tx rollback
+        {
+            let mut tx = manager.db.begin().await.unwrap();
+            AccountManager::activate_account_in_tx(&mut tx, &did)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+        let takedown: Option<String> =
+            sqlx::query_scalar("SELECT takedown_ref FROM actor WHERE did = $1")
+                .bind(&did)
+                .fetch_one(&manager.db)
+                .await
+                .unwrap();
+        assert_eq!(takedown.as_deref(), Some("pre"));
+
+        // deactivate_in_tx rollback
+        {
+            let mut tx = manager.db.begin().await.unwrap();
+            AccountManager::deactivate_account_in_tx(&mut tx, &did)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+        let deactivated_at: Option<String> =
+            sqlx::query_scalar("SELECT deactivated_at FROM actor WHERE did = $1")
+                .bind(&did)
+                .fetch_one(&manager.db)
+                .await
+                .unwrap();
+        assert!(
+            deactivated_at.is_none(),
+            "deactivate rolled back; deactivated_at remains NULL"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_password_reset_token_in_tx_rolls_back_on_caller_rollback() {
+        let manager = setup_test_db().await;
+        let _account = manager
+            .create_account(
+                "alice".to_string(),
+                Some("alice@example".to_string()),
+                "password123".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
+
+        {
+            let mut tx = manager.db.begin().await.unwrap();
+            let _token =
+                AccountManager::generate_password_reset_token_in_tx(&mut tx, &did)
+                    .await
+                    .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let token_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM email_token WHERE did = $1 AND purpose = 'reset_password'",
+        )
+        .bind(&did)
+        .fetch_one(&manager.db)
+        .await
+        .unwrap();
+        assert_eq!(token_count, 0, "rolled-back tx must not leave a token row");
     }
 }

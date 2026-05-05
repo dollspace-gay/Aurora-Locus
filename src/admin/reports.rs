@@ -178,6 +178,21 @@ impl ReportManager {
         reviewed_by: &str,
         resolution: Option<&str>,
     ) -> PdsResult<()> {
+        let mut tx = self.db.begin().await?;
+        Self::update_status_in_tx(&mut tx, report_id, status, reviewed_by, resolution).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Update report status inside an existing transaction. LB-1 /
+    /// chainlink #129 atomic-with-chain entry point.
+    pub async fn update_status_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        report_id: i64,
+        status: ReportStatus,
+        reviewed_by: &str,
+        resolution: Option<&str>,
+    ) -> PdsResult<()> {
         let now = Utc::now();
 
         let result = sqlx::query(
@@ -195,7 +210,7 @@ impl ReportManager {
         .bind(now.to_rfc3339())
         .bind(resolution)
         .bind(report_id)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -303,5 +318,80 @@ impl ReportManager {
             reviewed_at,
             resolution: row.get("resolution"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Once;
+
+    async fn open_test_pool() -> AnyPool {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE report (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                reason_type TEXT NOT NULL,
+                reason TEXT,
+                reported_by TEXT NOT NULL,
+                reported_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reviewed_by TEXT,
+                reviewed_at TEXT,
+                resolution TEXT
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    // LB-1 Session 12 / chainlink #129: ReportManager::update_status_in_tx
+    // must roll back when the caller rolls back.
+    #[tokio::test]
+    async fn update_status_in_tx_rolls_back_on_caller_rollback() {
+        let db = open_test_pool().await;
+        let manager = ReportManager::new(db.clone());
+        let report = manager
+            .submit_report(
+                Some("did:plc:victim"),
+                None,
+                None,
+                ReportReason::Spam,
+                Some("test"),
+                "did:plc:reporter",
+            )
+            .await
+            .unwrap();
+
+        {
+            let mut tx = db.begin().await.unwrap();
+            ReportManager::update_status_in_tx(
+                &mut tx,
+                report.id,
+                ReportStatus::Resolved,
+                "did:plc:moderator",
+                Some("would be rolled back"),
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        let post = manager.get_report(report.id).await.unwrap().unwrap();
+        assert_eq!(post.status, ReportStatus::Open);
+        assert!(post.resolution.is_none());
     }
 }
