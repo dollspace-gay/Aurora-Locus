@@ -1103,8 +1103,32 @@ async fn update_account_email(
         return Err((StatusCode::BAD_REQUEST, "Invalid email format".to_string()));
     }
 
-    ctx.account_manager
-        .update_email(&canonical_did, &req.email)
+    let subject = Subject::Repo {
+        did: canonical_did.clone(),
+    };
+    // Snapshot the pre-mutation state outside the tx — the
+    // snapshot is immutable evidence of state-at-decision; a
+    // vestigial snapshot row that doesn't end up referenced by a
+    // chain row is harmless.
+    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rationale = format!("change email to {}", req.email);
+
+    // LB-1 / chainlink #128: the email UPDATE and chain entry land
+    // in one transaction. Multi-store side effects (token store
+    // invalidation, queueing a confirmation email) remain
+    // post-commit best-effort per §3.4 reading — the LB-1
+    // commitment scopes to chain-entry atomicity with the primary
+    // `account` table mutation. See update_email_in_tx's doc
+    // comment for the boundary.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::account::AccountManager::update_email_in_tx(&mut tx, &canonical_did, &req.email)
         .await
         .map_err(|e| {
             if matches!(e, PdsError::NotFound(_)) {
@@ -1118,16 +1142,8 @@ async fn update_account_email(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-
-    let subject = Subject::Repo {
-        did: canonical_did.clone(),
-    };
-    let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rationale = format!("change email to {}", req.email);
-    audit_chain::append_entry(
-        &ctx.account_db,
+    audit_chain::append_entry_in_tx(
+        &mut tx,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.update_email",
@@ -1141,6 +1157,9 @@ async fn update_account_email(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
 }
@@ -7422,6 +7441,68 @@ mod tests {
             count_chain_rows(&ctx, "account.update_email", Some("did:plc:emailchain"))
                 .await,
             1
+        );
+    }
+
+    // LB-1 / chainlink #128: pin the atomicity invariant for
+    // update_account_email. The handler runs the email UPDATE and
+    // the chain append in one transaction; if anything inside the
+    // tx rolls back, both writes must roll back together. This
+    // test exercises that contract directly via the in_tx
+    // primitives the handler uses.
+    #[tokio::test]
+    async fn update_account_email_in_tx_rolls_back_atomically() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:atomictest", "at.test", Some("old@x.com"))
+            .await;
+
+        // Build an append-chain guard + tx + run the same _in_tx
+        // calls the handler does, then deliberately rollback.
+        // Neither row should land.
+        {
+            let _guard = audit_chain::AppendChainGuard::acquire().await;
+            let mut tx = ctx.account_db.begin().await.unwrap();
+            crate::account::AccountManager::update_email_in_tx(
+                &mut tx,
+                "did:plc:atomictest",
+                "new@example.com",
+            )
+            .await
+            .unwrap();
+            audit_chain::append_entry_in_tx(
+                &mut tx,
+                AppendEntryParams {
+                    actor_did: "did:plc:admin",
+                    action: "account.update_email",
+                    subject: Some(&Subject::Repo {
+                        did: "did:plc:atomictest".to_string(),
+                    }),
+                    rationale: "would be rolled back",
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        // Email unchanged.
+        let email = account_email(&ctx, "did:plc:atomictest").await;
+        assert_eq!(
+            email.as_deref(),
+            Some("old@x.com"),
+            "rolled-back tx must not land email update"
+        );
+        // No chain entry for this DID.
+        let chain_count =
+            count_chain_rows(&ctx, "account.update_email", Some("did:plc:atomictest"))
+                .await;
+        assert_eq!(
+            chain_count, 0,
+            "rolled-back tx must not land chain entry"
         );
     }
 
