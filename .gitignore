@@ -29,3 +29,6 @@ data.backup/
 # Python
 __pycache__/
 *.pyc
+
+# Working design docs (per-cycle, local-only artifacts)
+docs/*_DESIGN.md
