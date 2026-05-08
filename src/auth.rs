@@ -200,82 +200,301 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
         parts: &mut Parts,
         state: &AppContext,
     ) -> Result<Self, Self::Rejection> {
-        // Extract bearer token
         let token = extract_bearer_token(&parts.headers)
             .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
+        admin_auth_from_token(state, &token).await
+    }
+}
 
-        // Try to validate as session token first
-        let (did, session) = match state.account_manager.validate_access_token(&token).await {
-            Ok(session) => {
-                let did = session.did.clone();
-                (did, session)
+/// Pre-Step-2 layering had two paths (local session, then HS256
+/// admin JWT). Step 2 (§5.4.2) adds a third: ES256K service-auth
+/// JWTs, gated by a four-case pre-check (§5.3.1) so non-ES256K
+/// tokens never trigger the resolver. The full layering is:
+///
+/// 1. Local session (`account_manager.validate_access_token`).
+/// 2. HS256 admin JWT (`verify_jwt_token`, scope=admin).
+/// 3. ES256K pre-check (`pre_check_es256k`) — four explicit
+///    fall-through cases, NO `?` propagation.
+/// 4. `verify_service_jwt` against `state.identity_resolver`.
+/// 5. Role lookup against `admin_role_manager`.
+///
+/// Layers 1 and 2 short-circuit on success. Layer 1's failure falls
+/// to layer 2; layer 2's failure falls to layer 3. A successful
+/// HS256 JWT with non-admin scope is treated as a definitive layer-2
+/// rejection (401) — falling through to layer 3 would only re-reject
+/// it as `alg=HS256 not ES256K`, with no observable benefit and a
+/// less specific log line.
+///
+/// Extracted to a free function so tests can invoke it directly with
+/// a token + AppContext rather than building HTTP `Parts`.
+pub(crate) async fn admin_auth_from_token(
+    state: &AppContext,
+    token: &str,
+) -> Result<AdminAuthContext, PdsError> {
+    // Layer 1: local session
+    match state.account_manager.validate_access_token(token).await {
+        Ok(session) => {
+            let did = session.did.clone();
+            return finalize_admin_role(state, did, session).await;
+        }
+        Err(_) => {
+            tracing::debug!(token_prefix = %mask_token(token), "local session token rejected");
+        }
+    }
+
+    // Layer 2: HS256 admin JWT
+    match verify_jwt_token(token, &state.config.authentication.jwt_secret) {
+        Ok(token_data) => {
+            let claims = &token_data.claims;
+            let did = claims
+                .get("sub")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    tracing::debug!(reason = "missing-sub", "HS256 admin token rejected");
+                    PdsError::Authentication("HS256 admin token missing 'sub' claim".to_string())
+                })?
+                .to_string();
+            let scope = claims.get("scope").and_then(|v| v.as_str());
+            if scope != Some("admin") {
+                tracing::debug!(reason = "scope-not-admin", "HS256 admin token rejected");
+                return Err(PdsError::Authentication(
+                    "HS256 token does not have admin scope".to_string(),
+                ));
             }
-            Err(_) => {
-                // Session validation failed, try JWT validation for admin-only tokens
-                tracing::debug!(
-                    "AdminAuthContext: Session validation failed, trying JWT validation"
-                );
+            let session = ValidatedSession {
+                did: did.clone(),
+                session_id: format!("jwt-{}", Uuid::new_v4()),
+                is_app_password: false,
+            };
+            return finalize_admin_role(state, did, session).await;
+        }
+        Err(e) => {
+            tracing::debug!(
+                reason = %hs256_rejection_category(&e),
+                "HS256 admin token rejected"
+            );
+            // fall through to layer 3
+        }
+    }
 
-                let token_data = verify_jwt_token(&token, &state.config.authentication.jwt_secret)?;
+    // Layer 3: ES256K pre-check (§5.3.1). Each rejection variant is
+    // a non-error fall-through — no `?` propagation; the pre-check
+    // returns a `Result<(), PreCheckRejection>` that we dispatch on.
+    match pre_check_es256k(token) {
+        Err(PreCheckRejection::NotJwtShaped) => {
+            tracing::debug!("service-auth pre-check: token is not JWT-shaped");
+            return Err(PdsError::Authentication("Invalid auth token".to_string()));
+        }
+        Err(PreCheckRejection::NoValidAlgField) => {
+            tracing::debug!("service-auth pre-check: header lacks valid alg field");
+            return Err(PdsError::Authentication("Invalid auth token".to_string()));
+        }
+        Err(PreCheckRejection::AlgNotEs256k(received)) => {
+            tracing::debug!(
+                received_alg = %received,
+                "service-auth pre-check: alg={} not ES256K",
+                received
+            );
+            return Err(PdsError::Authentication("Invalid auth token".to_string()));
+        }
+        Ok(()) => {}
+    }
 
-                // Extract DID from JWT claims
-                let claims = &token_data.claims;
-                let did = claims
-                    .get("sub")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        PdsError::Authentication("Invalid JWT: missing 'sub' claim".to_string())
-                    })?
-                    .to_string();
+    // Layer 4: ES256K service-auth verification against the resolver.
+    // §5.3.1 specifies `expected_aud = state.service_did()`; §5.5.6
+    // documents this as byte-for-byte strict-equal (no normalization).
+    let claims = match crate::service_auth::verify_service_jwt(
+        token,
+        state.service_did(),
+        state.identity_resolver.as_ref(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log_service_auth_error(&e, state.service_did());
+            return Err(PdsError::Authentication(format!(
+                "service-auth verification failed: {}",
+                e
+            )));
+        }
+    };
 
-                // Check scope is admin
-                let scope = claims.get("scope").and_then(|v| v.as_str());
-                if scope != Some("admin") {
-                    return Err(PdsError::Authentication(
-                        "JWT token does not have admin scope".to_string(),
-                    ));
-                }
+    // Synthetic session — service-auth tokens aren't backed by a
+    // local-session row. session_id is unique per request so audit
+    // logs can correlate.
+    let session = ValidatedSession {
+        did: claims.iss.clone(),
+        session_id: format!("svc-{}", Uuid::new_v4()),
+        is_app_password: false,
+    };
+    finalize_admin_role(state, claims.iss, session).await
+}
 
-                tracing::info!(
-                    "AdminAuthContext: JWT validation successful for DID: {}",
-                    did
-                );
+/// Look up the admin role for `did`. Returns 403 (`Authorization`)
+/// when authentication succeeded but no role exists — distinct from
+/// the 401 `Authentication` errors above so operators can tell
+/// "wrong token" from "valid token, not authorized".
+async fn finalize_admin_role(
+    state: &AppContext,
+    did: String,
+    session: ValidatedSession,
+) -> Result<AdminAuthContext, PdsError> {
+    match state.admin_role_manager.get_role(&did).await? {
+        Some(admin_role) => {
+            tracing::debug!(
+                did = %did,
+                role = %admin_role.role.as_str(),
+                "admin role lookup succeeded"
+            );
+            Ok(AdminAuthContext {
+                did,
+                session,
+                role: admin_role.role,
+            })
+        }
+        None => {
+            tracing::info!("authorization: DID={} has no role", did);
+            Err(PdsError::Authorization(format!(
+                "Admin role required for {}",
+                did
+            )))
+        }
+    }
+}
 
-                // Create a synthetic session for admin JWT tokens
-                let session = ValidatedSession {
-                    did: did.clone(),
-                    session_id: format!("jwt-{}", Uuid::new_v4()),
-                    is_app_password: false,
-                };
+/// §5.3.1 pre-check rejection variants. Each one is a non-error
+/// fall-through from the perspective of `admin_auth_from_token` —
+/// the load-bearing property is that `verify_service_jwt` and the
+/// resolver are unreachable when `pre_check_es256k` returns `Err`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreCheckRejection {
+    /// Token doesn't split into 3 base64url-shaped segments, or the
+    /// header doesn't decode/parse as JSON.
+    NotJwtShaped,
+    /// Header is parseable JSON but `alg` is absent or not a string.
+    /// Treated identically to alg-mismatch per §5.3.1: the resolver
+    /// must not be reached.
+    NoValidAlgField,
+    /// Header has a string `alg`, but it isn't `ES256K`.
+    AlgNotEs256k(String),
+}
 
-                (did, session)
+/// Defensive header inspection — no `unwrap`, no `?` for the parse
+/// cases. All four step-3 outcomes are explicit results the caller
+/// dispatches on.
+fn pre_check_es256k(token: &str) -> Result<(), PreCheckRejection> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(PreCheckRejection::NotJwtShaped);
+    }
+    let header_bytes = match URL_SAFE_NO_PAD.decode(parts[0]) {
+        Ok(b) => b,
+        Err(_) => return Err(PreCheckRejection::NotJwtShaped),
+    };
+    let header_json: serde_json::Value = match serde_json::from_slice(&header_bytes) {
+        Ok(v) => v,
+        Err(_) => return Err(PreCheckRejection::NotJwtShaped),
+    };
+    let alg = match header_json.get("alg").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return Err(PreCheckRejection::NoValidAlgField),
+    };
+    if alg != "ES256K" {
+        return Err(PreCheckRejection::AlgNotEs256k(alg.to_string()));
+    }
+    Ok(())
+}
+
+/// First 8 chars of the token as a debug-correlatable prefix. Tokens
+/// here are bearer tokens (session IDs, JWTs); first 8 chars is
+/// either an opaque ID prefix or the JWT header's `eyJhbGci...`
+/// boilerplate. Either way, not enough to authenticate with on its
+/// own.
+fn mask_token(token: &str) -> String {
+    let head: String = token.chars().take(8).collect();
+    if token.chars().count() > 8 {
+        format!("{}…", head)
+    } else {
+        head
+    }
+}
+
+/// Categorise an HS256 verification failure for logging without
+/// echoing the underlying jsonwebtoken error message (which can
+/// include token contents).
+fn hs256_rejection_category(err: &PdsError) -> &'static str {
+    match err {
+        PdsError::Authentication(msg) => {
+            if msg.contains("expired") {
+                "expired"
+            } else if msg.contains("signature") {
+                "bad-signature"
+            } else {
+                "invalid"
             }
-        };
+        }
+        _ => "other",
+    }
+}
 
-        tracing::debug!("AdminAuthContext: Checking admin role for DID: {}", did);
-
-        // Authority comes from the admin_role table only. The
-        // PDS_ADMIN_DIDS env var is a bootstrap convenience for
-        // operator-side configuration (warnings, OAuth allow-list at
-        // first-login time per the assessment doc §1.1) and does not
-        // by itself confer any role — every grant must be a recorded
-        // audit-chain decision.
-        let role = match state.admin_role_manager.get_role(&did).await? {
-            Some(admin_role) => {
-                tracing::info!(
-                    "AdminAuthContext: User {} has role {} from database",
-                    did,
-                    admin_role.role.as_str()
-                );
-                admin_role.role
-            }
-            None => {
-                tracing::warn!("AdminAuthContext: User {} is not an admin", did);
-                return Err(PdsError::Authorization("Admin role required".to_string()));
-            }
-        };
-
-        Ok(AdminAuthContext { did, session, role })
+/// Per-cause log-line dispatch for `verify_service_jwt` failures
+/// (§5.3.5). Each line is distinguishable in a log search; sensitive
+/// fields (token, signing keys, internal state) are not emitted.
+/// The audience-mismatch line is the §5.5.6 known-limitation
+/// diagnostic — both expected and received audiences are visible to
+/// the operator.
+fn log_service_auth_error(err: &crate::service_auth::ServiceAuthError, expected_aud: &str) {
+    use crate::service_auth::ServiceAuthError;
+    match err {
+        ServiceAuthError::AudienceMismatch { expected, received } => {
+            tracing::debug!(
+                "service-auth: expected aud={}, received aud={}",
+                expected,
+                received
+            );
+            // `expected` from the error == `expected_aud` we passed
+            // in — just defensively reference both so the param isn't
+            // dead under future refactors.
+            let _ = expected_aud;
+        }
+        ServiceAuthError::Expired => {
+            tracing::debug!("service-auth: token expired");
+        }
+        ServiceAuthError::SignatureVerificationFailed => {
+            tracing::debug!("service-auth: signature verification failed");
+        }
+        ServiceAuthError::ResolverError(detail) => {
+            tracing::debug!("service-auth: resolver error: {}", detail);
+        }
+        ServiceAuthError::InvalidPublicKey(detail) => {
+            tracing::debug!("service-auth: invalid public key: {}", detail);
+        }
+        ServiceAuthError::InvalidSignatureFormat(detail) => {
+            tracing::debug!("service-auth: invalid signature format: {}", detail);
+        }
+        ServiceAuthError::InvalidClaims(detail) => {
+            tracing::debug!("service-auth: invalid claims: {}", detail);
+        }
+        ServiceAuthError::InvalidExpirationWindow(detail) => {
+            tracing::debug!("service-auth: invalid expiration window: {}", detail);
+        }
+        // Pre-check is supposed to reject these before
+        // verify_service_jwt is called. If they surface here, the
+        // contract is violated — log at warn so it shows up.
+        ServiceAuthError::NotJwtShaped(detail) | ServiceAuthError::UnsupportedAlg(detail) => {
+            tracing::warn!(
+                "service-auth: pre-check leak — verify_service_jwt rejected for {}",
+                detail
+            );
+        }
+        ServiceAuthError::MissingOrInvalidAlg => {
+            tracing::warn!(
+                "service-auth: pre-check leak — verify_service_jwt rejected for missing-or-invalid alg"
+            );
+        }
     }
 }
 
@@ -636,5 +855,438 @@ mod identity_resolver_slot_smoke_tests {
         // payload; touching `slot` keeps the binding non-trivially
         // used so the test isn't elided as a no-op.
         assert!(Arc::strong_count(&slot) >= 1);
+    }
+}
+
+#[cfg(test)]
+mod admin_auth_third_path_tests {
+    //! Step 2 (§5.4.2) tests for the ES256K third path on
+    //! `AdminAuthContext`. Exercises `admin_auth_from_token` directly
+    //! so the test surface is the auth logic, not HTTP plumbing.
+    //!
+    //! Pre-check tests (§5.3.1) are load-bearing: each one must
+    //! observe `mock.resolve_did_calls() == 0`. A non-zero reading
+    //! means the alg boundary leaked and the design needs revision.
+    use super::admin_auth_from_token;
+    use crate::admin::roles::Role;
+    use crate::config::*;
+    use crate::context::AppContext;
+    use crate::error::PdsError;
+    use crate::identity::did_document::{DidDocument, VerificationMethod};
+    use crate::identity::resolver::test_doubles::MockIdentityResolver;
+    use crate::service_auth::create_service_jwt;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use k256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    // `traced_test` injects a local `logs_contain(val: &str) -> bool`
+    // function into each test scope (per tracing-test 0.2 macro).
+    use tracing_test::traced_test;
+
+    const TEST_SERVICE_DID: &str = "did:web:localhost";
+    const TEST_ISS: &str = "did:plc:test1234";
+
+    /// Match the test-context construction used by `aurora_admin`'s
+    /// tests so all managers wire up correctly. Returns an owned
+    /// AppContext whose `identity_resolver` slot is replaced by an
+    /// `Arc<MockIdentityResolver>` after construction; the mock is
+    /// returned alongside so the test can script DIDs and read
+    /// invocation counters.
+    async fn build_test_ctx_with_mock() -> (AppContext, Arc<MockIdentityResolver>) {
+        let dir = tempdir().unwrap().keep();
+        let db_path = dir.join("test.db");
+        let config = ServerConfig {
+            service: ServiceConfig {
+                hostname: "localhost".to_string(),
+                port: 2583,
+                service_did: TEST_SERVICE_DID.to_string(),
+                version: "0.1.0-test".to_string(),
+                blob_upload_limit: 5_242_880,
+            },
+            storage: StorageConfig {
+                data_directory: dir.clone(),
+                account_db: db_path.clone(),
+                sequencer_db: dir.join("sequencer.db"),
+                did_cache_db: dir.join("did_cache.db"),
+                actor_store_directory: dir.join("actors"),
+                blobstore: BlobstoreConfig::Disk {
+                    location: dir.join("blobs"),
+                    tmp_location: dir.join("temp"),
+                },
+            },
+            database: Default::default(),
+            authentication: AuthConfig {
+                jwt_secret: "test-secret-key-aurora-admin-test-32xx".to_string(),
+                repo_signing_key: "a".repeat(64),
+                plc_rotation_key: "b".repeat(64),
+                admin_dids: vec![],
+                oauth: OAuthConfig {
+                    client_id: "http://localhost:3000/client-metadata.json".to_string(),
+                    redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
+                    pds_url: "https://bsky.social".to_string(),
+                },
+                jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
+                oauth_migration_guide_url:
+                    "https://docs.atproto.com/guides/oauth-migration".to_string(),
+                oauth_features: Default::default(),
+            },
+            identity: IdentityConfig {
+                did_plc_url: "https://plc.directory".to_string(),
+                service_handle_domains: vec![".localhost".to_string()],
+                did_cache_stale_ttl: 3600,
+                did_cache_max_ttl: 86400,
+            },
+            email: None,
+            invites: InviteConfig {
+                required: false,
+                interval: 604800,
+                epoch: "2024-01-01T00:00:00Z".to_string(),
+            },
+            rate_limit: RateLimitConfig {
+                enabled: false,
+                global_requests_per_minute: 3000,
+                use_redis: false,
+                redis_url: None,
+                exempt_admin_assets: true,
+            },
+            logging: LoggingConfig {
+                level: "info".to_string(),
+            },
+            federation: FederationConfig {
+                enabled: false,
+                relay_urls: vec![],
+                appview_url: None,
+                firehose_enabled: false,
+                crawl_enabled: false,
+                public_url: Some("http://localhost:2583".to_string()),
+                auto_stream_events: false,
+            },
+            validation_mode: PathBuf::from("required")
+                .into_os_string()
+                .to_string_lossy()
+                .parse()
+                .unwrap_or(crate::validation::ValidationMode::Required),
+        };
+        let mut ctx = AppContext::new(config).await.unwrap();
+        let mock: Arc<MockIdentityResolver> = Arc::new(MockIdentityResolver::new());
+        ctx.identity_resolver = mock.clone();
+        (ctx, mock)
+    }
+
+    fn multibase_encode(verifying_key: &VerifyingKey) -> String {
+        let sec1 = verifying_key.to_encoded_point(true);
+        let mut buf = vec![0xe7_u8, 0x01_u8];
+        buf.extend_from_slice(sec1.as_bytes());
+        format!("z{}", bs58::encode(&buf).into_string())
+    }
+
+    fn did_doc_with_key(did: &str, verifying_key: &VerifyingKey) -> DidDocument {
+        DidDocument {
+            context: None,
+            id: did.to_string(),
+            also_known_as: vec![],
+            service: vec![],
+            verification_method: vec![VerificationMethod {
+                id: format!("{}#atproto", did),
+                key_type: "Multikey".to_string(),
+                controller: did.to_string(),
+                public_key_multibase: Some(multibase_encode(verifying_key)),
+            }],
+        }
+    }
+
+    fn manual_jwt(header_json: &str, claims_json: &str, signature: &[u8]) -> String {
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let claims_b64 = URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature);
+        format!("{}.{}.{}", header_b64, claims_b64, sig_b64)
+    }
+
+    fn future_exp() -> i64 {
+        chrono::Utc::now().timestamp() + 60
+    }
+
+    fn past_exp() -> i64 {
+        chrono::Utc::now().timestamp() - 60
+    }
+
+    fn well_formed_claims_json(iss: &str, aud: &str, exp: i64) -> String {
+        format!(
+            r#"{{"iss":"{}","aud":"{}","exp":{}}}"#,
+            iss, aud, exp
+        )
+    }
+
+    /// Construct a fresh ES256K signing keypair, script the resolver
+    /// with a matching DID document under `iss`, and return the
+    /// signing key bytes ready for `create_service_jwt`.
+    fn script_iss_with_fresh_key(
+        mock: &MockIdentityResolver,
+        iss: &str,
+    ) -> k256::ecdsa::SigningKey {
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let verifying_key = *signing_key.verifying_key();
+        mock.script_did(iss, did_doc_with_key(iss, &verifying_key));
+        signing_key
+    }
+
+    // ---------- Happy path ----------
+
+    #[traced_test]
+    #[tokio::test]
+    async fn extracts_service_auth_identity_with_valid_role() {
+        let (ctx, mock) = build_test_ctx_with_mock().await;
+        let signing_key = script_iss_with_fresh_key(&mock, TEST_ISS);
+        ctx.admin_role_manager
+            .grant_role(TEST_ISS, Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .expect("grant_role");
+
+        let token = create_service_jwt(
+            TEST_ISS,
+            TEST_SERVICE_DID,
+            Some(60),
+            None,
+            &signing_key.to_bytes(),
+        )
+        .expect("create_service_jwt");
+
+        let auth = admin_auth_from_token(&ctx, &token)
+            .await
+            .expect("happy path");
+
+        assert_eq!(auth.did, TEST_ISS);
+        assert_eq!(auth.role, Role::Admin);
+        assert!(mock.resolve_did_calls() >= 1);
+    }
+
+    // ---------- Authorization (403) ----------
+
+    #[traced_test]
+    #[tokio::test]
+    async fn rejects_with_403_when_role_lookup_returns_none() {
+        let (ctx, mock) = build_test_ctx_with_mock().await;
+        let signing_key = script_iss_with_fresh_key(&mock, TEST_ISS);
+        // No grant_role call — the DID has no admin role.
+
+        let token = create_service_jwt(
+            TEST_ISS,
+            TEST_SERVICE_DID,
+            Some(60),
+            None,
+            &signing_key.to_bytes(),
+        )
+        .unwrap();
+
+        let result = admin_auth_from_token(&ctx, &token).await;
+
+        match result {
+            Err(PdsError::Authorization(_)) => {}
+            other => panic!("expected Authorization (403), got {:?}", other),
+        }
+        assert!(logs_contain(&format!("authorization: DID={} has no role", TEST_ISS)));
+    }
+
+    // ---------- 401 — verify_service_jwt rejections ----------
+
+    #[traced_test]
+    #[tokio::test]
+    async fn rejects_with_401_on_audience_mismatch_with_log() {
+        let (ctx, mock) = build_test_ctx_with_mock().await;
+        let signing_key = script_iss_with_fresh_key(&mock, TEST_ISS);
+
+        // Token's `aud` is intentionally wrong.
+        let token = create_service_jwt(
+            TEST_ISS,
+            "did:plc:wrongAudience",
+            Some(60),
+            None,
+            &signing_key.to_bytes(),
+        )
+        .unwrap();
+
+        let result = admin_auth_from_token(&ctx, &token).await;
+
+        match result {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401), got {:?}", other),
+        }
+        // The §5.5.6 known-limitation diagnostic: both audiences
+        // must be visible to the operator.
+        assert!(logs_contain(&format!("expected aud={}", TEST_SERVICE_DID)));
+        assert!(logs_contain("received aud=did:plc:wrongAudience"));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn rejects_with_401_on_expired_token() {
+        let (ctx, mock) = build_test_ctx_with_mock().await;
+        let signing_key = script_iss_with_fresh_key(&mock, TEST_ISS);
+        let verifying_key = *signing_key.verifying_key();
+        // Re-script with the verifying key just to be defensive
+        // about the helper's state — already done by
+        // script_iss_with_fresh_key, but harmless.
+        let _ = verifying_key;
+
+        // create_service_jwt rejects past-exp via claims.validate;
+        // assemble manually with a real ES256K signature so the
+        // path threads through resolver + signature verify and
+        // fails only at the final expiry check.
+        let header = r#"{"alg":"ES256K","typ":"JWT"}"#;
+        let claims = well_formed_claims_json(TEST_ISS, TEST_SERVICE_DID, past_exp());
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let claims_b64 = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let signing_input = format!("{}.{}", header_b64, claims_b64);
+        let sig: Signature = signing_key.sign(signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_der().as_bytes());
+        let token = format!("{}.{}.{}", header_b64, claims_b64, sig_b64);
+
+        let result = admin_auth_from_token(&ctx, &token).await;
+
+        match result {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401), got {:?}", other),
+        }
+        assert!(logs_contain("service-auth: token expired"));
+    }
+
+    // ---------- 401 — pre-check rejections ----------
+    //
+    // Each pre-check test asserts `mock.resolve_did_calls() == 0` —
+    // load-bearing per §5.3.1 / §5.4.2. A non-zero reading means the
+    // alg boundary leaked.
+
+    #[traced_test]
+    #[tokio::test]
+    async fn rejects_with_401_on_alg_mismatch_pre_check_skips_resolver() {
+        let (ctx, mock) = build_test_ctx_with_mock().await;
+        let header = r#"{"alg":"RS256","typ":"JWT"}"#;
+        let claims = well_formed_claims_json(TEST_ISS, TEST_SERVICE_DID, future_exp());
+        let token = manual_jwt(header, &claims, b"junk-signature-bytes");
+
+        let result = admin_auth_from_token(&ctx, &token).await;
+
+        match result {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401), got {:?}", other),
+        }
+        assert!(logs_contain("service-auth pre-check: alg=RS256 not ES256K"));
+        assert_eq!(
+            mock.resolve_did_calls(),
+            0,
+            "pre-check leaked: resolver was reached on alg-mismatch path"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn rejects_with_401_on_opaque_non_jwt_pre_check_skips_resolver() {
+        let (ctx, mock) = build_test_ctx_with_mock().await;
+        let token = "not-a-jwt";
+
+        let result = admin_auth_from_token(&ctx, token).await;
+
+        match result {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401), got {:?}", other),
+        }
+        assert!(logs_contain("service-auth pre-check: token is not JWT-shaped"));
+        assert_eq!(
+            mock.resolve_did_calls(),
+            0,
+            "pre-check leaked: resolver was reached on non-JWT-shaped token path"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn rejects_with_401_on_missing_alg_field_pre_check_skips_resolver() {
+        let (ctx, mock) = build_test_ctx_with_mock().await;
+        let header = r#"{"typ":"JWT"}"#;
+        let claims = well_formed_claims_json(TEST_ISS, TEST_SERVICE_DID, future_exp());
+        let token = manual_jwt(header, &claims, b"junk-signature-bytes");
+
+        let result = admin_auth_from_token(&ctx, &token).await;
+
+        match result {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401), got {:?}", other),
+        }
+        assert!(logs_contain(
+            "service-auth pre-check: header lacks valid alg field"
+        ));
+        assert_eq!(
+            mock.resolve_did_calls(),
+            0,
+            "pre-check leaked: resolver was reached on missing-alg path"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn rejects_with_401_on_non_string_alg_pre_check_skips_resolver() {
+        let (ctx, mock) = build_test_ctx_with_mock().await;
+        let header = r#"{"alg":123,"typ":"JWT"}"#;
+        let claims = well_formed_claims_json(TEST_ISS, TEST_SERVICE_DID, future_exp());
+        let token = manual_jwt(header, &claims, b"junk-signature-bytes");
+
+        let result = admin_auth_from_token(&ctx, &token).await;
+
+        match result {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401), got {:?}", other),
+        }
+        assert!(logs_contain(
+            "service-auth pre-check: header lacks valid alg field"
+        ));
+        assert_eq!(
+            mock.resolve_did_calls(),
+            0,
+            "pre-check leaked: resolver was reached on non-string-alg path"
+        );
+    }
+
+    // ---------- Layer-2 regression ----------
+
+    /// Confirms the layer-2 HS256 admin path still works post-Step-2
+    /// fall-through refactor. The token is a vanilla HS256 JWT
+    /// signed with the test JWT secret with `scope=admin`; layer 1
+    /// fails (no local session row), layer 2 succeeds, role lookup
+    /// succeeds.
+    #[traced_test]
+    #[tokio::test]
+    async fn layer_2_hs256_admin_still_works_after_fall_through_refactor() {
+        let (ctx, mock) = build_test_ctx_with_mock().await;
+        ctx.admin_role_manager
+            .grant_role("did:plc:hs256admin", Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .expect("grant_role");
+
+        // Build an HS256 admin JWT.
+        let secret = &ctx.config.authentication.jwt_secret;
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let claims = serde_json::json!({
+            "sub": "did:plc:hs256admin",
+            "scope": "admin",
+            "exp": exp,
+        });
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+
+        let auth = admin_auth_from_token(&ctx, &token).await.expect("layer 2");
+        assert_eq!(auth.did, "did:plc:hs256admin");
+        assert_eq!(auth.role, Role::Admin);
+        // Layer 2 short-circuited; the resolver was never reached.
+        assert_eq!(
+            mock.resolve_did_calls(),
+            0,
+            "layer 2 success must not reach the identity resolver"
+        );
     }
 }

@@ -135,6 +135,9 @@ tempfile = "3"
 # tests (§5.4.1) to forge a realistic HS256 attacker token signed
 # with the ES256K public key as secret. Test-only.
 hmac = "0.12"
+# Capture tracing log lines in AdminAuthContext extractor tests
+# (§5.4.2 / §5.3.5) so per-cause logging assertions are first-class.
+tracing-test = "0.2"
 # Direct access to the same query-string format axum's Query extractor
 # uses, so PaginationParams deserialization can be exercised end-to-end
 # in unit tests (mirrors the over-the-wire path of /xrpc handlers).

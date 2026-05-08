@@ -42,6 +42,96 @@ use crate::{
     identity::resolver::IdentityResolverApi,
 };
 
+/// Structured failure modes from `verify_service_jwt`. Each variant
+/// carries enough context for callers (specifically the
+/// `AdminAuthContext` extractor) to emit a per-cause log line per
+/// §5.3.5 without scraping error message strings. `Display` is
+/// non-leaky — it doesn't include the token, signing key, or any
+/// scripted resolver internals.
+///
+/// Step 2 introduces this so the extractor can distinguish audience
+/// mismatch from expired-token from signature-verification failure
+/// without parsing message prefixes (the §5.4.2 "Acceptable" path
+/// would have left a brittle `// TODO(v0.4)` string-match marker).
+#[derive(Debug, Clone)]
+pub enum ServiceAuthError {
+    /// Token couldn't be split into three dot-separated segments, the
+    /// header isn't valid base64url, or the header isn't valid JSON.
+    NotJwtShaped(String),
+    /// Header lacks an `alg` field, or `alg` isn't a string.
+    MissingOrInvalidAlg,
+    /// Header's `alg` is a string but isn't `ES256K`.
+    UnsupportedAlg(String),
+    /// Claims segment couldn't be decoded or parsed.
+    InvalidClaims(String),
+    /// `aud` claim doesn't byte-equal `expected_aud`.
+    AudienceMismatch { expected: String, received: String },
+    /// `identity_resolver.resolve_did(...)` returned an error.
+    ResolverError(String),
+    /// DID document had no `#atproto` verification method, or the
+    /// public key was malformed / multibase decode failed.
+    InvalidPublicKey(String),
+    /// Signature segment couldn't be base64-decoded, or the DER
+    /// envelope was malformed.
+    InvalidSignatureFormat(String),
+    /// ES256K signature did not verify against the resolved key.
+    SignatureVerificationFailed,
+    /// `exp` claim is in the past.
+    Expired,
+    /// `exp` claim is too far in the future for the token's lxm
+    /// presence/absence, per `ServiceAuthClaims::validate`.
+    InvalidExpirationWindow(String),
+}
+
+impl std::fmt::Display for ServiceAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotJwtShaped(detail) => write!(f, "JWT format invalid: {}", detail),
+            Self::MissingOrInvalidAlg => write!(f, "Missing or non-string alg in JWT header"),
+            Self::UnsupportedAlg(alg) => write!(f, "Unsupported algorithm: {}", alg),
+            Self::InvalidClaims(detail) => write!(f, "JWT claims invalid: {}", detail),
+            Self::AudienceMismatch { expected, received } => write!(
+                f,
+                "Invalid audience: expected {}, got {}",
+                expected, received
+            ),
+            Self::ResolverError(detail) => write!(f, "Failed to resolve issuer DID: {}", detail),
+            Self::InvalidPublicKey(detail) => write!(f, "Invalid public key: {}", detail),
+            Self::InvalidSignatureFormat(detail) => {
+                write!(f, "Invalid signature format: {}", detail)
+            }
+            Self::SignatureVerificationFailed => write!(f, "Signature verification failed"),
+            Self::Expired => write!(f, "Service auth token has expired"),
+            Self::InvalidExpirationWindow(detail) => write!(f, "Invalid expiration: {}", detail),
+        }
+    }
+}
+
+impl std::error::Error for ServiceAuthError {}
+
+/// Lift to the project-wide error vocabulary so the extractor's
+/// `PdsResult<...>` callsites can return `ServiceAuthError` cases as
+/// 401 authentication failures while still preserving the structured
+/// cause for logging at the dispatch site.
+impl From<ServiceAuthError> for PdsError {
+    fn from(e: ServiceAuthError) -> Self {
+        match e {
+            // Shape-level rejections are reported as Jwt parse errors
+            // to mirror the pre-Step-2 behavior of this function.
+            ServiceAuthError::NotJwtShaped(_)
+            | ServiceAuthError::MissingOrInvalidAlg
+            | ServiceAuthError::UnsupportedAlg(_)
+            | ServiceAuthError::InvalidClaims(_)
+            | ServiceAuthError::InvalidSignatureFormat(_) => PdsError::Jwt(e.to_string()),
+            // Validation-window violations stay as Validation errors
+            // (matching `ServiceAuthClaims::validate`).
+            ServiceAuthError::InvalidExpirationWindow(_) => PdsError::Validation(e.to_string()),
+            // Everything else is an authentication failure (401).
+            _ => PdsError::Authentication(e.to_string()),
+        }
+    }
+}
+
 /// Maximum expiration time for tokens with a lexicon method (1 hour)
 const MAX_EXP_WITH_METHOD: i64 = 3600;
 
@@ -261,95 +351,93 @@ pub async fn verify_service_jwt(
     token: &str,
     expected_aud: &str,
     identity_resolver: &dyn IdentityResolverApi,
-) -> PdsResult<ServiceAuthClaims> {
-    // Split JWT into parts
+) -> Result<ServiceAuthClaims, ServiceAuthError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
-        return Err(PdsError::Jwt(
-            "Invalid JWT format: expected 3 parts".to_string(),
+        return Err(ServiceAuthError::NotJwtShaped(
+            "expected 3 dot-separated segments".to_string(),
         ));
     }
 
     let (header_b64, claims_b64, signature_b64) = (parts[0], parts[1], parts[2]);
 
-    // Decode header
     let header_bytes = URL_SAFE_NO_PAD
         .decode(header_b64)
-        .map_err(|e| PdsError::Jwt(format!("Failed to decode header: {}", e)))?;
+        .map_err(|e| ServiceAuthError::NotJwtShaped(format!("header decode failed: {}", e)))?;
     let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-        .map_err(|e| PdsError::Jwt(format!("Failed to parse header: {}", e)))?;
+        .map_err(|e| ServiceAuthError::NotJwtShaped(format!("header parse failed: {}", e)))?;
 
-    // Verify algorithm is ES256K
     let alg = header
         .get("alg")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| PdsError::Jwt("Missing algorithm in JWT header".to_string()))?;
+        .ok_or(ServiceAuthError::MissingOrInvalidAlg)?;
 
     if alg != "ES256K" {
-        return Err(PdsError::Jwt(format!("Unsupported algorithm: {}", alg)));
+        return Err(ServiceAuthError::UnsupportedAlg(alg.to_string()));
     }
 
-    // Decode claims
     let claims_bytes = URL_SAFE_NO_PAD
         .decode(claims_b64)
-        .map_err(|e| PdsError::Jwt(format!("Failed to decode claims: {}", e)))?;
+        .map_err(|e| ServiceAuthError::InvalidClaims(format!("decode failed: {}", e)))?;
     let claims: ServiceAuthClaims = serde_json::from_slice(&claims_bytes)
-        .map_err(|e| PdsError::Jwt(format!("Failed to parse claims: {}", e)))?;
+        .map_err(|e| ServiceAuthError::InvalidClaims(format!("parse failed: {}", e)))?;
 
-    // Validate audience matches expected
     if claims.aud != expected_aud {
-        return Err(PdsError::Authentication(format!(
-            "Invalid audience: expected {}, got {}",
-            expected_aud, claims.aud
-        )));
+        return Err(ServiceAuthError::AudienceMismatch {
+            expected: expected_aud.to_string(),
+            received: claims.aud.clone(),
+        });
     }
 
-    // Resolve issuer's DID document to get signing key
     let did_doc = identity_resolver
         .resolve_did(&claims.iss)
         .await
-        .map_err(|e| PdsError::Authentication(format!("Failed to resolve issuer DID: {}", e)))?;
+        .map_err(|e| ServiceAuthError::ResolverError(e.to_string()))?;
 
-    // Extract signing key from DID document
     let verification_method = did_doc.get_signing_key().ok_or_else(|| {
-        PdsError::Authentication(format!(
-            "No signing key found in DID document for {}",
+        ServiceAuthError::InvalidPublicKey(format!(
+            "no #atproto verification method on DID document for {}",
             claims.iss
         ))
     })?;
 
-    // Decode multibase public key
     let public_key_bytes = verification_method
         .public_key_multibase
         .as_ref()
         .ok_or_else(|| {
-            PdsError::Authentication("No public key in verification method".to_string())
+            ServiceAuthError::InvalidPublicKey(
+                "verification method missing publicKeyMultibase".to_string(),
+            )
         })?;
 
-    // Parse multibase key (format: z<base58btc-encoded-key>)
-    let public_key_decoded = decode_multibase_key(public_key_bytes)?;
+    let public_key_decoded = decode_multibase_key(public_key_bytes)
+        .map_err(|e| ServiceAuthError::InvalidPublicKey(e.to_string()))?;
 
-    // Create verifying key
     let verifying_key = VerifyingKey::from_sec1_bytes(&public_key_decoded)
-        .map_err(|e| PdsError::Authentication(format!("Invalid public key: {}", e)))?;
+        .map_err(|e| ServiceAuthError::InvalidPublicKey(e.to_string()))?;
 
-    // Decode signature
-    let signature_bytes = URL_SAFE_NO_PAD
-        .decode(signature_b64)
-        .map_err(|e| PdsError::Jwt(format!("Failed to decode signature: {}", e)))?;
+    let signature_bytes = URL_SAFE_NO_PAD.decode(signature_b64).map_err(|e| {
+        ServiceAuthError::InvalidSignatureFormat(format!("base64 decode failed: {}", e))
+    })?;
     let signature = Signature::from_der(&signature_bytes)
-        .map_err(|e| PdsError::Authentication(format!("Invalid signature format: {}", e)))?;
+        .map_err(|e| ServiceAuthError::InvalidSignatureFormat(format!("DER parse failed: {}", e)))?;
 
-    // Verify signature
     let signing_input = format!("{}.{}", header_b64, claims_b64);
     verifying_key
         .verify(signing_input.as_bytes(), &signature)
-        .map_err(|e| PdsError::Authentication(format!("Signature verification failed: {}", e)))?;
+        .map_err(|_| ServiceAuthError::SignatureVerificationFailed)?;
 
-    // Validate claims (expiration, etc.)
-    claims.validate()?;
-
-    Ok(claims)
+    // Validate claims (expiration window). `claims.validate` returns
+    // PdsError variants; lift them into ServiceAuthError so the
+    // structured-cause contract holds end-to-end.
+    match claims.validate() {
+        Ok(()) => Ok(claims),
+        Err(PdsError::Authentication(_)) => Err(ServiceAuthError::Expired),
+        Err(PdsError::Validation(msg)) => Err(ServiceAuthError::InvalidExpirationWindow(msg)),
+        // `ServiceAuthClaims::validate` doesn't construct any other
+        // PdsError variant, but be defensive in case it grows one.
+        Err(other) => Err(ServiceAuthError::InvalidExpirationWindow(other.to_string())),
+    }
 }
 
 /// Decode a multibase-encoded public key
@@ -360,7 +448,6 @@ pub async fn verify_service_jwt(
 /// For secp256k1 keys:
 /// - Multicodec prefix: 0xe7 (secp256k1-pub)
 /// - Key bytes: 33 bytes (compressed) or 65 bytes (uncompressed)
-#[allow(dead_code)] // Used by verify_service_jwt and tests
 fn decode_multibase_key(multibase_key: &str) -> PdsResult<Vec<u8>> {
     // Check for 'z' prefix (base58btc)
     if !multibase_key.starts_with('z') {
