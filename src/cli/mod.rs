@@ -261,4 +261,10 @@ pub enum DebugCommands {
         #[arg(short, long)]
         output: String,
     },
+
+    /// Walk the audit chain from genesis forward, recomputing hashes
+    /// per entry, and report pass/fail + entry count + any
+    /// discontinuity. Read-only; exits 0 on healthy, 1 on
+    /// discontinuity or DB error.
+    VerifyAuditChain,
 }

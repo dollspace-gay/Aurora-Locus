@@ -223,6 +223,12 @@ async fn main() -> PdsResult<()> {
                 DebugCommands::ExportAccount { did, output } => {
                     cli::debug::export_account(&ctx, &did, &output).await?;
                 }
+                DebugCommands::VerifyAuditChain => {
+                    let healthy = cli::debug::verify_audit_chain(&ctx).await?;
+                    if !healthy {
+                        std::process::exit(1);
+                    }
+                }
             }
         }
     }
