@@ -205,6 +205,15 @@ async fn main() -> PdsResult<()> {
             cli::validate_config::validate_config(&ctx.config)?;
         }
 
+        Some(Commands::GrantAdmin {
+            did,
+            role,
+            notes,
+            force,
+        }) => {
+            cli::admin::grant_admin(&ctx, did, role, notes, force).await?;
+        }
+
         Some(Commands::Debug { subcommand }) => {
             use cli::DebugCommands;
             match subcommand {

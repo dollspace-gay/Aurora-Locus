@@ -12,6 +12,7 @@
 //! - Debug utilities
 
 pub mod account;
+pub mod admin;
 pub mod backup;
 pub mod debug;
 pub mod health;
@@ -200,6 +201,26 @@ pub enum Commands {
 
     /// Validate configuration
     ValidateConfig,
+
+    /// Grant an admin role to a DID. Step 3 (§5.4.3) scaffolding;
+    /// the grant body itself lands in Step 4.
+    GrantAdmin {
+        /// DID to grant the role to (e.g. did:plc:abc, did:web:host).
+        did: String,
+
+        /// Role to grant: moderator, admin, or superadmin
+        /// (case-insensitive).
+        role: String,
+
+        /// Optional human-readable note recorded with the grant.
+        #[arg(long)]
+        notes: Option<String>,
+
+        /// Re-grant a DID with a previously revoked role. Offline-
+        /// only; semantics land in Step 4.
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Debug utilities
     Debug {
