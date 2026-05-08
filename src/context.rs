@@ -14,7 +14,7 @@ use crate::{
         search::FederatedSearch,
         NonceStore, RelayClient, RelayConfig,
     },
-    identity::{DidCache, IdentityResolver, IdentityResolverConfig},
+    identity::{DidCache, IdentityResolver, IdentityResolverApi, IdentityResolverConfig},
     mailer::Mailer,
     oauth::{ClientManager, DeviceManager},
     rate_limit::RateLimiter,
@@ -34,7 +34,7 @@ pub struct AppContext {
     pub account_manager: Arc<AccountManager>,
     pub actor_store: Arc<ActorStore>,
     pub blob_store: Arc<BlobStore>,
-    pub identity_resolver: Arc<IdentityResolver>,
+    pub identity_resolver: Arc<dyn IdentityResolverApi>,
     // Admin & Moderation
     pub admin_role_manager: Arc<AdminRoleManager>,
     pub moderation_manager: Arc<ModerationManager>,
@@ -175,7 +175,8 @@ impl AppContext {
             retry_base_delay_ms: 100,
             retry_max_delay_ms: 5000,
         };
-        let identity_resolver = Arc::new(IdentityResolver::new(did_cache, identity_config)?);
+        let identity_resolver: Arc<dyn IdentityResolverApi> =
+            Arc::new(IdentityResolver::new(did_cache, identity_config)?);
 
         // Initialize admin & moderation managers
         let admin_role_manager = Arc::new(AdminRoleManager::new(account_db.clone()));

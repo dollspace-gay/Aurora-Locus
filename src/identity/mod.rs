@@ -11,7 +11,7 @@ pub mod resolver;
 
 pub use cache::DidCache;
 pub use handle_validation::validate_handle;
-pub use resolver::{IdentityResolver, IdentityResolverConfig};
+pub use resolver::{IdentityResolver, IdentityResolverApi, IdentityResolverConfig};
 
 use chrono::{DateTime, Utc};
 

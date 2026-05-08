@@ -616,3 +616,25 @@ mod password_tests {
         assert!(PasswordHasher::verify("same", &h2).unwrap());
     }
 }
+
+#[cfg(test)]
+mod identity_resolver_slot_smoke_tests {
+    //! Step 0.6 smoke test — proves the `AppContext::identity_resolver`
+    //! slot type accepts a non-`IdentityResolver` impl of
+    //! `IdentityResolverApi`. Step 2's extractor tests rely on
+    //! constructing an `AppContext` with a counting mock swapped in;
+    //! this test only proves the slot's type permits that swap.
+    use crate::identity::resolver::test_doubles::MockIdentityResolver;
+    use crate::identity::IdentityResolverApi;
+    use std::sync::Arc;
+
+    #[test]
+    fn arc_of_mock_coerces_into_identity_resolver_slot() {
+        let mock: Arc<MockIdentityResolver> = Arc::new(MockIdentityResolver::new());
+        let slot: Arc<dyn IdentityResolverApi> = mock;
+        // Compile-time assertion of trait-object coercion is the
+        // payload; touching `slot` keeps the binding non-trivially
+        // used so the test isn't elided as a no-op.
+        assert!(Arc::strong_count(&slot) >= 1);
+    }
+}

@@ -617,7 +617,10 @@ async fn describe_repo(
 
     // Get description with account manager and identity resolver
     let desc = repo_mgr
-        .describe_repo(Some(&ctx.account_manager), Some(&ctx.identity_resolver))
+        .describe_repo(
+            Some(&ctx.account_manager),
+            Some(ctx.identity_resolver.as_ref()),
+        )
         .await?;
 
     Ok(Json(DescribeRepoResponse {

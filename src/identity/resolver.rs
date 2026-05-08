@@ -752,6 +752,229 @@ impl IdentityResolver {
     }
 }
 
+/// Mockable abstraction over identity resolution.
+///
+/// Introduced in v0.3 Arc 1 Step 0.6 so consumers like
+/// `service_auth::verify_service_jwt` and the federation
+/// authenticators can be unit-tested with an in-memory implementation
+/// rather than the live `IdentityResolver`. The production impl is
+/// the existing `IdentityResolver` struct; tests use
+/// `test_doubles::MockIdentityResolver`.
+#[async_trait::async_trait]
+pub trait IdentityResolverApi: Send + Sync {
+    async fn resolve_handle(&self, handle: &str) -> PdsResult<String>;
+    async fn resolve_did(&self, did: &str) -> PdsResult<DidDocument>;
+    async fn get_signing_key(&self, did: &str) -> PdsResult<Vec<u8>>;
+    async fn get_handle_for_did(&self, did: &str) -> PdsResult<Option<String>>;
+    async fn update_handle(&self, did: &str, handle: &str) -> PdsResult<()>;
+    async fn invalidate_handle(&self, handle: &str) -> PdsResult<()>;
+    async fn invalidate_did(&self, did: &str) -> PdsResult<()>;
+    async fn cleanup_cache(&self) -> PdsResult<()>;
+}
+
+#[async_trait::async_trait]
+impl IdentityResolverApi for IdentityResolver {
+    async fn resolve_handle(&self, handle: &str) -> PdsResult<String> {
+        IdentityResolver::resolve_handle(self, handle).await
+    }
+    async fn resolve_did(&self, did: &str) -> PdsResult<DidDocument> {
+        IdentityResolver::resolve_did(self, did).await
+    }
+    async fn get_signing_key(&self, did: &str) -> PdsResult<Vec<u8>> {
+        IdentityResolver::get_signing_key(self, did).await
+    }
+    async fn get_handle_for_did(&self, did: &str) -> PdsResult<Option<String>> {
+        IdentityResolver::get_handle_for_did(self, did).await
+    }
+    async fn update_handle(&self, did: &str, handle: &str) -> PdsResult<()> {
+        IdentityResolver::update_handle(self, did, handle).await
+    }
+    async fn invalidate_handle(&self, handle: &str) -> PdsResult<()> {
+        IdentityResolver::invalidate_handle(self, handle).await
+    }
+    async fn invalidate_did(&self, did: &str) -> PdsResult<()> {
+        IdentityResolver::invalidate_did(self, did).await
+    }
+    async fn cleanup_cache(&self) -> PdsResult<()> {
+        IdentityResolver::cleanup_cache(self).await
+    }
+}
+
+#[cfg(test)]
+pub mod test_doubles {
+    //! Test doubles for the identity-resolution surface.
+    //!
+    //! `MockIdentityResolver` is a `HashMap`-backed implementation of
+    //! `IdentityResolverApi` that scripts outcomes per-DID and counts
+    //! invocations. Step 1's algorithm-confusion tests for
+    //! `verify_service_jwt` use the invocation counter to assert the
+    //! security boundary rejects bad algorithms before reaching the
+    //! resolver. Step 2's extractor tests use it to count invocations
+    //! after an `AppContext` swap.
+    #![allow(dead_code)] // Step 0.6 infrastructure for Step 1/2 tests
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// In-memory `IdentityResolverApi` for unit tests.
+    ///
+    /// Errors are stored as message strings (PdsError isn't Clone) and
+    /// surfaced as `PdsError::IdentityResolution(msg)` on the call
+    /// path that hits the unscripted entry — matching the variant the
+    /// production resolver returns for not-found / fetch-failed cases.
+    pub struct MockIdentityResolver {
+        did_docs: Mutex<HashMap<String, Result<DidDocument, String>>>,
+        signing_keys: Mutex<HashMap<String, Result<Vec<u8>, String>>>,
+        handles_to_dids: Mutex<HashMap<String, String>>,
+        dids_to_handles: Mutex<HashMap<String, String>>,
+        resolve_did_count: AtomicUsize,
+        get_signing_key_count: AtomicUsize,
+        resolve_handle_count: AtomicUsize,
+        invalidate_count: AtomicUsize,
+    }
+
+    impl MockIdentityResolver {
+        pub fn new() -> Self {
+            Self {
+                did_docs: Mutex::new(HashMap::new()),
+                signing_keys: Mutex::new(HashMap::new()),
+                handles_to_dids: Mutex::new(HashMap::new()),
+                dids_to_handles: Mutex::new(HashMap::new()),
+                resolve_did_count: AtomicUsize::new(0),
+                get_signing_key_count: AtomicUsize::new(0),
+                resolve_handle_count: AtomicUsize::new(0),
+                invalidate_count: AtomicUsize::new(0),
+            }
+        }
+
+        /// Script `resolve_did(did)` to return a synthetic DID document.
+        pub fn script_did(&self, did: &str, doc: DidDocument) {
+            self.did_docs
+                .lock()
+                .unwrap()
+                .insert(did.to_string(), Ok(doc));
+        }
+
+        /// Script `resolve_did(did)` to return a not-found / fetch-failed error.
+        pub fn script_did_error(&self, did: &str, msg: &str) {
+            self.did_docs
+                .lock()
+                .unwrap()
+                .insert(did.to_string(), Err(msg.to_string()));
+        }
+
+        /// Script `get_signing_key(did)` to return a synthetic key.
+        pub fn script_signing_key(&self, did: &str, key: Vec<u8>) {
+            self.signing_keys
+                .lock()
+                .unwrap()
+                .insert(did.to_string(), Ok(key));
+        }
+
+        /// Script a handle ↔ did mapping for `resolve_handle` and
+        /// `get_handle_for_did`.
+        pub fn script_handle(&self, handle: &str, did: &str) {
+            self.handles_to_dids
+                .lock()
+                .unwrap()
+                .insert(handle.to_string(), did.to_string());
+            self.dids_to_handles
+                .lock()
+                .unwrap()
+                .insert(did.to_string(), handle.to_string());
+        }
+
+        pub fn resolve_did_calls(&self) -> usize {
+            self.resolve_did_count.load(Ordering::SeqCst)
+        }
+        pub fn get_signing_key_calls(&self) -> usize {
+            self.get_signing_key_count.load(Ordering::SeqCst)
+        }
+        pub fn resolve_handle_calls(&self) -> usize {
+            self.resolve_handle_count.load(Ordering::SeqCst)
+        }
+        pub fn invalidate_calls(&self) -> usize {
+            self.invalidate_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Default for MockIdentityResolver {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IdentityResolverApi for MockIdentityResolver {
+        async fn resolve_handle(&self, handle: &str) -> PdsResult<String> {
+            self.resolve_handle_count.fetch_add(1, Ordering::SeqCst);
+            match self.handles_to_dids.lock().unwrap().get(handle) {
+                Some(did) => Ok(did.clone()),
+                None => Err(PdsError::IdentityResolution(format!(
+                    "MockIdentityResolver: no scripted DID for handle {}",
+                    handle
+                ))),
+            }
+        }
+
+        async fn resolve_did(&self, did: &str) -> PdsResult<DidDocument> {
+            self.resolve_did_count.fetch_add(1, Ordering::SeqCst);
+            match self.did_docs.lock().unwrap().get(did) {
+                Some(Ok(doc)) => Ok(doc.clone()),
+                Some(Err(msg)) => Err(PdsError::IdentityResolution(msg.clone())),
+                None => Err(PdsError::IdentityResolution(format!(
+                    "MockIdentityResolver: no scripted outcome for DID {}",
+                    did
+                ))),
+            }
+        }
+
+        async fn get_signing_key(&self, did: &str) -> PdsResult<Vec<u8>> {
+            self.get_signing_key_count.fetch_add(1, Ordering::SeqCst);
+            match self.signing_keys.lock().unwrap().get(did) {
+                Some(Ok(key)) => Ok(key.clone()),
+                Some(Err(msg)) => Err(PdsError::IdentityResolution(msg.clone())),
+                None => Err(PdsError::IdentityResolution(format!(
+                    "MockIdentityResolver: no scripted signing key for {}",
+                    did
+                ))),
+            }
+        }
+
+        async fn get_handle_for_did(&self, did: &str) -> PdsResult<Option<String>> {
+            self.resolve_handle_count.fetch_add(1, Ordering::SeqCst);
+            Ok(self.dids_to_handles.lock().unwrap().get(did).cloned())
+        }
+
+        async fn update_handle(&self, did: &str, handle: &str) -> PdsResult<()> {
+            self.handles_to_dids
+                .lock()
+                .unwrap()
+                .insert(handle.to_string(), did.to_string());
+            self.dids_to_handles
+                .lock()
+                .unwrap()
+                .insert(did.to_string(), handle.to_string());
+            Ok(())
+        }
+
+        async fn invalidate_handle(&self, _handle: &str) -> PdsResult<()> {
+            self.invalidate_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn invalidate_did(&self, _did: &str) -> PdsResult<()> {
+            self.invalidate_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn cleanup_cache(&self) -> PdsResult<()> {
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

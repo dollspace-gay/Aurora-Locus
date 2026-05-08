@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{PdsError, PdsResult},
-    identity::resolver::IdentityResolver,
+    identity::resolver::IdentityResolverApi,
 };
 
 /// Maximum expiration time for tokens with a lexicon method (1 hour)
@@ -243,14 +243,14 @@ pub fn create_service_jwt(
 ///
 /// ```no_run
 /// use aurora_locus::service_auth::verify_service_jwt;
-/// use aurora_locus::identity::resolver::IdentityResolver;
+/// use aurora_locus::identity::resolver::IdentityResolverApi;
 ///
-/// # async fn example(resolver: IdentityResolver) -> Result<(), Box<dyn std::error::Error>> {
+/// # async fn example(resolver: &dyn IdentityResolverApi) -> Result<(), Box<dyn std::error::Error>> {
 /// let token = "eyJ..."; // JWT token from request
 /// let claims = verify_service_jwt(
 ///     token,
 ///     "did:plc:myservice123",
-///     &resolver,
+///     resolver,
 /// ).await?;
 ///
 /// println!("Authenticated request from: {}", claims.iss);
@@ -261,7 +261,7 @@ pub fn create_service_jwt(
 pub async fn verify_service_jwt(
     token: &str,
     expected_aud: &str,
-    identity_resolver: &IdentityResolver,
+    identity_resolver: &dyn IdentityResolverApi,
 ) -> PdsResult<ServiceAuthClaims> {
     // Split JWT into parts
     let parts: Vec<&str> = token.split('.').collect();
@@ -590,5 +590,21 @@ mod tests {
         // Invalid base58 characters
         let result = decode_multibase_key("z0OIl"); // 0, O, I, l are not valid base58
         assert!(result.is_err());
+    }
+
+    /// Step 0.6 smoke test — proves the test-friendly resolver is
+    /// callable from this module's test scope and that its invocation
+    /// counter is observable. Step 1's algorithm-confusion tests will
+    /// rely on this counter reading zero on the rejection path; this
+    /// test only proves the counter increments on a real call.
+    #[tokio::test]
+    async fn mock_identity_resolver_invocation_counter_increments_on_call() {
+        use crate::identity::resolver::test_doubles::MockIdentityResolver;
+        use crate::identity::resolver::IdentityResolverApi;
+
+        let mock = MockIdentityResolver::new();
+        assert_eq!(mock.resolve_did_calls(), 0);
+        let _ = mock.resolve_did("did:plc:nonexistent").await;
+        assert_eq!(mock.resolve_did_calls(), 1);
     }
 }
