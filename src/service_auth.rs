@@ -257,7 +257,6 @@ pub fn create_service_jwt(
 /// # Ok(())
 /// # }
 /// ```
-#[allow(dead_code)] // Public API for future service-to-service auth
 pub async fn verify_service_jwt(
     token: &str,
     expected_aud: &str,
@@ -606,5 +605,375 @@ mod tests {
         assert_eq!(mock.resolve_did_calls(), 0);
         let _ = mock.resolve_did("did:plc:nonexistent").await;
         assert_eq!(mock.resolve_did_calls(), 1);
+    }
+}
+
+#[cfg(test)]
+mod verify_service_jwt_tests {
+    //! Step 1 (§5.4.1): activation tests for `verify_service_jwt`.
+    //!
+    //! The algorithm-confusion tests are load-bearing. Per the design
+    //! doc, if the resolver is reached on any of the malformed-alg
+    //! cases below, the security boundary leaked and the design needs
+    //! revision — counter assertions read zero are the contract.
+    //!
+    //! `verify_service_jwt` calls `resolver.resolve_did(...)` and then
+    //! reads the signing key off the returned `DidDocument` directly
+    //! (it does NOT call `resolver.get_signing_key(...)`). So
+    //! `get_signing_key_calls()` is always 0 in these tests; the
+    //! load-bearing counter is `resolve_did_calls()`.
+    use super::*;
+    use crate::identity::did_document::{DidDocument, VerificationMethod};
+    use crate::identity::resolver::test_doubles::MockIdentityResolver;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use hmac::{Hmac, Mac};
+    use k256::ecdsa::{SigningKey, VerifyingKey};
+    use sha2::Sha256;
+
+    type HmacSha256 = Hmac<Sha256>;
+
+    const TEST_AUD: &str = "did:plc:audience";
+    const TEST_ISS: &str = "did:plc:test1234";
+
+    /// Encode a verifying key as multibase per ATProto: `z` prefix,
+    /// base58btc encoding of `[0xe7, 0x01]` multicodec varint
+    /// (secp256k1-pub) + compressed SEC1 public-key bytes.
+    fn multibase_encode(verifying_key: &VerifyingKey) -> String {
+        let sec1 = verifying_key.to_encoded_point(true); // compressed
+        let mut buf = vec![0xe7_u8, 0x01_u8];
+        buf.extend_from_slice(sec1.as_bytes());
+        format!("z{}", bs58::encode(&buf).into_string())
+    }
+
+    /// Build a synthetic DID document whose `#atproto` verification
+    /// method carries the given verifying key in multibase form.
+    fn did_doc_with_key(did: &str, verifying_key: &VerifyingKey) -> DidDocument {
+        DidDocument {
+            context: None,
+            id: did.to_string(),
+            also_known_as: vec![],
+            service: vec![],
+            verification_method: vec![VerificationMethod {
+                id: format!("{}#atproto", did),
+                key_type: "Multikey".to_string(),
+                controller: did.to_string(),
+                public_key_multibase: Some(multibase_encode(verifying_key)),
+            }],
+        }
+    }
+
+    /// Manually assemble a JWT from raw header + claims JSON strings
+    /// and a raw signature byte slice. Used for malformed-header
+    /// negative tests where `create_service_jwt` would refuse to emit
+    /// the shape we want to attack.
+    fn manual_jwt(header_json: &str, claims_json: &str, signature: &[u8]) -> String {
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let claims_b64 = URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature);
+        format!("{}.{}.{}", header_b64, claims_b64, sig_b64)
+    }
+
+    fn well_formed_claims_json(iss: &str, aud: &str, exp: i64) -> String {
+        serde_json::to_string(&ServiceAuthClaims {
+            iss: iss.to_string(),
+            aud: aud.to_string(),
+            exp,
+            lxm: None,
+            jti: None,
+        })
+        .unwrap()
+    }
+
+    /// Round-trip happy path: generate keypair, script the resolver
+    /// with a matching DID document, sign a real JWT, verify, assert
+    /// claims round-trip and the resolver was actually consulted.
+    #[tokio::test]
+    async fn round_trip_passes_with_matching_signing_key() {
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let verifying_key = *signing_key.verifying_key();
+        let key_bytes = signing_key.to_bytes();
+
+        let token = create_service_jwt(TEST_ISS, TEST_AUD, Some(60), None, &key_bytes)
+            .expect("create_service_jwt happy path");
+
+        let mock = MockIdentityResolver::new();
+        mock.script_did(TEST_ISS, did_doc_with_key(TEST_ISS, &verifying_key));
+
+        let claims = verify_service_jwt(&token, TEST_AUD, &mock)
+            .await
+            .expect("happy path verifies");
+
+        assert_eq!(claims.iss, TEST_ISS);
+        assert_eq!(claims.aud, TEST_AUD);
+        assert!(
+            mock.resolve_did_calls() >= 1,
+            "happy path must reach resolver — otherwise verification short-circuited"
+        );
+        // `verify_service_jwt` reads the key off the DidDocument
+        // directly rather than calling resolver.get_signing_key();
+        // pin that fact as a contract.
+        assert_eq!(mock.get_signing_key_calls(), 0);
+    }
+
+    // ---------- Algorithm-confusion negative tests (Q8 hypothesis) ----------
+    //
+    // Asserts: Err result + BOTH counters at zero. Failure here means
+    // the algorithm boundary leaked — STOP and report per §5.4.1.
+
+    #[tokio::test]
+    async fn rejects_alg_none_without_reaching_resolver() {
+        let header = r#"{"alg":"none","typ":"JWT"}"#;
+        let claims = well_formed_claims_json(TEST_ISS, TEST_AUD, future_exp());
+        let token = manual_jwt(header, &claims, b"");
+
+        let mock = MockIdentityResolver::new();
+        let result = verify_service_jwt(&token, TEST_AUD, &mock).await;
+
+        assert!(result.is_err(), "alg:none must be rejected");
+        assert_eq!(
+            mock.resolve_did_calls(),
+            0,
+            "alg-rejection path called resolve_did — algorithm boundary leaked"
+        );
+        assert_eq!(
+            mock.get_signing_key_calls(),
+            0,
+            "alg-rejection path called get_signing_key — algorithm boundary leaked"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_hs256_signed_with_es256k_pubkey_as_secret_without_reaching_resolver() {
+        // Classic algorithm-confusion attack: an attacker who knows
+        // the issuer's public key forges an HS256 token using that
+        // public key as the HMAC secret. If the verifier dispatched
+        // verification by the header's alg, this would succeed.
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let verifying_key = *signing_key.verifying_key();
+        let public_key_bytes = verifying_key.to_encoded_point(true).as_bytes().to_vec();
+
+        let header = r#"{"alg":"HS256","typ":"JWT"}"#;
+        let claims = well_formed_claims_json(TEST_ISS, TEST_AUD, future_exp());
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let claims_b64 = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let signing_input = format!("{}.{}", header_b64, claims_b64);
+
+        let mut mac = HmacSha256::new_from_slice(&public_key_bytes)
+            .expect("HMAC accepts arbitrary key length");
+        mac.update(signing_input.as_bytes());
+        let sig = mac.finalize().into_bytes();
+        let sig_b64 = URL_SAFE_NO_PAD.encode(&sig);
+        let token = format!("{}.{}.{}", header_b64, claims_b64, sig_b64);
+
+        // Script the resolver with the matching DID document so that
+        // IF the alg boundary leaked, the attacker's token would
+        // actually verify against the (HS256-shaped) signature. The
+        // counter assertions catch the leak even if downstream code
+        // were to spuriously accept.
+        let mock = MockIdentityResolver::new();
+        mock.script_did(TEST_ISS, did_doc_with_key(TEST_ISS, &verifying_key));
+
+        let result = verify_service_jwt(&token, TEST_AUD, &mock).await;
+
+        assert!(result.is_err(), "alg:HS256 must be rejected");
+        assert_eq!(
+            mock.resolve_did_calls(),
+            0,
+            "alg-rejection path called resolve_did — algorithm boundary leaked"
+        );
+        assert_eq!(
+            mock.get_signing_key_calls(),
+            0,
+            "alg-rejection path called get_signing_key — algorithm boundary leaked"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_alg_field_without_reaching_resolver() {
+        let header = r#"{"typ":"JWT"}"#;
+        let claims = well_formed_claims_json(TEST_ISS, TEST_AUD, future_exp());
+        let token = manual_jwt(header, &claims, b"junk-signature-bytes");
+
+        let mock = MockIdentityResolver::new();
+        let result = verify_service_jwt(&token, TEST_AUD, &mock).await;
+
+        assert!(result.is_err(), "missing alg must be rejected");
+        assert_eq!(
+            mock.resolve_did_calls(),
+            0,
+            "alg-rejection path called resolve_did — algorithm boundary leaked"
+        );
+        assert_eq!(
+            mock.get_signing_key_calls(),
+            0,
+            "alg-rejection path called get_signing_key — algorithm boundary leaked"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_non_string_alg_without_reaching_resolver() {
+        let header = r#"{"alg":123,"typ":"JWT"}"#;
+        let claims = well_formed_claims_json(TEST_ISS, TEST_AUD, future_exp());
+        let token = manual_jwt(header, &claims, b"junk-signature-bytes");
+
+        let mock = MockIdentityResolver::new();
+        let result = verify_service_jwt(&token, TEST_AUD, &mock).await;
+
+        assert!(result.is_err(), "non-string alg must be rejected");
+        assert_eq!(
+            mock.resolve_did_calls(),
+            0,
+            "alg-rejection path called resolve_did — algorithm boundary leaked"
+        );
+        assert_eq!(
+            mock.get_signing_key_calls(),
+            0,
+            "alg-rejection path called get_signing_key — algorithm boundary leaked"
+        );
+    }
+
+    // ---------- Resolver-error-path tests ----------
+
+    #[tokio::test]
+    async fn propagates_resolver_not_found_error() {
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let token = create_service_jwt(TEST_ISS, TEST_AUD, Some(60), None, &signing_key.to_bytes())
+            .unwrap();
+
+        let mock = MockIdentityResolver::new();
+        mock.script_did_error(TEST_ISS, "DID not found");
+
+        let result = verify_service_jwt(&token, TEST_AUD, &mock).await;
+
+        assert!(result.is_err(), "NotFound must propagate as Err");
+        assert!(
+            mock.resolve_did_calls() >= 1,
+            "NotFound path must reach resolver before failing"
+        );
+    }
+
+    #[tokio::test]
+    async fn propagates_resolver_network_error() {
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let token = create_service_jwt(TEST_ISS, TEST_AUD, Some(60), None, &signing_key.to_bytes())
+            .unwrap();
+
+        let mock = MockIdentityResolver::new();
+        mock.script_did_error(TEST_ISS, "connection refused");
+
+        let result = verify_service_jwt(&token, TEST_AUD, &mock).await;
+
+        assert!(result.is_err(), "network error must propagate as Err");
+        assert!(
+            mock.resolve_did_calls() >= 1,
+            "network-error path must reach resolver before failing"
+        );
+    }
+
+    // ---------- Standard negative tests ----------
+
+    #[tokio::test]
+    async fn rejects_audience_mismatch_before_reaching_resolver() {
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let key_bytes = signing_key.to_bytes();
+        // Token's `aud` is set to TEST_AUD via create_service_jwt.
+        let token = create_service_jwt(TEST_ISS, TEST_AUD, Some(60), None, &key_bytes).unwrap();
+
+        let mock = MockIdentityResolver::new();
+        // Don't script anything — if the resolver were called, this
+        // test would fail to verify even on the audience-mismatch
+        // path. The counter assertion is the load-bearing check.
+
+        let result = verify_service_jwt(&token, "did:plc:wrongAudience", &mock).await;
+
+        assert!(result.is_err(), "audience mismatch must be rejected");
+        // Per Q11 / source-ordering: audience check (line 300-306)
+        // happens BEFORE resolver invocation (line 308-312).
+        assert_eq!(
+            mock.resolve_did_calls(),
+            0,
+            "audience check must reject before resolver invocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_token_after_reaching_resolver() {
+        // The expiry check is at the END of verify_service_jwt
+        // (after signature verification). Building a token with a
+        // past `exp` directly through create_service_jwt is blocked
+        // by claims.validate(); construct the token manually with
+        // the real ES256K signature so the path threads through
+        // resolver + signature verify and only fails at the final
+        // expiry check.
+        use k256::ecdsa::{signature::Signer, Signature};
+
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let verifying_key = *signing_key.verifying_key();
+
+        let header = r#"{"alg":"ES256K","typ":"JWT"}"#;
+        let claims = well_formed_claims_json(TEST_ISS, TEST_AUD, past_exp());
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let claims_b64 = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let signing_input = format!("{}.{}", header_b64, claims_b64);
+        let sig: Signature = signing_key.sign(signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_der().as_bytes());
+        let token = format!("{}.{}.{}", header_b64, claims_b64, sig_b64);
+
+        let mock = MockIdentityResolver::new();
+        mock.script_did(TEST_ISS, did_doc_with_key(TEST_ISS, &verifying_key));
+
+        let result = verify_service_jwt(&token, TEST_AUD, &mock).await;
+
+        assert!(result.is_err(), "expired token must be rejected");
+        // Source-ordering contract: expiry is checked AFTER resolver
+        // and signature verify, so the resolver must have been
+        // invoked.
+        assert!(
+            mock.resolve_did_calls() >= 1,
+            "expired path is reached only after resolver invocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_corrupted_signature_after_reaching_resolver() {
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let verifying_key = *signing_key.verifying_key();
+        let token = create_service_jwt(TEST_ISS, TEST_AUD, Some(60), None, &signing_key.to_bytes())
+            .unwrap();
+
+        // Flip the last byte of the base64-encoded signature segment
+        // to corrupt the signature without breaking JWT structure.
+        let mut parts: Vec<&str> = token.split('.').collect();
+        let mut sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        let last_idx = sig_bytes.len() - 1;
+        sig_bytes[last_idx] ^= 0xff;
+        let corrupted_sig_b64 = URL_SAFE_NO_PAD.encode(&sig_bytes);
+        parts[2] = &corrupted_sig_b64;
+        let corrupted_token = parts.join(".");
+
+        let mock = MockIdentityResolver::new();
+        mock.script_did(TEST_ISS, did_doc_with_key(TEST_ISS, &verifying_key));
+
+        let result = verify_service_jwt(&corrupted_token, TEST_AUD, &mock).await;
+
+        assert!(result.is_err(), "corrupted signature must be rejected");
+        // Source-ordering contract: signature verify happens AFTER
+        // resolver invocation.
+        assert!(
+            mock.resolve_did_calls() >= 1,
+            "signature-corrupted path is reached only after resolver invocation"
+        );
+        // verify_service_jwt does not call resolver.get_signing_key();
+        // it reads the key off the DidDocument directly.
+        assert_eq!(mock.get_signing_key_calls(), 0);
+    }
+
+    fn future_exp() -> i64 {
+        Utc::now().timestamp() + 60
+    }
+
+    fn past_exp() -> i64 {
+        Utc::now().timestamp() - 60
     }
 }

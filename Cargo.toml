@@ -131,6 +131,10 @@ tar = "0.4"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+# HMAC-SHA256 used in service_auth.rs algorithm-confusion negative
+# tests (§5.4.1) to forge a realistic HS256 attacker token signed
+# with the ES256K public key as secret. Test-only.
+hmac = "0.12"
 # Direct access to the same query-string format axum's Query extractor
 # uses, so PaginationParams deserialization can be exercised end-to-end
 # in unit tests (mirrors the over-the-wire path of /xrpc handlers).
