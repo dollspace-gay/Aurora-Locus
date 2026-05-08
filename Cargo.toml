@@ -98,6 +98,10 @@ hex = "0.4"
 # SHA-256 hashing for blob CIDs
 sha2 = "0.10"
 
+# Cooperative file locking for the SQLite-backend PDS-liveness lock
+# (src/db/liveness_lock.rs). flock(2) on Unix; LockFileEx on Windows.
+fs2 = "0.4"
+
 # secp256k1 for PLC operation signing
 k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 

@@ -4,6 +4,8 @@
 //! to the account, sequencer, and DID cache databases.
 
 pub mod account;
+pub mod advisory_locks;
+pub mod liveness_lock;
 pub mod postgres;
 
 use crate::config::{DatabaseBackend, DatabaseConfig};
