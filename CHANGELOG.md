@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Wire-format breaking change (v0.3 / Arc 4 multi-subject reshape).**
+  `tools.aurora.admin.emitEvent` now accepts an array of subjects per
+  call instead of a single subject. The input field renames
+  `subject: Subject` → `subjects: Vec<Subject>`; the output field
+  renames `snapshot_id: Option<String>` → `snapshots: Vec<SnapshotRef>`
+  paired 1:1-by-index with `subjects`. Single-subject callers migrate
+  by wrapping in a one-element array (`subjects: [s]`); multi-subject
+  callers fan out across supported actions (account state, label,
+  blob quarantine/restore/delete, record takedown,
+  `UpdateSubjectStatus`). Embedded-id and `SendEmail` variants remain
+  length-1 only and are explicitly refused for `subjects.len() > 1`
+  with HTTP 400 `SubjectsArrayInvalidForAction`. Per-action
+  `subjects.len()` caps: `DeleteAccount` = 10 (irreversible),
+  `DeleteBlob` = 25 (storage-irreversible), all others = 50.
+  `dispatch_action` is fully tx-bound — per-subject mutation failures
+  abort the wrapping tx atomically with the chain entry (LB-1 /
+  chainlink #122 / chainlink #130).
+
 ### Added
 - **Arc 3: Audit-trail read contract.**
   `tools.aurora.admin.getAuditTrail` is committed as the fifth

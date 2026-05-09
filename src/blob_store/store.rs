@@ -403,6 +403,16 @@ impl BlobStore {
         Ok(())
     }
 
+    /// Storage-backend delete only (no metadata touch). Used by the
+    /// `emit_event` `DeleteBlob` arm (Arc 4 §8.4.1) as the post-commit
+    /// best-effort cleanup paired with `delete_metadata_in_tx`. Per
+    /// Step 0.6 §3 Branch (B): the metadata DELETE rides inside the
+    /// wrapping transaction; the storage delete runs after `tx.commit`
+    /// and is best-effort with WARN-on-failure.
+    pub async fn backend_delete(&self, cid: &str) -> PdsResult<()> {
+        self.backend.delete(cid).await
+    }
+
     /// Calculate CID for data using SHA-256
     fn calculate_cid(&self, data: &[u8]) -> String {
         let hash = Sha256::digest(data);
