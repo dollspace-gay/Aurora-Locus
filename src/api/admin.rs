@@ -5985,6 +5985,13 @@ async fn cleanup_nonce_stores(
     })))
 }
 
+// Arc 2 Step 1 (§6.4.1) — canonical-JSON helper for snapshot
+// tests. See the matching declaration in `src/admin/defs.rs` for
+// the rationale on top-level placement vs nested-mod placement.
+#[cfg(test)]
+#[path = "../../tests/common/canonical_json.rs"]
+mod canonical_json_helper;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8143,9 +8150,10 @@ mod tests {
     /// (Repo, Record, Blob) byte-equal across the two types so the
     /// drift cannot regress.
     ///
-    /// Step 1 will lift the inline `canonical_json` helper into
-    /// `tests/common/canonical_json.rs`; for now it lives inline
-    /// because Step 0.5's scope is the byte-fix, not the helper.
+    /// Uses the formal canonical-JSON helper at
+    /// `tests/common/canonical_json.rs`, included via `#[path]` at
+    /// the bottom of this test module so unit tests can reach it
+    /// across the unit-vs-integration boundary.
     #[test]
     fn subject_blob_and_subject_union_repoblobref_serialize_byte_equal() {
         use crate::admin::defs::Subject;
@@ -8228,40 +8236,7 @@ mod tests {
         );
     }
 
-    /// Minimal canonical-JSON serializer: sort object keys
-    /// recursively, no whitespace, standard escaping. Step 1 lifts
-    /// this into `tests/common/canonical_json.rs`; for Step 0.5 it
-    /// lives inline — the byte-equality test is the regression
-    /// guard, the helper is incidental.
-    fn canonical_json<T: serde::Serialize>(value: &T) -> String {
-        let v = serde_json::to_value(value).expect("serializable");
-        canonicalize(&v)
-    }
-
-    fn canonicalize(v: &serde_json::Value) -> String {
-        match v {
-            serde_json::Value::Object(map) => {
-                let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
-                sorted.sort_by(|a, b| a.0.cmp(b.0));
-                let parts: Vec<String> = sorted
-                    .iter()
-                    .map(|(k, val)| {
-                        format!(
-                            "{}:{}",
-                            serde_json::to_string(k).unwrap(),
-                            canonicalize(val)
-                        )
-                    })
-                    .collect();
-                format!("{{{}}}", parts.join(","))
-            }
-            serde_json::Value::Array(arr) => {
-                let parts: Vec<String> = arr.iter().map(canonicalize).collect();
-                format!("[{}]", parts.join(","))
-            }
-            other => serde_json::to_string(other).unwrap(),
-        }
-    }
+    use super::canonical_json_helper::canonical_json;
 
     #[test]
     fn test_status_attr_round_trip() {
