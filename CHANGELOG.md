@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **Arc 2: Contract lockdown.** Aurora-Locus v0.3 commits to four
+  stability contracts on its admin-and-capability surfaces:
+  Subject vocabulary stability (canonical Aurora `Subject` and
+  createReport `ReportSubject` — two distinct surfaces;
+  internally-tagged for the former, untagged-at-the-enum-level for
+  the latter), `describeCapabilities` response shape stability,
+  capability string versioning convention
+  (`<kebab-family>-v<integer>`), and action-ID surfacing
+  (`auditEntryId` and optionally `eventId` on Aurora-namespace
+  handlers writing audit chain entries). Each contract is committed
+  in a doc comment at the canonical source location and pinned by
+  snapshot tests (`Subject` and `ReportSubject` wire-format
+  snapshots in their respective modules; `describe_capabilities_snapshot`
+  in `src/api/admin.rs`) plus a structural lint
+  (`tests/admin_handler_contract.rs`) and a phrase-presence test
+  (`tests/contract_phrases.rs`). Operator summary at
+  `docs/operator/contract-stability.md`. Drift becomes a loud
+  CI failure: any future PR that silently removes a commitment
+  phrase from its canonical location, breaks a wire-format
+  snapshot, or drops the audit-entry-ID field from a typed
+  `*Output` struct (without an explicit allowlist entry) fails
+  the appropriate test.
+
 ### Changed
 - **Wire-format breaking change (v0.3 / Arc 2 contract lockdown).**
   `tools.aurora.superadmin.grantRole` and `tools.aurora.superadmin.revokeRole`

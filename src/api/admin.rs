@@ -3023,6 +3023,21 @@ fn aurora_capability_families() -> serde_json::Value {
 ///   - `invite-lineage-v1`     (no shipped endpoint as of v0.2 cycle)
 ///   - `reporter-context-v1`   (no shipped endpoint as of v0.2 cycle)
 /// Add them here when their handlers land.
+///
+/// # Versioning contract
+///
+/// Per `docs/V03_DESIGN.md` §6.3.1: capability strings follow the pattern `<kebab-family>-v<integer>`.
+/// Kebab-case family name, hyphen, lowercase `v`, integer
+/// version. Breaking changes ship as a NEW version suffix (e.g.
+/// `subject-context-v2`); the OLD version is removed only after
+/// the new version has shipped and consumers have had time to
+/// migrate. Bumping the integer is the wire signal that breaking
+/// change has landed.
+///
+/// The snapshot test `describe_capabilities_snapshot` (Step 3) pins
+/// the advertised set; the contract-phrase test
+/// `tests/contract_phrases.rs` (Step 4) pins this versioning
+/// commitment by grepping for the pattern in this doc comment.
 fn aurora_capability_extensions() -> Vec<CapabilityExtension> {
     vec![
         // Phase 3.2 — capability probe ships alongside getSubjectContext.
