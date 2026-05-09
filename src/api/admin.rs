@@ -3385,10 +3385,17 @@ enum SubjectUnion {
         rename_all = "camelCase"
     )]
     StrongRef { uri: String, cid: String },
-    #[serde(
-        rename = "com.atproto.admin.defs#repoBlobRef",
-        rename_all = "camelCase"
-    )]
+    // §6.4.0.5: emit `record_uri` (snake_case) on the wire to
+    // byte-match `Subject::Blob` in src/admin/defs.rs:37-43.
+    // Shipped Aurora-namespace handlers (getAuditTrail,
+    // subscribeModEvents, etc.) emit Subject::Blob's snake_case
+    // shape; SubjectUnion is the input/parsing dual on
+    // updateSubjectStatus and must accept and re-emit the same
+    // wire bytes. `rename_all = "camelCase"` would re-emit
+    // `recordUri`, drifting from the shipped contract — drop it.
+    // The other fields in this variant (did, cid) are single
+    // words and unaffected by the absent `rename_all`.
+    #[serde(rename = "com.atproto.admin.defs#repoBlobRef")]
     RepoBlobRef {
         did: String,
         cid: String,
@@ -8087,11 +8094,13 @@ mod tests {
 
     #[test]
     fn test_subject_union_repo_blob_ref_round_trip() {
+        // §6.4.0.5: wire field is `record_uri` (snake_case), matching
+        // Subject::Blob in src/admin/defs.rs.
         let json = serde_json::json!({
             "$type": "com.atproto.admin.defs#repoBlobRef",
             "did": "did:plc:abc",
             "cid": "bafyblob",
-            "recordUri": "at://did:plc:abc/app.bsky.feed.post/xyz"
+            "record_uri": "at://did:plc:abc/app.bsky.feed.post/xyz"
         });
         let parsed: SubjectUnion = serde_json::from_value(json.clone()).unwrap();
         match &parsed {
@@ -8114,6 +8123,144 @@ mod tests {
         let json = serde_json::json!({"did": "did:plc:abc"});
         let result: Result<SubjectUnion, _> = serde_json::from_value(json);
         assert!(result.is_err());
+    }
+
+    /// Arc 2 Step 0.5 (§6.4.0.5) — within-surface byte-equality
+    /// regression guard for the canonical Aurora Subject contract.
+    /// `Subject` (in `crate::admin::defs`) is the type Aurora-namespace
+    /// handlers serialize on getAuditTrail / subscribeModEvents /
+    /// batch-label / etc.; `SubjectUnion` (private to admin.rs) is the
+    /// parsing dual on updateSubjectStatus and friends. The two MUST
+    /// produce byte-identical canonical-JSON output for every shared
+    /// variant — otherwise round-tripping a payload through
+    /// updateSubjectStatus → getAuditTrail would surface a re-keyed
+    /// shape and break clients.
+    ///
+    /// The byte-drift between these types on `Blob`/`RepoBlobRef` —
+    /// `record_uri` vs `recordUri` — was caught by Arc 2 Step 0 recon
+    /// and fixed in this step by dropping `rename_all = "camelCase"`
+    /// from `RepoBlobRef`. This test pins all three shared variants
+    /// (Repo, Record, Blob) byte-equal across the two types so the
+    /// drift cannot regress.
+    ///
+    /// Step 1 will lift the inline `canonical_json` helper into
+    /// `tests/common/canonical_json.rs`; for now it lives inline
+    /// because Step 0.5's scope is the byte-fix, not the helper.
+    #[test]
+    fn subject_blob_and_subject_union_repoblobref_serialize_byte_equal() {
+        use crate::admin::defs::Subject;
+
+        // ---- Repo / RepoRef ----
+        let s_repo = Subject::Repo {
+            did: "did:plc:test1234567890abcdef".to_string(),
+        };
+        let u_repo = SubjectUnion::RepoRef {
+            did: "did:plc:test1234567890abcdef".to_string(),
+        };
+        assert_eq!(
+            canonical_json(&s_repo),
+            canonical_json(&u_repo),
+            "Repo / RepoRef must serialize byte-equal"
+        );
+
+        // ---- Record / StrongRef ----
+        let s_record = Subject::Record {
+            uri: "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            cid: "bafyreidemo123".to_string(),
+        };
+        let u_strong = SubjectUnion::StrongRef {
+            uri: "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            cid: "bafyreidemo123".to_string(),
+        };
+        assert_eq!(
+            canonical_json(&s_record),
+            canonical_json(&u_strong),
+            "Record / StrongRef must serialize byte-equal"
+        );
+
+        // ---- Blob / RepoBlobRef (the case Step 0.5 reconciled) ----
+        let s_blob = Subject::Blob {
+            did: "did:plc:test1234567890abcdef".to_string(),
+            cid: "bafyreidemoblob456".to_string(),
+            record_uri: Some(
+                "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            ),
+        };
+        let u_blob = SubjectUnion::RepoBlobRef {
+            did: "did:plc:test1234567890abcdef".to_string(),
+            cid: "bafyreidemoblob456".to_string(),
+            record_uri: Some(
+                "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            ),
+        };
+        let s_blob_json = canonical_json(&s_blob);
+        let u_blob_json = canonical_json(&u_blob);
+        assert_eq!(
+            s_blob_json, u_blob_json,
+            "Blob / RepoBlobRef must serialize byte-equal — \
+             record_uri rename direction is the load-bearing fix"
+        );
+        // Pin the absolute wire shape so a later refactor that
+        // re-introduces `rename_all = \"camelCase\"` (or otherwise
+        // re-keys to `recordUri`) is caught at this assertion, not
+        // just at the cross-type comparison above.
+        assert_eq!(
+            s_blob_json,
+            r#"{"$type":"com.atproto.admin.defs#repoBlobRef","cid":"bafyreidemoblob456","did":"did:plc:test1234567890abcdef","record_uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc"}"#,
+            "wire shape must include snake_case `record_uri`"
+        );
+
+        // Blob with record_uri = None (skip_serializing_if path).
+        let s_blob_none = Subject::Blob {
+            did: "did:plc:test1234567890abcdef".to_string(),
+            cid: "bafyreidemoblob456".to_string(),
+            record_uri: None,
+        };
+        let u_blob_none = SubjectUnion::RepoBlobRef {
+            did: "did:plc:test1234567890abcdef".to_string(),
+            cid: "bafyreidemoblob456".to_string(),
+            record_uri: None,
+        };
+        assert_eq!(
+            canonical_json(&s_blob_none),
+            canonical_json(&u_blob_none),
+            "Blob / RepoBlobRef byte-equal when record_uri omitted"
+        );
+    }
+
+    /// Minimal canonical-JSON serializer: sort object keys
+    /// recursively, no whitespace, standard escaping. Step 1 lifts
+    /// this into `tests/common/canonical_json.rs`; for Step 0.5 it
+    /// lives inline — the byte-equality test is the regression
+    /// guard, the helper is incidental.
+    fn canonical_json<T: serde::Serialize>(value: &T) -> String {
+        let v = serde_json::to_value(value).expect("serializable");
+        canonicalize(&v)
+    }
+
+    fn canonicalize(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(b.0));
+                let parts: Vec<String> = sorted
+                    .iter()
+                    .map(|(k, val)| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(k).unwrap(),
+                            canonicalize(val)
+                        )
+                    })
+                    .collect();
+                format!("{{{}}}", parts.join(","))
+            }
+            serde_json::Value::Array(arr) => {
+                let parts: Vec<String> = arr.iter().map(canonicalize).collect();
+                format!("[{}]", parts.join(","))
+            }
+            other => serde_json::to_string(other).unwrap(),
+        }
     }
 
     #[test]
