@@ -2897,6 +2897,22 @@ async fn search_accounts(
 // targeted attacks; we don't gate the wire format on an unauth
 // probe.
 
+/// Response shape for `tools.aurora.admin.describeCapabilities`.
+///
+/// Per `docs/V03_DESIGN.md` §6.3.1: field stability is committed.
+/// New fields may be added; existing field names and shapes do not
+/// change across releases. Capability strings within `extensions`
+/// follow the `<kebab-family>-v<integer>` versioning convention
+/// (committed separately on `aurora_capability_extensions` per
+/// Step 4).
+///
+/// Snapshot test: `describe_capabilities_snapshot` in this file's
+/// test module pins the wire format and catches drift loudly.
+/// Both top-level fields (alphabetical via canonical-JSON) and
+/// inner namespace keys (alphabetical via `serde_json::Map`'s
+/// default `BTreeMap` backing) sort deterministically; endpoint
+/// arrays preserve the source-order of the `aurora_capability_families`
+/// JSON literal.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DescribeCapabilitiesResponse {
@@ -7142,6 +7158,141 @@ mod tests {
     }
 
     // ---- tools.aurora.describeCapabilities (chainlink #99 / Phase 3.2) ----
+
+    /// Arc 2 Step 3 (§6.4.3) — full canonical-JSON snapshot of the
+    /// `tools.aurora.admin.describeCapabilities` response. Pins:
+    ///
+    /// - Top-level field set (`extensions`, `families`,
+    ///   `implementation`, `version`) and ordering (alphabetical via
+    ///   canonical-JSON).
+    /// - All 14 capability extension strings (the advertised set
+    ///   per Arc 2 Step 0 recon Q2; two further §8.15 vocabulary
+    ///   entries — `invite-lineage-v1` and `reporter-context-v1` —
+    ///   remain intentionally omitted because their endpoints aren't
+    ///   shipped).
+    /// - The four namespace keys (`tools.aurora.admin`, `.moderator`,
+    ///   `.ops`, `.superadmin`) and every endpoint within each.
+    /// - `implementation` literal "aurora-locus" and the pinned
+    ///   `version` string from CARGO_PKG_VERSION (bumped in lockstep
+    ///   with the cycle).
+    ///
+    /// Determinism rationale: `serde_json::Map` defaults to a
+    /// `BTreeMap` (no `preserve_order` feature) so namespace keys
+    /// inside `families` come out alphabetically; `extensions` is
+    /// `Vec<CapabilityExtension>` with hardcoded declaration order;
+    /// endpoint arrays inside `families` preserve the JSON-literal
+    /// source order. No `HashMap` iteration anywhere on the wire
+    /// path.
+    #[tokio::test]
+    async fn describe_capabilities_snapshot() {
+        let ctx = create_test_context().await;
+        let resp = describe_capabilities(State(ctx), admin_test_auth())
+            .await
+            .unwrap()
+            .0;
+        let actual = canonical_json(&resp);
+        let expected = concat!(
+            r#"{"#,
+            // ---- extensions: 14 strings in Vec declaration order ----
+            r#""extensions":["#,
+            r#"{"name":"subject-context-v1"},"#,
+            r#"{"name":"moderator-activity-v1"},"#,
+            r#"{"name":"subject-history-v1"},"#,
+            r#"{"name":"appeals-v1"},"#,
+            r#"{"name":"instance-metrics-v1"},"#,
+            r#"{"name":"mod-events-emit-v1"},"#,
+            r#"{"name":"batch-takedown-v1"},"#,
+            r#"{"name":"trigger-password-reset-v1"},"#,
+            r#"{"name":"moderation-metrics-v1"},"#,
+            r#"{"name":"queue-stats-v1"},"#,
+            r#"{"name":"audit-trail-v1"},"#,
+            r#"{"name":"forensic-export-v1"},"#,
+            r#"{"name":"mod-events-stream-v1"},"#,
+            r#"{"name":"runtime-settings-v1"}"#,
+            r#"],"#,
+            // ---- families: 4 namespaces, alphabetical keys ----
+            r#""families":{"#,
+            // tools.aurora.admin (15 endpoints)
+            r#""tools.aurora.admin":["#,
+            r#""emitEvent","#,
+            r#""batchTakedownAccounts","#,
+            r#""batchSuspendAccounts","#,
+            r#""batchRestoreAccounts","#,
+            r#""batchTakedownRecords","#,
+            r#""batchApplyLabel","#,
+            r#""batchRemoveLabel","#,
+            r#""triggerPasswordReset","#,
+            r#""getQueueStats","#,
+            r#""getModerationMetrics","#,
+            r#""getAuditTrail","#,
+            r#""exportAccountForensic","#,
+            r#""subscribeModEvents","#,
+            r#""getRuntimeSetting","#,
+            r#""setRuntimeSetting""#,
+            r#"],"#,
+            // tools.aurora.moderator (7 endpoints)
+            r#""tools.aurora.moderator":["#,
+            r#""queryEvents","#,
+            r#""getEvent","#,
+            r#""queryStatuses","#,
+            r#""getSubjectContext","#,
+            r#""getSubjectHistory","#,
+            r#""listAppeals","#,
+            r#""getAppeal""#,
+            r#"],"#,
+            // tools.aurora.ops (32 endpoints)
+            r#""tools.aurora.ops":["#,
+            r#""getStats","#,
+            r#""listAccounts","#,
+            r#""getInstanceMetrics","#,
+            r#""getValidationFailures","#,
+            r#""getSystemHealth","#,
+            r#""getDatabaseStatus","#,
+            r#""getResourceUsage","#,
+            r#""listBackgroundJobs","#,
+            r#""runHealthChecks","#,
+            r#""getVersionInfo","#,
+            r#""getSystemMetrics","#,
+            r#""getNonceStoreStatus","#,
+            r#""cleanupNonceStores","#,
+            r#""getBlobStatistics","#,
+            r#""listBlobs","#,
+            r#""deleteBlob","#,
+            r#""quarantineBlob","#,
+            r#""restoreBlob","#,
+            r#""runBlobGC","#,
+            r#""getBlobQuotas","#,
+            r#""getSequencerStatus","#,
+            r#""pauseSequencer","#,
+            r#""resumeSequencer","#,
+            r#""resetSequencerCursor","#,
+            r#""rebuildSequencer","#,
+            r#""getRateLimitConfig","#,
+            r#""getRateLimitStatus","#,
+            r#""cleanupRateLimitState","#,
+            r#""getFederationStatus","#,
+            r#""getRelayConfig","#,
+            r#""listKnownInstances","#,
+            r#""triggerPdsDiscovery""#,
+            r#"],"#,
+            // tools.aurora.superadmin (2 endpoints)
+            r#""tools.aurora.superadmin":["#,
+            r#""grantRole","#,
+            r#""revokeRole""#,
+            r#"]"#,
+            r#"},"#,
+            // ---- implementation, version (literals) ----
+            r#""implementation":"aurora-locus","#,
+            r#""version":"0.2.0""#,
+            r#"}"#,
+        );
+        assert_eq!(
+            actual, expected,
+            "describeCapabilities wire shape changed — \
+             update the snapshot AND the §6.3.1 commitment if the \
+             change is intentional, otherwise revert"
+        );
+    }
 
     #[tokio::test]
     async fn test_describe_capabilities_returns_expected_shape() {
