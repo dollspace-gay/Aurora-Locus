@@ -7,6 +7,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Arc 3: Audit-trail read contract.**
+  `tools.aurora.admin.getAuditTrail` is committed as the fifth
+  stability surface under the v0.3 contract-lockdown framework.
+  The endpoint exposes `cascadeSnapshotIds` on the wire
+  (load-bearing for independent chain verification per
+  `docs/operator/audit-chain-verification.md`), ships a
+  seven-filter set (`actor_did`, `action`, `subject_did`,
+  `subject_uri`, `subject_cid`, `after_created`, `before_created`)
+  with `subject_cid` newly added in this cycle, and pins
+  pagination/verification semantics via doc-comment commitment
+  on `GetAuditTrailOutput` (literal phrase
+  "audit-trail read contract is committed"). The wire-to-canonical
+  bridge documentation enables external consumers to recompute
+  SHA-256 hashes independently from response data, with all
+  transformation rules verified against production behavior by
+  `tests/audit_chain_canonical_verification.rs` (six worked
+  examples with reproducible hashes plus seven production-roundtrip
+  tests). Drift caught by `tests/contract_phrases.rs` (sixth
+  phrase added) and the structural lint from Arc 2.
+
+  Operator summary at `docs/operator/contract-stability.md`
+  (now five committed surfaces).
+
 - **Arc 2: Contract lockdown.** Aurora-Locus v0.3 commits to four
   stability contracts on its admin-and-capability surfaces:
   Subject vocabulary stability (canonical Aurora `Subject` and

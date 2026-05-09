@@ -206,6 +206,27 @@ fn audit_chain_module_has_action_id_contract_phrase() {
 }
 
 // ====================================================================
+// Audit-trail read contract — sixth phrase, added Arc 3 Step 3
+// (§7.3.1, §7.4.3)
+// ====================================================================
+
+#[test]
+fn get_audit_trail_output_has_audit_trail_read_phrase() {
+    let path = "src/api/aurora_admin.rs";
+    let contents = fs::read_to_string(path).unwrap();
+    // Brace-anchored per Arc 2 Step 4 lesson: bare
+    // `pub struct GetAuditTrailOutput` would also substring-match
+    // `pub struct GetAuditTrailOutputThing`. Anchor on the open
+    // brace to nail the actual declaration.
+    assert_phrase_in_docblock_before(
+        path,
+        &contents,
+        "pub struct GetAuditTrailOutput {",
+        "audit-trail read contract is committed",
+    );
+}
+
+// ====================================================================
 // Operator-facing doc existence + non-emptiness
 // ====================================================================
 

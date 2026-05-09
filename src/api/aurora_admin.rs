@@ -2627,6 +2627,49 @@ pub struct GetAuditTrailParams {
 /// `chain_verified_through` is the highest sequence covered by the
 /// verification window and is meaningful only when `chain_verified` is
 /// true.
+///
+/// # Stability commitment
+///
+/// Per `docs/V03_DESIGN.md` §7.3.1: audit-trail read contract is committed.
+/// The following are stable across releases:
+///
+/// - **Endpoint identity**: `tools.aurora.admin.getAuditTrail`, GET,
+///   `AdminAuthContext` with `Moderator+` role gate.
+/// - **Filter set** (seven fields, AND-combined): `actor_did`,
+///   `action`, `subject_did`, `subject_uri`, `subject_cid`,
+///   `after_created`, `before_created`. `subject_cid` was added in
+///   the v0.3 cycle (Arc 3 Step 0.5); the other six predate.
+/// - **Response shape**: this struct's four fields (`items`,
+///   `cursor`, `chainVerified`, `chainVerifiedThrough`).
+/// - **Per-entry shape**: `AuditEntry`, including `cascadeSnapshotIds`
+///   which Arc 3 Step 1 added on the wire to enable independent
+///   chain verification for batch entries.
+/// - **Pagination**: forward-only, newest-first
+///   (`ORDER BY created_at DESC, id DESC`); base64-encoded
+///   `CursorPosition` (composite of `after_created` + `after_id` for
+///   tie-stable ordering); default limit 50, max 100, min 1; absent
+///   `cursor` on the response signals end-of-results.
+/// - **Verification**: `chainVerified` is computed over rows
+///   `[1..head_seq]` on every request (whole-chain re-verification);
+///   `chainVerifiedThrough` is `head_seq` on success or
+///   `failing_sequence - 1` on per-row / linkage / gap failure
+///   (saturating_sub at seq=1). Per-entry `verified` is a separate
+///   per-row hash recompute, independent of the chain-level result.
+///
+/// New filters and new top-level fields may be added additively;
+/// removal of any committed surface is a breaking change.
+///
+/// **Wire-to-canonical bridge** for independent chain verification:
+/// `docs/operator/audit-chain-verification.md`. Consumers reading
+/// this response and recomputing SHA-256 hashes themselves should
+/// follow the per-variant Subject decomposition rules and the
+/// stringified-i64 → numeric-i64 conversion documented there.
+///
+/// Snapshot tests in `tests/audit_chain_canonical_verification.rs`
+/// (Step 2) and the cascade roundtrip test
+/// `get_audit_trail_round_trips_cascade_snapshot_ids` (Step 1) pin
+/// the wire format. Contract-phrase test in
+/// `tests/contract_phrases.rs` pins the commitment phrase above.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetAuditTrailOutput {
@@ -4794,6 +4837,390 @@ mod tests {
              (JS-precision parity); got section: {}",
             cascade_section,
         );
+    }
+
+    // ====================================================================
+    // Arc 3 Step 3 (§7.4.3) — coverage gap closure for getAuditTrail.
+    // Seven tests covering pagination edges, filter combinations,
+    // malformed inputs, and per-entry verified-flag independence.
+    // Each test exercises the production handler end-to-end.
+    // ====================================================================
+
+    /// Helper: append `n` chain entries with deterministic rationales.
+    /// Reused across the coverage-gap tests below.
+    async fn append_n_chain_entries(ctx: &AppContext, n: usize) {
+        for i in 0..n {
+            crate::admin::audit_chain::append_entry(
+                &ctx.account_db,
+                crate::admin::audit_chain::AppendEntryParams {
+                    actor_did: "did:plc:moderator",
+                    action: "TakedownAccount",
+                    subject: Some(&repo_subject("did:plc:victim")),
+                    rationale: &format!("entry-{}", i),
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    fn empty_filter_params(limit: Option<u32>, cursor: Option<String>) -> GetAuditTrailParams {
+        GetAuditTrailParams {
+            actor_did: None,
+            action: None,
+            subject_did: None,
+            subject_uri: None,
+            subject_cid: None,
+            after_created: None,
+            before_created: None,
+            pagination: PaginationParams { limit, cursor },
+        }
+    }
+
+    // ---- Gap 1: cursor round-trip ----
+    #[tokio::test]
+    async fn get_audit_trail_pagination_cursor_round_trip_equals_unpaginated() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        append_n_chain_entries(&ctx, 7).await;
+
+        // Unpaginated baseline (limit covers all 7).
+        let baseline = get_audit_trail(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(empty_filter_params(Some(100), None)),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(baseline.items.len(), 7);
+
+        // Paginate with limit=3, accumulate via cursor.
+        let mut accumulated: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= 10, "pagination loop is unbounded");
+            let page = get_audit_trail(
+                State(ctx.clone()),
+                moderator_auth(),
+                axum::extract::Query(empty_filter_params(Some(3), cursor.clone())),
+            )
+            .await
+            .unwrap()
+            .0;
+            for item in &page.items {
+                accumulated.push(item.id.clone());
+            }
+            match page.cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(
+            accumulated.len(),
+            7,
+            "paginated traversal must yield same count as unpaginated"
+        );
+        let baseline_ids: Vec<String> = baseline.items.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(
+            accumulated, baseline_ids,
+            "paginated id sequence must equal unpaginated id sequence"
+        );
+    }
+
+    // ---- Gap 2: multi-filter combination (3+ filters AND-combined) ----
+    #[tokio::test]
+    async fn get_audit_trail_three_way_filter_and_combination() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        // Two actors × two actions × two subject_dids = 8 entries.
+        let actors = ["did:plc:m1", "did:plc:m2"];
+        let actions = ["TakedownAccount", "RestoreAccount"];
+        let subjects = ["did:plc:s1", "did:plc:s2"];
+        for actor in &actors {
+            for action in &actions {
+                for subj in &subjects {
+                    crate::admin::audit_chain::append_entry(
+                        &ctx.account_db,
+                        crate::admin::audit_chain::AppendEntryParams {
+                            actor_did: actor,
+                            action,
+                            subject: Some(&repo_subject(subj)),
+                            rationale: &format!("{}+{}+{}", actor, action, subj),
+                            snapshot_id: None,
+                            event_id: None,
+                            cascade_subjects: &[],
+                            cascade_snapshot_ids: &[],
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+        // Filter on actor_did=m1 AND action=TakedownAccount AND
+        // subject_did=s1 — exactly one match.
+        let resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: Some("did:plc:m1".to_string()),
+                action: Some("TakedownAccount".to_string()),
+                subject_did: Some("did:plc:s1".to_string()),
+                subject_uri: None,
+                subject_cid: None,
+                after_created: None,
+                before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "three-way AND must collapse 8 entries to exactly one"
+        );
+        let item = &resp.items[0];
+        assert_eq!(item.actor_did, "did:plc:m1");
+        assert_eq!(item.action, "TakedownAccount");
+        assert_eq!(item.rationale, "did:plc:m1+TakedownAccount+did:plc:s1");
+    }
+
+    // ---- Gap 3: time-range filters ----
+    #[tokio::test]
+    async fn get_audit_trail_time_range_window_filters_strictly() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        // Append 5 entries; record their actual stored timestamps.
+        // append_entry uses Utc::now() so entries land at the
+        // wall-clock instant of insertion. Stagger by sleeps to make
+        // the timestamps distinguishable at sub-millisecond resolution.
+        let mut timestamps: Vec<String> = Vec::new();
+        for i in 0..5 {
+            crate::admin::audit_chain::append_entry(
+                &ctx.account_db,
+                crate::admin::audit_chain::AppendEntryParams {
+                    actor_did: "did:plc:moderator",
+                    action: "TakedownAccount",
+                    subject: Some(&repo_subject("did:plc:victim")),
+                    rationale: &format!("entry-{}", i),
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // Read the just-inserted row's timestamp.
+            use sqlx::Row as _;
+            let r = sqlx::query("SELECT created_at FROM audit_chain_entry WHERE sequence = $1")
+                .bind((i + 1) as i64)
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+            timestamps.push(r.try_get("created_at").unwrap());
+        }
+        // Window = [timestamp[1], timestamp[3]] (inclusive both ends
+        // per the handler's `>=` / `<=` semantics). Should return
+        // entries 2, 3, 4 (sequences 2/3/4, three rows).
+        let resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: None,
+                subject_uri: None,
+                subject_cid: None,
+                after_created: Some(timestamps[1].clone()),
+                before_created: Some(timestamps[3].clone()),
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            resp.items.len(),
+            3,
+            "window [{}, {}] must include 3 entries; got {}",
+            timestamps[1],
+            timestamps[3],
+            resp.items.len()
+        );
+        // Entries are returned newest-first; rationales are entry-1,
+        // entry-2, entry-3 (sequence 2, 3, 4) — newest-first by
+        // created_at means entry-3 first.
+        let rationales: Vec<&str> = resp.items.iter().map(|e| e.rationale.as_str()).collect();
+        assert!(rationales.iter().any(|r| *r == "entry-1"));
+        assert!(rationales.iter().any(|r| *r == "entry-2"));
+        assert!(rationales.iter().any(|r| *r == "entry-3"));
+        assert!(!rationales.iter().any(|r| *r == "entry-0"));
+        assert!(!rationales.iter().any(|r| *r == "entry-4"));
+    }
+
+    // ---- Gap 4: malformed cursor ----
+    #[tokio::test]
+    async fn get_audit_trail_malformed_cursor_returns_outdated_cursor_error() {
+        use base64::Engine as _;
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        append_n_chain_entries(&ctx, 3).await;
+
+        // Three flavors of malformed:
+        //  (a) non-base64 garbage
+        //  (b) base64 of garbage bytes (not valid JSON)
+        //  (c) base64 of valid JSON but wrong shape
+        let bad_cursors = [
+            "not!base64@@@".to_string(),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"\xff\xff\xff\xff"),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"unrelated\":\"value\"}"),
+        ];
+        for bad in &bad_cursors {
+            let result = get_audit_trail(
+                State(ctx.clone()),
+                moderator_auth(),
+                axum::extract::Query(empty_filter_params(None, Some(bad.clone()))),
+            )
+            .await;
+            match result {
+                Err((status, body)) => {
+                    assert_eq!(
+                        status,
+                        StatusCode::BAD_REQUEST,
+                        "malformed cursor `{}` must produce 400; got {:?}",
+                        bad,
+                        status,
+                    );
+                    let error_field = body
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    assert_eq!(
+                        error_field, "OutdatedCursor",
+                        "malformed cursor `{}` must surface OutdatedCursor in the error field; got: {:?}",
+                        bad, body,
+                    );
+                }
+                Ok(_) => panic!(
+                    "malformed cursor `{}` must produce an error, not Ok",
+                    bad
+                ),
+            }
+        }
+    }
+
+    // ---- Gap 5: limit cap + has_more ----
+    #[tokio::test]
+    async fn get_audit_trail_caps_limit_at_max_and_signals_more_via_cursor() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        // 105 entries — enough to exceed the 100 cap and leave 5 more.
+        append_n_chain_entries(&ctx, 105).await;
+
+        // Request limit=200; effective cap is 100 (PaginationParams::MAX_LIMIT).
+        let resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(empty_filter_params(Some(200), None)),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            resp.items.len(),
+            100,
+            "limit=200 must be capped at the MAX_LIMIT of 100"
+        );
+        assert!(
+            resp.cursor.is_some(),
+            "with 105 entries and a 100-row page, cursor must be set to signal there's more"
+        );
+    }
+
+    // ---- Gap 6: cursor beyond latest entry ----
+    #[tokio::test]
+    async fn get_audit_trail_cursor_beyond_latest_returns_empty_no_error() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        append_n_chain_entries(&ctx, 3).await;
+        // Construct a cursor pointing at a past timestamp + below
+        // every existing id. The cursor's WHERE clause is
+        // `created_at < ? OR (created_at = ? AND id < ?)`, so a
+        // VERY OLD timestamp returns zero items.
+        let past_cursor = CursorPosition {
+            after_created: chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            after_id: 0,
+        }
+        .encode();
+        let resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(empty_filter_params(None, Some(past_cursor))),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(
+            resp.items.is_empty(),
+            "cursor pointing past tail of newest-first chain must return empty items"
+        );
+        assert!(
+            resp.cursor.is_none(),
+            "empty page must not include a continuation cursor"
+        );
+    }
+
+    // ---- Gap 7: mixed-page verified-flag independence ----
+    #[tokio::test]
+    async fn get_audit_trail_per_entry_verified_flag_independent_within_a_page() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        append_n_chain_entries(&ctx, 3).await;
+        // Tamper sequence 2's rationale via the consolidated helper
+        // (Step 0.6); the row's recomputed hash diverges from its
+        // stored current_hash, so verify_entry returns false for it.
+        crate::admin::audit_chain::corrupt_entry_rationale(
+            &ctx.account_db,
+            crate::admin::audit_chain::EntryRef::Sequence(2),
+            "tampered-by-test",
+        )
+        .await
+        .unwrap();
+        let resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(empty_filter_params(None, None)),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.items.len(), 3);
+        // Items are newest-first: sequence 3, 2, 1.
+        let by_seq: std::collections::HashMap<i64, bool> = resp
+            .items
+            .iter()
+            .map(|e| (e.sequence, e.verified))
+            .collect();
+        assert_eq!(by_seq.get(&1), Some(&true), "row 1 must verify cleanly");
+        assert_eq!(
+            by_seq.get(&2),
+            Some(&false),
+            "row 2 (the tampered row) must surface verified=false"
+        );
+        assert_eq!(by_seq.get(&3), Some(&true), "row 3 must verify cleanly");
     }
 
     // CR-8 / chainlink #120: chainVerifiedThrough must surface the

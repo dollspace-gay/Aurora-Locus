@@ -196,11 +196,18 @@ isn't on the allowlist) fails the lint.
 ## 5. Audit-trail read
 
 The `tools.aurora.admin.getAuditTrail` response shape is stable.
-Pagination semantics, the committed filter set
-(`actor_did`, `action`, `subject_did`, `subject_uri`, `subject_cid`,
-`after_created`, `before_created`), and per-entry wire format are
-locked. New per-entry fields may be added; existing fields will
-not change name, type, or representation.
+The seven-filter set is locked (AND-combined): `actor_did`,
+`action`, `subject_did`, `subject_uri`, `subject_cid`,
+`after_created`, `before_created`. (`subject_cid` was added in
+the v0.3 cycle; the other six predate.) Pagination semantics
+(forward-only, newest-first, base64-encoded `CursorPosition`
+cursor, default 50 max 100), per-entry wire format (`AuditEntry`
+with `cascadeSnapshotIds`), and verification semantics
+(`chainVerified` over the whole chain, `chainVerifiedThrough` =
+head sequence on success or `failing_sequence - 1` on chain-level
+failure) are all locked. New per-entry fields and new top-level
+fields may be added additively; removal of any committed surface
+is breaking.
 
 The wire-to-canonical bridge (the transformation rules an external
 consumer needs to independently verify chain hashes) is documented
@@ -210,11 +217,11 @@ decomposition rules, and six worked examples with reproducible
 SHA-256 hashes.
 
 Canonical commitment: `crate::api::aurora_admin::GetAuditTrailOutput`
-doc comment (committed in Arc 3 Step 3). Drift on the canonical
-form is caught by
-`tests/audit_chain_canonical_verification.rs`, which reproduces
-the documented transformation rules + worked-example hashes
-against the production writer.
+doc comment. Drift on the contract phrase is caught by
+`tests/contract_phrases.rs`; drift on the canonical form is
+caught by `tests/audit_chain_canonical_verification.rs`, which
+reproduces the documented transformation rules + worked-example
+hashes against the production writer.
 
 ## Out of scope
 
