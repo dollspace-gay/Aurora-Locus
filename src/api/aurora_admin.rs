@@ -2603,6 +2603,14 @@ pub struct GetAuditTrailParams {
     pub subject_did: Option<String>,
     #[serde(default)]
     pub subject_uri: Option<String>,
+    /// Filter to entries with `subject_cid` matching this CID. Useful
+    /// for finding audit entries about a specific blob (Subject::Blob
+    /// carries CID; Subject::Record's CID is also indexed here when
+    /// present). Added Arc 3 Step 0.5 (§7.4.0.5) — the prior six
+    /// filters omitted CID despite it being a primary identifier for
+    /// blob subjects; v0.2 corpus was silent on the omission.
+    #[serde(default)]
+    pub subject_cid: Option<String>,
     #[serde(default)]
     pub after_created: Option<String>,
     #[serde(default)]
@@ -2664,6 +2672,10 @@ pub async fn get_audit_trail(
     if let Some(s) = &params.subject_uri {
         clauses.push("subject_uri = ?");
         binds.push(s.clone());
+    }
+    if let Some(c) = &params.subject_cid {
+        clauses.push("subject_cid = ?");
+        binds.push(c.clone());
     }
     if let Some(a) = &params.after_created {
         clauses.push("created_at >= ?");
@@ -4441,6 +4453,7 @@ mod tests {
                 action: None,
                 subject_did: None,
                 subject_uri: None,
+                subject_cid: None,
                 after_created: None,
                 before_created: None,
                 pagination: PaginationParams::default(),
@@ -4494,12 +4507,168 @@ mod tests {
             axum::extract::Query(GetAuditTrailParams {
                 actor_did: Some("did:plc:m1".to_string()),
                 action: None, subject_did: None, subject_uri: None,
+                subject_cid: None,
                 after_created: None, before_created: None,
                 pagination: PaginationParams::default(),
             }),
         )
         .await.unwrap().0;
         assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].actor_did, "did:plc:m1");
+    }
+
+    // Arc 3 Step 0.5 (§7.4.0.5) — `subject_cid` filter coverage. The
+    // recon report at /tmp/arc3_recon.md Q5 found no documentation
+    // either for or against the prior six-filter omission of CID, so
+    // the conditional fired and Step 0.5 added the seventh filter.
+    // Two tests: filter alone, filter combined with another.
+
+    #[tokio::test]
+    async fn get_audit_trail_filters_by_subject_cid() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        // Two entries with distinct subject_cids (Subject::Blob carries
+        // the CID through to the chain row's subject_cid column via
+        // append_entry's flat-column mapping).
+        let target_cid = "bafyblobtarget";
+        let other_cid = "bafyblobother";
+        crate::admin::audit_chain::append_entry(
+            &ctx.account_db,
+            crate::admin::audit_chain::AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownAccount",
+                subject: Some(&Subject::Blob {
+                    did: "did:plc:victim".to_string(),
+                    cid: target_cid.to_string(),
+                    record_uri: None,
+                }),
+                rationale: "target",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+        crate::admin::audit_chain::append_entry(
+            &ctx.account_db,
+            crate::admin::audit_chain::AppendEntryParams {
+                actor_did: "did:plc:m1",
+                action: "TakedownAccount",
+                subject: Some(&Subject::Blob {
+                    did: "did:plc:victim".to_string(),
+                    cid: other_cid.to_string(),
+                    record_uri: None,
+                }),
+                rationale: "other",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+
+        // Filter to target_cid only — exactly one entry returned.
+        let filtered = get_audit_trail(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: None,
+                subject_uri: None,
+                subject_cid: Some(target_cid.to_string()),
+                after_created: None,
+                before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].rationale, "target");
+
+        // Omitting the filter — both entries returned.
+        let unfiltered = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: None,
+                subject_uri: None,
+                subject_cid: None,
+                after_created: None,
+                before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(unfiltered.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_audit_trail_subject_cid_combines_with_actor_did_filter() {
+        // Four entries: 2 actors × 2 subject_cids. Filtering by both
+        // actor_did AND subject_cid must AND the predicates — only
+        // the one entry matching both should be returned.
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:victim", "victim.test").await;
+        let cid_a = "bafyblobA";
+        let cid_b = "bafyblobB";
+        for (actor, cid, rationale) in &[
+            ("did:plc:m1", cid_a, "m1+A"),
+            ("did:plc:m1", cid_b, "m1+B"),
+            ("did:plc:m2", cid_a, "m2+A"),
+            ("did:plc:m2", cid_b, "m2+B"),
+        ] {
+            crate::admin::audit_chain::append_entry(
+                &ctx.account_db,
+                crate::admin::audit_chain::AppendEntryParams {
+                    actor_did: *actor,
+                    action: "TakedownAccount",
+                    subject: Some(&Subject::Blob {
+                        did: "did:plc:victim".to_string(),
+                        cid: cid.to_string(),
+                        record_uri: None,
+                    }),
+                    rationale,
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Filter by actor_did=m1 AND subject_cid=A — only "m1+A".
+        let resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: Some("did:plc:m1".to_string()),
+                action: None,
+                subject_did: None,
+                subject_uri: None,
+                subject_cid: Some(cid_a.to_string()),
+                after_created: None,
+                before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].rationale, "m1+A");
         assert_eq!(resp.items[0].actor_did, "did:plc:m1");
     }
 
@@ -4537,6 +4706,7 @@ mod tests {
                 action: None,
                 subject_did: None,
                 subject_uri: None,
+                subject_cid: None,
                 after_created: None,
                 before_created: None,
                 pagination: PaginationParams::default(),
@@ -4594,6 +4764,7 @@ mod tests {
                 action: None,
                 subject_did: None,
                 subject_uri: None,
+                subject_cid: None,
                 after_created: None,
                 before_created: None,
                 pagination: PaginationParams::default(),
