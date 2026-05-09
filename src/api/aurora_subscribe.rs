@@ -516,6 +516,21 @@ async fn fetch_new_chain_entries(
         let cascade_str: Option<String> = row.try_get("cascade_subjects").ok().flatten();
         let cascade_snapshot_ids_str: Option<String> =
             row.try_get("cascade_snapshot_ids").ok().flatten();
+        // Parse on-disk numeric JSON for the wire field. The
+        // verify_entry call below still receives the raw JSON
+        // string because the canonical hash sees that form.
+        // Mirrors the handler at aurora_admin.rs::get_audit_trail —
+        // both consumer sites must populate cascade_snapshot_ids
+        // identically or the subscribe-vs-handler wire shapes
+        // diverge.
+        let cascade_snapshot_ids_i64: Vec<Option<i64>> = cascade_snapshot_ids_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let cascade_snapshot_ids: Vec<Option<String>> = cascade_snapshot_ids_i64
+            .iter()
+            .map(|opt| opt.map(|v| v.to_string()))
+            .collect();
 
         let verified = crate::admin::audit_chain::verify_entry(
             sequence,
@@ -558,6 +573,7 @@ async fn fetch_new_chain_entries(
             previous_hash,
             verified,
             cascade_subjects,
+            cascade_snapshot_ids,
         });
     }
     Ok(out)
@@ -719,6 +735,7 @@ mod tests {
             previous_hash: None,
             verified: true,
             cascade_subjects: Vec::new(),
+            cascade_snapshot_ids: Vec::new(),
         }
     }
 
@@ -821,6 +838,7 @@ mod tests {
                 previous_hash: Some("p".to_string()),
                 verified: true,
                 cascade_subjects: Vec::new(),
+                cascade_snapshot_ids: Vec::new(),
             },
             sequence: 42,
         };
@@ -870,6 +888,7 @@ mod tests {
             previous_hash: None,
             verified: true,
             cascade_subjects: Vec::new(),
+            cascade_snapshot_ids: Vec::new(),
         };
         let standalone = serde_json::to_value(&entry).unwrap();
         let wrapped = serde_json::to_value(&SubscribeMessage::AuditEntry {

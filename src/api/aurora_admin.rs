@@ -2767,6 +2767,19 @@ pub async fn get_audit_trail(
             .unwrap_or_default();
         let cascade_snapshot_ids_str: Option<String> =
             row.try_get("cascade_snapshot_ids").ok().flatten();
+        // Parse the on-disk numeric JSON for the wire field. The
+        // verify_entry call below still receives the raw string
+        // form because the canonical hash sees the JSON-encoded
+        // string nested inside the canonical object (Arc 3 Step 2
+        // documents the wire-vs-canonical asymmetry).
+        let cascade_snapshot_ids_i64: Vec<Option<i64>> = cascade_snapshot_ids_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let cascade_snapshot_ids: Vec<Option<String>> = cascade_snapshot_ids_i64
+            .iter()
+            .map(|opt| opt.map(|v| v.to_string()))
+            .collect();
 
         let verified = audit_chain::verify_entry(
             sequence,
@@ -2805,6 +2818,7 @@ pub async fn get_audit_trail(
             previous_hash,
             verified,
             cascade_subjects,
+            cascade_snapshot_ids,
         });
     }
 
@@ -4670,6 +4684,116 @@ mod tests {
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].rationale, "m1+A");
         assert_eq!(resp.items[0].actor_did, "did:plc:m1");
+    }
+
+    // Arc 3 Step 1 (§7.4.1) — `cascade_snapshot_ids` round-trip from
+    // batch-event producer to getAuditTrail wire response. The
+    // existing `batch_takedown_captures_per_subject_snapshots` test
+    // pins the producer side (chain row's column populated with
+    // i64s). This test pins the CONSUMER side: getAuditTrail surfaces
+    // the column on the wire as `Vec<Option<String>>` (stringified
+    // for JS-precision parity with snapshot_id / event_id).
+    #[tokio::test]
+    async fn get_audit_trail_round_trips_cascade_snapshot_ids() {
+        let ctx = create_test_context().await;
+        for i in 0..3 {
+            seed_actor(&ctx, &format!("did:plc:c{}", i), &format!("c{}.test", i)).await;
+        }
+        // Trigger a batch event that produces cascade subjects + ids.
+        let _batch_resp = batch_takedown_accounts(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(BatchAccountsInput {
+                dids: vec![
+                    "did:plc:c0".to_string(),
+                    "did:plc:c1".to_string(),
+                    "did:plc:c2".to_string(),
+                ],
+                rationale: "cascade-roundtrip".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        // Fetch via getAuditTrail.
+        let trail_resp = get_audit_trail(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: None,
+                subject_uri: None,
+                subject_cid: None,
+                after_created: None,
+                before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        // Find the batch entry. Batch action is "account.batch_takedown"
+        // per the producer at aurora_admin.rs:1168.
+        let batch_entry = trail_resp
+            .items
+            .iter()
+            .find(|e| e.action == "account.batch_takedown")
+            .expect("trail must include the batch entry just emitted");
+
+        // Wire-side type pin: cascade_snapshot_ids is Vec<Option<String>>.
+        // The batch produced 3 snapshots, one per subject — none should
+        // be None (every subject was snapshottable).
+        assert_eq!(
+            batch_entry.cascade_snapshot_ids.len(),
+            3,
+            "cascade_snapshot_ids must mirror cascade_subjects length \
+             (3 batch subjects → 3 snapshot ids)"
+        );
+        assert_eq!(
+            batch_entry.cascade_subjects.len(),
+            batch_entry.cascade_snapshot_ids.len(),
+            "cascade_snapshot_ids must be paired by index with cascade_subjects"
+        );
+        for snap_id in &batch_entry.cascade_snapshot_ids {
+            let id_str = snap_id
+                .as_deref()
+                .expect("every batch snapshot id should be Some for a Repo subject");
+            // Stringified i64 — must parse cleanly back to i64.
+            id_str
+                .parse::<i64>()
+                .expect("wire form is the i64 stringified, must parse");
+        }
+
+        // Wire-shape pin: serialize and confirm the JSON contains the
+        // camelCase key with stringified array values. This is the
+        // load-bearing assertion that the field landed on the wire
+        // in the documented form.
+        let wire = serde_json::to_string(&batch_entry).unwrap();
+        assert!(
+            wire.contains("\"cascadeSnapshotIds\":["),
+            "wire shape must include camelCase `cascadeSnapshotIds` array; got: {}",
+            wire,
+        );
+        // String-quoted values rather than bare numbers — assert by
+        // checking for `"<digit>` (a string-quoted digit) inside the
+        // cascadeSnapshotIds array. If serialization regressed to bare
+        // i64s (`[7,12,...]`), this assertion fails.
+        let cascade_section = wire
+            .split("\"cascadeSnapshotIds\":[")
+            .nth(1)
+            .unwrap_or("")
+            .split(']')
+            .next()
+            .unwrap_or("");
+        assert!(
+            cascade_section.contains("\""),
+            "cascadeSnapshotIds must contain string-quoted values \
+             (JS-precision parity); got section: {}",
+            cascade_section,
+        );
     }
 
     // CR-8 / chainlink #120: chainVerifiedThrough must surface the

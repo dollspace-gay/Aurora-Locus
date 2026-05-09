@@ -123,6 +123,28 @@ pub struct AuditEntry {
     pub previous_hash: Option<String>,
     pub verified: bool,
     pub cascade_subjects: Vec<Subject>,
+
+    /// Snapshot IDs from the cascade subjects, paired by index with
+    /// `cascade_subjects`. Populated when this entry was produced by a
+    /// batch event; empty Vec for non-cascade entries. Each element
+    /// is `None` when the subject at that index wasn't snapshottable
+    /// at decision time, otherwise `Some(<id>)`.
+    ///
+    /// Wire form: stringified i64 values for JS-precision parity with
+    /// `snapshot_id` and `event_id`. Consumers decoding in JavaScript
+    /// should use the string values directly or convert via
+    /// `BigInt(value)` rather than `Number(value)` to avoid precision
+    /// loss above `Number.MAX_SAFE_INTEGER` (2^53 - 1).
+    ///
+    /// On-disk shape (in the `audit_chain_entry.cascade_snapshot_ids`
+    /// TEXT column) is a JSON array of i64 numbers, e.g.
+    /// `[7, null, 12]`, with SQL NULL when empty. The row decoder
+    /// converts to stringified form for the wire. The canonical hash
+    /// form (used for chain verification) sees the on-disk
+    /// JSON-encoded string, NOT the wire form — this asymmetry is
+    /// documented in `docs/operator/audit-chain-verification.md`
+    /// (Arc 3 Step 2).
+    pub cascade_snapshot_ids: Vec<Option<String>>,
 }
 
 /// Compact subject capture for snapshot content. v0.2 ships the
