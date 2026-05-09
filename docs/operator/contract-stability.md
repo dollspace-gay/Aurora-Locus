@@ -24,6 +24,7 @@ committed surface, fails CI loudly.
 | 2 | `describeCapabilities` response | Field names + shapes additive only | `crate::api::admin::DescribeCapabilitiesResponse` doc comment | `describe_capabilities_snapshot` in `src/api/admin.rs` |
 | 3 | Capability strings | `<kebab-family>-v<integer>`; breaking changes ship as new version | `crate::api::admin::aurora_capability_extensions` doc comment | `describe_capabilities_snapshot` (full set) + `contract_phrases` (versioning convention) |
 | 4 | Action-ID surfacing | Aurora-namespace handlers writing chain entries surface `auditEntryId` (and `eventId` if also writing event rows) | `crate::admin::audit_chain` module doc | `tests/admin_handler_contract.rs` (structural lint) |
+| 5 | Audit-trail read | Wire shape, filter set, and canonical hash-input form for `getAuditTrail`; external chain verification reproducible per [audit-chain-verification.md](audit-chain-verification.md) | `crate::api::aurora_admin::GetAuditTrailOutput` doc comment | `tests/audit_chain_canonical_verification.rs` (canonical-form + worked-example hashes) |
 
 ---
 
@@ -192,9 +193,32 @@ isn't on the allowlist) fails the lint.
 
 ---
 
+## 5. Audit-trail read
+
+The `tools.aurora.admin.getAuditTrail` response shape is stable.
+Pagination semantics, the committed filter set
+(`actor_did`, `action`, `subject_did`, `subject_uri`, `subject_cid`,
+`after_created`, `before_created`), and per-entry wire format are
+locked. New per-entry fields may be added; existing fields will
+not change name, type, or representation.
+
+The wire-to-canonical bridge (the transformation rules an external
+consumer needs to independently verify chain hashes) is documented
+at [audit-chain-verification.md](audit-chain-verification.md),
+which includes the canonical hash-input shape, per-variant Subject
+decomposition rules, and six worked examples with reproducible
+SHA-256 hashes.
+
+Canonical commitment: `crate::api::aurora_admin::GetAuditTrailOutput`
+doc comment (committed in Arc 3 Step 3). Drift on the canonical
+form is caught by
+`tests/audit_chain_canonical_verification.rs`, which reproduces
+the documented transformation rules + worked-example hashes
+against the production writer.
+
 ## Out of scope
 
-Stability contracts apply to the four surfaces above only. Other
+Stability contracts apply to the five surfaces above only. Other
 admin surfaces (individual handlers' request shapes, moderation
 queue ordering, internal database schemas, log line formats) are
 **not covered** by these contracts and may change between minor

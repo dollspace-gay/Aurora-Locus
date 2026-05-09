@@ -44,6 +44,24 @@
 //! the typed-JSON convention (currently only `export_account_forensic`,
 //! which returns a binary tar response and surfaces the ID via the
 //! `X-Aurora-Audit-Entry-Id` HTTP header).
+//!
+//! # External verification
+//!
+//! Consumers verifying chain integrity independently (e.g., a
+//! third-party tool that reads `tools.aurora.admin.getAuditTrail`
+//! responses and recomputes SHA-256 hashes to confirm the chain
+//! hasn't been tampered with) should consult
+//! `docs/operator/audit-chain-verification.md` for the
+//! wire-to-canonical bridge specification, including per-variant
+//! Subject decomposition rules, the canonical hash-input shape
+//! (alphabetical key order, JSON-encoded cascade fields, numeric
+//! i64 ids in canonical form vs stringified ids on the wire), and
+//! six worked examples with byte-equal canonical forms and SHA-256
+//! hashes. The side-script at
+//! `tests/audit_chain_canonical_verification.rs` is the executable
+//! form of that document — both must agree, and the doc's worked
+//! examples are sourced from the side-script's deterministic
+//! hash captures.
 
 use crate::{admin::defs::Subject, error::PdsError};
 use chrono::{DateTime, Utc};
