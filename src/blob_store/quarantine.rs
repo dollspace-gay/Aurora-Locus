@@ -87,7 +87,10 @@ impl BlobQuarantine {
         Self { db }
     }
 
-    /// Quarantine a blob (mark as taken down)
+    /// Quarantine a blob (mark as taken down). Pool-API wrapper that
+    /// opens its own transaction; for atomic-with-chain entry, callers
+    /// should use [`Self::quarantine_blob_in_tx`] (Arc 4 §8.4.0.5 /
+    /// chainlink #131).
     pub async fn quarantine_blob(
         &self,
         cid: &str,
@@ -96,11 +99,51 @@ impl BlobQuarantine {
         quarantined_by: &str,
         legal_reference: Option<&str>,
     ) -> PdsResult<QuarantineRecord> {
+        let mut tx = self.db.begin().await?;
+        let record = Self::quarantine_blob_in_tx(
+            &mut tx,
+            cid,
+            reason,
+            details,
+            quarantined_by,
+            legal_reference,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    /// Quarantine a blob inside an existing transaction. Arc 4 §8.4.0.5
+    /// (chainlink #131) atomic-with-chain entry point: the caller
+    /// (`dispatch_action`'s `QuarantineBlob` arm) writes the chain
+    /// entry in the same tx, so a crash between the quarantine and the
+    /// chain row leaves neither, not an audit-blind quarantine.
+    ///
+    /// The existence check (`SELECT ... FROM blob_quarantine WHERE
+    /// cid = ? AND restored_at IS NULL`) runs against the wrapping tx
+    /// so it sees the tx's snapshot — correctly rejects a
+    /// double-quarantine attempt within the same tx.
+    pub async fn quarantine_blob_in_tx<'tx>(
+        tx: &mut sqlx::Transaction<'tx, sqlx::Any>,
+        cid: &str,
+        reason: QuarantineReason,
+        details: Option<&str>,
+        quarantined_by: &str,
+        legal_reference: Option<&str>,
+    ) -> PdsResult<QuarantineRecord> {
         let now = Utc::now();
 
-        // Check if already quarantined
-        let existing = self.is_quarantined(cid).await?;
-        if existing {
+        // Existence check inside the wrapping tx so the SELECT sees
+        // pending writes from the same caller (e.g., a tx that wrote
+        // a quarantine row earlier and is now trying to write
+        // another for the same cid).
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_quarantine WHERE cid = $1 AND restored_at IS NULL",
+        )
+        .bind(cid)
+        .fetch_one(&mut **tx)
+        .await?;
+        if existing > 0 {
             return Err(PdsError::Conflict(format!(
                 "Blob {} is already quarantined",
                 cid
@@ -120,17 +163,17 @@ impl BlobQuarantine {
         .bind(quarantined_by)
         .bind(now.to_rfc3339())
         .bind(legal_reference)
-        .fetch_one(&self.db)
+        .fetch_one(&mut **tx)
         .await?;
 
-        // Update blob table to mark as taken down
+        // Update blob table to mark as taken down (same tx).
         sqlx::query("UPDATE blob SET takedown = true WHERE cid = $1")
             .bind(cid)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await?;
 
         tracing::info!(
-            "Quarantined blob CID: {} by {} for reason: {:?}",
+            "Quarantined blob CID: {} by {} for reason: {:?} (in_tx)",
             cid,
             quarantined_by,
             reason
@@ -149,8 +192,22 @@ impl BlobQuarantine {
         })
     }
 
-    /// Restore a quarantined blob
+    /// Restore a quarantined blob. Pool-API wrapper; for atomic-with-chain
+    /// entry, callers should use [`Self::restore_blob_in_tx`].
     pub async fn restore_blob(&self, cid: &str, restored_by: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await?;
+        Self::restore_blob_in_tx(&mut tx, cid, restored_by).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Restore a quarantined blob inside an existing transaction.
+    /// Arc 4 §8.4.0.5 (chainlink #131) atomic-with-chain entry point.
+    pub async fn restore_blob_in_tx<'tx>(
+        tx: &mut sqlx::Transaction<'tx, sqlx::Any>,
+        cid: &str,
+        restored_by: &str,
+    ) -> PdsResult<()> {
         let now = Utc::now();
 
         let result = sqlx::query(
@@ -164,7 +221,7 @@ impl BlobQuarantine {
         .bind(now.to_rfc3339())
         .bind(restored_by)
         .bind(cid)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -174,13 +231,13 @@ impl BlobQuarantine {
             )));
         }
 
-        // Update blob table to remove takedown
+        // Update blob table to remove takedown (same tx).
         sqlx::query("UPDATE blob SET takedown = false WHERE cid = $1")
             .bind(cid)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await?;
 
-        tracing::info!("Restored blob CID: {} by {}", cid, restored_by);
+        tracing::info!("Restored blob CID: {} by {} (in_tx)", cid, restored_by);
         Ok(())
     }
 
@@ -394,5 +451,190 @@ mod tests {
         let history = quarantine.get_history("bafytest123").await.unwrap();
         assert_eq!(history.len(), 1);
         assert!(history[0].restored_at.is_some());
+    }
+
+    // ====================================================================
+    // Arc 4 §8.4.0.5 / chainlink #131 — _in_tx variants. Tests pin
+    // commit + rollback semantics for both quarantine and restore.
+    // ====================================================================
+
+    /// Stand up the schema + a single test blob row. Used by every
+    /// _in_tx test below.
+    async fn setup_blob_pool(cid: &str) -> AnyPool {
+        let db = open_test_pool().await;
+        sqlx::query(
+            "CREATE TABLE blob (
+                cid TEXT PRIMARY KEY, did TEXT NOT NULL, size INTEGER NOT NULL,
+                mime_type TEXT NOT NULL, created_at TEXT NOT NULL,
+                takedown INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE blob_quarantine (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, cid TEXT NOT NULL, reason TEXT NOT NULL,
+                details TEXT, quarantined_by TEXT NOT NULL, quarantined_at TEXT NOT NULL,
+                restored_at TEXT, restored_by TEXT, legal_reference TEXT
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO blob (cid, did, size, mime_type, created_at) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(cid)
+        .bind("did:plc:alice")
+        .bind(1024)
+        .bind("image/png")
+        .bind(Utc::now().to_rfc3339())
+        .execute(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn quarantine_blob_in_tx_rolls_back_on_caller_rollback() {
+        let db = setup_blob_pool("bafy_in_tx_rollback").await;
+        {
+            let mut tx = db.begin().await.unwrap();
+            BlobQuarantine::quarantine_blob_in_tx(
+                &mut tx,
+                "bafy_in_tx_rollback",
+                QuarantineReason::Dmca,
+                None,
+                "did:plc:m",
+                None,
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob_quarantine")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "rolled-back tx must not leave a quarantine row");
+        // The blob's takedown flag must also have rolled back.
+        let takedown: i64 = sqlx::query_scalar("SELECT takedown FROM blob WHERE cid = $1")
+            .bind("bafy_in_tx_rollback")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(takedown, 0);
+    }
+
+    #[tokio::test]
+    async fn quarantine_blob_in_tx_commits_on_caller_commit() {
+        let db = setup_blob_pool("bafy_in_tx_commit").await;
+        let mut tx = db.begin().await.unwrap();
+        let record = BlobQuarantine::quarantine_blob_in_tx(
+            &mut tx,
+            "bafy_in_tx_commit",
+            QuarantineReason::Dmca,
+            None,
+            "did:plc:m",
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(record.reason, QuarantineReason::Dmca);
+        let mgr = BlobQuarantine::new(db.clone());
+        assert!(mgr.is_quarantined("bafy_in_tx_commit").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn quarantine_blob_in_tx_rejects_double_quarantine_within_same_tx() {
+        let db = setup_blob_pool("bafy_double").await;
+        let mut tx = db.begin().await.unwrap();
+        BlobQuarantine::quarantine_blob_in_tx(
+            &mut tx,
+            "bafy_double",
+            QuarantineReason::Dmca,
+            None,
+            "did:plc:m",
+            None,
+        )
+        .await
+        .unwrap();
+        // Second call within the SAME tx must see the pending write
+        // and reject — that's the load-bearing in-tx-existence-check
+        // behaviour.
+        let err = BlobQuarantine::quarantine_blob_in_tx(
+            &mut tx,
+            "bafy_double",
+            QuarantineReason::Dmca,
+            None,
+            "did:plc:m",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PdsError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn restore_blob_in_tx_rolls_back_on_caller_rollback() {
+        let db = setup_blob_pool("bafy_restore_rollback").await;
+        // Quarantine first via the pool API so the rollback test
+        // exercises the restore-then-rollback path against an
+        // existing quarantine row.
+        BlobQuarantine::new(db.clone())
+            .quarantine_blob(
+                "bafy_restore_rollback",
+                QuarantineReason::Dmca,
+                None,
+                "did:plc:m",
+                None,
+            )
+            .await
+            .unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            BlobQuarantine::restore_blob_in_tx(&mut tx, "bafy_restore_rollback", "did:plc:m")
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+        // Quarantine row must still be active (restored_at NULL).
+        let restored: Option<String> = sqlx::query_scalar(
+            "SELECT restored_at FROM blob_quarantine WHERE cid = $1",
+        )
+        .bind("bafy_restore_rollback")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(
+            restored.is_none(),
+            "rolled-back restore must leave quarantine active"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_blob_in_tx_commits_on_caller_commit() {
+        let db = setup_blob_pool("bafy_restore_commit").await;
+        BlobQuarantine::new(db.clone())
+            .quarantine_blob(
+                "bafy_restore_commit",
+                QuarantineReason::Dmca,
+                None,
+                "did:plc:m",
+                None,
+            )
+            .await
+            .unwrap();
+        let mut tx = db.begin().await.unwrap();
+        BlobQuarantine::restore_blob_in_tx(&mut tx, "bafy_restore_commit", "did:plc:m")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let mgr = BlobQuarantine::new(db);
+        assert!(!mgr.is_quarantined("bafy_restore_commit").await.unwrap());
     }
 }

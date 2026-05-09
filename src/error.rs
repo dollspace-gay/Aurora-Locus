@@ -86,6 +86,32 @@ pub enum PdsError {
     /// 503 Service Unavailable. See chainlink #89 / docs/AURORA_DESIGN.md §5.4.1.
     #[error("Sequencer leader is on a different instance: {0}")]
     NotLeader(String),
+
+    /// Aurora Step 0.6 §2 (chainlink #130 / Arc 4): the embedded-ID action
+    /// (`ResolveAppeal`/`EscalateAppeal` and similar) was called with a
+    /// `subjects[0]` whose Subject *variant* doesn't match the variant
+    /// resolved through the appeal's foreign-key chain. Mapped to HTTP 400.
+    /// Distinct from `SubjectTargetMismatch` so operators can tell
+    /// "wrong kind of subject" apart from "right kind, wrong identifier".
+    #[error("Subject variant mismatch: expected {expected}, got {got}")]
+    SubjectVariantMismatch { expected: String, got: String },
+
+    /// Aurora Step 0.6 §2 (chainlink #130 / Arc 4): the embedded-ID action's
+    /// `subjects[0]` matches the resolved variant but its *identifier* (DID
+    /// for Repo, URI for Record, CID for Blob) doesn't. Mapped to HTTP 400.
+    /// Distinct from `SubjectVariantMismatch` so operators can tell
+    /// "wrong identifier" apart from "wrong kind of subject".
+    #[error("Subject target mismatch: expected {expected}, got {got}")]
+    SubjectTargetMismatch { expected: String, got: String },
+
+    /// Aurora Step 0.6 §2 (chainlink #130 / Arc 4): defensive — appeal row
+    /// has all three foreign-key columns NULL, so there's no target to
+    /// validate against. Today's `submit_appeal` enforces "at least one set"
+    /// via code-level invariant (no schema CHECK); orphan rows shouldn't
+    /// exist but if one slipped in via direct SQL, this surfaces it. Mapped
+    /// to HTTP 400.
+    #[error("Orphaned appeal: appeal {appeal_id} has no FK to moderation/report/quarantine")]
+    OrphanedAppeal { appeal_id: i64 },
 }
 
 /// Manual PartialEq implementation for PdsError
@@ -112,6 +138,18 @@ impl PartialEq for PdsError {
             (PdsError::AccountTakenDown(a), PdsError::AccountTakenDown(b)) => a == b,
             (PdsError::AccountSuspended(a), PdsError::AccountSuspended(b)) => a == b,
             (PdsError::NotLeader(a), PdsError::NotLeader(b)) => a == b,
+            (
+                PdsError::SubjectVariantMismatch { expected: ae, got: ag },
+                PdsError::SubjectVariantMismatch { expected: be, got: bg },
+            ) => ae == be && ag == bg,
+            (
+                PdsError::SubjectTargetMismatch { expected: ae, got: ag },
+                PdsError::SubjectTargetMismatch { expected: be, got: bg },
+            ) => ae == be && ag == bg,
+            (
+                PdsError::OrphanedAppeal { appeal_id: a },
+                PdsError::OrphanedAppeal { appeal_id: b },
+            ) => a == b,
             // Database and Io errors cannot be compared, so we use error message comparison
             (PdsError::Database(a), PdsError::Database(b)) => a.to_string() == b.to_string(),
             (PdsError::Io(a), PdsError::Io(b)) => a.to_string() == b.to_string(),

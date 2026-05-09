@@ -640,14 +640,34 @@ impl BlobStore {
         }
     }
 
-    /// Delete blob metadata from database
+    /// Delete blob metadata from database. Pool-API wrapper that opens
+    /// its own tx; for atomic-with-chain entry, callers should use
+    /// [`Self::delete_metadata_in_tx`] (Arc 4 §8.4.0.5 / Step 0.6
+    /// Branch (B) decision).
     async fn delete_metadata(&self, cid: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        Self::delete_metadata_in_tx(&mut tx, cid).await?;
+        tx.commit().await.map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Delete blob metadata inside an existing transaction. Arc 4
+    /// §8.4.0.5 / Step 0.6 Branch (B): the metadata DELETE + the
+    /// chain entry write atomically inside the wrapping tx; the
+    /// **storage-side delete** (`backend.delete(cid)`) is a separate
+    /// post-commit operation, intentionally NOT pulled inside this
+    /// method. Storage cleanup is best-effort with WARN-on-failure;
+    /// orphaned bytes get reconciled by a future GC sweep
+    /// (v0.4 follow-up #23).
+    pub async fn delete_metadata_in_tx<'tx>(
+        tx: &mut sqlx::Transaction<'tx, sqlx::Any>,
+        cid: &str,
+    ) -> PdsResult<()> {
         sqlx::query("DELETE FROM blob_metadata WHERE cid = $1")
             .bind(cid)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
-
         Ok(())
     }
 
@@ -1066,5 +1086,82 @@ mod tests {
         assert_eq!(metadata.mime_type, "image/png");
         assert_eq!(metadata.size, 9);
         assert_eq!(metadata.creator_did, "did:plc:test");
+    }
+
+    // ====================================================================
+    // Arc 4 §8.4.0.5 / Step 0.6 Branch (B) — delete_metadata_in_tx.
+    // Tests pin commit + rollback semantics for the metadata DELETE.
+    // ====================================================================
+
+    async fn setup_metadata_pool(cid: &str) -> AnyPool {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let db = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE blob_metadata (
+                cid TEXT PRIMARY KEY, mime_type TEXT NOT NULL, size INTEGER NOT NULL,
+                creator_did TEXT NOT NULL, created_at TEXT NOT NULL,
+                width INTEGER, height INTEGER, alt_text TEXT, thumbnail_cid TEXT
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(cid)
+        .bind("image/png")
+        .bind(1024_i64)
+        .bind("did:plc:alice")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn metadata_count(db: &AnyPool, cid: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM blob_metadata WHERE cid = $1")
+            .bind(cid)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_metadata_in_tx_rolls_back_on_caller_rollback() {
+        let cid = "bafy_meta_rollback";
+        let db = setup_metadata_pool(cid).await;
+        {
+            let mut tx = db.begin().await.unwrap();
+            BlobStore::delete_metadata_in_tx(&mut tx, cid).await.unwrap();
+            tx.rollback().await.unwrap();
+        }
+        assert_eq!(
+            metadata_count(&db, cid).await,
+            1,
+            "rolled-back tx must leave metadata row intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_metadata_in_tx_commits_on_caller_commit() {
+        let cid = "bafy_meta_commit";
+        let db = setup_metadata_pool(cid).await;
+        let mut tx = db.begin().await.unwrap();
+        BlobStore::delete_metadata_in_tx(&mut tx, cid).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            metadata_count(&db, cid).await,
+            0,
+            "committed tx must remove the metadata row"
+        );
     }
 }

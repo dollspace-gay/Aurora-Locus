@@ -3589,18 +3589,15 @@ async fn update_subject_status(
                      only takedown applies to blobs",
                 ));
             }
-            // Drop the held tx so the blob quarantine layer's own tx
-            // can acquire the pool connection (single-connection
-            // pools deadlock otherwise). After the quarantine call
-            // we reopen a tx for the chain entry.
-            tx.rollback()
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+            // Arc 4 §8.4.0.5 / chainlink #131: thread the wrapping
+            // tx into apply_blob_status so the quarantine/restore
+            // operations + the chain entry land atomically. Pre-Arc-4
+            // this site released the held tx, called the pool-API
+            // quarantine layer (which opened its own tx), then
+            // reopened a fresh tx for the chain entry — fragile and
+            // non-atomic.
             let (resp, fx) =
-                apply_blob_status(&ctx, &auth, did, cid, takedown.as_ref()).await?;
-            tx = ctx.account_db.begin().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            })?;
+                apply_blob_status(&ctx, &mut tx, &auth, did, cid, takedown.as_ref()).await?;
             (resp, fx)
         }
 
@@ -3775,8 +3772,9 @@ async fn apply_account_status_in_tx<'c>(
 /// than silently no-op'ing through the idempotency path. Already-in-state
 /// cases (already quarantined when applying, not quarantined when removing)
 /// are treated as idempotent success.
-async fn apply_blob_status(
+async fn apply_blob_status<'tx>(
     ctx: &AppContext,
+    tx: &mut sqlx::Transaction<'tx, sqlx::Any>,
     auth: &AdminAuthContext,
     did: &str,
     cid: &str,
@@ -3791,6 +3789,8 @@ async fn apply_blob_status(
 
     // Establish that the blob actually exists. `BlobStore::get_metadata`
     // returns Some(_) iff the blob is registered; missing → 404.
+    // (Pool-API read; safe outside the wrapping tx because we're only
+    // reading metadata, not branching on quarantine state.)
     let exists = ctx
         .blob_store
         .get_metadata(cid)
@@ -3801,38 +3801,48 @@ async fn apply_blob_status(
         return Err(xrpc_blob_not_found_error(cid));
     }
 
-    let quarantine = BlobQuarantine::new(ctx.account_db.clone());
     let mut effects: Vec<String> = Vec::new();
+
+    // Track post-state to populate the response without a stale read
+    // against the pool (an `is_quarantined` SELECT against `&self.db`
+    // wouldn't see the wrapping tx's pending writes). When `takedown`
+    // is None, no patch is applied and the blob's pre-call state is
+    // returned via the post-tx-commit pool read at the call site.
+    let mut post_state_taken_down: Option<bool> = None;
 
     if let Some(td) = takedown {
         if td.applied {
             // Already-quarantined → Conflict from the quarantine layer →
             // idempotent success since the desired post-state already obtains.
-            match quarantine
-                .quarantine_blob(
-                    cid,
-                    QuarantineReason::Other,
-                    td.ref_field.as_deref(),
-                    &auth.did,
-                    None,
-                )
-                .await
+            // Arc 4 §8.4.0.5: in-tx variant so the quarantine row + the
+            // chain entry the caller writes land atomically.
+            match BlobQuarantine::quarantine_blob_in_tx(
+                tx,
+                cid,
+                QuarantineReason::Other,
+                td.ref_field.as_deref(),
+                &auth.did,
+                None,
+            )
+            .await
             {
                 Ok(_) | Err(PdsError::Conflict(_)) => {}
                 Err(e) => {
                     return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
                 }
             }
+            post_state_taken_down = Some(true);
         } else {
             // Not-currently-quarantined → NotFound from `restore_blob` →
             // idempotent success (operator wanted "ensure not quarantined";
             // we already are).
-            match quarantine.restore_blob(cid, &auth.did).await {
+            match BlobQuarantine::restore_blob_in_tx(tx, cid, &auth.did).await {
                 Ok(_) | Err(PdsError::NotFound(_)) => {}
                 Err(e) => {
                     return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
                 }
             }
+            post_state_taken_down = Some(false);
         }
         effects.push(render_status_effect(
             "takedown",
@@ -3841,10 +3851,21 @@ async fn apply_blob_status(
         ));
     }
 
-    let is_taken_down = quarantine
-        .is_quarantined(cid)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+    // Determine the wire response's `applied` flag. When a takedown
+    // patch was applied, we know the post-state from the operation
+    // (quarantine call set true; restore call set false). When
+    // takedown is None, query the pool for the current state — no
+    // pending writes exist on this tx for this cid.
+    let is_taken_down = match post_state_taken_down {
+        Some(state) => state,
+        None => {
+            let quarantine = BlobQuarantine::new(ctx.account_db.clone());
+            quarantine
+                .is_quarantined(cid)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?
+        }
+    };
     Ok((
         Some(StatusAttr {
             applied: is_taken_down,
