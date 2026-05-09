@@ -763,11 +763,16 @@ mod verify_audit_chain_tests {
         let db = open_test_pool().await;
         append_n_entries(&db, 3).await;
         // Corrupt row 2's rationale without rewriting current_hash so
-        // per-row recompute mismatches.
-        sqlx::query("UPDATE audit_chain_entry SET rationale = 'tampered' WHERE sequence = 2")
-            .execute(&db)
-            .await
-            .unwrap();
+        // per-row recompute mismatches. Uses the consolidated helper
+        // from `crate::admin::audit_chain::corrupt_entry_rationale`
+        // (Arc 3 Step 0.6).
+        crate::admin::audit_chain::corrupt_entry_rationale(
+            &db,
+            crate::admin::audit_chain::EntryRef::Sequence(2),
+            "tampered",
+        )
+        .await
+        .unwrap();
 
         let mut buf: Vec<u8> = Vec::new();
         let healthy = run_verify_audit_chain(&db, &mut buf).await.unwrap();

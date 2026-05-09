@@ -4576,10 +4576,16 @@ mod tests {
         // Tamper sequence 2 the same way audit_chain's own
         // verify_chain_range_detects_per_row_tamper test does:
         // mutate the row's content without recomputing current_hash.
-        sqlx::query("UPDATE audit_chain_entry SET rationale = 'tampered' WHERE sequence = 2")
-            .execute(&ctx.account_db)
-            .await
-            .unwrap();
+        // Uses the consolidated helper from
+        // `crate::admin::audit_chain::corrupt_entry_rationale` (Arc 3
+        // Step 0.6).
+        crate::admin::audit_chain::corrupt_entry_rationale(
+            &ctx.account_db,
+            crate::admin::audit_chain::EntryRef::Sequence(2),
+            "tampered",
+        )
+        .await
+        .unwrap();
         let resp = get_audit_trail(
             State(ctx),
             moderator_auth(),

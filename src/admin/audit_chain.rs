@@ -776,6 +776,64 @@ pub fn verify_entry(
     computed == expected_hash
 }
 
+/// Test-only addressing mode for [`corrupt_entry_rationale`]. Site 1 of
+/// the open-coded tamper pattern (`verify_entry_fails_when_rationale_tampered`)
+/// targets a row by its primary-key id (the `i64` returned from
+/// `append_entry`); sites 2, 3, and 4 target by `sequence` (the chain
+/// position, hardcoded to `2` because their tests append three entries
+/// and tamper the middle one). Both addressing modes are kept rather
+/// than rekeying everyone to one because the original choice is
+/// load-bearing for test readability.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum EntryRef {
+    Id(i64),
+    Sequence(i64),
+}
+
+/// Test-only helper: rewrite a row's `rationale` directly via SQL,
+/// bypassing the normal append-and-hash pathway. Verification primitives
+/// (`verify_entry`, `verify_chain_range`) will subsequently fail on the
+/// tampered row because the recomputed hash diverges from the stored
+/// `current_hash`. Field-agnostic at the column level — operates against
+/// raw SQL so it survives any future addition to `AuditEntry` or to the
+/// canonical hash input.
+///
+/// Use cases (the pattern this consolidates):
+/// - **Per-row tamper**: simplest case, used by 3 of the 4 open-coded
+///   sites this helper replaced. The recomputed hash diverges from the
+///   stored `current_hash` and `verify_entry` returns `false`.
+/// - **Linkage tamper** (NOT this helper): when the test wants the
+///   tampered row to PASS per-row verification but break chain linkage,
+///   the test must additionally write a per-row-consistent
+///   `current_hash` computed via SHA-256 over the canonical input. That
+///   case is intentionally left inline at
+///   `verify_chain_range_detects_consistent_rewrite_via_linkage` because
+///   the SHA-256 recompute is the test's payload, not boilerplate.
+#[cfg(test)]
+pub(crate) async fn corrupt_entry_rationale(
+    db: &AnyPool,
+    target: EntryRef,
+    new_rationale: &str,
+) -> sqlx::Result<()> {
+    let (sql, key) = match target {
+        EntryRef::Id(id) => (
+            "UPDATE audit_chain_entry SET rationale = $1 WHERE id = $2",
+            id,
+        ),
+        EntryRef::Sequence(seq) => (
+            "UPDATE audit_chain_entry SET rationale = $1 WHERE sequence = $2",
+            seq,
+        ),
+    };
+    sqlx::query(sql)
+        .bind(new_rationale)
+        .bind(key)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,10 +1317,7 @@ mod tests {
         // Simulate tamper: rewrite rationale in place after the chain
         // entry was sealed. Verification should fail because the
         // recomputed hash diverges from the stored current_hash.
-        sqlx::query("UPDATE audit_chain_entry SET rationale = $1 WHERE id = $2")
-            .bind("tampered rationale")
-            .bind(id)
-            .execute(&db)
+        corrupt_entry_rationale(&db, EntryRef::Id(id), "tampered rationale")
             .await
             .unwrap();
         let row = sqlx::query(
@@ -1329,8 +1384,9 @@ mod tests {
         }
         // Tamper with row 2's rationale only — current_hash NOT updated,
         // so per-row recompute mismatches.
-        sqlx::query("UPDATE audit_chain_entry SET rationale = 'tampered' WHERE sequence = 2")
-            .execute(&db).await.unwrap();
+        corrupt_entry_rationale(&db, EntryRef::Sequence(2), "tampered")
+            .await
+            .unwrap();
         let err = verify_chain_range(&db, 1, 3).await.expect_err("tampered chain must fail");
         assert_eq!(err.failing_sequence, 2);
         assert_eq!(err.kind, ChainFailureKind::PerRowMismatch);
@@ -1653,5 +1709,121 @@ mod tests {
         verify_chain_range(&db, 1, n as i64)
             .await
             .expect("clean chain after concurrent appends");
+    }
+
+    // ====================================================================
+    // Arc 3 Step 0.6 (§7.4.0.6) — invariants on `corrupt_entry_rationale`.
+    //
+    // The helper consolidates the open-coded tamper pattern that 3 of
+    // the 4 prior call sites used. These two tests pin its semantics:
+    // (1) the targeted row fails verify_entry; (2) untouched rows
+    // continue to verify cleanly. Future maintenance changes that
+    // accidentally broaden the helper's blast radius (e.g., a typo
+    // dropping the WHERE clause) get caught here.
+    // ====================================================================
+
+    /// Fixture: append `n` chain entries with deterministic rationales
+    /// and return the row ids in order. Used by both invariant tests.
+    async fn append_n_entries(db: &AnyPool, n: usize) -> Vec<i64> {
+        let subject = Subject::Repo {
+            did: "did:plc:victim".to_string(),
+        };
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = append_entry(
+                db,
+                AppendEntryParams {
+                    actor_did: "did:plc:m1",
+                    action: "TakedownAccount",
+                    subject: Some(&subject),
+                    rationale: &format!("orig-{}", i),
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Read a row by id and call `verify_entry` against its current
+    /// stored hash. Returns the boolean verdict.
+    async fn verify_row_by_id(db: &AnyPool, id: i64) -> bool {
+        let row = sqlx::query(
+            "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
+                    subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
+                    cascade_subjects, cascade_snapshot_ids \
+             FROM audit_chain_entry WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        verify_entry(
+            row.try_get::<i64, _>("sequence").unwrap(),
+            &row.try_get::<String, _>("created_at").unwrap(),
+            &row.try_get::<String, _>("actor_did").unwrap(),
+            &row.try_get::<String, _>("action").unwrap(),
+            row.try_get::<Option<String>, _>("subject_did").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("subject_uri").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("subject_cid").unwrap().as_deref(),
+            &row.try_get::<String, _>("rationale").unwrap(),
+            row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            row.try_get::<Option<i64>, _>("event_id").unwrap(),
+            row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("current_hash").unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn corrupt_entry_rationale_breaks_verify_entry_for_target_row() {
+        let db = open_test_pool().await;
+        let ids = append_n_entries(&db, 3).await;
+        // Pre-tamper: target row verifies cleanly.
+        assert!(
+            verify_row_by_id(&db, ids[1]).await,
+            "row 2 must verify before tamper"
+        );
+        // Tamper via the helper (sequence-based, since the helper's
+        // most common use is sequence-keyed).
+        corrupt_entry_rationale(&db, EntryRef::Sequence(2), "tampered-by-helper")
+            .await
+            .unwrap();
+        // Post-tamper: target row no longer verifies.
+        assert!(
+            !verify_row_by_id(&db, ids[1]).await,
+            "row 2 must fail verification after corrupt_entry_rationale"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_entry_rationale_preserves_neighbor_verification() {
+        let db = open_test_pool().await;
+        let ids = append_n_entries(&db, 3).await;
+        // Tamper the middle row only.
+        corrupt_entry_rationale(&db, EntryRef::Sequence(2), "tampered-by-helper")
+            .await
+            .unwrap();
+        // Neighbors (rows 1 and 3) are untouched at the row level —
+        // their per-row hashes still match their stored content.
+        // (Note: verify_chain_range would still flag the chain as
+        // broken because row 3's previous_hash chains through row 2's
+        // current_hash; that's verify_chain_range's contract, not
+        // verify_entry's. This test pins per-row blast radius only.)
+        assert!(
+            verify_row_by_id(&db, ids[0]).await,
+            "row 1 must still verify after tampering row 2"
+        );
+        assert!(
+            verify_row_by_id(&db, ids[2]).await,
+            "row 3 must still verify after tampering row 2 \
+             (per-row check ignores prior-row linkage)"
+        );
     }
 }
