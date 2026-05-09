@@ -145,28 +145,60 @@ PDS_BLOBSTORE_S3_ACCESS_KEY_ID=<your-key>
 PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY=<your-secret>
 ```
 
-### First Admin User
+### Initial Setup
 
-After starting the server, create the first admin user. This is a
-one-time bootstrap — admin authority comes from the `admin_role`
-table only, not from any environment variable. After the first
-SuperAdmin exists, all subsequent role grants flow through
-`tools.aurora.superadmin.grantRole`, which writes to the audit chain.
+Bootstrap a fresh deployment by granting the first SuperAdmin
+through the `aurora-locus grant-admin` CLI subcommand. Admin
+authority comes from the `admin_roles` table only — no environment
+variable confers a role. After the first SuperAdmin exists, all
+subsequent role grants flow through
+`tools.aurora.superadmin.grantRole`, which writes to the audit
+chain.
+
+The bootstrap commands below require these env vars to be set
+(see [.env.example](.env.example) for the full configuration
+surface — these three are the bootstrap-critical subset that
+every CLI subcommand needs to construct an `AppContext`):
+
+- `PDS_JWT_SECRET` — secret for HS256 admin tokens.
+- `PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX` — 64-hex-char
+  secp256k1 private key for repo signing.
+- `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` — 64-hex-char
+  secp256k1 private key for PLC rotation.
+
+Plus one operator-supplied placeholder used by the bash block
+below:
+
+- `PDS_OPERATOR_DID` — the DID of the account being granted
+  superadmin (e.g. `did:plc:abc...` or `did:web:host`). This is
+  the account that will run all subsequent admin operations
+  through the live PDS.
+
+The PDS must be **stopped** while `grant-admin` runs. The CLI
+acquires the same cooperative liveness lock the `serve`
+subcommand holds, so it fast-fails if a PDS is already up
+against the same database.
 
 ```bash
-# Register account
-curl -X POST http://localhost:3000/xrpc/com.atproto.server.createAccount \
-  -H "Content-Type: application/json" \
-  -d '{
-    "handle": "admin.pds.example.com",
-    "email": "admin@example.com",
-    "password": "secure-password"
-  }'
+set -euo pipefail
 
-# Grant SuperAdmin role (one-time bootstrap; requires direct database access)
-sqlite3 data/accounts.db "INSERT INTO admin_role (did, role, granted_by, granted_at)
-  VALUES ('did:plc:...', 'superadmin', 'system', datetime('now'));"
+# Grant SuperAdmin role to the operator's DID.
+aurora-locus grant-admin "${PDS_OPERATOR_DID}" superadmin \
+  --notes "Initial bootstrap"
+
+# Verify the audit chain is internally consistent.
+aurora-locus debug verify-audit-chain
 ```
+
+The grant prints `Granted role 'superadmin' to <did>. Audit
+entry: #1.` on success. The chain-walk reports `1 entry verified,
+chain healthy.` immediately after — discontinuities indicate
+either a failed grant transaction (rare) or external tampering
+with the `audit_chain_entry` table; investigate before proceeding
+with further grants.
+
+For a full list of CLI subcommands and their flags, run
+`aurora-locus --help`.
 
 ## API Endpoints
 

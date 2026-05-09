@@ -338,7 +338,7 @@ Auth: `atproto:admin.moderation` scope. Admin-tier role check at handler level f
 
 Auth: `atproto:admin.moderation` plus `Role::SuperAdmin` check at handler level via the existing `require_admin_role!` macro. Two endpoints:
 
-**`grantRole`** (sub-phase 3.6). Relocated from `com.atproto.admin.grantRole`. Inputs: `did`, `role`, `notes`. Writes a row to `admin_role` and emits the corresponding chain entry.
+**`grantRole`** (sub-phase 3.6). Relocated from `com.atproto.admin.grantRole`. Inputs: `did`, `role`, `notes`. Writes a row to `admin_roles` and emits the corresponding chain entry.
 
 **`revokeRole`** (sub-phase 3.6). Relocated from `com.atproto.admin.revokeRole`. Marks the role record as revoked (preserving audit history) and emits the corresponding chain entry.
 
@@ -435,7 +435,7 @@ After 3.5 lands, 3.7 (aggregations), 3.8 (audit chain), 3.9 (subscription), and 
 
 ### §4.6 Bootstrap path
 
-The first SuperAdmin is granted via direct SQL insertion into the `admin_role` table against a freshly-created account. After the first SuperAdmin exists, all subsequent role grants flow through `tools.aurora.superadmin.grantRole` and the audit chain. See [README.md "First Admin User" section](../README.md) for the operator-facing procedure (Block 6 / chainlink #95 dropped the `PDS_ADMIN_DIDS` env var auto-grant; bootstrap is now the SQL path).
+The first SuperAdmin is granted via direct SQL insertion into the `admin_roles` table against a freshly-created account. After the first SuperAdmin exists, all subsequent role grants flow through `tools.aurora.superadmin.grantRole` and the audit chain. See [README.md "First Admin User" section](../README.md) for the operator-facing procedure (Block 6 / chainlink #95 dropped the `PDS_ADMIN_DIDS` env var auto-grant; bootstrap is now the SQL path).
 
 ---
 
