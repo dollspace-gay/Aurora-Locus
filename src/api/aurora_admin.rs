@@ -80,6 +80,13 @@ fn default_true() -> bool {
 }
 
 /// Output for `tools.aurora.admin.emitEvent`. Per design doc §8.1.
+///
+/// Surfaces `auditEntryId` and `eventId` per the action-ID
+/// contract committed in `crate::admin::audit_chain` (Arc 2 §6.4.2).
+/// `emit_event` is the canonical category-(a) typed handler; new
+/// Aurora-namespace handlers writing chain entries should mirror
+/// this struct's `audit_entry_id` field name and `rename_all =
+/// "camelCase"` wire convention.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmitEventOutput {

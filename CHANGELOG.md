@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Wire-format breaking change (v0.3 / Arc 2 contract lockdown).**
+  `tools.aurora.superadmin.grantRole` and `tools.aurora.superadmin.revokeRole`
+  responses are now typed structs with `rename_all = "camelCase"` wire fields,
+  replacing the prior ad-hoc `serde_json::json!(...)` shape. The action-ID
+  field renames from `audit_entry_id` → `auditEntryId`; on `grantRole` the
+  embedded role record's wrapper field also renames `admin_role` → `adminRole`
+  (the inner struct's snake_case fields are unchanged). Aligns these two
+  handlers with the action-ID contract committed in
+  `crate::admin::audit_chain` per `docs/V03_DESIGN.md` §6.3.4 — every
+  Aurora-namespace admin handler that writes a chain entry now surfaces
+  `auditEntryId` on a typed `*Output` struct. Drift is caught by
+  `tests/admin_handler_contract.rs`. Per Arc 2 Step 0.5 prereq recon, the
+  only in-tree consumer of `audit_entry_id` was a single unit test in
+  `src/api/admin.rs` (updated alongside this change); the admin UI invokes
+  these endpoints but discards the response, so no UI-side coordination
+  needed.
+
 ### Added
 - Design corpus updated to reflect as-built reality on five surfaces. Forensic export's `account-state.json` is always included with operational fields; sensitive fields remain `includeAccountMetadata`-gated (CR-7). `describeCapabilities` advertises a hand-curated capability list; runtime route enumeration deferred to v0.3 (#123). Runtime settings configuration is two-tier (Runtime + Default with RecoveryMode override) rather than the originally-specified three-tier; file-tier addition deferred to v0.3 (#124). `ModEventAction` is subject-aware (`TakedownAccount` vs `TakedownRecord` etc.) rather than the originally-specified compositional shape; compositional revisit deferred to v0.3 (#125). `getModerationMetrics` and `getQueueStats` use flat `start`/`end` strings and `i64` rather than the `TimeRange` wrapper and `u32`; typed-shape revisit deferred to v0.3 (#126).
 - Live subscription channel separated from the historical aggregate. New `mod_event_seq` table mirrors the subset of `moderation_event` columns the `Event` wire variant emits (the `meta` column is intentionally not mirrored — the wire format doesn't carry it). Every `moderation_event` INSERT also writes a `mod_event_seq` row inside the same transaction via `insert_moderation_event_in_tx`, so the two surfaces never diverge. `tools.aurora.admin.subscribeModEvents` now reads from `mod_event_seq`; `tools.aurora.moderator.queryEvents` and other historical reads continue to use `moderation_event` directly. Migration `0006_mod_event_seq.sql` (SQLite + Postgres). Per docs/AURORA_ADMIN_UI_DESIGN.md §3.5. (#115)

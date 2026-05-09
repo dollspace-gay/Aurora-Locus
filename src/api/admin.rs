@@ -811,12 +811,35 @@ struct GrantRoleRequest {
     rationale: Option<String>,
 }
 
+/// Output for `tools.aurora.superadmin.grantRole`. Surfaces
+/// `auditEntryId` per the action-ID contract committed in
+/// `crate::admin::audit_chain` (Arc 2 §6.4.2). Pre-Arc-2 this
+/// handler returned `serde_json::json!(...)` ad-hoc with the
+/// snake_case wire field `audit_entry_id`; Step 2 normalized
+/// to a typed struct with camelCase wire fields throughout.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrantRoleOutput {
+    pub success: bool,
+    pub did: String,
+    pub role: String,
+    /// Full role record as recorded in the `admin_roles` table.
+    /// Wire field renamed from `admin_role` to `adminRole` as part
+    /// of Arc 2's typed-struct conversion (`rename_all =
+    /// "camelCase"`).
+    pub admin_role: crate::admin::roles::AdminRole,
+    /// Wire field renamed from `audit_entry_id` to `auditEntryId`
+    /// as part of Arc 2's action-ID contract; emitted as a string
+    /// to dodge JS-number-precision issues with large i64 ids.
+    pub audit_entry_id: String,
+}
+
 /// Grant admin role to a user
 async fn grant_role(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<GrantRoleRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<GrantRoleOutput>, (StatusCode, String)> {
     use crate::admin::roles::Role;
 
     // SuperAdmin only — relocated to tools.aurora.superadmin.* in
@@ -898,13 +921,31 @@ async fn grant_role(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": req.did,
-        "role": req.role,
-        "admin_role": admin_role,
-        "audit_entry_id": audit_entry_id.to_string(),
-    })))
+    Ok(Json(GrantRoleOutput {
+        success: true,
+        did: req.did,
+        role: req.role,
+        admin_role,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// Output for `tools.aurora.superadmin.revokeRole`. Surfaces
+/// `auditEntryId` per the action-ID contract committed in
+/// `crate::admin::audit_chain`. Pre-Arc-2 this handler returned
+/// `serde_json::json!(...)` ad-hoc; Step 2 normalized to a typed
+/// struct with camelCase wire fields throughout. Wire field
+/// renamed from `audit_entry_id` to `auditEntryId`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevokeRoleOutput {
+    pub success: bool,
+    pub did: String,
+    /// Emitted as a string to dodge JS-number-precision issues
+    /// with large i64 ids; field name renamed wire-side from
+    /// `audit_entry_id` to `auditEntryId` as part of Arc 2's
+    /// action-ID contract.
+    pub audit_entry_id: String,
 }
 
 #[derive(Deserialize)]
@@ -923,7 +964,7 @@ async fn revoke_role(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<RevokeRoleRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<RevokeRoleOutput>, (StatusCode, String)> {
     use crate::admin::roles::Role;
 
     // SuperAdmin only — same rationale as grant_role above
@@ -986,11 +1027,11 @@ async fn revoke_role(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": req.did,
-        "audit_entry_id": audit_entry_id.to_string(),
-    })))
+    Ok(Json(RevokeRoleOutput {
+        success: true,
+        did: req.did,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -7221,18 +7262,26 @@ mod tests {
         let resp = grant_role(State(ctx.clone()), superadmin_test_auth(), Json(req))
             .await
             .expect("SuperAdmin should be allowed to grant roles");
-        let json = resp.0;
-        assert_eq!(
-            json.get("did").and_then(|v| v.as_str()),
-            Some("did:plc:newmod")
+        let output = resp.0;
+        assert_eq!(output.did, "did:plc:newmod");
+        assert_eq!(output.role, "moderator");
+        assert!(
+            !output.audit_entry_id.is_empty(),
+            "grantRole must return the chain entry id"
         );
-        assert_eq!(
-            json.get("role").and_then(|v| v.as_str()),
-            Some("moderator")
+        // Wire-form check: serialize to JSON and confirm the field
+        // surfaces as `auditEntryId` (camelCase) per the Arc 2
+        // action-ID contract — the pre-Arc-2 wire form
+        // `audit_entry_id` (snake_case) was renamed in Step 2.
+        let wire = serde_json::to_value(&output).unwrap();
+        assert!(
+            wire.get("auditEntryId").is_some(),
+            "grantRole wire output must use camelCase `auditEntryId`; full payload: {}",
+            wire,
         );
         assert!(
-            json.get("audit_entry_id").is_some(),
-            "grantRole must return the chain entry id"
+            wire.get("audit_entry_id").is_none(),
+            "grantRole must not emit the pre-Arc-2 snake_case `audit_entry_id`",
         );
     }
 

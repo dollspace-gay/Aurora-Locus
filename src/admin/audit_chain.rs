@@ -18,6 +18,32 @@
 //! `moderation_event` rows pre-date this infrastructure. Per §8.4
 //! they surface in `getAuditTrail` with `current_hash="pre-chain"`
 //! sentinel and `verified=false` so consumers know the difference.
+//!
+//! # Canonical commitment: action-ID surfacing
+//!
+//! This module is the canonical commitment location for the
+//! action-ID contract for Aurora-namespace handlers. Per
+//! `docs/V03_DESIGN.md` §6.3.4: every `tools.aurora.*` admin
+//! handler that writes an `audit_chain_entry` row MUST surface
+//! `auditEntryId` in its response, on a typed `*Output` struct
+//! whose Rust-side field is named `audit_entry_id` and whose wire
+//! form is camelCase via `#[serde(rename_all = "camelCase")]`.
+//! Handlers that also write `moderation_event` rows additionally
+//! surface `eventId` (typed `event_id` Rust-side).
+//!
+//! Upstream-lexicon handlers (`com.atproto.*`) are carved out —
+//! their wire shapes preserve lexicon conformance; the contract
+//! applies only to the Aurora namespace.
+//!
+//! Drift is caught by `tests/admin_handler_contract.rs`, a
+//! structural lint that scans Aurora-namespace handler files for
+//! `pub async fn` declarations whose body invokes
+//! `append_entry_in_tx` and asserts each one returns a typed
+//! `*Output` struct with the required `audit_entry_id` field. A
+//! short allowlist carves out handlers that surface the ID outside
+//! the typed-JSON convention (currently only `export_account_forensic`,
+//! which returns a binary tar response and surfaces the ID via the
+//! `X-Aurora-Audit-Entry-Id` HTTP header).
 
 use crate::{admin::defs::Subject, error::PdsError};
 use chrono::{DateTime, Utc};
