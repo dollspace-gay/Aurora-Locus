@@ -44,6 +44,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   abort the wrapping tx atomically with the chain entry (LB-1 /
   chainlink #122 / chainlink #130).
 
+### Documentation
+- **Aurora-Locus commits to URI-level record-takedown semantics**
+  for the batch path (`tools.aurora.admin.batchTakedownRecords`,
+  Arc 4 §8.4.3). Cascade entries written to `audit_chain_entry`
+  carry empty-string CIDs (`Subject::Record { uri, cid: "" }`)
+  by deliberate convention — the URI is the identifying field;
+  the takedown covers all versions of the record at that URI,
+  including future revisions. Empty-CID is **not** missing data;
+  external consumers reading `cascadeSubjects` from `getAuditTrail`
+  must treat empty-CID Record entries as URI-level references.
+  This commitment is now documented at `BatchRecordsInput` and
+  the `Subject::Record` variant doc comments, and pinned by
+  `batch_takedown_records_produces_uri_level_cascade_with_empty_cids`.
+  Single-subject `emitEvent{TakedownRecord}` retains CID-level
+  semantics (specific record version, real CID populated).
+  Operators choosing between paths select on whether they need
+  version-specific or URI-level coverage.
+  `docs/operator/audit-chain-verification.md` Section A is
+  updated to call out the empty-CID Record cascade shape so
+  independent chain-verification implementations handle it
+  correctly.
+
 ### Added
 - **Arc 3: Audit-trail read contract.**
   `tools.aurora.admin.getAuditTrail` is committed as the fifth

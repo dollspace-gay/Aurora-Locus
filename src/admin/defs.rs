@@ -48,6 +48,29 @@ pub enum Subject {
     Repo {
         did: String,
     },
+    /// Record subject — strong reference to a single record.
+    ///
+    /// The `cid` field's interpretation depends on the surface
+    /// that produced the value:
+    ///
+    /// - **Single-subject paths** (e.g., `emitEvent{TakedownRecord}`,
+    ///   `emitEvent{ApplyLabel}` on a Record subject, and the
+    ///   getAuditTrail wire shape): `cid` is the strong-reference
+    ///   CID and identifies a specific record version. Semantics
+    ///   are CID-level.
+    /// - **`batchTakedownRecords` cascade entries** (per Arc 4
+    ///   §8.4.3): `cid` is an empty string by deliberate
+    ///   convention, signaling URI-level takedown semantics. The
+    ///   URI is the identifying field; the takedown covers all
+    ///   versions of the record at that URI. See
+    ///   [`crate::api::aurora_admin::BatchRecordsInput`].
+    ///
+    /// External consumers reading `cascade_subjects` from the
+    /// audit chain MUST treat empty-CID `Record` entries as
+    /// URI-level references, not as missing data. The empty-CID
+    /// convention is pinned by
+    /// `batch_takedown_records_produces_uri_level_cascade_with_empty_cids`
+    /// in `src/api/aurora_admin.rs`.
     #[serde(rename = "com.atproto.repo.strongRef")]
     Record {
         uri: String,

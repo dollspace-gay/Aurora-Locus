@@ -1296,6 +1296,34 @@ pub struct BatchAccountsOutput {
     pub snapshots: Vec<SnapshotRef>,
 }
 
+/// Input for `tools.aurora.admin.batchTakedownRecords` (§8.11).
+///
+/// Aurora-Locus record-takedown semantics on this surface are
+/// **URI-level** (per Arc 4 §8.4.3). Each entry in `uris`
+/// identifies a record by its `at://` URI without pinning a
+/// specific CID version; the takedown applies to whatever
+/// content currently resides at the URI, and future versions
+/// of the record at the same URI are also covered.
+///
+/// The chain row this handler writes carries `cascade_subjects`
+/// entries shaped as `Subject::Record { uri, cid: "" }` — the
+/// empty `cid` is a **deliberate convention**, not missing data
+/// or a sentinel-null. It explicitly signals "URI-level
+/// takedown, no CID anchor." Pinned by
+/// `batch_takedown_records_produces_uri_level_cascade_with_empty_cids`
+/// in this module's tests.
+///
+/// This contrasts with single-subject `emitEvent{TakedownRecord}`
+/// (§8.3): there the input `Subject::Record` carries a real CID,
+/// the takedown is **CID-level** (specific record version), and
+/// the cascade entry preserves that CID. Operators choosing
+/// between the two paths select on whether they want
+/// version-specific or URI-level coverage.
+///
+/// The empty-CID convention is committed-by-documentation here
+/// and on the [`Subject::Record`](crate::admin::defs::Subject)
+/// variant; external consumers reading the audit chain can rely
+/// on it.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchRecordsInput {
@@ -4535,6 +4563,89 @@ mod tests {
         let cascade_json: String = row.try_get("cascade_subjects").unwrap();
         let cascade: Vec<Subject> = serde_json::from_str(&cascade_json).unwrap();
         assert_eq!(cascade.len(), 2);
+    }
+
+    // Arc 4 §8.4.3: pin the URI-level convention. `batch_takedown_records`
+    // emits cascade_subjects entries shaped as `Record { uri, cid: "" }`
+    // — the empty CID is deliberate and signals URI-level takedown
+    // semantics, not missing data. A future change that populates CIDs
+    // (e.g., resolving URI→CID at takedown time) flips Aurora-Locus
+    // from URI-level to CID-level on this surface, which is a design
+    // conversation, not a silent migration. This test fails loudly in
+    // that case so the change must be explicit.
+    #[tokio::test]
+    async fn batch_takedown_records_produces_uri_level_cascade_with_empty_cids() {
+        use sqlx::Row as _;
+        let ctx = create_test_context().await;
+        let uris = vec![
+            "at://did:plc:author0/app.bsky.feed.post/aaa".to_string(),
+            "at://did:plc:author1/app.bsky.feed.post/bbb".to_string(),
+            "at://did:plc:author2/app.bsky.feed.post/ccc".to_string(),
+        ];
+        let resp = batch_takedown_records(
+            State(ctx.clone()),
+            moderator_auth(),
+            Json(BatchRecordsInput {
+                uris: uris.clone(),
+                rationale: "URI-level takedown convention".to_string(),
+            }),
+        )
+        .await
+        .expect("batch returns 200")
+        .0;
+        assert_eq!(resp.affected_count, 3);
+
+        let row = sqlx::query(
+            "SELECT cascade_subjects FROM audit_chain_entry \
+             WHERE action = 'record.batch_takedown'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        let cascade_json: String = row.try_get("cascade_subjects").unwrap();
+        let cascade: Vec<Subject> = serde_json::from_str(&cascade_json).unwrap();
+        assert_eq!(cascade.len(), 3, "one cascade entry per input URI");
+
+        for (i, entry) in cascade.iter().enumerate() {
+            match entry {
+                Subject::Record { uri, cid } => {
+                    assert_eq!(
+                        uri, &uris[i],
+                        "cascade URI at index {i} matches input URI"
+                    );
+                    assert_eq!(
+                        cid, "",
+                        "cascade CID at index {i} is the empty string \
+                         (URI-level convention per Arc 4 §8.4.3); \
+                         a non-empty value here means batch record \
+                         takedown shifted to CID-level semantics"
+                    );
+                }
+                other => panic!(
+                    "cascade entry at index {i} is not Subject::Record: {other:?}"
+                ),
+            }
+        }
+
+        // The wire response's per-subject snapshot refs carry the same
+        // empty-CID Record shape — pin this too so consumers reading
+        // the response (not the chain row directly) get the same
+        // signal.
+        for (i, snap) in resp.snapshots.iter().enumerate() {
+            match &snap.subject {
+                Subject::Record { uri, cid } => {
+                    assert_eq!(uri, &uris[i]);
+                    assert_eq!(
+                        cid, "",
+                        "wire response snapshot.subject CID at index {i} \
+                         is empty (URI-level convention)"
+                    );
+                }
+                other => panic!(
+                    "snapshot subject at index {i} is not Subject::Record: {other:?}"
+                ),
+            }
+        }
     }
 
     #[tokio::test]

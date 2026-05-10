@@ -67,6 +67,9 @@ Each item is an `AuditEntry`:
 // Record (single record)
 {"$type":"com.atproto.repo.strongRef","cid":"...","uri":"at://..."}
 
+// Record (cascade entry from `batchTakedownRecords` — URI-level convention)
+{"$type":"com.atproto.repo.strongRef","cid":"","uri":"at://..."}
+
 // Blob (with optional originating record URI)
 {
   "$type": "com.atproto.admin.defs#repoBlobRef",
@@ -75,6 +78,16 @@ Each item is an `AuditEntry`:
   "record_uri": "at://..."   // optional; omitted when not present
 }
 ```
+
+A `Record` entry with an empty-string `cid` inside
+`cascadeSubjects` signals **URI-level takedown semantics**, not
+missing data. This shape is produced exclusively by
+`tools.aurora.admin.batchTakedownRecords` and is pinned by
+`batch_takedown_records_produces_uri_level_cascade_with_empty_cids`.
+Single-subject paths (e.g., `emitEvent{TakedownRecord}`) carry
+real CIDs and remain CID-level. The `subject_cid` canonical
+column for these cascade entries is the empty string verbatim
+(no normalization) — see Section C.
 
 Subject vocabulary stability is a separate contract — see
 [contract-stability.md §1](contract-stability.md#1-subject-vocabulary-stability).
