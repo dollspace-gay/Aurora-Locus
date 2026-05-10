@@ -7,6 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **Wire-format breaking change (v0.3 / Arc 4 atomicity unification).**
+  Every `tools.aurora.admin.batch*` handler is now whole-tx atomic
+  (chainlink #113). The per-subject `failures: Vec<BatchFailure>`
+  field is removed from `BatchAccountsOutput`, `BatchLabelOutput`,
+  and `BatchRemoveLabelOutput`; the v0.2 `BatchFailure` struct is
+  retired. Per-subject mutation failure now aborts the wrapping
+  transaction (chain entry, moderation_event, account_moderation /
+  label rows, and the per-subject mutation either ALL land or NONE
+  do). `batch_takedown_accounts` and `batch_restore_accounts` drop
+  their per-subject SAVEPOINT recovery pattern in favour of
+  `?`-propagation through the wrapping `tx`. Errors surface the
+  failing subject's index and identifier in the response body
+  (`failingSubject`, `failingSubjectId` keys). `batch_remove_label`
+  keeps its `skipped: Vec<Subject>` field — semantically distinct
+  from a failure (subjects without the label to remove are a no-op,
+  not an error). Affected operator endpoints: `batchTakedownAccounts`,
+  `batchSuspendAccounts`, `batchRestoreAccounts`,
+  `batchTakedownRecords`, `batchApplyLabel`, `batchRemoveLabel`.
+
 - **Wire-format breaking change (v0.3 / Arc 4 multi-subject reshape).**
   `tools.aurora.admin.emitEvent` now accepts an array of subjects per
   call instead of a single subject. The input field renames
