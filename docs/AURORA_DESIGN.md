@@ -222,6 +222,8 @@ pub enum AppealResolutionDecision { Approve, Deny }
 
 > **Reconciliation.** Earlier drafts specified a `$type`-tagged compositional `ModEvent` enum (subject-agnostic — one `Takedown` variant applied to any `Subject`, with the lexicon as source of truth for which actions apply where) plus an `AppealResolution` enum with `Uphold | Reject | Modify`. As-built, Phase 3.5 collapsed the API enum into the storage shape (`ModEventAction` is `kind`-tagged with subject-aware variants); `AppealResolutionDecision` ships with `Approve | Deny`. The compositional revisit is a v0.3 candidate (chainlink #125); the wire-breaking nature of the change motivated its deferral.
 
+**Commitment (v0.3 / Arc 5 §9.4.4 / chainlink #125):** ModEventAction's enum discriminator is flat (action-verb × subject-type cartesian product, 16 variants). Subject set is a peer axis at the request level (per Arc 4's multi-subject `emitEvent`). Compositional reshape — separating action-verb from subject-type into orthogonal enum axes — is a v0.4-or-later candidate gated on use-case surface. The flat shape is the stable v0.3 contract; Aurora Admin UI and third-party tooling can build switch tables on the discriminator without anticipating a structural reshape during the v0.3 series. See `docs/v04-candidates.md` for the open candidate list.
+
 **Why role grant/revoke aren't here** — they live at `tools.aurora.superadmin.*` ([§4.3.3](#§433-toolsaurorasuperadmin)) as dedicated endpoints rather than `ModEvent` variants. Keeping them out of `ModEvent` makes the SuperAdmin auth boundary structurally visible in the namespace.
 
 #### §4.1.3 Pagination (decision E)

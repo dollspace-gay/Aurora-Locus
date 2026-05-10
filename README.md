@@ -581,11 +581,11 @@ Dual-licensed under MIT OR Apache-2.0
 
 **Production Ready**: YES ✅
 
-**Version**: 0.1.0
+**Version**: 0.3.0
 
 **Federation**: Enabled (Bluesky network compatible)
 
-**Last Updated**: 2025
+**Last Updated**: 2026
 
 ---
 

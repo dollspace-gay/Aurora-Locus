@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+_Future v0.4 cycle work lands here. See
+[`docs/v04-candidates.md`](docs/v04-candidates.md) for the
+named deferrals from v0.3 and the running candidate
+accumulator._
+
+## [0.3.0] - 2026-05-10
+
+### Documentation
+- **`ModEventAction` flat-shape commitment** (#125, Arc 5
+  Step 4). The 16-variant flat enum is the v0.3 committed
+  contract; compositional reshape (separating action-verb from
+  subject-type into orthogonal axes) is a v0.4-or-later
+  candidate gated on use-case surface. Subject set is a peer
+  axis at the request level (per Arc 4's multi-subject
+  `emitEvent`), not an enum-internal axis. Aurora Admin UI and
+  third-party tooling can build switch tables on the
+  discriminator without anticipating a structural reshape
+  during the v0.3 series. Documented in `docs/AURORA_DESIGN.md`
+  §4.1.2; cross-referenced from `docs/v04-candidates.md`.
+- **#123 LB-3 runtime route enumeration handoff to v0.4**
+  (Arc 5 Step 4). `tools.aurora.admin.describeCapabilities`
+  continues to advertise a hand-curated capability list, with
+  the v0.2 reconciliation conclusion (manual list stays)
+  carried forward. The drift-detection test at
+  `src/api/admin.rs:7223-7331`
+  (`describe_capabilities_snapshot`) ensures any new route not
+  in the hand-curated list fails CI. Code-level anchors at
+  `src/api/admin.rs:2939` and `:3041` (immediately preceding
+  `aurora_capability_families` and `aurora_capability_extensions`
+  respectively) carry `TODO(#123, v0.4)` comments for v0.4
+  discoverability. Full handoff at `docs/V03_DESIGN.md` §9.8;
+  v0.4 candidate accumulator at `docs/v04-candidates.md`.
 ### Changed
 - **`TimeRange` wrapper + selective `u32` retype** (#126). Three
   bundled changes close the v0.3 cycle's TimeRange + numeric-typing

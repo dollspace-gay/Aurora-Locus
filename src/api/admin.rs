@@ -2932,6 +2932,7 @@ struct CapabilityExtension {
     value: Option<serde_json::Value>,
 }
 
+// TODO(#123, v0.4): runtime route enumeration deferred per V03_DESIGN.md §9 and docs/v04-candidates.md
 /// Endpoint names per Aurora namespace, as currently shipped. Updated
 /// by future sub-phases as they land. Phase 3.2's snapshot reflects
 /// the surface present at this commit; sub-phases 3.3-3.9 each add
@@ -3012,6 +3013,7 @@ fn aurora_capability_families() -> serde_json::Value {
     })
 }
 
+// TODO(#123, v0.4): runtime route enumeration deferred per V03_DESIGN.md §9 and docs/v04-candidates.md
 /// Static capability advertisement reflecting what's structurally
 /// present in this build. The `name` strings are the canonical
 /// vocabulary from §8.15 and double as the keys clients use to gate
@@ -7318,7 +7320,7 @@ mod tests {
             r#"},"#,
             // ---- implementation, version (literals) ----
             r#""implementation":"aurora-locus","#,
-            r#""version":"0.2.0""#,
+            r#""version":"0.3.0""#,
             r#"}"#,
         );
         assert_eq!(
@@ -7338,10 +7340,10 @@ mod tests {
             .0;
 
         assert_eq!(resp.implementation, "aurora-locus");
-        // version comes from CARGO_PKG_VERSION; pinned to the v0.2
-        // cycle release per CR-4 / chainlink #117. Bump in lockstep
-        // with Cargo.toml when the cycle increments.
-        assert_eq!(resp.version, "0.2.0");
+        // version comes from CARGO_PKG_VERSION; pinned to the
+        // current cycle release per CR-4 / chainlink #117. Bump in
+        // lockstep with Cargo.toml when the cycle increments.
+        assert_eq!(resp.version, "0.3.0");
 
         // Families object must include the four Aurora namespaces, each
         // a JSON array (possibly empty for namespaces that haven't
