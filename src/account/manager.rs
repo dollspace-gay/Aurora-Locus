@@ -2187,9 +2187,7 @@ impl AccountManager {
         // (operator disabling another account's code) belongs at the
         // admin XRPC handler tier where AdminAuthContext gates entry
         // — see src/api/admin.rs::disable_invite_code, which routes
-        // through invite_manager and never calls this method. The
-        // PDS_ADMIN_DIDS env var does not by itself confer authority
-        // to bypass the creator check here.
+        // through invite_manager and never calls this method.
         if created_by != requesting_did {
             return Err(PdsError::Authorization(
                 "Only the creator can disable this invite code at the account layer; \
@@ -2640,7 +2638,6 @@ mod tests {
                 jwt_secret: "test-secret-key-for-testing-only".to_string(),
                 repo_signing_key: "test-key".to_string(),
                 plc_rotation_key: "test-rotation-key".to_string(),
-                admin_dids: vec![],
                 oauth: crate::config::OAuthConfig {
                     client_id: "test-client".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),

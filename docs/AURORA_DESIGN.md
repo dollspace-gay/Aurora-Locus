@@ -78,7 +78,7 @@ The cycle began with three assessment documents drafted on 2026-04-30 (one day b
 
 **Out of scope for v0.2.** Signed URL generation; Aurora-driven CDN purge on takedown (deferred to a later admin/moderation extension); live disk → S3 migration tooling; multi-region/multi-bucket configurations; backends beyond Disk and S3.
 
-**Status post-cycle.** S3 backend activation work has not landed in v0.2 — the cycle prioritized the admin/moderation extensions, the proto-blue migration, and the Postgres backend. The assessment's three-phase plan remains the right shape for the work; a v0.3 issue tracks the activation.
+**Status post-cycle.** S3 backend support shipped in v0.2: AWS SDK dependencies are live in `Cargo.toml`, `src/blob_store/s3.rs` is exported from `src/blob_store/mod.rs`, and `AppContext` selects between Disk and S3 via the `BlobstoreConfig` enum based on the `PDS_BLOBSTORE_*` env vars. The assessment's three-phase plan landed in full.
 
 ### §2.3 Postgres backend feasibility
 
@@ -672,7 +672,7 @@ The v0.2 cycle delivered the following phases against the upstream baseline `c2d
 
 ### §8.2 Deferred to v0.3
 
-- **S3 blob storage activation.** Assessment ([§2.2](#§22-blob-storage-s3-feasibility)) work scoped; activation deferred. The S3 path remains commented out at the dependency and module-export levels.
+- **S3 blob storage activation.** Initially deferred per the v0.2 cycle plan; ultimately shipped in v0.2 alongside the assessment's three-phase activation work. AWS SDK dependencies and `src/blob_store/s3.rs` exports are live; backend selection runs via `BlobstoreConfig` from the `PDS_BLOBSTORE_*` env vars. See [§2.2](#§22-blob-storage-s3-feasibility) for the post-cycle status.
 - **Forensic export full-content inclusion.** v0.2 ships metadata-only ([§4.3.2](#§432-toolsauroraadmin)); CAR data + blob bytes deferred. Streaming response body for large bundles also deferred.
 - **Forensic export streaming.** In-memory tar assembly today; streaming response body for large bundles deferred.
 - **Per-record/per-blob status tracking.** [`tools.aurora.moderator.queryStatuses`](#§431-toolsauroramoderator) accepts `subject_type=Record|Blob` for wire-format stability but short-circuits to empty pages because `subject_status` only tracks repo-level state today.

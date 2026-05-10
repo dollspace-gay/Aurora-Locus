@@ -366,8 +366,6 @@ pub struct AuthConfig {
     pub jwt_secret: String,
     pub repo_signing_key: String,
     pub plc_rotation_key: String,
-    /// DID(s) allowed to access admin panel (comma-separated)
-    pub admin_dids: Vec<String>,
     /// OAuth configuration for admin login
     pub oauth: OAuthConfig,
     /// JWT deprecation sunset date (RFC 7231 format: "Sat, 31 Dec 2024 23:59:59 GMT")
@@ -624,14 +622,6 @@ impl ServerConfig {
         let plc_rotation_key = env::var("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX")
             .map_err(|_| PdsError::Validation("PLC rotation key required".to_string()))?;
 
-        // Parse admin DIDs from comma-separated list
-        let admin_dids = env::var("PDS_ADMIN_DIDS")
-            .unwrap_or_else(|_| String::new())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<String>>();
-
         // OAuth configuration for admin login
         let oauth_client_id = env::var("PDS_OAUTH_CLIENT_ID")
             .unwrap_or_else(|_| format!("https://{}/oauth/client-metadata.json", hostname));
@@ -760,7 +750,6 @@ impl ServerConfig {
                 jwt_secret,
                 repo_signing_key,
                 plc_rotation_key,
-                admin_dids,
                 oauth: OAuthConfig {
                     client_id: oauth_client_id,
                     redirect_uri: oauth_redirect_uri,

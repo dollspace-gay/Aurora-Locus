@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Removed
+- **`PDS_ADMIN_DIDS` configuration** (#155). The `admin_dids`
+  field on `AuthConfig` and the `PDS_ADMIN_DIDS` env-var parsing
+  in `src/config.rs` are removed. Admin authority is gated solely
+  by the `admin_role` table (per #95); the dead config and its
+  `validate_config` warning ("admin panel will not be accessible")
+  predated #95 and gave operators incorrect guidance — a populated
+  `admin_dids` list never conferred admin authority on its own.
+  Operators with `PDS_ADMIN_DIDS` set in their environment should
+  remove the variable; it's no longer read. The first SuperAdmin
+  is bootstrapped by inserting a row directly into `admin_role`
+  (see README "First Admin User"); subsequent grants flow through
+  `tools.aurora.superadmin.grantRole` and the audit chain.
+
+### Documentation
+- **`AURORA_DESIGN.md` S3 framing corrected** (#156). Two stale
+  lines in `docs/AURORA_DESIGN.md` claimed S3 backend support
+  "has not landed in v0.2" and listed S3 activation as deferred
+  to v0.3. S3 actually shipped in v0.2: AWS SDK dependencies are
+  live, `src/blob_store/s3.rs` is exported from
+  `src/blob_store/mod.rs`, and `AppContext` selects between Disk
+  and S3 via `BlobstoreConfig` from `PDS_BLOBSTORE_*` env vars.
+  §2.2's "Status post-cycle" and §8.2's deferred-to-v0.3 entry
+  are updated to reflect the as-built reality.
+
 ### Changed
 
 - **Wire-format breaking change (v0.3 / Arc 4 multi-subject + atomicity unification).**
