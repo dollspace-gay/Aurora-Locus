@@ -410,23 +410,6 @@ fn validate_auth_config(config: &ServerConfig, issues: &mut Vec<ValidationIssue>
         }
     }
 
-    // Admin DIDs validation
-    if config.authentication.admin_dids.is_empty() {
-        issues.push(ValidationIssue::warning(
-            "Auth",
-            "No admin DIDs configured - admin panel will not be accessible".to_string(),
-        ));
-    } else {
-        for did in &config.authentication.admin_dids {
-            if !did.starts_with("did:") {
-                issues.push(ValidationIssue::error(
-                    "Auth",
-                    format!("Admin DID '{}' is not a valid DID", did),
-                ));
-            }
-        }
-    }
-
     // OAuth configuration validation
     if !config.authentication.oauth.client_id.starts_with("http://")
         && !config

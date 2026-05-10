@@ -126,6 +126,14 @@ pub async fn serve(ctx: AppContext) -> PdsResult<()> {
     info!("   Service DID: {}", ctx.service_did());
     info!("   Service URL: {}", ctx.service_url());
 
+    // Acquire the PDS-liveness lock before binding the listener.
+    // `_liveness_lock` lives for the entire `serve` scope; dropping
+    // on return releases the lock (Postgres session close or kernel
+    // flock release). The forthcoming `grant-admin` CLI (Step 4)
+    // probes this same lock to fast-fail when a PDS is running. See
+    // `src/db/liveness_lock.rs`.
+    let _liveness_lock = crate::db::liveness_lock::LivenessLock::acquire(&ctx.config).await?;
+
     let app = build_router(ctx);
 
     // Create TCP listener

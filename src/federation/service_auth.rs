@@ -13,7 +13,7 @@
 //! - https://docs.bsky.app/docs/advanced-guides/service-auth
 
 use crate::error::{PdsError, PdsResult};
-use crate::identity::IdentityResolver;
+use crate::identity::IdentityResolverApi;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -46,12 +46,12 @@ pub struct ServiceAuthClaims {
 
 /// Service authenticator for creating and verifying cross-PDS JWTs
 pub struct ServiceAuthenticator {
-    identity_resolver: Arc<IdentityResolver>,
+    identity_resolver: Arc<dyn IdentityResolverApi>,
 }
 
 impl ServiceAuthenticator {
     /// Create a new service authenticator
-    pub fn new(identity_resolver: Arc<IdentityResolver>) -> Self {
+    pub fn new(identity_resolver: Arc<dyn IdentityResolverApi>) -> Self {
         Self { identity_resolver }
     }
 

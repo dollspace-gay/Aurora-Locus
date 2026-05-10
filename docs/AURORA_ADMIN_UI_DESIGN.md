@@ -46,7 +46,7 @@ A small set of new endpoints in the `tools.aurora.admin.*` namespace, sequenced 
 
 - `triggerPasswordReset` — admin-initiated user-mediated password reset
 - `exportAccountForensic` — chain-of-custody forensic bundle export
-- Six batch endpoints for multi-subject moderation actions (chain-entry atomic; per-subject best-effort with a `failures` array — see chainlink #112 for the two-tier model)
+- Six batch endpoints for multi-subject moderation actions, whole-tx-atomic post-Arc-4 (chainlink #113): chain entry, moderation_event row, and per-subject mutations either ALL land or NONE do — per-subject failure aborts the wrapping tx and surfaces the failing subject in the error response
 - Phase 3.5/3.7/3.8/3.9 endpoints already planned in their respective design docs, here specified for UI integration
 
 ## 1.2 What is preserved from the current UI
@@ -2773,10 +2773,10 @@ BulkActionPanel:
 ### Implementation notes
 
 - Calls one of the six batch endpoints (`batchTakedownAccounts`, `batchSuspendAccounts`, etc.).
-- Atomicity is two-tier (chainlink #112): the chain entry recording the operator decision is atomic — the moderation_event row and the corresponding `audit_chain_entry` row land together in a single transaction, or neither lands. Per-subject actor-state mutations (account_moderation rows, takedown_ref updates) are best-effort; failures are surfaced in the response's `failures` array and do not roll back the chain entry. True end-to-end per-subject atomicity is a v0.3 candidate (chainlink #113).
+- Per Arc 4 §8.4.2 (chainlink #113), atomicity is **whole-tx**: the moderation_event row, the `audit_chain_entry` row, and every per-subject mutation (account_moderation rows, takedown_ref updates, label rows) either ALL land or NONE do. Per-subject failure aborts the wrapping transaction. The v0.2 partial-success / `failures` response surface is retired; `batchRemoveLabel` keeps its `skipped` list (no-op, semantically distinct from failure).
 - Single audit chain entry per batch with all subjects referenced (per section 8 batch endpoint specs).
-- Snapshot-at-decision captures per-subject (one snapshot per affected subject, all referenced from the single chain entry via `cascade_snapshot_ids`).
-- UI surfaces partial-success: when the response's `failures` array is non-empty the batch summary distinguishes "applied" (`affected_count`) from "requested" (`cascade_subjects.length`) and lists the failing subjects with their per-subject reason. The chain entry still landed and operators can reconcile via `getAuditTrail`.
+- Snapshot-at-decision captures per-subject BEFORE the wrapping tx opens (orphan snapshots on capture failure are an explicit carve-out per `docs/V03_DESIGN.md` §8.3.1; the chain entry never lands so orphan rows have no chain-of-custody and are reconcilable by GC). Per-subject ids land in `cascade_snapshot_ids`.
+- UI on success: `affected_count` always equals `cascade_subjects.length`. UI on failure: error response identifies the failing subject's index and identifier (`failingSubject`, `failingSubjectId`); nothing landed at the chain or mutation level (Phase 2 abort) — operators retry the whole batch after addressing the failing subject. Phase 1 (snapshot-capture) failures may leave orphan snapshot rows; the error envelope identifies the phase and the operator can reconcile via GC.
 
 ## 6.5 FilterStrip
 
@@ -3886,7 +3886,7 @@ The endpoints are grouped by namespace and ordered by phase.
 
 ## 8.1 Phase 3.5 — `tools.aurora.admin.emitEvent`
 
-The unified moderation action surface. Subsumes the per-action endpoints (`takedownAccount`, `suspendAccount`, etc.) post-3.5 while those remain live for protocol compatibility.
+The unified moderation action surface. Subsumes the per-action endpoints (`takedownAccount`, `suspendAccount`, etc.) post-3.5 while those remain live for protocol compatibility. Multi-subject input shape committed in v0.3 Arc 4 (§8.3.1).
 
 ### Specification
 
@@ -3895,16 +3895,17 @@ The unified moderation action surface. Subsumes the per-action endpoints (`taked
 - **Auth:** AdminModeration scope; role gating per action (Moderator+ for content actions, Admin+ for account-infrastructure actions)
 - **Phase:** 3.5
 - **Used by:** ActionPanel (substrate primitive 3) for all moderation actions; substrate primitive 21 routes here when capability `mod-events-emit-v1` is present
+- **Stability**: input/output shapes, action vocabulary, atomicity scope, and chain row shape are committed under contract surface 6 (see [contract-stability.md §6](../contract-stability.md))
 
 ### Input
 
 ```rust
 struct EmitEventInput {
-    action: ModEventAction,           // discriminated enum
-    subject: SubjectRef,              // {type, did|uri|cid}
-    rationale: String,                // required, non-empty after trim
-    snapshot_capture: bool,           // default true; whether to capture snapshot-at-decision
-    metadata: Option<serde_json::Value>,  // action-specific options
+    action: ModEventAction,             // discriminated enum
+    subjects: Vec<Subject>,             // 1..=N subjects; per-action cap (see below). Single-subject callers wrap in a one-element array.
+    rationale: String,                  // required, non-empty after trim
+    snapshot_capture: bool,             // default true; whether to capture snapshot-at-decision per subject
+    metadata: Option<serde_json::Value>,// action-specific options
 }
 
 enum ModEventAction {
@@ -3918,50 +3919,65 @@ enum ModEventAction {
     QuarantineBlob,
     RestoreBlob,
     DeleteBlob,
-    ResolveReport { report_id: String, resolution: ReportResolution },
-    DismissReport { report_id: String },
-    ResolveAppeal { appeal_id: String, resolution: AppealResolution },
-    EscalateAppeal { appeal_id: String },
-    SendEmail { template: Option<String>, subject: String, body: String },
-    UpdateSubjectStatus { status: SubjectStatus },
-}
-
-struct SubjectRef {
-    #[serde(tag = "$type")]
-    discriminator: SubjectType,  // RepoRef | StrongRef | RepoBlobRef
-    did: Option<String>,
-    uri: Option<String>,
-    cid: Option<String>,
+    ResolveReport { report_id: i64, resolution: ReportResolution },          // length-1 only
+    DismissReport { report_id: i64 },                                        // length-1 only
+    ResolveAppeal { appeal_id: i64, resolution: AppealResolutionDecision },  // length-1 only
+    EscalateAppeal { appeal_id: i64 },                                       // length-1 only
+    SendEmail { template: Option<String>, subject: String, body: String },   // length-1 only
+    UpdateSubjectStatus { status: SubjectStatusValue },
 }
 ```
+
+`Subject` is the canonical Aurora subject (`Repo` | `Record` | `Blob`); see [contract-stability.md §1](../contract-stability.md#1-subject-vocabulary-stability).
+
+#### Per-action multi-subject support
+
+Multi-subject (`subjects.len() > 1`) is **supported** on: `TakedownAccount`, `SuspendAccount`, `RestoreAccount`, `DeleteAccount`, `ApplyLabel`, `RemoveLabel`, `TakedownRecord`, `QuarantineBlob`, `RestoreBlob`, `DeleteBlob`, `UpdateSubjectStatus`.
+
+Multi-subject is **refused** with HTTP 400 `SubjectsArrayInvalidForAction` on the embedded-id variants (`ResolveReport`, `DismissReport`, `ResolveAppeal`, `EscalateAppeal`) and `SendEmail` — those carry per-message identity that's inherently single-subject.
+
+#### Per-action `MAX_BATCH_SIZE`
+
+| Action | Cap | Reason |
+|---|---|---|
+| `DeleteAccount` | 10 | Irreversible |
+| `DeleteBlob` | 25 | Storage-irreversible |
+| All other multi-subject-supported actions | 50 | General hard cap |
 
 ### Output
 
 ```rust
 struct EmitEventOutput {
     event_id: String,
-    audit_entry_id: String,            // always populated; chain entry lands in the same tx as the moderation_event row
-    snapshot_id: Option<String>,       // None if snapshot_capture was false or not applicable
-    cascading_actions: Vec<String>,    // event_ids of actions cascaded server-side (e.g., appeal-approval triggering restore)
+    audit_entry_id: String,         // always populated on success (chain entry inside same tx as the moderation_event row)
+    snapshots: Vec<SnapshotRef>,    // 1:1-by-index with input `subjects`; empty when snapshot_capture: false
+    cascading_actions: Vec<String>, // event_ids of actions cascaded server-side (e.g., appeal-approval triggering restore)
+}
+
+struct SnapshotRef {
+    subject: Subject,
+    snapshot_id: Option<String>,    // None when subject wasn't snapshottable at decision time
 }
 ```
 
 ### Behavior
 
-1. Validate operator's role against action requirements (Moderator+ vs Admin+).
-2. Validate action against subject type (lexicon-aware action surfacing — e.g., reject "SuspendAccount" with a record subject).
-3. Capture snapshot of subject's current state if `snapshot_capture` is true and the action affects an entity that has snapshottable state.
-4. Apply the action atomically.
-5. Write audit chain entry referencing the snapshot and including operator DID, action, subject, rationale, timestamp.
-6. Emit event to `mod_event_seq` for subscription consumers.
-7. If the action cascades (e.g., approving an appeal also reverses the original action), perform the cascade atomically as part of the same audit entry — one chain entry, multiple referenced subjects.
-8. Return event_id, audit_entry_id, snapshot_id, and cascading_actions.
+1. **Phase 0 — input validation.** Role check, rationale non-empty after trim, `subjects` non-empty and within the per-action cap, embedded-id variants enforce length-1.
+2. **Phase 1 — pre-tx snapshot capture.** Per-subject snapshots captured BEFORE the wrapping tx opens. On capture failure, the snapshot rows that did land remain (orphan snapshots — explicit carve-out per `docs/V03_DESIGN.md` §8.3.1; the chain entry never lands so orphans have no chain-of-custody and are reconcilable by GC).
+3. **Phase 2 — tx-bound mutations.** Open `account_db` tx; for each subject in `subjects`, dispatch the per-action mutation via `_in_tx` manager variants. Per-subject failure aborts the whole tx — no mutation lands.
+4. **Phase 3 — chain entry + commit.** Append the audit chain entry inside the same tx, then commit. Chain row shape per §8.3.3: single-subject events populate BOTH flat columns AND `cascade_subjects: [s]`; multi-subject events use synthetic-primary (NULL flat columns, populated cascade).
+5. **Phase 4 — post-commit deferred actions.** `DeleteBlob`'s backend storage delete runs after tx commit via the `DeferredAction` queue; mailer dispatch for `SendEmail` runs post-commit. Failures here log at WARN; the action is already durable on the chain.
+
+If the action cascades (e.g., approving an appeal also reverses the original action), the cascade lands inside the same tx — one chain entry, multiple referenced subjects.
+
+On per-subject failure during Phase 2, the error response identifies the failing subject's index and identifier (`failingSubject`, `failingSubjectId` keys); nothing landed.
 
 ### Notes
 
 - The discriminated enum approach lets the lexicon evolve — new action types added by extending the enum, existing handlers untouched.
 - Snapshot capture is opt-out for actions that don't benefit from snapshots (e.g., `SendEmail` doesn't need a snapshot of the recipient's repo state).
 - Capability advertisement: deployments shipping this endpoint advertise `mod-events-emit-v1` in `describeCapabilities`. UI checks for this capability before routing actions here.
+- Drift on the contract phrase ("emitEvent multi-subject contract is committed") is caught by `tests/contract_phrases.rs`; drift on the wire shape is caught by snapshot tests in `src/api/aurora_admin.rs`'s test module.
 
 ## 8.2 Phase 3.7 — `tools.aurora.admin.getModerationMetrics`
 
@@ -4371,35 +4387,34 @@ struct BatchFailure {
 1. Validate batch size ≤ 50.
 2. Validate operator's role.
 3. Capture snapshot per subject before action (recorded in chain row's `cascade_snapshot_ids`, paired by index with `cascade_subjects`).
-4. Apply takedown with **two-tier atomicity** (chainlink #112): the chain entry is atomic — moderation_event row + chain entry land together or neither lands. Per-subject actor-state mutations (account_moderation rows, takedown_ref updates) are best-effort; per-subject failures land in `failures` without rolling back the chain entry. True end-to-end per-subject atomicity is a v0.3 candidate (chainlink #113).
+4. Apply takedown with **whole-tx atomicity** (Arc 4 §8.4.2 / chainlink #113): the moderation_event row, the chain entry, and every per-subject `actor.takedown_ref` UPDATE run inside a single wrapping tx via `_in_tx` manager variants. Per-subject failure aborts the whole tx; nothing partially lands.
 5. Write single audit chain entry referencing all subjects with shared rationale.
-6. Return single event_id and audit_entry_id with snapshot references per subject and any per-subject failures.
+6. Return single event_id and audit_entry_id with per-subject snapshot references on success. On per-subject failure, error response identifies the failing subject's index and DID; nothing landed.
 
 ### Notes
 
 - 50-subject hard cap. Larger batches require multiple calls. UI surfaces this expectation in the BulkActionPanel.
 - Single audit entry is intentional — operator made one decision affecting many subjects, audit reflects that semantically.
-- `affected_count` may be less than `cascade_subjects.length` on the chain row when `failures` is non-empty. The chain entry records operator intent (every requested subject); `affected_count` records actuated subjects. The two are reconciled via `getAuditTrail`.
+- `affected_count` always equals `cascade_subjects.length` on success per Arc 4 §8.4.2's whole-tx contract; partial-success states are no longer observable.
 
 ## 8.9 New endpoint — `tools.aurora.admin.batchSuspendAccounts`
 
-Multi-account suspension; same atomicity model as `batchTakedownAccounts` (chainlink #112).
+Multi-account suspension; same whole-tx-atomic model as `batchTakedownAccounts` (Arc 4 §8.4.2 / chainlink #113).
 
 ### Specification
 
 - Same shape as `batchTakedownAccounts`, with `suspend` semantics.
-- Same auth, phase, behavior pattern.
-- Today the suspension record is the moderation_event row itself — there is no separate per-DID actor-table side-effect, so `failures` is always empty in v0.2. Field is in the response shape for parity.
+- Same auth, phase, behavior pattern. The v0.2 `failures` field is retired.
 
 ## 8.10 New endpoint — `tools.aurora.admin.batchRestoreAccounts`
 
-Multi-account restoration (reverses takedown or suspension); same atomicity model as `batchTakedownAccounts` (chainlink #112).
+Multi-account restoration (reverses takedown or suspension); same whole-tx-atomic model as `batchTakedownAccounts` (Arc 4 §8.4.2 / chainlink #113).
 
 ### Specification
 
 - Same shape as `batchTakedownAccounts`, with `restore` semantics.
 - Same auth, phase, behavior pattern.
-- Per-DID `UPDATE actor SET takedown_ref = NULL` failures land in `failures`; the chain entry still records the full set of requested subjects.
+- Per-DID `UPDATE actor SET takedown_ref = NULL` runs inside the wrapping tx via `activate_account_in_tx`; per-subject failure aborts the whole batch. Missing DIDs are silent no-ops (UPDATE returns 0 rows_affected without erroring) — operator intent is preserved on the chain row's `cascade_subjects` regardless.
 
 ## 8.11 New endpoint — `tools.aurora.admin.batchTakedownRecords`
 

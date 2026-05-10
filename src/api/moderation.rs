@@ -16,8 +16,37 @@ pub fn routes() -> Router<AppContext> {
 // Request/Response Types
 // ============================================================================
 
-/// Subject reference - either a repo (account) or a record
-#[derive(Debug, Clone, Deserialize)]
+/// Subject vocabulary for `com.atproto.moderation.createReport`.
+///
+/// # Wire-format contract
+///
+/// Wire format is **untagged** — there is no top-level `$type`
+/// discriminator on the enum itself; variants disambiguate
+/// structurally via the inner struct's `$type` field. Two
+/// variants:
+///
+/// - `Repo` → `{"$type":"com.atproto.admin.defs#repoRef","did":...}`
+/// - `StrongRef` → `{"$type":"com.atproto.repo.strongRef","cid":...,"uri":...}`
+///
+/// Per `docs/V03_DESIGN.md` §6.3.1: variant stability is committed.
+/// New variants are additive only; existing variants do not change
+/// shape across releases.
+///
+/// This is a **separate contract surface** from the canonical
+/// Aurora Subject (`crate::admin::defs::Subject`); the two
+/// surfaces are intentionally distinct shapes (createReport is
+/// untagged-at-the-enum-level, the Aurora surface is internally
+/// tagged via serde's `tag = "$type"`). Cross-surface byte
+/// comparison is not a meaningful test — the distinct shapes are
+/// the contract. Snapshot tests in this module's
+/// `#[cfg(test)] mod tests` pin each variant's exact wire shape.
+///
+/// `Serialize` is derived alongside `Deserialize` so canonical-JSON
+/// snapshot tests can emit the wire shape; nothing in production
+/// serialises this type (the surface is parse-only on
+/// `createReport`), but the derive is harmless and keeps the
+/// snapshot test shape symmetric with `Subject`'s.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ReportSubject {
     /// Reference to an account (com.atproto.admin.defs#repoRef)
@@ -27,7 +56,7 @@ pub enum ReportSubject {
 }
 
 /// Repo reference (account)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoRef {
     #[serde(rename = "$type")]
     pub type_field: String,
@@ -35,7 +64,7 @@ pub struct RepoRef {
 }
 
 /// Strong reference to a record
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrongRef {
     #[serde(rename = "$type")]
     pub type_field: String,
@@ -277,6 +306,13 @@ fn extract_did_from_uri(uri: &str) -> Option<String> {
     None
 }
 
+// Arc 2 Step 1 (§6.4.1) — canonical-JSON helper for snapshot
+// tests. See the matching declaration in `src/admin/defs.rs` for
+// the rationale on top-level placement vs nested-mod placement.
+#[cfg(test)]
+#[path = "../../tests/common/canonical_json.rs"]
+mod canonical_json_helper;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +430,48 @@ mod tests {
         assert_eq!(
             extract_did_from_uri("at://handle.bsky.social/col/key"),
             None
+        );
+    }
+
+    // ====================================================================
+    // Arc 2 Step 1 (§6.4.1) — ReportSubject vocabulary contract.
+    //
+    // The createReport surface is the OTHER Subject contract — a
+    // separate, intentionally-distinct shape from the canonical
+    // Aurora Subject (crate::admin::defs::Subject). It's untagged
+    // at the enum level: variants disambiguate via the inner
+    // struct's $type field, not via serde's tag = "$type". Each
+    // variant gets a full canonical-JSON snapshot here pinning the
+    // exact wire shape per §6.3.1's variant-stability commitment.
+    // ====================================================================
+
+    use super::canonical_json_helper::canonical_json;
+
+    #[test]
+    fn report_subject_repo_wire_format_snapshot() {
+        let subject = ReportSubject::Repo(RepoRef {
+            type_field: "com.atproto.admin.defs#repoRef".to_string(),
+            did: "did:plc:test1234567890abcdef".to_string(),
+        });
+        // Untagged at the enum level: serializer emits the inner
+        // RepoRef directly; the only $type marker is the inner
+        // struct's `type_field`.
+        assert_eq!(
+            canonical_json(&subject),
+            r#"{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:test1234567890abcdef"}"#,
+        );
+    }
+
+    #[test]
+    fn report_subject_strong_ref_wire_format_snapshot() {
+        let subject = ReportSubject::StrongRef(StrongRef {
+            type_field: "com.atproto.repo.strongRef".to_string(),
+            uri: "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            cid: "bafyreidemorecord456".to_string(),
+        });
+        assert_eq!(
+            canonical_json(&subject),
+            r#"{"$type":"com.atproto.repo.strongRef","cid":"bafyreidemorecord456","uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc"}"#,
         );
     }
 }

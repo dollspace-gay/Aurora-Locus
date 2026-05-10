@@ -22,6 +22,25 @@ use serde::{Deserialize, Serialize};
 ///
 /// Per design doc §4.1: same shape used by every Phase 3 endpoint
 /// that takes or returns a subject.
+///
+/// # Wire-format contract
+///
+/// Per `docs/V03_DESIGN.md` §6.3.1 (and `docs/AURORA_DESIGN.md`
+/// §4.1.1): variant stability is committed. New variants are
+/// additive only; existing variants do not change shape across
+/// releases. The three variants currently committed:
+///
+/// - `Repo` → `{"$type":"com.atproto.admin.defs#repoRef","did":...}`
+/// - `Record` → `{"$type":"com.atproto.repo.strongRef","cid":...,"uri":...}`
+/// - `Blob` → `{"$type":"com.atproto.admin.defs#repoBlobRef","cid":...,"did":...,"record_uri"?:...}`
+///
+/// Snapshot tests in this module's `#[cfg(test)] mod tests` pin
+/// each variant's exact wire shape; the cross-type byte-equality
+/// guard at `src/api/admin.rs::tests::subject_blob_and_subject_union_repoblobref_serialize_byte_equal`
+/// pins agreement with `SubjectUnion` (the parsing dual on the
+/// updateSubjectStatus surface). Either guards a regression
+/// individually; together they make a silent wire-shape change
+/// impossible.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(tag = "$type")]
 pub enum Subject {
@@ -29,6 +48,29 @@ pub enum Subject {
     Repo {
         did: String,
     },
+    /// Record subject — strong reference to a single record.
+    ///
+    /// The `cid` field's interpretation depends on the surface
+    /// that produced the value:
+    ///
+    /// - **Single-subject paths** (e.g., `emitEvent{TakedownRecord}`,
+    ///   `emitEvent{ApplyLabel}` on a Record subject, and the
+    ///   getAuditTrail wire shape): `cid` is the strong-reference
+    ///   CID and identifies a specific record version. Semantics
+    ///   are CID-level.
+    /// - **`batchTakedownRecords` cascade entries** (per Arc 4
+    ///   §8.4.3): `cid` is an empty string by deliberate
+    ///   convention, signaling URI-level takedown semantics. The
+    ///   URI is the identifying field; the takedown covers all
+    ///   versions of the record at that URI. See
+    ///   [`crate::api::aurora_admin::BatchRecordsInput`].
+    ///
+    /// External consumers reading `cascade_subjects` from the
+    /// audit chain MUST treat empty-CID `Record` entries as
+    /// URI-level references, not as missing data. The empty-CID
+    /// convention is pinned by
+    /// `batch_takedown_records_produces_uri_level_cascade_with_empty_cids`
+    /// in `src/api/aurora_admin.rs`.
     #[serde(rename = "com.atproto.repo.strongRef")]
     Record {
         uri: String,
@@ -324,6 +366,17 @@ impl From<AuroraAdminError> for (axum::http::StatusCode, axum::Json<serde_json::
     }
 }
 
+// Arc 2 Step 1 (§6.4.1) — canonical-JSON helper for snapshot
+// tests. Lives at top-level (not inside `mod tests`) because
+// `#[path]` resolution from inside a nested inline module
+// produces a virtual path that the filesystem can't traverse on
+// Linux (the `mod tests/` segment doesn't physically exist).
+// Top-level `#[path]` resolves relative to the directory holding
+// this .rs file (`src/admin/`), which is real on disk.
+#[cfg(test)]
+#[path = "../../tests/common/canonical_json.rs"]
+mod canonical_json_helper;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +622,76 @@ mod tests {
             serde_urlencoded::from_str("limit=25&cursor=abc").expect("combined parses");
         assert_eq!(parsed.pagination.limit, Some(25));
         assert_eq!(parsed.pagination.cursor.as_deref(), Some("abc"));
+    }
+
+    // ====================================================================
+    // Arc 2 Step 1 (§6.4.1) — Subject vocabulary contract snapshots.
+    //
+    // Each variant gets a full canonical-JSON snapshot pinning the
+    // exact wire shape. The strings here are the contract — changing
+    // any of them breaks shipped clients. New variants are additive
+    // only per §6.3.1's variant-stability commitment.
+    //
+    // Cross-type byte-equality with `SubjectUnion` (the parsing dual
+    // on updateSubjectStatus) is pinned separately at
+    // `src/api/admin.rs::tests::subject_blob_and_subject_union_repoblobref_serialize_byte_equal`
+    // — that test must live in `admin.rs` because `SubjectUnion` is
+    // private to that module. Here we pin the absolute wire shape;
+    // there we pin agreement.
+    // ====================================================================
+
+    use super::canonical_json_helper::canonical_json;
+
+    #[test]
+    fn subject_repo_wire_format_snapshot() {
+        let subject = Subject::Repo {
+            did: "did:plc:test1234567890abcdef".to_string(),
+        };
+        assert_eq!(
+            canonical_json(&subject),
+            r#"{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:test1234567890abcdef"}"#,
+        );
+    }
+
+    #[test]
+    fn subject_record_wire_format_snapshot() {
+        let subject = Subject::Record {
+            uri: "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            cid: "bafyreidemorecord456".to_string(),
+        };
+        assert_eq!(
+            canonical_json(&subject),
+            r#"{"$type":"com.atproto.repo.strongRef","cid":"bafyreidemorecord456","uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc"}"#,
+        );
+    }
+
+    #[test]
+    fn subject_blob_wire_format_snapshot() {
+        let subject = Subject::Blob {
+            did: "did:plc:test1234567890abcdef".to_string(),
+            cid: "bafyreidemoblob456".to_string(),
+            record_uri: Some(
+                "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            ),
+        };
+        assert_eq!(
+            canonical_json(&subject),
+            r#"{"$type":"com.atproto.admin.defs#repoBlobRef","cid":"bafyreidemoblob456","did":"did:plc:test1234567890abcdef","record_uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc"}"#,
+        );
+    }
+
+    #[test]
+    fn subject_blob_wire_format_snapshot_record_uri_omitted() {
+        let subject = Subject::Blob {
+            did: "did:plc:test1234567890abcdef".to_string(),
+            cid: "bafyreidemoblob456".to_string(),
+            record_uri: None,
+        };
+        // skip_serializing_if drops `record_uri` entirely; the wire
+        // shape collapses to {$type, cid, did}.
+        assert_eq!(
+            canonical_json(&subject),
+            r#"{"$type":"com.atproto.admin.defs#repoBlobRef","cid":"bafyreidemoblob456","did":"did:plc:test1234567890abcdef"}"#,
+        );
     }
 }

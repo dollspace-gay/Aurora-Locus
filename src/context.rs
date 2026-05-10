@@ -14,7 +14,7 @@ use crate::{
         search::FederatedSearch,
         NonceStore, RelayClient, RelayConfig,
     },
-    identity::{DidCache, IdentityResolver, IdentityResolverConfig},
+    identity::{DidCache, IdentityResolver, IdentityResolverApi, IdentityResolverConfig},
     mailer::Mailer,
     oauth::{ClientManager, DeviceManager},
     rate_limit::RateLimiter,
@@ -34,7 +34,7 @@ pub struct AppContext {
     pub account_manager: Arc<AccountManager>,
     pub actor_store: Arc<ActorStore>,
     pub blob_store: Arc<BlobStore>,
-    pub identity_resolver: Arc<IdentityResolver>,
+    pub identity_resolver: Arc<dyn IdentityResolverApi>,
     // Admin & Moderation
     pub admin_role_manager: Arc<AdminRoleManager>,
     pub moderation_manager: Arc<ModerationManager>,
@@ -84,6 +84,15 @@ pub struct AppContext {
     /// `local_records_cache.invalidate_did` directly. See
     /// chainlink #90 / docs/AURORA_DESIGN.md §5.4.2.
     pub cache_invalidator: Arc<crate::cache::invalidation::CacheInvalidator>,
+    /// File-tier runtime settings loaded once at startup from
+    /// `<data_directory>/runtime.yaml` (override via `PDS_RUNTIME_FILE`).
+    /// Per Arc 5 §9.4.2 / chainlink #124: sits between the runtime
+    /// row and the compiled-in default in `get_runtime_setting`'s
+    /// lookup. `Arc<HashMap>` keeps `AppContext::clone()` cheap;
+    /// the cache is read-only post-startup. Reload-on-SIGHUP is a
+    /// v0.4 follow-up — runtime_settings rows are the hot path for
+    /// in-process changes.
+    pub file_tier_settings: Arc<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 impl AppContext {
@@ -94,6 +103,23 @@ impl AppContext {
 
         // Create data directories if they don't exist
         Self::ensure_directories(&config).await?;
+
+        // Load file-tier runtime settings (Arc 5 §9.4.2 / chainlink
+        // #124). Path defaults to `<data_directory>/runtime.yaml`;
+        // env-var override via `PDS_RUNTIME_FILE`. Missing file =>
+        // empty map (file tier is optional). Malformed YAML =>
+        // startup error with file path. Unknown keys (vs.
+        // KNOWN_RUNTIME_KEYS) and invalid per-key values
+        // warn-and-skip — operator typos surface in logs without
+        // bringing the deployment down.
+        let runtime_file_path = std::env::var(
+            crate::api::aurora_admin::RUNTIME_FILE_ENV,
+        )
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| config.storage.data_directory.join("runtime.yaml"));
+        let file_tier_settings = Arc::new(
+            crate::api::aurora_admin::load_file_tier_settings(&runtime_file_path)?,
+        );
 
         // Open the shared-database pool. `db::create_any_pool` dispatches
         // on `config.database.backend` to either SQLite (using the
@@ -175,7 +201,8 @@ impl AppContext {
             retry_base_delay_ms: 100,
             retry_max_delay_ms: 5000,
         };
-        let identity_resolver = Arc::new(IdentityResolver::new(did_cache, identity_config)?);
+        let identity_resolver: Arc<dyn IdentityResolverApi> =
+            Arc::new(IdentityResolver::new(did_cache, identity_config)?);
 
         // Initialize admin & moderation managers
         let admin_role_manager = Arc::new(AdminRoleManager::new(account_db.clone()));
@@ -462,6 +489,7 @@ impl AppContext {
             mailer,
             local_records_cache,
             cache_invalidator,
+            file_tier_settings,
         })
     }
 

@@ -205,6 +205,15 @@ async fn main() -> PdsResult<()> {
             cli::validate_config::validate_config(&ctx.config)?;
         }
 
+        Some(Commands::GrantAdmin {
+            did,
+            role,
+            notes,
+            force,
+        }) => {
+            cli::admin::grant_admin(&ctx, did, role, notes, force).await?;
+        }
+
         Some(Commands::Debug { subcommand }) => {
             use cli::DebugCommands;
             match subcommand {
@@ -222,6 +231,12 @@ async fn main() -> PdsResult<()> {
                 }
                 DebugCommands::ExportAccount { did, output } => {
                     cli::debug::export_account(&ctx, &did, &output).await?;
+                }
+                DebugCommands::VerifyAuditChain => {
+                    let healthy = cli::debug::verify_audit_chain(&ctx).await?;
+                    if !healthy {
+                        std::process::exit(1);
+                    }
                 }
             }
         }

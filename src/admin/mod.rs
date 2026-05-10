@@ -15,9 +15,11 @@ pub mod labels;
 pub mod moderation;
 pub mod reports;
 pub mod roles;
+pub mod time_range;
 
 pub use invites::{InviteCode, InviteCodeManager};
 pub use labels::LabelManager;
 pub use moderation::ModerationManager;
 pub use reports::ReportManager;
 pub use roles::{AdminRoleManager, Role};
+pub use time_range::TimeRange;

@@ -14,6 +14,7 @@ pub mod api;
 pub mod auth;
 pub mod blob_store;
 pub mod cache;
+pub mod cli;
 pub mod config;
 pub mod context;
 pub mod crypto;

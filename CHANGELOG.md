@@ -6,6 +6,291 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+_Future v0.4 cycle work lands here. See
+[`docs/v04-candidates.md`](docs/v04-candidates.md) for the
+named deferrals from v0.3 and the running candidate
+accumulator._
+
+## [0.3.0] - 2026-05-10
+
+### Documentation
+- **`ModEventAction` flat-shape commitment** (#125, Arc 5
+  Step 4). The 16-variant flat enum is the v0.3 committed
+  contract; compositional reshape (separating action-verb from
+  subject-type into orthogonal axes) is a v0.4-or-later
+  candidate gated on use-case surface. Subject set is a peer
+  axis at the request level (per Arc 4's multi-subject
+  `emitEvent`), not an enum-internal axis. Aurora Admin UI and
+  third-party tooling can build switch tables on the
+  discriminator without anticipating a structural reshape
+  during the v0.3 series. Documented in `docs/AURORA_DESIGN.md`
+  §4.1.2; cross-referenced from `docs/v04-candidates.md`.
+- **#123 LB-3 runtime route enumeration handoff to v0.4**
+  (Arc 5 Step 4). `tools.aurora.admin.describeCapabilities`
+  continues to advertise a hand-curated capability list, with
+  the v0.2 reconciliation conclusion (manual list stays)
+  carried forward. The drift-detection test at
+  `src/api/admin.rs:7223-7331`
+  (`describe_capabilities_snapshot`) ensures any new route not
+  in the hand-curated list fails CI. Code-level anchors at
+  `src/api/admin.rs:2939` and `:3041` (immediately preceding
+  `aurora_capability_families` and `aurora_capability_extensions`
+  respectively) carry `TODO(#123, v0.4)` comments for v0.4
+  discoverability. Full handoff at `docs/V03_DESIGN.md` §9.8;
+  v0.4 candidate accumulator at `docs/v04-candidates.md`.
+### Changed
+- **`TimeRange` wrapper + selective `u32` retype** (#126). Three
+  bundled changes close the v0.3 cycle's TimeRange + numeric-typing
+  cleanup:
+
+  - **`TimeRange` newtype** (`crate::admin::TimeRange`). New
+    validated `(start, end)` primitive constructible from either
+    a preset name string (`"last_hour"`, `"last_24h"`, `"last_7d"`,
+    `"last_30d"`) or an explicit `{start, end}` object with RFC
+    3339 timestamps. The wrapper rejects inverted ranges
+    (`start > end`) at deserialize time so handlers can trust the
+    value without re-validating; equal start/end is allowed
+    (zero-duration ranges are valid empty queries). Validation is
+    centralized — handlers no longer carry ad-hoc range checks.
+
+  - **`getModerationMetrics` request shape**. The handler accepts
+    both wire shapes per Arc 5 §9.4.3's backward-compat
+    requirement, dispatched via a custom `Deserialize` on the
+    request struct (recon Q3(b) decision):
+    - **Canonical**: `timeRange` field carrying a preset name.
+    - **Legacy**: peer `start` and `end` RFC 3339 timestamp fields
+      (the v0.2 wire shape).
+    Exactly one shape per request. Mixed (`timeRange` plus
+    `start`/`end`) and missing-both error envelopes name the
+    canonical field FIRST and surface preset alternatives —
+    typo'd preset names produce errors mentioning `timeRange`,
+    NOT misdirecting toward the legacy fields. The §9.5.9
+    untagged-enum misdirection risk is mitigated by the explicit
+    dispatcher.
+
+  - **`GetQueueStatsOutput` selective `u32` retype**. Six count
+    and age fields (`open_reports`, `pending_appeals`,
+    `under_review_reports`, `under_review_appeals`,
+    `average_age_open_reports_seconds`,
+    `oldest_open_report_age_seconds`) retype from `i64` to `u32`
+    per recon Q4 — domain-safely non-negative AND bounded < 2^32
+    (a u32 seconds counter spans ~136 years; ample for any
+    realistic age). `queue_attention_total` stays `i64` to
+    preserve the sum-overflow guard. The handler converts SQL
+    `i64` reads to `u32` via a saturating helper. JSON wire shape
+    unchanged (still emitted as non-negative integers); strict-
+    typed Rust consumers gain the narrower type. No
+    generated-client impact (Aurora-Locus has no OpenAPI/JSON-
+    Schema codegen consumer per recon Q4).
+
+  Operator note: existing v0.2 `getModerationMetrics` callers
+  continue to work without modification. New callers should
+  prefer the canonical `timeRange` field.
+
+### Added
+- **File-tier runtime configuration** (#124). Aurora-Locus
+  resolves `runtime_settings` keys through a four-tier
+  hierarchy from highest to lowest precedence: recovery-mode
+  env-var override (`AURORA_RECOVERY_MODE`, `moderation-mode`
+  reads only), runtime row, **file-tier YAML**, compiled-in
+  default. The new file tier sits between operator runtime
+  control and the compiled-in defaults — load-once-at-startup
+  YAML at `<data_directory>/runtime.yaml` (override via
+  `PDS_RUNTIME_FILE`) for deployment-stable values that don't
+  need the runtime API surface. Unknown keys (vs.
+  `KNOWN_RUNTIME_KEYS`) and invalid per-key values
+  warn-and-skip; malformed YAML produces a clear startup error
+  with the file path. The `getRuntimeSetting` response's
+  `source` field gains a fourth value, `"File"`, distinguishing
+  file-tier-resolved reads from runtime/default. The field
+  becomes a typed `SettingSource` enum with a custom
+  `Serialize` impl emitting the existing string literals —
+  wire-additive, no contract amendment (the `source` field is
+  open per Arc 2's contract framing). New dependency
+  `serde_yaml = "0.9"`. Operator setup at
+  `docs/operator/file-tier-config.md`. Reload-on-SIGHUP is a
+  v0.4 follow-up; `setRuntimeSetting` remains the in-process
+  hot path for setting changes.
+
+### Removed
+- **`PDS_ADMIN_DIDS` configuration** (#155). The `admin_dids`
+  field on `AuthConfig` and the `PDS_ADMIN_DIDS` env-var parsing
+  in `src/config.rs` are removed. Admin authority is gated solely
+  by the `admin_role` table (per #95); the dead config and its
+  `validate_config` warning ("admin panel will not be accessible")
+  predated #95 and gave operators incorrect guidance — a populated
+  `admin_dids` list never conferred admin authority on its own.
+  Operators with `PDS_ADMIN_DIDS` set in their environment should
+  remove the variable; it's no longer read. The first SuperAdmin
+  is bootstrapped by inserting a row directly into `admin_role`
+  (see README "First Admin User"); subsequent grants flow through
+  `tools.aurora.superadmin.grantRole` and the audit chain.
+
+### Documentation
+- **`AURORA_DESIGN.md` S3 framing corrected** (#156). Two stale
+  lines in `docs/AURORA_DESIGN.md` claimed S3 backend support
+  "has not landed in v0.2" and listed S3 activation as deferred
+  to v0.3. S3 actually shipped in v0.2: AWS SDK dependencies are
+  live, `src/blob_store/s3.rs` is exported from
+  `src/blob_store/mod.rs`, and `AppContext` selects between Disk
+  and S3 via `BlobstoreConfig` from `PDS_BLOBSTORE_*` env vars.
+  §2.2's "Status post-cycle" and §8.2's deferred-to-v0.3 entry
+  are updated to reflect the as-built reality.
+
+### Changed
+
+- **Wire-format breaking change (v0.3 / Arc 4 multi-subject + atomicity unification).**
+  Five intertwined cycle changes ship together:
+
+  - **`emitEvent` multi-subject reshape** (chainlinks #122, #130).
+    `tools.aurora.admin.emitEvent` accepts `subjects: Vec<Subject>`
+    on input and returns `snapshots: Vec<SnapshotRef>` paired
+    1:1-by-index. Single-subject callers migrate by wrapping in a
+    one-element array (`subjects: [s]`); multi-subject callers fan
+    out across the supported action vocabulary: account state
+    (`TakedownAccount`/`SuspendAccount`/`RestoreAccount`/`DeleteAccount`),
+    label (`ApplyLabel`/`RemoveLabel`), blob lifecycle
+    (`QuarantineBlob`/`RestoreBlob`/`DeleteBlob`), record takedown
+    (`TakedownRecord`), and `UpdateSubjectStatus`. Embedded-id
+    variants (`ResolveReport`, `DismissReport`, `ResolveAppeal`,
+    `EscalateAppeal`) and `SendEmail` reject `subjects.len() > 1`
+    with HTTP 400 `SubjectsArrayInvalidForAction`. Per-action
+    `MAX_BATCH_SIZE` caps: `DeleteAccount` = 10 (irreversible),
+    `DeleteBlob` = 25 (storage-irreversible), all others = 50.
+    `dispatch_action` is fully tx-bound — every match arm runs
+    via `_in_tx` manager variants inside the wrapping tx, so
+    per-subject mutation failure aborts the whole tx atomically
+    with the chain entry.
+
+  - **Whole-batch atomicity across all `batch*` handlers**
+    (#113). The `failures: Vec<BatchFailure>` field is
+    removed from `BatchAccountsOutput`, `BatchLabelOutput`, and
+    `BatchRemoveLabelOutput`; the v0.2 `BatchFailure` struct is
+    retired. `batch_takedown_accounts` and `batch_restore_accounts`
+    drop their per-subject SAVEPOINT recovery patterns in favor of
+    `?`-propagation through the wrapping tx. Every batch handler
+    now has the same atomicity contract: chain entry,
+    `moderation_event`, and per-subject mutations either ALL land
+    or NONE do. `affected_count` always equals
+    `cascade_subjects.len()` for successful responses; the
+    partial-success state is no longer observable. Errors surface
+    the failing subject's index and identifier in the response
+    body (`failingSubject`, `failingSubjectId` keys).
+    `batch_remove_label` keeps its `skipped: Vec<Subject>` field —
+    no-op, semantically distinct from a failure. Affected operator
+    endpoints: `batchTakedownAccounts`, `batchSuspendAccounts`,
+    `batchRestoreAccounts`, `batchTakedownRecords`,
+    `batchApplyLabel`, `batchRemoveLabel`.
+
+  - **`BlobQuarantine`, `BlobStore`, `AppealManager` `_in_tx`
+    variants** (#131). Step 0.5 introduced the missing
+    in-tx manager methods so every `dispatch_action` arm has a
+    tx-bound execution path. `update_subject_status`'s
+    release-reopen-tx pattern collapses to a single in-tx call.
+    `DeleteBlob`'s backend storage delete runs post-commit via the
+    `DeferredAction` queue; orphan storage on backend-delete
+    failure is accepted (future GC sweep tracked as v0.4 follow-up).
+
+  - **Chain row shape commitment** (per §8.3.3). Single-subject
+    events now populate BOTH the flat
+    `subject_did`/`subject_uri`/`subject_cid` columns AND
+    `cascade_subjects: [s]`; multi-subject events use
+    synthetic-primary (NULL flat columns, populated cascade).
+    External consumers can rely on `cascade_subjects` always
+    containing every subject regardless of arity. Pre-Arc-4
+    chain rows (with empty cascade on single-subject events)
+    remain valid and verifiable; the mixed-corpus state is
+    expected. `docs/operator/audit-chain-verification.md`
+    Section D worked examples and the side-script's deterministic
+    hashes are updated to reflect the new shape.
+
+  - **URI-level record-takedown semantics for
+    `tools.aurora.admin.batchTakedownRecords`** (Arc 4 §8.4.3).
+    Cascade entries carry empty-string CIDs by deliberate
+    convention; the URI is the identifying field and the takedown
+    covers all versions of the record at that URI. Single-subject
+    `emitEvent{TakedownRecord}` retains CID-level semantics
+    (specific record version, real CID populated). Operators
+    choosing between paths select based on whether they need
+    version-specific or URI-level coverage. Documented at
+    `BatchRecordsInput` and the `Subject::Record` variant doc
+    comments, pinned by
+    `batch_takedown_records_produces_uri_level_cascade_with_empty_cids`.
+
+  Stability commitment: `tools.aurora.admin.emitEvent` is the
+  sixth committed surface under the v0.3 contract-lockdown
+  framework, pinned by the doc-comment on `EmitEventOutput`
+  (literal phrase "emitEvent multi-subject contract is
+  committed"). Drift caught by `tests/contract_phrases.rs`
+  (seventh phrase added). Operator summary at
+  `docs/operator/contract-stability.md` (now six committed
+  surfaces).
+
+### Added
+- **Arc 3: Audit-trail read contract.**
+  `tools.aurora.admin.getAuditTrail` is committed as the fifth
+  stability surface under the v0.3 contract-lockdown framework.
+  The endpoint exposes `cascadeSnapshotIds` on the wire
+  (load-bearing for independent chain verification per
+  `docs/operator/audit-chain-verification.md`), ships a
+  seven-filter set (`actor_did`, `action`, `subject_did`,
+  `subject_uri`, `subject_cid`, `after_created`, `before_created`)
+  with `subject_cid` newly added in this cycle, and pins
+  pagination/verification semantics via doc-comment commitment
+  on `GetAuditTrailOutput` (literal phrase
+  "audit-trail read contract is committed"). The wire-to-canonical
+  bridge documentation enables external consumers to recompute
+  SHA-256 hashes independently from response data, with all
+  transformation rules verified against production behavior by
+  `tests/audit_chain_canonical_verification.rs` (six worked
+  examples with reproducible hashes plus seven production-roundtrip
+  tests). Drift caught by `tests/contract_phrases.rs` (sixth
+  phrase added) and the structural lint from Arc 2.
+
+  Operator summary at `docs/operator/contract-stability.md`
+  (now five committed surfaces).
+
+- **Arc 2: Contract lockdown.** Aurora-Locus v0.3 commits to four
+  stability contracts on its admin-and-capability surfaces:
+  Subject vocabulary stability (canonical Aurora `Subject` and
+  createReport `ReportSubject` — two distinct surfaces;
+  internally-tagged for the former, untagged-at-the-enum-level for
+  the latter), `describeCapabilities` response shape stability,
+  capability string versioning convention
+  (`<kebab-family>-v<integer>`), and action-ID surfacing
+  (`auditEntryId` and optionally `eventId` on Aurora-namespace
+  handlers writing audit chain entries). Each contract is committed
+  in a doc comment at the canonical source location and pinned by
+  snapshot tests (`Subject` and `ReportSubject` wire-format
+  snapshots in their respective modules; `describe_capabilities_snapshot`
+  in `src/api/admin.rs`) plus a structural lint
+  (`tests/admin_handler_contract.rs`) and a phrase-presence test
+  (`tests/contract_phrases.rs`). Operator summary at
+  `docs/operator/contract-stability.md`. Drift becomes a loud
+  CI failure: any future PR that silently removes a commitment
+  phrase from its canonical location, breaks a wire-format
+  snapshot, or drops the audit-entry-ID field from a typed
+  `*Output` struct (without an explicit allowlist entry) fails
+  the appropriate test.
+
+### Changed
+- **Wire-format breaking change (v0.3 / Arc 2 contract lockdown).**
+  `tools.aurora.superadmin.grantRole` and `tools.aurora.superadmin.revokeRole`
+  responses are now typed structs with `rename_all = "camelCase"` wire fields,
+  replacing the prior ad-hoc `serde_json::json!(...)` shape. The action-ID
+  field renames from `audit_entry_id` → `auditEntryId`; on `grantRole` the
+  embedded role record's wrapper field also renames `admin_role` → `adminRole`
+  (the inner struct's snake_case fields are unchanged). Aligns these two
+  handlers with the action-ID contract committed in
+  `crate::admin::audit_chain` per `docs/V03_DESIGN.md` §6.3.4 — every
+  Aurora-namespace admin handler that writes a chain entry now surfaces
+  `auditEntryId` on a typed `*Output` struct. Drift is caught by
+  `tests/admin_handler_contract.rs`. Per Arc 2 Step 0.5 prereq recon, the
+  only in-tree consumer of `audit_entry_id` was a single unit test in
+  `src/api/admin.rs` (updated alongside this change); the admin UI invokes
+  these endpoints but discards the response, so no UI-side coordination
+  needed.
+
 ### Added
 - Design corpus updated to reflect as-built reality on five surfaces. Forensic export's `account-state.json` is always included with operational fields; sensitive fields remain `includeAccountMetadata`-gated (CR-7). `describeCapabilities` advertises a hand-curated capability list; runtime route enumeration deferred to v0.3 (#123). Runtime settings configuration is two-tier (Runtime + Default with RecoveryMode override) rather than the originally-specified three-tier; file-tier addition deferred to v0.3 (#124). `ModEventAction` is subject-aware (`TakedownAccount` vs `TakedownRecord` etc.) rather than the originally-specified compositional shape; compositional revisit deferred to v0.3 (#125). `getModerationMetrics` and `getQueueStats` use flat `start`/`end` strings and `i64` rather than the `TimeRange` wrapper and `u32`; typed-shape revisit deferred to v0.3 (#126).
 - Live subscription channel separated from the historical aggregate. New `mod_event_seq` table mirrors the subset of `moderation_event` columns the `Event` wire variant emits (the `meta` column is intentionally not mirrored — the wire format doesn't carry it). Every `moderation_event` INSERT also writes a `mod_event_seq` row inside the same transaction via `insert_moderation_event_in_tx`, so the two surfaces never diverge. `tools.aurora.admin.subscribeModEvents` now reads from `mod_event_seq`; `tools.aurora.moderator.queryEvents` and other historical reads continue to use `moderation_event` directly. Migration `0006_mod_event_seq.sql` (SQLite + Postgres). Per docs/AURORA_ADMIN_UI_DESIGN.md §3.5. (#115)
@@ -47,7 +332,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - F3 — Tighten batch endpoint audit_entry_id type from Option<String> to String (#133)
 - F2 — subscribeModEvents AuditEntry shape: wrap in entry field and add missing AuditEntry fields (#132)
 - **Wire-format breaking change.** `tools.aurora.admin.getModerationMetrics` is now a `GET` query, not `POST`. The endpoint is a pure read with no side effects, so XRPC's query convention applies; the prior `POST` shape contradicted §8.16's read-vs-mutate split. Inputs (`start`, `end`, `granularity`, `metrics`) move from a JSON body to query parameters. The `metrics: Vec<MetricType>` parameter takes repeated keys (`?metrics=takedowns&metrics=labels`), which requires `axum_extra::extract::Query` rather than `axum::extract::Query` — same pattern `getAccountInfos` uses. Clients sending `POST` get 405 Method Not Allowed. v0.2 has not shipped to upstream so no external clients need a coordinated upgrade. (#118)
-- `audit_chain::append_entry` gains an `_in_tx` companion so admin handlers can land the chain entry atomically with their underlying mutation. Pre-fix, `append_entry` opened its own transaction and committed before returning, so a handler calling it after an actor-table UPDATE had a tear window where the mutation could land but the chain row could fail/crash, silently violating the §3.4 "every administrative decision gets a chain row" invariant. Five sites migrated (`emit_event`, `enable_account_invites`, `disable_account_invites`, `grantRole`, `revokeRole`); the seven remaining sites — six `batch*` handlers and `updateAccountEmail` — depend on manager-API `_in_tx` splits and are tracked under chainlink #127 for v0.3. New `AppendChainGuard` exposes the in-process serialization for caller-managed tx flow; existing pool-API `append_entry` is now a thin wrapper. `ModerationEventLogger::log_event_in_tx` companion lands moderation_event + mod_event_seq + audit_chain_entry in one tx. (#122)
+- `audit_chain::append_entry` gains an `_in_tx` companion so admin handlers can land the chain entry atomically with their underlying mutation. Pre-fix, `append_entry` opened its own transaction and committed before returning, so a handler calling it after an actor-table UPDATE had a tear window where the mutation could land but the chain row could fail/crash, silently violating the §3.4 "every administrative decision gets a chain row" invariant. Five sites migrated (`emit_event`, `enable_account_invites`, `disable_account_invites`, `grantRole`, `revokeRole`); the seven remaining sites — six `batch*` handlers and `updateAccountEmail` — depend on manager-API `_in_tx` splits and are tracked under #127 for v0.3. New `AppendChainGuard` exposes the in-process serialization for caller-managed tx flow; existing pool-API `append_entry` is now a thin wrapper. `ModerationEventLogger::log_event_in_tx` companion lands moderation_event + mod_event_seq + audit_chain_entry in one tx. (#122)
 - `Subject::Blob` round-trips `record_uri` through `audit_chain_entry`'s flat columns. Pre-fix, the chain producer destructured `Subject::Blob { did, cid, .. }` and dropped `record_uri` on the floor; reading the row back through `Subject::from_columns` then saw `(Some(did), None, Some(cid))` — a shape with no matching arm — and returned `None`, losing the subject identity entirely on every Blob entry that carried a record context. Producer now binds and stores `record_uri` in `subject_uri`; reader gains a `(Some, None, Some) → Blob with record_uri = None` arm that also handles legacy chain rows written before this fix. The L-2 canonical-hash invariant is preserved (the new value flows through the same hash path; existing chain rows verify unchanged). (#121)
 - `getAuditTrail`'s `chainVerifiedThrough` field surfaces the failing sequence on chain verification failure. Pre-fix the handler used `verify_chain_range(...).is_ok()` and reported `chain_verified_through = head_seq` on success but `0` on any failure, collapsing every failure mode (per-row tamper at seq=N, linkage break at seq=N, gap at seq=N) into the same "verified through 0" signal. Operators investigating a chain failure now get `failing_sequence - 1` (saturating), pointing at the last verified row before the divergence. The change is purely informational — clients reading `chainVerified` get the same boolean — but operators auditing a tampered chain can localize the break instead of doing a manual binary search. (#120)
 - `tools.aurora.admin.setRuntimeSetting` validates the `key` against an allowlist (`KNOWN_RUNTIME_KEYS`: currently `moderation-mode` and `moderation-mode-redirect-url`). Pre-fix, any key was accepted into the `runtime_settings` table; a typo or fabricated key would write a row that no reader ever consults. The allowlist makes drift loud — unknown keys return 400 with the known-keys list — without locking the surface against legitimate v0.3 additions (the constant lives next to the existing key constants). `getRuntimeSetting` is unaffected; the read side already returns the hardcoded default for keys with no row. (#119)
@@ -67,7 +352,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - All administrative call sites in `aurora_admin.rs` and `admin.rs` that perform a chain-write paired with an actor-state mutation now do both atomically. Round-three audit's LB-1 finding flagged twelve such sites (sessions covered by #122 and #128 closed them); this round closes seventeen additional sites with the same shape that the audit's curated list didn't enumerate: single-account mutations (`updateAccountHandle`, `updateAccountPassword`, `adminDeleteAccount`, `updateAccountSigningKey`), single-handler `takedownAccount`/`suspendAccount`/`restoreAccount` (via `ModerationManager`), single-record/blob `applyLabel`/`removeLabel`, `updateSubjectStatus`, `updateReportStatus`, `sendEmail`, `createInviteCode`/`disableInviteCode`/`disableInviteCodes`, `setRuntimeSetting`, `triggerPasswordReset`. New `_in_tx` variants land on `AccountManager` (handle, password, delete, activate/deactivate/reactivate, generate_password_reset_token), `ModerationManager` (apply_action, reverse_action — both thread the tx through to the AccountManager variants for actor-state side effects), `ReportManager` (update_status), and `InviteCodeManager` (create_invite, disable_code, disable_codes_batch). `ModerationManager.apply_action`'s takedown side-effect was previously best-effort (logged failure, returned Ok with the moderation row); it is now atomic with the moderation row — failure of the actor UPDATE aborts the transaction. `sendEmail` and `triggerPasswordReset` moved to chain-first ordering: chain entry commits before the mailer dispatch, so a mailer failure no longer leaves operator action un-audited. The §3.4 chain-of-custody invariant now holds at every administrative call site where the pattern applies; sequencer ops, cleanup ops, and forensic export remain on the non-tx variant because they emit chain entries without paired mutations. (#129)
-- All administrative call sites in `aurora_admin.rs` and `admin.rs` now write the audit chain entry atomically with the underlying mutation. Pre-fix, twelve sites split the moderation_event commit and the chain append into separate transactions, leaving an orphan-window where a mid-handler crash could strand a state mutation without chain coverage. Session 10 closed five sites (`emit_event`, `enableAccountInvites`, `disableAccountInvites`, `grantRole`, `revokeRole`); this round closes the remaining seven (six batch handlers — `batchTakedownAccounts`, `batchSuspendAccounts`, `batchRestoreAccounts`, `batchTakedownRecords`, `batchApplyLabel`, `batchRemoveLabel` — plus `updateAccountEmail`). `AccountManager` and `LabelManager` gain `_in_tx` companion variants for `takedown_account`, `update_email`, `apply_label`, and `remove_label`; the batch helper `insert_batch_account_moderations` becomes tx-aware. The two batch handlers with per-subject best-effort semantics (`batchTakedownAccounts`, `batchRestoreAccounts`) use `SAVEPOINT`-backed inner transactions so chainlink #112's `failures[]` array is preserved while the wrapping tx still gives chain-entry atomicity. The §3.4 chain-of-custody invariant now holds at every administrative call site identified by the round-3 audit; round-three's load-bearing LB-1 finding closed. (#128)
+- All administrative call sites in `aurora_admin.rs` and `admin.rs` now write the audit chain entry atomically with the underlying mutation. Pre-fix, twelve sites split the moderation_event commit and the chain append into separate transactions, leaving an orphan-window where a mid-handler crash could strand a state mutation without chain coverage. Session 10 closed five sites (`emit_event`, `enableAccountInvites`, `disableAccountInvites`, `grantRole`, `revokeRole`); this round closes the remaining seven (six batch handlers — `batchTakedownAccounts`, `batchSuspendAccounts`, `batchRestoreAccounts`, `batchTakedownRecords`, `batchApplyLabel`, `batchRemoveLabel` — plus `updateAccountEmail`). `AccountManager` and `LabelManager` gain `_in_tx` companion variants for `takedown_account`, `update_email`, `apply_label`, and `remove_label`; the batch helper `insert_batch_account_moderations` becomes tx-aware. The two batch handlers with per-subject best-effort semantics (`batchTakedownAccounts`, `batchRestoreAccounts`) use `SAVEPOINT`-backed inner transactions so #112's `failures[]` array is preserved while the wrapping tx still gives chain-entry atomicity. The §3.4 chain-of-custody invariant now holds at every administrative call site identified by the round-3 audit; round-three's load-bearing LB-1 finding closed. (#128)
 - `tests/multi_instance_test.rs` now compiles. The Postgres testcontainer harness was stranded after #103's dedicated-lock-connection refactor changed `PostgresLockProvider::new` to take the database URL string instead of an `AnyPool`; the test still passed `pool.clone()` and broke the integration-test build. `cargo test --tests --no-run` now compiles all eight integration test binaries clean. The harness still requires Docker to actually run, but the binary at least builds. (#110)
 - Forensic export `bundle_hash` now covers the complete tar bytes. Pre-fix, the recorded hash covered only `manifest.json`; the per-file payloads (account state, moderation history, audit entries, audit-trail manifest) were inside the tar but outside the chain commitment. A tampered tar still passed verification. The chain entry's rationale and the `X-Aurora-Bundle-Hash` response header now both record SHA-256 over the complete tar bytes. The in-tar `audit-trail.json` no longer carries `bundleHash` or `auditEntryId` (would create a self-referencing hash cycle); consumers correlate the export to the chain entry via the `X-Aurora-Audit-Entry-Id` response header and a `getAuditTrail` lookup. (#99)
 - Audit chain `append_entry` serializes concurrent writers. Pre-fix, two concurrent admin actions racing through the chain both observed the same head and both computed the same next sequence; the second INSERT failed with a `UNIQUE(sequence)` constraint error while the underlying mutation had already executed — silent chain entry loss under bursty load. Three layers of serialization (in-process mutex, transaction wrapping, Postgres `pg_advisory_xact_lock`) now hold; stress-tested with 20 concurrent writers producing contiguous sequences and clean linkage. (#106)

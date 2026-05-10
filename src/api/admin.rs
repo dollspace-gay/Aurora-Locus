@@ -811,12 +811,35 @@ struct GrantRoleRequest {
     rationale: Option<String>,
 }
 
+/// Output for `tools.aurora.superadmin.grantRole`. Surfaces
+/// `auditEntryId` per the action-ID contract committed in
+/// `crate::admin::audit_chain` (Arc 2 §6.4.2). Pre-Arc-2 this
+/// handler returned `serde_json::json!(...)` ad-hoc with the
+/// snake_case wire field `audit_entry_id`; Step 2 normalized
+/// to a typed struct with camelCase wire fields throughout.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrantRoleOutput {
+    pub success: bool,
+    pub did: String,
+    pub role: String,
+    /// Full role record as recorded in the `admin_roles` table.
+    /// Wire field renamed from `admin_role` to `adminRole` as part
+    /// of Arc 2's typed-struct conversion (`rename_all =
+    /// "camelCase"`).
+    pub admin_role: crate::admin::roles::AdminRole,
+    /// Wire field renamed from `audit_entry_id` to `auditEntryId`
+    /// as part of Arc 2's action-ID contract; emitted as a string
+    /// to dodge JS-number-precision issues with large i64 ids.
+    pub audit_entry_id: String,
+}
+
 /// Grant admin role to a user
 async fn grant_role(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<GrantRoleRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<GrantRoleOutput>, (StatusCode, String)> {
     use crate::admin::roles::Role;
 
     // SuperAdmin only — relocated to tools.aurora.superadmin.* in
@@ -898,13 +921,31 @@ async fn grant_role(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": req.did,
-        "role": req.role,
-        "admin_role": admin_role,
-        "audit_entry_id": audit_entry_id.to_string(),
-    })))
+    Ok(Json(GrantRoleOutput {
+        success: true,
+        did: req.did,
+        role: req.role,
+        admin_role,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// Output for `tools.aurora.superadmin.revokeRole`. Surfaces
+/// `auditEntryId` per the action-ID contract committed in
+/// `crate::admin::audit_chain`. Pre-Arc-2 this handler returned
+/// `serde_json::json!(...)` ad-hoc; Step 2 normalized to a typed
+/// struct with camelCase wire fields throughout. Wire field
+/// renamed from `audit_entry_id` to `auditEntryId`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevokeRoleOutput {
+    pub success: bool,
+    pub did: String,
+    /// Emitted as a string to dodge JS-number-precision issues
+    /// with large i64 ids; field name renamed wire-side from
+    /// `audit_entry_id` to `auditEntryId` as part of Arc 2's
+    /// action-ID contract.
+    pub audit_entry_id: String,
 }
 
 #[derive(Deserialize)]
@@ -923,7 +964,7 @@ async fn revoke_role(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<RevokeRoleRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<RevokeRoleOutput>, (StatusCode, String)> {
     use crate::admin::roles::Role;
 
     // SuperAdmin only — same rationale as grant_role above
@@ -986,11 +1027,11 @@ async fn revoke_role(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "did": req.did,
-        "audit_entry_id": audit_entry_id.to_string(),
-    })))
+    Ok(Json(RevokeRoleOutput {
+        success: true,
+        did: req.did,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -2856,6 +2897,22 @@ async fn search_accounts(
 // targeted attacks; we don't gate the wire format on an unauth
 // probe.
 
+/// Response shape for `tools.aurora.admin.describeCapabilities`.
+///
+/// Per `docs/V03_DESIGN.md` §6.3.1: field stability is committed.
+/// New fields may be added; existing field names and shapes do not
+/// change across releases. Capability strings within `extensions`
+/// follow the `<kebab-family>-v<integer>` versioning convention
+/// (committed separately on `aurora_capability_extensions` per
+/// Step 4).
+///
+/// Snapshot test: `describe_capabilities_snapshot` in this file's
+/// test module pins the wire format and catches drift loudly.
+/// Both top-level fields (alphabetical via canonical-JSON) and
+/// inner namespace keys (alphabetical via `serde_json::Map`'s
+/// default `BTreeMap` backing) sort deterministically; endpoint
+/// arrays preserve the source-order of the `aurora_capability_families`
+/// JSON literal.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DescribeCapabilitiesResponse {
@@ -2875,6 +2932,7 @@ struct CapabilityExtension {
     value: Option<serde_json::Value>,
 }
 
+// TODO(#123, v0.4): runtime route enumeration deferred per V03_DESIGN.md §9 and docs/v04-candidates.md
 /// Endpoint names per Aurora namespace, as currently shipped. Updated
 /// by future sub-phases as they land. Phase 3.2's snapshot reflects
 /// the surface present at this commit; sub-phases 3.3-3.9 each add
@@ -2955,6 +3013,7 @@ fn aurora_capability_families() -> serde_json::Value {
     })
 }
 
+// TODO(#123, v0.4): runtime route enumeration deferred per V03_DESIGN.md §9 and docs/v04-candidates.md
 /// Static capability advertisement reflecting what's structurally
 /// present in this build. The `name` strings are the canonical
 /// vocabulary from §8.15 and double as the keys clients use to gate
@@ -2966,6 +3025,21 @@ fn aurora_capability_families() -> serde_json::Value {
 ///   - `invite-lineage-v1`     (no shipped endpoint as of v0.2 cycle)
 ///   - `reporter-context-v1`   (no shipped endpoint as of v0.2 cycle)
 /// Add them here when their handlers land.
+///
+/// # Versioning contract
+///
+/// Per `docs/V03_DESIGN.md` §6.3.1: capability strings follow the pattern `<kebab-family>-v<integer>`.
+/// Kebab-case family name, hyphen, lowercase `v`, integer
+/// version. Breaking changes ship as a NEW version suffix (e.g.
+/// `subject-context-v2`); the OLD version is removed only after
+/// the new version has shipped and consumers have had time to
+/// migrate. Bumping the integer is the wire signal that breaking
+/// change has landed.
+///
+/// The snapshot test `describe_capabilities_snapshot` (Step 3) pins
+/// the advertised set; the contract-phrase test
+/// `tests/contract_phrases.rs` (Step 4) pins this versioning
+/// commitment by grepping for the pattern in this doc comment.
 fn aurora_capability_extensions() -> Vec<CapabilityExtension> {
     vec![
         // Phase 3.2 — capability probe ships alongside getSubjectContext.
@@ -3385,10 +3459,17 @@ enum SubjectUnion {
         rename_all = "camelCase"
     )]
     StrongRef { uri: String, cid: String },
-    #[serde(
-        rename = "com.atproto.admin.defs#repoBlobRef",
-        rename_all = "camelCase"
-    )]
+    // §6.4.0.5: emit `record_uri` (snake_case) on the wire to
+    // byte-match `Subject::Blob` in src/admin/defs.rs:37-43.
+    // Shipped Aurora-namespace handlers (getAuditTrail,
+    // subscribeModEvents, etc.) emit Subject::Blob's snake_case
+    // shape; SubjectUnion is the input/parsing dual on
+    // updateSubjectStatus and must accept and re-emit the same
+    // wire bytes. `rename_all = "camelCase"` would re-emit
+    // `recordUri`, drifting from the shipped contract — drop it.
+    // The other fields in this variant (did, cid) are single
+    // words and unaffected by the absent `rename_all`.
+    #[serde(rename = "com.atproto.admin.defs#repoBlobRef")]
     RepoBlobRef {
         did: String,
         cid: String,
@@ -3510,18 +3591,15 @@ async fn update_subject_status(
                      only takedown applies to blobs",
                 ));
             }
-            // Drop the held tx so the blob quarantine layer's own tx
-            // can acquire the pool connection (single-connection
-            // pools deadlock otherwise). After the quarantine call
-            // we reopen a tx for the chain entry.
-            tx.rollback()
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+            // Arc 4 §8.4.0.5 / chainlink #131: thread the wrapping
+            // tx into apply_blob_status so the quarantine/restore
+            // operations + the chain entry land atomically. Pre-Arc-4
+            // this site released the held tx, called the pool-API
+            // quarantine layer (which opened its own tx), then
+            // reopened a fresh tx for the chain entry — fragile and
+            // non-atomic.
             let (resp, fx) =
-                apply_blob_status(&ctx, &auth, did, cid, takedown.as_ref()).await?;
-            tx = ctx.account_db.begin().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            })?;
+                apply_blob_status(&ctx, &mut tx, &auth, did, cid, takedown.as_ref()).await?;
             (resp, fx)
         }
 
@@ -3696,8 +3774,9 @@ async fn apply_account_status_in_tx<'c>(
 /// than silently no-op'ing through the idempotency path. Already-in-state
 /// cases (already quarantined when applying, not quarantined when removing)
 /// are treated as idempotent success.
-async fn apply_blob_status(
+async fn apply_blob_status<'tx>(
     ctx: &AppContext,
+    tx: &mut sqlx::Transaction<'tx, sqlx::Any>,
     auth: &AdminAuthContext,
     did: &str,
     cid: &str,
@@ -3712,6 +3791,8 @@ async fn apply_blob_status(
 
     // Establish that the blob actually exists. `BlobStore::get_metadata`
     // returns Some(_) iff the blob is registered; missing → 404.
+    // (Pool-API read; safe outside the wrapping tx because we're only
+    // reading metadata, not branching on quarantine state.)
     let exists = ctx
         .blob_store
         .get_metadata(cid)
@@ -3722,38 +3803,48 @@ async fn apply_blob_status(
         return Err(xrpc_blob_not_found_error(cid));
     }
 
-    let quarantine = BlobQuarantine::new(ctx.account_db.clone());
     let mut effects: Vec<String> = Vec::new();
+
+    // Track post-state to populate the response without a stale read
+    // against the pool (an `is_quarantined` SELECT against `&self.db`
+    // wouldn't see the wrapping tx's pending writes). When `takedown`
+    // is None, no patch is applied and the blob's pre-call state is
+    // returned via the post-tx-commit pool read at the call site.
+    let mut post_state_taken_down: Option<bool> = None;
 
     if let Some(td) = takedown {
         if td.applied {
             // Already-quarantined → Conflict from the quarantine layer →
             // idempotent success since the desired post-state already obtains.
-            match quarantine
-                .quarantine_blob(
-                    cid,
-                    QuarantineReason::Other,
-                    td.ref_field.as_deref(),
-                    &auth.did,
-                    None,
-                )
-                .await
+            // Arc 4 §8.4.0.5: in-tx variant so the quarantine row + the
+            // chain entry the caller writes land atomically.
+            match BlobQuarantine::quarantine_blob_in_tx(
+                tx,
+                cid,
+                QuarantineReason::Other,
+                td.ref_field.as_deref(),
+                &auth.did,
+                None,
+            )
+            .await
             {
                 Ok(_) | Err(PdsError::Conflict(_)) => {}
                 Err(e) => {
                     return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
                 }
             }
+            post_state_taken_down = Some(true);
         } else {
             // Not-currently-quarantined → NotFound from `restore_blob` →
             // idempotent success (operator wanted "ensure not quarantined";
             // we already are).
-            match quarantine.restore_blob(cid, &auth.did).await {
+            match BlobQuarantine::restore_blob_in_tx(tx, cid, &auth.did).await {
                 Ok(_) | Err(PdsError::NotFound(_)) => {}
                 Err(e) => {
                     return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
                 }
             }
+            post_state_taken_down = Some(false);
         }
         effects.push(render_status_effect(
             "takedown",
@@ -3762,10 +3853,21 @@ async fn apply_blob_status(
         ));
     }
 
-    let is_taken_down = quarantine
-        .is_quarantined(cid)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+    // Determine the wire response's `applied` flag. When a takedown
+    // patch was applied, we know the post-state from the operation
+    // (quarantine call set true; restore call set false). When
+    // takedown is None, query the pool for the current state — no
+    // pending writes exist on this tx for this cid.
+    let is_taken_down = match post_state_taken_down {
+        Some(state) => state,
+        None => {
+            let quarantine = BlobQuarantine::new(ctx.account_db.clone());
+            quarantine
+                .is_quarantined(cid)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?
+        }
+    };
     Ok((
         Some(StatusAttr {
             applied: is_taken_down,
@@ -5978,6 +6080,13 @@ async fn cleanup_nonce_stores(
     })))
 }
 
+// Arc 2 Step 1 (§6.4.1) — canonical-JSON helper for snapshot
+// tests. See the matching declaration in `src/admin/defs.rs` for
+// the rationale on top-level placement vs nested-mod placement.
+#[cfg(test)]
+#[path = "../../tests/common/canonical_json.rs"]
+mod canonical_json_helper;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6045,7 +6154,6 @@ mod tests {
                 // tests that exercise PLC code paths.
                 repo_signing_key: "a".repeat(64),
                 plc_rotation_key: "b".repeat(64),
-                admin_dids: vec![],
                 oauth: OAuthConfig {
                     client_id: "http://localhost:3000/client-metadata.json".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -7088,6 +7196,141 @@ mod tests {
 
     // ---- tools.aurora.describeCapabilities (chainlink #99 / Phase 3.2) ----
 
+    /// Arc 2 Step 3 (§6.4.3) — full canonical-JSON snapshot of the
+    /// `tools.aurora.admin.describeCapabilities` response. Pins:
+    ///
+    /// - Top-level field set (`extensions`, `families`,
+    ///   `implementation`, `version`) and ordering (alphabetical via
+    ///   canonical-JSON).
+    /// - All 14 capability extension strings (the advertised set
+    ///   per Arc 2 Step 0 recon Q2; two further §8.15 vocabulary
+    ///   entries — `invite-lineage-v1` and `reporter-context-v1` —
+    ///   remain intentionally omitted because their endpoints aren't
+    ///   shipped).
+    /// - The four namespace keys (`tools.aurora.admin`, `.moderator`,
+    ///   `.ops`, `.superadmin`) and every endpoint within each.
+    /// - `implementation` literal "aurora-locus" and the pinned
+    ///   `version` string from CARGO_PKG_VERSION (bumped in lockstep
+    ///   with the cycle).
+    ///
+    /// Determinism rationale: `serde_json::Map` defaults to a
+    /// `BTreeMap` (no `preserve_order` feature) so namespace keys
+    /// inside `families` come out alphabetically; `extensions` is
+    /// `Vec<CapabilityExtension>` with hardcoded declaration order;
+    /// endpoint arrays inside `families` preserve the JSON-literal
+    /// source order. No `HashMap` iteration anywhere on the wire
+    /// path.
+    #[tokio::test]
+    async fn describe_capabilities_snapshot() {
+        let ctx = create_test_context().await;
+        let resp = describe_capabilities(State(ctx), admin_test_auth())
+            .await
+            .unwrap()
+            .0;
+        let actual = canonical_json(&resp);
+        let expected = concat!(
+            r#"{"#,
+            // ---- extensions: 14 strings in Vec declaration order ----
+            r#""extensions":["#,
+            r#"{"name":"subject-context-v1"},"#,
+            r#"{"name":"moderator-activity-v1"},"#,
+            r#"{"name":"subject-history-v1"},"#,
+            r#"{"name":"appeals-v1"},"#,
+            r#"{"name":"instance-metrics-v1"},"#,
+            r#"{"name":"mod-events-emit-v1"},"#,
+            r#"{"name":"batch-takedown-v1"},"#,
+            r#"{"name":"trigger-password-reset-v1"},"#,
+            r#"{"name":"moderation-metrics-v1"},"#,
+            r#"{"name":"queue-stats-v1"},"#,
+            r#"{"name":"audit-trail-v1"},"#,
+            r#"{"name":"forensic-export-v1"},"#,
+            r#"{"name":"mod-events-stream-v1"},"#,
+            r#"{"name":"runtime-settings-v1"}"#,
+            r#"],"#,
+            // ---- families: 4 namespaces, alphabetical keys ----
+            r#""families":{"#,
+            // tools.aurora.admin (15 endpoints)
+            r#""tools.aurora.admin":["#,
+            r#""emitEvent","#,
+            r#""batchTakedownAccounts","#,
+            r#""batchSuspendAccounts","#,
+            r#""batchRestoreAccounts","#,
+            r#""batchTakedownRecords","#,
+            r#""batchApplyLabel","#,
+            r#""batchRemoveLabel","#,
+            r#""triggerPasswordReset","#,
+            r#""getQueueStats","#,
+            r#""getModerationMetrics","#,
+            r#""getAuditTrail","#,
+            r#""exportAccountForensic","#,
+            r#""subscribeModEvents","#,
+            r#""getRuntimeSetting","#,
+            r#""setRuntimeSetting""#,
+            r#"],"#,
+            // tools.aurora.moderator (7 endpoints)
+            r#""tools.aurora.moderator":["#,
+            r#""queryEvents","#,
+            r#""getEvent","#,
+            r#""queryStatuses","#,
+            r#""getSubjectContext","#,
+            r#""getSubjectHistory","#,
+            r#""listAppeals","#,
+            r#""getAppeal""#,
+            r#"],"#,
+            // tools.aurora.ops (32 endpoints)
+            r#""tools.aurora.ops":["#,
+            r#""getStats","#,
+            r#""listAccounts","#,
+            r#""getInstanceMetrics","#,
+            r#""getValidationFailures","#,
+            r#""getSystemHealth","#,
+            r#""getDatabaseStatus","#,
+            r#""getResourceUsage","#,
+            r#""listBackgroundJobs","#,
+            r#""runHealthChecks","#,
+            r#""getVersionInfo","#,
+            r#""getSystemMetrics","#,
+            r#""getNonceStoreStatus","#,
+            r#""cleanupNonceStores","#,
+            r#""getBlobStatistics","#,
+            r#""listBlobs","#,
+            r#""deleteBlob","#,
+            r#""quarantineBlob","#,
+            r#""restoreBlob","#,
+            r#""runBlobGC","#,
+            r#""getBlobQuotas","#,
+            r#""getSequencerStatus","#,
+            r#""pauseSequencer","#,
+            r#""resumeSequencer","#,
+            r#""resetSequencerCursor","#,
+            r#""rebuildSequencer","#,
+            r#""getRateLimitConfig","#,
+            r#""getRateLimitStatus","#,
+            r#""cleanupRateLimitState","#,
+            r#""getFederationStatus","#,
+            r#""getRelayConfig","#,
+            r#""listKnownInstances","#,
+            r#""triggerPdsDiscovery""#,
+            r#"],"#,
+            // tools.aurora.superadmin (2 endpoints)
+            r#""tools.aurora.superadmin":["#,
+            r#""grantRole","#,
+            r#""revokeRole""#,
+            r#"]"#,
+            r#"},"#,
+            // ---- implementation, version (literals) ----
+            r#""implementation":"aurora-locus","#,
+            r#""version":"0.3.0""#,
+            r#"}"#,
+        );
+        assert_eq!(
+            actual, expected,
+            "describeCapabilities wire shape changed — \
+             update the snapshot AND the §6.3.1 commitment if the \
+             change is intentional, otherwise revert"
+        );
+    }
+
     #[tokio::test]
     async fn test_describe_capabilities_returns_expected_shape() {
         let ctx = create_test_context().await;
@@ -7097,10 +7340,10 @@ mod tests {
             .0;
 
         assert_eq!(resp.implementation, "aurora-locus");
-        // version comes from CARGO_PKG_VERSION; pinned to the v0.2
-        // cycle release per CR-4 / chainlink #117. Bump in lockstep
-        // with Cargo.toml when the cycle increments.
-        assert_eq!(resp.version, "0.2.0");
+        // version comes from CARGO_PKG_VERSION; pinned to the
+        // current cycle release per CR-4 / chainlink #117. Bump in
+        // lockstep with Cargo.toml when the cycle increments.
+        assert_eq!(resp.version, "0.3.0");
 
         // Families object must include the four Aurora namespaces, each
         // a JSON array (possibly empty for namespaces that haven't
@@ -7207,18 +7450,26 @@ mod tests {
         let resp = grant_role(State(ctx.clone()), superadmin_test_auth(), Json(req))
             .await
             .expect("SuperAdmin should be allowed to grant roles");
-        let json = resp.0;
-        assert_eq!(
-            json.get("did").and_then(|v| v.as_str()),
-            Some("did:plc:newmod")
+        let output = resp.0;
+        assert_eq!(output.did, "did:plc:newmod");
+        assert_eq!(output.role, "moderator");
+        assert!(
+            !output.audit_entry_id.is_empty(),
+            "grantRole must return the chain entry id"
         );
-        assert_eq!(
-            json.get("role").and_then(|v| v.as_str()),
-            Some("moderator")
+        // Wire-form check: serialize to JSON and confirm the field
+        // surfaces as `auditEntryId` (camelCase) per the Arc 2
+        // action-ID contract — the pre-Arc-2 wire form
+        // `audit_entry_id` (snake_case) was renamed in Step 2.
+        let wire = serde_json::to_value(&output).unwrap();
+        assert!(
+            wire.get("auditEntryId").is_some(),
+            "grantRole wire output must use camelCase `auditEntryId`; full payload: {}",
+            wire,
         );
         assert!(
-            json.get("audit_entry_id").is_some(),
-            "grantRole must return the chain entry id"
+            wire.get("audit_entry_id").is_none(),
+            "grantRole must not emit the pre-Arc-2 snake_case `audit_entry_id`",
         );
     }
 
@@ -8087,11 +8338,13 @@ mod tests {
 
     #[test]
     fn test_subject_union_repo_blob_ref_round_trip() {
+        // §6.4.0.5: wire field is `record_uri` (snake_case), matching
+        // Subject::Blob in src/admin/defs.rs.
         let json = serde_json::json!({
             "$type": "com.atproto.admin.defs#repoBlobRef",
             "did": "did:plc:abc",
             "cid": "bafyblob",
-            "recordUri": "at://did:plc:abc/app.bsky.feed.post/xyz"
+            "record_uri": "at://did:plc:abc/app.bsky.feed.post/xyz"
         });
         let parsed: SubjectUnion = serde_json::from_value(json.clone()).unwrap();
         match &parsed {
@@ -8115,6 +8368,112 @@ mod tests {
         let result: Result<SubjectUnion, _> = serde_json::from_value(json);
         assert!(result.is_err());
     }
+
+    /// Arc 2 Step 0.5 (§6.4.0.5) — within-surface byte-equality
+    /// regression guard for the canonical Aurora Subject contract.
+    /// `Subject` (in `crate::admin::defs`) is the type Aurora-namespace
+    /// handlers serialize on getAuditTrail / subscribeModEvents /
+    /// batch-label / etc.; `SubjectUnion` (private to admin.rs) is the
+    /// parsing dual on updateSubjectStatus and friends. The two MUST
+    /// produce byte-identical canonical-JSON output for every shared
+    /// variant — otherwise round-tripping a payload through
+    /// updateSubjectStatus → getAuditTrail would surface a re-keyed
+    /// shape and break clients.
+    ///
+    /// The byte-drift between these types on `Blob`/`RepoBlobRef` —
+    /// `record_uri` vs `recordUri` — was caught by Arc 2 Step 0 recon
+    /// and fixed in this step by dropping `rename_all = "camelCase"`
+    /// from `RepoBlobRef`. This test pins all three shared variants
+    /// (Repo, Record, Blob) byte-equal across the two types so the
+    /// drift cannot regress.
+    ///
+    /// Uses the formal canonical-JSON helper at
+    /// `tests/common/canonical_json.rs`, included via `#[path]` at
+    /// the bottom of this test module so unit tests can reach it
+    /// across the unit-vs-integration boundary.
+    #[test]
+    fn subject_blob_and_subject_union_repoblobref_serialize_byte_equal() {
+        use crate::admin::defs::Subject;
+
+        // ---- Repo / RepoRef ----
+        let s_repo = Subject::Repo {
+            did: "did:plc:test1234567890abcdef".to_string(),
+        };
+        let u_repo = SubjectUnion::RepoRef {
+            did: "did:plc:test1234567890abcdef".to_string(),
+        };
+        assert_eq!(
+            canonical_json(&s_repo),
+            canonical_json(&u_repo),
+            "Repo / RepoRef must serialize byte-equal"
+        );
+
+        // ---- Record / StrongRef ----
+        let s_record = Subject::Record {
+            uri: "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            cid: "bafyreidemo123".to_string(),
+        };
+        let u_strong = SubjectUnion::StrongRef {
+            uri: "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            cid: "bafyreidemo123".to_string(),
+        };
+        assert_eq!(
+            canonical_json(&s_record),
+            canonical_json(&u_strong),
+            "Record / StrongRef must serialize byte-equal"
+        );
+
+        // ---- Blob / RepoBlobRef (the case Step 0.5 reconciled) ----
+        let s_blob = Subject::Blob {
+            did: "did:plc:test1234567890abcdef".to_string(),
+            cid: "bafyreidemoblob456".to_string(),
+            record_uri: Some(
+                "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            ),
+        };
+        let u_blob = SubjectUnion::RepoBlobRef {
+            did: "did:plc:test1234567890abcdef".to_string(),
+            cid: "bafyreidemoblob456".to_string(),
+            record_uri: Some(
+                "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+            ),
+        };
+        let s_blob_json = canonical_json(&s_blob);
+        let u_blob_json = canonical_json(&u_blob);
+        assert_eq!(
+            s_blob_json, u_blob_json,
+            "Blob / RepoBlobRef must serialize byte-equal — \
+             record_uri rename direction is the load-bearing fix"
+        );
+        // Pin the absolute wire shape so a later refactor that
+        // re-introduces `rename_all = \"camelCase\"` (or otherwise
+        // re-keys to `recordUri`) is caught at this assertion, not
+        // just at the cross-type comparison above.
+        assert_eq!(
+            s_blob_json,
+            r#"{"$type":"com.atproto.admin.defs#repoBlobRef","cid":"bafyreidemoblob456","did":"did:plc:test1234567890abcdef","record_uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc"}"#,
+            "wire shape must include snake_case `record_uri`"
+        );
+
+        // Blob with record_uri = None (skip_serializing_if path).
+        let s_blob_none = Subject::Blob {
+            did: "did:plc:test1234567890abcdef".to_string(),
+            cid: "bafyreidemoblob456".to_string(),
+            record_uri: None,
+        };
+        let u_blob_none = SubjectUnion::RepoBlobRef {
+            did: "did:plc:test1234567890abcdef".to_string(),
+            cid: "bafyreidemoblob456".to_string(),
+            record_uri: None,
+        };
+        assert_eq!(
+            canonical_json(&s_blob_none),
+            canonical_json(&u_blob_none),
+            "Blob / RepoBlobRef byte-equal when record_uri omitted"
+        );
+    }
+
+    use super::canonical_json_helper::canonical_json;
 
     #[test]
     fn test_status_attr_round_trip() {

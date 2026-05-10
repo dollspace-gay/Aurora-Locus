@@ -2,6 +2,7 @@
 //!
 //! Provides debugging and inspection tools for troubleshooting server issues.
 
+use crate::admin::audit_chain::{verify_chain_range, ChainVerificationError};
 use crate::context::AppContext;
 use crate::error::PdsResult;
 use serde_json::json;
@@ -559,4 +560,228 @@ pub async fn export_account(ctx: &AppContext, did: &str, output: &str) -> PdsRes
 
     println!("\n════════════════════════════════════════════════════════\n");
     Ok(())
+}
+
+/// Walk the audit chain from sequence 1 through the current head,
+/// recomputing per-row hashes and checking linkage via
+/// `verify_chain_range`. Writes a single-line verdict to stdout and
+/// returns `Ok(true)` if the chain is healthy (including empty),
+/// `Ok(false)` on a discontinuity. DB errors propagate as `Err`.
+///
+/// Read-only. Uses the configured backend via `AppContext`.
+pub async fn verify_audit_chain(ctx: &AppContext) -> PdsResult<bool> {
+    run_verify_audit_chain(&ctx.account_db, &mut std::io::stdout()).await
+}
+
+/// Core walk used by `verify_audit_chain` and unit-tested directly.
+/// Querying the head + dispatching to `verify_chain_range` lives here
+/// so tests can supply an in-memory pool and capture stdout.
+pub(crate) async fn run_verify_audit_chain<W: std::io::Write>(
+    db: &sqlx::AnyPool,
+    out: &mut W,
+) -> PdsResult<bool> {
+    // MAX over an empty table returns NULL — model the column as
+    // Option<i64> so an empty chain decodes cleanly without losing
+    // real DB errors (we want those to propagate as Err).
+    let head: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(sequence) FROM audit_chain_entry",
+    )
+    .fetch_one(db)
+    .await?;
+
+    let head = match head {
+        None => {
+            writeln!(out, "0 entries verified, chain healthy.").map_err(|e| {
+                crate::error::PdsError::Internal(format!("write failed: {}", e))
+            })?;
+            return Ok(true);
+        }
+        Some(h) => h,
+    };
+
+    match verify_chain_range(db, 1, head).await {
+        Ok(()) => {
+            let label = if head == 1 { "entry" } else { "entries" };
+            writeln!(out, "{} {} verified, chain healthy.", head, label).map_err(|e| {
+                crate::error::PdsError::Internal(format!("write failed: {}", e))
+            })?;
+            Ok(true)
+        }
+        Err(ChainVerificationError {
+            failing_sequence,
+            kind,
+        }) => {
+            let description = match kind {
+                crate::admin::audit_chain::ChainFailureKind::PerRowMismatch => {
+                    "per-row hash mismatch"
+                }
+                crate::admin::audit_chain::ChainFailureKind::LinkageMismatch => {
+                    "linkage hash mismatch"
+                }
+                crate::admin::audit_chain::ChainFailureKind::Gap => "missing sequence",
+            };
+            let verified_before = (failing_sequence - 1).max(0);
+            writeln!(
+                out,
+                "Chain discontinuity at sequence {}: {}.",
+                failing_sequence, description
+            )
+            .map_err(|e| crate::error::PdsError::Internal(format!("write failed: {}", e)))?;
+            let label = if verified_before == 1 { "entry" } else { "entries" };
+            writeln!(
+                out,
+                "{} {} verified before discontinuity.",
+                verified_before, label
+            )
+            .map_err(|e| crate::error::PdsError::Internal(format!("write failed: {}", e)))?;
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(test)]
+mod verify_audit_chain_tests {
+    use super::*;
+    use crate::admin::audit_chain::{append_entry, AppendEntryParams};
+    use crate::admin::defs::Subject;
+    use sqlx::any::AnyPoolOptions;
+    use sqlx::AnyPool;
+    use std::sync::Once;
+
+    async fn open_test_pool() -> AnyPool {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE audit_chain_entry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sequence INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                actor_did TEXT NOT NULL,
+                action TEXT NOT NULL,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                rationale TEXT NOT NULL,
+                snapshot_id INTEGER,
+                event_id INTEGER,
+                current_hash TEXT NOT NULL,
+                previous_hash TEXT,
+                cascade_subjects TEXT,
+                cascade_snapshot_ids TEXT,
+                UNIQUE(sequence)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE audit_snapshot (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at TEXT NOT NULL,
+                subject_did TEXT,
+                subject_uri TEXT,
+                subject_cid TEXT,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE actor (did TEXT PRIMARY KEY, handle TEXT, takedown_ref TEXT, \
+             deactivated_at TEXT, created_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn append_n_entries(db: &AnyPool, n: usize) {
+        let subject = Subject::Repo {
+            did: "did:plc:s".to_string(),
+        };
+        for i in 0..n {
+            append_entry(
+                db,
+                AppendEntryParams {
+                    actor_did: "did:plc:m1",
+                    action: "TakedownAccount",
+                    subject: Some(&subject),
+                    rationale: &format!("rationale-{}", i),
+                    snapshot_id: None,
+                    event_id: None,
+                    cascade_subjects: &[],
+                    cascade_snapshot_ids: &[],
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_chain_reports_zero_and_healthy() {
+        let db = open_test_pool().await;
+        let mut buf: Vec<u8> = Vec::new();
+        let healthy = run_verify_audit_chain(&db, &mut buf).await.unwrap();
+        assert!(healthy);
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "0 entries verified, chain healthy.\n");
+    }
+
+    #[tokio::test]
+    async fn healthy_chain_reports_entry_count_and_healthy() {
+        let db = open_test_pool().await;
+        append_n_entries(&db, 3).await;
+        let mut buf: Vec<u8> = Vec::new();
+        let healthy = run_verify_audit_chain(&db, &mut buf).await.unwrap();
+        assert!(healthy);
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "3 entries verified, chain healthy.\n");
+    }
+
+    #[tokio::test]
+    async fn singleton_chain_uses_singular_entry_label() {
+        let db = open_test_pool().await;
+        append_n_entries(&db, 1).await;
+        let mut buf: Vec<u8> = Vec::new();
+        let healthy = run_verify_audit_chain(&db, &mut buf).await.unwrap();
+        assert!(healthy);
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "1 entry verified, chain healthy.\n");
+    }
+
+    #[tokio::test]
+    async fn tampered_chain_reports_discontinuity_and_exits_unhealthy() {
+        let db = open_test_pool().await;
+        append_n_entries(&db, 3).await;
+        // Corrupt row 2's rationale without rewriting current_hash so
+        // per-row recompute mismatches. Uses the consolidated helper
+        // from `crate::admin::audit_chain::corrupt_entry_rationale`
+        // (Arc 3 Step 0.6).
+        crate::admin::audit_chain::corrupt_entry_rationale(
+            &db,
+            crate::admin::audit_chain::EntryRef::Sequence(2),
+            "tampered",
+        )
+        .await
+        .unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        let healthy = run_verify_audit_chain(&db, &mut buf).await.unwrap();
+        assert!(!healthy);
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            out,
+            "Chain discontinuity at sequence 2: per-row hash mismatch.\n\
+             1 entry verified before discontinuity.\n"
+        );
+    }
 }

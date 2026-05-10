@@ -515,7 +515,7 @@ impl RepositoryManager {
     pub async fn describe_repo(
         &self,
         account_manager: Option<&crate::account::AccountManager>,
-        identity_resolver: Option<&crate::identity::IdentityResolver>,
+        identity_resolver: Option<&dyn crate::identity::IdentityResolverApi>,
     ) -> PdsResult<serde_json::Value> {
         let _repo_root = self.store.get_repo_root(&self.did).await?;
 

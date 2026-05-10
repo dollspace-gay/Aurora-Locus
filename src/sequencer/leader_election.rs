@@ -32,26 +32,11 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-/// Constant lock key derived from `SHA-256("aurora-locus.sequencer.leader")`,
-/// first 8 bytes interpreted as a signed `i64`. See design doc §3.4.
-///
-/// Hashing the human-readable identifier:
-/// - Avoids collisions with other applications using advisory locks.
-/// - Is reproducible — every Aurora-Locus build derives the same key
-///   without coordination.
-/// - Is hardcoded; not configurable. Operators sharing one Postgres
-///   between multiple deployments separate them by database/schema,
-///   not by lock key.
-pub const SEQUENCER_LEADER_LOCK_KEY: i64 = sequencer_leader_lock_key();
-
-const fn sequencer_leader_lock_key() -> i64 {
-    // SHA-256("aurora-locus.sequencer.leader") first 8 bytes (big-endian) as i64.
-    // Pre-computed so this is a const value rather than a runtime hash.
-    // Verified by `test_lock_key_derivation_matches_runtime_hash` against
-    // the runtime computation — if that test fails, the bytes below need
-    // updating to match the current hash.
-    i64::from_be_bytes([0x27, 0x21, 0x0a, 0x65, 0x7a, 0x4a, 0x3d, 0x34])
-}
+/// Re-exported from the project-wide advisory-lock registry. The
+/// canonical definition lives in [`crate::db::advisory_locks`] so all
+/// `pg_advisory_lock` keys in the codebase are visible in one file —
+/// see that module's doc-comment for the no-collision discipline.
+pub use crate::db::advisory_locks::SEQUENCER_LEADER_LOCK_KEY;
 
 /// Role assigned by the leader-election state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,7 +273,6 @@ impl LeaderElection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
 
     /// Mock lock provider for testing the state machine without Postgres.
     /// All instances share an `Arc<Mutex<Option<usize>>>` representing the
@@ -343,20 +327,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_lock_key_derivation_matches_runtime_hash() {
-        // Verify the const lock key matches the first 8 bytes of the
-        // documented hash. If this assertion fires, the const value in
-        // sequencer_leader_lock_key() is wrong and needs updating to
-        // match the actual hash.
-        let mut h = Sha256::new();
-        h.update(b"aurora-locus.sequencer.leader");
-        let digest = h.finalize();
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&digest[..8]);
-        let expected = i64::from_be_bytes(bytes);
-        assert_eq!(SEQUENCER_LEADER_LOCK_KEY, expected);
-    }
+    // The hash-derivation invariant for SEQUENCER_LEADER_LOCK_KEY now
+    // lives in `crate::db::advisory_locks::tests` alongside the other
+    // registry keys.
 
     #[tokio::test]
     async fn single_instance_acquires_on_first_tick() {

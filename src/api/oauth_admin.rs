@@ -261,11 +261,10 @@ async fn handle_oauth_callback(
     tracing::info!("OAuth authentication successful for DID: {}", did);
 
     // Admin authorisation check. Authority comes from the admin_role
-    // table only — PDS_ADMIN_DIDS does not by itself imply a role.
-    // The first SuperAdmin must be inserted directly into admin_role
-    // per the bootstrap path in README "First Admin User"; subsequent
-    // grants flow through tools.aurora.superadmin.grantRole and the
-    // audit chain.
+    // table only. The first SuperAdmin must be inserted directly into
+    // admin_role per the bootstrap path in README "First Admin User";
+    // subsequent grants flow through tools.aurora.superadmin.grantRole
+    // and the audit chain.
     let admin_role = ctx.admin_role_manager.get_role(&did).await.map_err(|e| {
         tracing::error!("Failed to query admin role: {}", e);
         (

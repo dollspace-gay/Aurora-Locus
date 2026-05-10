@@ -9,7 +9,7 @@
 use crate::error::{PdsError, PdsResult};
 use crate::federation::ServiceAuthenticator;
 use crate::identity::did_document::DidDocument;
-use crate::identity::IdentityResolver;
+use crate::identity::IdentityResolverApi;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 /// Federation authenticator for cross-PDS authentication
 #[derive(Clone)]
 pub struct FederationAuthenticator {
-    identity_resolver: Arc<IdentityResolver>,
+    identity_resolver: Arc<dyn IdentityResolverApi>,
     http_client: Client,
     #[allow(dead_code)] // TODO: Implement token caching
     cache_ttl: u64,
@@ -28,7 +28,7 @@ pub struct FederationAuthenticator {
 
 impl FederationAuthenticator {
     /// Create a new federation authenticator
-    pub fn new(identity_resolver: Arc<IdentityResolver>) -> Self {
+    pub fn new(identity_resolver: Arc<dyn IdentityResolverApi>) -> Self {
         let authenticator = Arc::new(ServiceAuthenticator::new(Arc::clone(&identity_resolver)));
 
         Self {

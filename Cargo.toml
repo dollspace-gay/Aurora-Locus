@@ -1,6 +1,6 @@
 [package]
 name = "aurora-locus"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Aurora Locus Contributors"]
 description = "ATProto Personal Data Server implementation in Rust"
@@ -29,6 +29,10 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# YAML for file-tier runtime configuration (chainlink #124).
+# Loaded once at startup via `aurora_admin::load_file_tier_settings`;
+# the runtime_settings table remains the hot path for setting changes.
+serde_yaml = "0.9"
 
 # Configuration
 dotenv = "0.15"
@@ -98,6 +102,10 @@ hex = "0.4"
 # SHA-256 hashing for blob CIDs
 sha2 = "0.10"
 
+# Cooperative file locking for the SQLite-backend PDS-liveness lock
+# (src/db/liveness_lock.rs). flock(2) on Unix; LockFileEx on Windows.
+fs2 = "0.4"
+
 # secp256k1 for PLC operation signing
 k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 
@@ -127,6 +135,13 @@ tar = "0.4"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+# HMAC-SHA256 used in service_auth.rs algorithm-confusion negative
+# tests (§5.4.1) to forge a realistic HS256 attacker token signed
+# with the ES256K public key as secret. Test-only.
+hmac = "0.12"
+# Capture tracing log lines in AdminAuthContext extractor tests
+# (§5.4.2 / §5.3.5) so per-cause logging assertions are first-class.
+tracing-test = "0.2"
 # Direct access to the same query-string format axum's Query extractor
 # uses, so PaginationParams deserialization can be exercised end-to-end
 # in unit tests (mirrors the over-the-wire path of /xrpc handlers).

@@ -78,7 +78,7 @@ The cycle began with three assessment documents drafted on 2026-04-30 (one day b
 
 **Out of scope for v0.2.** Signed URL generation; Aurora-driven CDN purge on takedown (deferred to a later admin/moderation extension); live disk → S3 migration tooling; multi-region/multi-bucket configurations; backends beyond Disk and S3.
 
-**Status post-cycle.** S3 backend activation work has not landed in v0.2 — the cycle prioritized the admin/moderation extensions, the proto-blue migration, and the Postgres backend. The assessment's three-phase plan remains the right shape for the work; a v0.3 issue tracks the activation.
+**Status post-cycle.** S3 backend support shipped in v0.2: AWS SDK dependencies are live in `Cargo.toml`, `src/blob_store/s3.rs` is exported from `src/blob_store/mod.rs`, and `AppContext` selects between Disk and S3 via the `BlobstoreConfig` enum based on the `PDS_BLOBSTORE_*` env vars. The assessment's three-phase plan landed in full.
 
 ### §2.3 Postgres backend feasibility
 
@@ -222,6 +222,8 @@ pub enum AppealResolutionDecision { Approve, Deny }
 
 > **Reconciliation.** Earlier drafts specified a `$type`-tagged compositional `ModEvent` enum (subject-agnostic — one `Takedown` variant applied to any `Subject`, with the lexicon as source of truth for which actions apply where) plus an `AppealResolution` enum with `Uphold | Reject | Modify`. As-built, Phase 3.5 collapsed the API enum into the storage shape (`ModEventAction` is `kind`-tagged with subject-aware variants); `AppealResolutionDecision` ships with `Approve | Deny`. The compositional revisit is a v0.3 candidate (chainlink #125); the wire-breaking nature of the change motivated its deferral.
 
+**Commitment (v0.3 / Arc 5 §9.4.4 / chainlink #125):** ModEventAction's enum discriminator is flat (action-verb × subject-type cartesian product, 16 variants). Subject set is a peer axis at the request level (per Arc 4's multi-subject `emitEvent`). Compositional reshape — separating action-verb from subject-type into orthogonal enum axes — is a v0.4-or-later candidate gated on use-case surface. The flat shape is the stable v0.3 contract; Aurora Admin UI and third-party tooling can build switch tables on the discriminator without anticipating a structural reshape during the v0.3 series. See `docs/v04-candidates.md` for the open candidate list.
+
 **Why role grant/revoke aren't here** — they live at `tools.aurora.superadmin.*` ([§4.3.3](#§433-toolsaurorasuperadmin)) as dedicated endpoints rather than `ModEvent` variants. Keeping them out of `ModEvent` makes the SuperAdmin auth boundary structurally visible in the namespace.
 
 #### §4.1.3 Pagination (decision E)
@@ -322,7 +324,7 @@ Auth: `atproto:admin.moderation` scope. Admin-tier role check at handler level f
 
 **`emitEvent`** (sub-phase 3.5). Unified action surface; takes `(ModEvent, Subject, comment?)` and writes both the moderation_event row and the audit chain entry inside one transaction. Translates the API-shaped `ModEvent` to the storage-shaped `ModerationEventType` variant per [§4.4.5](#§445-storage-event-vocabulary).
 
-**Batch operations** (sub-phase 3.5). Six endpoints: `batchTakedownAccounts`, `batchSuspendAccounts`, `batchRestoreAccounts`, `batchTakedownRecords`, `batchApplyLabel`, `batchRemoveLabel`. Multi-subject takedowns (a spam ring of N accounts taken down together with one chain entry linking all subjects) are a real moderation workflow that bsky-PDS doesn't expose. Atomicity is two-tier: chain-entry-atomic (the moderation_event row + the audit chain entry land together or neither lands), per-subject best-effort. Per-subject failures are surfaced in a `failures` response field rather than rolling back the chain entry. True end-to-end per-subject atomicity is a v0.3 candidate (chainlink #113).
+**Batch operations** (sub-phase 3.5). Six endpoints: `batchTakedownAccounts`, `batchSuspendAccounts`, `batchRestoreAccounts`, `batchTakedownRecords`, `batchApplyLabel`, `batchRemoveLabel`. Multi-subject takedowns (a spam ring of N accounts taken down together with one chain entry linking all subjects) are a real moderation workflow that bsky-PDS doesn't expose. Per Arc 4 §8.4.2 (chainlink #113) atomicity is **whole-tx-atomic**: the moderation_event row, audit chain entry, and every per-subject mutation either ALL land or NONE do. Per-subject mutation failure aborts the wrapping tx; the response body's error envelope identifies the failing subject's index and identifier. The v0.2 `failures: Vec<BatchFailure>` field is retired. `batchRemoveLabel` keeps `skipped: Vec<Subject>` for subjects without the label to remove (no-op, not failure). Snapshot capture is the explicit pre-tx phase per `docs/V03_DESIGN.md` §8.3.1; orphan snapshots on capture failure are accepted as a deliberate carve-out (the chain entry never lands).
 
 **Aggregations** (sub-phase 3.7). `getModerationMetrics` (events_total, events_by_type, appeals_total, appeals_by_resolution, takedowns_applied, takedowns_reversed, top_moderators) and `getQueueStats` (pending_appeals_count, open_reports_count, reports_awaiting_review_age_p50/p95).
 
@@ -338,7 +340,7 @@ Auth: `atproto:admin.moderation` scope. Admin-tier role check at handler level f
 
 Auth: `atproto:admin.moderation` plus `Role::SuperAdmin` check at handler level via the existing `require_admin_role!` macro. Two endpoints:
 
-**`grantRole`** (sub-phase 3.6). Relocated from `com.atproto.admin.grantRole`. Inputs: `did`, `role`, `notes`. Writes a row to `admin_role` and emits the corresponding chain entry.
+**`grantRole`** (sub-phase 3.6). Relocated from `com.atproto.admin.grantRole`. Inputs: `did`, `role`, `notes`. Writes a row to `admin_roles` and emits the corresponding chain entry.
 
 **`revokeRole`** (sub-phase 3.6). Relocated from `com.atproto.admin.revokeRole`. Marks the role record as revoked (preserving audit history) and emits the corresponding chain entry.
 
@@ -435,7 +437,7 @@ After 3.5 lands, 3.7 (aggregations), 3.8 (audit chain), 3.9 (subscription), and 
 
 ### §4.6 Bootstrap path
 
-The first SuperAdmin is granted via direct SQL insertion into the `admin_role` table against a freshly-created account. After the first SuperAdmin exists, all subsequent role grants flow through `tools.aurora.superadmin.grantRole` and the audit chain. See [README.md "First Admin User" section](../README.md) for the operator-facing procedure (Block 6 / chainlink #95 dropped the `PDS_ADMIN_DIDS` env var auto-grant; bootstrap is now the SQL path).
+The first SuperAdmin is granted via direct SQL insertion into the `admin_roles` table against a freshly-created account. After the first SuperAdmin exists, all subsequent role grants flow through `tools.aurora.superadmin.grantRole` and the audit chain. See [README.md "First Admin User" section](../README.md) for the operator-facing procedure (Block 6 / chainlink #95 dropped the `PDS_ADMIN_DIDS` env var auto-grant; bootstrap is now the SQL path).
 
 ---
 
@@ -672,11 +674,11 @@ The v0.2 cycle delivered the following phases against the upstream baseline `c2d
 
 ### §8.2 Deferred to v0.3
 
-- **S3 blob storage activation.** Assessment ([§2.2](#§22-blob-storage-s3-feasibility)) work scoped; activation deferred. The S3 path remains commented out at the dependency and module-export levels.
+- **S3 blob storage activation.** Initially deferred per the v0.2 cycle plan; ultimately shipped in v0.2 alongside the assessment's three-phase activation work. AWS SDK dependencies and `src/blob_store/s3.rs` exports are live; backend selection runs via `BlobstoreConfig` from the `PDS_BLOBSTORE_*` env vars. See [§2.2](#§22-blob-storage-s3-feasibility) for the post-cycle status.
 - **Forensic export full-content inclusion.** v0.2 ships metadata-only ([§4.3.2](#§432-toolsauroraadmin)); CAR data + blob bytes deferred. Streaming response body for large bundles also deferred.
 - **Forensic export streaming.** In-memory tar assembly today; streaming response body for large bundles deferred.
 - **Per-record/per-blob status tracking.** [`tools.aurora.moderator.queryStatuses`](#§431-toolsauroramoderator) accepts `subject_type=Record|Blob` for wire-format stability but short-circuits to empty pages because `subject_status` only tracks repo-level state today.
-- **Batch ops end-to-end per-subject atomicity** (chainlink #113). v0.2 ships two-tier atomicity (chain-entry-atomic, per-subject best-effort); true per-subject atomicity requires `account_manager` API restructure.
+- **Batch ops end-to-end per-subject atomicity** (chainlink #113). v0.2 shipped two-tier atomicity (chain-entry-atomic, per-subject best-effort); resolved in v0.3 Arc 4 §8.4.2 — every `batch*` handler (and `emitEvent` after Arc 4's multi-subject reshape) is now whole-tx-atomic via `_in_tx` manager variants. Per-subject mutation failure aborts the wrapping tx atomically with the chain entry; the v0.2 `failures` response field is retired.
 - **Distributed rate limiting.** [§5.6](#§56-out-of-scope-for-v02) — Redis or Postgres-CAS token bucket required.
 - **OAuth state and DPoP nonces multi-instance.** Per-process limitations preserved.
 - **Hover tooltips, signed URLs, Aurora-driven CDN purge on takedown, live SQLite→Postgres migration tooling.** All scoped out by their respective assessments.
