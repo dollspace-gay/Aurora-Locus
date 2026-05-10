@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **File-tier runtime configuration** (#124). Aurora-Locus
+  resolves `runtime_settings` keys through a four-tier
+  hierarchy from highest to lowest precedence: recovery-mode
+  env-var override (`AURORA_RECOVERY_MODE`, `moderation-mode`
+  reads only), runtime row, **file-tier YAML**, compiled-in
+  default. The new file tier sits between operator runtime
+  control and the compiled-in defaults — load-once-at-startup
+  YAML at `<data_directory>/runtime.yaml` (override via
+  `PDS_RUNTIME_FILE`) for deployment-stable values that don't
+  need the runtime API surface. Unknown keys (vs.
+  `KNOWN_RUNTIME_KEYS`) and invalid per-key values
+  warn-and-skip; malformed YAML produces a clear startup error
+  with the file path. The `getRuntimeSetting` response's
+  `source` field gains a fourth value, `"File"`, distinguishing
+  file-tier-resolved reads from runtime/default. The field
+  becomes a typed `SettingSource` enum with a custom
+  `Serialize` impl emitting the existing string literals —
+  wire-additive, no contract amendment (the `source` field is
+  open per Arc 2's contract framing). New dependency
+  `serde_yaml = "0.9"`. Operator setup at
+  `docs/operator/file-tier-config.md`. Reload-on-SIGHUP is a
+  v0.4 follow-up; `setRuntimeSetting` remains the in-process
+  hot path for setting changes.
+
 ### Removed
 - **`PDS_ADMIN_DIDS` configuration** (#155). The `admin_dids`
   field on `AuthConfig` and the `PDS_ADMIN_DIDS` env-var parsing

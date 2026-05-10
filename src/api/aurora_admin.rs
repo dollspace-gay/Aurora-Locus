@@ -3413,12 +3413,19 @@ pub async fn get_audit_trail(
 // need to know what mode they're operating in); write is SuperAdmin
 // only. Writes are audit-chained per §8.16.
 //
-// Recovery path: AURORA_RECOVERY_MODE=true env var bypasses runtime
-// settings on startup. The check is at AppContext construction —
-// when recovery is set, the live moderation-mode read returns
-// "full" regardless of the runtime_settings row, so an operator
-// who deployed into a misconfigured "disabled" state can boot with
-// the env var set, fix the runtime row, and unset the env var.
+// Lookup precedence (per Arc 5 §9.4.2 / chainlink #124):
+//   1. Recovery-mode env-var override (AURORA_RECOVERY_MODE=true,
+//      `moderation-mode` only).
+//   2. Runtime row in `runtime_settings` (operator-set, ephemeral).
+//   3. File-tier YAML loaded once at startup from
+//      `<data_directory>/runtime.yaml` (overridable via
+//      `PDS_RUNTIME_FILE`); deployment-stable.
+//   4. Compiled-in default from `default_for_key`.
+//
+// Recovery path: AURORA_RECOVERY_MODE=true env var bypasses tiers
+// 2-4 for the moderation-mode key. An operator who deployed into a
+// misconfigured "disabled" state can boot with the env var set, fix
+// the runtime row, and unset the env var.
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3431,25 +3438,72 @@ pub struct GetRuntimeSettingParams {
 pub struct GetRuntimeSettingOutput {
     pub key: String,
     pub value: serde_json::Value,
-    pub source: &'static str,
+    pub source: SettingSource,
     pub last_modified: Option<String>,
     pub last_modified_by: Option<String>,
+}
+
+/// Origin of a resolved runtime-setting value. Per Arc 5 §9.4.2
+/// (chainlink #124) the lookup walks four tiers in priority order
+/// — `RecoveryMode` env-var override (top, `moderation-mode` only),
+/// then `Runtime` row, then `File` (YAML loaded at startup), then
+/// `Default` compiled-in fallback. The wire encoding is the bare
+/// string "Runtime" / "File" / "Default" / "RecoveryMode" via the
+/// custom `Serialize` impl below; pre-Arc-5 callers reading the
+/// `source` field as a string see no change for the existing three
+/// values.
+///
+/// The field's value set is **open** per Arc 2's contract framing
+/// — `contract-stability.md` does not pin a closed enumeration on
+/// `source`, and this addition is wire-additive, not a contract
+/// amendment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingSource {
+    Runtime,
+    File,
+    Default,
+    RecoveryMode,
+}
+
+impl SettingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "Runtime",
+            Self::File => "File",
+            Self::Default => "Default",
+            Self::RecoveryMode => "RecoveryMode",
+        }
+    }
+}
+
+impl Serialize for SettingSource {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
 }
 
 const MODERATION_MODE_KEY: &str = "moderation-mode";
 const MODERATION_MODE_REDIRECT_KEY: &str = "moderation-mode-redirect-url";
 
-/// Allowlist of runtime-setting keys this v0.2 build accepts. Per
-/// CR-2 / chainlink #119, setRuntimeSetting rejects any other key
-/// with 400 — the inventory's "validates known keys" framing
-/// (docs/AURORA_ENDPOINT_INVENTORY.md) is enforced here. Adding a
-/// new runtime-setting key in a future cycle is one append to this
-/// constant plus the corresponding default in `default_for_key`.
-const KNOWN_RUNTIME_KEYS: &[&str] = &[
+/// Allowlist of runtime-setting keys this build accepts. Per CR-2 /
+/// chainlink #119, `setRuntimeSetting` rejects any other key with
+/// 400 — the inventory's "validates known keys" framing
+/// (docs/AURORA_ENDPOINT_INVENTORY.md) is enforced there. The
+/// file-tier loader (`load_file_tier_settings`) applies the same
+/// allowlist: keys outside this set are warned-and-skipped at
+/// startup so a typo doesn't silently disable a deployment-stable
+/// override. Adding a new runtime-setting key in a future cycle is
+/// one append to this constant plus the corresponding default in
+/// `default_for_key`.
+pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     MODERATION_MODE_KEY,
     MODERATION_MODE_REDIRECT_KEY,
 ];
 const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
+
+/// Env-var override of the file-tier YAML path. Default is
+/// `<data_directory>/runtime.yaml`. Resolved in `AppContext::new`.
+pub const RUNTIME_FILE_ENV: &str = "PDS_RUNTIME_FILE";
 
 fn default_for_key(key: &str) -> serde_json::Value {
     match key {
@@ -3457,6 +3511,118 @@ fn default_for_key(key: &str) -> serde_json::Value {
         MODERATION_MODE_REDIRECT_KEY => serde_json::Value::String(String::new()),
         _ => serde_json::Value::Null,
     }
+}
+
+/// Validate a runtime-setting value at file-tier load time. Mirrors
+/// the per-key validation `set_runtime_setting` performs at the API
+/// boundary so file-tier and runtime-row writes share the same
+/// vocabulary. Unknown keys (already filtered against
+/// `KNOWN_RUNTIME_KEYS` upstream) accept any value shape.
+fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
+    match key {
+        MODERATION_MODE_KEY => value
+            .as_str()
+            .is_some_and(|s| matches!(s, "full" | "reduced" | "disabled")),
+        MODERATION_MODE_REDIRECT_KEY => value.as_str().is_some(),
+        _ => true,
+    }
+}
+
+/// Load file-tier runtime settings from the YAML at `path`.
+///
+/// Per Arc 5 §9.4.2 / chainlink #124:
+/// - Missing file → empty map (file tier is optional; falls through
+///   to default).
+/// - Malformed YAML → `PdsError::Validation` with the file path in
+///   the message; surfaces as a startup error.
+/// - Unknown key (not in `KNOWN_RUNTIME_KEYS`) → warn-and-skip;
+///   per-deployment typos don't silently disable the deployment.
+/// - Invalid value (per `validate_runtime_value`) → warn-and-skip.
+/// - Top-level non-mapping → `PdsError::Validation`.
+///
+/// The returned map is loaded once at `AppContext::new` and cached
+/// for the process lifetime. Reload-on-SIGHUP is deferred to v0.4;
+/// the runtime_settings table provides the hot path for changes
+/// inside a running process.
+pub fn load_file_tier_settings(
+    path: &std::path::Path,
+) -> crate::error::PdsResult<std::collections::HashMap<String, serde_json::Value>> {
+    use crate::error::PdsError;
+    if !path.exists() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let yaml_str = std::fs::read_to_string(path).map_err(|e| {
+        PdsError::Validation(format!(
+            "Failed to read file-tier config at {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml_str).map_err(|e| {
+        PdsError::Validation(format!(
+            "Failed to parse file-tier config at {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let mapping = match parsed {
+        serde_yaml::Value::Mapping(m) => m,
+        serde_yaml::Value::Null => return Ok(std::collections::HashMap::new()),
+        _ => {
+            return Err(PdsError::Validation(format!(
+                "File-tier config at {} must be a top-level YAML mapping",
+                path.display()
+            )));
+        }
+    };
+    let mut out = std::collections::HashMap::new();
+    for (key_v, val_v) in mapping {
+        let key = match key_v {
+            serde_yaml::Value::String(s) => s,
+            other => {
+                tracing::warn!(
+                    "file-tier config: skipping non-string key {:?} in {}",
+                    other,
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if !KNOWN_RUNTIME_KEYS.contains(&key.as_str()) {
+            tracing::warn!(
+                "file-tier config: unknown runtime-setting key '{}' in {}; \
+                 skipping (known keys: {:?})",
+                key,
+                path.display(),
+                KNOWN_RUNTIME_KEYS
+            );
+            continue;
+        }
+        let json_val = match serde_json::to_value(&val_v) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "file-tier config: cannot convert YAML value for key '{}' in {} \
+                     to JSON: {}; skipping",
+                    key,
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        if !validate_runtime_value(&key, &json_val) {
+            tracing::warn!(
+                "file-tier config: invalid value for key '{}' in {} ({}); skipping",
+                key,
+                path.display(),
+                json_val
+            );
+            continue;
+        }
+        out.insert(key, json_val);
+    }
+    Ok(out)
 }
 
 pub async fn get_runtime_setting(
@@ -3482,7 +3648,7 @@ pub async fn get_runtime_setting(
         return Ok(Json(GetRuntimeSettingOutput {
             key: params.key,
             value: serde_json::Value::String("full".to_string()),
-            source: "RecoveryMode",
+            source: SettingSource::RecoveryMode,
             last_modified: None,
             last_modified_by: None,
         }));
@@ -3501,22 +3667,32 @@ pub async fn get_runtime_setting(
             .unwrap_or(serde_json::Value::String(value_str));
         let last_modified: String = r.try_get("last_modified").map_err(internal)?;
         let last_modified_by: String = r.try_get("last_modified_by").map_err(internal)?;
-        Ok(Json(GetRuntimeSettingOutput {
+        return Ok(Json(GetRuntimeSettingOutput {
             key: params.key,
             value,
-            source: "Runtime",
+            source: SettingSource::Runtime,
             last_modified: Some(last_modified),
             last_modified_by: Some(last_modified_by),
-        }))
-    } else {
-        Ok(Json(GetRuntimeSettingOutput {
-            key: params.key.clone(),
-            value: default_for_key(&params.key),
-            source: "Default",
+        }));
+    }
+    // Tier 3: file-tier YAML loaded once at startup. Sits between
+    // runtime row and compiled-in default per Arc 5 §9.4.2.
+    if let Some(value) = ctx.file_tier_settings.get(&params.key) {
+        return Ok(Json(GetRuntimeSettingOutput {
+            key: params.key,
+            value: value.clone(),
+            source: SettingSource::File,
             last_modified: None,
             last_modified_by: None,
-        }))
+        }));
     }
+    Ok(Json(GetRuntimeSettingOutput {
+        key: params.key.clone(),
+        value: default_for_key(&params.key),
+        source: SettingSource::Default,
+        last_modified: None,
+        last_modified_by: None,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -6275,8 +6451,332 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(resp.source, "Default");
+        assert_eq!(resp.source, SettingSource::Default);
         assert_eq!(resp.value, serde_json::Value::String("full".to_string()));
+    }
+
+    /// Test helper: build a context whose tempdir contains a
+    /// `runtime.yaml` with the supplied content. Mirrors
+    /// `create_test_context`'s fixture but writes the yaml file
+    /// before `AppContext::new` so file-tier loading runs against
+    /// it. Returns `Result` so malformed-yaml tests can `unwrap_err`.
+    async fn try_create_test_context_with_runtime_yaml(
+        yaml: &str,
+    ) -> crate::error::PdsResult<AppContext> {
+        use crate::config::*;
+        use std::path::PathBuf;
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap().keep();
+        std::fs::write(dir.join("runtime.yaml"), yaml).unwrap();
+        let db_path = dir.join("test.db");
+        let config = ServerConfig {
+            service: ServiceConfig {
+                hostname: "localhost".to_string(),
+                port: 2583,
+                service_did: "did:web:localhost".to_string(),
+                version: "0.1.0-test".to_string(),
+                blob_upload_limit: 5_242_880,
+            },
+            storage: StorageConfig {
+                data_directory: dir.clone(),
+                account_db: db_path.clone(),
+                sequencer_db: dir.join("sequencer.db"),
+                did_cache_db: dir.join("did_cache.db"),
+                actor_store_directory: dir.join("actors"),
+                blobstore: BlobstoreConfig::Disk {
+                    location: dir.join("blobs"),
+                    tmp_location: dir.join("temp"),
+                },
+            },
+            database: Default::default(),
+            authentication: AuthConfig {
+                jwt_secret: "test-secret-key-aurora-admin-test-32xx".to_string(),
+                repo_signing_key: "a".repeat(64),
+                plc_rotation_key: "b".repeat(64),
+                oauth: OAuthConfig {
+                    client_id: "http://localhost:3000/client-metadata.json".to_string(),
+                    redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
+                    pds_url: "https://bsky.social".to_string(),
+                },
+                jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
+                oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration"
+                    .to_string(),
+                oauth_features: Default::default(),
+            },
+            identity: IdentityConfig {
+                did_plc_url: "https://plc.directory".to_string(),
+                service_handle_domains: vec![".localhost".to_string()],
+                did_cache_stale_ttl: 3600,
+                did_cache_max_ttl: 86400,
+            },
+            email: None,
+            invites: InviteConfig {
+                required: false,
+                interval: 604800,
+                epoch: "2024-01-01T00:00:00Z".to_string(),
+            },
+            rate_limit: RateLimitConfig {
+                enabled: false,
+                global_requests_per_minute: 3000,
+                use_redis: false,
+                redis_url: None,
+                exempt_admin_assets: true,
+            },
+            logging: LoggingConfig {
+                level: "info".to_string(),
+            },
+            federation: FederationConfig {
+                enabled: false,
+                relay_urls: vec![],
+                appview_url: None,
+                firehose_enabled: false,
+                crawl_enabled: false,
+                public_url: Some("http://localhost:2583".to_string()),
+                auto_stream_events: false,
+            },
+            validation_mode: PathBuf::from("required")
+                .into_os_string()
+                .to_string_lossy()
+                .parse()
+                .unwrap_or(crate::validation::ValidationMode::Required),
+        };
+        AppContext::new(config).await
+    }
+
+    /// Arc 5 §9.4.2 / chainlink #124: file-tier value resolves
+    /// when no runtime row exists for the key. Pin that the
+    /// returned `source` is `File` and the value is the YAML
+    /// content (not the compiled-in default).
+    #[tokio::test]
+    async fn get_runtime_setting_resolves_from_file_tier_when_no_runtime_row() {
+        let ctx = try_create_test_context_with_runtime_yaml(
+            "moderation-mode: reduced\n",
+        )
+        .await
+        .expect("file-tier yaml loads cleanly");
+        let resp = get_runtime_setting(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetRuntimeSettingParams {
+                key: "moderation-mode".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            resp.source,
+            SettingSource::File,
+            "no runtime row + file-tier present => File source"
+        );
+        assert_eq!(resp.value, serde_json::Value::String("reduced".to_string()));
+    }
+
+    /// Runtime row takes precedence over file-tier per the
+    /// committed lookup order (Runtime > File > Default). Pin
+    /// that the runtime value wins even when file-tier has the
+    /// same key.
+    #[tokio::test]
+    async fn get_runtime_setting_runtime_row_overrides_file_tier() {
+        let ctx = try_create_test_context_with_runtime_yaml(
+            "moderation-mode: reduced\n",
+        )
+        .await
+        .expect("file-tier yaml loads cleanly");
+        // Land a runtime row for the same key — must win over
+        // file-tier value.
+        set_runtime_setting(
+            State(ctx.clone()),
+            super_admin_auth(),
+            Json(SetRuntimeSettingInput {
+                key: "moderation-mode".to_string(),
+                value: serde_json::Value::String("disabled".to_string()),
+                rationale: "test runtime > file precedence".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let resp = get_runtime_setting(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetRuntimeSettingParams {
+                key: "moderation-mode".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            resp.source,
+            SettingSource::Runtime,
+            "runtime row wins over file-tier per precedence rule"
+        );
+        assert_eq!(
+            resp.value,
+            serde_json::Value::String("disabled".to_string())
+        );
+    }
+
+    /// Default falls through when neither runtime row nor file-tier
+    /// has the key. With an empty yaml file present, file-tier
+    /// loads to an empty map and the lookup must reach the
+    /// compiled-in default.
+    #[tokio::test]
+    async fn get_runtime_setting_default_when_neither_runtime_nor_file() {
+        let ctx = try_create_test_context_with_runtime_yaml("")
+            .await
+            .expect("empty yaml loads as empty map");
+        let resp = get_runtime_setting(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetRuntimeSettingParams {
+                key: "moderation-mode".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.source, SettingSource::Default);
+        assert_eq!(resp.value, serde_json::Value::String("full".to_string()));
+    }
+
+    /// Malformed YAML at the file-tier path produces a startup
+    /// error. The error message must include the file path so an
+    /// operator hitting this can find the file. Per Arc 5
+    /// §9.4.2's "no silent fallback" rule.
+    #[tokio::test]
+    async fn malformed_runtime_yaml_returns_startup_error() {
+        // Drive the file-tier loader directly with a malformed
+        // YAML — `AppContext` doesn't impl Debug so we can't
+        // `expect_err` through it. The loader is the unit of
+        // interest: it owns the "no silent fallback on bad YAML"
+        // contract that AppContext::new propagates verbatim.
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap().keep();
+        let path = dir.join("runtime.yaml");
+        std::fs::write(
+            &path,
+            "moderation-mode: : :\n  - this is not valid yaml\n",
+        )
+        .unwrap();
+        let err = match load_file_tier_settings(&path) {
+            Ok(_) => panic!("malformed yaml must surface as a startup error"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("runtime.yaml"),
+            "error message must name the file path; got: {msg}"
+        );
+        assert!(
+            msg.contains("file-tier")
+                || msg.contains("parse")
+                || msg.contains("YAML")
+                || msg.contains("yaml"),
+            "error message must mention the file-tier / YAML context; got: {msg}"
+        );
+    }
+
+    /// Unknown keys in the file-tier yaml warn-and-skip per
+    /// recon Q5 — operator typos surface in logs without bringing
+    /// the deployment down. The known-key value remains effective;
+    /// the unknown-key lookup falls through to default.
+    #[tokio::test]
+    async fn unknown_key_in_file_tier_warns_and_skips() {
+        let ctx = try_create_test_context_with_runtime_yaml(
+            "moderation-mode: reduced\n\
+             made-up-key: should-be-skipped\n",
+        )
+        .await
+        .expect("yaml with unknown key still loads (warn-and-skip)");
+        // Known key resolved from file-tier.
+        let resp_known = get_runtime_setting(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetRuntimeSettingParams {
+                key: "moderation-mode".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp_known.source, SettingSource::File);
+        assert_eq!(
+            resp_known.value,
+            serde_json::Value::String("reduced".to_string())
+        );
+        // Unknown key was skipped at load time; the cache doesn't
+        // hold it, so a lookup falls through (admin role required
+        // for non-mode keys, hence super_admin_auth).
+        let resp_unknown = get_runtime_setting(
+            State(ctx),
+            super_admin_auth(),
+            axum::extract::Query(GetRuntimeSettingParams {
+                key: "made-up-key".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            resp_unknown.source,
+            SettingSource::Default,
+            "unknown file-tier key must not appear in the cache; falls through to default"
+        );
+    }
+
+    /// Invalid value for a known key (e.g.,
+    /// `moderation-mode: nonsense`) warns-and-skips at load time;
+    /// the cache doesn't hold the bad value and the lookup falls
+    /// through to the compiled-in default. Mirrors the per-key
+    /// validation `set_runtime_setting` enforces at the API
+    /// boundary.
+    #[tokio::test]
+    async fn invalid_value_in_file_tier_warns_and_skips() {
+        let ctx = try_create_test_context_with_runtime_yaml(
+            "moderation-mode: nonsense\n",
+        )
+        .await
+        .expect("yaml with invalid value still loads (warn-and-skip)");
+        let resp = get_runtime_setting(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetRuntimeSettingParams {
+                key: "moderation-mode".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            resp.source,
+            SettingSource::Default,
+            "invalid value at load time => not in cache => default"
+        );
+        assert_eq!(resp.value, serde_json::Value::String("full".to_string()));
+    }
+
+    /// Wire-format check: `SettingSource` serializes to the bare
+    /// string the v0.2 wire shape used. Pre-Arc-5 callers reading
+    /// the `source` field as a string see no change.
+    #[test]
+    fn setting_source_serializes_as_bare_string_for_wire_compat() {
+        assert_eq!(
+            serde_json::to_string(&SettingSource::Runtime).unwrap(),
+            "\"Runtime\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SettingSource::File).unwrap(),
+            "\"File\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SettingSource::Default).unwrap(),
+            "\"Default\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SettingSource::RecoveryMode).unwrap(),
+            "\"RecoveryMode\""
+        );
     }
 
     #[tokio::test]
