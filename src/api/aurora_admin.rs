@@ -2346,15 +2346,34 @@ pub async fn trigger_password_reset(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetQueueStatsOutput {
-    pub open_reports: i64,
-    pub pending_appeals: i64,
-    pub under_review_reports: i64,
-    pub under_review_appeals: i64,
+    /// Count of reports awaiting initial review (status = 'open').
+    /// Per Arc 5 §9.4.3 / chainlink #126: domain-safely
+    /// non-negative and bounded < 2^32 — retyped from `i64` to
+    /// `u32` in v0.3 cycle close. JSON wire shape unchanged
+    /// (still emitted as a non-negative integer); strict-typed
+    /// Rust consumers gain a narrower type.
+    pub open_reports: u32,
+    /// Count of pending appeals. See `open_reports` for retype
+    /// rationale.
+    pub pending_appeals: u32,
+    /// Count of reports under review (status = 'acknowledged').
+    /// See `open_reports` for retype rationale.
+    pub under_review_reports: u32,
+    /// Count of appeals under review. See `open_reports` for
+    /// retype rationale.
+    pub under_review_appeals: u32,
     /// Sum of items needing operator decision. Canonical value the
-    /// sidebar bell badge displays.
+    /// sidebar bell badge displays. Stays `i64` because the
+    /// pathological sum-of-four-near-saturating-u32-counts could
+    /// exceed `u32::MAX` (per recon Q4 sum-overflow guard).
     pub queue_attention_total: i64,
-    pub average_age_open_reports_seconds: i64,
-    pub oldest_open_report_age_seconds: i64,
+    /// Average age in seconds of open reports. See `open_reports`
+    /// for retype rationale (u32 = ~136 years; ample bound for any
+    /// realistic report age).
+    pub average_age_open_reports_seconds: u32,
+    /// Age in seconds of the oldest open report. See
+    /// `open_reports` for retype rationale.
+    pub oldest_open_report_age_seconds: u32,
 }
 
 pub async fn get_queue_stats(
@@ -2418,14 +2437,22 @@ pub async fn get_queue_stats(
     let queue_attention_total =
         open_reports + pending_appeals + under_review_reports + under_review_appeals;
 
+    // Saturating i64 → u32 conversion for the count and age
+    // fields per Arc 5 §9.4.3 / chainlink #126 retype. Counts
+    // come from `SELECT COUNT(*)` and ages from RFC 3339 parsing
+    // — both are domain-non-negative; saturating is defensive
+    // against the (unreachable in practice) > 2^32 case rather
+    // than truncation surprise.
+    let to_u32 = |n: i64| -> u32 { u32::try_from(n.max(0)).unwrap_or(u32::MAX) };
+
     Ok(Json(GetQueueStatsOutput {
-        open_reports,
-        pending_appeals,
-        under_review_reports,
-        under_review_appeals,
+        open_reports: to_u32(open_reports),
+        pending_appeals: to_u32(pending_appeals),
+        under_review_reports: to_u32(under_review_reports),
+        under_review_appeals: to_u32(under_review_appeals),
         queue_attention_total,
-        average_age_open_reports_seconds: avg_age,
-        oldest_open_report_age_seconds: oldest_age_secs,
+        average_age_open_reports_seconds: to_u32(avg_age),
+        oldest_open_report_age_seconds: to_u32(oldest_age_secs),
     }))
 }
 
@@ -2470,17 +2497,103 @@ pub enum MetricType {
     AverageTimeToResolution,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Input for `tools.aurora.admin.getModerationMetrics`.
+///
+/// Per Arc 5 §9.4.3 / chainlink #126 the request struct accepts
+/// two wire shapes for the time-range parameter:
+///
+/// - **Canonical**: `timeRange` field carrying a preset name string
+///   (`"last_hour"`, `"last_24h"`, `"last_7d"`, `"last_30d"`).
+///   Internally the preset resolves to a `(now - duration, now)`
+///   window at deserialize time. Future JSON-body consumers may
+///   also pass the `{start, end}` object form via the same field
+///   (the underlying [`crate::admin::TimeRange`] supports both);
+///   query-string callers wanting an explicit window use the
+///   legacy fields below instead.
+/// - **Legacy**: peer `start` and `end` RFC 3339 timestamp strings.
+///   The dispatcher builds a `TimeRange` from them; the pair is
+///   validated as `start <= end`.
+///
+/// Exactly one shape must be present. Both shapes simultaneously
+/// or neither shape produces a clear error; typo'd preset names
+/// surface the canonical preset list, NOT the legacy fields.
+#[derive(Debug)]
 pub struct GetModerationMetricsInput {
-    /// ISO8601 RFC3339 timestamp lower bound.
-    pub start: String,
-    /// ISO8601 RFC3339 timestamp upper bound.
-    pub end: String,
+    pub time_range: crate::admin::TimeRange,
     pub granularity: Granularity,
     /// Subset of metrics to return. Empty list returns all metrics.
-    #[serde(default)]
     pub metrics: Vec<MetricType>,
+}
+
+/// Wire-side scaffold for `GetModerationMetricsInput`'s custom
+/// Deserialize. Holds raw optional fields so the dispatcher can
+/// inspect which time-range shape the caller chose.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetModerationMetricsRawInput {
+    #[serde(default)]
+    time_range: Option<String>,
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
+    granularity: Granularity,
+    #[serde(default)]
+    metrics: Vec<MetricType>,
+}
+
+impl<'de> Deserialize<'de> for GetModerationMetricsInput {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let raw = GetModerationMetricsRawInput::deserialize(d)?;
+        let time_range = match (raw.time_range, raw.start, raw.end) {
+            (Some(preset), None, None) => crate::admin::TimeRange::from_preset(
+                &preset,
+                chrono::Utc::now(),
+            )
+            .ok_or_else(|| {
+                D::Error::custom(format!(
+                    "unknown time-range preset {:?} on field 'timeRange'; expected one of: {}. \
+                     For an explicit window, use the legacy fields 'start' and 'end' (RFC 3339 \
+                     timestamps) instead.",
+                    preset,
+                    crate::admin::TimeRange::PRESETS.join(", "),
+                ))
+            })?,
+            (None, Some(s), Some(e)) => crate::admin::TimeRange::from_rfc3339_pair(&s, &e)
+                .map_err(|msg| {
+                    D::Error::custom(format!(
+                        "legacy 'start'/'end' time-range failed validation: {}. \
+                         For preset windows, use the canonical 'timeRange' field instead.",
+                        msg
+                    ))
+                })?,
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                return Err(D::Error::custom(
+                    "ambiguous time range: both canonical 'timeRange' and legacy 'start'/'end' \
+                     fields are present. Choose exactly one shape per request.",
+                ));
+            }
+            (None, Some(_), None) | (None, None, Some(_)) => {
+                return Err(D::Error::custom(
+                    "incomplete legacy time range: 'start' and 'end' must both be provided. \
+                     Or use the canonical 'timeRange' field with a preset name.",
+                ));
+            }
+            (None, None, None) => {
+                return Err(D::Error::custom(format!(
+                    "missing time range: provide canonical 'timeRange' (preset name, one of: {}) \
+                     or legacy 'start'+'end' RFC 3339 timestamps.",
+                    crate::admin::TimeRange::PRESETS.join(", "),
+                )));
+            }
+        };
+        Ok(GetModerationMetricsInput {
+            time_range,
+            granularity: raw.granularity,
+            metrics: raw.metrics,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2671,15 +2784,11 @@ pub async fn get_moderation_metrics(
             auth.role
         )));
     }
-    let start = chrono::DateTime::parse_from_rfc3339(&input.start)
-        .map_err(|e| validation(format!("invalid start timestamp: {}", e)))?
-        .with_timezone(&chrono::Utc);
-    let end = chrono::DateTime::parse_from_rfc3339(&input.end)
-        .map_err(|e| validation(format!("invalid end timestamp: {}", e)))?
-        .with_timezone(&chrono::Utc);
-    if end <= start {
-        return Err(validation("end must be after start"));
-    }
+    // TimeRange is the validation boundary (Arc 5 §9.4.3): the
+    // wrapper guarantees `start <= end` at deserialize time, so
+    // this handler trusts the value without re-validating.
+    let start = input.time_range.start();
+    let end = input.time_range.end();
     let range_len = end - start;
     let prev_start = start - range_len;
     let prev_end = start;
@@ -5144,33 +5253,223 @@ mod tests {
             .0;
         assert_eq!(resp.open_reports, 1);
         assert_eq!(resp.queue_attention_total, 1);
-        assert!(resp.average_age_open_reports_seconds >= 0);
+        // average_age_open_reports_seconds is u32 (Arc 5 §9.4.3
+        // retype): always non-negative by type, so a `>= 0`
+        // assertion would be a tautology. The seeded report is
+        // freshly inserted in this test, so the average age is
+        // bounded by test runtime — under 60 seconds is a safe
+        // ceiling that catches arithmetic errors without flakiness.
+        assert!(
+            resp.average_age_open_reports_seconds < 60,
+            "freshly-seeded report should have average age < 60s; got {}",
+            resp.average_age_open_reports_seconds,
+        );
     }
 
     // ---------- Phase 3.7 — getModerationMetrics (§8.2) ----------
 
-    #[tokio::test]
-    async fn get_moderation_metrics_rejects_invalid_range() {
-        // Per LB-2 / chainlink #118, the endpoint is now a query (GET).
-        // Tests construct the input directly and wrap in
-        // axum_extra::extract::Query — same shape the GET extractor
-        // would produce after parsing the query string.
-        use axum_extra::extract::Query as ExtraQuery;
-        let ctx = create_test_context().await;
-        let now = chrono::Utc::now().to_rfc3339();
-        let err = get_moderation_metrics(
-            State(ctx),
-            moderator_auth(),
-            ExtraQuery(GetModerationMetricsInput {
-                start: now.clone(),
-                end: now,
-                granularity: Granularity::Day,
-                metrics: vec![],
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    /// Inverted-range rejection moves to the deserialize boundary
+    /// per Arc 5 §9.4.3: `TimeRange::new` rejects `start > end`.
+    /// Direct struct-literal construction in tests goes through
+    /// the validating constructor so the test exercises the same
+    /// semantic path the wire deserialize does.
+    #[test]
+    fn get_moderation_metrics_input_rejects_inverted_legacy_range() {
+        // Wire-form: legacy start/end with start > end. The
+        // dispatcher must reject at deserialize time.
+        let inverted = serde_json::json!({
+            "start": "2026-01-02T00:00:00Z",
+            "end":   "2026-01-01T00:00:00Z",
+            "granularity": "day"
+        });
+        let err = serde_json::from_value::<GetModerationMetricsInput>(inverted)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("start must be <= end"),
+            "expected start-greater-than-end error from the legacy-shape \
+             dispatcher; got: {err}"
+        );
+    }
+
+    /// Sub-3b: canonical shape — `timeRange: "last_24h"`. The
+    /// dispatcher must resolve the preset to a 24h window.
+    #[test]
+    fn get_moderation_metrics_input_accepts_canonical_preset_shape() {
+        let body = serde_json::json!({
+            "timeRange": "last_24h",
+            "granularity": "day"
+        });
+        let input: GetModerationMetricsInput =
+            serde_json::from_value(body).expect("canonical preset shape parses");
+        let span = input.time_range.end() - input.time_range.start();
+        assert_eq!(span.num_hours(), 24);
+    }
+
+    /// Sub-3b: legacy shape — peer `start`/`end` RFC 3339 strings.
+    /// The dispatcher builds a TimeRange from the pair.
+    #[test]
+    fn get_moderation_metrics_input_accepts_legacy_start_end_shape() {
+        let body = serde_json::json!({
+            "start": "2026-01-01T00:00:00Z",
+            "end":   "2026-01-02T00:00:00Z",
+            "granularity": "day"
+        });
+        let input: GetModerationMetricsInput =
+            serde_json::from_value(body).expect("legacy shape parses");
+        assert_eq!(
+            input.time_range.start().to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            (input.time_range.end() - input.time_range.start()).num_hours(),
+            24
+        );
+    }
+
+    /// Sub-3b: typo'd preset name in the canonical `timeRange`
+    /// field. The error MUST mention the canonical field and the
+    /// preset alternatives, NOT misdirect to the legacy
+    /// `start`/`end` fields. This is the §9.5.9 misdirection-risk
+    /// mitigation made explicit (per recon Q3(b)).
+    #[test]
+    fn get_moderation_metrics_input_typo_in_canonical_preset_emits_canonical_error() {
+        let body = serde_json::json!({
+            "timeRange": "last_5min",
+            "granularity": "day"
+        });
+        let err = serde_json::from_value::<GetModerationMetricsInput>(body)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("last_5min"),
+            "error must include the typo'd preset name; got: {err}"
+        );
+        assert!(
+            err.contains("timeRange"),
+            "error must name the canonical 'timeRange' field; got: {err}"
+        );
+        assert!(
+            err.contains("last_24h"),
+            "error must list the canonical preset alternatives; got: {err}"
+        );
+    }
+
+    /// Sub-3b: both shapes simultaneously => ambiguous error.
+    /// Operators get a clear "choose one" message rather than a
+    /// silent precedence rule.
+    #[test]
+    fn get_moderation_metrics_input_rejects_mixed_canonical_and_legacy() {
+        let body = serde_json::json!({
+            "timeRange": "last_24h",
+            "start": "2026-01-01T00:00:00Z",
+            "end":   "2026-01-02T00:00:00Z",
+            "granularity": "day"
+        });
+        let err = serde_json::from_value::<GetModerationMetricsInput>(body)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ambiguous") && err.contains("timeRange"),
+            "error must say 'ambiguous' and name 'timeRange'; got: {err}"
+        );
+        assert!(
+            err.contains("start") || err.contains("end"),
+            "error must reference the legacy fields too; got: {err}"
+        );
+    }
+
+    /// Sub-3b: neither shape present => error mentions canonical
+    /// field FIRST so callers gravitate toward the modern shape.
+    #[test]
+    fn get_moderation_metrics_input_rejects_missing_time_range() {
+        let body = serde_json::json!({
+            "granularity": "day"
+        });
+        let err = serde_json::from_value::<GetModerationMetricsInput>(body)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("timeRange"),
+            "error must mention canonical 'timeRange' field first; got: {err}"
+        );
+        assert!(
+            err.contains("start") && err.contains("end"),
+            "error must also mention legacy 'start'/'end' as alternative; got: {err}"
+        );
+    }
+
+    /// Sub-3b: incomplete legacy shape (only `start`, no `end`).
+    /// The dispatcher must distinguish "incomplete legacy" from
+    /// "missing entirely" so operators don't misread the cause.
+    #[test]
+    fn get_moderation_metrics_input_rejects_incomplete_legacy_shape() {
+        let body = serde_json::json!({
+            "start": "2026-01-01T00:00:00Z",
+            "granularity": "day"
+        });
+        let err = serde_json::from_value::<GetModerationMetricsInput>(body)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("start") && err.contains("end") && err.contains("both"),
+            "error must explain that legacy requires both 'start' and 'end'; got: {err}"
+        );
+    }
+
+    /// Sub-3c: GetQueueStatsOutput's retyped fields serialize as
+    /// non-negative JSON integers. Pin the wire shape so a future
+    /// refactor that drops the `serde::Serialize` derive (or
+    /// changes a field to a wrapper that emits a different JSON
+    /// shape) fails loudly. JSON-equivalence with the v0.2 i64
+    /// shape is a wire commitment per recon Q4.
+    #[test]
+    fn get_queue_stats_output_retyped_fields_emit_json_integers() {
+        let out = GetQueueStatsOutput {
+            open_reports: 3,
+            pending_appeals: 5,
+            under_review_reports: 0,
+            under_review_appeals: 1,
+            queue_attention_total: 9,
+            average_age_open_reports_seconds: 86_400,
+            oldest_open_report_age_seconds: 3 * 86_400,
+        };
+        let value = serde_json::to_value(&out).unwrap();
+        for key in [
+            "openReports",
+            "pendingAppeals",
+            "underReviewReports",
+            "underReviewAppeals",
+            "queueAttentionTotal",
+            "averageAgeOpenReportsSeconds",
+            "oldestOpenReportAgeSeconds",
+        ] {
+            let v = &value[key];
+            assert!(
+                v.is_number() && v.as_u64().is_some(),
+                "{key} must serialize as a non-negative JSON integer; got {v}"
+            );
+        }
+    }
+
+    /// Sub-3c: the retyped fields can carry u32::MAX without
+    /// truncation. Boundary check that the saturating conversion
+    /// in the handler doesn't accidentally clip to a smaller
+    /// width.
+    #[test]
+    fn get_queue_stats_output_retyped_fields_carry_u32_max() {
+        let out = GetQueueStatsOutput {
+            open_reports: u32::MAX,
+            pending_appeals: u32::MAX,
+            under_review_reports: u32::MAX,
+            under_review_appeals: u32::MAX,
+            queue_attention_total: 4 * (u32::MAX as i64),
+            average_age_open_reports_seconds: u32::MAX,
+            oldest_open_report_age_seconds: u32::MAX,
+        };
+        let value = serde_json::to_value(&out).unwrap();
+        assert_eq!(value["openReports"].as_u64().unwrap(), u32::MAX as u64);
+        assert_eq!(value["oldestOpenReportAgeSeconds"].as_u64().unwrap(), u32::MAX as u64);
     }
 
     #[tokio::test]
@@ -5188,15 +5487,14 @@ mod tests {
             .await
             .unwrap();
         }
-        let start = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
-        let end = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let start = chrono::Utc::now() - chrono::Duration::days(1);
+        let end = chrono::Utc::now() + chrono::Duration::seconds(60);
         use axum_extra::extract::Query as ExtraQuery;
         let resp = get_moderation_metrics(
             State(ctx),
             moderator_auth(),
             ExtraQuery(GetModerationMetricsInput {
-                start,
-                end,
+                time_range: crate::admin::TimeRange::new(start, end).unwrap(),
                 granularity: Granularity::Day,
                 metrics: vec![MetricType::ReportsFiled],
             }),
@@ -5235,15 +5533,14 @@ mod tests {
             .await
             .unwrap();
         }
-        let start = (now - chrono::Duration::days(1)).to_rfc3339();
-        let end = (now + chrono::Duration::seconds(60)).to_rfc3339();
+        let start = now - chrono::Duration::days(1);
+        let end = now + chrono::Duration::seconds(60);
         use axum_extra::extract::Query as ExtraQuery;
         let resp = get_moderation_metrics(
             State(ctx),
             moderator_auth(),
             ExtraQuery(GetModerationMetricsInput {
-                start,
-                end,
+                time_range: crate::admin::TimeRange::new(start, end).unwrap(),
                 granularity: Granularity::Day,
                 metrics: vec![MetricType::ReportsFiled],
             }),

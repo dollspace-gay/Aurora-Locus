@@ -6,6 +6,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- **`TimeRange` wrapper + selective `u32` retype** (#126). Three
+  bundled changes close the v0.3 cycle's TimeRange + numeric-typing
+  cleanup:
+
+  - **`TimeRange` newtype** (`crate::admin::TimeRange`). New
+    validated `(start, end)` primitive constructible from either
+    a preset name string (`"last_hour"`, `"last_24h"`, `"last_7d"`,
+    `"last_30d"`) or an explicit `{start, end}` object with RFC
+    3339 timestamps. The wrapper rejects inverted ranges
+    (`start > end`) at deserialize time so handlers can trust the
+    value without re-validating; equal start/end is allowed
+    (zero-duration ranges are valid empty queries). Validation is
+    centralized — handlers no longer carry ad-hoc range checks.
+
+  - **`getModerationMetrics` request shape**. The handler accepts
+    both wire shapes per Arc 5 §9.4.3's backward-compat
+    requirement, dispatched via a custom `Deserialize` on the
+    request struct (recon Q3(b) decision):
+    - **Canonical**: `timeRange` field carrying a preset name.
+    - **Legacy**: peer `start` and `end` RFC 3339 timestamp fields
+      (the v0.2 wire shape).
+    Exactly one shape per request. Mixed (`timeRange` plus
+    `start`/`end`) and missing-both error envelopes name the
+    canonical field FIRST and surface preset alternatives —
+    typo'd preset names produce errors mentioning `timeRange`,
+    NOT misdirecting toward the legacy fields. The §9.5.9
+    untagged-enum misdirection risk is mitigated by the explicit
+    dispatcher.
+
+  - **`GetQueueStatsOutput` selective `u32` retype**. Six count
+    and age fields (`open_reports`, `pending_appeals`,
+    `under_review_reports`, `under_review_appeals`,
+    `average_age_open_reports_seconds`,
+    `oldest_open_report_age_seconds`) retype from `i64` to `u32`
+    per recon Q4 — domain-safely non-negative AND bounded < 2^32
+    (a u32 seconds counter spans ~136 years; ample for any
+    realistic age). `queue_attention_total` stays `i64` to
+    preserve the sum-overflow guard. The handler converts SQL
+    `i64` reads to `u32` via a saturating helper. JSON wire shape
+    unchanged (still emitted as non-negative integers); strict-
+    typed Rust consumers gain the narrower type. No
+    generated-client impact (Aurora-Locus has no OpenAPI/JSON-
+    Schema codegen consumer per recon Q4).
+
+  Operator note: existing v0.2 `getModerationMetrics` callers
+  continue to work without modification. New callers should
+  prefer the canonical `timeRange` field.
+
 ### Added
 - **File-tier runtime configuration** (#124). Aurora-Locus
   resolves `runtime_settings` keys through a four-tier
