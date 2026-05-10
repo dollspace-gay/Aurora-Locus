@@ -7,64 +7,93 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
-- **Wire-format breaking change (v0.3 / Arc 4 atomicity unification).**
-  Every `tools.aurora.admin.batch*` handler is now whole-tx atomic
-  (chainlink #113). The per-subject `failures: Vec<BatchFailure>`
-  field is removed from `BatchAccountsOutput`, `BatchLabelOutput`,
-  and `BatchRemoveLabelOutput`; the v0.2 `BatchFailure` struct is
-  retired. Per-subject mutation failure now aborts the wrapping
-  transaction (chain entry, moderation_event, account_moderation /
-  label rows, and the per-subject mutation either ALL land or NONE
-  do). `batch_takedown_accounts` and `batch_restore_accounts` drop
-  their per-subject SAVEPOINT recovery pattern in favour of
-  `?`-propagation through the wrapping `tx`. Errors surface the
-  failing subject's index and identifier in the response body
-  (`failingSubject`, `failingSubjectId` keys). `batch_remove_label`
-  keeps its `skipped: Vec<Subject>` field — semantically distinct
-  from a failure (subjects without the label to remove are a no-op,
-  not an error). Affected operator endpoints: `batchTakedownAccounts`,
-  `batchSuspendAccounts`, `batchRestoreAccounts`,
-  `batchTakedownRecords`, `batchApplyLabel`, `batchRemoveLabel`.
 
-- **Wire-format breaking change (v0.3 / Arc 4 multi-subject reshape).**
-  `tools.aurora.admin.emitEvent` now accepts an array of subjects per
-  call instead of a single subject. The input field renames
-  `subject: Subject` → `subjects: Vec<Subject>`; the output field
-  renames `snapshot_id: Option<String>` → `snapshots: Vec<SnapshotRef>`
-  paired 1:1-by-index with `subjects`. Single-subject callers migrate
-  by wrapping in a one-element array (`subjects: [s]`); multi-subject
-  callers fan out across supported actions (account state, label,
-  blob quarantine/restore/delete, record takedown,
-  `UpdateSubjectStatus`). Embedded-id and `SendEmail` variants remain
-  length-1 only and are explicitly refused for `subjects.len() > 1`
-  with HTTP 400 `SubjectsArrayInvalidForAction`. Per-action
-  `subjects.len()` caps: `DeleteAccount` = 10 (irreversible),
-  `DeleteBlob` = 25 (storage-irreversible), all others = 50.
-  `dispatch_action` is fully tx-bound — per-subject mutation failures
-  abort the wrapping tx atomically with the chain entry (LB-1 /
-  chainlink #122 / chainlink #130).
+- **Wire-format breaking change (v0.3 / Arc 4 multi-subject + atomicity unification).**
+  Five intertwined cycle changes ship together:
 
-### Documentation
-- **Aurora-Locus commits to URI-level record-takedown semantics**
-  for the batch path (`tools.aurora.admin.batchTakedownRecords`,
-  Arc 4 §8.4.3). Cascade entries written to `audit_chain_entry`
-  carry empty-string CIDs (`Subject::Record { uri, cid: "" }`)
-  by deliberate convention — the URI is the identifying field;
-  the takedown covers all versions of the record at that URI,
-  including future revisions. Empty-CID is **not** missing data;
-  external consumers reading `cascadeSubjects` from `getAuditTrail`
-  must treat empty-CID Record entries as URI-level references.
-  This commitment is now documented at `BatchRecordsInput` and
-  the `Subject::Record` variant doc comments, and pinned by
-  `batch_takedown_records_produces_uri_level_cascade_with_empty_cids`.
-  Single-subject `emitEvent{TakedownRecord}` retains CID-level
-  semantics (specific record version, real CID populated).
-  Operators choosing between paths select on whether they need
-  version-specific or URI-level coverage.
-  `docs/operator/audit-chain-verification.md` Section A is
-  updated to call out the empty-CID Record cascade shape so
-  independent chain-verification implementations handle it
-  correctly.
+  - **`emitEvent` multi-subject reshape** (chainlinks #122, #130).
+    `tools.aurora.admin.emitEvent` accepts `subjects: Vec<Subject>`
+    on input and returns `snapshots: Vec<SnapshotRef>` paired
+    1:1-by-index. Single-subject callers migrate by wrapping in a
+    one-element array (`subjects: [s]`); multi-subject callers fan
+    out across the supported action vocabulary: account state
+    (`TakedownAccount`/`SuspendAccount`/`RestoreAccount`/`DeleteAccount`),
+    label (`ApplyLabel`/`RemoveLabel`), blob lifecycle
+    (`QuarantineBlob`/`RestoreBlob`/`DeleteBlob`), record takedown
+    (`TakedownRecord`), and `UpdateSubjectStatus`. Embedded-id
+    variants (`ResolveReport`, `DismissReport`, `ResolveAppeal`,
+    `EscalateAppeal`) and `SendEmail` reject `subjects.len() > 1`
+    with HTTP 400 `SubjectsArrayInvalidForAction`. Per-action
+    `MAX_BATCH_SIZE` caps: `DeleteAccount` = 10 (irreversible),
+    `DeleteBlob` = 25 (storage-irreversible), all others = 50.
+    `dispatch_action` is fully tx-bound — every match arm runs
+    via `_in_tx` manager variants inside the wrapping tx, so
+    per-subject mutation failure aborts the whole tx atomically
+    with the chain entry.
+
+  - **Whole-batch atomicity across all `batch*` handlers**
+    (#113). The `failures: Vec<BatchFailure>` field is
+    removed from `BatchAccountsOutput`, `BatchLabelOutput`, and
+    `BatchRemoveLabelOutput`; the v0.2 `BatchFailure` struct is
+    retired. `batch_takedown_accounts` and `batch_restore_accounts`
+    drop their per-subject SAVEPOINT recovery patterns in favor of
+    `?`-propagation through the wrapping tx. Every batch handler
+    now has the same atomicity contract: chain entry,
+    `moderation_event`, and per-subject mutations either ALL land
+    or NONE do. `affected_count` always equals
+    `cascade_subjects.len()` for successful responses; the
+    partial-success state is no longer observable. Errors surface
+    the failing subject's index and identifier in the response
+    body (`failingSubject`, `failingSubjectId` keys).
+    `batch_remove_label` keeps its `skipped: Vec<Subject>` field —
+    no-op, semantically distinct from a failure. Affected operator
+    endpoints: `batchTakedownAccounts`, `batchSuspendAccounts`,
+    `batchRestoreAccounts`, `batchTakedownRecords`,
+    `batchApplyLabel`, `batchRemoveLabel`.
+
+  - **`BlobQuarantine`, `BlobStore`, `AppealManager` `_in_tx`
+    variants** (#131). Step 0.5 introduced the missing
+    in-tx manager methods so every `dispatch_action` arm has a
+    tx-bound execution path. `update_subject_status`'s
+    release-reopen-tx pattern collapses to a single in-tx call.
+    `DeleteBlob`'s backend storage delete runs post-commit via the
+    `DeferredAction` queue; orphan storage on backend-delete
+    failure is accepted (future GC sweep tracked as v0.4 follow-up).
+
+  - **Chain row shape commitment** (per §8.3.3). Single-subject
+    events now populate BOTH the flat
+    `subject_did`/`subject_uri`/`subject_cid` columns AND
+    `cascade_subjects: [s]`; multi-subject events use
+    synthetic-primary (NULL flat columns, populated cascade).
+    External consumers can rely on `cascade_subjects` always
+    containing every subject regardless of arity. Pre-Arc-4
+    chain rows (with empty cascade on single-subject events)
+    remain valid and verifiable; the mixed-corpus state is
+    expected. `docs/operator/audit-chain-verification.md`
+    Section D worked examples and the side-script's deterministic
+    hashes are updated to reflect the new shape.
+
+  - **URI-level record-takedown semantics for
+    `tools.aurora.admin.batchTakedownRecords`** (Arc 4 §8.4.3).
+    Cascade entries carry empty-string CIDs by deliberate
+    convention; the URI is the identifying field and the takedown
+    covers all versions of the record at that URI. Single-subject
+    `emitEvent{TakedownRecord}` retains CID-level semantics
+    (specific record version, real CID populated). Operators
+    choosing between paths select based on whether they need
+    version-specific or URI-level coverage. Documented at
+    `BatchRecordsInput` and the `Subject::Record` variant doc
+    comments, pinned by
+    `batch_takedown_records_produces_uri_level_cascade_with_empty_cids`.
+
+  Stability commitment: `tools.aurora.admin.emitEvent` is the
+  sixth committed surface under the v0.3 contract-lockdown
+  framework, pinned by the doc-comment on `EmitEventOutput`
+  (literal phrase "emitEvent multi-subject contract is
+  committed"). Drift caught by `tests/contract_phrases.rs`
+  (seventh phrase added). Operator summary at
+  `docs/operator/contract-stability.md` (now six committed
+  surfaces).
 
 ### Added
 - **Arc 3: Audit-trail read contract.**
@@ -172,7 +201,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - F3 — Tighten batch endpoint audit_entry_id type from Option<String> to String (#133)
 - F2 — subscribeModEvents AuditEntry shape: wrap in entry field and add missing AuditEntry fields (#132)
 - **Wire-format breaking change.** `tools.aurora.admin.getModerationMetrics` is now a `GET` query, not `POST`. The endpoint is a pure read with no side effects, so XRPC's query convention applies; the prior `POST` shape contradicted §8.16's read-vs-mutate split. Inputs (`start`, `end`, `granularity`, `metrics`) move from a JSON body to query parameters. The `metrics: Vec<MetricType>` parameter takes repeated keys (`?metrics=takedowns&metrics=labels`), which requires `axum_extra::extract::Query` rather than `axum::extract::Query` — same pattern `getAccountInfos` uses. Clients sending `POST` get 405 Method Not Allowed. v0.2 has not shipped to upstream so no external clients need a coordinated upgrade. (#118)
-- `audit_chain::append_entry` gains an `_in_tx` companion so admin handlers can land the chain entry atomically with their underlying mutation. Pre-fix, `append_entry` opened its own transaction and committed before returning, so a handler calling it after an actor-table UPDATE had a tear window where the mutation could land but the chain row could fail/crash, silently violating the §3.4 "every administrative decision gets a chain row" invariant. Five sites migrated (`emit_event`, `enable_account_invites`, `disable_account_invites`, `grantRole`, `revokeRole`); the seven remaining sites — six `batch*` handlers and `updateAccountEmail` — depend on manager-API `_in_tx` splits and are tracked under chainlink #127 for v0.3. New `AppendChainGuard` exposes the in-process serialization for caller-managed tx flow; existing pool-API `append_entry` is now a thin wrapper. `ModerationEventLogger::log_event_in_tx` companion lands moderation_event + mod_event_seq + audit_chain_entry in one tx. (#122)
+- `audit_chain::append_entry` gains an `_in_tx` companion so admin handlers can land the chain entry atomically with their underlying mutation. Pre-fix, `append_entry` opened its own transaction and committed before returning, so a handler calling it after an actor-table UPDATE had a tear window where the mutation could land but the chain row could fail/crash, silently violating the §3.4 "every administrative decision gets a chain row" invariant. Five sites migrated (`emit_event`, `enable_account_invites`, `disable_account_invites`, `grantRole`, `revokeRole`); the seven remaining sites — six `batch*` handlers and `updateAccountEmail` — depend on manager-API `_in_tx` splits and are tracked under #127 for v0.3. New `AppendChainGuard` exposes the in-process serialization for caller-managed tx flow; existing pool-API `append_entry` is now a thin wrapper. `ModerationEventLogger::log_event_in_tx` companion lands moderation_event + mod_event_seq + audit_chain_entry in one tx. (#122)
 - `Subject::Blob` round-trips `record_uri` through `audit_chain_entry`'s flat columns. Pre-fix, the chain producer destructured `Subject::Blob { did, cid, .. }` and dropped `record_uri` on the floor; reading the row back through `Subject::from_columns` then saw `(Some(did), None, Some(cid))` — a shape with no matching arm — and returned `None`, losing the subject identity entirely on every Blob entry that carried a record context. Producer now binds and stores `record_uri` in `subject_uri`; reader gains a `(Some, None, Some) → Blob with record_uri = None` arm that also handles legacy chain rows written before this fix. The L-2 canonical-hash invariant is preserved (the new value flows through the same hash path; existing chain rows verify unchanged). (#121)
 - `getAuditTrail`'s `chainVerifiedThrough` field surfaces the failing sequence on chain verification failure. Pre-fix the handler used `verify_chain_range(...).is_ok()` and reported `chain_verified_through = head_seq` on success but `0` on any failure, collapsing every failure mode (per-row tamper at seq=N, linkage break at seq=N, gap at seq=N) into the same "verified through 0" signal. Operators investigating a chain failure now get `failing_sequence - 1` (saturating), pointing at the last verified row before the divergence. The change is purely informational — clients reading `chainVerified` get the same boolean — but operators auditing a tampered chain can localize the break instead of doing a manual binary search. (#120)
 - `tools.aurora.admin.setRuntimeSetting` validates the `key` against an allowlist (`KNOWN_RUNTIME_KEYS`: currently `moderation-mode` and `moderation-mode-redirect-url`). Pre-fix, any key was accepted into the `runtime_settings` table; a typo or fabricated key would write a row that no reader ever consults. The allowlist makes drift loud — unknown keys return 400 with the known-keys list — without locking the surface against legitimate v0.3 additions (the constant lives next to the existing key constants). `getRuntimeSetting` is unaffected; the read side already returns the hardcoded default for keys with no row. (#119)
@@ -192,7 +221,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - All administrative call sites in `aurora_admin.rs` and `admin.rs` that perform a chain-write paired with an actor-state mutation now do both atomically. Round-three audit's LB-1 finding flagged twelve such sites (sessions covered by #122 and #128 closed them); this round closes seventeen additional sites with the same shape that the audit's curated list didn't enumerate: single-account mutations (`updateAccountHandle`, `updateAccountPassword`, `adminDeleteAccount`, `updateAccountSigningKey`), single-handler `takedownAccount`/`suspendAccount`/`restoreAccount` (via `ModerationManager`), single-record/blob `applyLabel`/`removeLabel`, `updateSubjectStatus`, `updateReportStatus`, `sendEmail`, `createInviteCode`/`disableInviteCode`/`disableInviteCodes`, `setRuntimeSetting`, `triggerPasswordReset`. New `_in_tx` variants land on `AccountManager` (handle, password, delete, activate/deactivate/reactivate, generate_password_reset_token), `ModerationManager` (apply_action, reverse_action — both thread the tx through to the AccountManager variants for actor-state side effects), `ReportManager` (update_status), and `InviteCodeManager` (create_invite, disable_code, disable_codes_batch). `ModerationManager.apply_action`'s takedown side-effect was previously best-effort (logged failure, returned Ok with the moderation row); it is now atomic with the moderation row — failure of the actor UPDATE aborts the transaction. `sendEmail` and `triggerPasswordReset` moved to chain-first ordering: chain entry commits before the mailer dispatch, so a mailer failure no longer leaves operator action un-audited. The §3.4 chain-of-custody invariant now holds at every administrative call site where the pattern applies; sequencer ops, cleanup ops, and forensic export remain on the non-tx variant because they emit chain entries without paired mutations. (#129)
-- All administrative call sites in `aurora_admin.rs` and `admin.rs` now write the audit chain entry atomically with the underlying mutation. Pre-fix, twelve sites split the moderation_event commit and the chain append into separate transactions, leaving an orphan-window where a mid-handler crash could strand a state mutation without chain coverage. Session 10 closed five sites (`emit_event`, `enableAccountInvites`, `disableAccountInvites`, `grantRole`, `revokeRole`); this round closes the remaining seven (six batch handlers — `batchTakedownAccounts`, `batchSuspendAccounts`, `batchRestoreAccounts`, `batchTakedownRecords`, `batchApplyLabel`, `batchRemoveLabel` — plus `updateAccountEmail`). `AccountManager` and `LabelManager` gain `_in_tx` companion variants for `takedown_account`, `update_email`, `apply_label`, and `remove_label`; the batch helper `insert_batch_account_moderations` becomes tx-aware. The two batch handlers with per-subject best-effort semantics (`batchTakedownAccounts`, `batchRestoreAccounts`) use `SAVEPOINT`-backed inner transactions so chainlink #112's `failures[]` array is preserved while the wrapping tx still gives chain-entry atomicity. The §3.4 chain-of-custody invariant now holds at every administrative call site identified by the round-3 audit; round-three's load-bearing LB-1 finding closed. (#128)
+- All administrative call sites in `aurora_admin.rs` and `admin.rs` now write the audit chain entry atomically with the underlying mutation. Pre-fix, twelve sites split the moderation_event commit and the chain append into separate transactions, leaving an orphan-window where a mid-handler crash could strand a state mutation without chain coverage. Session 10 closed five sites (`emit_event`, `enableAccountInvites`, `disableAccountInvites`, `grantRole`, `revokeRole`); this round closes the remaining seven (six batch handlers — `batchTakedownAccounts`, `batchSuspendAccounts`, `batchRestoreAccounts`, `batchTakedownRecords`, `batchApplyLabel`, `batchRemoveLabel` — plus `updateAccountEmail`). `AccountManager` and `LabelManager` gain `_in_tx` companion variants for `takedown_account`, `update_email`, `apply_label`, and `remove_label`; the batch helper `insert_batch_account_moderations` becomes tx-aware. The two batch handlers with per-subject best-effort semantics (`batchTakedownAccounts`, `batchRestoreAccounts`) use `SAVEPOINT`-backed inner transactions so #112's `failures[]` array is preserved while the wrapping tx still gives chain-entry atomicity. The §3.4 chain-of-custody invariant now holds at every administrative call site identified by the round-3 audit; round-three's load-bearing LB-1 finding closed. (#128)
 - `tests/multi_instance_test.rs` now compiles. The Postgres testcontainer harness was stranded after #103's dedicated-lock-connection refactor changed `PostgresLockProvider::new` to take the database URL string instead of an `AnyPool`; the test still passed `pool.clone()` and broke the integration-test build. `cargo test --tests --no-run` now compiles all eight integration test binaries clean. The harness still requires Docker to actually run, but the binary at least builds. (#110)
 - Forensic export `bundle_hash` now covers the complete tar bytes. Pre-fix, the recorded hash covered only `manifest.json`; the per-file payloads (account state, moderation history, audit entries, audit-trail manifest) were inside the tar but outside the chain commitment. A tampered tar still passed verification. The chain entry's rationale and the `X-Aurora-Bundle-Hash` response header now both record SHA-256 over the complete tar bytes. The in-tar `audit-trail.json` no longer carries `bundleHash` or `auditEntryId` (would create a self-referencing hash cycle); consumers correlate the export to the chain entry via the `X-Aurora-Audit-Entry-Id` response header and a `getAuditTrail` lookup. (#99)
 - Audit chain `append_entry` serializes concurrent writers. Pre-fix, two concurrent admin actions racing through the chain both observed the same head and both computed the same next sequence; the second INSERT failed with a `UNIQUE(sequence)` constraint error while the underlying mutation had already executed — silent chain entry loss under bursty load. Three layers of serialization (in-process mutex, transaction wrapping, Postgres `pg_advisory_xact_lock`) now hold; stress-tested with 20 concurrent writers producing contiguous sequences and clean linkage. (#106)

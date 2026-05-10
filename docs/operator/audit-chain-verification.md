@@ -55,8 +55,8 @@ Each item is an `AuditEntry`:
 | `currentHash` | string | SHA-256 over the canonical input — the hash this doc tells you how to reproduce. Hex-lowercase, 64 chars. |
 | `previousHash` | string \| null | Prior row's `currentHash`. **`null` for the genesis row.** |
 | `verified` | boolean | Aurora-Locus's per-row verify check. Independent verification is what this doc enables. |
-| `cascadeSubjects` | array of object | Per-subject Subject objects for batch events. Empty array when not a batch entry. |
-| `cascadeSnapshotIds` | array of (string \| null) | Per-subject snapshot ids paired by index with `cascadeSubjects`. **Stringified i64** values; `null` per element when the subject wasn't snapshottable at decision time. Empty array when not a batch entry. |
+| `cascadeSubjects` | array of object | Per-subject Subject objects. Per Arc 4 §8.3.3, single-subject events carry a one-element array (mirroring the `subjectRef` field); multi-subject events carry one element per subject. The array is empty only on pre-Arc-4 single-subject chain rows or chain entries written without a subject. |
+| `cascadeSnapshotIds` | array of (string \| null) | Per-subject snapshot ids paired by index with `cascadeSubjects`. **Stringified i64** values; `null` per element when the subject wasn't snapshottable at decision time. Empty array when `snapshot_capture: false` was passed or for chain entries without subjects. |
 
 `subjectRef` is one of three discriminated shapes:
 
@@ -268,6 +268,19 @@ fixed (not the production `Utc::now()`) so the hashes are
 reproducible. In production, `timestamp` is the row's `created_at`
 column value verbatim.
 
+### Examples 1–4 (single-subject events) and Arc 4 chain-row shape
+
+Per Arc 4 §8.3.3, single-subject events populate BOTH the flat
+`subject_did`/`subject_uri`/`subject_cid` columns AND a
+single-element `cascade_subjects: [s]`. Multi-subject events
+(Example 5) use synthetic-primary (NULL flat columns, populated
+cascade). Examples 1–4 below reflect the post-Arc-4 single-subject
+shape; the `cascade_subjects` canonical column is a JSON-encoded
+string of the one-element array. The production writer emits the
+embedded Subject with `$type` first (from the internal-tag) and
+then the struct fields in **source-declared order** (Repo: just
+`did`; Record: `uri`, `cid`; Blob: `did`, `cid`, `record_uri`).
+
 ### Example 1 — `repoRef` Subject, genesis row
 
 **Inputs**:
@@ -281,18 +294,21 @@ column value verbatim.
 - `snapshot_id: null`
 - `event_id: null`
 - `previous_hash: null` (genesis)
-- `cascade_subjects: null`
-- `cascade_snapshot_ids: null`
+- `cascade_subjects`: JSON-encoded string of a one-element array:
+  ```
+  [{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:test1234567890abcdef"}]
+  ```
+- `cascade_snapshot_ids: null` (snapshot_capture: false)
 
 **Canonical JSON** (alphabetical key order, no whitespace):
 
 ```json
-{"action":"TakedownAccount","actor_did":"did:plc:moderator","cascade_snapshot_ids":null,"cascade_subjects":null,"event_id":null,"previous_hash":null,"rationale":"spam","sequence":1,"snapshot_id":null,"subject_cid":null,"subject_did":"did:plc:test1234567890abcdef","subject_uri":null,"timestamp":"2026-05-09T00:00:00Z"}
+{"action":"TakedownAccount","actor_did":"did:plc:moderator","cascade_snapshot_ids":null,"cascade_subjects":"[{\"$type\":\"com.atproto.admin.defs#repoRef\",\"did\":\"did:plc:test1234567890abcdef\"}]","event_id":null,"previous_hash":null,"rationale":"spam","sequence":1,"snapshot_id":null,"subject_cid":null,"subject_did":"did:plc:test1234567890abcdef","subject_uri":null,"timestamp":"2026-05-09T00:00:00Z"}
 ```
 
 **SHA-256**:
 ```
-767642f918fd725e8e63f0898b0883345237ab60da31da52062fa058f4ee9e34
+3e5c0aca41c91b941e7382218fb063be599a9f50266aee7a188991096a2450bc
 ```
 
 ### Example 2 — `strongRef` Subject (Record)
@@ -305,11 +321,20 @@ column value verbatim.
 - `subject_uri: "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc"`
 - `subject_cid: "bafyreidemorecord"`
 - `rationale: "off-topic"`
+- `cascade_subjects`: JSON-encoded string:
+  ```
+  [{"$type":"com.atproto.repo.strongRef","uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc","cid":"bafyreidemorecord"}]
+  ```
+  Note `uri` precedes `cid` here — the production writer uses
+  source-declared field order, NOT alphabetical, when serializing
+  the embedded Subject struct. The internally-tagged `$type` is
+  always emitted first.
+- `cascade_snapshot_ids: null`
 - (others: same as Example 1 — null/absent)
 
 **SHA-256**:
 ```
-bc2b9e84613f5ceb81ed0330296dcfc4be0981e2907c7930b46cd5251984ef83
+5815a391b016fd4ac25f5ec6070a136971f5c91c93d145fecf3615fdebae1f20
 ```
 
 ### Example 3 — `repoBlobRef` Subject with `record_uri`
@@ -322,15 +347,21 @@ bc2b9e84613f5ceb81ed0330296dcfc4be0981e2907c7930b46cd5251984ef83
 - `subject_uri: "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc"`
 - `subject_cid: "bafyreidemoblob"`
 - `rationale: "csam"`
+- `cascade_subjects`: JSON-encoded string (struct order: did,
+  cid, record_uri):
+  ```
+  [{"$type":"com.atproto.admin.defs#repoBlobRef","did":"did:plc:test1234567890abcdef","cid":"bafyreidemoblob","record_uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc"}]
+  ```
+- `cascade_snapshot_ids: null`
 - (others: null)
 
-All three subject_* columns are populated. The wire form's
+All three flat subject_* columns are populated. The wire form's
 `subjectRef` is `Blob { did, cid, record_uri: Some(<uri>) }`;
 the canonical form puts the record URI in `subject_uri`.
 
 **SHA-256**:
 ```
-4bc69ebf0230809851723f71b2fa1b3e94e34f721c27467a82b003e9cff25f57
+39ec7c56b387f34c36798f7165a538b588581419bd51f6e9c8b09bbd92def49a
 ```
 
 ### Example 4 — `repoBlobRef` Subject without `record_uri`
@@ -343,15 +374,22 @@ the canonical form puts the record URI in `subject_uri`.
 - `subject_uri: null`   ← differs from Example 3
 - `subject_cid: "bafyreidemoblob"`
 - `rationale: "csam-orphan-blob"`
+- `cascade_subjects`: JSON-encoded string (no `record_uri` key
+  — `skip_serializing_if = "Option::is_none"` drops it):
+  ```
+  [{"$type":"com.atproto.admin.defs#repoBlobRef","did":"did:plc:test1234567890abcdef","cid":"bafyreidemoblob"}]
+  ```
+- `cascade_snapshot_ids: null`
 - (others: null)
 
 The wire form's `subjectRef` is `Blob { did, cid, record_uri:
 None }` — when the originating record isn't known, `subject_uri`
-is `null` even though the variant is `Blob`.
+is `null` even though the variant is `Blob`. The `record_uri`
+key is also absent from the cascade entry.
 
 **SHA-256**:
 ```
-b175ef5957ababe5b6e0b9667ce52724484accfc2abe4ced1d0ea1b570717ccb
+2b8e88caa44c1b4fefe3f7790dbf8161a50c1f0c1298ec678c0a47641254a842
 ```
 
 ### Example 5 — Batch event with cascades
@@ -397,9 +435,14 @@ f0465eef6ef0318ae497e97d5fe7adf76143090f577266bfd812e6b7f4739d27
 - `rationale: "appeal granted"`
 - `snapshot_id: null`, `event_id: null`
 - `previous_hash:
-  "767642f918fd725e8e63f0898b0883345237ab60da31da52062fa058f4ee9e34"`
-  (Example 1's `currentHash`)
-- `cascade_subjects: null`, `cascade_snapshot_ids: null`
+  "3e5c0aca41c91b941e7382218fb063be599a9f50266aee7a188991096a2450bc"`
+  (Example 1's `currentHash` — post-Arc-4 cascade-populated shape)
+- `cascade_subjects`: JSON-encoded string (single-subject; populated
+  per Arc 4 §8.3.3):
+  ```
+  [{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:test1234567890abcdef"}]
+  ```
+- `cascade_snapshot_ids: null`
 
 This pins **chain continuity**: Example 6's hash depends on
 Example 1's hash via the `previous_hash` field. A consumer that
@@ -409,7 +452,7 @@ the chain provides.
 
 **SHA-256**:
 ```
-10ee580b267cb083c33df7dcb7effc07567000a8cd32265c929023ef353015dd
+92ad90ef72ec8b8af22478c325ed8b3514166169fd2f244279dc47138b9c43b7
 ```
 
 ---

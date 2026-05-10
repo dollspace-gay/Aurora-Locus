@@ -1,13 +1,16 @@
-//! Arc 2 Step 4 (§6.4.4) — phrase-presence test for the five
-//! contract commitments installed during Arc 2.
+//! Arc 2 Step 4 (§6.4.4) — phrase-presence test for the contract
+//! commitments installed during Arcs 2/3/4.
 //!
-//! Each Arc 2 step landed a literal phrase in a doc comment at a
-//! canonical source location. Together they declare:
+//! Each step in the contract-lockdown framework lands a literal
+//! phrase in a doc comment at a canonical source location.
+//! Together they declare:
 //!
 //! 1. Subject vocabulary stability (`Subject`, `ReportSubject`).
 //! 2. describeCapabilities response field stability.
 //! 3. Capability string versioning convention.
 //! 4. Action-ID surfacing on Aurora-namespace handlers.
+//! 5. Audit-trail read contract on `getAuditTrail` (Arc 3).
+//! 6. Multi-subject emitEvent contract on `emitEvent` (Arc 4).
 //!
 //! This test asserts each phrase is present in the doc block
 //! immediately preceding its committed item — the `before` framing
@@ -223,6 +226,27 @@ fn get_audit_trail_output_has_audit_trail_read_phrase() {
         &contents,
         "pub struct GetAuditTrailOutput {",
         "audit-trail read contract is committed",
+    );
+}
+
+// ====================================================================
+// Multi-subject emitEvent contract — seventh phrase, added Arc 4 Step 4
+// (§8.3.1, §8.4.4)
+// ====================================================================
+
+#[test]
+fn emit_event_output_has_emit_event_multi_subject_phrase() {
+    let path = "src/api/aurora_admin.rs";
+    let contents = fs::read_to_string(path).unwrap();
+    // Brace-anchored per Arc 2 Step 4 lesson: bare
+    // `pub struct EmitEventOutput` would also substring-match
+    // `pub struct EmitEventOutputWrapper`. Anchor on the open
+    // brace to nail the actual declaration.
+    assert_phrase_in_docblock_before(
+        path,
+        &contents,
+        "pub struct EmitEventOutput {",
+        "emitEvent multi-subject contract is committed",
     );
 }
 

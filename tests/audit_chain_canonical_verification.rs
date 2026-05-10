@@ -422,6 +422,11 @@ fn fixed_row(
 #[test]
 fn worked_example_1_repo_ref_genesis() {
     // Section D Example 1: Repo Subject, genesis row.
+    // Per Arc 4 §8.3.3, single-subject events populate BOTH the flat
+    // subject_* columns AND `cascade_subjects: [s]` — `cascade_subjects_json`
+    // here is the production writer's `serde_json::to_string` output for the
+    // single-element slice, with $type emitted first by serde's internal-tag
+    // implementation followed by the struct fields in source-declared order.
     let row = fixed_row(
         1,
         "did:plc:moderator",
@@ -433,13 +438,15 @@ fn worked_example_1_repo_ref_genesis() {
         None,
         None,
         None,
-        None,
+        Some(
+            r#"[{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:test1234567890abcdef"}]"#,
+        ),
         None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "767642f918fd725e8e63f0898b0883345237ab60da31da52062fa058f4ee9e34",
+        "3e5c0aca41c91b941e7382218fb063be599a9f50266aee7a188991096a2450bc",
         "Section D Example 1 hash mismatch — update the doc OR fix the side-script"
     );
 }
@@ -447,6 +454,7 @@ fn worked_example_1_repo_ref_genesis() {
 #[test]
 fn worked_example_2_strong_ref() {
     // Section D Example 2: Record Subject (strongRef).
+    // Single-subject event: BOTH flat columns AND cascade_subjects: [s] populated.
     let row = fixed_row(
         1,
         "did:plc:moderator",
@@ -458,13 +466,15 @@ fn worked_example_2_strong_ref() {
         None,
         None,
         None,
-        None,
+        Some(
+            r#"[{"$type":"com.atproto.repo.strongRef","uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc","cid":"bafyreidemorecord"}]"#,
+        ),
         None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "bc2b9e84613f5ceb81ed0330296dcfc4be0981e2907c7930b46cd5251984ef83",
+        "5815a391b016fd4ac25f5ec6070a136971f5c91c93d145fecf3615fdebae1f20",
         "Section D Example 2 hash mismatch"
     );
 }
@@ -472,7 +482,7 @@ fn worked_example_2_strong_ref() {
 #[test]
 fn worked_example_3_repo_blob_ref_with_record_uri() {
     // Section D Example 3: Blob Subject with record_uri populated.
-    // All three subject_* columns are populated.
+    // All three subject_* columns are populated; cascade_subjects: [s] mirrors.
     let row = fixed_row(
         1,
         "did:plc:moderator",
@@ -484,13 +494,15 @@ fn worked_example_3_repo_blob_ref_with_record_uri() {
         None,
         None,
         None,
-        None,
+        Some(
+            r#"[{"$type":"com.atproto.admin.defs#repoBlobRef","did":"did:plc:test1234567890abcdef","cid":"bafyreidemoblob","record_uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc"}]"#,
+        ),
         None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "4bc69ebf0230809851723f71b2fa1b3e94e34f721c27467a82b003e9cff25f57",
+        "39ec7c56b387f34c36798f7165a538b588581419bd51f6e9c8b09bbd92def49a",
         "Section D Example 3 hash mismatch"
     );
 }
@@ -498,7 +510,8 @@ fn worked_example_3_repo_blob_ref_with_record_uri() {
 #[test]
 fn worked_example_4_repo_blob_ref_without_record_uri() {
     // Section D Example 4: Blob Subject WITHOUT record_uri.
-    // subject_uri is null; subject_did + subject_cid populated.
+    // subject_uri is null; subject_did + subject_cid populated. cascade_subjects: [s]
+    // omits `record_uri` per skip_serializing_if = "Option::is_none".
     let row = fixed_row(
         1,
         "did:plc:moderator",
@@ -510,13 +523,15 @@ fn worked_example_4_repo_blob_ref_without_record_uri() {
         None,
         None,
         None,
-        None,
+        Some(
+            r#"[{"$type":"com.atproto.admin.defs#repoBlobRef","did":"did:plc:test1234567890abcdef","cid":"bafyreidemoblob"}]"#,
+        ),
         None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "b175ef5957ababe5b6e0b9667ce52724484accfc2abe4ced1d0ea1b570717ccb",
+        "2b8e88caa44c1b4fefe3f7790dbf8161a50c1f0c1298ec678c0a47641254a842",
         "Section D Example 4 hash mismatch"
     );
 }
@@ -554,8 +569,9 @@ fn worked_example_5_batch_with_cascades() {
 fn worked_example_6_second_entry_with_previous_hash() {
     // Section D Example 6: chain continuity — second entry, with
     // previous_hash referencing the genesis row's current_hash.
-    // Uses Example 1's hash as the previous_hash to give consumers
-    // an end-to-end chain-continuity example.
+    // Uses Example 1's NEW hash (post-Arc-4 §8.3.3 cascade-populated
+    // shape) as the previous_hash to give consumers an end-to-end
+    // chain-continuity example.
     let row = fixed_row(
         2,
         "did:plc:moderator",
@@ -566,16 +582,64 @@ fn worked_example_6_second_entry_with_previous_hash() {
         "appeal granted",
         None,
         None,
-        Some("767642f918fd725e8e63f0898b0883345237ab60da31da52062fa058f4ee9e34"),
-        None,
+        Some("3e5c0aca41c91b941e7382218fb063be599a9f50266aee7a188991096a2450bc"),
+        Some(
+            r#"[{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:test1234567890abcdef"}]"#,
+        ),
         None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "10ee580b267cb083c33df7dcb7effc07567000a8cd32265c929023ef353015dd",
+        "92ad90ef72ec8b8af22478c325ed8b3514166169fd2f244279dc47138b9c43b7",
         "Section D Example 6 hash mismatch"
     );
+}
+
+/// Arc 4 §8.3.3: single-subject events populate BOTH the flat
+/// subject_* columns AND `cascade_subjects: [s]`. This roundtrip
+/// test exercises every Subject variant in cascade form to pin
+/// the production writer's `serde_json::to_string` output: $type
+/// emitted first by the internal-tag, then struct fields in
+/// source-declared order. Section D's worked-example
+/// `cascade_subjects_json` strings depend on this exact ordering.
+/// If a future serde or struct-field reordering shifts the
+/// emitted JSON, this test fails before Section D's hashes
+/// diverge from production behavior.
+#[tokio::test]
+async fn canonical_form_matches_for_single_subject_with_cascade_per_arc4() {
+    let db = open_pool().await;
+    let cascade = vec![Subject::Record {
+        uri: "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
+        cid: "bafyreidemorecord".to_string(),
+    }];
+    let subject = cascade[0].clone();
+    append_entry(
+        &db,
+        AppendEntryParams {
+            actor_did: "did:plc:moderator",
+            action: "TakedownRecord",
+            subject: Some(&subject),
+            rationale: "Arc 4 single-subject + cascade roundtrip",
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &cascade,
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .unwrap();
+    let row = fetch_row(&db, 1).await;
+    // Pin the JSON shape Section D's worked examples assume — $type
+    // first, then struct fields in source order.
+    assert_eq!(
+        row.cascade_subjects_json.as_deref(),
+        Some(
+            r#"[{"$type":"com.atproto.repo.strongRef","uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc","cid":"bafyreidemorecord"}]"#
+        ),
+        "production cascade_subjects shape changed; Section D worked examples + the worked_example_*_test fixtures need to be updated together"
+    );
+    assert_canonical_hash_matches(&db, 1, "single_subject_with_cascade").await;
 }
 
 #[tokio::test]

@@ -91,17 +91,57 @@ fn default_true() -> bool {
     true
 }
 
-/// Output for `tools.aurora.admin.emitEvent`. Per v0.3 spec §8.4.1.
+/// Response shape for `tools.aurora.admin.emitEvent`.
 ///
-/// Wire-shape break from v0.2: the scalar `snapshot_id:
-/// Option<String>` field became `snapshots: Vec<SnapshotRef>` paired
-/// 1:1-by-index with the input's `subjects`. When
-/// `snapshot_capture: false` is passed, `snapshots` is empty.
-/// Otherwise each entry holds its subject and the captured snapshot
-/// id (or `None` if that subject was not snapshottable).
+/// Per `docs/V03_DESIGN.md` §8.3.1: emitEvent multi-subject contract is committed.
+/// The following are stable across releases:
+///
+/// - **Endpoint identity**: `tools.aurora.admin.emitEvent`, POST,
+///   AdminAuthContext + Moderator+ (with per-action role gating
+///   for destructive actions like `DeleteAccount`/`DeleteBlob`).
+/// - **Input shape**: `EmitEventInput { action, subjects,
+///   rationale, snapshot_capture, metadata }`.
+///   `subjects: Vec<Subject>` — single-subject callers wrap in a
+///   one-element array.
+/// - **Per-action multi-subject support**: account state
+///   (`TakedownAccount`, `SuspendAccount`, `RestoreAccount`,
+///   `DeleteAccount`), label (`ApplyLabel`, `RemoveLabel`), blob
+///   quarantine/restore/delete (`QuarantineBlob`, `RestoreBlob`,
+///   `DeleteBlob`), record takedown (`TakedownRecord`), and
+///   `UpdateSubjectStatus` accept `subjects.len() > 1`.
+///   Embedded-id variants (`ResolveReport`, `DismissReport`,
+///   `ResolveAppeal`, `EscalateAppeal`) and `SendEmail` are
+///   length-1 only and refuse `subjects.len() > 1` with HTTP 400
+///   `SubjectsArrayInvalidForAction`.
+/// - **Per-action `MAX_BATCH_SIZE` caps**: `DeleteAccount` = 10
+///   (irreversible), `DeleteBlob` = 25 (storage-irreversible),
+///   all others = 50.
+/// - **Output shape**: this struct's four fields. `snapshots`
+///   pairs 1:1-by-index with input `subjects`; empty when
+///   `snapshot_capture: false`.
+/// - **Atomicity scope** (per §8.3.1): pre-tx snapshot capture
+///   (orphan snapshots accepted on Phase 2/3 failure — explicit
+///   carve-out); per-subject mutation in tx via tx-bound
+///   `dispatch_action` (failure aborts the whole tx); chain
+///   entry write inside the same tx; commit makes everything
+///   visible atomically. Per-subject mutation failure surfaces
+///   the failing subject's index and identifier in the response
+///   body.
+/// - **Chain row shape** (per §8.3.3): single-subject populates
+///   BOTH the flat `subject_did`/`subject_uri`/`subject_cid`
+///   columns AND `cascade_subjects: [s]`; multi-subject uses
+///   synthetic-primary (NULL flat columns, populated cascade).
+///   External consumers can rely on `cascade_subjects` always
+///   containing every subject regardless of arity.
 ///
 /// Surfaces `auditEntryId` and `eventId` per the action-ID
-/// contract committed in `crate::admin::audit_chain` (Arc 2 §6.4.2).
+/// contract committed in `crate::admin::audit_chain` (Arc 2
+/// §6.4.2). Wire-to-canonical bridge for independent chain
+/// verification: `docs/operator/audit-chain-verification.md`.
+///
+/// Snapshot tests in this module's `#[cfg(test)] mod tests`
+/// pin the wire format. The contract-phrase test in
+/// `tests/contract_phrases.rs` pins this commitment.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmitEventOutput {
@@ -1232,23 +1272,34 @@ fn require_blob_cid_pds(subject: &Subject) -> Result<&str, PdsError> {
 // Batch endpoints — §8.8–§8.13
 // ===========================================================================
 //
-// All six batch endpoints follow the same atomic pattern:
-//   1. Validate batch size (1..=50) per design doc hard cap
-//   2. Validate role
-//   3. Begin transaction on account_db
-//   4. INSERT one moderation_event row per batch (single audit semantic;
-//      subject columns NULL since the batch references many subjects;
-//      full subject list lives in details JSON)
-//   5. INSERT per-subject rows (account_moderation or label) within tx
-//   6. Commit transaction (atomicity boundary)
-//   7. Best-effort side-effect updates outside tx (takedown_ref,
-//      session purge) — failures logged, do not roll back the audit
-//      record. This matches existing single-subject takedown_account's
-//      "Don't fail the whole operation" pattern in admin.rs.
+// All six batch endpoints share the whole-tx-atomic contract per Arc 4
+// §8.4.2 (chainlink #113). For full atomicity-scope details see
+// `docs/V03_DESIGN.md` §8.3.1.
 //
-// `batchRemoveLabel` is the only endpoint with non-atomic-failure
-// semantics: subjects without the label get reported in `skipped`
-// rather than failing the whole batch (per design doc §8.13).
+//   1. Validate batch size (1..=MAX_BATCH_SIZE) and role.
+//   2. Capture per-subject snapshots BEFORE the wrapping tx opens
+//      (CR-2 / chainlink #111). Snapshot capture failure aborts the
+//      handler before the tx; the snapshot rows that did land
+//      remain (orphan-snapshot carve-out per §8.3.1).
+//   3. Open tx on account_db; per-subject mutation runs in-tx via
+//      the corresponding `_in_tx` manager method. Per-subject
+//      failure aborts the wrapping tx — moderation_event row,
+//      audit_chain_entry row, and every per-subject mutation
+//      either ALL land or NONE do.
+//   4. INSERT one moderation_event row per batch (synthetic-primary;
+//      flat subject columns NULL; full subject list lives in
+//      `details` JSON and chain row's `cascade_subjects`).
+//   5. Append chain entry inside the same tx via
+//      `audit_chain::append_entry_in_tx`.
+//   6. Commit; the response body's `affected_count` always equals
+//      `cascade_subjects.len()` for successful responses.
+//
+// The v0.2 `failures: Vec<BatchFailure>` field is retired (Arc 4
+// §8.4.2): per-subject failure now aborts the whole batch and
+// surfaces the failing subject's index and identifier in the error
+// response body. `batch_remove_label` keeps `skipped: Vec<Subject>`
+// — subjects without the label to remove are a no-op rather than a
+// failure (per design doc §8.13's non-atomic-failure rule).
 
 const MAX_BATCH_SIZE: usize = 50;
 

@@ -3,7 +3,7 @@
 Operator-and-integrator guide to Aurora-Locus's stability contracts
 on its admin-and-capability surfaces.
 
-Aurora-Locus v0.3 commits to four stability contracts. If you're
+Aurora-Locus v0.3 commits to six stability contracts. If you're
 deploying Aurora-Locus or building external tools against it, this
 document tells you which surfaces are stable and how to write code
 that won't break across releases.
@@ -25,6 +25,7 @@ committed surface, fails CI loudly.
 | 3 | Capability strings | `<kebab-family>-v<integer>`; breaking changes ship as new version | `crate::api::admin::aurora_capability_extensions` doc comment | `describe_capabilities_snapshot` (full set) + `contract_phrases` (versioning convention) |
 | 4 | Action-ID surfacing | Aurora-namespace handlers writing chain entries surface `auditEntryId` (and `eventId` if also writing event rows) | `crate::admin::audit_chain` module doc | `tests/admin_handler_contract.rs` (structural lint) |
 | 5 | Audit-trail read | Wire shape, filter set, and canonical hash-input form for `getAuditTrail`; external chain verification reproducible per [audit-chain-verification.md](audit-chain-verification.md) | `crate::api::aurora_admin::GetAuditTrailOutput` doc comment | `tests/audit_chain_canonical_verification.rs` (canonical-form + worked-example hashes) |
+| 6 | Multi-subject emitEvent | Input/output shape, per-action multi-subject support set, per-action `MAX_BATCH_SIZE`, atomicity scope, chain row shape | `crate::api::aurora_admin::EmitEventOutput` doc comment | `tests/contract_phrases.rs` (phrase) + snapshot tests in `src/api/aurora_admin.rs` (wire shape) |
 
 ---
 
@@ -223,9 +224,85 @@ caught by `tests/audit_chain_canonical_verification.rs`, which
 reproduces the documented transformation rules + worked-example
 hashes against the production writer.
 
+---
+
+## 6. Multi-subject emitEvent
+
+The `tools.aurora.admin.emitEvent` input/output shapes are stable.
+The input field `subjects: Vec<Subject>` accepts one or more
+subjects per call; the output field `snapshots: Vec<SnapshotRef>`
+pairs 1:1-by-index with `subjects` (empty when
+`snapshot_capture: false`). Single-subject callers wrap in a
+one-element array.
+
+Per-action multi-subject support follows a committed action
+vocabulary. Multi-subject is supported on:
+
+- **Account state**: `TakedownAccount`, `SuspendAccount`,
+  `RestoreAccount`, `DeleteAccount`.
+- **Label**: `ApplyLabel`, `RemoveLabel`.
+- **Blob lifecycle**: `QuarantineBlob`, `RestoreBlob`,
+  `DeleteBlob`.
+- **Record takedown**: `TakedownRecord`.
+- **Subject status**: `UpdateSubjectStatus`.
+
+Multi-subject is **refused** (HTTP 400
+`SubjectsArrayInvalidForAction`) on:
+
+- **Embedded-id variants**: `ResolveReport`, `DismissReport`,
+  `ResolveAppeal`, `EscalateAppeal` — the embedded report/appeal
+  ID makes the call inherently single-subject.
+- **`SendEmail`**: per-message addressing is single-subject.
+
+Per-action `MAX_BATCH_SIZE` caps:
+
+| Action | Cap | Reason |
+|---|---|---|
+| `DeleteAccount` | 10 | Irreversible |
+| `DeleteBlob` | 25 | Storage-irreversible |
+| All other multi-subject-supported actions | 50 | General hard cap |
+
+### Atomicity contract
+
+Pre-tx snapshot capture; per-subject mutation in tx via
+`_in_tx` manager variants; chain entry write inside the same
+tx; commit makes everything visible atomically.
+
+Per-subject mutation failure aborts the whole tx and surfaces
+the failing subject's index and identifier in the response body
+(`failingSubject`, `failingSubjectId` keys). Snapshot capture
+failures BEFORE the tx leave orphan snapshots (deliberate
+carve-out — the chain entry never lands, so the orphan rows
+have no chain-of-custody and can be reconciled by GC). The full
+two-phase failure model is documented at `docs/V03_DESIGN.md`
+§8.3.1.
+
+### Chain row shape
+
+Per `docs/V03_DESIGN.md` §8.3.3:
+
+- **Single-subject events** populate BOTH the flat
+  `subject_did`/`subject_uri`/`subject_cid` columns AND
+  `cascade_subjects: [s]`. External consumers can read either
+  surface and get the same subject identity.
+- **Multi-subject events** use synthetic-primary: NULL flat
+  columns, populated `cascade_subjects: [s1, s2, ...]`.
+
+This means `cascade_subjects` always contains every subject
+regardless of arity — consumers can rely on it as the
+authoritative subject list.
+
+### Canonical commitment
+
+`crate::api::aurora_admin::EmitEventOutput` doc comment. Drift
+on the contract phrase ("emitEvent multi-subject contract is
+committed") is caught by `tests/contract_phrases.rs`; drift on
+the wire shape is caught by snapshot tests in
+`src/api/aurora_admin.rs`'s test module.
+
 ## Out of scope
 
-Stability contracts apply to the five surfaces above only. Other
+Stability contracts apply to the six surfaces above only. Other
 admin surfaces (individual handlers' request shapes, moderation
 queue ordering, internal database schemas, log line formats) are
 **not covered** by these contracts and may change between minor
