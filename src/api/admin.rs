@@ -3473,7 +3473,16 @@ enum SubjectUnion {
     RepoBlobRef {
         did: String,
         cid: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        // Arc 6 Step 7 dual-shape acceptance (V04_DESIGN §5.3.6):
+        // accept both the canonical `record_uri` (snake_case, the
+        // v0.3 wire byte form) and the legacy `recordUri` (camelCase,
+        // v0.2 wire byte form). The `alias` attribute makes serde
+        // parse either form into this single field; serialization
+        // continues to emit only `record_uri` per the byte-equality
+        // contract above. Detection of WHICH form was used happens
+        // at the request level in `UpdateSubjectStatusRequest`'s
+        // custom Deserialize, which inspects the raw JSON.
+        #[serde(default, alias = "recordUri", skip_serializing_if = "Option::is_none")]
         record_uri: Option<String>,
     },
 }
@@ -3484,14 +3493,91 @@ enum SubjectUnion {
 /// shape with the spec-conformant declarative status-patch model. Both
 /// `takedown` and `deactivated` are optional patches; restore is implicit
 /// via `takedown: {applied: false}`.
+///
+/// **Dual-shape acceptance** (Arc 6 Step 7, V04_DESIGN §5.3.6):
+/// `RepoBlobRef` subjects accept both the canonical `record_uri`
+/// (snake_case) and the legacy `recordUri` (camelCase) field
+/// names. The custom Deserialize impl peeks at the raw JSON to
+/// detect which form was used, sets `legacy_record_uri_used`
+/// accordingly, and rejects requests that include both forms
+/// simultaneously. The handler reads the flag to record a
+/// legacy-wire-shape counter increment.
+#[derive(Debug)]
+struct UpdateSubjectStatusRequest {
+    subject: SubjectUnion,
+    takedown: Option<StatusAttr>,
+    deactivated: Option<StatusAttr>,
+    /// True when the request's `RepoBlobRef` subject (if any) used
+    /// the legacy `recordUri` camelCase field rather than the
+    /// canonical `record_uri` snake_case. Not part of the wire
+    /// shape; set by the Deserialize impl; consumed by the handler
+    /// to record a [`crate::metrics::record_legacy_wire_ingest`]
+    /// increment.
+    legacy_record_uri_used: bool,
+}
+
+/// Wire-side scaffold for [`UpdateSubjectStatusRequest`]'s custom
+/// Deserialize. Mirrors the original derive without the legacy flag.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UpdateSubjectStatusRequest {
+struct UpdateSubjectStatusRequestRaw {
     subject: SubjectUnion,
     #[serde(default)]
     takedown: Option<StatusAttr>,
     #[serde(default)]
     deactivated: Option<StatusAttr>,
+}
+
+impl<'de> Deserialize<'de> for UpdateSubjectStatusRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        // Parse to Value first so we can peek at the raw subject
+        // object's key set BEFORE serde normalizes the `recordUri`
+        // alias into `record_uri`. The alias attribute on the
+        // RepoBlobRef variant accepts both names transparently, but
+        // it does NOT tell us which one was actually present —
+        // that's what this peek is for.
+        let value = serde_json::Value::deserialize(d)?;
+
+        // Look at the subject object's keys when the variant is
+        // RepoBlobRef. If both `record_uri` and `recordUri` are
+        // present, reject — the alias would otherwise silently pick
+        // one and the operator wouldn't see the ambiguity.
+        let (legacy_record_uri_used, has_both) = value
+            .as_object()
+            .and_then(|obj| obj.get("subject"))
+            .and_then(|s| s.as_object())
+            .map(|s| {
+                let is_blob = s.get("$type").and_then(|v| v.as_str())
+                    == Some("com.atproto.admin.defs#repoBlobRef");
+                if !is_blob {
+                    return (false, false);
+                }
+                let has_canonical = s.contains_key("record_uri");
+                let has_legacy = s.contains_key("recordUri");
+                (has_legacy && !has_canonical, has_canonical && has_legacy)
+            })
+            .unwrap_or((false, false));
+
+        if has_both {
+            return Err(D::Error::custom(
+                "RepoBlobRef subject accepts either canonical 'record_uri' \
+                 (snake_case) or legacy 'recordUri' (camelCase), not both; \
+                 pick exactly one shape per request",
+            ));
+        }
+
+        // Standard deserialize via the scaffold; the `alias` attribute
+        // on RepoBlobRef.record_uri handles the field-name folding.
+        let raw: UpdateSubjectStatusRequestRaw =
+            serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(UpdateSubjectStatusRequest {
+            subject: raw.subject,
+            takedown: raw.takedown,
+            deactivated: raw.deactivated,
+            legacy_record_uri_used,
+        })
+    }
 }
 
 /// Response shape for `com.atproto.admin.updateSubjectStatus`.
@@ -3527,10 +3613,30 @@ async fn update_subject_status(
 ) -> Result<Json<UpdateSubjectStatusResponse>, axum::response::Response> {
     use axum::response::IntoResponse;
 
+    // Arc 6 Step 7: legacy wire-shape observability. When the request
+    // used the legacy camelCase `recordUri` on a RepoBlobRef subject,
+    // record a counter + structured-log line. See the matching
+    // emit_event handler comment for the deviation from the kickoff's
+    // response-header pattern.
+    if req.legacy_record_uri_used {
+        crate::metrics::record_legacy_wire_ingest(
+            "com.atproto.admin.updateSubjectStatus",
+            "v0.2_camelCase_record_uri",
+            "recordUri",
+        );
+        tracing::info!(
+            endpoint = "com.atproto.admin.updateSubjectStatus",
+            shape = "v0.2_camelCase_record_uri",
+            field = "recordUri",
+            "legacy_wire_shape_ingested"
+        );
+    }
+
     let UpdateSubjectStatusRequest {
         subject,
         takedown,
         deactivated,
+        legacy_record_uri_used: _,
     } = req;
 
     // Per §3.4 "one decision = one chain entry": each updateSubjectStatus
@@ -8147,6 +8253,7 @@ mod tests {
                 applied: true,
                 ref_field: None,
             }),
+            legacy_record_uri_used: false,
         };
         update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -8526,6 +8633,7 @@ mod tests {
                 ref_field: Some("ticket-99".to_string()),
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
         let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -8566,6 +8674,7 @@ mod tests {
                 ref_field: None,
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
         let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -8591,6 +8700,7 @@ mod tests {
                 applied: true,
                 ref_field: None,
             }),
+            legacy_record_uri_used: false,
         };
         let _ = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -8611,6 +8721,7 @@ mod tests {
                 ref_field: None,
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
         let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
             .await
@@ -8656,6 +8767,7 @@ mod tests {
                 ref_field: Some("legal-1".to_string()),
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
         let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -8697,6 +8809,7 @@ mod tests {
                 applied: true,
                 ref_field: None,
             }),
+            legacy_record_uri_used: false,
         };
         let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
             .await
@@ -8723,6 +8836,7 @@ mod tests {
                 applied: true,
                 ref_field: None,
             }),
+            legacy_record_uri_used: false,
         };
         let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
             .await
@@ -8752,6 +8866,7 @@ mod tests {
                 ref_field: None,
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
         let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
             .await
@@ -8783,6 +8898,7 @@ mod tests {
                 ref_field: None,
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
         let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
             .await
@@ -8822,6 +8938,7 @@ mod tests {
                 ref_field: Some("second-takedown".to_string()),
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
         let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
             .await
@@ -9370,5 +9487,112 @@ mod tests {
         assert_eq!(page2.accounts.len(), 1);
         assert_eq!(page2.accounts[0].did, "did:plc:c");
         assert!(page2.cursor.is_none());
+    }
+
+    // ---------- Arc 6 Step 7: updateSubjectStatus dual-shape ----------
+    //
+    // Per V04_DESIGN §5.3.6 + Step 0 Q9. RepoBlobRef subjects accept
+    // both canonical `record_uri` (snake_case) and legacy `recordUri`
+    // (camelCase). The custom Deserialize on UpdateSubjectStatusRequest
+    // peeks at the raw JSON to flag which form was used; the handler
+    // reads the flag to record a legacy-wire-shape counter increment.
+
+    #[test]
+    fn update_subject_status_parses_canonical_record_uri_shape() {
+        let json = r#"{
+            "subject": {
+                "$type": "com.atproto.admin.defs#repoBlobRef",
+                "did": "did:plc:owner",
+                "cid": "bafyblob",
+                "record_uri": "at://did:plc:owner/app.bsky.feed.post/x"
+            },
+            "takedown": {"applied": true}
+        }"#;
+        let req: UpdateSubjectStatusRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            !req.legacy_record_uri_used,
+            "canonical 'record_uri' must not flag legacy"
+        );
+        if let SubjectUnion::RepoBlobRef { record_uri, .. } = &req.subject {
+            assert_eq!(
+                record_uri.as_deref(),
+                Some("at://did:plc:owner/app.bsky.feed.post/x")
+            );
+        } else {
+            panic!("expected RepoBlobRef variant");
+        }
+    }
+
+    #[test]
+    fn update_subject_status_parses_legacy_camelcase_shape_and_flags_it() {
+        let json = r#"{
+            "subject": {
+                "$type": "com.atproto.admin.defs#repoBlobRef",
+                "did": "did:plc:owner",
+                "cid": "bafyblob",
+                "recordUri": "at://did:plc:owner/app.bsky.feed.post/x"
+            },
+            "takedown": {"applied": true}
+        }"#;
+        let req: UpdateSubjectStatusRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            req.legacy_record_uri_used,
+            "legacy 'recordUri' must flag for handler-side observability"
+        );
+        if let SubjectUnion::RepoBlobRef { record_uri, .. } = &req.subject {
+            assert_eq!(
+                record_uri.as_deref(),
+                Some("at://did:plc:owner/app.bsky.feed.post/x"),
+                "alias must normalize recordUri → record_uri"
+            );
+        } else {
+            panic!("expected RepoBlobRef variant");
+        }
+    }
+
+    #[test]
+    fn update_subject_status_rejects_both_record_uri_shapes_simultaneously() {
+        let json = r#"{
+            "subject": {
+                "$type": "com.atproto.admin.defs#repoBlobRef",
+                "did": "did:plc:owner",
+                "cid": "bafyblob",
+                "record_uri": "at://x/y/1",
+                "recordUri": "at://x/y/2"
+            },
+            "takedown": {"applied": true}
+        }"#;
+        let err = serde_json::from_str::<UpdateSubjectStatusRequest>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("not both"),
+            "error must point at the both-shapes-present case; got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn update_subject_status_non_blob_subjects_dont_flag_legacy() {
+        // RepoRef and StrongRef subjects don't have record_uri at all,
+        // so the legacy flag must remain false regardless.
+        let repo_ref_json = r#"{
+            "subject": {
+                "$type": "com.atproto.admin.defs#repoRef",
+                "did": "did:plc:owner"
+            },
+            "takedown": {"applied": true}
+        }"#;
+        let req: UpdateSubjectStatusRequest = serde_json::from_str(repo_ref_json).unwrap();
+        assert!(!req.legacy_record_uri_used);
+
+        let strong_ref_json = r#"{
+            "subject": {
+                "$type": "com.atproto.repo.strongRef",
+                "uri": "at://did:plc:foo/app.bsky.feed.post/x",
+                "cid": "bafyabc"
+            },
+            "takedown": {"applied": true}
+        }"#;
+        let req: UpdateSubjectStatusRequest = serde_json::from_str(strong_ref_json).unwrap();
+        assert!(!req.legacy_record_uri_used);
     }
 }
