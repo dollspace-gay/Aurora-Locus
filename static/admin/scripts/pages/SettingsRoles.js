@@ -74,6 +74,13 @@
 
   function renderRoles(roles, isSuper) {
     const c = document.getElementById('roles-list');
+    // Operator's own DID, used to disable the inline self-revoke
+    // affordance. Falls back to '' (no match) if the session hasn't
+    // been hydrated yet; the server-side authority check is the
+    // authoritative guardrail — this is a UX nudge, not a security
+    // boundary.
+    const session = global.AuroraSession;
+    const operatorDid = (session && session.user() && session.user().did) || '';
     c.innerHTML = roles.map((role) => {
       const members = Array.isArray(role.members) ? role.members : [];
       const memberCount = members.length;
@@ -83,7 +90,7 @@
              (role.description ? '<p class="settings-help">' + esc(role.description) + '</p>' : '') +
              '<div class="role-members">' +
              (members.length === 0 ? '<p class="settings-help">No members.</p>' :
-              members.slice(0, 12).map((m) => global.AuroraEntityRef ? global.AuroraEntityRef.account(m.did, m.handle) : '@' + esc(m.handle || m.did)).join(' ')) +
+              members.slice(0, 12).map((m) => renderMemberRow(m, memberSlug, isSuper, operatorDid)).join(' ')) +
              '</div>' +
              '<div class="action-panel-buttons" style="justify-content: flex-start; gap: 0.5rem;">' +
              (members.length > 12 ? '<a class="btn-sm btn-secondary" href="#settings/roles/' + encodeURIComponent(memberSlug) + '">View all</a>' : '') +
@@ -95,6 +102,63 @@
       c.querySelectorAll('[data-grant]').forEach((btn) => {
         btn.addEventListener('click', () => openGrantModal(btn.dataset.grant));
       });
+      c.querySelectorAll('[data-revoke-did]').forEach((btn) => {
+        if (btn.disabled) return;
+        btn.addEventListener('click', () => openRevokeModal(btn.dataset.revokeTier, btn.dataset.revokeDid));
+      });
+    }
+  }
+
+  // Renders one member badge + inline Revoke button (for superadmins).
+  // The Revoke button is disabled when the badge DID matches the
+  // operator's own — the server-side check would reject the self-
+  // revoke regardless, but disabling the button surfaces that
+  // up-front rather than via a 4xx round-trip.
+  function renderMemberRow(member, memberSlug, isSuper, operatorDid) {
+    const badge = global.AuroraEntityRef
+      ? global.AuroraEntityRef.account(member.did, member.handle)
+      : '@' + esc(member.handle || member.did);
+    if (!isSuper) return '<span class="role-member">' + badge + '</span>';
+    const isSelf = operatorDid && member.did === operatorDid;
+    const revokeBtn =
+      '<button class="btn-sm btn-danger" data-revoke-did="' + esc(member.did) + '"' +
+      ' data-revoke-tier="' + esc(memberSlug) + '"' +
+      (isSelf ? ' disabled title="You cannot revoke your own role"' : '') +
+      '>Revoke</button>';
+    return '<span class="role-member">' + badge + ' ' + revokeBtn + '</span>';
+  }
+
+  async function openRevokeModal(roleSlug, did) {
+    // Mirror of SettingsRolesMembers.js:revoke. Both flows wire to
+    // the same `superadmin.revokeRole({did, role, rationale})`
+    // endpoint with identical destructiveConfirm contract: typed
+    // REVOKE gate + required rationale lands in the audit log.
+    // See V04_DESIGN §5.3.3 (destructive-confirm canonical example).
+    const result = await global.AuroraModal.destructiveConfirm({
+      heading: 'Revoke ' + roleSlug + ' role from ' + did,
+      body: 'This action will be recorded in the audit trail.',
+      typedConfirmGate: 'REVOKE',
+      rationaleRequired: true,
+      confirmLabel: 'Revoke role',
+    });
+    if (!result.confirmed) return;
+    const wireRole = tierToRoleString(roleSlug);
+    try {
+      const res = await global.AuroraEndpoints.superadmin.revokeRole({
+        did: did,
+        role: wireRole,
+        rationale: result.rationale,
+      });
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success('Role revoked.', auditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
+      await mountReload();
+    } catch (e) {
+      global.AuroraToast.danger(e && e.message ? e.message : 'Revoke failed.');
     }
   }
 
