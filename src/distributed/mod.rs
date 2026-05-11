@@ -33,9 +33,11 @@
 pub mod cache;
 pub mod lease;
 pub mod postgres_cas;
+pub mod registry;
 
 pub use lease::Lease;
 pub use postgres_cas::PostgresCasStore;
+pub use registry::DistributedStoreRegistry;
 
 use async_trait::async_trait;
 use thiserror::Error;
