@@ -96,6 +96,8 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
             auto_stream_events: false,
         },
         validation_mode: ValidationMode::Optimistic,
+        distributed_state_mode: Default::default(),
+        maintenance_pool: Default::default(),
     };
     let ctx = AppContext::new(config).await.expect("AppContext::new");
     (ctx, dir)

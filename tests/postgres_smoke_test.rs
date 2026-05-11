@@ -408,6 +408,8 @@ async fn account_manager_round_trip_on_postgres() {
             auto_stream_events: false,
         },
         validation_mode: ValidationMode::Optimistic,
+        distributed_state_mode: Default::default(),
+        maintenance_pool: Default::default(),
     });
 
     let mgr = AccountManager::new(pool, config);

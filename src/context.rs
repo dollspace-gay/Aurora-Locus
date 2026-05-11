@@ -4,8 +4,9 @@ use crate::{
     actor_store::{ActorStore, ActorStoreConfig},
     admin::{AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager, ReportManager},
     blob_store::{BlobBackendType, BlobStorageConfig, BlobStore, BlobStoreConfig},
-    config::{BlobstoreConfig, ServerConfig},
+    config::{BlobstoreConfig, DatabaseConfig, DistributedStateMode, ServerConfig},
     db,
+    distributed::{DistributedStore, PostgresCasStore},
     error::{PdsError, PdsResult},
     federation::{
         authentication::FederationAuthenticator,
@@ -93,6 +94,19 @@ pub struct AppContext {
     /// v0.4 follow-up — runtime_settings rows are the hot path for
     /// in-process changes.
     pub file_tier_settings: Arc<std::collections::HashMap<String, serde_json::Value>>,
+    /// Dedicated maintenance pool for the distributed-state
+    /// substrate (Arc 7, V04_DESIGN.md §6.4.0 Q8b). Isolated from
+    /// the main `account_db` pool so DPoP / OAuth-state /
+    /// rate-limit roundtrips can't starve regular request
+    /// handling. `None` in `DistributedStateMode::SingleInstanceInmemory`
+    /// — the substrate isn't constructed in that mode.
+    pub maintenance_pool: Option<Arc<sqlx::AnyPool>>,
+    /// Distributed-state substrate (Arc 7, V04_DESIGN.md §6.3.2).
+    /// Operates against `maintenance_pool` when present. `None`
+    /// in `SingleInstanceInmemory` mode; consumers (DPoP, OAuth
+    /// state, rate-limit — wired in Steps 2-3) fall back to
+    /// in-process state when the substrate is absent.
+    pub distributed_store: Option<Arc<dyn DistributedStore>>,
 }
 
 impl AppContext {
@@ -130,6 +144,58 @@ impl AppContext {
         let account_db =
             db::create_any_pool(&config.database, &config.storage.account_db).await?;
         db::run_any_migrations(&account_db, &config.database).await?;
+
+        // Distributed-state substrate's dedicated maintenance pool
+        // (Arc 7, V04_DESIGN.md §6.4.0 Q8b). Same database as
+        // `account_db` (so migrations run once against the shared
+        // pool above), but a separate pool so DPoP / OAuth-state /
+        // rate-limit roundtrips have their own connection budget
+        // and can't starve regular request handling under load.
+        // Constructed only in `Distributed` mode;
+        // `SingleInstanceInmemory` mode skips the substrate
+        // entirely. `Redis` is rejected at `config.validate()`
+        // time so it never reaches this branch.
+        let (maintenance_pool, distributed_store) = match config.distributed_state_mode {
+            DistributedStateMode::Distributed => {
+                let maintenance_db_config = DatabaseConfig {
+                    backend: config.database.backend,
+                    url: config.database.url.clone(),
+                    max_connections: config.maintenance_pool.max_connections,
+                    min_connections: config.maintenance_pool.min_connections,
+                    acquire_timeout_secs: config.maintenance_pool.acquire_timeout_secs,
+                    idle_timeout_secs: config.database.idle_timeout_secs,
+                    max_lifetime_secs: config.database.max_lifetime_secs,
+                    leader_retry_interval_ms: config.database.leader_retry_interval_ms,
+                };
+                let pool = Arc::new(
+                    db::create_any_pool(&maintenance_db_config, &config.storage.account_db)
+                        .await?,
+                );
+                let store: Arc<dyn DistributedStore> =
+                    Arc::new(PostgresCasStore::new(Arc::clone(&pool)));
+                tracing::info!(
+                    max_connections = config.maintenance_pool.max_connections,
+                    min_connections = config.maintenance_pool.min_connections,
+                    "Distributed-state substrate initialized (Postgres-CAS)"
+                );
+                (Some(pool), Some(store))
+            }
+            DistributedStateMode::SingleInstanceInmemory => {
+                tracing::info!(
+                    "Distributed-state substrate disabled \
+                     (PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory) — \
+                     auth state lost on restart"
+                );
+                (None, None)
+            }
+            DistributedStateMode::Redis => {
+                // Unreachable: config.validate() rejects Redis at
+                // startup. Defensive return for completeness.
+                return Err(PdsError::Validation(
+                    "Redis distributed-state mode not implemented in v0.4".to_string(),
+                ));
+            }
+        };
 
         // Initialize account manager
         let account_manager = Arc::new(AccountManager::new(
@@ -490,6 +556,8 @@ impl AppContext {
             local_records_cache,
             cache_invalidator,
             file_tier_settings,
+            maintenance_pool,
+            distributed_store,
         })
     }
 

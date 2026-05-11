@@ -95,6 +95,8 @@ async fn create_test_manager() -> AccountManager {
             auto_stream_events: false,
         },
         validation_mode: ValidationMode::Optimistic,
+        distributed_state_mode: Default::default(),
+        maintenance_pool: Default::default(),
     });
 
     AccountManager::new(db, config)

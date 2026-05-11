@@ -2679,6 +2679,8 @@ mod tests {
                 auto_stream_events: false,
             },
             validation_mode: crate::validation::ValidationMode::Optimistic,
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
         });
 
         AccountManager::new(db, config)

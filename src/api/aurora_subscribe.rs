@@ -984,6 +984,8 @@ mod tests {
                 .to_string_lossy()
                 .parse()
                 .unwrap_or(crate::validation::ValidationMode::Required),
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
         };
         AppContext::new(config).await.unwrap()
     }

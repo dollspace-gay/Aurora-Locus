@@ -24,6 +24,130 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
     pub federation: FederationConfig,
     pub validation_mode: ValidationMode,
+    /// Distributed-state substrate mode (Arc 7, V04_DESIGN.md
+    /// §6.3.6). Default `Distributed` — Postgres-CAS substrate
+    /// for multi-instance correctness. See
+    /// [`DistributedStateMode`] for variants.
+    #[serde(default)]
+    pub distributed_state_mode: DistributedStateMode,
+    /// Connection-pool sizing for the substrate's dedicated
+    /// maintenance pool (Arc 7, V04_DESIGN.md §6.4.0 Q8b).
+    /// Constructed when `distributed_state_mode == Distributed`;
+    /// ignored in `SingleInstanceInmemory` mode.
+    #[serde(default)]
+    pub maintenance_pool: MaintenancePoolConfig,
+}
+
+/// Distributed-state substrate selector (Arc 7, V04_DESIGN.md
+/// §6.3.6 amended). Controls which backing store the
+/// `DistributedStore` trait is wired against at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedStateMode {
+    /// Postgres-CAS substrate (the v0.4 default). Required for
+    /// multi-instance correctness; works on single-instance
+    /// deployments too at the cost of a few extra Postgres
+    /// roundtrips per request.
+    #[default]
+    Distributed,
+    /// In-process state only. Auth state is lost on restart.
+    /// Operator-confirmed opt-in for single-instance
+    /// deployments that want the perf of in-memory state and
+    /// accept the durability trade-off.
+    SingleInstanceInmemory,
+    /// Forward-compat slot for a Redis backend. Not implemented
+    /// in v0.4 — selecting this fails at startup with a clear
+    /// error. Kept as an enum variant so the config surface is
+    /// stable across cycles even before the backend ships.
+    Redis,
+}
+
+impl DistributedStateMode {
+    /// Parse from an env-var value with the same case-insensitive
+    /// + aliased-form pattern `DatabaseBackend::from_env_values`
+    /// uses. Returns an error naming the valid options on
+    /// unrecognised input so operator typos surface
+    /// actionably.
+    pub fn from_env_value(s: &str) -> PdsResult<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "distributed" => Ok(Self::Distributed),
+            "single_instance_inmemory" => Ok(Self::SingleInstanceInmemory),
+            "redis" => Ok(Self::Redis),
+            other => Err(PdsError::Validation(format!(
+                "PDS_DISTRIBUTED_STATE_MODE must be one of \
+                 'distributed', 'single_instance_inmemory', \
+                 'redis' (got: {:?})",
+                other
+            ))),
+        }
+    }
+}
+
+/// Connection-pool sizing for the substrate's dedicated
+/// maintenance pool. Defaults sized for typical multi-instance
+/// deployments (Step 0 Q8 recon recommendation): smaller than
+/// the main pool to keep total Postgres connection count
+/// predictable, with a faster acquire timeout so DPoP / rate-
+/// limit hot paths fail fast under contention rather than
+/// blocking the request thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenancePoolConfig {
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout_secs: u64,
+}
+
+impl Default for MaintenancePoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 15,
+            min_connections: 2,
+            acquire_timeout_secs: 10,
+        }
+    }
+}
+
+impl MaintenancePoolConfig {
+    /// Construct from explicit option-typed env-var values.
+    /// Mirrors the pattern in `DatabaseConfig::from_env_values`.
+    pub fn from_env_values(
+        max_connections: Option<String>,
+        min_connections: Option<String>,
+        acquire_timeout_secs: Option<String>,
+    ) -> PdsResult<Self> {
+        let defaults = Self::default();
+        let max_connections =
+            parse_u32_env("PDS_MAINTENANCE_DB_MAX_CONNECTIONS", max_connections, defaults.max_connections)?;
+        let min_connections =
+            parse_u32_env("PDS_MAINTENANCE_DB_MIN_CONNECTIONS", min_connections, defaults.min_connections)?;
+        let acquire_timeout_secs = parse_u64_env(
+            "PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS",
+            acquire_timeout_secs,
+            defaults.acquire_timeout_secs,
+        )?;
+        if max_connections == 0 {
+            return Err(PdsError::Validation(
+                "PDS_MAINTENANCE_DB_MAX_CONNECTIONS must be greater than 0".to_string(),
+            ));
+        }
+        if min_connections > max_connections {
+            return Err(PdsError::Validation(format!(
+                "PDS_MAINTENANCE_DB_MIN_CONNECTIONS ({}) must not exceed \
+                 PDS_MAINTENANCE_DB_MAX_CONNECTIONS ({})",
+                min_connections, max_connections
+            )));
+        }
+        if acquire_timeout_secs == 0 {
+            return Err(PdsError::Validation(
+                "PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS must be greater than 0".to_string(),
+            ));
+        }
+        Ok(Self {
+            max_connections,
+            min_connections,
+            acquire_timeout_secs,
+        })
+    }
 }
 
 /// Shared-database backend selector.
@@ -729,6 +853,17 @@ impl ServerConfig {
             env::var("PDS_SEQUENCER_LEADER_RETRY_MS").ok(),
         )?;
 
+        let distributed_state_mode = match env::var("PDS_DISTRIBUTED_STATE_MODE") {
+            Ok(s) => DistributedStateMode::from_env_value(&s)?,
+            Err(_) => DistributedStateMode::default(),
+        };
+
+        let maintenance_pool = MaintenancePoolConfig::from_env_values(
+            env::var("PDS_MAINTENANCE_DB_MAX_CONNECTIONS").ok(),
+            env::var("PDS_MAINTENANCE_DB_MIN_CONNECTIONS").ok(),
+            env::var("PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS").ok(),
+        )?;
+
         Ok(ServerConfig {
             service: ServiceConfig {
                 hostname,
@@ -789,6 +924,8 @@ impl ServerConfig {
                 auto_stream_events,
             },
             validation_mode,
+            distributed_state_mode,
+            maintenance_pool,
         })
     }
 
@@ -805,6 +942,49 @@ impl ServerConfig {
         }
 
         // Admin password removed - OAuth uses DID-based authentication
+
+        // Redis substrate is a forward-compat slot in the enum
+        // but not implemented in v0.4. Fail-fast at startup so
+        // an operator selecting it gets a clear error instead of
+        // silently falling through to default behaviour.
+        if matches!(self.distributed_state_mode, DistributedStateMode::Redis) {
+            return Err(PdsError::Validation(
+                "PDS_DISTRIBUTED_STATE_MODE=redis is not implemented in v0.4; \
+                 use 'distributed' (default) or 'single_instance_inmemory'"
+                    .to_string(),
+            ));
+        }
+
+        // Distributed mode needs Postgres — SQLite is single-
+        // instance by definition and the maintenance pool would
+        // operate against the same DB as the application pool
+        // with no isolation benefit. Surface the mismatch
+        // explicitly rather than producing a confusing runtime
+        // behavior; operators on SQLite who want the substrate
+        // can either switch to Postgres or run in
+        // SingleInstanceInmemory mode.
+        if matches!(
+            self.distributed_state_mode,
+            DistributedStateMode::Distributed
+        ) && matches!(self.database.backend, DatabaseBackend::Sqlite)
+        {
+            // Note: this is a warning rather than a hard error
+            // because single-instance SQLite deployments may
+            // legitimately want the substrate tables present
+            // (for tooling, future migration). Log loudly but
+            // don't refuse startup. Production operators
+            // generally combine PDS_DB_BACKEND=postgres with
+            // PDS_DISTRIBUTED_STATE_MODE=distributed; mismatches
+            // mostly come from incomplete env-var copies during
+            // upgrade.
+            tracing::warn!(
+                "PDS_DISTRIBUTED_STATE_MODE=distributed combined with \
+                 PDS_DB_BACKEND=sqlite — distributed substrate operates \
+                 against the same SQLite database as the application pool; \
+                 no multi-instance benefit. Consider Postgres or \
+                 PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory."
+            );
+        }
 
         Ok(())
     }

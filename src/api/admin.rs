@@ -6302,6 +6302,8 @@ mod tests {
                 auto_stream_events: false,
             },
             validation_mode: crate::validation::ValidationMode::Required,
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
         };
 
         AppContext::new(config).await.unwrap()

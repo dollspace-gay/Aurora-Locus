@@ -966,6 +966,8 @@ mod admin_auth_third_path_tests {
                 .to_string_lossy()
                 .parse()
                 .unwrap_or(crate::validation::ValidationMode::Required),
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
         };
         let mut ctx = AppContext::new(config).await.unwrap();
         let mock: Arc<MockIdentityResolver> = Arc::new(MockIdentityResolver::new());
