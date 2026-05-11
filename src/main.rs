@@ -18,6 +18,7 @@ mod config;
 mod context;
 mod crypto;
 mod db;
+mod distributed;
 mod error;
 mod federation;
 mod identity;

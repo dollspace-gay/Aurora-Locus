@@ -19,6 +19,7 @@ pub mod config;
 pub mod context;
 pub mod crypto;
 pub mod db;
+pub mod distributed;
 pub mod error;
 pub mod federation;
 pub mod identity;
