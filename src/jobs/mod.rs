@@ -121,6 +121,14 @@ impl JobScheduler {
         tokio::spawn(Self::dpop_jti_replay_reaper_job(Arc::clone(&self)));
         info!("dpop_jti_replay reaper job started");
 
+        // Spawn rate_limit_buckets reaper (Arc 7 Step 3).
+        // Inactivity-based GC: rows whose window_start hasn't
+        // moved in 7 days are presumed cold and swept. Hourly
+        // cadence — the 7-day threshold is coarse so frequent
+        // sweeps add no value.
+        tokio::spawn(Self::rate_limit_buckets_reaper_job(Arc::clone(&self)));
+        info!("rate_limit_buckets reaper job started");
+
         // Spawn OAuth authorization_request cleanup job. The
         // sweeper has existed since Arc 7 Step 0 recon Q1 but
         // was previously unwired (no JobScheduler entry). Step 1
@@ -388,6 +396,43 @@ impl JobScheduler {
                     }
                     Err(e) => error!("Failed to cleanup expired DPoP nonces: {}", e),
                 }
+            }
+        }
+    }
+
+    /// `rate_limit_buckets` reaper sweep (Arc 7 Step 3).
+    /// Inactivity-based GC at a 7-day threshold (constant
+    /// inside the substrate impl) — buckets with no recent
+    /// `window_start_at_epoch_ms` updates are presumed cold
+    /// and swept. The next first-touch self-reconstructs at
+    /// full max_tokens, so the cost of an over-eager sweep is
+    /// one extra INSERT.
+    ///
+    /// Hourly cadence: the 7-day threshold is coarse; minute-
+    /// scale sweeps add no value. Per V04_DESIGN.md §6.3.7 the
+    /// sweep is idempotent (DELETE WHERE) so concurrent
+    /// invocations from sibling instances are fine.
+    async fn rate_limit_buckets_reaper_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(3600)); // 1 hour
+
+        loop {
+            interval.tick().await;
+            let Some(store) = scheduler.context.distributed_store.as_ref() else {
+                continue;
+            };
+            let now_epoch_ms = chrono::Utc::now().timestamp_millis();
+            match store.reap_expired("rate_limit_buckets", now_epoch_ms).await {
+                Ok(count) if count > 0 => info!(
+                    table = "rate_limit_buckets",
+                    count,
+                    "Rate-limit bucket reaper swept inactive buckets"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(
+                    table = "rate_limit_buckets",
+                    error = %e,
+                    "Rate-limit bucket reaper failed"
+                ),
             }
         }
     }

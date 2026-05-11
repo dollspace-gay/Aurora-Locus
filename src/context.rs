@@ -70,8 +70,15 @@ pub struct AppContext {
     /// JTI replay set is shared with the federation §8 challenge
     /// store when federation is enabled (see field above).
     pub dpop_verifier: Arc<DPopVerifier>,
-    // Rate limiter
+    // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
+    // Cross-instance rate-limit primitive (Arc 7 Step 3).
+    // `Some` in Distributed mode, `None` in SingleInstanceInmemory.
+    // The middleware consults this BEFORE the governor's
+    // per-endpoint check so cross-instance correctness is
+    // enforced first; the governor still runs as
+    // per-instance defense-in-depth.
+    pub distributed_rate_limiter: Option<Arc<crate::rate_limit::DistributedRateLimiter>>,
     // Email mailer
     pub mailer: Arc<Mailer>,
     // Read-after-write cache
@@ -480,6 +487,16 @@ impl AppContext {
             },
         ));
 
+        // Distributed rate-limit primitive (Arc 7 Step 3). One
+        // construction site, mode-gated on the maintenance pool's
+        // presence — `Distributed` mode has both; the other modes
+        // have neither. The middleware consults this for
+        // cross-instance bucket coherence; the governor above
+        // stays running as per-instance defense.
+        let distributed_rate_limiter = maintenance_pool.as_ref().map(|pool| {
+            Arc::new(crate::rate_limit::DistributedRateLimiter::new(Arc::clone(pool)))
+        });
+
         // Initialize mailer
         let mailer = Arc::new(Mailer::new(config.email.clone())?);
 
@@ -560,6 +577,7 @@ impl AppContext {
             dpop_nonce_store,
             dpop_verifier,
             rate_limiter,
+            distributed_rate_limiter,
             mailer,
             local_records_cache,
             cache_invalidator,
