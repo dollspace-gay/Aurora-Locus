@@ -4,6 +4,28 @@
 (function (global) {
   'use strict';
 
+  // Map UI tier slugs (plural; derived from role.name in
+  // SettingsRoles.groupRoles and embedded in route URLs like
+  // #settings/roles/moderators, which this page reads as
+  // params.role) to canonical Role enum strings (singular,
+  // lowercase) per src/admin/roles.rs:67-78 `Role::from_str`.
+  // The backend's grantRole / revokeRole handlers call
+  // .parse::<Role>() on the wire `role` field; passing the
+  // plural slug returns Validation("Invalid role: moderators")
+  // and a 400.
+  //
+  // Duplicated verbatim in pages/SettingsRoles.js per Arc 6's
+  // anti-restructuring convention (see the parallel
+  // `settingSourceSuffix` duplication from Step 2).
+  function tierToRoleString(tier) {
+    switch (tier) {
+      case 'moderators':     return 'moderator';
+      case 'administrators': return 'admin';
+      case 'superadmins':    return 'superadmin';
+      default:               return tier;
+    }
+  }
+
   async function mount({ params, container }) {
     const role = params && params.role;
     const session = global.AuroraSession;
@@ -76,8 +98,12 @@
       confirmLabel: 'Revoke role',
     });
     if (!result.confirmed) return;
+    // Map the route's plural tier slug to the canonical Role enum
+    // string the server's `Role::from_str` accepts. See
+    // tierToRoleString comment above.
+    const wireRole = tierToRoleString(role);
     try {
-      const res = await global.AuroraEndpoints.superadmin.revokeRole({ did: did, role: role, rationale: result.rationale });
+      const res = await global.AuroraEndpoints.superadmin.revokeRole({ did: did, role: wireRole, rationale: result.rationale });
       const auditEntryId = res && res.auditEntryId;
       global.AuroraToast.success('Role revoked.', auditEntryId ? {
         action: {
@@ -128,10 +154,13 @@
       submitLabel: 'Grant role',
     });
     if (!result.submitted) return;
+    // Map the route's plural tier slug to the canonical Role enum
+    // string. Same fix as the revoke path above.
+    const wireRole = tierToRoleString(role);
     try {
       const res = await global.AuroraEndpoints.superadmin.grantRole({
         did: result.values.did,
-        role: role,
+        role: wireRole,
         rationale: result.values.rationale,
       });
       const auditEntryId = res && res.auditEntryId;

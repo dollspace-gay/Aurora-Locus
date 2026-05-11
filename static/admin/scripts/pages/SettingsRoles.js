@@ -4,6 +4,34 @@
 (function (global) {
   'use strict';
 
+  // Map UI tier slugs (plural, derived from role.name in groupRoles
+  // and embedded in route URLs like #settings/roles/moderators) to
+  // canonical Role enum strings (singular, lowercase) per
+  // src/admin/roles.rs:67-78 `Role::from_str`. The backend's
+  // grantRole / revokeRole handlers call .parse::<Role>() on the
+  // wire `role` field; passing the plural slug returns
+  // `Validation("Invalid role: moderators")` and a 400.
+  //
+  // Duplicated verbatim in pages/SettingsRolesMembers.js — the
+  // codebase doesn't have a cross-page utility location for view
+  // helpers, and manufacturing a module just for two callers is
+  // over-investment per Arc 6's anti-restructuring convention
+  // (see the parallel `settingSourceSuffix` duplication from
+  // Step 2).
+  //
+  // Unknown tier strings pass through unchanged so a future-added
+  // tier doesn't silently lose its wire form before the helper is
+  // updated — the server will reject with its native "Invalid
+  // role" message in that case.
+  function tierToRoleString(tier) {
+    switch (tier) {
+      case 'moderators':     return 'moderator';
+      case 'administrators': return 'admin';
+      case 'superadmins':    return 'superadmin';
+      default:               return tier;
+    }
+  }
+
   async function mount({ container }) {
     const session = global.AuroraSession;
     const isSuper = session && session.hasRole('superadmin');
@@ -107,10 +135,14 @@
       submitLabel: 'Grant role',
     });
     if (!result.submitted) return;
+    // Map the tier slug (plural display form derived from role.name)
+    // to the canonical Role enum string (singular) the server's
+    // `Role::from_str` accepts. See tierToRoleString comment above.
+    const wireRole = tierToRoleString(roleSlug);
     try {
       const res = await global.AuroraEndpoints.superadmin.grantRole({
         did: result.values.did,
-        role: roleSlug,
+        role: wireRole,
         rationale: result.values.rationale,
       });
       const auditEntryId = res && res.auditEntryId;
