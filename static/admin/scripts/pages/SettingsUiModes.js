@@ -4,6 +4,27 @@
 (function (global) {
   'use strict';
 
+  // Suffix appended to a setting value to indicate its source tier
+  // (Runtime / File / Default / RecoveryMode). Runtime is the
+  // operator-set normal case and renders bare; the other three are
+  // informational annotations. Per V04_DESIGN.md §5.2.1 / §5.3.5.
+  // Unknown values render bare so a future wire-additive source value
+  // doesn't break rendering.
+  //
+  // Duplicated verbatim in pages/SettingsGeneral.js — the codebase
+  // doesn't have a cross-page utility location for view helpers, and
+  // manufacturing a module just for two callers is over-investment
+  // per Step 2's scope.
+  function settingSourceSuffix(source) {
+    switch (source) {
+      case 'Runtime':      return '';
+      case 'Default':      return ' (default)';
+      case 'File':         return ' (file)';
+      case 'RecoveryMode': return ' (recovery override)';
+      default:             return '';
+    }
+  }
+
   async function mount({ container }) {
     const session = global.AuroraSession;
     const isSuper = session && session.hasRole('superadmin');
@@ -70,7 +91,7 @@
       const data = await ep.admin.getRuntimeSetting('moderation-mode');
       const value = (data && typeof data.value === 'string') ? data.value : 'full';
       const cur = document.getElementById('mod-mode-current');
-      if (cur) cur.textContent = value + (data.source === 'RecoveryMode' ? ' (recovery override)' : '');
+      if (cur) cur.textContent = value + settingSourceSuffix(data && data.source);
       const radio = document.querySelector('input[name="mod-mode"][value="' + value + '"]');
       if (radio) radio.checked = true;
       if (global.AuroraSettings) global.AuroraSettings.setModerationModeCache(value);

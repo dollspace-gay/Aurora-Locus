@@ -4,6 +4,27 @@
 (function (global) {
   'use strict';
 
+  // Suffix appended to a setting value to indicate its source tier
+  // (Runtime / File / Default / RecoveryMode). Runtime is the
+  // operator-set normal case and renders bare; the other three are
+  // informational annotations. Per V04_DESIGN.md §5.2.1 / §5.3.5.
+  // Unknown values render bare so a future wire-additive source value
+  // doesn't break rendering.
+  //
+  // Duplicated verbatim in pages/SettingsUiModes.js — the codebase
+  // doesn't have a cross-page utility location for view helpers, and
+  // manufacturing a module just for two callers is over-investment
+  // per Step 2's scope.
+  function settingSourceSuffix(source) {
+    switch (source) {
+      case 'Runtime':      return '';
+      case 'Default':      return ' (default)';
+      case 'File':         return ' (file)';
+      case 'RecoveryMode': return ' (recovery override)';
+      default:             return '';
+    }
+  }
+
   async function mount({ container }) {
     const session = global.AuroraSession;
     const writable = session && session.hasRole('superadmin');
@@ -14,25 +35,25 @@
       '  <div class="settings-card">' +
       '    <h3>Server identity</h3>' +
       '    <form id="sg-identity">' +
-      '      <div class="form-group"><label>Instance name</label><input type="text" id="sg-name"' + (writable ? '' : ' disabled') + '></div>' +
-      '      <div class="form-group"><label>Service URL</label><input type="text" id="sg-url"' + (writable ? '' : ' disabled') + '></div>' +
-      '      <div class="form-group"><label>Contact email</label><input type="email" id="sg-contact"' + (writable ? '' : ' disabled') + '></div>' +
+      '      <div class="form-group"><label>Instance name <small class="settings-source-tag" id="sg-name-source"></small></label><input type="text" id="sg-name"' + (writable ? '' : ' disabled') + '></div>' +
+      '      <div class="form-group"><label>Service URL <small class="settings-source-tag" id="sg-url-source"></small></label><input type="text" id="sg-url"' + (writable ? '' : ' disabled') + '></div>' +
+      '      <div class="form-group"><label>Contact email <small class="settings-source-tag" id="sg-contact-source"></small></label><input type="email" id="sg-contact"' + (writable ? '' : ' disabled') + '></div>' +
       (writable ? '<button type="submit" class="btn-primary">Save changes</button>' : '<p class="settings-help">Read-only for non-SuperAdmin sessions.</p>') +
       '    </form>' +
       '  </div>' +
       '  <div class="settings-card">' +
       '    <h3>Operational thresholds</h3>' +
       '    <form id="sg-thresholds">' +
-      '      <div class="form-group"><label>Max blob size (MB)</label><input type="number" id="sg-blob-mb" value="5"' + (writable ? '' : ' disabled') + '></div>' +
-      '      <div class="form-group"><label>Account creation rate (per day)</label><input type="number" id="sg-acct-rate" value="100"' + (writable ? '' : ' disabled') + '></div>' +
+      '      <div class="form-group"><label>Max blob size (MB) <small class="settings-source-tag" id="sg-blob-mb-source"></small></label><input type="number" id="sg-blob-mb" value="5"' + (writable ? '' : ' disabled') + '></div>' +
+      '      <div class="form-group"><label>Account creation rate (per day) <small class="settings-source-tag" id="sg-acct-rate-source"></small></label><input type="number" id="sg-acct-rate" value="100"' + (writable ? '' : ' disabled') + '></div>' +
       (writable ? '<button type="submit" class="btn-primary">Save changes</button>' : '') +
       '    </form>' +
       '  </div>' +
       '  <div class="settings-card">' +
       '    <h3>Registration</h3>' +
       '    <form id="sg-registration">' +
-      '      <div class="form-group"><label class="checkbox-label"><input type="checkbox" id="sg-invite-required"' + (writable ? '' : ' disabled') + '> Require invite codes</label></div>' +
-      '      <div class="form-group"><label class="checkbox-label"><input type="checkbox" id="sg-email-verification"' + (writable ? '' : ' disabled') + '> Require email verification</label></div>' +
+      '      <div class="form-group"><label class="checkbox-label"><input type="checkbox" id="sg-invite-required"' + (writable ? '' : ' disabled') + '> Require invite codes <small class="settings-source-tag" id="sg-invite-required-source"></small></label></div>' +
+      '      <div class="form-group"><label class="checkbox-label"><input type="checkbox" id="sg-email-verification"' + (writable ? '' : ' disabled') + '> Require email verification <small class="settings-source-tag" id="sg-email-verification-source"></small></label></div>' +
       (writable ? '<button type="submit" class="btn-primary">Save changes</button>' : '') +
       '    </form>' +
       '  </div>' +
@@ -65,6 +86,8 @@
         const v = data && data.value;
         const el = document.getElementById(id);
         if (el) el.value = (v != null ? v : defaultV);
+        const srcEl = document.getElementById(id + '-source');
+        if (srcEl) srcEl.textContent = settingSourceSuffix(data && data.source);
       } catch (e) {
         const el = document.getElementById(id);
         if (el) el.value = defaultV;
@@ -76,6 +99,8 @@
         const data = await ep.admin.getRuntimeSetting(key);
         const el = document.getElementById(id);
         if (el) el.checked = !!(data && (data.value === true || data.value === 'true'));
+        const srcEl = document.getElementById(id + '-source');
+        if (srcEl) srcEl.textContent = settingSourceSuffix(data && data.source);
       } catch (e) { /* leave unchecked */ }
     }
   }
