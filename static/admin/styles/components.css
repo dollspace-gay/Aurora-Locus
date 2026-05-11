@@ -472,6 +472,35 @@
   gap: var(--space-3);
 }
 
+/* AuroraModal.form / .destructiveConfirm helper API (Arc 6 Step 4).
+ * The body Node these helpers construct uses .modal-body-text for
+ * the leading prose paragraph, .form-error for inline per-field
+ * validation messages, .required-marker for the * indicator after
+ * required field labels, and .modal-buttons for the footer row. */
+.modal-body-text {
+  margin-bottom: var(--space-4);
+  color: var(--text-primary);
+}
+
+.form-error {
+  color: var(--danger-color);
+  font-size: var(--font-size-sm);
+  margin-top: var(--space-1);
+  min-height: 1em;
+}
+
+.required-marker {
+  color: var(--danger-color);
+  margin-left: 0.125rem;
+}
+
+.modal-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  width: 100%;
+}
+
 /* ==================== Invite stats ==================== */
 
 .invite-stats {
