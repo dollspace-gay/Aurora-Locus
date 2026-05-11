@@ -64,10 +64,20 @@
   }
 
   async function revoke(role, did) {
-    const rationale = prompt('Rationale (required, recorded in audit log):');
-    if (!rationale) return;
+    // Canonical destructive-confirm example per V04_DESIGN §5.3.3:
+    // REVOKE typed gate + required rationale. The role + target are
+    // surfaced in the heading; the operator types REVOKE to unlock
+    // submit and supplies the rationale that lands in the audit log.
+    const result = await global.AuroraModal.destructiveConfirm({
+      heading: 'Revoke ' + role + ' role from ' + did,
+      body: 'This action will be recorded in the audit trail.',
+      typedConfirmGate: 'REVOKE',
+      rationaleRequired: true,
+      confirmLabel: 'Revoke role',
+    });
+    if (!result.confirmed) return;
     try {
-      const res = await global.AuroraEndpoints.superadmin.revokeRole({ did: did, role: role, rationale: rationale });
+      const res = await global.AuroraEndpoints.superadmin.revokeRole({ did: did, role: role, rationale: result.rationale });
       const auditEntryId = res && res.auditEntryId;
       global.AuroraToast.success('Role revoked.', auditEntryId ? {
         action: {

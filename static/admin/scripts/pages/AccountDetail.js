@@ -248,17 +248,19 @@
   }
 
   async function overridePassword() {
-    const rationale = await promptRationaleAndConfirmation(
-      'Override password',
-      'This is irreversible. The operator must communicate the new credential to the account holder out-of-band.',
-      'I understand this overrides without notifying the account holder',
-    );
-    if (!rationale) return;
-    const newPwd = prompt('New password:');
-    if (!newPwd) return;
+    const result = await global.AuroraModal.form({
+      heading: 'Override password',
+      body: 'Sets a new password directly on the account. The operator must communicate the new credential to the account holder out-of-band.',
+      fields: [
+        { name: 'newPwd', label: 'New password', type: 'password', required: true },
+        { name: 'rationale', label: 'Rationale (recorded in audit log)', type: 'textarea', required: true },
+      ],
+      submitLabel: 'Override password',
+    });
+    if (!result.submitted) return;
     try {
       await global.AuroraClient.post('com.atproto.admin.updateAccountPassword', {
-        did: currentDid, password: newPwd,
+        did: currentDid, password: result.values.newPwd,
       });
       global.AuroraToast.success('Password override applied.');
     } catch (e) {
@@ -267,17 +269,19 @@
   }
 
   async function updateSigningKey() {
-    const rationale = await promptRationaleAndConfirmation(
-      'Update signing key',
-      'Updating the signing key affects identity verification across federation. This is irreversible.',
-      'I understand this is irreversible',
-    );
-    if (!rationale) return;
-    const key = prompt('New signing key (DID-key form):');
-    if (!key) return;
+    const result = await global.AuroraModal.form({
+      heading: 'Update signing key',
+      body: 'Updates the account\'s signing key. Affects identity verification across federation.',
+      fields: [
+        { name: 'didKey', label: 'New signing key (DID-key form)', type: 'text', required: true },
+        { name: 'rationale', label: 'Rationale (recorded in audit log)', type: 'textarea', required: true },
+      ],
+      submitLabel: 'Update signing key',
+    });
+    if (!result.submitted) return;
     try {
       await global.AuroraClient.post('com.atproto.admin.updateAccountSigningKey', {
-        did: currentDid, signingKey: key,
+        did: currentDid, signingKey: result.values.didKey,
       });
       global.AuroraToast.success('Signing key updated.');
     } catch (e) {
@@ -334,17 +338,15 @@
 
   async function deleteAccount() {
     const handle = currentAccount.handle || '';
-    const typed = prompt('Type the account handle (' + handle + ') to confirm deletion:');
-    if (typed !== handle) {
-      if (typed != null) global.AuroraToast.warning('Handle did not match; cancelled.');
-      return;
-    }
-    const rationale = await promptRationaleAndConfirmation(
-      'Delete account',
-      'This permanently removes the account, its records, and its invite lineage. Irreversible.',
-      'I understand this is irreversible',
-    );
-    if (!rationale) return;
+    const result = await global.AuroraModal.destructiveConfirm({
+      heading: 'Delete account',
+      body: 'This permanently removes the account, its records, and its invite lineage. Irreversible.',
+      typedConfirmGate: handle,
+      rationaleRequired: true,
+      ackCheckbox: 'I understand this is irreversible',
+      confirmLabel: 'Delete account',
+    });
+    if (!result.confirmed) return;
     try {
       await global.AuroraClient.post('com.atproto.admin.deleteAccount', {
         did: currentDid,
