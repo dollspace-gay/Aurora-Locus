@@ -66,8 +66,15 @@ use std::collections::HashSet;
 /// Per-action support and per-action `subjects.len()` caps are
 /// enforced in Phase 0 of the handler. See §8.3.4 for the action
 /// vocabulary and §8.3.1 for the atomicity scope.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// **Dual-shape acceptance** (Arc 6 Step 7, V04_DESIGN §5.3.6):
+/// requests using the legacy v0.2 `subject: Subject` shape are
+/// accepted and normalized to the canonical `subjects: vec![s]`
+/// during Deserialize. When the legacy shape is parsed,
+/// `legacy_subject_used` is set to `true`; the handler reads this
+/// to record a metrics counter increment for operator-visible
+/// migration tracking.
+#[derive(Debug)]
 pub struct EmitEventInput {
     pub action: ModEventAction,
     pub subjects: Vec<Subject>,
@@ -77,14 +84,73 @@ pub struct EmitEventInput {
     /// transaction opens (Phase 1 of the handler) so a snapshot can
     /// outlive a rolled-back mutation — an intentional carve-out from
     /// whole-tx atomicity per §8.3.1's orphan-snapshot rule.
-    #[serde(default = "default_true")]
     pub snapshot_capture: bool,
     /// Action-specific options (e.g. `{"durationDays": 7}` for
     /// SuspendAccount, `{"reason": "csam", "legalReference": "..."}`
     /// for QuarantineBlob). Per-action interpretation documented in
     /// the dispatch matrix below.
-    #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// True when this input was deserialized from the legacy v0.2
+    /// `subject: Subject` single-subject shape (vs. the canonical
+    /// v0.3 `subjects: Vec<Subject>` array). Set by the custom
+    /// Deserialize impl; the handler reads it to record a
+    /// legacy-wire-shape counter increment via
+    /// [`crate::metrics::record_legacy_wire_ingest`]. Not part of
+    /// the wire shape — purely an in-memory observability flag.
+    pub legacy_subject_used: bool,
+}
+
+/// Wire-side scaffold for [`EmitEventInput`]'s custom Deserialize.
+/// Holds both shape variants as optional fields; the manual impl
+/// matches on which were present and normalizes.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EmitEventInputRaw {
+    action: ModEventAction,
+    /// Canonical v0.3 multi-subject shape.
+    #[serde(default)]
+    subjects: Option<Vec<Subject>>,
+    /// Legacy v0.2 single-subject shape; accepted during dual-shape
+    /// window per V04_DESIGN §5.3.6.
+    #[serde(default)]
+    subject: Option<Subject>,
+    rationale: String,
+    #[serde(default = "default_true")]
+    snapshot_capture: bool,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for EmitEventInput {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let raw = EmitEventInputRaw::deserialize(d)?;
+        let (subjects, legacy_subject_used) = match (raw.subjects, raw.subject) {
+            (Some(ss), None) => (ss, false),
+            (None, Some(s)) => (vec![s], true),
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "emitEvent accepts either canonical 'subjects' \
+                     (array of Subject) or legacy 'subject' (single Subject), \
+                     not both; pick exactly one shape per request",
+                ));
+            }
+            (None, None) => {
+                return Err(D::Error::custom(
+                    "emitEvent requires either canonical 'subjects' \
+                     (array of Subject) or legacy 'subject' (single Subject)",
+                ));
+            }
+        };
+        Ok(EmitEventInput {
+            action: raw.action,
+            subjects,
+            rationale: raw.rationale,
+            snapshot_capture: raw.snapshot_capture,
+            metadata: raw.metadata,
+            legacy_subject_used,
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -585,6 +651,31 @@ pub async fn emit_event(
     auth: AdminAuthContext,
     Json(input): Json<EmitEventInput>,
 ) -> Result<Json<EmitEventOutput>, (StatusCode, Json<serde_json::Value>)> {
+    // Arc 6 Step 7: legacy wire-shape observability. When the input
+    // was deserialized from the v0.2 `subject: Subject` shape, record
+    // a counter increment + structured log so operators tracking
+    // migration progress can see which clients still send the legacy
+    // shape. Response headers (Deprecation, Sunset, Warning,
+    // X-Wire-Migration-Guide) are NOT emitted here — adding them
+    // would require restructuring the handler return type from
+    // `Json<EmitEventOutput>` to `Response`, which would ripple
+    // through 29 test call sites. Counter + log is sufficient for
+    // the observability goal of §5.3.6; headers are a follow-up
+    // cycle decision (flagged in Step 7 report).
+    if input.legacy_subject_used {
+        crate::metrics::record_legacy_wire_ingest(
+            "tools.aurora.admin.emitEvent",
+            "v0.2_single_subject",
+            "subject",
+        );
+        tracing::info!(
+            endpoint = "tools.aurora.admin.emitEvent",
+            shape = "v0.2_single_subject",
+            field = "subject",
+            "legacy_wire_shape_ingested"
+        );
+    }
+
     // === Phase 0: input validation ===
     check_role(&auth, &input.action)?;
 
@@ -4061,6 +4152,7 @@ mod tests {
                 rationale: "spam".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4107,6 +4199,7 @@ mod tests {
                 rationale: "   ".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4129,6 +4222,7 @@ mod tests {
                 rationale: "wrong subject type".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4148,6 +4242,7 @@ mod tests {
                 rationale: "test".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4179,6 +4274,7 @@ mod tests {
                 rationale: "Moderator may not emit SendEmail".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4203,6 +4299,7 @@ mod tests {
                 rationale: "Admin may emit SendEmail".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await;
@@ -4237,6 +4334,7 @@ mod tests {
                 rationale: "moderator-flavored event still allowed".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4263,6 +4361,7 @@ mod tests {
                 rationale: "obvious spam".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4330,6 +4429,7 @@ mod tests {
                 rationale: "appeal valid".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4389,6 +4489,7 @@ mod tests {
                 rationale: "denied".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4423,6 +4524,7 @@ mod tests {
                 rationale: "voluntary deletion".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -5571,6 +5673,7 @@ mod tests {
                 rationale: "spam".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -5606,6 +5709,7 @@ mod tests {
                 rationale: "spam".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7323,6 +7427,7 @@ mod tests {
                 rationale: "no subjects".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7355,6 +7460,7 @@ mod tests {
                 rationale: "two subjects on a length-1 action".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7387,6 +7493,7 @@ mod tests {
                 rationale: "spam ring".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7429,6 +7536,7 @@ mod tests {
                 rationale: "spam wave".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7465,6 +7573,7 @@ mod tests {
                 rationale: "spam posts".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7531,6 +7640,7 @@ mod tests {
                 rationale: "test rollback".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7607,6 +7717,7 @@ mod tests {
                 rationale: "exercise orphan-snapshot semantics".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await;
@@ -7656,6 +7767,7 @@ mod tests {
                 rationale: "single subject".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7699,6 +7811,7 @@ mod tests {
                 rationale: "no snapshot".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7738,6 +7851,7 @@ mod tests {
                 rationale: "multi-subject batch".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7789,6 +7903,7 @@ mod tests {
                 rationale: "wrong subject type".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7852,6 +7967,7 @@ mod tests {
                 rationale: "wrong target".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7881,6 +7997,7 @@ mod tests {
                 rationale: "over the cap".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7914,6 +8031,7 @@ mod tests {
                 rationale: "over the cap".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7979,6 +8097,7 @@ mod tests {
                 rationale: "expect rollback".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -8000,5 +8119,75 @@ mod tests {
         );
         // No new chain entry.
         assert_eq!(count_chain_entries(&ctx).await, chain_before);
+    }
+
+    // ---------- Arc 6 Step 7: emitEvent dual-shape Deserialize ----------
+    //
+    // Per V04_DESIGN §5.3.6 + Step 0 Q9. The input accepts both the
+    // canonical v0.3 `subjects: [Subject]` shape and the legacy v0.2
+    // `subject: Subject` shape during the deprecation window.
+
+    #[test]
+    fn emit_event_input_parses_canonical_subjects_shape() {
+        let json = r#"{
+            "action": {"kind": "TakedownAccount"},
+            "subjects": [{"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:abc"}],
+            "rationale": "spam"
+        }"#;
+        let input: EmitEventInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.subjects.len(), 1);
+        assert!(
+            !input.legacy_subject_used,
+            "canonical shape must not set legacy_subject_used"
+        );
+    }
+
+    #[test]
+    fn emit_event_input_parses_legacy_subject_shape_and_flags_it() {
+        let json = r#"{
+            "action": {"kind": "TakedownAccount"},
+            "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:abc"},
+            "rationale": "spam"
+        }"#;
+        let input: EmitEventInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.subjects.len(), 1);
+        assert!(
+            matches!(input.subjects[0], Subject::Repo { ref did } if did == "did:plc:abc"),
+            "legacy single-subject normalizes to subjects[0]"
+        );
+        assert!(
+            input.legacy_subject_used,
+            "legacy shape must set legacy_subject_used for handler-side observability"
+        );
+    }
+
+    #[test]
+    fn emit_event_input_rejects_both_shapes_simultaneously() {
+        let json = r#"{
+            "action": {"kind": "TakedownAccount"},
+            "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:abc"},
+            "subjects": [{"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:def"}],
+            "rationale": "spam"
+        }"#;
+        let err = serde_json::from_str::<EmitEventInput>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("not both"),
+            "error message must point at the both-shapes-present case; got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn emit_event_input_rejects_neither_shape() {
+        let json = r#"{
+            "action": {"kind": "TakedownAccount"},
+            "rationale": "spam"
+        }"#;
+        let err = serde_json::from_str::<EmitEventInput>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("requires either"),
+            "error message must point at the missing-shape case; got: {}",
+            err
+        );
     }
 }
