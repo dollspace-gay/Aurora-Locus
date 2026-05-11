@@ -235,7 +235,13 @@
       const sent = res.resetEmailSent
         ? 'Password reset email sent to ' + (res.maskedEmail || '')
         : 'Token generated; email not sent (mailer not configured).';
-      global.AuroraToast.success(sent);
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success(sent, auditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
     } catch (e) {
       global.AuroraToast.danger('Password reset failed: ' + (e && e.message ? e.message : ''));
     }
@@ -420,7 +426,16 @@
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
       modalHandle.close();
-      global.AuroraToast.success('Export complete. Audit entry: ' + auditId + ', bundle hash: ' + bundleHash);
+      // Bundle hash stays inline (it's the verification token operators
+      // need to keep with the bundle); the audit-entry id moves into a
+      // click-through action link per Arc 6 Step 3 sub-3e.
+      const msg = 'Export complete. Bundle hash: ' + bundleHash;
+      global.AuroraToast.success(msg, auditId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditId),
+        },
+      } : undefined);
     } catch (e) {
       global.AuroraToast.danger('Export failed: ' + (e && e.message ? e.message : ''));
     }

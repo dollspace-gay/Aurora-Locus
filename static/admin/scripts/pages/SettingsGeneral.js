@@ -125,13 +125,24 @@
     };
     const rationale = 'Routine config update via Settings → General';
     try {
+      // Each setRuntimeSetting call lands its own audit entry. When the
+      // form saves multiple keys, the toast's "View audit entry" link
+      // points at the most-recent entry — pragmatic compromise that
+      // beats omitting the link entirely or surfacing N toasts.
+      let lastAuditEntryId = null;
       for (const [key, id] of fieldsByForm[formId] || []) {
         const el = document.getElementById(id);
         if (!el) continue;
         const value = el.type === 'checkbox' ? el.checked : el.value;
-        await ep.admin.setRuntimeSetting({ key: key, value: value, rationale: rationale });
+        const res = await ep.admin.setRuntimeSetting({ key: key, value: value, rationale: rationale });
+        if (res && res.auditEntryId) lastAuditEntryId = res.auditEntryId;
       }
-      global.AuroraToast.success('Settings saved.');
+      global.AuroraToast.success('Settings saved.', lastAuditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(lastAuditEntryId),
+        },
+      } : undefined);
     } catch (e) {
       global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));
     }

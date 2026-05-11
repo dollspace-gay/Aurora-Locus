@@ -67,8 +67,14 @@
     const rationale = prompt('Rationale (required, recorded in audit log):');
     if (!rationale) return;
     try {
-      await global.AuroraEndpoints.superadmin.revokeRole({ did: did, role: role, rationale: rationale });
-      global.AuroraToast.success('Role revoked.');
+      const res = await global.AuroraEndpoints.superadmin.revokeRole({ did: did, role: role, rationale: rationale });
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success('Role revoked.', auditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
       if (global.AuroraRouter) global.AuroraRouter.dispatch();
     } catch (e) {
       global.AuroraToast.danger('Revoke failed: ' + (e && e.message ? e.message : ''));

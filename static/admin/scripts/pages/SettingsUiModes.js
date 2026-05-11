@@ -113,8 +113,17 @@
     const redirect = document.getElementById('mod-mode-redirect').value.trim();
     try {
       await global.AuroraEndpoints.admin.setRuntimeSetting({ key: 'moderation-mode', value: selected.value, rationale: rationale });
-      await global.AuroraEndpoints.admin.setRuntimeSetting({ key: 'moderation-mode-redirect-url', value: redirect, rationale: rationale });
-      global.AuroraToast.success('Mode change saved. Sidebar may re-render.');
+      // Two setRuntimeSetting calls land two audit entries. Link the
+      // toast to the most-recent (redirect-url) entry per the same
+      // pragmatic last-entry rule used in SettingsGeneral.saveCard.
+      const res = await global.AuroraEndpoints.admin.setRuntimeSetting({ key: 'moderation-mode-redirect-url', value: redirect, rationale: rationale });
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success('Mode change saved. Sidebar may re-render.', auditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
       await loadModerationMode();
     } catch (e) {
       global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));

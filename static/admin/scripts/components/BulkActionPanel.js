@@ -431,6 +431,25 @@
       this.state.submitting = false;
       this.state.result = result;
       this.render();
+      // v0.3 batch endpoints surface a single auditEntryId per batch.
+      // Per V04_DESIGN §5.4.3 sub-3e, the success toast carries a
+      // click-through to that audit entry alongside the in-panel
+      // "Processed N subject(s)" status.
+      const auditEntryId = result && result.auditEntryId;
+      if (global.AuroraToast) {
+        const count = (result && result.affectedCount) || this.subjects.length;
+        const msg = 'Processed ' + count + ' subject' + (count === 1 ? '' : 's') + '.';
+        if (auditEntryId) {
+          global.AuroraToast.success(msg, {
+            action: {
+              label: 'View audit entry',
+              href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+            },
+          });
+        } else {
+          global.AuroraToast.success(msg);
+        }
+      }
       return result;
     } catch (e) {
       this.state.submitting = false;

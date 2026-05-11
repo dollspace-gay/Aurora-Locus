@@ -581,6 +581,25 @@
         this._statusEl.classList.remove('action-panel-status-error');
       }
       this.refreshConfirmButton();
+      // v0.3 emitEvent (and onConfirm dispatchers built on it) surface
+      // auditEntryId on the response. Per V04_DESIGN §5.4.3 sub-3e,
+      // a success toast with a click-through to the audit-trail
+      // detail view lets operators inspect the recorded action. The
+      // toast is additive — the in-panel status remains for callers
+      // that lean on it.
+      const auditEntryId = result && result.auditEntryId;
+      if (global.AuroraToast) {
+        if (auditEntryId) {
+          global.AuroraToast.success('Action complete.', {
+            action: {
+              label: 'View audit entry',
+              href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+            },
+          });
+        } else {
+          global.AuroraToast.success('Action complete.');
+        }
+      }
       return result;
     } catch (e) {
       this.state.submitting = false;
