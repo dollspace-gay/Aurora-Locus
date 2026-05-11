@@ -22,11 +22,34 @@
 
   function account(did, handle) {
     if (!did) return '<span class="entity-ref">—</span>';
+    // CLI sentinel: actor strings prefixed with 'cli:' come from
+    // command-line invocations (bootstrap, gc-sweep, etc.) and
+    // have no runtime-PDS account to navigate to. Render as a
+    // non-clickable badge per V04_DESIGN §5.3.4. Defensive
+    // typeof check — non-string DIDs fall through to the
+    // existing rendering path's null-handling.
+    if (typeof did === 'string' && did.startsWith('cli:')) {
+      return _renderCliSentinel(did);
+    }
     const display = handle ? '@' + handle : '';
     return '<a class="entity-ref" href="#ops/accounts/' + encodeURIComponent(did) + '">' +
            (display ? '<span>' + esc(display) + '</span> ' : '') +
            '<code>' + esc(shortDid(did)) + '</code>' +
            '</a>';
+  }
+
+  // Render a CLI-actor sentinel as a non-clickable badge. The 'cli:'
+  // prefix is stripped from the displayed label; the suffix is the
+  // CLI command / identity name (e.g. 'bootstrap', 'gc-sweep'). Uses
+  // both `entity-ref` (shared inline-flex positioning) and
+  // `entity-ref--cli` (sentinel-specific styling) classes so the
+  // badge participates in the surrounding entity-ref layout while
+  // visually distinguishing itself from clickable runtime-account
+  // links.
+  function _renderCliSentinel(did) {
+    const suffix = did.slice(4);
+    return '<span class="entity-ref entity-ref--cli">CLI: ' +
+           esc(suffix) + '</span>';
   }
 
   function record(uri) {

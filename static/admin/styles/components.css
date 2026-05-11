@@ -1032,6 +1032,26 @@ input[type="checkbox"][disabled] {
   color: var(--text-secondary);
 }
 
+/* CLI-actor sentinel: actor strings prefixed with `cli:` render as a
+ * non-clickable badge per V04_DESIGN §5.3.4. Visually distinct from
+ * runtime-account links (no underline-on-hover, muted background)
+ * so operators see at a glance that the actor was a CLI invocation
+ * rather than a runtime PDS user. */
+.entity-ref--cli {
+  color: var(--text-secondary);
+  background: var(--background);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 0.05em 0.4em;
+  font-size: 0.85em;
+  font-family: var(--font-mono);
+  cursor: default;
+}
+
+.entity-ref--cli:hover {
+  text-decoration: none;
+}
+
 /* ==================== Two-column detail layout ==================== */
 
 .detail-layout {
