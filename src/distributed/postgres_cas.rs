@@ -104,10 +104,10 @@ struct RateLimitBucketValue {
 /// backend-specific quirk.
 fn is_unique_violation(err: &sqlx::Error) -> bool {
     if let sqlx::Error::Database(db_err) = err {
-        match db_err.code().as_deref() {
-            Some("23505") | Some("1555") | Some("2067") => true,
-            _ => false,
-        }
+        matches!(
+            db_err.code().as_deref(),
+            Some("23505") | Some("1555") | Some("2067")
+        )
     } else {
         false
     }
