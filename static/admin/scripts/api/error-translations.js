@@ -19,9 +19,18 @@
   'use strict';
 
   const TABLE = {
+    // Phase B refinement: the embedded-id action subject-
+    // variant check at aurora_admin.rs:910 emits this when the
+    // request's named subject doesn't match the variant
+    // expected by an action like ResolveAppeal{appealId} (the
+    // appeal is bound to a specific subject; the request must
+    // match). Distinct from InvalidEvent's wider per-arm
+    // subject-shape check.
     SubjectVariantMismatch:
       "The action's required subject type doesn't match the " +
-      "subject you selected.",
+      "subject you selected. The action targets a specific " +
+      "subject variant (account / record / blob); the request " +
+      "supplied a different variant.",
     SubjectTargetMismatch:
       "The action targets a different subject than expected.",
     OrphanedAppeal:
@@ -30,6 +39,29 @@
       "account or record has been deleted.",
     SubjectsArrayInvalidForAction:
       "This action only supports a single subject.",
+    // Phase B addition: the per-arm subject-shape check at
+    // aurora_admin.rs:552 (dispatch_err_to_response wrapping
+    // PdsError::Validation from the require_*_pds helpers)
+    // emits this when an action like TakedownRecord requires
+    // a specific subject shape (e.g., a Record), but the
+    // request supplied a different shape (e.g., a Repo). Also
+    // emitted by validation() at aurora_admin.rs:339 for early-
+    // validation failures (e.g., empty rationale).
+    InvalidEvent:
+      "The action and the subject you selected are incompatible. " +
+      "Check that the subject type matches what this action " +
+      "operates on (TakedownRecord needs a record subject, " +
+      "TakedownAccount needs an account subject, etc.).",
+    // Phase B addition: emitted by the AuroraJson extractor
+    // (src/api/extractors.rs) when the request body fails JSON
+    // deserialization. The original axum diagnostic is preserved
+    // in the message field; this translation surfaces the
+    // category to operators in actionable terms.
+    InvalidRequestBody:
+      "The request body has invalid structure. This usually " +
+      "indicates a UI/server version mismatch or a malformed " +
+      "field. Try reloading the page; if the error persists, " +
+      "report the exact action you were taking.",
   };
 
   // translate(code, fallback) — looks up `code` in TABLE.
