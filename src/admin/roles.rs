@@ -131,14 +131,25 @@ impl AdminRoleManager {
         // the same tx so the check + insert are linearizable —
         // otherwise two concurrent grants could both pass the
         // "no existing active role" check.
-        let existing: Option<(String, bool)> = sqlx::query_as(
-            "SELECT role, revoked FROM admin_roles WHERE did = $1 \
+        //
+        // SELECT projects only `role` — the prior shape projected
+        // `(role, revoked)` and decoded into `Option<(String,
+        // bool)>`, which fires the SQLite/Postgres bool-decode
+        // mismatch under `sqlx::Any` (SQLite stores BOOLEAN as
+        // INTEGER which surfaces as BIGINT). The `revoked` value
+        // was discarded into `_` anyway since the WHERE clause
+        // already filters to NOT revoked. Dropping the column
+        // sidesteps the bool decode entirely without needing the
+        // `crate::db::read_bool` cross-backend helper here — same
+        // outcome as that helper, smaller diff.
+        let existing: Option<(String,)> = sqlx::query_as(
+            "SELECT role FROM admin_roles WHERE did = $1 \
              AND NOT revoked ORDER BY granted_at DESC LIMIT 1",
         )
         .bind(did)
         .fetch_optional(&mut **tx)
         .await?;
-        if let Some((existing_role, _)) = existing {
+        if let Some((existing_role,)) = existing {
             return Err(PdsError::Conflict(format!(
                 "User already has active role: {}",
                 existing_role
@@ -421,6 +432,80 @@ mod tests {
             .has_role("did:plc:alice", Role::SuperAdmin)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_grant_role_rejects_when_did_already_has_active_role() {
+        // Phase B regression test: a second grant_role call for a
+        // DID that already holds an active role must return
+        // PdsError::Conflict from the existing-role check at the
+        // top of `grant_role_in_tx`. Pre-fix, the check's
+        // `SELECT role, revoked FROM admin_roles` decoded into
+        // `Option<(String, bool)>`, which fires the SQLite
+        // bool/BIGINT decode mismatch under `sqlx::Any` and 500s
+        // before reaching the Conflict branch. This test
+        // exercises the path on SQLite (the only backend test_pool
+        // configures) and would have surfaced the bug.
+        let db = open_test_pool().await;
+        sqlx::query(
+            r#"
+            CREATE TABLE admin_roles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                did TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL,
+                granted_by TEXT,
+                granted_at TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                revoked_at TEXT,
+                revoked_by TEXT,
+                notes TEXT
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let manager = AdminRoleManager::new(db);
+
+        // First grant: succeeds.
+        manager
+            .grant_role(
+                "did:plc:carol",
+                Role::Moderator,
+                "did:plc:superadmin",
+                None,
+            )
+            .await
+            .expect("first grant succeeds");
+
+        // Second grant for the same DID with a different role:
+        // must return Conflict, not a Database error.
+        let err = manager
+            .grant_role(
+                "did:plc:carol",
+                Role::Admin,
+                "did:plc:superadmin",
+                Some("attempt to upgrade".to_string()),
+            )
+            .await
+            .expect_err("second grant must reject with Conflict");
+
+        match err {
+            PdsError::Conflict(msg) => {
+                assert!(
+                    msg.contains("moderator"),
+                    "Conflict message should name the existing role; got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "expected PdsError::Conflict, got {:?} — if this is a \
+                 Database decode error, the existing-role check's SELECT \
+                 has regressed to including a bool-typed column",
+                other
+            ),
+        }
     }
 
     #[tokio::test]
