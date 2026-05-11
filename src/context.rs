@@ -72,9 +72,6 @@ pub struct AppContext {
     pub dpop_verifier: Arc<DPopVerifier>,
     // Rate limiter
     pub rate_limiter: Arc<RateLimiter>,
-    // Distributed rate limiter (Redis-backed, for multi-instance deployments)
-    #[allow(dead_code)] // Future distributed rate limiting
-    pub distributed_rate_limiter: Option<Arc<crate::rate_limit_new::DistributedRateLimiter>>,
     // Email mailer
     pub mailer: Arc<Mailer>,
     // Read-after-write cache
@@ -433,33 +430,6 @@ impl AppContext {
 
         let sequencer = Arc::new(seq);
 
-        // Initialize distributed rate limiter if Redis is enabled
-        let distributed_rate_limiter = if config.rate_limit.use_redis {
-            if let Some(ref redis_url) = config.rate_limit.redis_url {
-                tracing::info!(
-                    "Initializing distributed Redis-backed rate limiter: {}",
-                    redis_url
-                );
-                // Create cache client for Redis
-                let cache_config = crate::cache::CacheConfig {
-                    enabled: true,
-                    redis_url: redis_url.clone(),
-                    ..Default::default()
-                };
-                let cache_client = crate::cache::CacheClient::new(cache_config).await?;
-                let dist_limiter = crate::rate_limit_new::DistributedRateLimiter::new(
-                    cache_client,
-                    config.rate_limit.global_requests_per_minute,
-                );
-                Some(Arc::new(dist_limiter))
-            } else {
-                tracing::warn!("Redis rate limiting enabled but no redis_url configured");
-                None
-            }
-        } else {
-            None
-        };
-
         // Initialize rate limiter with Bluesky-compatible endpoint limits.
         // The `exempt_admin_assets` flag is the only env-driven runtime
         // tuning currently plumbed through; the rest of the runtime quotas
@@ -551,7 +521,6 @@ impl AppContext {
             dpop_nonce_store,
             dpop_verifier,
             rate_limiter,
-            distributed_rate_limiter,
             mailer,
             local_records_cache,
             cache_invalidator,

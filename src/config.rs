@@ -654,10 +654,6 @@ pub struct InviteConfig {
 pub struct RateLimitConfig {
     pub enabled: bool,
     pub global_requests_per_minute: u32,
-    /// Enable distributed Redis-backed rate limiting for multi-instance deployments
-    pub use_redis: bool,
-    /// Redis connection URL for distributed rate limiting (e.g., redis://localhost:6379)
-    pub redis_url: Option<String>,
     /// Bypass the limiter for GET requests to admin UI static assets.
     /// Defaults to `true`; see `crate::rate_limit::is_admin_asset_exempt`
     /// for the exact path/method matrix. Set to `false` to opt admin
@@ -799,11 +795,12 @@ impl ServerConfig {
             .unwrap_or_else(|_| "3000".to_string())
             .parse()
             .unwrap_or(3000);
-        let rate_limit_use_redis = env::var("PDS_RATE_LIMIT_USE_REDIS")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false);
-        let rate_limit_redis_url = env::var("PDS_RATE_LIMIT_REDIS_URL").ok();
+        // PDS_RATE_LIMIT_USE_REDIS / PDS_RATE_LIMIT_REDIS_URL
+        // were inputs to the now-retired rate_limit_new module
+        // (Arc 7 Step 1 disposition). Reading them here would
+        // mislead operators into thinking they still affect
+        // anything; the substrate's Redis hook is reserved for
+        // a future cycle under DistributedStateMode::Redis.
         let rate_limit_exempt_admin_assets = env::var("PDS_RATE_LIMIT_EXEMPT_ADMIN_ASSETS")
             .unwrap_or_else(|_| "true".to_string())
             .parse()
@@ -909,8 +906,6 @@ impl ServerConfig {
             rate_limit: RateLimitConfig {
                 enabled: rate_limit_enabled,
                 global_requests_per_minute: rate_limit_requests,
-                use_redis: rate_limit_use_redis,
-                redis_url: rate_limit_redis_url,
                 exempt_admin_assets: rate_limit_exempt_admin_assets,
             },
             logging: LoggingConfig { level: log_level },

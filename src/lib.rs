@@ -28,7 +28,6 @@ pub mod mailer;
 pub mod metrics;
 pub mod oauth;
 pub mod rate_limit;
-pub mod rate_limit_new; // Distributed Redis-backed rate limiting
 pub mod read_after_write; // Must come before actor_store (actor_store uses its types)
 pub mod sequencer;
 pub mod service_auth;

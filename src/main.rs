@@ -27,7 +27,6 @@ mod mailer;
 mod metrics;
 mod oauth;
 mod rate_limit;
-mod rate_limit_new; // Distributed Redis-backed rate limiting
 mod read_after_write;
 mod sequencer;
 mod server;

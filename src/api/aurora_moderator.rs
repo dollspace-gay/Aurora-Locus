@@ -1636,8 +1636,6 @@ mod tests {
             rate_limit: RateLimitConfig {
                 enabled: false,
                 global_requests_per_minute: 3000,
-                use_redis: false,
-                redis_url: None,
                 exempt_admin_assets: true,
             },
             logging: LoggingConfig {
