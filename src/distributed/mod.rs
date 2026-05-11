@@ -31,8 +31,10 @@
 //! on restart — operator-accepted trade-off per §6.3.6).
 
 pub mod lease;
+pub mod postgres_cas;
 
 pub use lease::Lease;
+pub use postgres_cas::PostgresCasStore;
 
 use async_trait::async_trait;
 use thiserror::Error;
