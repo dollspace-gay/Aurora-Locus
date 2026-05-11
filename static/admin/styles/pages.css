@@ -93,3 +93,26 @@
   font-size: var(--font-size-sm);
   color: var(--text-secondary);
 }
+
+/* Settings — source-tier suffix (Runtime/File/Default/RecoveryMode)
+ * per Arc 6 Step 2 §5.2.1/§5.3.5. Visually subdued; placed inline
+ * after the setting label without distracting from the form. */
+.settings-source-tag {
+  color: var(--text-tertiary);
+  font-style: italic;
+  margin-left: var(--space-2);
+  font-weight: normal;
+}
+
+/* Audit-entry detail — cascade-subjects list (Arc 6 Step 3 sub-3a).
+ * One line per cascade subject, paired with its snapshot id. */
+.audit-cascade-list {
+  list-style: disc;
+  padding-left: var(--space-5);
+  margin: var(--space-2) 0;
+  font-size: var(--font-size-sm);
+}
+
+.audit-cascade-list li {
+  margin: var(--space-1) 0;
+}
