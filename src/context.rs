@@ -376,18 +376,34 @@ impl AppContext {
         // when federation is off the verifier still has its own JTI
         // replay tracker (separate Arc), which is what RFC 9449 §11.1
         // requires regardless of the §8 challenge flow.
+        //
+        // Arc 7 Step 3: in Distributed mode the JTI-replay path
+        // additionally routes through the substrate (cross-instance
+        // single-use enforcement). The substrate handle is wired
+        // through the `with_distributed_store` builder; the
+        // server-nonce half stays in-memory regardless of mode
+        // (federation-scoped, no cross-instance correctness story
+        // in v0.4 per Step 0 OQ3).
+        let make_dpop_store = || {
+            let store = DPopNonceStore::new();
+            if let Some(substrate) = distributed_store.as_ref() {
+                store.with_distributed_store(Arc::clone(substrate))
+            } else {
+                store
+            }
+        };
         let dpop_nonce_store: Option<Arc<DPopNonceStore>> = if config.federation.enabled {
             tracing::info!(
                 "Initializing DPoP §8 nonce challenge store (federation enabled)"
             );
-            Some(Arc::new(DPopNonceStore::new()))
+            Some(Arc::new(make_dpop_store()))
         } else {
             None
         };
         let dpop_verifier = {
             let store_for_verifier = match &dpop_nonce_store {
                 Some(s) => Arc::clone(s),
-                None => Arc::new(DPopNonceStore::new()),
+                None => Arc::new(make_dpop_store()),
             };
             Arc::new(DPopVerifier::new(store_for_verifier))
         };
