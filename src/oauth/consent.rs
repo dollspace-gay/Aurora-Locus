@@ -433,12 +433,18 @@ pub async fn get_request_by_code(
     ctx: &AppContext,
     authorization_code: &str,
 ) -> PdsResult<crate::oauth::models::AuthorizationRequest> {
+    // `id` and `code_used_at` columns don't exist in the
+    // 0001_initial schema. The model still has those fields
+    // (pre-Arc-7 mismatch) but they're effectively dead
+    // state; we synthesise defaults below. Same workaround as
+    // the OAuth adapter's `get`. See the adapter for
+    // cross-reference.
     let row = sqlx::query(
         r#"
         SELECT
-            id, request_id, did, client_id, code_challenge, code_challenge_method,
+            request_id, did, client_id, code_challenge, code_challenge_method,
             authorization_code, scope, redirect_uri, state, created_at, expires_at,
-            code_used, code_used_at
+            code_used
         FROM authorization_request
         WHERE authorization_code = $1
         "#,
@@ -470,7 +476,7 @@ pub async fn get_request_by_code(
     }
 
     Ok(crate::oauth::models::AuthorizationRequest {
-        id: row.get("id"),
+        id: 0,
         request_id: row.get("request_id"),
         did: row.get("did"),
         client_id: row.get("client_id"),
@@ -483,11 +489,7 @@ pub async fn get_request_by_code(
         created_at: parse_ts(&row.get::<String, _>("created_at"))?,
         expires_at: parse_ts(&row.get::<String, _>("expires_at"))?,
         code_used: crate::db::read_bool(&row, "code_used")?,
-        code_used_at: row
-            .get::<Option<String>, _>("code_used_at")
-            .as_deref()
-            .map(parse_ts)
-            .transpose()?,
+        code_used_at: None,
     })
 }
 

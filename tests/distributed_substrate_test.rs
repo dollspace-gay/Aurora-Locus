@@ -28,6 +28,10 @@ use std::time::Duration;
 use aurora_locus::distributed::{
     DistributedError, DistributedStore, Lease, PostgresCasStore,
 };
+use aurora_locus::oauth::flow_state_adapter::{
+    decode_request, encode_request_data, OAuthFlowStateAdapter,
+};
+use aurora_locus::oauth::models::AuthorizationRequestData;
 use sqlx::any::AnyPoolOptions;
 use sqlx::AnyPool;
 use testcontainers::runners::AsyncRunner;
@@ -324,4 +328,205 @@ async fn cross_instance_cas_race_yields_one_winner_and_one_conflict() {
         }
         other => panic!("expected Conflict on loser, got {:?}", other),
     }
+}
+
+// =====================================================================
+// OAuth flow state adapter — cross-instance tests (Arc 7 Step 2).
+//
+// Same in-process pattern as the substrate tests above: two
+// `OAuthFlowStateAdapter` instances against the same Postgres
+// testcontainer, each with its own pool. The
+// `authorization_request` table lives in `account_db` (not the
+// substrate's maintenance pool) but the testcontainer hosts
+// both schemas in one DB, so we reuse `open_pool`.
+//
+// What we're verifying: OAuth state inserted on instance A is
+// visible to instance B's `get`; consumed by instance B via
+// `delete`; subsequent reads on either instance return None.
+// These properties always worked at the storage layer (both
+// instances share `account_db`); Step 2 surfaces them through
+// the trait so the cross-instance correctness story is
+// uniform across the substrate's three tables.
+// =====================================================================
+
+/// Build an `OAuthFlowStateAdapter` against the given Postgres URL.
+async fn build_oauth_adapter(url: &str) -> OAuthFlowStateAdapter {
+    let pool = open_pool(url).await;
+    OAuthFlowStateAdapter::new(pool)
+}
+
+fn sample_authorization_request() -> AuthorizationRequestData {
+    AuthorizationRequestData {
+        did: "did:web:alice.example.com".to_string(),
+        client_id: "https://client.example.com/metadata.json".to_string(),
+        code_challenge: "abc_xyz_challenge".to_string(),
+        code_challenge_method: "S256".to_string(),
+        scope: "atproto:read atproto:write".to_string(),
+        redirect_uri: "https://client.example.com/cb".to_string(),
+        state: Some("client-csrf-state".to_string()),
+    }
+}
+
+/// Instance A inserts an OAuth flow state; instance B reads it
+/// successfully via the trait. The behavior has always worked
+/// at the storage layer (shared account_db), but Step 2
+/// surfaces it through the trait so the cross-instance read
+/// story matches the substrate's other tables.
+#[tokio::test]
+async fn cross_instance_oauth_state_visible_to_siblings() {
+    let (_pg, url) = start_postgres().await;
+    let adapter_a = build_oauth_adapter(&url).await;
+    let adapter_b = build_oauth_adapter(&url).await;
+
+    let request_id = "req-cross-instance-visible";
+    let value = encode_request_data(&sample_authorization_request());
+    let lease = Lease::from_now(chrono::Duration::minutes(10));
+
+    // A inserts.
+    adapter_a
+        .insert("oauth_flow_state", request_id, &value, Some(lease))
+        .await
+        .expect("instance A: insert succeeds");
+
+    // B reads — sees the same row.
+    let bytes = adapter_b
+        .get("oauth_flow_state", request_id)
+        .await
+        .expect("instance B: get without error")
+        .expect("instance B: row visible to siblings");
+    let request = decode_request(&bytes).expect("decode AuthorizationRequest");
+    assert_eq!(request.request_id, request_id);
+    assert_eq!(request.did, "did:web:alice.example.com");
+    assert!(!request.code_used);
+}
+
+/// Cross-instance consume-and-reject-replay: A inserts, B
+/// consumes (delete returns true), A's subsequent read returns
+/// None. Pins the single-use-across-instances guarantee that
+/// makes OAuth code redemption coherent in multi-instance
+/// deployments.
+#[tokio::test]
+async fn cross_instance_oauth_state_consume_rejects_replay() {
+    let (_pg, url) = start_postgres().await;
+    let adapter_a = build_oauth_adapter(&url).await;
+    let adapter_b = build_oauth_adapter(&url).await;
+
+    let request_id = "req-cross-instance-consume";
+    let value = encode_request_data(&sample_authorization_request());
+    let lease = Lease::from_now(chrono::Duration::minutes(10));
+
+    adapter_a
+        .insert("oauth_flow_state", request_id, &value, Some(lease))
+        .await
+        .expect("A insert");
+
+    // B consumes — returns true.
+    assert!(
+        adapter_b
+            .delete("oauth_flow_state", request_id)
+            .await
+            .expect("B delete ok"),
+        "first consume returns true"
+    );
+
+    // A's subsequent read sees None (filtered: code_used = TRUE).
+    assert!(
+        adapter_a
+            .get("oauth_flow_state", request_id)
+            .await
+            .expect("A get ok")
+            .is_none(),
+        "post-consume row is None on the sibling instance"
+    );
+
+    // B's repeat consume is idempotent — returns false (already used).
+    assert!(
+        !adapter_b
+            .delete("oauth_flow_state", request_id)
+            .await
+            .expect("B re-delete ok"),
+        "second consume returns false"
+    );
+
+    // A racing the same consume after B's success: also false.
+    assert!(
+        !adapter_a
+            .delete("oauth_flow_state", request_id)
+            .await
+            .expect("A delete after B consume ok"),
+        "sibling consume after B's success returns false"
+    );
+}
+
+/// Concurrent consume race: A and B both attempt to consume
+/// the same OAuth flow state. Exactly one wins. Pins the
+/// atomic UPDATE-with-predicate serialization through
+/// Postgres's row lock.
+#[tokio::test]
+async fn cross_instance_oauth_consume_race_yields_one_winner() {
+    let (_pg, url) = start_postgres().await;
+    let adapter_a = build_oauth_adapter(&url).await;
+    let adapter_b = build_oauth_adapter(&url).await;
+
+    let request_id = "req-race-consume";
+    let value = encode_request_data(&sample_authorization_request());
+    let lease = Lease::from_now(chrono::Duration::minutes(10));
+    adapter_a
+        .insert("oauth_flow_state", request_id, &value, Some(lease))
+        .await
+        .unwrap();
+
+    let (res_a, res_b) = tokio::join!(
+        adapter_a.delete("oauth_flow_state", request_id),
+        adapter_b.delete("oauth_flow_state", request_id),
+    );
+    let res_a = res_a.expect("A delete ok");
+    let res_b = res_b.expect("B delete ok");
+
+    let winners = [res_a, res_b].iter().filter(|w| **w).count();
+    assert_eq!(
+        winners, 1,
+        "exactly one consume must succeed under concurrent race \
+         (A={}, B={})",
+        res_a, res_b
+    );
+}
+
+/// Cross-instance reaper sweep: A inserts a row with a stale
+/// lease; B sweeps; A no longer sees the row. Confirms the
+/// trait-routed reaper path operates against the shared table
+/// the way the pre-Arc-7 direct-SQL cleanup did.
+#[tokio::test]
+async fn cross_instance_oauth_reap_sweeps_for_siblings() {
+    let (_pg, url) = start_postgres().await;
+    let adapter_a = build_oauth_adapter(&url).await;
+    let adapter_b = build_oauth_adapter(&url).await;
+
+    let request_id = "req-stale-for-reap";
+    let value = encode_request_data(&sample_authorization_request());
+    let past_lease = Lease::until(chrono::Utc::now().timestamp_millis() - 60_000);
+
+    adapter_a
+        .insert("oauth_flow_state", request_id, &value, Some(past_lease))
+        .await
+        .unwrap();
+
+    // A's get already returns None (lease-expired filter
+    // applies regardless of reaper).
+    assert!(adapter_a
+        .get("oauth_flow_state", request_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    // B sweeps; row is physically deleted.
+    let swept = adapter_b
+        .reap_expired("oauth_flow_state", chrono::Utc::now().timestamp_millis())
+        .await
+        .expect("B reaper ok");
+    assert!(
+        swept >= 1,
+        "reaper sweeps at least the stale row (got {})",
+        swept
+    );
 }

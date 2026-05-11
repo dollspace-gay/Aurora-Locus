@@ -174,12 +174,23 @@ impl DistributedStore for OAuthFlowStateAdapter {
             return Err(DistributedError::UnsupportedTable(table.to_string()));
         }
         let now_rfc3339 = Utc::now().to_rfc3339();
+        // `id` and `code_used_at` are model fields whose columns
+        // don't exist in the 0001_initial schema — Step 0 Q1
+        // recon copied the model verbatim and missed the
+        // pre-existing inconsistency. The adapter SELECTs only
+        // the columns that actually exist; the model's `id`
+        // and `code_used_at` are populated with synthetic
+        // defaults (0 / None) in `row_to_authorization_request`.
+        // Adding the columns would require a schema migration
+        // which is out of scope for Step 2 (kickoff §scope).
+        // Tracked for v0.6 cleanup as part of the
+        // schema/model audit.
         let row = sqlx::query(
             r#"
             SELECT
-                id, request_id, did, client_id, code_challenge, code_challenge_method,
+                request_id, did, client_id, code_challenge, code_challenge_method,
                 authorization_code, scope, redirect_uri, state, created_at, expires_at,
-                code_used, code_used_at
+                code_used
             FROM authorization_request
             WHERE request_id = $1
               AND code_used = FALSE
@@ -216,14 +227,20 @@ impl DistributedStore for OAuthFlowStateAdapter {
         // request_id). The atomic transition through the
         // `code_used = FALSE` predicate IS the cross-instance
         // single-use guarantee.
+        //
+        // `code_used_at` would be the natural column to record
+        // the consumption timestamp, but it doesn't exist in
+        // the 0001_initial schema — see `row_to_authorization_request`
+        // for the cross-reference. The UPDATE writes only
+        // `code_used`; the model's `code_used_at` field stays
+        // None.
         let result = sqlx::query(
             r#"
             UPDATE authorization_request
-            SET code_used = TRUE, code_used_at = $1
-            WHERE request_id = $2 AND code_used = FALSE
+            SET code_used = TRUE
+            WHERE request_id = $1 AND code_used = FALSE
             "#,
         )
-        .bind(Utc::now().to_rfc3339())
         .bind(key)
         .execute(self.account_db.as_ref())
         .await
@@ -288,8 +305,13 @@ impl DistributedStore for OAuthFlowStateAdapter {
 fn row_to_authorization_request(
     row: &sqlx::any::AnyRow,
 ) -> Result<AuthorizationRequest, sqlx::Error> {
+    // `id` and `code_used_at` are model fields whose columns
+    // don't exist in the 0001_initial schema. Synthetic
+    // defaults (0 / None) — they're effectively dead fields
+    // and would be removed in a model audit. See the SELECT
+    // above for the cross-reference.
     Ok(AuthorizationRequest {
-        id: row.try_get("id")?,
+        id: 0,
         request_id: row.try_get("request_id")?,
         did: row.try_get("did")?,
         client_id: row.try_get("client_id")?,
@@ -302,11 +324,7 @@ fn row_to_authorization_request(
         created_at: parse_ts(row.try_get::<String, _>("created_at")?.as_str())?,
         expires_at: parse_ts(row.try_get::<String, _>("expires_at")?.as_str())?,
         code_used: crate::db::read_bool(row, "code_used")?,
-        code_used_at: row
-            .try_get::<Option<String>, _>("code_used_at")?
-            .as_deref()
-            .map(parse_ts)
-            .transpose()?,
+        code_used_at: None,
     })
 }
 
@@ -350,28 +368,25 @@ mod tests {
             .await
             .expect("connect in-memory sqlite");
 
-        // Mirror the relevant subset of
-        // migrations/0001_initial.sql for the table the
-        // adapter operates against. INTEGER PRIMARY KEY
-        // AUTOINCREMENT on `id` matches the SQLite migration
-        // (Postgres translates to BIGSERIAL; both round-trip
-        // via sqlx::Any).
+        // Mirror migrations/0001_initial.sql verbatim for the
+        // authorization_request table — TEXT PRIMARY KEY on
+        // request_id, no `id` or `code_used_at` columns. The
+        // model's `id` / `code_used_at` fields are pre-existing
+        // dead state (see row_to_authorization_request).
         sqlx::query(
             "CREATE TABLE authorization_request (
-                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
-                request_id               TEXT UNIQUE NOT NULL,
+                request_id               TEXT PRIMARY KEY,
                 did                      TEXT NOT NULL,
                 client_id                TEXT NOT NULL,
                 code_challenge           TEXT NOT NULL,
                 code_challenge_method    TEXT NOT NULL,
-                authorization_code       TEXT,
                 scope                    TEXT NOT NULL,
                 redirect_uri             TEXT NOT NULL,
                 state                    TEXT,
-                created_at               TEXT NOT NULL,
-                expires_at               TEXT NOT NULL,
+                authorization_code       TEXT,
                 code_used                INTEGER NOT NULL DEFAULT 0,
-                code_used_at             TEXT
+                created_at               TEXT NOT NULL,
+                expires_at               TEXT NOT NULL
             )",
         )
         .execute(&pool)
