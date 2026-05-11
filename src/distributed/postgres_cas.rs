@@ -208,12 +208,33 @@ impl DistributedStore for PostgresCasStore {
                 .await?;
                 Ok(result.rows_affected() as usize)
             }
-            // rate_limit_buckets is stateful across windows
-            // (V04_DESIGN.md §6.3.7); inactivity-based GC is a
-            // Step-3 follow-up decision. Surface UnsupportedTable
-            // so a future caller doesn't silently get a no-op.
+            // Inactivity-based GC for rate_limit_buckets. Step 1
+            // returned UnsupportedTable here because the policy
+            // wasn't decided; Step 3 (V04_DESIGN.md §6.4.3
+            // post-recon resolution) commits to a 7-day
+            // inactivity threshold. A bucket whose
+            // `window_start_at_epoch_ms` hasn't been touched in
+            // 7 days is presumed cold; deleting it costs the next
+            // first-touch one extra INSERT (the bucket
+            // self-reconstructs at full max_tokens) but bounds
+            // table growth for deployments accumulating many
+            // unique bucket keys (one row per
+            // (client_id, endpoint_class) ever seen).
+            //
+            // The 7-day constant is in-code rather than
+            // configurable to keep the operator surface tight in
+            // v0.4; making it operator-tunable is a v0.6
+            // candidate (running accumulator).
             "rate_limit_buckets" => {
-                Err(DistributedError::UnsupportedTable(table.to_string()))
+                const SEVEN_DAYS_MS: i64 = 7 * 24 * 3600 * 1000;
+                let cutoff = now_epoch_ms - SEVEN_DAYS_MS;
+                let result = sqlx::query(
+                    "DELETE FROM rate_limit_buckets WHERE window_start_at_epoch_ms < $1",
+                )
+                .bind(cutoff)
+                .execute(self.pool.as_ref())
+                .await?;
+                Ok(result.rows_affected() as usize)
             }
             other => Err(DistributedError::UnsupportedTable(other.to_string())),
         }
@@ -708,14 +729,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limit_reap_expired_returns_unsupported_table() {
+    async fn rate_limit_reap_expired_sweeps_only_stale_buckets() {
         let pool = fresh_pool().await;
-        let store = PostgresCasStore::new(pool);
-        let err = store
-            .reap_expired("rate_limit_buckets", 0)
+        let store = PostgresCasStore::new(Arc::clone(&pool));
+        let now = now_epoch_ms();
+        let eight_days_ago = now - 8 * 24 * 3600 * 1000;
+        let one_day_ago = now - 24 * 3600 * 1000;
+
+        // Stale bucket: should be swept.
+        store
+            .insert(
+                "rate_limit_buckets",
+                "stale-bucket",
+                &bucket_value(50, 100, 10, eight_days_ago),
+                None,
+            )
             .await
-            .expect_err("rate-limit table not reaper-swept");
-        assert!(matches!(err, DistributedError::UnsupportedTable(_)));
+            .unwrap();
+        // Active bucket: should survive.
+        store
+            .insert(
+                "rate_limit_buckets",
+                "active-bucket",
+                &bucket_value(50, 100, 10, one_day_ago),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let swept = store
+            .reap_expired("rate_limit_buckets", now)
+            .await
+            .expect("reaper sweep ok");
+        assert_eq!(swept, 1, "exactly the stale bucket is swept");
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_buckets")
+                .fetch_one(pool.as_ref())
+                .await
+                .unwrap();
+        assert_eq!(remaining, 1, "active bucket survives");
     }
 
     // ---------- unknown-table dispatch ----------
