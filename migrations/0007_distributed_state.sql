@@ -1,4 +1,5 @@
 -- Arc 7 / V04_DESIGN.md §6.2.1 + §6.4.0.6 — distributed-state substrate.
+-- chainlink #53 — Arc 7 multi-instance auth state + rate limiting (v0.4).
 --
 -- These tables back the DistributedStore trait surface
 -- (src/distributed/mod.rs, introduced in Step 1) for two

@@ -113,6 +113,22 @@ impl JobScheduler {
             info!("DPoP nonce cleanup job started");
         }
 
+        // Spawn dpop_jti_replay reaper (Arc 7, chainlink #53).
+        // Substrate-level cleanup for the cross-instance JTI
+        // replay table; spawn unconditionally — the loop itself
+        // skips the sweep in SingleInstanceInmemory mode where
+        // distributed_store is None.
+        tokio::spawn(Self::dpop_jti_replay_reaper_job(Arc::clone(&self)));
+        info!("dpop_jti_replay reaper job started");
+
+        // Spawn OAuth authorization_request cleanup job. The
+        // sweeper has existed since Arc 7 Step 0 recon Q1 but
+        // was previously unwired (no JobScheduler entry). Step 1
+        // folds this in alongside the new reaper since Step 2
+        // would need it wired anyway.
+        tokio::spawn(Self::oauth_authorization_request_cleanup_job(Arc::clone(&self)));
+        info!("OAuth authorization_request cleanup job started");
+
         info!("Background jobs started");
     }
 
@@ -372,6 +388,73 @@ impl JobScheduler {
                     }
                     Err(e) => error!("Failed to cleanup expired DPoP nonces: {}", e),
                 }
+            }
+        }
+    }
+
+    /// `dpop_jti_replay` reaper sweep (Arc 7, V04_DESIGN.md
+    /// §6.3.7). Substrate-level cleanup for the cross-instance
+    /// JTI replay table. Runs every 5 minutes; per V04_DESIGN.md
+    /// §6.3.7 the sweep is idempotent so concurrent invocations
+    /// from sibling instances are fine.
+    ///
+    /// In `SingleInstanceInmemory` mode `distributed_store` is
+    /// `None` and this loop tick is a continue/no-op. The task
+    /// stays alive for process lifetime regardless of mode so a
+    /// future runtime-toggle of the mode doesn't require
+    /// respawning.
+    async fn dpop_jti_replay_reaper_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(300)); // Every 5 minutes
+
+        loop {
+            interval.tick().await;
+            let Some(store) = scheduler.context.distributed_store.as_ref() else {
+                continue;
+            };
+            let now_epoch_ms = chrono::Utc::now().timestamp_millis();
+            match store.reap_expired("dpop_jti_replay", now_epoch_ms).await {
+                Ok(count) if count > 0 => info!(
+                    table = "dpop_jti_replay",
+                    count,
+                    "Reaper swept expired entries"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(
+                    table = "dpop_jti_replay",
+                    error = %e,
+                    "Reaper sweep failed"
+                ),
+            }
+        }
+    }
+
+    /// Sweep expired OAuth authorization requests every 5
+    /// minutes. Pre-existing sweeper at
+    /// `src/oauth/authorize.rs:cleanup_expired_requests` was
+    /// previously unwired (Step 0 Q1 finding). Arc 7 Step 1
+    /// folds the wiring in alongside the new substrate reaper.
+    ///
+    /// Not gated on the distributed-state mode — the
+    /// `authorization_request` table lives in `account_db`
+    /// regardless of substrate mode, so the sweeper is useful
+    /// even in `SingleInstanceInmemory` deployments.
+    async fn oauth_authorization_request_cleanup_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(300)); // Every 5 minutes
+
+        loop {
+            interval.tick().await;
+            match crate::oauth::authorize::cleanup_expired_requests(&scheduler.context).await {
+                Ok(count) if count > 0 => info!(
+                    table = "authorization_request",
+                    count,
+                    "OAuth state cleanup swept expired requests"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(
+                    table = "authorization_request",
+                    error = %e,
+                    "OAuth state cleanup failed"
+                ),
             }
         }
     }

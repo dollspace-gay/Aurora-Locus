@@ -1,6 +1,6 @@
 -- Postgres variant of migrations/0007_distributed_state.sql.
 -- See that file for the Arc 7 / V04_DESIGN.md §6.2.1 + §6.4.0.6
--- motivation.
+-- motivation. chainlink #53.
 --
 -- Schema is identical to the SQLite variant — the column types
 -- chosen (TEXT, BIGINT) are within sqlx::Any's portable subset
