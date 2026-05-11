@@ -696,6 +696,73 @@ pub fn enforce_scope(auth: &UnifiedAuthContext, required_scope: &AtProtoScope) -
     }
 }
 
+/// Emit v0.3-wire-shape deprecation headers on a response built
+/// from a legacy-shape request. Increments the
+/// `aurora_legacy_wire_ingest_total` counter and emits a tracing
+/// info event.
+///
+/// Per V04_DESIGN §5.3.6 + Step 0 Q12 recon. Structurally parallel
+/// to the JWT-deprecation middleware below, but called inline from
+/// each dual-shape handler rather than wired as a layer — there are
+/// only two dual-shape endpoints (`emitEvent`, `updateSubjectStatus`)
+/// and an inline helper is less surface area than a full middleware
+/// for that footprint. The Deserialize impls can't set request
+/// extensions (no request context), and the handler-set marker
+/// can't be read post-`next.run` (request consumed), so the
+/// JWT-style middleware shape doesn't fit cleanly anyway.
+///
+/// Header set, mirroring the JWT pattern:
+/// - `Deprecation: true`
+/// - `Sunset: <date>` (only when `PDS_V03_WIRE_SUNSET_DATE` is set
+///   to a real HTTP-date string; omitted when the env var is unset
+///   or "deprecated").
+/// - `Warning: 299 - "<message>"` naming the legacy fields + endpoint.
+/// - `X-Wire-Migration-Guide` pointing at the operator doc.
+pub fn emit_legacy_wire_headers(
+    response: &mut Response,
+    endpoint: &str,
+    shape: &str,
+    fields: &[&str],
+) {
+    use axum::http::HeaderValue;
+
+    let headers = response.headers_mut();
+    headers.insert("Deprecation", HeaderValue::from_static("true"));
+
+    let sunset_raw =
+        std::env::var("PDS_V03_WIRE_SUNSET_DATE").unwrap_or_else(|_| "deprecated".to_string());
+    if sunset_raw != "deprecated" {
+        if let Ok(val) = HeaderValue::from_str(&sunset_raw) {
+            headers.insert("Sunset", val);
+        }
+    }
+
+    let warning = format!(
+        "299 - \"v0.3 wire shape is canonical; legacy fields [{}] on {} are deprecated\"",
+        fields.join(", "),
+        endpoint,
+    );
+    if let Ok(val) = HeaderValue::from_str(&warning) {
+        headers.insert("Warning", val);
+    }
+
+    headers.insert(
+        "X-Wire-Migration-Guide",
+        HeaderValue::from_static("/docs/operator/v03-wire-deprecation-rollout.md"),
+    );
+
+    for field in fields {
+        crate::metrics::record_legacy_wire_ingest(endpoint, shape, field);
+    }
+
+    info!(
+        endpoint = endpoint,
+        shape = shape,
+        fields = ?fields,
+        "legacy_wire_shape_ingested"
+    );
+}
+
 /// Add JWT deprecation headers to responses
 ///
 /// This middleware checks if the request used JWT authentication (vs OAuth 2.1)

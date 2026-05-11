@@ -531,6 +531,30 @@ lazy_static! {
     )
     .unwrap();
 
+    /// Wire-shape deprecation: counts requests received in a legacy
+    /// (pre-v0.3) wire shape. Per V04_DESIGN §5.3.6 + Arc 6 Step 7
+    /// (Q12 recon structural-reuse of the JWT-deprecation pattern).
+    ///
+    /// Labels:
+    /// - `endpoint`: NSID of the receiving handler
+    ///   (e.g. "tools.aurora.admin.emitEvent").
+    /// - `shape`: high-level legacy shape identifier
+    ///   (e.g. "v0.2_single_subject"). Identifies the version /
+    ///   contract era the legacy shape belongs to.
+    /// - `field`: specific legacy field name (e.g. "subject",
+    ///   "recordUri"). Some shapes may emit multiple field-level
+    ///   increments per request — operators can track per-field
+    ///   migration progress independently.
+    ///
+    /// Incremented by the handler-side header-emission helper in
+    /// `crate::api::middleware::emit_legacy_wire_headers`.
+    pub static ref LEGACY_WIRE_INGEST_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "aurora_legacy_wire_ingest_total",
+        "Total requests received in a legacy (pre-v0.3) wire shape",
+        &["endpoint", "shape", "field"]
+    )
+    .unwrap();
+
     // ========== Firehose Metrics ==========
 
     /// Active firehose WebSocket connections
@@ -845,6 +869,22 @@ pub fn record_oauth_scope_grant(scope: &str, granted: bool) {
 /// versus OAuth 2.1, helping monitor migration progress.
 pub fn record_jwt_deprecation_warning() {
     JWT_DEPRECATION_WARNINGS_TOTAL.inc();
+}
+
+/// Record a legacy-wire-shape ingest. Call once per legacy field
+/// actually parsed (not per request) so the counter reflects
+/// field-level migration progress — e.g., a single
+/// `updateSubjectStatus` request that touched both legacy field
+/// names would increment twice. Operators query the counter by
+/// (endpoint, shape, field) labels to identify which specific
+/// legacy paths remain in use.
+///
+/// Per V04_DESIGN §5.3.6 + Q12 recon structural reuse of the
+/// JWT-deprecation helper at [`record_jwt_deprecation_warning`].
+pub fn record_legacy_wire_ingest(endpoint: &str, shape: &str, field: &str) {
+    LEGACY_WIRE_INGEST_TOTAL
+        .with_label_values(&[endpoint, shape, field])
+        .inc();
 }
 
 // ========== Firehose Helper Functions ==========
