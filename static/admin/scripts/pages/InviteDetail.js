@@ -57,7 +57,12 @@
     const btn = document.getElementById('id-disable');
     if (btn && !c.disabled) {
       btn.addEventListener('click', async () => {
-        if (!confirm('Disable this invite code?')) return;
+        const result = await global.AuroraModal.destructiveConfirm({
+          heading: 'Disable invite code',
+          body: 'Disable invite code ' + c.code + '? It can be re-enabled later.',
+          confirmLabel: 'Disable',
+        });
+        if (!result.confirmed) return;
         try {
           await global.AuroraEndpoints.atproto.disableInviteCode({ code: c.code });
           global.AuroraToast.success('Invite disabled.');

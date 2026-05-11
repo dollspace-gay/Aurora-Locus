@@ -113,10 +113,16 @@
   async function bulkDisable() {
     const codes = [...bulkSelected];
     if (codes.length === 0) return;
-    if (!confirm('Disable ' + codes.length + ' invite code' + (codes.length === 1 ? '' : 's') + '?')) return;
+    const plural = codes.length === 1 ? '' : 's';
+    const result = await global.AuroraModal.destructiveConfirm({
+      heading: 'Disable invite codes',
+      body: 'Disable ' + codes.length + ' invite code' + plural + '? They can be re-enabled later.',
+      confirmLabel: 'Disable all',
+    });
+    if (!result.confirmed) return;
     try {
       await global.AuroraEndpoints.atproto.disableInviteCodes({ codes: codes });
-      global.AuroraToast.success('Disabled ' + codes.length + ' code' + (codes.length === 1 ? '' : 's') + '.');
+      global.AuroraToast.success('Disabled ' + codes.length + ' code' + plural + '.');
       bulkSelected = new Set();
       await refresh();
     } catch (e) {
@@ -125,7 +131,12 @@
   }
 
   async function disableInvite(code) {
-    if (!confirm('Disable this invite code?')) return;
+    const result = await global.AuroraModal.destructiveConfirm({
+      heading: 'Disable invite code',
+      body: 'Disable invite code ' + code + '? It can be re-enabled later.',
+      confirmLabel: 'Disable',
+    });
+    if (!result.confirmed) return;
     try {
       await global.AuroraEndpoints.atproto.disableInviteCode({ code: code });
       global.AuroraToast.success('Invite code disabled.');

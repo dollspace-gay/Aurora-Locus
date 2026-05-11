@@ -109,7 +109,12 @@
     if (!selected) { global.AuroraToast.warning('Select a mode.'); return; }
     const rationale = document.getElementById('mod-mode-rationale').value.trim();
     if (!rationale) { global.AuroraToast.warning('Rationale is required.'); return; }
-    if (!confirm('Switch moderation mode to "' + selected.value + '"? This affects all operators.')) return;
+    const confirmResult = await global.AuroraModal.destructiveConfirm({
+      heading: 'Switch moderation mode',
+      body: 'Switch moderation mode to "' + selected.value + '"? This affects all operators using this PDS.',
+      confirmLabel: 'Switch mode',
+    });
+    if (!confirmResult.confirmed) return;
     const redirect = document.getElementById('mod-mode-redirect').value.trim();
     try {
       await global.AuroraEndpoints.admin.setRuntimeSetting({ key: 'moderation-mode', value: selected.value, rationale: rationale });
