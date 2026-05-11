@@ -530,3 +530,162 @@ async fn cross_instance_oauth_reap_sweeps_for_siblings() {
         swept
     );
 }
+
+// =====================================================================
+// Rate-limit distributed primitive — cross-instance tests
+// (Arc 7 Step 3).
+//
+// Two `DistributedRateLimiter` instances pointed at the same
+// Postgres testcontainer. Each has its own pool — they see
+// the world only through the shared backend, the way two
+// Aurora-Locus instances would.
+// =====================================================================
+
+use aurora_locus::rate_limit::{DistributedRateLimiter, RateLimitOutcome};
+
+async fn build_rate_limiter(url: &str) -> DistributedRateLimiter {
+    let pool = open_pool(url).await;
+    DistributedRateLimiter::new(pool)
+}
+
+/// A drains a bucket; B sees the same bucket exhausted. The
+/// cross-instance correctness guarantee for distributed rate
+/// limiting — the per-instance governor sees only this
+/// instance's traffic, but the distributed substrate sees the
+/// whole deployment.
+#[tokio::test]
+async fn cross_instance_rate_limit_exhaustion() {
+    let (_pg, url) = start_postgres().await;
+    let limiter_a = build_rate_limiter(&url).await;
+    let limiter_b = build_rate_limiter(&url).await;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let bucket_key = "endpoint|/xrpc/com.atproto.test.xinst";
+
+    // Instance A: drain a small bucket. refill_rate=0 means no
+    // recovery within the test window.
+    for i in 0..3 {
+        let outcome = limiter_a
+            .try_consume(bucket_key, 1, 0, 3, now + i)
+            .await
+            .expect("A consume ok");
+        assert!(
+            matches!(outcome, RateLimitOutcome::Allowed { .. }),
+            "A request {} should be allowed",
+            i
+        );
+    }
+
+    // Instance B (separate pool) now sees the bucket exhausted.
+    let outcome = limiter_b
+        .try_consume(bucket_key, 1, 0, 3, now + 10)
+        .await
+        .expect("B consume ok");
+    assert!(
+        matches!(outcome, RateLimitOutcome::RateLimited),
+        "B must see the bucket exhausted by A, got {:?}",
+        outcome
+    );
+
+    // A also sees it exhausted on a fresh request.
+    let outcome = limiter_a
+        .try_consume(bucket_key, 1, 0, 3, now + 20)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, RateLimitOutcome::RateLimited));
+}
+
+/// Concurrent first-touch race on a fresh bucket: both A and
+/// B race to create the same bucket. Exactly one wins the
+/// INSERT; the loser retries the UPDATE; both ultimately
+/// observe a consistent decrement.
+#[tokio::test]
+async fn cross_instance_first_touch_race_resolves_cleanly() {
+    let (_pg, url) = start_postgres().await;
+    let limiter_a = build_rate_limiter(&url).await;
+    let limiter_b = build_rate_limiter(&url).await;
+
+    let bucket_key = "endpoint|/xrpc/com.atproto.test.race";
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let (res_a, res_b) = tokio::join!(
+        limiter_a.try_consume(bucket_key, 1, 10, 100, now),
+        limiter_b.try_consume(bucket_key, 1, 10, 100, now),
+    );
+    let res_a = res_a.expect("A ok");
+    let res_b = res_b.expect("B ok");
+
+    // Both should be Allowed: one created the bucket
+    // (max_tokens-cost = 99), the other deducted again
+    // (98). The order depends on race outcome; the invariant
+    // is that both observed Allowed and the deducted total
+    // is consistent.
+    let mut tokens: Vec<i64> = Vec::new();
+    for r in [res_a, res_b] {
+        match r {
+            RateLimitOutcome::Allowed { tokens_remaining } => tokens.push(tokens_remaining),
+            other => panic!("expected Allowed, got {:?}", other),
+        }
+    }
+    tokens.sort();
+    // Set of observed remaining counts under contention:
+    // either {98, 99} (sequential) or {98, 98} (both saw
+    // each other's writes). Both are correct outcomes; what
+    // matters is no Allowed went unrecorded.
+    assert!(
+        tokens == vec![98, 99] || tokens == vec![98, 98],
+        "unexpected token-remaining pair after concurrent first-touch: {:?}",
+        tokens
+    );
+}
+
+/// Cross-instance rate-limit bucket reaper: A inserts a stale
+/// bucket (8 days old); B sweeps via reap_expired; A's next
+/// touch on the same bucket key starts fresh (first-touch
+/// path engages).
+#[tokio::test]
+async fn cross_instance_rate_limit_reaper_sweeps_stale_buckets() {
+    let (_pg, url) = start_postgres().await;
+    let store_a = build_store(&url).await;
+    let limiter_a = build_rate_limiter(&url).await;
+    let store_b = build_store(&url).await;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let eight_days_ago = now - 8 * 24 * 3600 * 1000;
+
+    // A inserts a bucket with window_start 8 days ago.
+    let value = serde_json::to_vec(&serde_json::json!({
+        "tokens_remaining": 0_i64,
+        "max_tokens": 10_i64,
+        "refill_rate": 1_i64,
+        "window_start_at_epoch_ms": eight_days_ago,
+    }))
+    .unwrap();
+    store_a
+        .insert("rate_limit_buckets", "stale-rate-bucket", &value, None)
+        .await
+        .unwrap();
+
+    // B's reaper sweep removes the stale row.
+    let swept = store_b
+        .reap_expired("rate_limit_buckets", now)
+        .await
+        .expect("B reaper ok");
+    assert_eq!(swept, 1, "exactly the stale bucket is swept");
+
+    // A's next consume on the same bucket key is a first-touch
+    // — refilled to max_tokens, then deduct cost.
+    let outcome = limiter_a
+        .try_consume("stale-rate-bucket", 1, 10, 5, now)
+        .await
+        .expect("post-sweep first-touch ok");
+    match outcome {
+        RateLimitOutcome::Allowed { tokens_remaining } => {
+            assert_eq!(
+                tokens_remaining, 4,
+                "first-touch after sweep gives max-tokens (5) - cost (1) = 4"
+            );
+        }
+        other => panic!("expected Allowed after sweep, got {:?}", other),
+    }
+}
