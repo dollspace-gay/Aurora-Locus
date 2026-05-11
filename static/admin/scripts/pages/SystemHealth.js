@@ -31,7 +31,13 @@
       catch (e) { global.AuroraToast.danger('Run failed: ' + (e && e.message)); }
     });
     document.getElementById('sh-cleanup-nonce').addEventListener('click', async () => {
-      if (!confirm('Cleanup expired nonce stores?')) return;
+      const result = await global.AuroraModal.form({
+        heading: 'Clean up expired nonce stores?',
+        body: 'Removes expired nonce records. Active nonces are unaffected.',
+        fields: [],
+        submitLabel: 'Clean up',
+      });
+      if (!result.submitted) return;
       try { await global.AuroraClient.post('tools.aurora.ops.cleanupNonceStores', {});
             global.AuroraToast.success('Cleanup complete.'); await refresh(); }
       catch (e) { global.AuroraToast.danger('Cleanup failed: ' + (e && e.message)); }

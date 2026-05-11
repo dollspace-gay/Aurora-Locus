@@ -322,14 +322,41 @@
   }
 
   async function toggleInvites() {
-    const enable = !confirm('Press OK to disable account invites, Cancel to enable.');
-    const rationale = await promptRationale((enable ? 'Enable' : 'Disable') + ' account invites?');
-    if (rationale == null) return;
+    // The prior native confirm() inverted OK/Cancel (OK to disable,
+    // Cancel to enable) — cognitive load operators routinely
+    // misread. The modal makes the binary explicit via a select
+    // dropdown; the operator picks the target state.
+    const result = await global.AuroraModal.form({
+      heading: 'Toggle account invites',
+      body: 'Set the invite state for this account.',
+      fields: [
+        {
+          name: 'state',
+          label: 'New state',
+          type: 'select',
+          options: [
+            { value: 'disabled', label: 'Disabled' },
+            { value: 'enabled',  label: 'Enabled' },
+          ],
+          default: 'disabled',
+          required: true,
+        },
+        {
+          name: 'rationale',
+          label: 'Rationale (recorded in audit log)',
+          type: 'textarea',
+          required: true,
+        },
+      ],
+      submitLabel: 'Save state',
+    });
+    if (!result.submitted) return;
+    const enable = result.values.state === 'enabled';
     try {
       const ep = enable
         ? 'com.atproto.admin.enableAccountInvites'
         : 'com.atproto.admin.disableAccountInvites';
-      await global.AuroraClient.post(ep, { account: currentDid, note: rationale });
+      await global.AuroraClient.post(ep, { account: currentDid, note: result.values.rationale });
       global.AuroraToast.success((enable ? 'Enabled' : 'Disabled') + ' invites.');
     } catch (e) {
       global.AuroraToast.danger('Toggle failed: ' + (e && e.message ? e.message : ''));

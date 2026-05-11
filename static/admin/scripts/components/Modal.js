@@ -23,8 +23,9 @@
 //     → Promise<{ submitted: bool, values?: object }>
 //
 //     fields: [{ name, label, type, required?, placeholder?,
-//       default?, validate?(value) → string|null }]
-//     type ∈ 'text' | 'password' | 'textarea' | 'checkbox'
+//       default?, options?, validate?(value) → string|null }]
+//     type ∈ 'text' | 'password' | 'textarea' | 'checkbox' | 'select'
+//     For 'select', supply options: [{ value, label }].
 //
 //     fields: [] is the non-destructive yes/no shape — body
 //     text is the question; submitting confirms.
@@ -195,6 +196,13 @@
                   '<input type="checkbox" id="' + fid + '"' +
                   (f.default ? ' checked' : '') + '> ' + esc(f.label || '') +
                   '</label>';
+        } else if (f.type === 'select') {
+          html += '<select id="' + fid + '"' + required + '>';
+          for (const opt of (f.options || [])) {
+            const sel = (f.default != null && opt.value === f.default) ? ' selected' : '';
+            html += '<option value="' + esc(opt.value) + '"' + sel + '>' + esc(opt.label) + '</option>';
+          }
+          html += '</select>';
         } else {
           const t = f.type === 'password' ? 'password' : 'text';
           html += '<input type="' + t + '" id="' + fid + '"' + required + ph +
@@ -281,7 +289,7 @@
       for (const f of fields) {
         const el = body.querySelector('#' + fieldIds[f.name]);
         if (!el) continue;
-        const evt = f.type === 'checkbox' ? 'change' : 'input';
+        const evt = (f.type === 'checkbox' || f.type === 'select') ? 'change' : 'input';
         el.addEventListener(evt, refreshSubmit);
       }
 
