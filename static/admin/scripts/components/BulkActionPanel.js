@@ -310,12 +310,14 @@
       statusEl.textContent = 'Error: ' + this.state.error;
       statusEl.classList.add('action-panel-status-error');
     } else if (this.state.result) {
+      // v0.3 atomic-batch semantics (Arc 4 Step 2): either all subjects
+      // process or the whole batch aborts via 4xx. `affectedCount` is
+      // now "total subjects processed", not "successes in a partial
+      // batch"; there is no per-subject `skipped` list on success.
+      // Partial failure surfaces via the 4xx + per-subject error
+      // envelope handled in client.js, not here.
       const r = this.state.result;
-      let txt = 'Affected ' + (r.affectedCount || 0) + ' subject(s)';
-      if (Array.isArray(r.skipped) && r.skipped.length > 0) {
-        txt += ', ' + r.skipped.length + ' skipped';
-      }
-      statusEl.textContent = txt;
+      statusEl.textContent = 'Processed ' + (r.affectedCount || 0) + ' subject(s)';
     }
     this._statusEl = statusEl;
 
