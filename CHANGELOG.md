@@ -6,6 +6,226 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Arc 7 — Multi-instance auth state + rate limiting (v0.4-cycle)
+
+Four-step cycle (Step 0 recon, Step 0.6 schema, Steps 1-4
+implementation + docs) introducing the `DistributedStore`
+trait substrate so Aurora-Locus's per-request authentication
+state (DPoP JTI replay) and rate-limit buckets become
+cross-instance-coherent. Backed by Postgres-CAS; the existing
+in-process governor + in-memory JTI tracker remain functional
+as the `single_instance_inmemory` opt-out and as
+defense-in-depth in the default `distributed` mode.
+
+Tracked via chainlink #53. Design at
+[`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §6.
+
+#### Added
+
+- **`DistributedStore` trait abstraction**
+  (`src/distributed/mod.rs`) with five async methods —
+  insert / get / delete / cas / reap_expired — and three
+  error variants (`KeyExists`, `UnsupportedTable`,
+  `Database`). The trait is the consumer contract; backends
+  plug in behind it. [Arc 7 Step 1]
+- **`Lease` primitive** (`src/distributed/lease.rs`) —
+  epoch-ms BIGINT-backed expiry abstraction matching the
+  schema's portable arithmetic. saturating_add on
+  construction defeats i64 overflow on extreme durations.
+  [Arc 7 Step 1]
+- **`PostgresCasStore`** (`src/distributed/postgres_cas.rs`)
+  — Postgres-CAS substrate implementation via `sqlx::Any`
+  so a single backend serves SQLite (dev) and Postgres
+  (production) deployments. Per-table dispatch over
+  `dpop_jti_replay` and `rate_limit_buckets`. Backend-
+  specific unique-violation detection centralized in one
+  helper. [Arc 7 Step 1]
+- **`TtlCache` parse-result optimization layer**
+  (`src/distributed/cache.rs`) — dashmap-backed concurrent
+  cache for cryptographic parse caching per V04_DESIGN.md
+  §6.3.4. Built but not yet wired to a consumer; ready for
+  v0.6 DPoP parse-caching work. [Arc 7 Step 1]
+- **`OAuthFlowStateAdapter`**
+  (`src/oauth/flow_state_adapter.rs`) — sibling
+  `DistributedStore` impl wrapping the existing
+  `authorization_request` table without schema change. The
+  trait's opaque value parameter is JSON-encoded
+  `AuthorizationRequestData` on insert and
+  `AuthorizationRequest` on read. [Arc 7 Step 2]
+- **`DistributedStoreRegistry`**
+  (`src/distributed/registry.rs`) — per-table dispatch
+  facade implementing `DistributedStore`, routing consumers
+  to the right impl by table name. Substrate is `Option`
+  (skipped in `SingleInstanceInmemory` mode); OAuth adapter
+  is mandatory (table lives in `account_db` regardless of
+  mode). [Arc 7 Step 2]
+- **`DistributedRateLimiter`** in `src/rate_limit.rs` —
+  cross-instance rate-limit primitive built on the §6.3.5
+  atomic UPDATE-with-arithmetic pattern. First-touch INSERT
+  fallback with bounded retry on PK-collision races.
+  Portable CASE-WHEN SQL (no Postgres-only `LEAST`).
+  [Arc 7 Step 3]
+- **`dpop_jti_replay` and `rate_limit_buckets` tables**
+  (migration `0007_distributed_state.sql` + Postgres twin).
+  Schema stays within `sqlx::Any`'s portable subset —
+  TEXT primary keys, BIGINT epoch-millis timestamps. [Arc 7
+  Step 0.6]
+- **`PDS_DISTRIBUTED_STATE_MODE` config enum** —
+  `distributed` (default), `single_instance_inmemory`,
+  `redis` (forward-compat slot; rejected at startup).
+  [Arc 7 Step 1]
+- **Maintenance pool sizing env vars** —
+  `PDS_MAINTENANCE_DB_MAX_CONNECTIONS` (default 15),
+  `PDS_MAINTENANCE_DB_MIN_CONNECTIONS` (default 2),
+  `PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS` (default 10).
+  Dedicated pool isolates substrate load from the main
+  application pool. [Arc 7 Step 1]
+- **Three background reapers** in
+  `src/jobs/mod.rs:JobScheduler::start`:
+  `dpop_jti_replay_reaper_job` (300s),
+  `oauth_authorization_request_cleanup_job` (300s, fold-
+  in of pre-existing-but-unwired sweeper from Step 0 Q1
+  finding), `rate_limit_buckets_reaper_job` (3600s, 7-day
+  inactivity threshold). [Arc 7 Steps 1, 2, 3]
+- **`docs/operator/multi-instance-deployment.md`** —
+  485-line operator guide covering when multi-instance
+  makes sense, Postgres prerequisites with connection-
+  budget worked example, configuration env-var inventory,
+  migration path, verification smoke checks, monitoring
+  guidance, six known v0.4 limitations, and troubleshooting
+  for the most common operator surprises. [Arc 7 Step 4]
+- **`tests/distributed_substrate_test.rs`** — 11 cross-
+  instance integration tests against testcontainers
+  Postgres covering JTI replay rejection, OAuth state
+  visibility + consume-and-replay-rejection, rate-limit
+  exhaustion across instances, concurrent first-touch
+  race resolution, and reaper sweeps visible to siblings.
+  [Arc 7 Steps 1-3]
+
+#### Changed
+
+- **OAuth handlers route through the `DistributedStore`
+  trait**: `src/oauth/authorize.rs:create_authorization_request`
+  and `get_authorization_request` now call
+  `store.insert / get` for cross-instance-relevant
+  operations. `mark_code_as_used` in
+  `src/oauth/consent.rs` does a secondary-key lookup
+  (direct SQL, unchanged) then routes the consume through
+  `store.delete`. The trait's atomic UPDATE-with-predicate
+  IS the cross-instance single-use guarantee for OAuth
+  code redemption. [Arc 7 Step 2]
+- **DPoP JTI replay routes through the trait in
+  `distributed` mode**: `DPopNonceStore.check_and_record_jti`
+  in `src/federation/dpop.rs` calls
+  `store.insert("dpop_jti_replay", ...)` when configured;
+  `KeyExists` translates to "replay". In
+  `single_instance_inmemory` mode the pre-Arc-7
+  `HashMap<String, i64>` path runs unchanged.
+  `check_and_record_jti`'s signature widened from
+  `(jti, exp)` to `(jti, jkt, exp)` so the substrate's
+  `jkt` observability column is populated; the verifier
+  computes the JWK thumbprint earlier so it can be
+  passed through. [Arc 7 Step 3]
+- **Rate-limit middleware adds a PRIORITY-0 distributed
+  pre-check**: in `distributed` mode the middleware runs
+  the substrate's `try_consume` against a per-endpoint
+  bucket BEFORE the existing governor's PRIORITY-1+
+  checks. Returns 429 directly on substrate denial; falls
+  through with a `tracing::warn!` on substrate-consult
+  failure (non-fatal — request continues via the
+  governor's per-instance defense). [Arc 7 Step 3]
+- **Migration `0007_distributed_state.sql` retroactively
+  cites chainlink #53** in its header comment, matching
+  the existing `chainlink #NNN` convention from migrations
+  0005 and 0006. [Arc 7 Step 1]
+- **Background-task scheduling**: three new reapers
+  spawned through the existing `JobScheduler::start`
+  pattern, matching `dpop_nonce_cleanup_job`'s shape.
+  No new shutdown-handling infrastructure; reapers run
+  for process lifetime like the rest of the existing
+  background tasks. [Arc 7 Steps 1-3]
+- **`get_authorization_request` collapses "expired" and
+  "not found" into a single `NotFound`**. Pre-Arc-7 the
+  function raised separate `Authentication("Authorization
+  request expired")` for the expired case; the trait's
+  `get` filters lease-expired rows as `None` and the
+  handler collapses both into 404. Documented in the
+  function body — consent screen treats both identically.
+  [Arc 7 Step 2]
+
+#### Fixed
+
+- **Pre-existing `authorization_request` schema/model
+  mismatch surfaced and worked around**: the
+  `AuthorizationRequest` model declared `id: i64` and
+  `code_used_at: Option<DateTime<Utc>>` fields, but the
+  `0001_initial.sql` migrations never created backing
+  columns. Step 0 recon copied the model verbatim and
+  missed the inconsistency; the existing direct-SQL paths
+  that SELECTed those columns would have failed on
+  Postgres but were latent because the pre-Arc-7 test
+  suite never exercised them against real Postgres.
+  Step 2's testcontainers tests are the first to hit it.
+  Fixed in-scope (no schema migration per Step 2
+  kickoff): the adapter's `get`/`delete` and
+  `consent.rs:get_request_by_code` SELECT/UPDATE only
+  the columns that actually exist; the model fields are
+  populated with synthetic defaults (`0` / `None`). The
+  dead model fields stay for API compat — no consumer
+  reads them. v0.6 model audit should remove them.
+  [Arc 7 Step 2]
+
+#### Removed
+
+- **`src/rate_limit_new/distributed.rs`** (pre-existing
+  Redis-backed `DistributedRateLimiter`, 276 lines) —
+  retired per Step 1 disposition. Was wired through
+  `AppContext.distributed_rate_limiter` but marked
+  `#[allow(dead_code)]` and never consulted by the
+  rate-limit middleware. Replaced by Arc 7's trait
+  surface; the `DistributedStateMode::Redis` enum
+  variant preserves the forward-compat door for a future
+  cycle's clean Redis backend against the trait.
+  [Arc 7 Step 1]
+- **`RateLimitConfig.use_redis` and `RateLimitConfig.redis_url`
+  fields** plus the corresponding
+  `PDS_RATE_LIMIT_USE_REDIS` / `PDS_RATE_LIMIT_REDIS_URL`
+  env-var reads — only consumers were the now-deleted
+  rate_limit_new module. [Arc 7 Step 1]
+- **`crate::oauth::authorize::cleanup_expired_requests`
+  function** — only caller was the JobScheduler, which
+  now routes through `store.reap_expired("oauth_flow_state",
+  ...)` directly. [Arc 7 Step 2]
+
+#### Known v0.4 limitations (v0.6 candidates)
+
+- Distributed rate-limit defaults hardcoded
+  (100 tokens / 100 tokens/sec). Per-endpoint
+  configurability TBD.
+- 7-day `rate_limit_buckets` retention hardcoded.
+  Operator-tunable threshold TBD.
+- DPoP server-side nonce issuance stays in-memory
+  (federation `getDpopNonce` endpoint). Substrate's DPoP
+  scope is JTI replay only; the `dpop_jti_replay` table
+  name reflects this.
+- No DPoP parse-result cache wired in v0.4. `TtlCache`
+  primitive is in place from Step 1 (`src/distributed/cache.rs`);
+  no consumer yet. Deferred pending profiling.
+- No dedicated Arc-7 Prometheus metric families
+  (`aurora_distributed_store_operations_total`,
+  `aurora_distributed_store_latency_seconds`,
+  `rate_limit_substrate_fallthrough_total`). Monitoring
+  uses existing `background_jobs_*` and
+  `db_query_duration_seconds`; substrate-consult
+  fall-through is via `tracing::warn!` only.
+- Redis backend implementation deferred. Enum slot
+  reserved; setting `PDS_DISTRIBUTED_STATE_MODE=redis`
+  fails fast at startup.
+- `AuthorizationRequest.id` and `code_used_at` vestigial
+  model fields with no backing schema columns. Removing
+  is a model audit; would touch every fixture and any
+  external consumer that deserializes the JSON.
+
 ### Arc 6 — Aurora Admin UI v0.3 migration (v0.4-cycle)
 
 Eight-step migration of the admin UI to v0.3 wire shapes, with
