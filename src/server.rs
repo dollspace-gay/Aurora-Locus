@@ -1,6 +1,6 @@
 /// HTTP server setup and routing
 use crate::{
-    api::middleware::{check_account_moderation, namespace_scope_check},
+    api::middleware::{check_account_moderation, jwt_deprecation_headers, namespace_scope_check},
     context::AppContext,
     error::{PdsError, PdsResult},
     metrics,
@@ -86,7 +86,16 @@ pub fn build_router(ctx: AppContext) -> Router {
             namespace_scope_check,
         ))
         // Apply rate limiting middleware (after state so it can access AppContext)
-        .layer(middleware::from_fn_with_state(ctx, rate_limit_middleware))
+        .layer(middleware::from_fn_with_state(ctx.clone(), rate_limit_middleware))
+        // JWT-deprecation observability per Arc 6 Step 8: emits
+        // Deprecation/Sunset/Warning/X-OAuth-Migration-Guide
+        // response headers + increments the
+        // jwt_deprecation_warnings_total counter when the request
+        // carries a JWT-shaped bearer token (detected
+        // structurally — see token_looks_like_jwt). Outermost of
+        // the per-request layers so the headers reach the client
+        // verbatim.
+        .layer(middleware::from_fn_with_state(ctx, jwt_deprecation_headers))
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
