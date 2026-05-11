@@ -649,7 +649,7 @@ impl DispatchEffects {
 pub async fn emit_event(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
-    Json(input): Json<EmitEventInput>,
+    crate::api::extractors::AuroraJson(input): crate::api::extractors::AuroraJson<EmitEventInput>,
 ) -> Result<Json<EmitEventOutput>, (StatusCode, Json<serde_json::Value>)> {
     // Arc 6 Step 7: legacy wire-shape observability. When the input
     // was deserialized from the v0.2 `subject: Subject` shape, record
@@ -4146,7 +4146,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![repo_subject("did:plc:victim")],
                 rationale: "spam".to_string(),
@@ -4193,7 +4193,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![repo_subject("did:plc:victim")],
                 rationale: "   ".to_string(),
@@ -4213,7 +4213,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![Subject::Record {
                     uri: "at://did:plc:abc/app.bsky.feed.post/123".to_string(),
@@ -4236,7 +4236,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::DeleteAccount,
                 subjects: vec![repo_subject("did:plc:victim")],
                 rationale: "test".to_string(),
@@ -4264,7 +4264,7 @@ mod tests {
         let err = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::SendEmail {
                     template: None,
                     subject: "test subject".to_string(),
@@ -4289,7 +4289,7 @@ mod tests {
         let result = emit_event(
             State(ctx.clone()),
             admin_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::SendEmail {
                     template: None,
                     subject: "test subject".to_string(),
@@ -4322,7 +4322,7 @@ mod tests {
         let resp = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ApplyLabel {
                     val: "regression".to_string(),
                     neg: false,
@@ -4349,7 +4349,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ApplyLabel {
                     val: "spam".to_string(),
                     neg: false,
@@ -4420,7 +4420,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ResolveAppeal {
                     appeal_id: appeal.id,
                     resolution: AppealResolutionDecision::Approve,
@@ -4480,7 +4480,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ResolveAppeal {
                     appeal_id: appeal.id,
                     resolution: AppealResolutionDecision::Deny,
@@ -4518,7 +4518,7 @@ mod tests {
         let resp = emit_event(
             State(ctx),
             admin_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::DeleteAccount,
                 subjects: vec![repo_subject("did:plc:deleteme")],
                 rationale: "voluntary deletion".to_string(),
@@ -5667,7 +5667,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![repo_subject("did:plc:victim")],
                 rationale: "spam".to_string(),
@@ -5703,7 +5703,7 @@ mod tests {
         emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![repo_subject("did:plc:victim")],
                 rationale: "spam".to_string(),
@@ -7421,7 +7421,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![],
                 rationale: "no subjects".to_string(),
@@ -7448,7 +7448,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ResolveReport {
                     report_id: 42,
                     resolution: ReportResolution::Resolved,
@@ -7483,7 +7483,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![
                     repo_subject("did:plc:a"),
@@ -7518,7 +7518,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ApplyLabel {
                     val: "spam".to_string(),
                     neg: false,
@@ -7558,7 +7558,7 @@ mod tests {
         emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownRecord,
                 subjects: vec![
                     Subject::Record {
@@ -7623,7 +7623,7 @@ mod tests {
         let err = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::RestoreBlob,
                 subjects: vec![
                     Subject::Blob {
@@ -7707,7 +7707,7 @@ mod tests {
         let result = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![
                     repo_subject("did:plc:s0"),
@@ -7761,7 +7761,7 @@ mod tests {
         emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![repo_subject("did:plc:single")],
                 rationale: "single subject".to_string(),
@@ -7799,7 +7799,7 @@ mod tests {
         emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ApplyLabel {
                     val: "test".to_string(),
                     neg: false,
@@ -7842,7 +7842,7 @@ mod tests {
         emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![
                     repo_subject("did:plc:m1"),
@@ -7891,7 +7891,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ResolveReport {
                     report_id: report.id,
                     resolution: ReportResolution::Resolved,
@@ -7958,7 +7958,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ResolveAppeal {
                     appeal_id: appeal.id,
                     resolution: AppealResolutionDecision::Approve,
@@ -7991,7 +7991,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             admin_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::DeleteAccount,
                 subjects,
                 rationale: "over the cap".to_string(),
@@ -8025,7 +8025,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::DeleteBlob,
                 subjects,
                 rationale: "over the cap".to_string(),
@@ -8080,7 +8080,7 @@ mod tests {
         let err = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::QuarantineBlob,
                 subjects: vec![
                     Subject::Blob {

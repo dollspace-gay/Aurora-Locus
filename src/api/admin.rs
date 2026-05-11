@@ -3609,7 +3609,7 @@ struct UpdateSubjectStatusResponse {
 async fn update_subject_status(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
-    Json(req): Json<UpdateSubjectStatusRequest>,
+    crate::api::extractors::AuroraJson(req): crate::api::extractors::AuroraJson<UpdateSubjectStatusRequest>,
 ) -> Result<Json<UpdateSubjectStatusResponse>, axum::response::Response> {
     use axum::response::IntoResponse;
 
@@ -8255,7 +8255,7 @@ mod tests {
             }),
             legacy_record_uri_used: false,
         };
-        update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+        update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect("update_subject_status succeeds");
 
@@ -8635,7 +8635,7 @@ mod tests {
             deactivated: None,
             legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap()
             .0;
@@ -8676,7 +8676,7 @@ mod tests {
             deactivated: None,
             legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap()
             .0;
@@ -8702,7 +8702,7 @@ mod tests {
             }),
             legacy_record_uri_used: false,
         };
-        let _ = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+        let _ = update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap();
         assert!(account_deactivated(&ctx, "did:plc:dorm").await);
@@ -8723,7 +8723,7 @@ mod tests {
             deactivated: None,
             legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect_err("strongRef should return 501 until record-level setter exists");
         let status = resp.status();
@@ -8769,7 +8769,7 @@ mod tests {
             deactivated: None,
             legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap()
             .0;
@@ -8811,7 +8811,7 @@ mod tests {
             }),
             legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect_err("blob + deactivated should reject");
         let (status, body) = read_xrpc_error(resp).await;
@@ -8838,7 +8838,7 @@ mod tests {
             }),
             legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect_err("record + deactivated should reject");
         let (status, body) = read_xrpc_error(resp).await;
@@ -8868,7 +8868,7 @@ mod tests {
             deactivated: None,
             legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect_err("non-existent blob should 404");
         let (status, body) = read_xrpc_error(resp).await;
@@ -8900,7 +8900,7 @@ mod tests {
             deactivated: None,
             legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap()
             .0;
@@ -8940,7 +8940,7 @@ mod tests {
             deactivated: None,
             legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap()
             .0;
