@@ -6267,3 +6267,97 @@ A few directional thoughts that aren't specific deferred features but inform how
 **Deferred items aren't second-class.** The list above isn't "things that don't matter." It's "things that don't fit v0.2's ambitious-but-finite scope." Several items would meaningfully improve operator experience and may rank high in v0.3 prioritization. The cycle planning makes the call; this doc just records what's open.
 
 **Aurora-Locus's UI is its own product.** It interoperates with the broader ATProto ecosystem but stands alone. Future cycles preserve that independence. The UI doesn't become coupled to specific external systems even when those systems prove popular pairings.
+
+# 15. v0.4 (Arc 6) migration notes
+
+Section added during the v0.4 cycle close. This section is additive: it documents the substantive changes Arc 6 landed against the UI substrate without restructuring the v0.2-era prose above. Each subsection cross-references the section it amends.
+
+## 15.1 Modal substrate API extension (amends §5.6, §7.10)
+
+`AuroraModal` gained two static helper methods that compose the existing `open()` / `close()` substrate. Both return promises that resolve on submit/cancel/escape, with focus management, focus-trap, and aria-modal preserved from the base substrate.
+
+```javascript
+// Generic form input — collects 1+ fields with validation.
+// fields: [] is the zero-field shape used for non-destructive yes/no
+// confirms; body text becomes the question, submitting confirms.
+AuroraModal.form({ heading, body, fields, submitLabel })
+  → Promise<{ submitted, values? }>
+
+// Destructive confirmation — typed-confirm gate + optional rationale +
+// optional ack checkbox. Used for the canonical role-revoke pattern
+// (typedConfirmGate: 'REVOKE', rationaleRequired: true).
+AuroraModal.destructiveConfirm({ heading, body, typedConfirmGate,
+  rationaleRequired, ackCheckbox, confirmLabel })
+  → Promise<{ confirmed, rationale?, ackChecked? }>
+```
+
+Supported `form` field types: `text`, `password`, `textarea`, `checkbox`, `select`. The `select` type was added during Arc 6 Step 4 to support the `AccountDetail.toggleInvites` migration (replacing an inverted-OK-Cancel native confirm).
+
+13 native `confirm()` / `prompt()` call sites migrated to the helpers per Arc 6's modal-consolidation work. Operator UX is now uniform across destructive actions, form input, and informational yes/no prompts.
+
+## 15.2 Error-translation infrastructure (amends §7.6)
+
+A new module `static/admin/scripts/api/error-translations.js` provides server-error-code → operator-friendly prose translation. The 4xx handling path in `client.js` consults this table when a structured `error` field is present on the response body; falls back to the legacy `'HTTP <status>: <message>'` rendering when the code is unknown.
+
+Seeded with the four v0.3 codes: `SubjectVariantMismatch`, `SubjectTargetMismatch`, `OrphanedAppeal`, `SubjectsArrayInvalidForAction`. New error codes shipping on the backend land as one-line table entries in the module.
+
+The thrown `Error` from `client.js`'s 4xx path now carries: `status`, `code`, `serverMessage`, `detailsAvailable` (true when translation hit), `failingSubject`, `failingSubjectId`. The per-subject envelope fields (`failingSubject`, `failingSubjectId`) inline-render after the message when present — operators see which subject in a batch caused an atomic abort.
+
+## 15.3 v0.3 wire-format absorbing (amends §8.4.1, §8.8–§8.13)
+
+The UI now constructs canonical v0.3 wire shapes against all admin-tier endpoints:
+
+- **`emitEvent` multi-subject**: `ActionPanel.buildPayload()` emits `subjects: [this.subject]` (single-subject wrapped in a one-element array) per the v0.3 reshape. The legacy `subject: Subject` shape is no longer constructed by the UI.
+- **Batch handlers**: the response shape's dropped `failures` field is no longer read; the `affected_count` field renders as "Processed N subject(s)" (the v0.3 atomic-batch semantic) rather than as partial-success counts.
+- **`BulkActionPanel` per-action caps**: `MAX_BATCH_SIZE` is now a per-action lookup `{ DeleteAccount: 10, DeleteBlob: 25, default: 50 }`. The cap is consulted via `currentMaxBatchSize()` which follows the selected action.
+- **`SettingSource` parity**: `SettingsGeneral` and `SettingsUiModes` both render all four tier values (Runtime, File, Default, RecoveryMode) with informational suffixes. Runtime renders bare (operator-set normal case); the others get muted-italic `(default)` / `(file)` / `(recovery override)` tags inline with the setting label.
+
+## 15.4 v0.3 wire-format adopting features (amends §5.3.8, §5.3.9, §6.7)
+
+Five net-new feature surfaces from v0.3 are now consumed:
+
+- **`cascadeSnapshotIds` display** on audit-entry detail: paired-by-index with `cascadeSubjects`, rendered as a structured `<ul>` with per-subject click-throughs via `AuroraEntityRef.fromSubject` and inline `<code>` for the snapshot id (no detail-page route for snapshots today; rendered as plain code).
+- **`subject_cid` filter** on the audit-list filter strip: free-text input adjacent to the existing subject-DID field.
+- **`chainVerified` indicator** on the audit page header: three-state badge (✓ verified through entry M / ⚠ verified through M, failure at M+1 / ✗ failed at entry 1) with click-to-expand inline detail panel. The detail panel surfaces the chain-walk CLI suggestion (`aurora-locus debug verify-audit-chain`) for operator diagnostic use.
+- **`timeRange` preset dropdown** on the Dashboard's moderation-metrics card: `last_hour` / `last_24h` / `last_7d` / `last_30d` presets; default `last_30d` preserves the prior 30-day window.
+- **`auditEntryId` toast click-through** on 11 success toasts (emit_event via ActionPanel + 6 batch endpoints via BulkActionPanel + triggerPasswordReset + exportAccountForensic + setRuntimeSetting + revokeRole). The `AuroraToast` API gained an optional `action: { label, href }` argument; clicking the action link navigates to the audit-entry detail via the existing `#mod/audit/<id>` hash route.
+
+## 15.5 Role-management action UI (amends §5.5.3, §5.5.4)
+
+`SettingsRoles.js` and `SettingsRolesMembers.js` gained grant + revoke affordances:
+
+- **Grant flow**: per-tier "Grant role" button opens an `AuroraModal.form` with `did` (text, required, `did:` prefix validated client-side) and `rationale` (textarea, required) fields. On success, surfaces an audit-entry click-through toast.
+- **Revoke flow**: per-member "Revoke" button opens an `AuroraModal.destructiveConfirm` with `typedConfirmGate: 'REVOKE'` + `rationaleRequired: true`. Canonical destructive-confirm example for the design.
+
+The "View role audit trail" dual-link UX described in earlier drafts is **deferred to v0.5+** — the audit-list page doesn't currently read hash query params on mount, and adding that capability is a substrate addition beyond Arc 6's scope. Operators reach the audit trail via the sidebar entry and apply filters manually for now.
+
+## 15.6 CLI sentinel rendering (amends §6.1)
+
+`AuroraEntityRef.account(did, handle?)` gained a `cli:`-prefix detection branch that returns a non-clickable `<span class="entity-ref entity-ref--cli">CLI: <suffix></span>` badge. CLI-emitted audit entries set `actor_did` to sentinel strings like `cli:bootstrap` or `cli:gc-sweep`; rendering them as clickable links to `#ops/accounts/...` 404'd, since the CLI isn't a runtime account.
+
+The patch lives in one place (`EntityRef.js`) and propagates automatically to all seven actor-rendering surfaces (Audit list, Audit detail, Events list + live-prepend, Event detail, AccountDetail recent-actions). The `entity-ref--cli` CSS rule uses a subdued bordered chip with monospace font + `cursor: default` to visually distinguish CLI identities from runtime users.
+
+## 15.7 Backend dual-shape observability (amends §8.4.1, §7.6)
+
+Two backend endpoints gained dual-shape request acceptance for clients still on v0.2 wire shapes during the migration window:
+
+- **`tools.aurora.admin.emitEvent`**: accepts canonical `subjects: Vec<Subject>` (v0.3) and legacy `subject: Subject` (v0.2). Normalizes legacy to `vec![s]` during Deserialize.
+- **`com.atproto.admin.updateSubjectStatus`**: accepts canonical `record_uri` (snake_case) and legacy `recordUri` (camelCase) on the `RepoBlobRef` subject variant.
+
+Both reject requests that send both shapes simultaneously with a 400 + explicit error message.
+
+Operator observability:
+
+- **Metrics counter** `aurora_legacy_wire_ingest_total{endpoint, shape, field}`: incremented once per legacy-shape request. Operators query via Prometheus to track migration progress.
+- **Structured tracing log** `legacy_wire_shape_ingested` at INFO level with `endpoint`, `shape`, `field` structured fields. Cross-reference with access logs to identify specific clients.
+
+**Response headers** (`Deprecation`, `Sunset`, `Warning`, `X-Wire-Migration-Guide`) are **not emitted in v0.4**. The `emit_legacy_wire_headers()` helper is in place at `src/api/middleware.rs` but isn't called from the dual-shape handlers — wiring would require restructuring handler return types from `Json<T>` to `Response`, which ripples through ~43 test call sites. Deferred to v0.5+; documented in `docs/operator/v03-wire-deprecation-rollout.md` so operators don't expect them today.
+
+The JWT-deprecation middleware (`jwt_deprecation_headers` in `src/api/middleware.rs`) was wired into the router stack during Arc 6 Step 8 — previously defined but never registered as a layer. The wiring pattern serves as a reference for the deferred wire-shape response-header work.
+
+## 15.8 Operator docs added
+
+Two new operator-facing docs landed during Arc 6:
+
+- `docs/operator/running-ui-tests.md` — how to run `static/admin/scripts/api/__tests__/` against the working tree (Node ≥ 18, per-file invocation). Resolves the "didn't run the tests" friction that recurred across Arc 6 Steps 2–4.
+- `docs/operator/v03-wire-deprecation-rollout.md` — affected endpoints, the metrics counter + PromQL snippets, the structured tracing event, the response-header gap explicitly flagged, the per-endpoint migration checklist with before/after request body samples, and the `PDS_V03_WIRE_SUNSET_DATE` env var documentation.
