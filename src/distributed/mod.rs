@@ -30,6 +30,7 @@
 //! fall back to per-instance in-memory state (auth state is lost
 //! on restart — operator-accepted trade-off per §6.3.6).
 
+pub mod cache;
 pub mod lease;
 pub mod postgres_cas;
 
