@@ -529,9 +529,15 @@
         if (v != null && v !== '') action[f.key] = v;
       }
     }
+    // v0.3 wire shape: emitEvent takes `subjects: Vec<Subject>`.
+    // Single-subject callers wrap in a one-element array; ActionPanel
+    // is always single-subject (BulkActionPanel handles the multi-
+    // subject case). Per V04_DESIGN §5.3.6 the request side keeps
+    // dual-shape acceptance during the deprecation window, but the
+    // UI emits the canonical v0.3 shape unconditionally.
     const payload = {
       action: action,
-      subject: this.subject,
+      subjects: [this.subject],
       rationale: this.state.rationale,
       snapshotCapture: true,
     };
