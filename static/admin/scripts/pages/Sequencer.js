@@ -69,7 +69,18 @@
   }
 
   async function doAction(nsidLeaf, prompt) {
-    if (!confirm(prompt)) return;
+    // Per V04_DESIGN §5.3.3's Sequencer decision: sequencer ops are
+    // almost universally destructive (cursor adjustments, event
+    // replay, restart), so the dispatcher uses destructiveConfirm
+    // uniformly rather than per-op classification. If a non-
+    // destructive doAction caller appears in the future, it gets
+    // its own non-destructive path.
+    const result = await global.AuroraModal.destructiveConfirm({
+      heading: prompt,
+      body: 'Sequencer operations affect the cursor and may be irreversible. Proceed?',
+      confirmLabel: 'Run',
+    });
+    if (!result.confirmed) return;
     try {
       await global.AuroraClient.post('tools.aurora.ops.' + nsidLeaf, {});
       global.AuroraToast.success('Action complete: ' + nsidLeaf);
