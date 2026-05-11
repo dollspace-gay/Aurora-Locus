@@ -18,7 +18,27 @@
 (function (global) {
   'use strict';
 
-  const MAX_BATCH_SIZE = 50; // §6.4 visual contract
+  // Per-action batch caps per V04_DESIGN.md §5.2.1 / §5.3.6.
+  // Lookup keyed by ModEventAction discriminator name. DeleteAccount
+  // and DeleteBlob carry tighter caps because they are irreversible
+  // (account removal) or storage-irreversible (blob removal). Other
+  // actions share the §6.4 visual cap of 50.
+  //
+  // DeleteAccount/DeleteBlob are not in BATCH_ACTIONS yet — the table
+  // is primed so the lookup is wire-correct when those actions land
+  // here in a future cycle. Every current BATCH_ACTIONS key falls
+  // through to `default`.
+  const MAX_BATCH_SIZE = {
+    DeleteAccount: 10,
+    DeleteBlob: 25,
+    default: 50,
+  };
+
+  function maxBatchSizeFor(actionKind) {
+    return MAX_BATCH_SIZE[actionKind] != null
+      ? MAX_BATCH_SIZE[actionKind]
+      : MAX_BATCH_SIZE.default;
+  }
 
   // Action → (feature, payload-builder). Only actions backed by a
   // batch endpoint show up here; mapping mirrors §8.8–§8.13.
@@ -141,7 +161,10 @@
     this.availableActions = opts.availableActions || [];
     this.onConfirm = opts.onConfirm;
     this.onCancel = opts.onCancel || function () {};
-    this.maxBatchSize = opts.maxBatchSize || MAX_BATCH_SIZE;
+    // Explicit caller override; null means "use the per-action lookup".
+    this.maxBatchSizeOverride = opts.maxBatchSize != null
+      ? opts.maxBatchSize
+      : null;
     this.container = null;
     this.dom = null;
     this.state = {
@@ -157,6 +180,13 @@
   BulkActionPanel.prototype.mount = function (container) {
     this.container = container;
     this.render();
+  };
+
+  // Resolve the active cap: caller override wins, else per-action lookup.
+  BulkActionPanel.prototype.currentMaxBatchSize = function () {
+    return this.maxBatchSizeOverride != null
+      ? this.maxBatchSizeOverride
+      : maxBatchSizeFor(this.state.action);
   };
 
   BulkActionPanel.prototype.unmount = function () {
@@ -205,11 +235,13 @@
       subjectList.appendChild(el('li', { class: 'bulk-subjects-overflow' }, ['+ ' + overflow + ' more']));
     }
 
-    // Cap warning when approaching limit
+    // Cap warning when approaching limit. Cap is per-action: DeleteAccount
+    // and DeleteBlob carry tighter caps than the §6.4 default of 50.
+    const cap = this.currentMaxBatchSize();
     let capWarning = null;
-    if (subjectCount >= this.maxBatchSize) {
+    if (subjectCount >= cap) {
       capWarning = el('div', { class: 'bulk-cap-warning', role: 'alert' }, [
-        'Batch operations are limited to ' + this.maxBatchSize + ' subjects per call. Select fewer or repeat in batches.',
+        'Batch operations are limited to ' + cap + ' subjects per call. Select fewer or repeat in batches.',
       ]);
     }
 
@@ -348,8 +380,9 @@
     const def = BATCH_ACTIONS[this.state.action];
     if (!def) return 'Unknown action';
     if (this.subjects.length === 0) return 'No subjects selected';
-    if (this.subjects.length > this.maxBatchSize) {
-      return 'Too many subjects (max ' + this.maxBatchSize + ')';
+    const cap = this.currentMaxBatchSize();
+    if (this.subjects.length > cap) {
+      return 'Too many subjects (max ' + cap + ')';
     }
     // Subject-type compat — every subject must be valid for this action
     for (const s of this.subjects) {
@@ -408,4 +441,5 @@
   global.BulkActionPanel = BulkActionPanel;
   global.BulkActionPanel.BATCH_ACTIONS = BATCH_ACTIONS;
   global.BulkActionPanel.MAX_BATCH_SIZE = MAX_BATCH_SIZE;
+  global.BulkActionPanel.maxBatchSizeFor = maxBatchSizeFor;
 })(window);
