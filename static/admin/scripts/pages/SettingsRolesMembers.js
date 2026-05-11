@@ -87,7 +87,11 @@
       } : undefined);
       if (global.AuroraRouter) global.AuroraRouter.dispatch();
     } catch (e) {
-      global.AuroraToast.danger('Revoke failed: ' + (e && e.message ? e.message : ''));
+      // Surface err.message directly so Step 1's translation layer
+      // (or the fallback 'HTTP <status>: <msg>' rendering) shows
+      // through. The prior 'Revoke failed: <msg>' hand-prefix
+      // shadowed the translated prose for recognized error codes.
+      global.AuroraToast.danger(e && e.message ? e.message : 'Revoke failed.');
     }
   }
 
