@@ -1197,6 +1197,22 @@ input[type="checkbox"][disabled] {
 
 .toast-message { flex: 1; }
 
+/* Optional inline action link inside a toast (Arc 6 Step 3 sub-3e).
+ * Typically "View audit entry" → navigates to #mod/audit/<id> via
+ * the existing hash router. Subdued styling so it reads as a
+ * secondary affordance, not competing with the message. */
+.toast-action {
+  color: var(--primary-color);
+  text-decoration: underline;
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+  align-self: center;
+}
+
+.toast-action:hover {
+  text-decoration: none;
+}
+
 .toast-close {
   background: transparent;
   border: none;
