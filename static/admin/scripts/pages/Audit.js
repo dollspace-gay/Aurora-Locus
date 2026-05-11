@@ -27,6 +27,7 @@
         filters: [
           { type: 'text', id: 'actor', placeholder: 'Filter by actor DID' },
           { type: 'text', id: 'subject', placeholder: 'Filter by subject DID' },
+          { type: 'text', id: 'subjectCid', placeholder: 'Filter by subject CID' },
           { type: 'text', id: 'action', placeholder: 'Filter by action' },
           { type: 'checkbox', id: 'verifiedOnly', label: 'Verified only' },
           { type: 'dateRange', id: 'when', label: 'Date range' },
@@ -60,6 +61,7 @@
     const params = { limit: 25 };
     if (lastFilters.actor) params.actorDid = lastFilters.actor;
     if (lastFilters.subject) params.subjectDid = lastFilters.subject;
+    if (lastFilters.subjectCid) params.subjectCid = lastFilters.subjectCid;
     if (lastFilters.action) params.action = lastFilters.action;
     if (cursor) params.cursor = cursor;
     if (lastFilters.when && lastFilters.when.start) params.since = lastFilters.when.start.toISOString();
