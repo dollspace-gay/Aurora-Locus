@@ -23,25 +23,51 @@
 //! - https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-09
 //! - https://atproto.com/specs/oauth
 
+use crate::distributed::{DistributedError, Lease};
 use crate::error::{PdsError, PdsResult};
+use crate::oauth::flow_state_adapter::{decode_request, encode_request_data};
 use crate::oauth::models::{AuthorizationRequest, AuthorizationRequestData, AuthorizeQuery};
 use crate::AppContext;
 use axum::{
     extract::{Query, State},
     response::{IntoResponse, Redirect},
 };
-use chrono::{Duration, Utc};
-use sqlx::Row;
+use chrono::Duration;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 
-/// Parse RFC3339 timestamp string to DateTime<Utc>. Required for sqlx::Any
-/// since chrono types don't implement Type<Any>. See chainlink #76.
-fn parse_ts(s: &str) -> Result<chrono::DateTime<chrono::Utc>, crate::error::PdsError> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|e| crate::error::PdsError::Internal(format!("Invalid timestamp: {}", e)))
+/// Map `DistributedError` to `PdsError` for the OAuth-handler
+/// surface. The trait's KeyExists / UnsupportedTable variants
+/// shouldn't surface on the happy path through these handlers
+/// (the adapter routes only on `oauth_flow_state`, and OAuth
+/// request_ids are fresh UUIDs so KeyExists is structurally
+/// impossible), so we map them to Internal errors with an
+/// explicit "bug" prefix for log triage.
+fn map_distributed_err(err: DistributedError) -> PdsError {
+    match err {
+        DistributedError::Database(e) => PdsError::Database(e),
+        other => PdsError::Internal(format!("distributed-store bug: {}", other)),
+    }
+}
+
+/// Pull the distributed-store handle off AppContext. Panics
+/// (via the calling `?`) if the store is missing — that's a
+/// startup-config bug, not a request-time condition; the
+/// Step-1 context wiring guarantees the registry is always
+/// constructed (Some) even in SingleInstanceInmemory mode.
+fn require_store(
+    ctx: &AppContext,
+) -> PdsResult<&std::sync::Arc<dyn crate::distributed::DistributedStore>> {
+    ctx.distributed_store
+        .as_ref()
+        .ok_or_else(|| {
+            PdsError::Internal(
+                "distributed_store not constructed; AppContext::new \
+                 contract violation"
+                    .to_string(),
+            )
+        })
 }
 
 /// Authorization endpoint handler
@@ -234,31 +260,12 @@ async fn create_authorization_request(
     data: AuthorizationRequestData,
 ) -> PdsResult<String> {
     let request_id = Uuid::new_v4().to_string();
-    let now = Utc::now();
-    let expires_at = now + Duration::minutes(10); // 10-minute expiration
-
-    sqlx::query(
-        r#"
-        INSERT INTO authorization_request (
-            request_id, did, client_id, code_challenge, code_challenge_method,
-            scope, redirect_uri, state, created_at, expires_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        "#,
-    )
-    .bind(&request_id)
-    .bind(&data.did)
-    .bind(&data.client_id)
-    .bind(&data.code_challenge)
-    .bind(&data.code_challenge_method)
-    .bind(&data.scope)
-    .bind(&data.redirect_uri)
-    .bind(&data.state)
-    .bind(now.to_rfc3339())
-    .bind(expires_at.to_rfc3339())
-    .execute(&ctx.account_db)
-    .await?;
-
+    let lease = Lease::from_now(Duration::minutes(10));
+    let value = encode_request_data(&data);
+    require_store(ctx)?
+        .insert("oauth_flow_state", &request_id, &value, Some(lease))
+        .await
+        .map_err(map_distributed_err)?;
     Ok(request_id)
 }
 
@@ -274,82 +281,27 @@ pub async fn get_authorization_request(
     ctx: &AppContext,
     request_id: &str,
 ) -> PdsResult<AuthorizationRequest> {
-    let row = sqlx::query(
-        r#"
-        SELECT
-            id, request_id, did, client_id, code_challenge, code_challenge_method,
-            authorization_code, scope, redirect_uri, state, created_at, expires_at,
-            code_used, code_used_at
-        FROM authorization_request
-        WHERE request_id = $1
-        "#,
-    )
-    .bind(request_id)
-    .fetch_optional(&ctx.account_db)
-    .await?
-    .ok_or_else(|| {
-        PdsError::NotFound(format!("Authorization request not found: {}", request_id))
-    })?;
-
-    // Check if expired
-    let expires_at: chrono::DateTime<Utc> = parse_ts(&row.get::<String, _>("expires_at"))?;
-    if expires_at < Utc::now() {
-        return Err(PdsError::Authentication(
-            "Authorization request expired".to_string(),
-        ));
-    }
-
-    Ok(AuthorizationRequest {
-        id: row.get("id"),
-        request_id: row.get("request_id"),
-        did: row.get("did"),
-        client_id: row.get("client_id"),
-        code_challenge: row.get("code_challenge"),
-        code_challenge_method: row.get("code_challenge_method"),
-        authorization_code: row.get("authorization_code"),
-        scope: row.get("scope"),
-        redirect_uri: row.get("redirect_uri"),
-        state: row.get("state"),
-        created_at: parse_ts(&row.get::<String, _>("created_at"))?,
-        expires_at: parse_ts(&row.get::<String, _>("expires_at"))?,
-        code_used: crate::db::read_bool(&row, "code_used")?,
-        code_used_at: row
-            .get::<Option<String>, _>("code_used_at")
-            .as_deref()
-            .map(parse_ts)
-            .transpose()?,
+    let bytes = require_store(ctx)?
+        .get("oauth_flow_state", request_id)
+        .await
+        .map_err(map_distributed_err)?
+        .ok_or_else(|| {
+            // The adapter's `get` filters out lease-expired and
+            // already-consumed rows as `None`. Distinguishing
+            // "never existed", "expired", and "consumed" would
+            // require a richer adapter return type; the
+            // pre-Arc-7 path collapsed expired into a separate
+            // 401 ("Authorization request expired") while
+            // not-found was 404. Step 2 collapses to a single
+            // NotFound — the consent screen treats expiry and
+            // never-existed identically (operator restarts the
+            // flow either way) and the lookup site doesn't
+            // benefit from the distinction.
+            PdsError::NotFound(format!("Authorization request not found: {}", request_id))
+        })?;
+    decode_request(&bytes).map_err(|e| {
+        PdsError::Internal(format!("authorization_request decode failed: {}", e))
     })
-}
-
-/// Delete expired authorization requests (cleanup job)
-///
-/// Should be called periodically (e.g., every hour) to clean up old requests.
-///
-/// # Arguments
-/// * `ctx` - Application context
-///
-/// # Returns
-/// Number of requests deleted
-pub async fn cleanup_expired_requests(ctx: &AppContext) -> PdsResult<u64> {
-    let now = Utc::now();
-
-    let result = sqlx::query(
-        r#"
-        DELETE FROM authorization_request
-        WHERE expires_at < $1
-        "#,
-    )
-    .bind(now.to_rfc3339())
-    .execute(&ctx.account_db)
-    .await?;
-
-    let deleted = result.rows_affected();
-
-    if deleted > 0 {
-        debug!("Cleaned up {} expired authorization requests", deleted);
-    }
-
-    Ok(deleted)
 }
 
 #[cfg(test)]

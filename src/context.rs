@@ -6,7 +6,7 @@ use crate::{
     blob_store::{BlobBackendType, BlobStorageConfig, BlobStore, BlobStoreConfig},
     config::{BlobstoreConfig, DatabaseConfig, DistributedStateMode, ServerConfig},
     db,
-    distributed::{DistributedStore, PostgresCasStore},
+    distributed::{DistributedStore, DistributedStoreRegistry, PostgresCasStore},
     error::{PdsError, PdsResult},
     federation::{
         authentication::FederationAuthenticator,
@@ -152,7 +152,11 @@ impl AppContext {
         // `SingleInstanceInmemory` mode skips the substrate
         // entirely. `Redis` is rejected at `config.validate()`
         // time so it never reaches this branch.
-        let (maintenance_pool, distributed_store) = match config.distributed_state_mode {
+        // Substrate (DPoP + rate-limit tables, in the
+        // maintenance pool). Optional — `SingleInstanceInmemory`
+        // mode skips it. `Redis` mode is rejected at
+        // config.validate() so it never reaches this match.
+        let (maintenance_pool, substrate) = match config.distributed_state_mode {
             DistributedStateMode::Distributed => {
                 let maintenance_db_config = DatabaseConfig {
                     backend: config.database.backend,
@@ -168,14 +172,14 @@ impl AppContext {
                     db::create_any_pool(&maintenance_db_config, &config.storage.account_db)
                         .await?,
                 );
-                let store: Arc<dyn DistributedStore> =
+                let substrate: Arc<dyn DistributedStore> =
                     Arc::new(PostgresCasStore::new(Arc::clone(&pool)));
                 tracing::info!(
                     max_connections = config.maintenance_pool.max_connections,
                     min_connections = config.maintenance_pool.min_connections,
                     "Distributed-state substrate initialized (Postgres-CAS)"
                 );
-                (Some(pool), Some(store))
+                (Some(pool), Some(substrate))
             }
             DistributedStateMode::SingleInstanceInmemory => {
                 tracing::info!(
@@ -193,6 +197,25 @@ impl AppContext {
                 ));
             }
         };
+
+        // OAuth-state adapter (wraps account_db, not the
+        // maintenance pool) — always present. The underlying
+        // authorization_request table lives in account_db
+        // regardless of substrate mode, and OAuth flows need
+        // cross-instance coherence even in
+        // SingleInstanceInmemory mode (where the substrate
+        // skipping is fine because there are no siblings).
+        let oauth_adapter: Arc<dyn DistributedStore> = Arc::new(
+            crate::oauth::OAuthFlowStateAdapter::new(Arc::new(account_db.clone())),
+        );
+
+        // Registry: consumer-facing facade routing per-table
+        // operations to the right impl. AppContext consumers
+        // depend on Arc<dyn DistributedStore>; the registry
+        // hides the dispatch.
+        let distributed_store: Option<Arc<dyn DistributedStore>> = Some(Arc::new(
+            DistributedStoreRegistry::new(substrate, Arc::clone(&oauth_adapter)),
+        ));
 
         // Initialize account manager
         let account_manager = Arc::new(AccountManager::new(

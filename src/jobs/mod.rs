@@ -429,31 +429,38 @@ impl JobScheduler {
     }
 
     /// Sweep expired OAuth authorization requests every 5
-    /// minutes. Pre-existing sweeper at
-    /// `src/oauth/authorize.rs:cleanup_expired_requests` was
-    /// previously unwired (Step 0 Q1 finding). Arc 7 Step 1
-    /// folds the wiring in alongside the new substrate reaper.
+    /// minutes. Step 1 wired the pre-existing sweeper here
+    /// (Step 0 Q1 finding); Step 2 routes the call through
+    /// the `DistributedStore` trait now that the OAuth adapter
+    /// exists, so the surface stays uniform with the
+    /// `dpop_jti_replay_reaper_job` shape above.
     ///
     /// Not gated on the distributed-state mode — the
     /// `authorization_request` table lives in `account_db`
-    /// regardless of substrate mode, so the sweeper is useful
-    /// even in `SingleInstanceInmemory` deployments.
+    /// regardless of substrate mode, and the registry's OAuth
+    /// adapter is constructed in every mode. The
+    /// `distributed_store` check is a defensive precondition
+    /// matching the substrate reaper.
     async fn oauth_authorization_request_cleanup_job(scheduler: Arc<Self>) {
         let mut interval = interval(Duration::from_secs(300)); // Every 5 minutes
 
         loop {
             interval.tick().await;
-            match crate::oauth::authorize::cleanup_expired_requests(&scheduler.context).await {
+            let Some(store) = scheduler.context.distributed_store.as_ref() else {
+                continue;
+            };
+            let now_epoch_ms = chrono::Utc::now().timestamp_millis();
+            match store.reap_expired("oauth_flow_state", now_epoch_ms).await {
                 Ok(count) if count > 0 => info!(
-                    table = "authorization_request",
+                    table = "oauth_flow_state",
                     count,
-                    "OAuth state cleanup swept expired requests"
+                    "OAuth state reaper swept expired"
                 ),
                 Ok(_) => {}
                 Err(e) => warn!(
-                    table = "authorization_request",
+                    table = "oauth_flow_state",
                     error = %e,
-                    "OAuth state cleanup failed"
+                    "OAuth state reaper failed"
                 ),
             }
         }
