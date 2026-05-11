@@ -6,6 +6,185 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Arc 6 — Aurora Admin UI v0.3 migration (v0.4-cycle)
+
+Eight-step migration of the admin UI to v0.3 wire shapes, with
+modal consolidation, role-management action UI, CLI sentinel
+handling, and backend-side dual-shape observability. Arc 6 is
+the v0.4 cycle's headline arc.
+
+#### Added
+
+- **`AuroraErrorTranslations` module** at
+  `static/admin/scripts/api/error-translations.js`. Server
+  structured-error-code → operator-friendly prose translation
+  consumed by `client.js`'s 4xx rendering path. Seeded with the
+  four v0.3 codes (`SubjectVariantMismatch`,
+  `SubjectTargetMismatch`, `OrphanedAppeal`,
+  `SubjectsArrayInvalidForAction`). [Arc 6 Step 1]
+- **`AuroraModal.form` + `AuroraModal.destructiveConfirm`**
+  static helper API on the existing modal substrate. Promise-
+  returning; supports text/password/textarea/checkbox/select
+  field types; live validation; typed-confirm gates; required
+  rationale; ack checkboxes. [Arc 6 Step 4]
+- **`chainVerified` indicator** on the audit page header with
+  three-state semantics (✓ verified through entry M / ⚠
+  verified through M, failure at M+1 / ✗ failed at entry 1)
+  and click-to-expand inline detail panel surfacing the
+  chain-walk CLI suggestion. [Arc 6 Step 3]
+- **`cascadeSnapshotIds` cascade-subjects rendering** on
+  audit-entry detail. Subjects route via
+  `AuroraEntityRef.fromSubject`; snapshot ids render as inline
+  `<code>`. Section omitted entirely when the entry has no
+  cascade. [Arc 6 Step 3]
+- **`subject_cid` filter** on the audit list. [Arc 6 Step 3]
+- **`timeRange` preset dropdown** on the Dashboard moderation-
+  metrics card (`last_hour` / `last_24h` / `last_7d` /
+  `last_30d`). [Arc 6 Step 3]
+- **`auditEntryId` toast click-through** on 11 success toasts.
+  `AuroraToast` API extended with optional
+  `action: { label, href }` argument; clicking navigates to
+  `#mod/audit/<id>` via the existing hash router. [Arc 6 Step 3]
+- **CLI sentinel rendering** for `cli:`-prefixed actor strings:
+  non-clickable badges across all seven actor-rendering
+  surfaces, applied via a single `EntityRef.account()` patch.
+  [Arc 6 Step 6]
+- **Role-grant affordance** on `SettingsRoles.js` and
+  `SettingsRolesMembers.js`; both consume the new
+  `AuroraModal.form` substrate with `did:` prefix validation +
+  audit-entry click-through toast. [Arc 6 Step 5]
+- **Role-revoke flow with canonical destructive-confirm**:
+  typed-confirm gate `"REVOKE"`, required rationale,
+  audit-entry click-through. The role-revoke is the canonical
+  example in V04_DESIGN §5.3.3. [Arc 6 Steps 4 + 5]
+- **Dual-shape acceptance** on backend admin endpoints:
+  - `tools.aurora.admin.emitEvent` accepts both canonical v0.3
+    `subjects: Vec<Subject>` and legacy v0.2
+    `subject: Subject`.
+  - `com.atproto.admin.updateSubjectStatus` accepts both
+    canonical `record_uri` (snake_case) and legacy `recordUri`
+    (camelCase) on the `RepoBlobRef` subject variant.
+
+  Both reject requests sending both shapes simultaneously with
+  a 400 + explicit error. [Arc 6 Step 7]
+- **Metrics counter `aurora_legacy_wire_ingest_total`** with
+  labels (endpoint, shape, field). Operators query Prometheus
+  to track per-field migration progress. [Arc 6 Step 7]
+- **Structured tracing event** `legacy_wire_shape_ingested`
+  at INFO level with endpoint/shape/field structured fields.
+  [Arc 6 Step 7]
+- **JWT-deprecation middleware wired into the router stack.**
+  Previously defined but never registered as a layer; counter
+  + headers never fired. Step 8 wires it and replaces the
+  broken extractor-extension detection with structural
+  Authorization-header inspection (`token_looks_like_jwt`).
+  [Arc 6 Step 8]
+- **Operator doc**
+  [`docs/operator/v03-wire-deprecation-rollout.md`](docs/operator/v03-wire-deprecation-rollout.md):
+  dual-shape rollout reference for operators with custom UI
+  builds or third-party admin tooling. [Arc 6 Step 7]
+- **Operator doc**
+  [`docs/operator/running-ui-tests.md`](docs/operator/running-ui-tests.md):
+  how to run the admin UI test suite under bare Node ≥ 18.
+  Resolves the "harness invocation isn't documented" friction
+  that recurred across Arc 6 Steps 2-4. [Arc 6 Step 5]
+- **`AURORA_ADMIN_UI_DESIGN.md` §15**: additive prose audit
+  documenting Arc 6 changes against the v0.2-era reference
+  doc. [Arc 6 Step 8]
+
+#### Changed
+
+- **13 native `confirm()` / `prompt()` call sites migrated** to
+  `AuroraModal` helpers per the V04_DESIGN §5.3.3 classification
+  (7 destructive → `destructiveConfirm`; 3 form-input → `form`;
+  3 non-destructive yes/no → `form` with zero fields). The
+  Sequencer.js generic dispatcher path converted blanket; the
+  AccountDetail delete-account flow collapses a two-step
+  prompt+confirm into a single typed-gated modal. [Arc 6 Step 4]
+- **`SettingsGeneral` + `SettingsUiModes`** source-tier
+  rendering: all four `SettingSource` values
+  (Runtime / File / Default / RecoveryMode) render with
+  informational suffixes via a shared `settingSourceSuffix()`
+  helper. Runtime renders bare; the others get muted-italic
+  `(default)` / `(file)` / `(recovery override)` tags. [Arc 6
+  Step 2]
+- **`BulkActionPanel` `MAX_BATCH_SIZE`** switched from singleton
+  constant to per-action lookup
+  (`{ DeleteAccount: 10, DeleteBlob: 25, default: 50 }`).
+  `currentMaxBatchSize()` follows the selected action; existing
+  bulk actions fall through to `default` → 50, preserving
+  pre-Arc-6 behavior. [Arc 6 Step 2]
+- **`ActionPanel.js` payload construction** now emits
+  `subjects: [this.subject]` (v0.3 canonical) rather than
+  `subject: this.subject` (v0.2 legacy). [Arc 6 Step 2]
+- **`AuroraToast.show()` API** gained an optional
+  `opts.action: { label, href }` argument. `isSafeActionHref`
+  guard rejects non-same-origin hrefs defensively. [Arc 6
+  Step 3]
+- **JWT-deprecation middleware detection logic**: replaced the
+  unworking `req.extensions().get::<AuthMethod>()` read (which
+  was always empty pre-`next.run` and unreachable post-) with
+  structural `token_looks_like_jwt(token)` Authorization-header
+  inspection. [Arc 6 Step 8]
+
+#### Removed
+
+- **Dead `failures` field reading** in admin batch-handler
+  response consumers. v0.3's Arc 4 Step 2 made batch handlers
+  atomic (all-or-nothing); the `failures` field is no longer
+  emitted on success responses. UI had no live consumer to
+  remove (one false-positive grep hit on
+  `tools.aurora.ops.getValidationFailures`, unrelated).
+  [Arc 6 Step 2]
+- **`affected_count` partial-success rendering branch** in
+  `BulkActionPanel`. v0.3 atomic-batch semantics mean
+  `affectedCount` is now "total subjects processed"; the prior
+  `'Affected N subject(s), M skipped'` rendering with its
+  `r.skipped` array branch is dead. Reworded to
+  `'Processed N subject(s)'`. [Arc 6 Step 2]
+- **Inverted-OK-Cancel toggle** in `AccountDetail.toggleInvites`:
+  the prior native `confirm()` had OK to disable / Cancel to
+  enable, a routinely-misread cognitive trap. Replaced with an
+  explicit select-field `AuroraModal.form` where the operator
+  picks the target state directly. [Arc 6 Step 4]
+
+#### Deferred
+
+- **Response-header emission** for legacy wire shapes
+  (`Deprecation`, `Sunset`, `Warning`, `X-Wire-Migration-Guide`).
+  The `emit_legacy_wire_headers()` helper substrate is in place
+  at `src/api/middleware.rs`; wiring requires restructuring
+  handler return types from `Json<EmitEventOutput>` to
+  `Response`, which ripples through ~43 pre-existing test call
+  sites across `emit_event` and `update_subject_status`. Counter
+  + structured tracing log alone meet the operator-side
+  observability goal of V04_DESIGN §5.3.6; deferred to v0.5+
+  (federation-aligned since federated PDS consumers of those
+  endpoints benefit from the client-side deprecation signal).
+  Documented in
+  [`docs/operator/v03-wire-deprecation-rollout.md`](docs/operator/v03-wire-deprecation-rollout.md).
+  [Arc 6 Step 7]
+- **Dual-link audit-trail UX on role-tier cards** (V04_DESIGN
+  §5.3.2 option (c)). Requires extending `Audit.js` to parse
+  hash query params on mount or extending the router to surface
+  query params in route-match results — both substrate
+  additions beyond Arc 6's scope. Carryover to v0.5+. [Arc 6
+  Step 5]
+- **Chain-indicator detail panel migration to AuroraModal**.
+  Currently inline-expansion; migrating to `AuroraModal.form`
+  would require extending `form` to accept Node body (chain-
+  indicator detail has HTML content with code blocks). Two
+  substantive changes, not one — deferred. [Arc 6 Step 4]
+- **Backend error shape for `grant_role` / `revoke_role`**:
+  handlers return `(StatusCode, String)` plain text rather
+  than structured JSON, so Step 1's translation layer can't
+  match them on those endpoints. Reshape is its own
+  wire-shape work; carryover to v0.5+. [Arc 6 Step 5]
+- **CI integration for UI tests**: the admin UI test suite
+  (Node `node:test`, 12 tests, ~250ms total) is not invoked
+  by `.github/workflows/ci.yml`. Low-cost to add; flagged for
+  cycle-close audit. [Arc 6 Step 5]
+
 _Future v0.4 cycle work lands here. See
 [`docs/v04-candidates.md`](docs/v04-candidates.md) for the
 named deferrals from v0.3 and the running candidate
