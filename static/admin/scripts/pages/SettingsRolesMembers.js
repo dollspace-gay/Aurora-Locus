@@ -91,30 +91,56 @@
     }
   }
 
-  function openGrant(role) {
-    const div = document.createElement('div');
-    div.innerHTML =
-      '<div class="form-group"><label>Account DID or handle</label><input type="text" id="rmm-grant-target"></div>' +
-      '<div class="form-group"><label>Rationale (required)</label><textarea id="rmm-grant-r" rows="2" style="width:100%;"></textarea></div>' +
-      '<div class="action-panel-buttons">' +
-      '  <button class="btn-secondary" id="rmm-grant-cancel">Cancel</button>' +
-      '  <button class="btn-primary" id="rmm-grant-submit">Grant role</button>' +
-      '</div>';
-    const handle = global.AuroraModal.open({ title: 'Grant ' + role + ' role', body: div });
-    div.querySelector('#rmm-grant-cancel').addEventListener('click', () => handle.close());
-    div.querySelector('#rmm-grant-submit').addEventListener('click', async () => {
-      const target = div.querySelector('#rmm-grant-target').value.trim();
-      const rationale = div.querySelector('#rmm-grant-r').value.trim();
-      if (!target || !rationale) { global.AuroraToast.warning('Target and rationale required.'); return; }
-      try {
-        await global.AuroraEndpoints.superadmin.grantRole({ did: target, role: role, rationale: rationale });
-        global.AuroraToast.success('Role granted.');
-        handle.close();
-        if (global.AuroraRouter) global.AuroraRouter.dispatch();
-      } catch (e) {
-        global.AuroraToast.danger('Grant failed: ' + (e && e.message ? e.message : ''));
-      }
+  async function openGrant(role) {
+    // Mirror of SettingsRoles.js:openGrantModal. The members page
+    // exposes its own "Grant role" entry point on the per-role
+    // detail view; both flows go through the same backend wire
+    // contract { did, role, rationale }. See V04_DESIGN §5.4.5
+    // and the cross-page comment in SettingsRoles.js.
+    const result = await global.AuroraModal.form({
+      heading: 'Grant ' + role + ' role',
+      body: 'Grant this role to a member by DID. The grant lands as one audit-chain entry.',
+      fields: [
+        {
+          name: 'did',
+          label: 'DID',
+          type: 'text',
+          required: true,
+          placeholder: 'did:plc:…',
+          validate: (value) => {
+            if (!value || !value.startsWith('did:')) {
+              return 'DID must start with "did:" (e.g., did:plc:…).';
+            }
+            return null;
+          },
+        },
+        {
+          name: 'rationale',
+          label: 'Rationale (recorded in audit log)',
+          type: 'textarea',
+          required: true,
+        },
+      ],
+      submitLabel: 'Grant role',
     });
+    if (!result.submitted) return;
+    try {
+      const res = await global.AuroraEndpoints.superadmin.grantRole({
+        did: result.values.did,
+        role: role,
+        rationale: result.values.rationale,
+      });
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success('Granted ' + role + ' role to ' + result.values.did + '.', auditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
+      if (global.AuroraRouter) global.AuroraRouter.dispatch();
+    } catch (e) {
+      global.AuroraToast.danger(e && e.message ? e.message : 'Grant failed.');
+    }
   }
 
   function normalize(s) { return String(s || '').toLowerCase().replace(/s$/, ''); }

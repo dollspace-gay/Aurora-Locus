@@ -70,30 +70,65 @@
     }
   }
 
-  function openGrantModal(roleSlug) {
-    const div = document.createElement('div');
-    div.innerHTML =
-      '<div class="form-group"><label>Account DID or handle</label><input type="text" id="grant-target"></div>' +
-      '<div class="form-group"><label>Rationale (required)</label><textarea id="grant-r" rows="2" style="width:100%;"></textarea></div>' +
-      '<div class="action-panel-buttons">' +
-      '  <button class="btn-secondary" id="grant-cancel">Cancel</button>' +
-      '  <button class="btn-primary" id="grant-submit">Grant role</button>' +
-      '</div>';
-    const handle = global.AuroraModal.open({ title: 'Grant ' + roleSlug + ' role', body: div });
-    div.querySelector('#grant-cancel').addEventListener('click', () => handle.close());
-    div.querySelector('#grant-submit').addEventListener('click', async () => {
-      const target = div.querySelector('#grant-target').value.trim();
-      const rationale = div.querySelector('#grant-r').value.trim();
-      if (!target || !rationale) { global.AuroraToast.warning('Target and rationale required.'); return; }
-      try {
-        await global.AuroraEndpoints.superadmin.grantRole({ did: target, role: roleSlug, rationale: rationale });
-        global.AuroraToast.success('Role granted.');
-        handle.close();
-        await mountReload();
-      } catch (e) {
-        global.AuroraToast.danger('Grant failed: ' + (e && e.message ? e.message : ''));
-      }
+  async function openGrantModal(roleSlug) {
+    // Per V04_DESIGN §5.4.5. The form collects the target DID and a
+    // required audit-log rationale. DID prefix is validated
+    // client-side; full DID format is server-authoritative (the
+    // backend rejects invalid DIDs with a 4xx). The kickoff
+    // suggested optional `notes` / `force` fields, but the backend
+    // `GrantRoleRequest` (src/api/admin.rs:807-812) accepts only
+    // { did, role, rationale } — added fields would be ignored
+    // (or rejected with deny_unknown_fields), so the form mirrors
+    // the wire contract.
+    const result = await global.AuroraModal.form({
+      heading: 'Grant ' + roleSlug + ' role',
+      body: 'Grant this role to a member by DID. The grant lands as one audit-chain entry.',
+      fields: [
+        {
+          name: 'did',
+          label: 'DID',
+          type: 'text',
+          required: true,
+          placeholder: 'did:plc:…',
+          validate: (value) => {
+            if (!value || !value.startsWith('did:')) {
+              return 'DID must start with "did:" (e.g., did:plc:…).';
+            }
+            return null;
+          },
+        },
+        {
+          name: 'rationale',
+          label: 'Rationale (recorded in audit log)',
+          type: 'textarea',
+          required: true,
+        },
+      ],
+      submitLabel: 'Grant role',
     });
+    if (!result.submitted) return;
+    try {
+      const res = await global.AuroraEndpoints.superadmin.grantRole({
+        did: result.values.did,
+        role: roleSlug,
+        rationale: result.values.rationale,
+      });
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success('Granted ' + roleSlug + ' role to ' + result.values.did + '.', auditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
+      await mountReload();
+    } catch (e) {
+      // err.message carries Step 1's translated message when the
+      // server returns a structured error code; bare HTTP status
+      // otherwise. No need to hand-prefix "Grant failed:" — the
+      // translation layer or fallback rendering does the right
+      // thing.
+      global.AuroraToast.danger(e && e.message ? e.message : 'Grant failed.');
+    }
   }
 
   async function mountReload() {
