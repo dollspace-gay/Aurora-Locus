@@ -179,3 +179,29 @@
   font-size: var(--font-size-sm);
   overflow-x: auto;
 }
+
+/* Dashboard — moderation metrics header (Arc 6 Step 3 sub-3d).
+ * Hosts the time-range preset selector next to the section title. */
+.metrics-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.metrics-header h3 {
+  margin: 0;
+}
+
+.metrics-range-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.metrics-range-select {
+  font-size: var(--font-size-sm);
+}
