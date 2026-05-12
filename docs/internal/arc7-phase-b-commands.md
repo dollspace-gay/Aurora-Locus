@@ -1,63 +1,77 @@
 # Arc 7 Phase B exercise script
 
-Consolidated verification script for Chrys's Phase B sweep
-against an Aurora-Locus deployment running the Arc 7 substrate.
-Aggregates the per-step verification matrices from
-`/tmp/arc7_step1_report.md` through
-`/tmp/arc7_step4_report.md` into a single coherent run-through,
-plus the mode-coverage matrix from Step 3's report.
-
-Mirrors the per-arc convention established by
-[`arc6-phase-b-script.md`](arc6-phase-b-script.md). Sections A
-through J cover the substantive code surfaces; the Setup
-section bootstraps the credentials reused throughout.
+Localhost smoke-test script for Chrys's Phase B sweep of Arc 7
+(`chainlink #53` — Multi-instance auth state + rate limiting).
+Mirrors the Arc 6 convention at
+[`arc6-phase-b-script.md`](arc6-phase-b-script.md): curl
+against `localhost:2583`, `sqlite3 data/account.sqlite` for DB
+inspection, PDS restarts via env-var toggle, no deployment
+framing.
 
 ## Prerequisites
 
-- A Postgres instance reachable by the PDS process. Distributed
-  mode is the default and the load-bearing path; SingleInstance
-  mode falls back to in-memory state for the two migrated
-  surfaces.
-- Branch `skydeval/v0.4-cycle` at the Step 4 tip (post-CHANGELOG
-  commit) or later.
-- Docker daemon access — only required for re-running
-  `cargo test --test distributed_substrate_test` per Section J;
-  the manual exercises run against a single live PDS.
-- `psql` against the same Postgres the PDS uses, for the
-  cross-instance simulation exercises and DB inspection.
-- `jq` and `curl` for the HTTP-level exercises.
+- Working directory: the Aurora-Locus checkout (WSL path on
+  Chrys's environment).
+- Branch `skydeval/v0.4-cycle` at the Arc 7 Phase B tip or
+  later.
+- A free port 2583 (default `PDS_PORT`).
+- `curl` and `jq` on the dev machine.
+- `sqlite3` on the dev machine (the default backend is SQLite at
+  `data/account.sqlite`).
 
-Staged-data exercises (Sections A3, E1-3, F2-3) are called out
-inline. Where Arc 7's cross-instance correctness can't be
-exercised by a single-PDS Phase B, the script documents the
-substrate-level test (`tests/distributed_substrate_test.rs`)
-as the canonical proof and uses `psql` to simulate
-"instance B" against the shared table.
+### SQLite vs Postgres caveat
+
+Aurora-Locus's local-dev default backend is **SQLite**. Arc 7's
+distributed-state substrate is designed for **Postgres
+multi-instance** deployments, but the SQL it uses is portable
+via `sqlx::Any` — the substrate tables exist and the trait
+operations behave identically on SQLite. Phase B exercises the
+substrate's single-instance behaviour (atomic inserts,
+version-based CAS, reaper sweeps) against the local SQLite
+file.
+
+**Cross-instance correctness** (the load-bearing reason
+Arc 7 exists) was verified during Steps 1-3 by `cargo test
+--test distributed_substrate_test` running against
+testcontainers Postgres. That covers the
+JTI-accepted-on-A-rejected-on-B / bucket-exhausted-on-A-
+visible-on-B properties. Localhost Phase B doesn't re-prove
+those — it confirms the substrate operations work end-to-end
+against a real PDS handling real curl traffic. Section J
+re-runs the integration tests if you want fresh
+cross-instance proof.
+
+If you want to exercise Arc 7 against local Postgres
+specifically, set `PDS_DB_BACKEND=postgres` and
+`PDS_DB_URL=postgres://...` before `cargo run -- serve`. All
+the curl and sqlite3 commands below assume the default
+SQLite path; swap `sqlite3 data/account.sqlite` for
+`psql $PDS_DB_URL` if running against Postgres.
 
 ---
 
 ## Setup (one-time per Phase B session)
 
-### Start the PDS in Distributed mode (default)
+### Start the PDS in default mode
 
-Distributed mode is the default. No env var needs to be set for
-the substrate-on path:
+Default mode is `Distributed` (Step 1's config wiring landed
+this). The substrate is constructed; the JTI replay reaper,
+OAuth state cleanup, and rate-limit bucket reaper jobs all
+spawn at startup.
 
 ```bash
-PDS_HOSTNAME=localhost \
-PDS_PORT=2583 \
-PDS_DB_BACKEND=postgres \
-PDS_DB_URL=postgres://aurora:aurora@localhost:5432/aurora \
 cargo run --release -- serve
 ```
 
 Expected log lines on startup:
-- `Distributed-state substrate initialized (Postgres-CAS)`
-  with `max_connections=15 min_connections=2`.
-- `dpop_jti_replay reaper job started`.
-- `rate_limit_buckets reaper job started`.
-- `OAuth authorization_request cleanup job started`.
-- `🚀 Aurora Locus PDS listening on 0.0.0.0:2583`.
+
+```
+Distributed-state substrate initialized (Postgres-CAS) max_connections=15 min_connections=2
+dpop_jti_replay reaper job started
+OAuth authorization_request cleanup job started
+rate_limit_buckets reaper job started
+🚀 Aurora Locus PDS listening on 0.0.0.0:2583
+```
 
 ### Verify it's up
 
@@ -65,7 +79,7 @@ Expected log lines on startup:
 curl -s http://localhost:2583/health | jq
 ```
 
-Expected: `200 OK` with health-status JSON.
+Expected: `{"status":"ok",...}`.
 
 ### Create a test account
 
@@ -76,288 +90,279 @@ curl -s -X POST http://localhost:2583/xrpc/com.atproto.server.createAccount \
   | jq
 ```
 
-Expected: `200 OK` with `did`, `handle`, and `accessJwt`. Save
-the DID for later (e.g., `did:plc:alice...`).
+Expected: 200 with `did`, `handle`, `accessJwt`. Save the DID
+(format `did:plc:...`) for later if Chrys's existing local
+state doesn't already have one.
 
 ### Grant SuperAdmin
 
+(Skip if Chrys's local state already has a SuperAdmin from
+prior Phase B sessions.)
+
 ```bash
 cargo run --release -- grant-admin \
-  --did did:plc:alice... \
+  --did did:plc:<from-above> \
   --role SuperAdmin \
   --notes "Phase B sweep"
 ```
 
-Expected: success message; the audit chain entry is written.
+Expected: success message; audit chain entry written.
 
-### Mint a session JWT
+### Mint the session JWT
 
 ```bash
 SESSION=$(curl -s -X POST http://localhost:2583/xrpc/com.atproto.server.createSession \
   -H 'Content-Type: application/json' \
   -d '{"identifier":"alice.localhost","password":"TestPassword123!"}')
 export ADMIN_TOKEN=$(echo "$SESSION" | jq -r '.accessJwt')
-echo "${ADMIN_TOKEN:0:32}..."
+echo "Token prefix: ${ADMIN_TOKEN:0:32}..."
 ```
 
-Expected: a `eyJ...` prefix (JWT). Token lasts ~1 hour.
-Re-mint via `createSession` if mid-sweep.
-
-### Optional: maintenance pool sizing override
-
-The defaults (15 max / 2 min / 10s acquire-timeout) are tuned
-for the typical Phase-B scale. To exercise the override path
-in Section G3:
-
-```bash
-PDS_MAINTENANCE_DB_MAX_CONNECTIONS=5 \
-PDS_MAINTENANCE_DB_MIN_CONNECTIONS=1 \
-PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS=5 \
-cargo run --release -- serve
-```
-
-(restart required — env vars are read at startup).
+Expected: an `eyJ...` prefix. Token lasts ~1 hour; re-mint via
+the same command if it expires mid-sweep.
 
 ---
 
 ## Section A — DPoP JTI replay (distributed mode)
 
-### A1. Single-instance baseline: JTI recorded on first sighting
+DPoP JTI replay tracking is a per-authenticated-request path
+that requires a DPoP keypair + signed proof on each request.
+Exercising the full HTTP-level path via curl requires
+scripting the DPoP ceremony (P-256 keypair, JWT signing,
+PKCE), which is impractical for a Phase B smoke test.
 
-Issue an authenticated DPoP-bound request. The simplest path is
-the OAuth token endpoint with a fresh DPoP proof — the existing
-`DPopVerifier` exercises the JTI replay path on every
-authenticated request.
+Phase B instead exercises the **substrate operations directly
+via SQL**, matching exactly what
+`DPopNonceStore.check_and_record_jti` does internally in
+`Distributed` mode. The full HTTP-level path is covered by
+`src/federation/dpop.rs`'s 21 inline tests + the
+substrate-level integration test
+`tests/distributed_substrate_test.rs::cross_instance_dpop_jti_replay_rejection`.
 
-For Phase B, the easier exercise is to simulate via direct SQL:
-the substrate's `dpop_jti_replay` table is the load-bearing
-artifact.
+### A1. Substrate INSERT records a JTI
+
+Simulate "instance accepted a JTI" via the same INSERT shape
+the substrate uses:
 
 ```bash
-# Insert a JTI (simulating a successful first verification).
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 INSERT INTO dpop_jti_replay (jti, jkt, exp_at_epoch_ms, created_at_epoch_ms)
-VALUES ('phase-b-jti-1', 'thumb-a',
-        extract(epoch from now())::bigint * 1000 + 60000,
-        extract(epoch from now())::bigint * 1000);"
+VALUES (
+  'phase-b-jti-1',
+  'thumb-a',
+  CAST(strftime('%s','now') AS INTEGER) * 1000 + 60000,
+  CAST(strftime('%s','now') AS INTEGER) * 1000
+);
+"
 ```
 
-Confirm insertion:
+Confirm:
 
 ```bash
-psql $PDS_DB_URL -c "
-SELECT jti, jkt, exp_at_epoch_ms, created_at_epoch_ms
-FROM dpop_jti_replay WHERE jti = 'phase-b-jti-1';"
+sqlite3 data/account.sqlite "
+SELECT jti, jkt FROM dpop_jti_replay WHERE jti = 'phase-b-jti-1';
+"
 ```
 
-Expected: one row. **Ready to exercise.**
+Expected: `phase-b-jti-1|thumb-a`.
 
-### A2. Replay rejection: same JTI on a second attempt
+### A2. Replay rejection: duplicate INSERT fails
 
-Re-attempt the same insert via the substrate's `insert` path —
-this is what `check_and_record_jti` does internally. Simulate
-the second-attempt path:
+Re-run A1's INSERT. The `dpop_jti_replay` table's TEXT PRIMARY
+KEY on `jti` rejects the duplicate; SQLite returns
+`SQLITE_CONSTRAINT_PRIMARYKEY` (extended code 1555).
 
 ```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 INSERT INTO dpop_jti_replay (jti, jkt, exp_at_epoch_ms, created_at_epoch_ms)
-VALUES ('phase-b-jti-1', 'thumb-a',
-        extract(epoch from now())::bigint * 1000 + 60000,
-        extract(epoch from now())::bigint * 1000);"
+VALUES (
+  'phase-b-jti-1',
+  'thumb-a',
+  CAST(strftime('%s','now') AS INTEGER) * 1000 + 60000,
+  CAST(strftime('%s','now') AS INTEGER) * 1000
+);
+"
 ```
 
-Expected: Postgres returns
-`duplicate key value violates unique constraint
-"dpop_jti_replay_pkey"`. SQLSTATE `23505`. This is what the
-substrate translates to `DistributedError::KeyExists` →
-`check_and_record_jti` returns `Ok(false)` → verifier returns
-`Authentication("DPoP proof jti replay or expired")`. **Ready
-to exercise.**
-
-### A3. Cross-instance replay simulation
-
-True cross-instance verification requires two PDS processes
-against the same Postgres. The substrate-level integration test
-(`tests/distributed_substrate_test.rs::cross_instance_dpop_jti_replay_rejection`)
-exercises this against testcontainers Postgres. Phase B
-simulates by directly inserting "instance A's accept" into the
-shared table, then attempting to issue a DPoP proof with that
-JTI from "this PDS" (mimicking instance B):
-
-```bash
-# "Instance A" accepted JTI 'phase-b-cross-jti'.
-psql $PDS_DB_URL -c "
-INSERT INTO dpop_jti_replay (jti, jkt, exp_at_epoch_ms, created_at_epoch_ms)
-VALUES ('phase-b-cross-jti', 'thumb-instance-a',
-        extract(epoch from now())::bigint * 1000 + 60000,
-        extract(epoch from now())::bigint * 1000);"
-```
-
-Then issue an authenticated request with a DPoP proof whose
-JTI equals `phase-b-cross-jti`. The verifier's
-`check_and_record_jti` calls `store.insert(...)`, which returns
-`KeyExists` (SQLSTATE 23505), and the request is rejected with
+Expected: `Runtime error: UNIQUE constraint failed:
+dpop_jti_replay.jti`. This is what the substrate translates to
+`DistributedError::KeyExists`, which `check_and_record_jti`
+maps to `Ok(false)`, which the verifier maps to
 `Authentication("DPoP proof jti replay or expired")`.
 
-**Construction cost**: producing a valid DPoP proof with a
-chosen JTI is non-trivial (requires ES256 keypair, manual
-signing). For Phase B sweep purposes, the substrate-level
-correctness is the load-bearing proof; the manual exercise is
-satisfied by confirming A2's `KeyExists` translation works
-(same code path).
+### A3. Reaper sweeps expired rows
 
-**Documented limitation**: single-PDS Phase B cannot directly
-exercise the full cross-instance proof path; the integration
-test does. If true HTTP-level cross-instance verification is
-required, spin up a second PDS against the same Postgres
-following the Setup section.
-
-### A4. Reaper sweep deletes expired rows
-
-Insert an expired JTI:
+Stage an expired row (exp_at_epoch_ms in the past):
 
 ```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 INSERT INTO dpop_jti_replay (jti, jkt, exp_at_epoch_ms, created_at_epoch_ms)
-VALUES ('phase-b-stale-jti', 'thumb-stale',
-        extract(epoch from now())::bigint * 1000 - 60000,
-        extract(epoch from now())::bigint * 1000 - 120000);"
+VALUES (
+  'phase-b-stale-jti',
+  'thumb-stale',
+  CAST(strftime('%s','now') AS INTEGER) * 1000 - 60000,
+  CAST(strftime('%s','now') AS INTEGER) * 1000 - 120000
+);
+"
 ```
 
-The dpop_jti_replay reaper runs every 300s. Either wait, or
-manually trigger via SQL to confirm the sweep predicate:
+The reaper runs every 300s. Either wait, or simulate the
+predicate directly to confirm the SQL shape:
 
 ```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 DELETE FROM dpop_jti_replay
-WHERE exp_at_epoch_ms < extract(epoch from now())::bigint * 1000;"
+WHERE exp_at_epoch_ms < CAST(strftime('%s','now') AS INTEGER) * 1000;
+"
 ```
 
-Then confirm:
+Confirm:
 
 ```bash
-psql $PDS_DB_URL -c "
-SELECT jti FROM dpop_jti_replay WHERE jti = 'phase-b-stale-jti';"
+sqlite3 data/account.sqlite "
+SELECT jti FROM dpop_jti_replay WHERE jti = 'phase-b-stale-jti';
+"
 ```
 
-Expected: zero rows. **Ready to exercise** with manual reap.
+Expected: zero rows. The active row from A1 also went if its
+`exp_at_epoch_ms` was past `now`; that's correct sweep behaviour.
 
-Confirm the in-process reaper runs by checking
-`background_jobs_total` (see Section J for `/metrics` scrape):
+### Cross-instance verification
 
-```bash
-curl -s http://localhost:2583/metrics | grep -E 'background_jobs_total{[^}]*dpop'
-```
-
-Expected: a counter present (success or failed). If status is
-`success` and count climbs over time, the reaper is alive.
+Single-PDS localhost can't exercise cross-instance JTI
+rejection (no sibling instance to reject from). The
+substrate-level integration test
+`cross_instance_dpop_jti_replay_rejection` against
+testcontainers Postgres covers that property; re-run via
+Section J's J2 if you want fresh proof.
 
 ---
 
-## Section B — DPoP JTI replay (single-instance-inmemory mode)
+## Section B — DPoP JTI replay (single_instance_inmemory mode)
 
-### B1. Restart PDS in single-instance-inmemory mode
+In this mode, JTI state lives in `DPopNonceStore.nonces`
+(in-memory `HashMap`). No substrate table writes.
+
+### B1. Restart PDS in single_instance_inmemory mode
+
+Stop the running PDS (`Ctrl-C` or `kill`).
 
 ```bash
-PDS_HOSTNAME=localhost \
-PDS_PORT=2583 \
-PDS_DB_BACKEND=postgres \
-PDS_DB_URL=postgres://aurora:aurora@localhost:5432/aurora \
 PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory \
 cargo run --release -- serve
 ```
 
-Expected log lines on startup:
-- `Distributed-state substrate disabled
-  (PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory) —
-  auth state lost on restart`.
-- NO `Distributed-state substrate initialized` log.
-- Reapers (dpop_jti_replay, rate_limit_buckets) still spawn but
-  no-op when they tick (the loop's `let Some(store) = ... else
-  { continue; };` guard).
+Expected log line on startup:
 
-### B2. JTI tracked in-memory only
-
-Re-mint the session JWT (token may have expired across
-restart).
-
-The in-memory `DPopNonceStore.nonces` HashMap is the JTI tracker
-in this mode. Issue an authenticated request; the JTI is added
-to the in-memory map; no row appears in `dpop_jti_replay`:
-
-```bash
-# Confirm the substrate table is untouched in this mode.
-psql $PDS_DB_URL -c "SELECT COUNT(*) FROM dpop_jti_replay;"
+```
+Distributed-state substrate disabled (PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory) — auth state lost on restart
 ```
 
-Expected: zero rows (assuming the table was reset between A4 and
-B1, or filter for `created_at_epoch_ms > $RESTART_TIME`).
+NO `Distributed-state substrate initialized` log. The reaper
+jobs still spawn (loop guards skip the sweep when
+`distributed_store` is `None`).
 
-**Documented limitation**: Phase B can't directly observe the
-in-memory HashMap from outside the process; the absence of new
-rows in `dpop_jti_replay` is the proof that the in-memory path
-is engaged.
+Re-mint `$ADMIN_TOKEN` via Setup's createSession command —
+the prior token is still valid (session table is DB-backed),
+but exporting again is cheap.
 
-### B3. Restart-loss check
+### B2. In-memory path leaves the substrate table untouched
 
-In this mode, JTI state is lost across restart (the in-memory
-map doesn't persist). This is the documented trade-off — the
-operator opts into restart loss for hot-path latency savings.
+Snapshot the row count before any auth traffic:
 
-Test: issue an authenticated request → JTI accepted. Restart
-PDS. Issue the SAME request again with the same DPoP proof
-(same JTI). Expected outcome: the JTI is accepted again (no
-record of the prior acceptance survives the restart).
+```bash
+sqlite3 data/account.sqlite "
+SELECT COUNT(*) FROM dpop_jti_replay;
+" > /tmp/jti_before.txt
+cat /tmp/jti_before.txt
+```
 
-This is **correct behaviour** for `single_instance_inmemory`
-mode and **not a regression**. Operators who can't tolerate
-this should use `distributed` mode.
+Issue an authenticated request:
 
-**Ready to exercise** (but the practical observation is
-indirect — see Section B2 limitation).
+```bash
+curl -s http://localhost:2583/xrpc/com.atproto.server.describeServer \
+  -H "Authorization: Bearer $ADMIN_TOKEN" > /dev/null
+```
+
+Confirm the count is unchanged:
+
+```bash
+sqlite3 data/account.sqlite "
+SELECT COUNT(*) FROM dpop_jti_replay;
+" > /tmp/jti_after.txt
+diff /tmp/jti_before.txt /tmp/jti_after.txt && echo "unchanged"
+```
+
+Expected: `unchanged`. The in-memory `HashMap` is the JTI
+tracker in this mode; no rows written to the substrate
+table.
+
+### B3. In-memory replay rejection
+
+Replay rejection still works in this mode — it just lives in
+process memory. From the same PDS process (without restart),
+the in-memory map catches duplicate JTIs. The full HTTP-level
+exercise has the same DPoP-ceremony complexity as Section A;
+the inline unit tests
+`test_check_and_record_jti_replay_rejected` and
+`test_check_and_record_jti_already_expired_rejected` in
+`src/federation/dpop.rs` cover this.
+
+### B4. Restart loses in-memory state
+
+Stop the PDS. Confirm `dpop_jti_replay`'s row count is still
+whatever it was before B1 (nothing flushed to the table on
+shutdown).
+
+Restart again in the same in-memory mode. Any JTI accepted
+before the restart would now be accepted again — there's no
+persistent record. This is the documented trade-off of
+`single_instance_inmemory` mode and **not a regression**.
+
+### Restart back to default mode
+
+Stop the PDS. Restart in default `Distributed` mode for the
+rest of the script:
+
+```bash
+cargo run --release -- serve
+```
+
+Re-mint `$ADMIN_TOKEN`.
 
 ---
 
 ## Section C — Rate-limit middleware (distributed mode)
 
-Switch back to default `distributed` mode for this section:
-
-```bash
-PDS_HOSTNAME=localhost PDS_PORT=2583 \
-PDS_DB_BACKEND=postgres \
-PDS_DB_URL=postgres://aurora:aurora@localhost:5432/aurora \
-cargo run --release -- serve
-```
-
-Re-mint `ADMIN_TOKEN` per Setup.
+The distributed rate-limit pre-check (Step 3) runs in the
+middleware before the existing in-process governor. Each
+authenticated request hits a bucket keyed by the endpoint
+path. The full curl+SQL exercise covers C1-C4 cleanly; C5
+(substrate-consult fall-through) is skipped — see C5 below.
 
 ### C1. First-touch bucket creation
 
-Hit any endpoint behind the rate-limit middleware. The
-distributed pre-check runs against a bucket keyed by the path:
+Pick an endpoint and hit it once:
 
 ```bash
 curl -s http://localhost:2583/xrpc/com.atproto.server.describeServer \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  | jq
+  -H "Authorization: Bearer $ADMIN_TOKEN" > /dev/null
 ```
 
-Confirm the bucket appeared:
+Confirm the bucket appeared with first-touch state:
 
 ```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 SELECT bucket_key, tokens_remaining, max_tokens, refill_rate, version
 FROM rate_limit_buckets
-WHERE bucket_key LIKE 'endpoint|%';"
+WHERE bucket_key = 'endpoint|/xrpc/com.atproto.server.describeServer';
+"
 ```
 
-Expected: at least one row with `bucket_key =
-'endpoint|/xrpc/com.atproto.server.describeServer'`,
-`max_tokens = 100`, `refill_rate = 100`, `tokens_remaining = 99`
-(or similar — depends on how many requests have already gone
-through). `version = 0` for first-touch. **Ready to exercise.**
+Expected: one row with `tokens_remaining=99` (max=100 minus
+cost=1), `max_tokens=100`, `refill_rate=100`, `version=0`.
 
-### C2. Decrement on subsequent requests
+### C2. Subsequent requests decrement tokens_remaining
 
 Hit the same endpoint several more times:
 
@@ -371,206 +376,211 @@ done
 Re-query:
 
 ```bash
-psql $PDS_DB_URL -c "
-SELECT bucket_key, tokens_remaining, version
+sqlite3 data/account.sqlite "
+SELECT tokens_remaining, version
 FROM rate_limit_buckets
-WHERE bucket_key = 'endpoint|/xrpc/com.atproto.server.describeServer';"
+WHERE bucket_key = 'endpoint|/xrpc/com.atproto.server.describeServer';
+"
 ```
 
-Expected: `tokens_remaining` has decreased; `version` has
-increased by the number of consumes. **Ready to exercise.**
+Expected: `tokens_remaining` lower than after C1 (`99 - 5 + refill`
+within the elapsed time — at 100 tokens/sec, the count drops by
+roughly the number of requests minus the refill); `version`
+incremented by the number of UPDATEs.
 
-### C3. Refill recovery over time
+### C3. Refill recovers capacity
 
-Wait 2 seconds (the refill rate is 100 tokens/sec; in 2s a
-fully-drained bucket should be fully refilled). Hit the
-endpoint once:
+Wait 2 seconds (100 tokens/sec × 2s = 200 tokens of refill,
+capped at max=100 so the bucket fully refills):
 
 ```bash
 sleep 2
 curl -s http://localhost:2583/xrpc/com.atproto.server.describeServer \
   -H "Authorization: Bearer $ADMIN_TOKEN" > /dev/null
-psql $PDS_DB_URL -c "
-SELECT tokens_remaining, window_start_at_epoch_ms
-FROM rate_limit_buckets
-WHERE bucket_key = 'endpoint|/xrpc/com.atproto.server.describeServer';"
+sqlite3 data/account.sqlite "
+SELECT tokens_remaining FROM rate_limit_buckets
+WHERE bucket_key = 'endpoint|/xrpc/com.atproto.server.describeServer';
+"
 ```
 
-Expected: `tokens_remaining = 99` (refilled to max=100, minus
-the one request just made), `window_start_at_epoch_ms` updated
-to the current epoch-ms. **Ready to exercise.**
+Expected: `99` (refilled to max=100, minus the one request just
+made). `window_start_at_epoch_ms` updated to current time.
 
 ### C4. Exhaustion returns 429
 
-Hammer the endpoint until the bucket exhausts. With 100
-tokens/sec refill and 100 max_tokens, exhausting requires
-sending requests substantially faster than 100/sec:
+Hammer the endpoint above the refill rate:
 
 ```bash
-for i in $(seq 1 200); do
+for i in $(seq 1 300); do
   curl -s -o /dev/null -w "%{http_code}\n" \
     http://localhost:2583/xrpc/com.atproto.server.describeServer \
     -H "Authorization: Bearer $ADMIN_TOKEN"
 done | sort | uniq -c
 ```
 
-Expected output: a count of `200`s and some `429`s. The
-distributed pre-check or the in-process governor (whichever
-fires first) returns 429 with `Retry-After: 1`. The 429
-response body is `Too Many Requests`. **Ready to exercise.**
+Expected: a mix of `200` and `429` responses. The 429 comes with
+`Retry-After: 1` and body `Too Many Requests`. The 200/429 split
+depends on machine speed — slower hosts see more 200s (refill
+keeps up); fast hosts see more 429s.
 
-### C5. Substrate-consult fall-through (non-fatal)
+### C5. Substrate-consult fall-through — skipped
 
-Per Step 3's design: if the distributed-store consult fails on
-the rate-limit hot path, the request continues via the
-governor's per-instance defense rather than failing closed.
+Per Step 3's design, if the distributed-store consult fails on
+the rate-limit hot path, the request falls through to the
+governor's per-instance defense (logged as `warn`, not 503'd).
+Simulating Postgres unavailability mid-request against a local
+SQLite-backed PDS isn't practical — the substrate IS the
+SQLite file the application uses for everything else; "killing"
+it means stopping the PDS entirely.
 
-Simulate by killing the maintenance pool's connections via
-`pg_terminate_backend`:
-
-```bash
-# Find the PDS's connection PIDs.
-psql $PDS_DB_URL -c "
-SELECT pid, application_name, client_addr
-FROM pg_stat_activity
-WHERE datname = current_database()
-  AND state = 'idle'
-ORDER BY backend_start;"
-
-# Terminate a few (operator's choice; the pool reconnects on next use).
-# Then issue a request immediately.
-curl -s http://localhost:2583/xrpc/com.atproto.server.describeServer \
-  -H "Authorization: Bearer $ADMIN_TOKEN" -o /dev/null -w "%{http_code}\n"
-```
-
-Expected: the request returns `200` even with maintenance-pool
-disruption. Check the PDS log for a warn-level message
-containing
-`distributed rate-limit consult failed, falling through to
-governor`. The bucket may show stale state until the pool
-recovers; subsequent requests resume the substrate path
-seamlessly. **Ready to exercise** (advanced — requires
-DBA-style intervention).
-
-**Note**: this is a graceful-degradation test, not a stress
-test. Sustained fall-through means the substrate is degraded;
-brief windows are tolerable.
+The non-fatal fall-through behaviour is verified by the unit
+tests in `src/rate_limit.rs::distributed_tests` + the
+substrate-level integration tests in
+`tests/distributed_substrate_test.rs`. **Skip C5 for localhost
+Phase B**; this is intentional.
 
 ---
 
-## Section D — Rate-limit middleware (single-instance-inmemory mode)
+## Section D — Rate-limit middleware (single_instance_inmemory mode)
 
-### D1. Restart PDS in single-instance-inmemory mode
+### D1. Restart in single-instance mode; governor-only path
 
-Same restart as Section B1.
-
-After restart, hit an endpoint:
+Stop the PDS. Restart:
 
 ```bash
-curl -s http://localhost:2583/xrpc/com.atproto.server.describeServer \
-  -H "Authorization: Bearer $ADMIN_TOKEN" > /dev/null
+PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory \
+cargo run --release -- serve
 ```
 
-Confirm no new rows in `rate_limit_buckets`:
+Re-mint `$ADMIN_TOKEN` if needed.
+
+Snapshot the rate_limit_buckets count:
 
 ```bash
-psql $PDS_DB_URL -c "
-SELECT COUNT(*), MAX(window_start_at_epoch_ms)
-FROM rate_limit_buckets;"
+sqlite3 data/account.sqlite "
+SELECT COUNT(*) FROM rate_limit_buckets;
+" > /tmp/buckets_before.txt
+cat /tmp/buckets_before.txt
 ```
 
-Expected: the COUNT is whatever was there at restart (the table
-isn't wiped); the MAX of `window_start_at_epoch_ms` is from
-before the restart, NOT advancing on each new request. Rate
-limit enforcement comes from the in-process governor only in
-this mode. **Ready to exercise.**
+Hit a few endpoints:
+
+```bash
+for i in 1 2 3 4 5; do
+  curl -s http://localhost:2583/xrpc/com.atproto.server.describeServer \
+    -H "Authorization: Bearer $ADMIN_TOKEN" > /dev/null
+done
+```
+
+Confirm no new rows:
+
+```bash
+sqlite3 data/account.sqlite "
+SELECT COUNT(*) FROM rate_limit_buckets;
+" > /tmp/buckets_after.txt
+diff /tmp/buckets_before.txt /tmp/buckets_after.txt && echo "unchanged"
+```
+
+Expected: `unchanged`. The governor handles rate limiting
+in-process; no substrate-table writes.
+
+### Restart back to default mode
+
+Stop the PDS. Restart in default `Distributed` mode:
+
+```bash
+cargo run --release -- serve
+```
 
 ---
 
 ## Section E — Rate-limit bucket reaper
 
-Switch back to default `distributed` mode.
+The reaper sweeps inactive buckets (window_start_at_epoch_ms
+older than 7 days) every hour. Phase B simulates the
+predicate directly rather than waiting an hour.
 
-### E1. Stage an inactive bucket (8 days old)
+### E1. Stage an inactive bucket
 
 ```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 INSERT INTO rate_limit_buckets
   (bucket_key, tokens_remaining, max_tokens, refill_rate,
    window_start_at_epoch_ms, version)
-VALUES
-  ('endpoint|/xrpc/phase-b-stale-bucket', 0, 100, 100,
-   extract(epoch from now())::bigint * 1000 - 8*24*3600*1000, 0);"
+VALUES (
+  'endpoint|/xrpc/phase-b-stale-bucket',
+  0, 100, 100,
+  CAST(strftime('%s','now') AS INTEGER) * 1000 - 8 * 24 * 3600 * 1000,
+  0
+);
+"
 ```
 
-### E2. Stage an active bucket (1 day old)
+### E2. Stage an active bucket
 
 ```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 INSERT INTO rate_limit_buckets
   (bucket_key, tokens_remaining, max_tokens, refill_rate,
    window_start_at_epoch_ms, version)
-VALUES
-  ('endpoint|/xrpc/phase-b-active-bucket', 50, 100, 100,
-   extract(epoch from now())::bigint * 1000 - 1*24*3600*1000, 0);"
+VALUES (
+  'endpoint|/xrpc/phase-b-active-bucket',
+  50, 100, 100,
+  CAST(strftime('%s','now') AS INTEGER) * 1000 - 1 * 24 * 3600 * 1000,
+  0
+);
+"
 ```
 
-### E3. Trigger the reaper or wait
+### E3. Simulate the reaper sweep
 
-The `rate_limit_buckets` reaper runs hourly (`Duration::from_secs(3600)`).
-Either wait an hour, or simulate the sweep predicate manually:
+Either wait an hour (Phase B time isn't free) or run the
+predicate directly:
 
 ```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 DELETE FROM rate_limit_buckets
 WHERE window_start_at_epoch_ms <
-      extract(epoch from now())::bigint * 1000 - 7*24*3600*1000;"
+      CAST(strftime('%s','now') AS INTEGER) * 1000 - 7 * 24 * 3600 * 1000;
+"
 ```
 
 Confirm:
 
 ```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 SELECT bucket_key FROM rate_limit_buckets
-WHERE bucket_key LIKE 'endpoint|/xrpc/phase-b-%-bucket';"
+WHERE bucket_key LIKE 'endpoint|/xrpc/phase-b-%-bucket';
+"
 ```
 
-Expected: only `phase-b-active-bucket` remains; the stale row
-is gone. **Ready to exercise** with manual reap simulation.
+Expected: only `phase-b-active-bucket` remains. The stale
+8-days-ago row is gone.
 
-If you want to confirm the in-process reaper itself runs (not
-just the predicate), check the reaper's startup log line at
-PDS boot (`rate_limit_buckets reaper job started`) and the
-`background_jobs_total{job_type="..."}` counter:
+To confirm the actual in-process reaper is alive (rather than
+just the SQL predicate working), check the
+`background_jobs_total` Prometheus counter:
 
 ```bash
-curl -s http://localhost:2583/metrics \
-  | grep -E 'background_jobs_total{.*}'
+curl -s http://localhost:2583/metrics | grep -E 'background_jobs_total{' | head -10
 ```
 
-Expected: a counter with `job_type` labels matching the
-reapers; sustained success counts confirm the loop is alive.
-
-**Documented workaround**: no CLI exists to fire the reaper
-manually; SQL simulation is the practical Phase-B path. If
-an out-of-process trigger is desired in v0.6, it would be a
-`debug` CLI subcommand similar to the existing
-`aurora-locus debug verify-audit-chain`.
+Expected: counter entries with `job_type` labels matching the
+running reapers; sustained `status="success"` counts confirm
+the loops are alive.
 
 ---
 
 ## Section F — OAuth flow state adapter
 
-### F1. Single-instance OAuth flow happy path
+The `OAuthFlowStateAdapter` (Step 2) wraps the existing
+`authorization_request` table; it's always constructed, in
+either mode.
 
-Initiate the authorize endpoint, grant consent, redeem the
-code. The OAuth handler routes through the `OAuthFlowStateAdapter`
-in any mode (the adapter is always constructed — see Step 2
-report).
+### F1. Initiate authorize endpoint, confirm row appears
 
 ```bash
-# Step 1: authorize endpoint (creates the authorization_request row).
-curl -s "http://localhost:2583/oauth/authorize?\
+curl -s -i "http://localhost:2583/oauth/authorize?\
 response_type=code&\
 client_id=test-client&\
 redirect_uri=http://localhost:8080/cb&\
@@ -578,136 +588,90 @@ scope=atproto&\
 code_challenge=abc123_challenge&\
 code_challenge_method=S256&\
 state=phase-b-csrf" \
-  -i | head -10
+  | head -10
 ```
 
-Expected: a 302 redirect to `/oauth/consent?request_id=<UUID>`.
-The substrate's `insert` was invoked under the hood. Capture
-the `request_id` from the redirect URL.
+Expected: a `302 Found` redirect to
+`/oauth/consent?request_id=<UUID>`. Capture the `request_id`
+value.
 
-Confirm the row exists:
+Confirm the row:
 
 ```bash
-psql $PDS_DB_URL -c "
-SELECT request_id, did, code_used, expires_at
+sqlite3 data/account.sqlite "
+SELECT request_id, did, client_id, code_used, expires_at
 FROM authorization_request
-WHERE request_id = '<UUID>';"
+WHERE request_id = '<paste-request-id-here>';
+"
 ```
 
-Expected: one row, `code_used = false`,
-`expires_at = created_at + 10min`. **Ready to exercise.**
+Expected: one row with `code_used=0` (false), `expires_at`
+about 10 minutes ahead of now. The substrate's
+`OAuthFlowStateAdapter::insert` is what wrote it.
 
-Grant + redeem are interactive in the consent screen; for Phase
-B purposes, confirming the `insert` and the table state after a
-direct UPDATE setting `authorization_code` (mimicking grant)
-covers the substrate path. The full happy-path flow is
-exercised by the integration tests
-(`tests/oauth_tests.rs` for the existing tests; Step 2's tests
-in `tests/distributed_substrate_test.rs` for the cross-instance
-adapter properties).
+### F2. Sweeper is wired
 
-### F2. Cross-instance simulated read
+The `cleanup_expired_requests` sweeper was wired into the
+JobScheduler in Step 1 (Step 0 Q1 finding: pre-existing
+sweeper existed but was unwired). Step 2 converted it to
+route through the trait's `reap_expired("oauth_flow_state",
+_)`. No exercise needed beyond confirming the startup log
+mentioned `OAuth authorization_request cleanup job started`
+(see Setup).
 
-A row inserted by "instance A" should be visible to
-"instance B's" read. Phase B simulates by writing directly via
-psql, then attempting to read via the substrate's get path
-(through `get_authorization_request`):
+### F3. Stage an expired row; simulate sweep
 
 ```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 INSERT INTO authorization_request
   (request_id, did, client_id, code_challenge, code_challenge_method,
    scope, redirect_uri, state, created_at, expires_at, code_used)
-VALUES
-  ('phase-b-cross-req', 'did:plc:alice', 'cross-instance-client',
-   'challenge-cross', 'S256', 'atproto',
-   'http://localhost:8080/cb', 'csrf-cross',
-   to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
-   to_char((now() + interval '10 minutes') at time zone 'utc',
-           'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
-   false);"
+VALUES (
+  'phase-b-stale-oauth',
+  'did:plc:alice',
+  'test-client',
+  'c', 'S256',
+  'atproto',
+  'http://localhost:8080/cb',
+  'st',
+  strftime('%Y-%m-%dT%H:%M:%S.000Z', datetime('now', '-15 minutes')),
+  strftime('%Y-%m-%dT%H:%M:%S.000Z', datetime('now', '-5 minutes')),
+  0
+);
+"
 ```
 
-Then read via the PDS (e.g., navigate to the consent screen):
+Simulate the OAuth state reaper (every 300s; or just trigger
+the predicate):
 
 ```bash
-curl -s "http://localhost:2583/oauth/consent?request_id=phase-b-cross-req" \
-  -i | head -5
-```
-
-Expected: HTML consent screen renders. The substrate's `get`
-returned `Some(bytes)` for the request_id even though no PDS
-process initiated the row. **Ready to exercise.**
-
-### F3. Cross-instance simulated consume-and-reject-replay
-
-Setup: F2's row in place. Simulate "instance B consumed the
-code" via direct UPDATE:
-
-```bash
-psql $PDS_DB_URL -c "
-UPDATE authorization_request
-SET code_used = TRUE, authorization_code = 'ac_phase_b_consumed'
-WHERE request_id = 'phase-b-cross-req';"
-```
-
-Then attempt to redeem the code via the token endpoint
-(simulating an attacker who captured the code mid-flow):
-
-```bash
-curl -s -X POST http://localhost:2583/oauth/token \
-  -H 'Content-Type: application/x-www-form-urlencoded' \
-  -d 'grant_type=authorization_code&\
-code=ac_phase_b_consumed&\
-code_verifier=arbitrary&\
-client_id=cross-instance-client&\
-redirect_uri=http://localhost:8080/cb' \
-  | jq
-```
-
-Expected: `Authentication` error — "Authorization code invalid
-or already used" or similar. The substrate's atomic
-UPDATE-with-predicate (`WHERE code_used = FALSE`) refuses to
-flip the already-consumed row; the consumer translates to a
-401-class authentication failure. **Ready to exercise.**
-
-### F4. OAuth state reaper
-
-Stage an expired authorization_request:
-
-```bash
-psql $PDS_DB_URL -c "
-INSERT INTO authorization_request
-  (request_id, did, client_id, code_challenge, code_challenge_method,
-   scope, redirect_uri, state, created_at, expires_at, code_used)
-VALUES
-  ('phase-b-stale-req', 'did:plc:alice', 'client', 'c', 'S256',
-   'atproto', 'http://x/cb', 'st',
-   to_char((now() - interval '15 minutes') at time zone 'utc',
-           'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
-   to_char((now() - interval '5 minutes') at time zone 'utc',
-           'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
-   false);"
-```
-
-Either wait 5 minutes for the OAuth reaper, or simulate:
-
-```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 DELETE FROM authorization_request
-WHERE expires_at < to_char(now() at time zone 'utc',
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"');"
+WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now');
+"
 ```
 
 Confirm:
 
 ```bash
-psql $PDS_DB_URL -c "
+sqlite3 data/account.sqlite "
 SELECT request_id FROM authorization_request
-WHERE request_id = 'phase-b-stale-req';"
+WHERE request_id = 'phase-b-stale-oauth';
+"
 ```
 
-Expected: zero rows. **Ready to exercise** with manual reap.
+Expected: zero rows.
+
+### F4. Full OAuth happy path — out of Phase B scope
+
+The full happy path (consent screen click-through, PKCE
+verifier, DPoP keypair signing, token redemption) is
+interactive in the browser and would require multi-page
+scripting. Phase B confirms the substrate write path is
+engaged via F1; the full HTTP-level OAuth flow lives in
+`tests/oauth_tests.rs` and the new substrate-level
+cross-instance tests
+(`cross_instance_oauth_state_visible_to_siblings` etc).
 
 ---
 
@@ -715,20 +679,17 @@ Expected: zero rows. **Ready to exercise** with manual reap.
 
 ### G1. `PDS_DISTRIBUTED_STATE_MODE=redis` startup rejection
 
+Stop the PDS. Restart:
+
 ```bash
-PDS_HOSTNAME=localhost PDS_PORT=2583 \
-PDS_DB_BACKEND=postgres \
-PDS_DB_URL=postgres://aurora:aurora@localhost:5432/aurora \
-PDS_DISTRIBUTED_STATE_MODE=redis \
-cargo run --release -- serve
+PDS_DISTRIBUTED_STATE_MODE=redis cargo run --release -- serve
 ```
 
-Expected: PDS fails to start. The error message contains
+Expected: startup fails with an error message containing
 `PDS_DISTRIBUTED_STATE_MODE=redis is not implemented in v0.4;
 use 'distributed' (default) or 'single_instance_inmemory'`.
-The validation is at `config.validate()` time; no Postgres
-connection is opened before the validation runs. **Ready to
-exercise.**
+The PDS exits non-zero before any Postgres connection
+attempt — validation runs at `config.validate()` time.
 
 ### G2. `PDS_DISTRIBUTED_STATE_MODE=garbage` startup rejection
 
@@ -736,12 +697,11 @@ exercise.**
 PDS_DISTRIBUTED_STATE_MODE=garbage cargo run --release -- serve
 ```
 
-Expected: PDS fails to start. The error message contains
+Expected: startup fails with
 `PDS_DISTRIBUTED_STATE_MODE must be one of 'distributed',
 'single_instance_inmemory', 'redis' (got: "garbage")`.
-**Ready to exercise.**
 
-### G3. Maintenance pool sizing env vars accepted
+### G3. Custom maintenance pool sizing accepted
 
 ```bash
 PDS_MAINTENANCE_DB_MAX_CONNECTIONS=5 \
@@ -751,9 +711,13 @@ cargo run --release -- serve
 ```
 
 Expected log line:
-`Distributed-state substrate initialized (Postgres-CAS)
-max_connections=5 min_connections=1`. Confirms the
-overrides took effect. **Ready to exercise.**
+
+```
+Distributed-state substrate initialized (Postgres-CAS) max_connections=5 min_connections=1
+```
+
+The PDS starts cleanly with the overridden sizing. Stop the
+PDS after observing the log.
 
 ### G4. Invalid maintenance pool sizing rejected
 
@@ -762,7 +726,7 @@ PDS_MAINTENANCE_DB_MAX_CONNECTIONS=0 \
 cargo run --release -- serve
 ```
 
-Expected: PDS fails to start with
+Expected:
 `PDS_MAINTENANCE_DB_MAX_CONNECTIONS must be greater than 0`.
 
 ```bash
@@ -771,58 +735,95 @@ PDS_MAINTENANCE_DB_MAX_CONNECTIONS=15 \
 cargo run --release -- serve
 ```
 
-Expected: `PDS_MAINTENANCE_DB_MIN_CONNECTIONS (20) must not
-exceed PDS_MAINTENANCE_DB_MAX_CONNECTIONS (15)`. **Ready to
-exercise.**
+Expected:
+`PDS_MAINTENANCE_DB_MIN_CONNECTIONS (20) must not exceed
+PDS_MAINTENANCE_DB_MAX_CONNECTIONS (15)`.
+
+### Restart back to default mode
+
+```bash
+cargo run --release -- serve
+```
+
+Re-mint `$ADMIN_TOKEN`.
 
 ---
 
-## Section H — Migration
+## Section H — Migration verification
 
-### H1. Migration applied check
+### H1. `0007_distributed_state` applied
 
 ```bash
-psql $PDS_DB_URL -c "
-SELECT version, description, success, execution_time
+sqlite3 data/account.sqlite "
+SELECT version, description, success
 FROM _sqlx_migrations
-WHERE version = 7;"
+WHERE version >= 7
+ORDER BY version;
+"
 ```
 
-Expected: one row with `description LIKE 'distributed state%'`
-(or similar — sqlx names from the file prefix),
-`success = true`. **Ready to exercise.**
+Expected: row(s) for version 7+ with `success=1`. The
+`description` for version 7 is derived from the migration
+filename (`distributed_state` or similar).
 
-### H2. Tables and indexes present
+### H2. Substrate table schema matches Step 0.6
 
 ```bash
-psql $PDS_DB_URL -c "\d dpop_jti_replay"
+sqlite3 data/account.sqlite ".schema dpop_jti_replay"
 ```
 
-Expected: columns `jti TEXT PRIMARY KEY`, `jkt TEXT NOT NULL`,
-`exp_at_epoch_ms BIGINT NOT NULL`,
-`created_at_epoch_ms BIGINT NOT NULL`. Index
-`idx_dpop_jti_replay_exp ON dpop_jti_replay(exp_at_epoch_ms)`
-present.
+Expected:
+
+```
+CREATE TABLE dpop_jti_replay (
+    jti                     TEXT PRIMARY KEY,
+    jkt                     TEXT NOT NULL,
+    exp_at_epoch_ms         BIGINT NOT NULL,
+    created_at_epoch_ms     BIGINT NOT NULL
+);
+CREATE INDEX idx_dpop_jti_replay_exp
+    ON dpop_jti_replay(exp_at_epoch_ms);
+```
 
 ```bash
-psql $PDS_DB_URL -c "\d rate_limit_buckets"
+sqlite3 data/account.sqlite ".schema rate_limit_buckets"
 ```
 
-Expected: columns `bucket_key TEXT PRIMARY KEY`,
-`tokens_remaining BIGINT NOT NULL`, `max_tokens BIGINT NOT NULL`,
-`refill_rate BIGINT NOT NULL`,
-`window_start_at_epoch_ms BIGINT NOT NULL`,
-`version BIGINT NOT NULL DEFAULT 0`. Index
-`idx_rate_limit_buckets_window ON
-rate_limit_buckets(window_start_at_epoch_ms)` present.
+Expected:
 
-**Ready to exercise.**
+```
+CREATE TABLE rate_limit_buckets (
+    bucket_key                  TEXT PRIMARY KEY,
+    tokens_remaining            BIGINT NOT NULL,
+    max_tokens                  BIGINT NOT NULL,
+    refill_rate                 BIGINT NOT NULL,
+    window_start_at_epoch_ms    BIGINT NOT NULL,
+    version                     BIGINT NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_rate_limit_buckets_window
+    ON rate_limit_buckets(window_start_at_epoch_ms);
+```
 
 ---
 
 ## Section I — Decoupling sweep
 
-### I1. Cycle-wide sweep against Arc 7's diff
+```bash
+git grep -i "cairn\|hideaway\|horizon\|pursuingpeace\|nearhorizon"
+```
+
+Expected hits: only documented false positives —
+
+- English `horizontal` / `horizontally` / `horizons` in normal
+  prose (e.g., the new operator doc at
+  `docs/operator/multi-instance-deployment.md` uses
+  "horizontally" once).
+- Design-doc self-references listing the forbidden tokens as
+  decoupling-discipline criteria (`docs/V03_DESIGN.md`,
+  `docs/V04_DESIGN.md`, `docs/V02_DESIGN.md` if present).
+- Lucide icon names containing `more-horizontal` (admin UI).
+
+Cycle-narrow check against just the Arc 7 diff:
 
 ```bash
 git diff --name-only 0041dbb..HEAD | while read f; do
@@ -830,139 +831,107 @@ git diff --name-only 0041dbb..HEAD | while read f; do
 done
 ```
 
-Expected: zero hits. (Step 4 already confirmed; re-run for the
-cycle-close audit.)
-
-### I2. Informational "horizon" sweep
-
-```bash
-git diff --name-only 0041dbb..HEAD | while read f; do
-  [ -f "$f" ] && git grep -in "horizon" -- "$f"
-done
-```
-
-Expected: one hit — `docs/operator/multi-instance-deployment.md`
-contains "horizontally" in a normal English sentence. Documented
-false positive per the kickoff list.
-
-### I3. Whole-tree sweep (broader paranoia)
-
-```bash
-git grep -i "cairn\|hideaway\|pursuingpeace\|nearhorizon"
-```
-
-Expected: false positives only — design-doc self-references in
-`docs/V03_DESIGN.md` / `docs/V04_DESIGN.md` / `docs/V02_DESIGN.md`
-listing the forbidden tokens as decoupling-discipline criteria.
+Expected: zero hits across all 35 Arc-7-touched files.
 
 ---
 
 ## Section J — Test suite verification
 
-### J1. Library tests
+### J1. Lib tests
 
 ```bash
 cargo test --lib
 ```
 
-Expected: 924 passing, 0 failed, 0 ignored. (Step 3 baseline;
-Step 4 added no lib tests so the count is unchanged.)
+Expected: `test result: ok. 924 passed; 0 failed; 0 ignored`.
 
-### J2. Cross-instance substrate integration tests
+### J2. Cross-instance integration tests (testcontainers Postgres)
 
 ```bash
 cargo test --test distributed_substrate_test
 ```
 
-Expected: 11 passing, 0 failed (4 substrate + 4 OAuth adapter
-+ 3 rate-limit). Requires Docker daemon access for
-testcontainers Postgres.
+Expected: `test result: ok. 11 passed; 0 failed; 0 ignored`.
 
-If Docker is unreachable, the tests fail with a clear
+Prerequisite: Docker daemon accessible to the test runner.
+If Docker isn't running, the tests fail with a clear
 `Failed to start Postgres container — is Docker accessible?`
-message; that's a test-prerequisite issue, not a regression.
+panic; that's a prerequisite issue, not a regression.
 
-### J3. Lib-only clippy
+### J3. Lib clippy
 
 ```bash
 cargo clippy --lib --no-deps
 ```
 
-Expected: 24 lib-wide warnings unchanged from Step 3 baseline.
-Zero warnings on Arc 7 code (`src/distributed/*`,
-`src/oauth/flow_state_adapter.rs`,
+Expected: ~24 lib-wide warnings (pre-existing patterns
+unrelated to Arc 7), zero new warnings on Arc 7 code:
+`src/distributed/*`, `src/oauth/flow_state_adapter.rs`,
 `src/federation/dpop.rs`, `src/rate_limit.rs`,
-`src/jobs/mod.rs`, `src/context.rs`). The 24 pre-existing
-warnings are unrelated codebase-wide patterns (doc-overindented
-lists, unused methods in unrelated modules).
-
-### J4. All-targets clippy (informational)
-
-```bash
-cargo clippy --all-targets --no-deps
-```
-
-Expected: ~52 warnings, primarily "never used" in the
-`bin "aurora-locus" test` target for substrate primitives that
-the bin target doesn't import. Lib target uses them via the
-test consumers. Not actionable — artifact of the bin/lib split.
+`src/jobs/mod.rs`, `src/context.rs`.
 
 ---
 
 ## Notes
 
-- **PDS restart sequence**: mode toggles
-  (`PDS_DISTRIBUTED_STATE_MODE`) require restart — env vars are
-  read at `AppContext::new` startup, not runtime. Same for
-  maintenance pool sizing.
+- **Token expiry**: session JWT lasts ~1 hour. Re-mint via the
+  Setup section's `createSession` curl if `$ADMIN_TOKEN`
+  starts producing 401s mid-sweep. Each mode-toggle restart
+  also produces a window where the old token might briefly
+  fail revalidation; re-minting is the safest reflex.
 
-- **Token expiry**: session JWT lasts ~1 hour. If `ADMIN_TOKEN`
-  expires mid-sweep, re-mint via Setup's createSession step.
-  Restarts also invalidate previously-issued tokens in
-  `single_instance_inmemory` mode (session table is DB-backed;
-  tokens survive, but the running PDS's session manager state
-  is fresh).
+- **Restart sequence for mode toggles**: env vars
+  (`PDS_DISTRIBUTED_STATE_MODE`,
+  `PDS_MAINTENANCE_DB_MAX_CONNECTIONS`, etc) are read at
+  `AppContext::new` startup. Each mode-toggle exercise
+  documents the restart inline. Order: stop with `Ctrl-C` or
+  `kill`, set env vars, `cargo run --release -- serve` (the
+  `--release` flag is optional but recommended for cleaner
+  log output).
 
-- **DB inspection**: `psql $PDS_DB_URL` against the same
-  Postgres the PDS uses, for every cross-instance simulation
-  exercise. The substrate tables (`dpop_jti_replay`,
-  `rate_limit_buckets`) live alongside the application tables
-  in `account_db` regardless of substrate mode.
+- **DB inspection**: `sqlite3 data/account.sqlite` for all
+  queries. The substrate tables (`dpop_jti_replay`,
+  `rate_limit_buckets`) live alongside the OAuth + admin
+  tables in the same SQLite file by default. If running
+  against local Postgres instead, swap for `psql $PDS_DB_URL`
+  and adjust SQL syntax where needed (e.g., epoch-ms
+  arithmetic, `INSERT OR IGNORE` is SQLite-specific —
+  Postgres uses `ON CONFLICT DO NOTHING`).
+
+- **Cross-instance behaviour**: not exercisable via single-PDS
+  Phase B. The substrate-level integration tests
+  (`tests/distributed_substrate_test.rs`) cover
+  cross-instance JTI replay rejection (4 substrate + 4 OAuth
+  + 3 rate-limit = 11 tests against testcontainers
+  Postgres). Section J's J2 re-runs them.
+
+- **C5 (substrate-consult fall-through) skipped**: simulating
+  Postgres unavailability against a SQLite-backed local PDS
+  isn't practical — the substrate IS the same file the
+  application uses for everything else. The non-fatal
+  fall-through behaviour is verified by the unit + integration
+  tests; skip for localhost Phase B.
 
 - **Reaper-trigger workaround**: no CLI subcommand exists in
-  v0.4 to fire a specific reaper manually. The canonical
-  approach is either wait for the natural cadence (5 min for
-  DPoP JTI / OAuth state, 1 hour for rate-limit buckets) or
-  simulate the sweep predicate via `psql` DELETE statements as
-  shown above. A `debug trigger-reaper` CLI subcommand similar
-  to `aurora-locus debug verify-audit-chain` would be a v0.6
-  candidate if Phase-B-driven manual sweep ergonomics matter.
+  v0.4 to fire a specific reaper manually. SQL `DELETE`
+  matching the reaper's predicate is the canonical Phase B
+  simulation (Sections A3, E3, F3). Waiting the full reaper
+  cadence (300s for DPoP JTI / OAuth state, 1h for rate-limit
+  buckets) is the alternative but rarely used during Phase B.
 
-- **Single-PDS cross-instance simulation**: where Sections A3,
-  F2-3 require simulating "instance B", the script uses direct
-  `psql` writes against the shared table to mimic the second
-  instance's view. True multi-instance verification — two
-  Aurora-Locus processes pointing at the same Postgres —
-  requires spinning up a second PDS following the Setup
-  section. The cross-instance correctness invariants are
-  validated by the substrate-level integration tests in
-  [`tests/distributed_substrate_test.rs`](../../tests/distributed_substrate_test.rs)
-  (11 tests against real Postgres via testcontainers); the
-  manual Phase-B exercises are operator-confidence smoke
-  tests, not the proof of correctness.
+- **DPoP-bound auth ceremony**: the full HTTP-level DPoP-bound
+  authenticated-request path requires a P-256 keypair, JWT
+  signing, and PKCE — too much for a Phase B smoke test.
+  Sections A and B use SQL-based substrate simulation
+  exclusively. The full ceremony is exercised by
+  `src/federation/dpop.rs`'s 21 inline tests + the
+  substrate-level integration test
+  `cross_instance_dpop_jti_replay_rejection`.
 
-- **Substrate-consult fall-through interpretation**: brief
-  warn-log windows from the rate-limit middleware are
-  acceptable (Postgres hiccup, maintenance-pool brief
-  saturation). Sustained fall-through indicates the substrate
-  is degraded — check Postgres health, maintenance-pool
-  saturation (`pg_stat_activity`), and the connection-budget
-  math in [`docs/operator/multi-instance-deployment.md`](../operator/multi-instance-deployment.md).
-
-- **"If something looks off" failure routing**: same as the
-  Arc 6 convention. Document expected vs actual outcome in
-  a Phase B addendum (separate from this script); don't push
-  the addendum or any fix-up commits — drop back to Nova for
+- **"If something looks off"**: same convention as Arc 6 —
+  document expected vs actual in a Phase B addendum
+  (separate file under `docs/internal/`), don't push the
+  addendum or any fix-up commits, drop back to Nova for
   triage. Cycle close depends on a clean Phase B sweep.
 
 ---
@@ -974,5 +943,5 @@ Once all sections clear:
 1. Document any findings or regressions in a Phase B addendum
    (separate file under `docs/internal/`).
 2. If clean, Arc 7 closes; chainlink #53 can be closed.
-3. v0.4 cycle close gate: all arc Phase B sweeps must pass
-   before the cycle-close release work begins (Chrys's call).
+3. v0.4 cycle close gate: all per-arc Phase B sweeps must
+   pass before the cycle-close release work begins.
