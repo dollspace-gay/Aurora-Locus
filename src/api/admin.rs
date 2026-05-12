@@ -3024,7 +3024,7 @@ async fn search_accounts(
 /// New fields may be added; existing field names and shapes do not
 /// change across releases. Capability strings within `extensions`
 /// follow the `<kebab-family>-v<integer>` versioning convention
-/// (committed separately on `aurora_capability_extensions` per
+/// (committed on `crate::api::registry::WIRE_EXTENSION_ORDER` per
 /// Step 4).
 ///
 /// Snapshot test: `describe_capabilities_snapshot` in this file's
@@ -3032,8 +3032,8 @@ async fn search_accounts(
 /// Both top-level fields (alphabetical via canonical-JSON) and
 /// inner namespace keys (alphabetical via `serde_json::Map`'s
 /// default `BTreeMap` backing) sort deterministically; endpoint
-/// arrays preserve the source-order of the `aurora_capability_families`
-/// JSON literal.
+/// arrays preserve the per-family `registration_order` of the
+/// `RouteRegistry` populated by `aurora_route_builder()`.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DescribeCapabilitiesResponse {
@@ -3046,157 +3046,77 @@ struct DescribeCapabilitiesResponse {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CapabilityExtension {
-    name: &'static str,
+    name: String,
     /// Optional structured value (e.g. `event-variants` carries the list of
     /// supported ModEvent variant names). Omitted when not applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<serde_json::Value>,
 }
 
-// TODO(#123, v0.4): runtime route enumeration deferred per V03_DESIGN.md §9 and docs/v04-candidates.md
-/// Endpoint names per Aurora namespace, as currently shipped. Updated
-/// by future sub-phases as they land. Phase 3.2's snapshot reflects
-/// the surface present at this commit; sub-phases 3.3-3.9 each add
-/// their endpoint names to the appropriate family.
-fn aurora_capability_families() -> serde_json::Value {
-    serde_json::json!({
-        "tools.aurora.ops": [
-            "getStats",
-            "listAccounts",
-            "getInstanceMetrics",
-            "getValidationFailures",
-            "getSystemHealth",
-            "getDatabaseStatus",
-            "getResourceUsage",
-            "listBackgroundJobs",
-            "runHealthChecks",
-            "getVersionInfo",
-            "getSystemMetrics",
-            "getNonceStoreStatus",
-            "cleanupNonceStores",
-            "getBlobStatistics",
-            "listBlobs",
-            "deleteBlob",
-            "quarantineBlob",
-            "restoreBlob",
-            "runBlobGC",
-            "getBlobQuotas",
-            "getSequencerStatus",
-            "pauseSequencer",
-            "resumeSequencer",
-            "resetSequencerCursor",
-            "rebuildSequencer",
-            "getRateLimitConfig",
-            "getRateLimitStatus",
-            "cleanupRateLimitState",
-            "getFederationStatus",
-            "getRelayConfig",
-            "listKnownInstances",
-            "triggerPdsDiscovery"
-        ],
-        // Phase 3.3 (chainlink #100) — moderator-tier reads.
-        // Phase 3.4 (chainlink #101) — appeals reads (listAppeals, getAppeal).
-        "tools.aurora.moderator": [
-            "queryEvents",
-            "getEvent",
-            "queryStatuses",
-            "getSubjectContext",
-            "getSubjectHistory",
-            "listAppeals",
-            "getAppeal"
-        ],
-        // Phase 3.5 (chainlink #102) — emitEvent unified action surface,
-        // six batch endpoints, triggerPasswordReset companion.
-        // Phase 3.7 (chainlink #104) — moderation aggregations.
-        "tools.aurora.admin": [
-            "emitEvent",
-            "batchTakedownAccounts",
-            "batchSuspendAccounts",
-            "batchRestoreAccounts",
-            "batchTakedownRecords",
-            "batchApplyLabel",
-            "batchRemoveLabel",
-            "triggerPasswordReset",
-            "getQueueStats",
-            "getModerationMetrics",
-            "getAuditTrail",
-            "exportAccountForensic",
-            "subscribeModEvents",
-            "getRuntimeSetting",
-            "setRuntimeSetting"
-        ],
-        // Phase 3.6 (chainlink #103) — role management relocated from
-        // com.atproto.admin.{grantRole,revokeRole}.
-        "tools.aurora.superadmin": [
-            "grantRole",
-            "revokeRole"
-        ]
-    })
-}
-
-// TODO(#123, v0.4): runtime route enumeration deferred per V03_DESIGN.md §9 and docs/v04-candidates.md
-/// Static capability advertisement reflecting what's structurally
-/// present in this build. The `name` strings are the canonical
-/// vocabulary from §8.15 and double as the keys clients use to gate
-/// UI affordances. A capability is advertised iff its underlying
-/// endpoint(s) are actually registered as routes in this binary.
+/// Build the `families` `serde_json::Value` by walking
+/// `RouteRegistry::advertised_by_family`.
 ///
-/// Two §8.15 capabilities are intentionally omitted because the
-/// corresponding endpoints are not yet shipped:
-///   - `invite-lineage-v1`     (no shipped endpoint as of v0.2 cycle)
-///   - `reporter-context-v1`   (no shipped endpoint as of v0.2 cycle)
-/// Add them here when their handlers land.
+/// Family iteration order: `advertised_by_family()` returns a
+/// `BTreeMap<Family, _>` which iterates in `Family::Ord` order —
+/// alphabetical per the enum declaration. Inserting into a
+/// `serde_json::Map` (BTreeMap-backed) is also alphabetical by
+/// the namespace string. Both orderings coincide because the
+/// `Family` enum's variant order and its `Display` strings are
+/// alphabetical (`admin` < `moderator` < `ops` < `superadmin`).
 ///
-/// # Versioning contract
+/// Endpoint iteration order: each family's `Vec<&RouteEntry>` is
+/// pre-sorted by `registration_order` (per Step 0 Q5 disposition
+/// (a): freeze accidental orderings to the source declaration
+/// order in `admin::routes()`).
 ///
-/// Per `docs/V03_DESIGN.md` §6.3.1: capability strings follow the pattern `<kebab-family>-v<integer>`.
-/// Kebab-case family name, hyphen, lowercase `v`, integer
-/// version. Breaking changes ship as a NEW version suffix (e.g.
-/// `subject-context-v2`); the OLD version is removed only after
-/// the new version has shipped and consumers have had time to
-/// migrate. Bumping the integer is the wire signal that breaking
-/// change has landed.
-///
-/// The snapshot test `describe_capabilities_snapshot` (Step 3) pins
-/// the advertised set; the contract-phrase test
-/// `tests/contract_phrases.rs` (Step 4) pins this versioning
-/// commitment by grepping for the pattern in this doc comment.
-fn aurora_capability_extensions() -> Vec<CapabilityExtension> {
-    vec![
-        // Phase 3.2 — capability probe ships alongside getSubjectContext.
-        CapabilityExtension { name: "subject-context-v1", value: None },
-        // Phase 3.3 — moderator-tier reads.
-        CapabilityExtension { name: "moderator-activity-v1", value: None },
-        CapabilityExtension { name: "subject-history-v1", value: None },
-        // Phase 3.4 — appeals reads.
-        CapabilityExtension { name: "appeals-v1", value: None },
-        // Phase 2.3.8 — operator instance metrics.
-        CapabilityExtension { name: "instance-metrics-v1", value: None },
-        // Phase 3.5 — emitEvent unified action surface + batch suite.
-        CapabilityExtension { name: "mod-events-emit-v1", value: None },
-        CapabilityExtension { name: "batch-takedown-v1", value: None },
-        CapabilityExtension { name: "trigger-password-reset-v1", value: None },
-        // Phase 3.7 — moderation aggregations.
-        CapabilityExtension { name: "moderation-metrics-v1", value: None },
-        CapabilityExtension { name: "queue-stats-v1", value: None },
-        // Phase 3.8 — hash-chained audit + forensic export.
-        CapabilityExtension { name: "audit-trail-v1", value: None },
-        CapabilityExtension { name: "forensic-export-v1", value: None },
-        // Phase 3.9 — live event tail (HTTP-polling-driven in v0.2).
-        CapabilityExtension { name: "mod-events-stream-v1", value: None },
-        // Phase 3.10 — runtime settings read/write.
-        CapabilityExtension { name: "runtime-settings-v1", value: None },
-    ]
+/// Method-name extraction: every admin-tier route is an XRPC
+/// path shaped `/xrpc/<namespace>.<method>`. `rsplit('.').next()`
+/// returns the trailing segment after the last dot. The `.path`
+/// fallback only triggers if a future route deviates from this
+/// shape — in which case the snapshot test will fail loudly
+/// rather than silently shipping a malformed wire entry.
+fn build_families_value(
+    registry: &crate::api::registry::RouteRegistry,
+) -> serde_json::Value {
+    let by_family = registry.advertised_by_family();
+    let mut map = serde_json::Map::new();
+    for (family, entries) in by_family.iter() {
+        let endpoints: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                let method = e
+                    .path
+                    .strip_prefix("/xrpc/")
+                    .and_then(|p| p.rsplit('.').next())
+                    .unwrap_or(&e.path);
+                serde_json::Value::String(method.to_string())
+            })
+            .collect();
+        map.insert(family.to_string(), serde_json::Value::Array(endpoints));
+    }
+    serde_json::Value::Object(map)
 }
 
 /// `tools.aurora.describeCapabilities` — top-level probe.
+///
+/// Reads from `ctx.route_registry` populated by
+/// `aurora_route_builder()` in `admin::routes()`. Wire output is
+/// byte-identical to the prior hand-curated implementation — the
+/// snapshot test `describe_capabilities_snapshot` pins this.
 async fn describe_capabilities(
-    State(_ctx): State<AppContext>,
+    State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
 ) -> Result<Json<DescribeCapabilitiesResponse>, (StatusCode, String)> {
+    let registry = ctx.route_registry.as_ref();
+    let families = build_families_value(registry);
+    let extensions = registry
+        .advertised_extensions()
+        .into_iter()
+        .map(|name| CapabilityExtension { name, value: None })
+        .collect();
     Ok(Json(DescribeCapabilitiesResponse {
-        families: aurora_capability_families(),
-        extensions: aurora_capability_extensions(),
+        families,
+        extensions,
         implementation: "aurora-locus",
         // Cargo.toml's package version. Bumped as part of release work.
         version: env!("CARGO_PKG_VERSION"),
@@ -6425,12 +6345,16 @@ mod tests {
             maintenance_pool: Default::default(),
         };
 
-        AppContext::new(
-            config,
-            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
-        )
-        .await
-        .unwrap()
+        // The admin module hosts `describe_capabilities`, which
+        // Step 3 made registry-driven. Tests in this module
+        // construct the context with the populated registry
+        // returned by `routes()` so the
+        // `describe_capabilities_snapshot` test sees the same
+        // wire output a real PDS would emit. Other test
+        // fixtures (auth.rs, aurora_*.rs, tests/) keep the empty
+        // default — they don't exercise the capability probe.
+        let (_router, registry) = super::routes();
+        AppContext::new(config, registry).await.unwrap()
     }
 
     #[tokio::test]
@@ -7791,7 +7715,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let names: Vec<&str> = resp.extensions.iter().map(|e| e.name).collect();
+        let names: Vec<&str> = resp.extensions.iter().map(|e| e.name.as_str()).collect();
         let expected = [
             "subject-context-v1",
             "moderator-activity-v1",

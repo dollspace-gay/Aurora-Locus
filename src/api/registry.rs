@@ -1,12 +1,13 @@
 //! Runtime route enumeration substrate (Arc 8, chainlink #54).
 //!
-//! Replaces the hand-curated capability list at
-//! `aurora_capability_families` / `aurora_capability_extensions`
-//! with a registry that's populated at route registration time
-//! and queried by `describe_capabilities` at request time. Step 1
-//! builds this substrate; Step 2 migrates the registrations;
-//! Step 3 reimplements `describe_capabilities` against the
-//! registry and removes the hand-curated lists.
+//! Replaced the hand-curated capability list that previously
+//! lived at `aurora_capability_families` /
+//! `aurora_capability_extensions` (removed in Step 3) with a
+//! registry populated at route registration time and queried by
+//! `describe_capabilities` at request time. Step 1 built this
+//! substrate; Step 2 migrated the registrations; Step 3
+//! reimplemented `describe_capabilities` against the registry
+//! and removed the hand-curated lists.
 //!
 //! Per V04_DESIGN.md §7.3.2 + §7.3.3:
 //!
@@ -68,16 +69,37 @@ pub fn admin_tier_regex() -> &'static Regex {
 }
 
 /// Canonical wire ordering for the flat extensions list emitted
-/// by `describe_capabilities`. The 14 strings match
-/// `aurora_capability_extensions()` at `src/api/admin.rs:3043`
-/// verbatim — both this constant and that hand-curated list are
-/// the §7.3.4 byte-identical lock until Step 3 removes the
-/// hand-curated list and this becomes the sole source of truth.
+/// by `describe_capabilities` (Arc 8 Step 3 — the registry-driven
+/// handler reads `RouteRegistry::advertised_extensions`, which
+/// filters this constant by the present-set).
 ///
-/// Why a wire-order constant instead of registration-order union:
+/// # Versioning contract
+///
+/// Per `docs/V03_DESIGN.md` §6.3.1: capability strings follow the pattern `<kebab-family>-v<integer>`.
+/// Kebab-case family name, hyphen, lowercase `v`, integer
+/// version. Breaking changes ship as a NEW version suffix (e.g.
+/// `subject-context-v2`); the OLD version is removed only after
+/// the new version has shipped and consumers have had time to
+/// migrate. Bumping the integer is the wire signal that breaking
+/// change has landed.
+///
+/// Two §8.15 capabilities are intentionally omitted because the
+/// corresponding endpoints are not yet shipped:
+///   - `invite-lineage-v1`     (no shipped endpoint as of v0.4)
+///   - `reporter-context-v1`   (no shipped endpoint as of v0.4)
+/// Add them here when their handlers land.
+///
+/// The snapshot test `describe_capabilities_snapshot` in
+/// `src/api/admin.rs` pins the wire-format byte-for-byte; the
+/// contract-phrase test in `tests/contract_phrases.rs` pins this
+/// doc comment's `<kebab-family>-v<integer>` phrase. Together they
+/// declare both the structural shape and the versioning rule.
+///
+/// # Why a wire-order constant instead of registration-order union
+///
 /// Step 0 Q8 Part (c) claimed registration-order would reproduce
-/// the existing wire output. That claim is wrong, and Step 2's
-/// migration surfaced the mismatch:
+/// the existing wire output. That claim was wrong, and Step 2's
+/// migration surfaced three concrete mismatches:
 ///
 /// - `instance-metrics-v1` (Phase 2.3.8, on `ops.getInstanceMetrics`)
 ///   is registered first among admin-tier routes, but appears
@@ -94,17 +116,11 @@ pub fn admin_tier_regex() -> &'static Regex {
 ///   handler is registered before `getModerationMetrics` —
 ///   another phase-vs-registration swap.
 ///
-/// Encoding the wire order here keeps
-/// `RouteRegistry::advertised_extensions` byte-identical with
-/// the hand-curated list across the Step 1→3 migration without
-/// constraining the per-family route registration order (which
-/// is itself pinned by the snapshot test).
-///
-/// `RouteRegistry::advertised_extensions` filters this list down
-/// to the extensions actually present on advertised entries.
-/// `debug_assert!` catches drift if a registered route attributes
-/// an extension that isn't in this constant — surface it during
-/// dev/test rather than silently dropping the string at runtime.
+/// Encoding the wire order here decouples the (free) per-family
+/// route registration order from the (pinned) wire-format
+/// ordering. `debug_assert!` in `advertised_extensions` catches
+/// drift if a registered route attributes an extension that
+/// isn't in this constant.
 pub const WIRE_EXTENSION_ORDER: &[&str] = &[
     // Phase 3.2 — capability probe ships alongside getSubjectContext.
     "subject-context-v1",
@@ -831,33 +847,6 @@ mod tests {
         ]);
         let extensions = registry.advertised_extensions();
         assert_eq!(extensions, vec!["mod-events-emit-v1".to_string()]);
-    }
-
-    #[test]
-    fn wire_extension_order_matches_curated_list_byte_identical() {
-        // §7.3.4 byte-identical lock. While the hand-curated
-        // `aurora_capability_extensions()` still exists (Step 1-2
-        // intermediate state), both must be in sync. Step 3
-        // removes the hand-curated list and this becomes the
-        // sole source of truth.
-        let expected: &[&str] = &[
-            "subject-context-v1",
-            "moderator-activity-v1",
-            "subject-history-v1",
-            "appeals-v1",
-            "instance-metrics-v1",
-            "mod-events-emit-v1",
-            "batch-takedown-v1",
-            "trigger-password-reset-v1",
-            "moderation-metrics-v1",
-            "queue-stats-v1",
-            "audit-trail-v1",
-            "forensic-export-v1",
-            "mod-events-stream-v1",
-            "runtime-settings-v1",
-        ];
-        assert_eq!(WIRE_EXTENSION_ORDER, expected);
-        assert_eq!(WIRE_EXTENSION_ORDER.len(), 14);
     }
 
     // ---------- RouteRegistryBuilder ----------

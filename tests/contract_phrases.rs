@@ -179,14 +179,23 @@ fn describe_capabilities_response_has_field_stability_phrase() {
 // ====================================================================
 
 #[test]
-fn aurora_capability_extensions_has_versioning_pattern() {
-    let path = "src/api/admin.rs";
+fn wire_extension_order_has_versioning_pattern() {
+    // Arc 8 Step 3 (chainlink #54) moved the versioning contract
+    // anchor from the hand-curated `aurora_capability_extensions`
+    // function (removed in Step 3) to the
+    // `WIRE_EXTENSION_ORDER` constant in
+    // `src/api/registry.rs`. The constant is now the canonical
+    // wire-format pin; its doc comment carries the
+    // `<kebab-family>-v<integer>` versioning rule for the same
+    // reason `aurora_capability_extensions`'s doc comment did
+    // before — it sits immediately before the declaration that
+    // ships the extension strings.
+    let path = "src/api/registry.rs";
     let contents = fs::read_to_string(path).unwrap();
-    // `aurora_capability_extensions` is a private free function.
     assert_phrase_in_docblock_before(
         path,
         &contents,
-        "fn aurora_capability_extensions(",
+        "pub const WIRE_EXTENSION_ORDER:",
         "<kebab-family>-v<integer>",
     );
 }
