@@ -15,6 +15,7 @@ pub mod middleware;
 pub mod moderation;
 pub mod oauth_admin;
 pub mod oauth_server;
+pub mod registry;
 pub mod repo;
 pub mod server;
 pub mod sync;

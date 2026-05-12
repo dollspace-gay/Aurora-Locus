@@ -122,6 +122,13 @@ base32 = "0.5"
 prometheus = { version = "0.14", features = ["process"] }
 lazy_static = "1.4"
 
+# Regex for the Arc 8 admin-tier path filter
+# (src/api/registry.rs::ADMIN_TIER_PATH_REGEX). Verified by Step
+# 0 Q6 against the actual axum route table; consumers (registry
+# substrate, repurposed drift test) import the single shared
+# constant per V04_DESIGN.md §7.3.6.
+regex = "1"
+
 # Image processing for thumbnails and metadata
 image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
 dashmap = "6.1.0"
