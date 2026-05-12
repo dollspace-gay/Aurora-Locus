@@ -111,6 +111,16 @@ pub struct AppContext {
     /// state, rate-limit — wired in Steps 2-3) fall back to
     /// in-process state when the substrate is absent.
     pub distributed_store: Option<Arc<dyn DistributedStore>>,
+    /// Route registry for capability advertisement (Arc 8,
+    /// V04_DESIGN.md §7.3.2 + §7.3.3). Populated at startup by
+    /// `aurora_route_builder()` (Step 2 migration); consumed by
+    /// `describe_capabilities` at request time (Step 3). Step 1
+    /// initializes this to the empty default — every Arc-7-or-
+    /// earlier AppContext consumer still sees a valid registry,
+    /// but the wire output `describe_capabilities` produces is
+    /// unchanged from the hand-curated lists until Step 3
+    /// switches the handler over. See [`crate::api::registry`].
+    pub route_registry: Arc<crate::api::registry::RouteRegistry>,
 }
 
 impl AppContext {
@@ -554,6 +564,14 @@ impl AppContext {
             }
         }
 
+        // Route registry — empty default at Step 1; Step 2's
+        // migration replaces this with the populated registry
+        // returned from aurora_route_builder().build(). The
+        // empty default keeps describe_capabilities working
+        // off the hand-curated lists at admin.rs until Step 3
+        // switches the handler over.
+        let route_registry = Arc::new(crate::api::registry::RouteRegistry::default());
+
         Ok(Self {
             config: Arc::new(config),
             account_db,
@@ -584,6 +602,7 @@ impl AppContext {
             file_tier_settings,
             maintenance_pool,
             distributed_store,
+            route_registry,
         })
     }
 
