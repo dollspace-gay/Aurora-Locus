@@ -4543,12 +4543,65 @@ reporter-context-v1            — reporter context aggregation
 runtime-settings-v1            — runtime settings infrastructure (Phase 3.10)
 ```
 
-Adding new capabilities requires design-doc update before the server starts advertising them. Removing capabilities is a breaking change requiring major version bump (v1 → v2).
+### Adding a new capability
+
+Per Arc 8's runtime route enumeration (chainlink #54), capability advertisement is now driven by the `RouteRegistry` substrate at `src/api/registry.rs`. Adding a new capability is a three-step procedure:
+
+1. **Design-doc update.** Add the capability string to the vocabulary list above (`<kebab-family>-v<integer>` shape — kebab-case family name, hyphen, lowercase `v`, integer version).
+2. **`RouteRegistry` entry.** Attach the capability string to the appropriate route in `src/api/admin.rs::routes()` via `.route_with_caps(path, handler, CapsBuilder::new(family, version).extensions(["<capability-string>"]))`. Canonical-introducer attribution: each capability goes on its single phase-introducing endpoint; companion endpoints in the same phase share the capability without re-declaring it.
+3. **`WIRE_EXTENSION_ORDER` addition.** Insert the capability string into `WIRE_EXTENSION_ORDER` (`src/api/registry.rs`) at its declaration position — wire output follows this constant's order, independent of route registration order.
+
+Forgetting step 2 means the route exists but the capability isn't advertised; forgetting step 3 means the capability string silently drops from the wire output. The `debug_assert!` in `RouteRegistry::advertised_extensions` catches the missing-from-`WIRE_EXTENSION_ORDER` case in dev/test builds.
+
+Removing a capability is a breaking change requiring major version bump (v1 → v2). The new version ships as a new string; the old version is removed only after consumers have had time to migrate.
+
+### Omission policy
+
+Capabilities that exist structurally but are intentionally not advertised use `.omitted()` on the `CapsBuilder`:
+
+```rust
+.route_with_caps(
+    "/xrpc/tools.aurora.example.someEndpoint",
+    get(handler),
+    CapsBuilder::new(Family::Example, 1).omitted(),
+)
+```
+
+Omitted routes are excluded from `describeCapabilities`'s output but still registered in axum's router (so they remain HTTP-reachable). The rationale for each omitted route is documented alongside its entry above.
+
+**At the v0.4 freeze, no admin-tier routes are omitted** (List A is empty per Step 0 Q6 classification). The two §8.15 vocabulary capabilities that lack backing endpoints (`invite-lineage-v1`, `reporter-context-v1`) are vocabulary-level omissions; no routes exist to mark. When those endpoints ship, their capability strings are added per the three-step procedure above and the omission notes here are removed.
+
+### Admin-tier scope
+
+The capability registry covers `tools.aurora.{admin,moderator,ops,superadmin}.*` — verified by the regex centralized at `src/api/registry.rs::ADMIN_TIER_PATH_REGEX`:
+
+```
+^/xrpc/tools\.aurora\.(admin|moderator|superadmin|ops)(\.|$)
+```
+
+Routes outside this regex are out of capability-registry scope. The categorization below (List C) documents those out-of-scope categories.
+
+### Non-admin-tier routes (List C) — out of capability-registry scope
+
+The application registers a number of routes outside the admin-tier regex. They're intentionally not tracked in the registry; each category has a different advertisement mechanism:
+
+- **bsky-PDS-compat namespace** (`com.atproto.admin.*`): the Aurora capability registry advertises Aurora extensions, not the bsky-base admin surface. These endpoints remain functional and discoverable via lexicon-based discovery; they're advertised through the AT Protocol's lexicon mechanisms, not this registry.
+- **Capability-registry meta-endpoint** (`tools.aurora.describeCapabilities`): the meta-endpoint that describes the registry can't itself be in the registry it describes (self-referential). The endpoint exists and is HTTP-reachable; its presence is the precondition for capability discovery.
+- **Public XRPC namespaces** (`com.atproto.server.*`, `.sync.*`, `.identity.*`, `.repo.*`, `.label.*`, `.federation.*`, `.moderation.*`, `.temp.*`, and other public surfaces): non-admin authority; advertised through lexicon-based discovery, not the admin capability surface.
+- **Health checks and well-known endpoints** (`/health`, `/.well-known/atproto-did`, `/.well-known/did.json`, etc.): infrastructure routes with no admin authority and no XRPC shape.
+- **Admin UI static assets** (`/admin/*` via `ServeDir`): static file routes; not XRPC; not capability-bearing.
+- **Public OAuth surface** (`/oauth/authorize`, `/consent`, `/token`, `/grant`, `/deny`, and other OAuth-dance endpoints): required for the OAuth flow to work for non-admin users; no admin authority.
+- **Internal OAuth bootstrap** (`/oauth/admin/*`): admin-flavored but private to the OAuth machinery; not user-facing capability advertisement.
+- **Prometheus scrape endpoint** (`/metrics`): public per scrape convention; not capability-bearing.
+
+Routes added to any of these categories follow the existing per-category convention (i.e., register via `.route(...)` on the same builder, with no `CapsBuilder`). Adding a new category — i.e., a class of admin-flavored routes that intentionally aren't capability-bearing — requires a §8.15 update so future readers know why.
 
 ### Notes
 
 - Capability strings are versioned (`-v1`) so future incompatible changes can ship as `-v2` while v1 remains advertised for clients depending on the original shape.
 - The substrate primitive 21 reads this list on session start and uses it to route requests. Adding a capability to the server's response automatically activates the corresponding UI path.
+- The byte-for-byte wire snapshot is pinned by `test_admin_route_registry_completeness` in `src/api/admin.rs`'s test module; the structural invariants (every family appears, extensions match `WIRE_EXTENSION_ORDER`) are pinned by the same test's structural assertions.
+- The `<kebab-family>-v<integer>` versioning convention is locked by the contract-phrase test `wire_extension_order_has_versioning_pattern` in `tests/contract_phrases.rs`, which anchors on `WIRE_EXTENSION_ORDER`'s docstring in `src/api/registry.rs`.
 
 ## 8.16 New endpoint — `tools.aurora.admin.getRuntimeSetting` and `setRuntimeSetting`
 

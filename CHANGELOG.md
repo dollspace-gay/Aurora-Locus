@@ -6,6 +6,158 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Arc 8 — Runtime route enumeration (v0.4-cycle)
+
+Four-step cycle (Step 0 recon, Steps 1-4 implementation + docs)
+replacing the hand-curated `aurora_capability_families()` /
+`aurora_capability_extensions()` functions with a runtime
+`RouteRegistry` substrate populated during route registration and
+queried by `tools.aurora.describeCapabilities` at request time.
+Byte-identical wire output preserved across the migration —
+single-source-of-truth advertisement that can no longer drift
+from the actual route table.
+
+Tracked via chainlink #54 (closes chainlink #123 from v0.3).
+Design at [`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §7.
+
+#### Added
+
+- **`RouteRegistry` substrate** (`src/api/registry.rs`) with
+  `RouteEntry`, `Family` enum, `FamilyKind`, `CapsBuilder`, and
+  `RouteRegistryBuilder` typestate. The registry is built at
+  startup, consumed by handlers at request time, and is the
+  single source of truth for the capability advertisement.
+  [Arc 8 Step 1]
+- **`aurora_route_builder()` constructor** + `.route_with_caps()`
+  / `.route()` / `.merge()` / `.build()` chain. Each
+  `.route_with_caps()` call emits a `RouteEntry` alongside the
+  axum `Router` registration; pass-through `.route()` registers
+  without contributing a registry entry (List C routes).
+  [Arc 8 Step 1]
+- **`WIRE_EXTENSION_ORDER` constant** (`src/api/registry.rs`)
+  pinning the capability-extension wire-output order across the
+  migration. The `<kebab-family>-v<integer>` versioning contract
+  doc-comment lives here (moved from the deleted
+  `aurora_capability_extensions` function). [Arc 8 Step 2-3]
+- **`ADMIN_TIER_PATH_REGEX` constant** —
+  `^/xrpc/tools\.aurora\.(admin|moderator|superadmin|ops)(\.|$)`
+  — centralized in `src/api/registry.rs` per V04_DESIGN.md
+  §7.3.6's "shared-constant requirement." `admin_tier_regex()`
+  returns a `&'static Regex` cached via `OnceLock`. The starting
+  regex was missing `ops` (admin-tier by authority but advertised
+  through the existing curated list); Step 0 Q6 added it.
+  [Arc 8 Step 1]
+- **`Arc<RouteRegistry>` field on `AppContext`** populated by
+  `crate::api::routes()`'s builder pair and threaded through
+  `AppContext::new(config, route_registry)`. Test fixtures pass
+  an empty default; `api::admin::tests::create_test_context`
+  passes the populated registry from `super::routes()` so the
+  snapshot test exercises the real wire output. [Arc 8 Step 1-3]
+- **Structural-invariant assertions on
+  `test_admin_route_registry_completeness`** (renamed from
+  `describe_capabilities_snapshot` per V04_DESIGN.md §7.4.4):
+  the byte-for-byte literal stays in place as contract
+  protection; the new structural assertions (every family
+  namespace appears, extensions match `WIRE_EXTENSION_ORDER`
+  element-for-element) give human-readable diagnostics when
+  the registry drifts. [Arc 8 Step 4]
+
+#### Changed
+
+- **`describeCapabilities` handler** (`src/api/admin.rs`) now
+  reads from `ctx.route_registry` via a `build_families_value`
+  helper plus `RouteRegistry::advertised_extensions()`.
+  Byte-identical wire output preserved (the
+  `test_admin_route_registry_completeness` snapshot literal
+  is unchanged across Steps 1-4). [Arc 8 Step 3]
+- **`api::admin::routes()` return type** changed from
+  `Router<AppContext>` to `(Router<AppContext>, Arc<RouteRegistry>)`.
+  All 56 admin-tier routes use `.route_with_caps()` with
+  canonical-introducer capability attribution; ≈35 List C
+  routes (`com.atproto.admin.*` plus `describeCapabilities`)
+  use pass-through `.route()`. [Arc 8 Step 2]
+- **`api::routes()` return type** changed in lockstep to
+  `(Router<AppContext>, Arc<RouteRegistry>)` propagating
+  admin's registry tuple up. [Arc 8 Step 2]
+- **`AppContext::new(config)`** → `AppContext::new(config,
+  route_registry: Arc<RouteRegistry>)`. 8 callsites updated
+  (`main.rs`, 6 in-source test fixtures, 1 integration test).
+  [Arc 8 Step 2]
+- **`server::build_router(ctx)`** → `build_router(ctx, api_router)`
+  and **`server::serve(ctx)`** → `serve(ctx, api_router)`
+  accepting the pre-built `Router<AppContext>`. The startup
+  flow in `main.rs` is now: build `api::routes()` →
+  `AppContext::new` with the registry → `server::serve` with
+  the router. [Arc 8 Step 2]
+- **`CapabilityExtension.name`** type changed from
+  `&'static str` to `String` (registry returns owned strings;
+  `Box::leak`-per-request would accumulate leaked memory).
+  [Arc 8 Step 3]
+- **Contract-phrase test** renamed
+  `aurora_capability_extensions_has_versioning_pattern` →
+  `wire_extension_order_has_versioning_pattern`, with the anchor
+  moved from `fn aurora_capability_extensions(` in
+  `src/api/admin.rs` to `pub const WIRE_EXTENSION_ORDER:` in
+  `src/api/registry.rs`. Per Step 0 OQ1 disposition (b).
+  [Arc 8 Step 3]
+- **Direct `regex` crate dependency** (`Cargo.toml`) added for
+  `ADMIN_TIER_PATH_REGEX`. The crate was already in the tree
+  transitively via `tracing-subscriber`'s env-filter feature;
+  the direct dep makes the substrate's use explicit. [Arc 8
+  Step 1]
+
+#### Removed
+
+- **`aurora_capability_families()`** (~75 lines) and
+  **`aurora_capability_extensions()`** (~27 lines) from
+  `src/api/admin.rs`. Replaced by registry-driven generation;
+  the snapshot test confirms byte-identical wire output.
+  [Arc 8 Step 3]
+- **`// TODO(#123, v0.4): runtime route enumeration deferred …`**
+  anchors at the call sites — Arc 8 is the v0.4 cycle's
+  resolution of chainlink #123. [Arc 8 Step 3]
+- **`wire_extension_order_matches_curated_list_byte_identical`
+  test** (the Step 2 substrate test that locked the wire-order
+  constant against the curated list during the Step 1-2
+  intermediate; collapsed after Step 3 removed the curated
+  list). [Arc 8 Step 3]
+
+#### Documentation
+
+- **`docs/AURORA_ADMIN_UI_DESIGN.md` §8.15** rewritten with: the
+  three-step capability-addition procedure (design-doc update
+  → registry entry → `WIRE_EXTENSION_ORDER` insertion); the
+  `.omitted()` flag mechanism for vocabulary-level
+  intentionally-not-advertised capabilities; the admin-tier
+  scope definition with the verified `ADMIN_TIER_PATH_REGEX`;
+  and the representative-per-category List C rationale list
+  (bsky-PDS-compat namespace, capability-registry meta-endpoint,
+  public XRPC, health checks and well-known endpoints, admin
+  UI static assets, public OAuth surface, internal OAuth
+  bootstrap, Prometheus scrape). [Arc 8 Step 4]
+- **`docs/V04_DESIGN.md` §7** cross-references to
+  `AURORA_DESIGN.md §8.15` corrected to
+  `AURORA_ADMIN_UI_DESIGN.md §8.15` — the file was mislabeled
+  in the initial Arc 8 design prose (`AURORA_DESIGN.md` was
+  renamed to `V02_DESIGN.md` mid-Arc-7). 10 occurrences fixed.
+  [Arc 8 Step 4]
+
+#### Known limitations (v0.4)
+
+- **`RouteEntry.methods`** field exists but is left empty.
+  `axum::routing::MethodRouter` doesn't expose its accepted
+  methods publicly, and the current `describeCapabilities`
+  wire output doesn't include methods. Populating the field
+  would require either an explicit `methods: &[Method]`
+  parameter at every `.route_with_caps()` call site or
+  upstream axum changes. v0.6 candidate.
+- **Method-name extraction** in `build_families_value` uses
+  `path.rsplit('.').next()` to pull the trailing segment from
+  `/xrpc/<namespace>.<method>` paths. The fallback returns the
+  raw path; the snapshot test catches any future deviation
+  from the `<namespace>.<method>` shape loudly rather than
+  silently shipping a malformed wire entry.
+
 ### Arc 7 — Multi-instance auth state + rate limiting (v0.4-cycle)
 
 Four-step cycle (Step 0 recon, Step 0.6 schema, Steps 1-4
