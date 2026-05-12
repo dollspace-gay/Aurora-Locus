@@ -967,7 +967,12 @@ mod admin_auth_third_path_tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
         };
-        let mut ctx = AppContext::new(config).await.unwrap();
+        let mut ctx = AppContext::new(
+            config,
+            Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .unwrap();
         let mock: Arc<MockIdentityResolver> = Arc::new(MockIdentityResolver::new());
         ctx.identity_resolver = mock.clone();
         (ctx, mock)

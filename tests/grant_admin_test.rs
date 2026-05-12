@@ -97,7 +97,12 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
         distributed_state_mode: Default::default(),
         maintenance_pool: Default::default(),
     };
-    let ctx = AppContext::new(config).await.expect("AppContext::new");
+    let ctx = AppContext::new(
+        config,
+        std::sync::Arc::new(aurora_locus::api::registry::RouteRegistry::default()),
+    )
+    .await
+    .expect("AppContext::new");
     (ctx, dir)
 }
 

@@ -1654,7 +1654,12 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
         };
-        AppContext::new(config).await.unwrap()
+        AppContext::new(
+            config,
+            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .unwrap()
     }
 
     /// Insert an actor + a moderation_event for a clean test fixture.

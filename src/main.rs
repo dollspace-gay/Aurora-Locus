@@ -72,8 +72,17 @@ async fn main() -> PdsResult<()> {
     // Load configuration
     let config = ServerConfig::from_env()?;
 
+    // Arc 8 Step 2 (chainlink #54): build the API router +
+    // capability registry first so `AppContext::new` can park
+    // the populated `Arc<RouteRegistry>` in the context the
+    // request handlers see. The router itself is consumed by
+    // `server::serve` further down; CLI commands that don't
+    // start the server still construct it (cheap — no I/O) so
+    // the context always has a coherent registry.
+    let (api_router, route_registry) = api::routes();
+
     // Create application context
-    let ctx = AppContext::new(config).await?;
+    let ctx = AppContext::new(config, route_registry).await?;
     let ctx = std::sync::Arc::new(ctx);
 
     // Handle CLI commands
@@ -84,7 +93,7 @@ async fn main() -> PdsResult<()> {
             scheduler.start();
 
             // Start server
-            server::serve((*ctx).clone()).await?;
+            server::serve((*ctx).clone(), api_router).await?;
         }
 
         Some(Commands::CreateAccount {

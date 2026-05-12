@@ -4119,7 +4119,12 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
         };
-        AppContext::new(config).await.unwrap()
+        AppContext::new(
+            config,
+            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .unwrap()
     }
 
     /// Insert a minimal actor row so account-targeted actions resolve.
@@ -6941,7 +6946,11 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
         };
-        AppContext::new(config).await
+        AppContext::new(
+            config,
+            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
     }
 
     /// Arc 5 §9.4.2 / chainlink #124: file-tier value resolves

@@ -985,7 +985,12 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
         };
-        AppContext::new(config).await.unwrap()
+        AppContext::new(
+            config,
+            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .unwrap()
     }
 
     async fn write_test_chain_entry(ctx: &AppContext, action: &'static str) -> i64 {

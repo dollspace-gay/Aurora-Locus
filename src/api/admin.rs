@@ -6,6 +6,7 @@ use crate::{
         defs::Subject,
         InviteCode,
     },
+    api::registry::{aurora_route_builder, CapsBuilder, Family, RouteRegistry},
     auth::AdminAuthContext,
     error::{PdsError, PdsResult},
     AppContext,
@@ -18,6 +19,7 @@ use axum::{
 };
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Build admin API routes.
 ///
@@ -42,9 +44,28 @@ use serde::{Deserialize, Serialize};
 /// reaching it without an NSID rename, and the richer per-event reads
 /// that benefit from the new `tools.aurora.moderator.*` shape ship
 /// there alongside the unrelocated stream.
-pub fn routes() -> Router<AppContext> {
-    Router::new()
+pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
+    // Arc 8 Step 2 (chainlink #54): registration sites for the
+    // four `tools.aurora.<family>.*` namespaces flow through
+    // `aurora_route_builder()` so each admin-tier route emits a
+    // `RouteEntry` alongside its `axum::Router` registration.
+    // Non-admin-tier routes (`com.atproto.admin.*` and
+    // `tools.aurora.describeCapabilities`) use the builder's
+    // pass-through `.route(...)` — they live in the same router
+    // but contribute zero registry entries (Step 0 Q6 List C).
+    //
+    // Extension attribution policy: each capability extension is
+    // attributed to a single canonical endpoint (the
+    // capability-introducing route for that phase). The wire
+    // ordering is independent of per-route order — see
+    // `crate::api::registry::WIRE_EXTENSION_ORDER` for the
+    // declaration spec and the rationale.
+    aurora_route_builder::<AppContext>()
         // ---- com.atproto.admin.* (moderation/admin tier) ----
+        //
+        // Step 0 Q6 List C: out-of-Aurora-scope namespace. These
+        // routes register on the same Router but don't contribute
+        // to `tools.aurora.describeCapabilities`.
 
         // Account read
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
@@ -175,7 +196,9 @@ pub fn routes() -> Router<AppContext> {
         //
         // Capability probe — clients call this to discover which
         // Aurora extensions this instance supports without trial-
-        // and-error against individual endpoints.
+        // and-error against individual endpoints. List C: meta-
+        // endpoint that *describes* the registry, so it can't be
+        // an entry in the registry it describes (Step 0 Q6).
         .route(
             "/xrpc/tools.aurora.describeCapabilities",
             get(describe_capabilities),
@@ -183,35 +206,48 @@ pub fn routes() -> Router<AppContext> {
         // ---- tools.aurora.ops.* (operator / infrastructure tier) ----
         //
         // Stats and account-listing.
-        .route("/xrpc/tools.aurora.ops.getStats", get(get_stats))
-        .route(
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.getStats",
+            get(get_stats),
+            CapsBuilder::new(Family::Ops, 1),
+        )
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.listAccounts",
             get(ops_list_accounts),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        // Phase 2.3.8 — `getInstanceMetrics` is the
+        // `instance-metrics-v1` introducer.
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getInstanceMetrics",
             get(ops_get_instance_metrics),
+            CapsBuilder::new(Family::Ops, 1).extensions(["instance-metrics-v1"]),
         )
         // Health, metrics, validation, nonce store.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getValidationFailures",
             get(get_validation_failures),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getSystemHealth",
             get(get_system_health),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getDatabaseStatus",
             get(get_database_status),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getResourceUsage",
             get(get_resource_usage),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.listBackgroundJobs",
             get(list_background_jobs),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // POST: this is an action that triggers health-check execution
         // (with side effects in the form of probe RPCs / DB queries),
@@ -219,93 +255,129 @@ pub fn routes() -> Router<AppContext> {
         // (cleanupNonceStores, runBlobGC, pauseSequencer, etc.) all
         // use POST; this entry was an outlier that the admin UI's
         // SystemHealth page hit with POST and got a 405 in return.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.runHealthChecks",
             post(run_health_checks),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getVersionInfo",
             get(get_version_info),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getSystemMetrics",
             get(get_system_metrics),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getNonceStoreStatus",
             get(get_nonce_store_status),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.cleanupNonceStores",
             post(cleanup_nonce_stores),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // Blob storage.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getBlobStatistics",
             get(get_blob_statistics),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route("/xrpc/tools.aurora.ops.listBlobs", get(list_blobs))
-        .route("/xrpc/tools.aurora.ops.deleteBlob", post(delete_blob))
-        .route(
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.listBlobs",
+            get(list_blobs),
+            CapsBuilder::new(Family::Ops, 1),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.deleteBlob",
+            post(delete_blob),
+            CapsBuilder::new(Family::Ops, 1),
+        )
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.quarantineBlob",
             post(quarantine_blob),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route("/xrpc/tools.aurora.ops.restoreBlob", post(restore_blob))
-        .route("/xrpc/tools.aurora.ops.runBlobGC", post(run_blob_gc))
-        .route(
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.restoreBlob",
+            post(restore_blob),
+            CapsBuilder::new(Family::Ops, 1),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.runBlobGC",
+            post(run_blob_gc),
+            CapsBuilder::new(Family::Ops, 1),
+        )
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getBlobQuotas",
             get(get_blob_quotas),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // Sequencer infrastructure.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getSequencerStatus",
             get(get_sequencer_status),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.pauseSequencer",
             post(pause_sequencer),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.resumeSequencer",
             post(resume_sequencer),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.resetSequencerCursor",
             post(reset_sequencer_cursor),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.rebuildSequencer",
             post(rebuild_sequencer),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // Rate limiting.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getRateLimitConfig",
             get(get_rate_limit_config),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getRateLimitStatus",
             get(get_rate_limit_status),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.cleanupRateLimitState",
             post(cleanup_rate_limit_state),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // Federation / relay.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getFederationStatus",
             get(get_federation_status),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getRelayConfig",
             get(get_relay_config),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.listKnownInstances",
             get(list_known_instances),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.triggerPdsDiscovery",
             post(trigger_pds_discovery),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // ---- tools.aurora.moderator.* (chainlink #100 / Phase 3.3) ----
         //
@@ -314,39 +386,56 @@ pub fn routes() -> Router<AppContext> {
         // src/api/aurora_moderator.rs. Auth: AdminAuthContext
         // (Moderator+); namespace middleware also gates
         // tools.aurora.moderator.* to atproto:admin.moderation.
-        .route(
+        //
+        // Extension attribution: `moderator-activity-v1` ships on
+        // queryEvents (the primary activity query); `getEvent` and
+        // `queryStatuses` share that capability without
+        // re-declaring it. `subject-context-v1` is Phase 3.2's
+        // capability-probe companion attributed to its endpoint.
+        // `subject-history-v1` is Phase 3.3 attributed to its
+        // endpoint.
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.queryEvents",
             get(crate::api::aurora_moderator::query_events),
+            CapsBuilder::new(Family::Moderator, 1).extensions(["moderator-activity-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.getEvent",
             get(crate::api::aurora_moderator::get_event),
+            CapsBuilder::new(Family::Moderator, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.queryStatuses",
             get(crate::api::aurora_moderator::query_statuses),
+            CapsBuilder::new(Family::Moderator, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.getSubjectContext",
             get(crate::api::aurora_moderator::get_subject_context),
+            CapsBuilder::new(Family::Moderator, 1).extensions(["subject-context-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.getSubjectHistory",
             get(crate::api::aurora_moderator::get_subject_history),
+            CapsBuilder::new(Family::Moderator, 1).extensions(["subject-history-v1"]),
         )
         // ---- tools.aurora.moderator.* appeals reads (chainlink #101 / Phase 3.4) ----
         //
         // Two endpoints reusing 3.3's foundation types and rich-context
         // helpers (resolve_handles + new fetch_action_summaries batch
         // lookup). Auth: same AdminAuthContext + namespace scope as
-        // the other moderator-tier endpoints.
-        .route(
+        // the other moderator-tier endpoints. `appeals-v1` is
+        // attributed to `listAppeals` (the first appeals route);
+        // `getAppeal` shares the capability.
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.listAppeals",
             get(crate::api::aurora_moderator::list_appeals),
+            CapsBuilder::new(Family::Moderator, 1).extensions(["appeals-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.getAppeal",
             get(crate::api::aurora_moderator::get_appeal),
+            CapsBuilder::new(Family::Moderator, 1),
         )
         // ---- tools.aurora.admin.* (chainlink #102 / Phase 3.5) ----
         //
@@ -359,91 +448,120 @@ pub fn routes() -> Router<AppContext> {
         // Auth: AdminModeration scope (namespace middleware); within-
         // tier role checks happen at handler level (Moderator+ for
         // content actions, Admin+ for account-infrastructure actions).
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.emitEvent",
             post(crate::api::aurora_admin::emit_event),
+            CapsBuilder::new(Family::Admin, 1).extensions(["mod-events-emit-v1"]),
         )
         // Batch endpoints (Phase 3.5, §8.8–§8.13). Six atomic
         // multi-subject procedures driven by BulkActionPanel
-        // (substrate primitive 4). 50-subject hard cap per design doc.
-        .route(
+        // (substrate primitive 4). 50-subject hard cap per design
+        // doc. `batch-takedown-v1` is attributed to
+        // `batchTakedownAccounts` (the first batch route in
+        // registration order); the other five share the
+        // capability.
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchTakedownAccounts",
             post(crate::api::aurora_admin::batch_takedown_accounts),
+            CapsBuilder::new(Family::Admin, 1).extensions(["batch-takedown-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchSuspendAccounts",
             post(crate::api::aurora_admin::batch_suspend_accounts),
+            CapsBuilder::new(Family::Admin, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchRestoreAccounts",
             post(crate::api::aurora_admin::batch_restore_accounts),
+            CapsBuilder::new(Family::Admin, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchTakedownRecords",
             post(crate::api::aurora_admin::batch_takedown_records),
+            CapsBuilder::new(Family::Admin, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchApplyLabel",
             post(crate::api::aurora_admin::batch_apply_label),
+            CapsBuilder::new(Family::Admin, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchRemoveLabel",
             post(crate::api::aurora_admin::batch_remove_label),
+            CapsBuilder::new(Family::Admin, 1),
         )
         // triggerPasswordReset (Phase 3.5, §8.6). Admin+ role check
         // happens at handler level. Rationale recorded in the
         // hash-chained audit_chain_entry per design doc §3.4.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.triggerPasswordReset",
             post(crate::api::aurora_admin::trigger_password_reset),
+            CapsBuilder::new(Family::Admin, 1).extensions(["trigger-password-reset-v1"]),
         )
         // Phase 3.7 (chainlink #104) — moderation aggregations.
         // Auth: AdminModeration scope, Moderator+ role enforced at
         // handler level. Powers Dashboard Moderator flavor + bell
         // badge. Per §8.2 / §8.3.
-        .route(
+        //
+        // Wire order quirk: `moderation-metrics-v1` precedes
+        // `queue-stats-v1` in the curated extensions list, but
+        // `getQueueStats` is registered before `getModerationMetrics`
+        // (the natural alphabetical/grouped order from the original
+        // hand-written router). Wire ordering is preserved by
+        // WIRE_EXTENSION_ORDER rather than registration order, so
+        // the per-route attribution below is the natural one.
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.getQueueStats",
             get(crate::api::aurora_admin::get_queue_stats),
+            CapsBuilder::new(Family::Admin, 1).extensions(["queue-stats-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.getModerationMetrics",
             get(crate::api::aurora_admin::get_moderation_metrics),
+            CapsBuilder::new(Family::Admin, 1).extensions(["moderation-metrics-v1"]),
         )
         // Phase 3.8 (chainlink #105) — hash-chained audit trail.
         // Auth: AdminModeration scope, Moderator+ role at handler.
         // Per design doc §8.4: cursor-paginated newest-first; verified
         // flag computed at query time by re-hashing entry content.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.getAuditTrail",
             get(crate::api::aurora_admin::get_audit_trail),
+            CapsBuilder::new(Family::Admin, 1).extensions(["audit-trail-v1"]),
         )
         // Phase 3.8 (chainlink #105) — chain-of-custody forensic
         // export. AdminServer scope; Admin+ baseline at handler with
         // SuperAdmin gates on metadata + chain-inclusion params per
         // design doc §8.7.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.exportAccountForensic",
             post(crate::api::aurora_admin::export_account_forensic),
+            CapsBuilder::new(Family::Admin, 1).extensions(["forensic-export-v1"]),
         )
         // Phase 3.9 (chainlink #106) — real-time subscription via
         // WebSocket. Auth: AdminModeration scope, Moderator+ role.
         // Polling-driven (5s tick) over moderation_event with
         // heartbeat at 30s; wire protocol per §8.5 message shapes.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.subscribeModEvents",
             get(crate::api::aurora_subscribe::subscribe_mod_events),
+            CapsBuilder::new(Family::Admin, 1).extensions(["mod-events-stream-v1"]),
         )
         // Phase 3.10 (chainlink #117) — runtime settings infrastructure.
         // Two-tier config (runtime > file). Read at most-Admin-or-key-
         // dependent role; write SuperAdmin only with audit-chained
-        // rationale per design doc §8.16.
-        .route(
+        // rationale per design doc §8.16. `runtime-settings-v1`
+        // attributed to `getRuntimeSetting` (the read endpoint);
+        // `setRuntimeSetting` shares the capability.
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.getRuntimeSetting",
             get(crate::api::aurora_admin::get_runtime_setting),
+            CapsBuilder::new(Family::Admin, 1).extensions(["runtime-settings-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.setRuntimeSetting",
             post(crate::api::aurora_admin::set_runtime_setting),
+            CapsBuilder::new(Family::Admin, 1),
         )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
@@ -452,14 +570,17 @@ pub fn routes() -> Router<AppContext> {
         // (auth.role.can_act_as(Role::SuperAdmin)) — the namespace
         // alone doesn't gate this; the handler does. Per pre-deployment
         // framing, no deprecation aliases — clean wire-break.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.superadmin.grantRole",
             post(grant_role),
+            CapsBuilder::new(Family::SuperAdmin, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.superadmin.revokeRole",
             post(revoke_role),
+            CapsBuilder::new(Family::SuperAdmin, 1),
         )
+        .build()
 }
 
 // ============================================================================
@@ -6304,7 +6425,12 @@ mod tests {
             maintenance_pool: Default::default(),
         };
 
-        AppContext::new(config).await.unwrap()
+        AppContext::new(
+            config,
+            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]

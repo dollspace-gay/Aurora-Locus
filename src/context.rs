@@ -113,19 +113,30 @@ pub struct AppContext {
     pub distributed_store: Option<Arc<dyn DistributedStore>>,
     /// Route registry for capability advertisement (Arc 8,
     /// V04_DESIGN.md §7.3.2 + §7.3.3). Populated at startup by
-    /// `aurora_route_builder()` (Step 2 migration); consumed by
-    /// `describe_capabilities` at request time (Step 3). Step 1
-    /// initializes this to the empty default — every Arc-7-or-
-    /// earlier AppContext consumer still sees a valid registry,
-    /// but the wire output `describe_capabilities` produces is
-    /// unchanged from the hand-curated lists until Step 3
-    /// switches the handler over. See [`crate::api::registry`].
+    /// `aurora_route_builder()` in `main.rs` and threaded
+    /// through `AppContext::new`; consumed by
+    /// `describe_capabilities` at request time once Step 3
+    /// switches that handler over to the registry. Test
+    /// fixtures pass an empty default — the field exists for
+    /// every consumer but only `describe_capabilities` reads
+    /// it once Step 3 lands. See [`crate::api::registry`].
     pub route_registry: Arc<crate::api::registry::RouteRegistry>,
 }
 
 impl AppContext {
-    /// Create a new application context from configuration
-    pub async fn new(config: ServerConfig) -> PdsResult<Self> {
+    /// Create a new application context from configuration.
+    ///
+    /// `route_registry` is the populated registry returned by
+    /// `crate::api::routes()`'s builder pair, threaded in by the
+    /// startup flow so this constructor doesn't need to know
+    /// about route declarations. Tests use
+    /// `Arc::new(crate::api::registry::RouteRegistry::default())`
+    /// — the empty registry is fine for non-`describe_capabilities`
+    /// code paths.
+    pub async fn new(
+        config: ServerConfig,
+        route_registry: Arc<crate::api::registry::RouteRegistry>,
+    ) -> PdsResult<Self> {
         // Validate configuration
         config.validate()?;
 
@@ -564,13 +575,16 @@ impl AppContext {
             }
         }
 
-        // Route registry — empty default at Step 1; Step 2's
-        // migration replaces this with the populated registry
-        // returned from aurora_route_builder().build(). The
-        // empty default keeps describe_capabilities working
-        // off the hand-curated lists at admin.rs until Step 3
-        // switches the handler over.
-        let route_registry = Arc::new(crate::api::registry::RouteRegistry::default());
+        // Route registry — threaded in by the caller (Step 2:
+        // `main.rs` builds `aurora_route_builder()` first, then
+        // passes the populated registry here). Step 3 will
+        // switch `describe_capabilities` to read from this
+        // field; until then, the handler still reads the
+        // hand-curated lists at `admin.rs`, so the registry's
+        // contents are write-only at runtime — but the
+        // construction-time wiring is load-bearing so the test
+        // fixtures' empty-registry paths also flow through this
+        // arg.
 
         Ok(Self {
             config: Arc::new(config),

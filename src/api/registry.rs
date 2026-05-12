@@ -67,6 +67,70 @@ pub fn admin_tier_regex() -> &'static Regex {
     })
 }
 
+/// Canonical wire ordering for the flat extensions list emitted
+/// by `describe_capabilities`. The 14 strings match
+/// `aurora_capability_extensions()` at `src/api/admin.rs:3043`
+/// verbatim — both this constant and that hand-curated list are
+/// the §7.3.4 byte-identical lock until Step 3 removes the
+/// hand-curated list and this becomes the sole source of truth.
+///
+/// Why a wire-order constant instead of registration-order union:
+/// Step 0 Q8 Part (c) claimed registration-order would reproduce
+/// the existing wire output. That claim is wrong, and Step 2's
+/// migration surfaced the mismatch:
+///
+/// - `instance-metrics-v1` (Phase 2.3.8, on `ops.getInstanceMetrics`)
+///   is registered first among admin-tier routes, but appears
+///   fifth in wire output — after Phase 3.3's moderator
+///   extensions — because the wire order tracks phase
+///   *introduction* order, not route *registration* order.
+/// - `subject-context-v1` (Phase 3.2, on
+///   `moderator.getSubjectContext`) appears first in wire
+///   output but its handler is registered fourth within the
+///   moderator block (after `queryEvents`/`getEvent`/
+///   `queryStatuses`).
+/// - `moderation-metrics-v1` (Phase 3.7) precedes `queue-stats-v1`
+///   in wire output, but the corresponding `getQueueStats`
+///   handler is registered before `getModerationMetrics` —
+///   another phase-vs-registration swap.
+///
+/// Encoding the wire order here keeps
+/// `RouteRegistry::advertised_extensions` byte-identical with
+/// the hand-curated list across the Step 1→3 migration without
+/// constraining the per-family route registration order (which
+/// is itself pinned by the snapshot test).
+///
+/// `RouteRegistry::advertised_extensions` filters this list down
+/// to the extensions actually present on advertised entries.
+/// `debug_assert!` catches drift if a registered route attributes
+/// an extension that isn't in this constant — surface it during
+/// dev/test rather than silently dropping the string at runtime.
+pub const WIRE_EXTENSION_ORDER: &[&str] = &[
+    // Phase 3.2 — capability probe ships alongside getSubjectContext.
+    "subject-context-v1",
+    // Phase 3.3 — moderator-tier reads.
+    "moderator-activity-v1",
+    "subject-history-v1",
+    // Phase 3.4 — appeals reads.
+    "appeals-v1",
+    // Phase 2.3.8 — operator instance metrics.
+    "instance-metrics-v1",
+    // Phase 3.5 — emitEvent unified action surface + batch suite.
+    "mod-events-emit-v1",
+    "batch-takedown-v1",
+    "trigger-password-reset-v1",
+    // Phase 3.7 — moderation aggregations.
+    "moderation-metrics-v1",
+    "queue-stats-v1",
+    // Phase 3.8 — hash-chained audit + forensic export.
+    "audit-trail-v1",
+    "forensic-export-v1",
+    // Phase 3.9 — live event tail (HTTP-polling-driven in v0.2).
+    "mod-events-stream-v1",
+    // Phase 3.10 — runtime settings read/write.
+    "runtime-settings-v1",
+];
+
 /// Typed family identifier — enum so typos are compile errors;
 /// the wire-format string lives in a single [`Display`] impl.
 ///
@@ -303,33 +367,49 @@ impl RouteRegistry {
         map
     }
 
-    /// Union of all extension strings across advertised
-    /// entries, in declaration order (first-occurrence wins
-    /// for duplicates).
+    /// Flat extensions list for `describe_capabilities`,
+    /// emitted in [`WIRE_EXTENSION_ORDER`] and filtered to the
+    /// set of extensions actually attributed to advertised
+    /// routes.
     ///
-    /// Per Step 0 Q8: the wire output is a flat extensions
-    /// list aggregating across all routes. Union semantic +
-    /// declaration-order ordering reproduces the existing
-    /// hand-curated list byte-identically (verified during
-    /// Step 0 — see report Q8 Part (c)).
+    /// Step 0 Q8 Part (c)'s original plan was a
+    /// registration-order union; Step 2's migration surfaced
+    /// the mismatch (instance-metrics-v1 / subject-context-v1
+    /// / moderation-metrics-v1 / queue-stats-v1 all sit at
+    /// positions that disagree with their handlers'
+    /// registration order — see [`WIRE_EXTENSION_ORDER`]'s
+    /// docstring for the three cases). Encoding the wire order
+    /// in a separate constant keeps the snapshot byte-identical
+    /// without forcing routes to be registered in a less
+    /// natural order.
+    ///
+    /// `debug_assert!` panics in test/dev builds if a registered
+    /// route attributes an extension that isn't in
+    /// [`WIRE_EXTENSION_ORDER`] — surface drift loudly rather
+    /// than silently dropping the string at runtime.
     pub fn advertised_extensions(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-        // Iterate entries in registration_order so the resulting
-        // extension list preserves the byte-identical declaration
-        // order. `advertised_entries` already iterates the
-        // underlying Vec in insertion order; no extra sort
-        // needed because Step 2's migration registers routes in
-        // the same phase-introduction order as the current
-        // hand-curated lists.
-        for entry in self.advertised_entries() {
-            for ext in &entry.extensions {
-                if seen.insert(ext.clone()) {
-                    result.push(ext.clone());
-                }
+        let present: std::collections::HashSet<&str> = self
+            .advertised_entries()
+            .flat_map(|e| e.extensions.iter().map(String::as_str))
+            .collect();
+
+        if cfg!(debug_assertions) {
+            for ext in &present {
+                debug_assert!(
+                    WIRE_EXTENSION_ORDER.contains(ext),
+                    "extension {:?} attributed by a registered route is not \
+                     present in WIRE_EXTENSION_ORDER — add it to the constant \
+                     in declaration position or fix the attribution",
+                    ext
+                );
             }
         }
-        result
+
+        WIRE_EXTENSION_ORDER
+            .iter()
+            .filter(|ext| present.contains(**ext))
+            .map(|s| (*s).to_string())
+            .collect()
     }
 }
 
@@ -688,15 +768,44 @@ mod tests {
     }
 
     #[test]
-    fn registry_advertised_extensions_unions_in_declaration_order() {
+    fn registry_advertised_extensions_emits_in_wire_order_not_registration_order() {
+        // Register entries in registration_order that DOES NOT
+        // match the WIRE_EXTENSION_ORDER (e.g.,
+        // moderator-activity-v1 registered first, but
+        // subject-context-v1 must come first in wire output).
+        // This is exactly the live Phase 3.2/3.3 mismatch — see
+        // the `WIRE_EXTENSION_ORDER` docstring.
         let registry = RouteRegistry::from_entries(vec![
-            fixture_entry("/a", Family::Moderator, 0, vec!["subject-context-v1"], false),
-            fixture_entry("/b", Family::Moderator, 1, vec!["moderator-activity-v1"], false),
-            // Same extension contributed by a later entry —
-            // first-occurrence wins, so the order doesn't
-            // change.
-            fixture_entry("/c", Family::Moderator, 2, vec!["subject-context-v1", "subject-history-v1"], false),
-            fixture_entry("/d", Family::Admin, 3, vec!["mod-events-emit-v1"], false),
+            fixture_entry(
+                "/a",
+                Family::Moderator,
+                0,
+                vec!["moderator-activity-v1"],
+                false,
+            ),
+            fixture_entry(
+                "/b",
+                Family::Moderator,
+                1,
+                vec!["subject-context-v1"],
+                false,
+            ),
+            fixture_entry(
+                "/c",
+                Family::Moderator,
+                2,
+                vec!["subject-history-v1"],
+                false,
+            ),
+            // Same extension on a later entry — present-set
+            // dedup keeps wire output a single-occurrence list.
+            fixture_entry(
+                "/d",
+                Family::Admin,
+                3,
+                vec!["mod-events-emit-v1", "subject-context-v1"],
+                false,
+            ),
         ]);
         let extensions = registry.advertised_extensions();
         assert_eq!(
@@ -713,11 +822,42 @@ mod tests {
     #[test]
     fn registry_advertised_extensions_skips_omitted_entries() {
         let registry = RouteRegistry::from_entries(vec![
-            fixture_entry("/a", Family::Admin, 0, vec!["live-cap-v1"], false),
-            fixture_entry("/b", Family::Admin, 1, vec!["omitted-cap-v1"], true),
+            // `subject-context-v1` is in WIRE_EXTENSION_ORDER —
+            // the present-set on the omitted entry must not
+            // leak through to the wire output even though the
+            // string is otherwise wire-known.
+            fixture_entry("/a", Family::Admin, 0, vec!["mod-events-emit-v1"], false),
+            fixture_entry("/b", Family::Admin, 1, vec!["subject-context-v1"], true),
         ]);
         let extensions = registry.advertised_extensions();
-        assert_eq!(extensions, vec!["live-cap-v1".to_string()]);
+        assert_eq!(extensions, vec!["mod-events-emit-v1".to_string()]);
+    }
+
+    #[test]
+    fn wire_extension_order_matches_curated_list_byte_identical() {
+        // §7.3.4 byte-identical lock. While the hand-curated
+        // `aurora_capability_extensions()` still exists (Step 1-2
+        // intermediate state), both must be in sync. Step 3
+        // removes the hand-curated list and this becomes the
+        // sole source of truth.
+        let expected: &[&str] = &[
+            "subject-context-v1",
+            "moderator-activity-v1",
+            "subject-history-v1",
+            "appeals-v1",
+            "instance-metrics-v1",
+            "mod-events-emit-v1",
+            "batch-takedown-v1",
+            "trigger-password-reset-v1",
+            "moderation-metrics-v1",
+            "queue-stats-v1",
+            "audit-trail-v1",
+            "forensic-export-v1",
+            "mod-events-stream-v1",
+            "runtime-settings-v1",
+        ];
+        assert_eq!(WIRE_EXTENSION_ORDER, expected);
+        assert_eq!(WIRE_EXTENSION_ORDER.len(), 14);
     }
 
     // ---------- RouteRegistryBuilder ----------
