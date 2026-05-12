@@ -7352,8 +7352,16 @@ mod tests {
 
     // ---- tools.aurora.describeCapabilities (chainlink #99 / Phase 3.2) ----
 
-    /// Arc 2 Step 3 (§6.4.3) — full canonical-JSON snapshot of the
-    /// `tools.aurora.admin.describeCapabilities` response. Pins:
+    /// Admin route registry completeness — pins the
+    /// `tools.aurora.admin.describeCapabilities` wire output AND
+    /// asserts structural invariants the registry must satisfy.
+    /// Renamed from `describe_capabilities_snapshot` during Arc 8
+    /// Step 4 (chainlink #54): the test still snapshots the wire
+    /// shape, but its load-bearing purpose post-Arc-8 is to prove
+    /// every advertised family and every `WIRE_EXTENSION_ORDER`
+    /// entry round-trip through the registry-driven handler.
+    ///
+    /// What the byte-for-byte literal pins:
     ///
     /// - Top-level field set (`extensions`, `families`,
     ///   `implementation`, `version`) and ordering (alphabetical via
@@ -7369,15 +7377,28 @@ mod tests {
     ///   `version` string from CARGO_PKG_VERSION (bumped in lockstep
     ///   with the cycle).
     ///
+    /// What the structural assertions (run after the byte-for-byte
+    /// equality) add: inspectable invariant failures (`families`
+    /// contains the four namespace keys; `extensions` matches
+    /// `WIRE_EXTENSION_ORDER` element-for-element). When the test
+    /// fails the byte-for-byte assertion has the canonical
+    /// diagnostic, but the structural assertions give a
+    /// human-readable second opinion on what specifically drifted.
+    ///
     /// Determinism rationale: `serde_json::Map` defaults to a
     /// `BTreeMap` (no `preserve_order` feature) so namespace keys
-    /// inside `families` come out alphabetically; `extensions` is
-    /// `Vec<CapabilityExtension>` with hardcoded declaration order;
-    /// endpoint arrays inside `families` preserve the JSON-literal
-    /// source order. No `HashMap` iteration anywhere on the wire
-    /// path.
+    /// inside `families` come out alphabetically. Extensions output
+    /// comes from `WIRE_EXTENSION_ORDER` filtered by present-set
+    /// across registry entries
+    /// (`RouteRegistry::advertised_extensions`). Endpoint arrays
+    /// inside each family come from
+    /// `RouteRegistry::advertised_by_family`, which sorts by
+    /// `registration_order` within each family (preserving phase-
+    /// introduction order per Step 0 Q5 disposition (a) for
+    /// accidental orderings). No `HashMap` iteration anywhere on
+    /// the wire path.
     #[tokio::test]
-    async fn describe_capabilities_snapshot() {
+    async fn test_admin_route_registry_completeness() {
         let ctx = create_test_context().await;
         let resp = describe_capabilities(State(ctx), admin_test_auth())
             .await
@@ -7484,6 +7505,48 @@ mod tests {
             "describeCapabilities wire shape changed — \
              update the snapshot AND the §6.3.1 commitment if the \
              change is intentional, otherwise revert"
+        );
+
+        // Structural invariants — surface drift with
+        // human-readable failures alongside the byte-for-byte
+        // diagnostic above. Both pass-together / fail-together
+        // in normal operation; a structural-only failure points
+        // at a registry/wire-order mismatch the byte-for-byte
+        // assertion would also catch but with less direct
+        // signal.
+
+        let families_obj = resp
+            .families
+            .as_object()
+            .expect("describeCapabilities.families is a JSON object");
+        for namespace in [
+            "tools.aurora.admin",
+            "tools.aurora.moderator",
+            "tools.aurora.ops",
+            "tools.aurora.superadmin",
+        ] {
+            assert!(
+                families_obj.contains_key(namespace),
+                "families output missing namespace {} — \
+                 RouteRegistry::advertised_by_family didn't emit it; \
+                 check that admin::routes() registers at least one \
+                 route_with_caps() for the family",
+                namespace,
+            );
+        }
+
+        let extension_names: Vec<&str> =
+            resp.extensions.iter().map(|e| e.name.as_str()).collect();
+        let expected_extensions: Vec<&str> =
+            crate::api::registry::WIRE_EXTENSION_ORDER.to_vec();
+        assert_eq!(
+            extension_names, expected_extensions,
+            "extensions output diverges from WIRE_EXTENSION_ORDER — \
+             either a registered route is attributing an extension \
+             not in the wire-order constant (debug_assert! in \
+             RouteRegistry::advertised_extensions catches this in \
+             dev/test builds) or the present-set filter is missing \
+             an extension that should be advertised"
         );
     }
 
