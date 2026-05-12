@@ -357,40 +357,6 @@ fn forbidden(reason: &str) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// Subject → DID extractor for actions that target an account.
-/// Returns `None` for non-Repo subjects.
-fn require_repo_did(subject: &Subject) -> Result<&str, (StatusCode, Json<serde_json::Value>)> {
-    match subject {
-        Subject::Repo { did } => Ok(did.as_str()),
-        _ => Err(validation(
-            "action requires a Repo subject (did:plc:...) but got a Record or Blob subject",
-        )),
-    }
-}
-
-/// Subject → (URI, optional CID) for actions targeting a record or
-/// label-able subject. Records use `(uri, Some(cid))`; account labels
-/// can target a Repo subject's DID-as-URI form.
-fn subject_uri_cid(
-    subject: &Subject,
-) -> Result<(String, Option<String>), (StatusCode, Json<serde_json::Value>)> {
-    match subject {
-        Subject::Record { uri, cid } => Ok((uri.clone(), Some(cid.clone()))),
-        Subject::Repo { did } => Ok((format!("at://{}", did), None)),
-        Subject::Blob { did, cid, .. } => Ok((format!("at://{}", did), Some(cid.clone()))),
-    }
-}
-
-/// Subject → CID for blob-targeting actions.
-fn require_blob_cid(subject: &Subject) -> Result<&str, (StatusCode, Json<serde_json::Value>)> {
-    match subject {
-        Subject::Blob { cid, .. } => Ok(cid.as_str()),
-        _ => Err(validation(
-            "action requires a Blob subject ($type=com.atproto.admin.defs#repoBlobRef)",
-        )),
-    }
-}
-
 /// Bridge `Subject` → flat columns for `moderation_event` insertion.
 fn subject_columns(subject: &Subject) -> (Option<&str>, Option<&str>, Option<&str>) {
     match subject {
