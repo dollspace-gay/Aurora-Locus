@@ -223,6 +223,24 @@ async fn main() -> PdsResult<()> {
             cli::admin::grant_admin(&ctx, did, role, notes, force).await?;
         }
 
+        Some(Commands::GcSweep {
+            dry_run,
+            report_only,
+            max_deletes,
+            threshold_secs,
+            page_size,
+        }) => {
+            cli::gc_sweep::run(
+                &ctx,
+                dry_run,
+                report_only,
+                max_deletes,
+                threshold_secs,
+                page_size,
+            )
+            .await?;
+        }
+
         Some(Commands::Debug { subcommand }) => {
             use cli::DebugCommands;
             match subcommand {

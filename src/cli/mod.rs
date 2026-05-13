@@ -15,6 +15,7 @@ pub mod account;
 pub mod admin;
 pub mod backup;
 pub mod debug;
+pub mod gc_sweep;
 pub mod health;
 pub mod keygen;
 pub mod metrics;
@@ -220,6 +221,40 @@ pub enum Commands {
         /// only; semantics land in Step 4.
         #[arg(long)]
         force: bool,
+    },
+
+    /// Run an Arc 10 GC sweep against the offline PDS.
+    /// Reconciles blob storage against the `blob` /
+    /// `temp_blob_metadata` tables and deletes confirmed
+    /// orphans. CLI is offline-only (acquires
+    /// `LivenessLock`); for online sweeps, enable the
+    /// scheduled `gc_sweep_job` via
+    /// `PDS_GC_SWEEP_ENABLED=true`. Step 3 / chainlink #57.
+    GcSweep {
+        /// Force `dry_run` on regardless of `gc_sweep.dry_run`
+        /// in config. There is no `--no-dry-run`; flip
+        /// `PDS_GC_SWEEP_DRY_RUN=false` in config to enable
+        /// destructive mode.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Force `report_only` on — classify and log only.
+        /// Operator-intent disambiguation; see
+        /// `cli::gc_sweep::run` docs.
+        #[arg(long)]
+        report_only: bool,
+
+        /// Override `gc_sweep.max_deletes_per_run`.
+        #[arg(long)]
+        max_deletes: Option<usize>,
+
+        /// Override `gc_sweep.freshness_threshold_secs`.
+        #[arg(long)]
+        threshold_secs: Option<u64>,
+
+        /// Override `gc_sweep.page_size`.
+        #[arg(long)]
+        page_size: Option<usize>,
     },
 
     /// Debug utilities
