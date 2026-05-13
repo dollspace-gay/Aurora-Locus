@@ -1,6 +1,11 @@
 //! Configuration Validation CLI Command
 //!
 //! Provides comprehensive configuration validation with security and production readiness checks.
+//!
+//! Last audited for staleness: 2026-05-12 (Arc 9 Step 2 / chainlink #55;
+//! V04_DESIGN.md §8.4.1 Item 17). All emitted warnings classified as
+//! still valid; no rephrasing or removal needed. Re-audit when major
+//! auth, federation, or storage features change.
 
 use crate::config::{BlobstoreConfig, ServerConfig};
 use crate::error::PdsResult;
