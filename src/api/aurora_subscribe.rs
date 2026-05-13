@@ -155,7 +155,7 @@ enum SubscribeMessage<'a> {
     /// stays an explicit getAuditTrail request because it walks the
     /// whole chain.
     #[serde(rename = "auditEntry", rename_all = "camelCase")]
-    AuditEntry { entry: AuditEntry, sequence: i64 },
+    AuditEntry { entry: Box<AuditEntry>, sequence: i64 },
     #[serde(rename = "heartbeat")]
     Heartbeat { sequence: i64 },
     /// Per §8.5: emitted when the caller's `cursor` is older than the
@@ -421,7 +421,10 @@ fn merge_event_and_chain_streams(
         } else {
             let entry = chain_rows[ci].clone();
             let sequence = entry.sequence;
-            out.push(SubscribeMessage::AuditEntry { entry, sequence });
+            out.push(SubscribeMessage::AuditEntry {
+                entry: Box::new(entry),
+                sequence,
+            });
             ci += 1;
         }
     }
@@ -820,7 +823,7 @@ mod tests {
         // cascadeSubjects. Pinning the wrapped shape so future
         // refactors don't silently flatten or drop fields.
         let msg = SubscribeMessage::AuditEntry {
-            entry: AuditEntry {
+            entry: Box::new(AuditEntry {
                 id: "100".to_string(),
                 sequence: 42,
                 timestamp: DateTime::parse_from_rfc3339("2026-05-04T00:00:00Z")
@@ -839,7 +842,7 @@ mod tests {
                 verified: true,
                 cascade_subjects: Vec::new(),
                 cascade_snapshot_ids: Vec::new(),
-            },
+            }),
             sequence: 42,
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -892,7 +895,7 @@ mod tests {
         };
         let standalone = serde_json::to_value(&entry).unwrap();
         let wrapped = serde_json::to_value(&SubscribeMessage::AuditEntry {
-            entry,
+            entry: Box::new(entry),
             sequence: 42,
         })
         .unwrap();
