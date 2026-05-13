@@ -139,3 +139,33 @@ mechanism and the file tier as the deployment-stable layer.
   `audit_chain_entry` ledger — the file is operator
   configuration, not operator action. Runtime-row writes
   through `setRuntimeSetting` ARE audit-chained.
+
+## Per-key value formats
+
+Runtime settings are validated per-key at the API boundary
+(`setRuntimeSetting`) and warned-and-skipped at file-tier
+load time. The set of accepted keys is the `KNOWN_RUNTIME_KEYS`
+allowlist in `src/api/aurora_admin.rs`; the per-key validation
+rules live alongside the allowlist in `validate_runtime_value`.
+
+| Key | JSON type | Allowed values | Default | Notes |
+|-----|-----------|----------------|---------|-------|
+| `moderation-mode` | String | `"full"` \| `"reduced"` \| `"disabled"` | `"full"` | Controls moderation surface visibility. `full` keeps the moderation domain visible to moderator-role operators; `reduced` collapses the moderation surface (operations-domain only); `disabled` hides moderation entirely. The `AURORA_RECOVERY_MODE=true` env-var override forces this back to `"full"` regardless of runtime / file tier. |
+| `moderation-mode-redirect-url` | String | Any non-null string (including empty) | `""` | Where to redirect callers when `moderation-mode` is `reduced` or `disabled`. Empty string means no redirect (status-only response). The validator accepts any string shape; format checking (URL parse) is not enforced. |
+
+### Adding a new runtime setting
+
+Adding a new key in a future cycle is a four-step procedure:
+
+1. Append the key constant + add it to `KNOWN_RUNTIME_KEYS` in
+   `src/api/aurora_admin.rs`.
+2. Add the per-key validation arm to `validate_runtime_value`
+   in the same file.
+3. Add a default in `default_for_key`.
+4. Append a row to the table above documenting the value
+   format, allowed values, default, and any semantic notes.
+
+The table here is the operator-facing reference; the source
+allowlist is the runtime enforcement. The two must stay in
+sync — new keys must be documented here before the cycle that
+ships them closes.
