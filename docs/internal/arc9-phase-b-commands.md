@@ -7,6 +7,16 @@ at [`arc7-phase-b-commands.md`](arc7-phase-b-commands.md) and
 against `localhost:2583`, `cargo test` for deterministic
 test-infra checks, no deployment framing.
 
+> **Arc 11 dependency**: the Setup section uses
+> [`dev.aurora.*`](dev-routes.md) HTTP endpoints introduced by
+> Arc 11 (chainlink #56). The dev endpoints are present in
+> debug builds only via `#[cfg(debug_assertions)]`; running
+> Phase B against a release build requires falling back to the
+> legacy `cargo run -- grant-admin` CLI (and accepting the
+> stop-PDS / restart-PDS cycle Arc 11 was built to eliminate).
+> Arc 9's implementation work is debug-build-agnostic; only the
+> Setup section depends on Arc 11.
+
 Arc 9 is a hygiene pass with heterogeneous surfaces: a forensic-
 endpoint wire-shape migration with a `schemaVersion: "2"`
 manifest marker (Item 2), a test-clock primitive that makes
@@ -55,65 +65,137 @@ curl -s http://localhost:2583/health | jq
 
 Expected: `{"status":"ok",...}`.
 
-### Test accounts (skip if local state already has them)
+### Provision the admin account (four POSTs, zero PDS restarts)
 
-Admin path — create the account, grant SuperAdmin, mint JWT.
-
-> **`grant-admin` CLI signature**: positional `<DID> <ROLE>`
-> followed by optional `--notes` and `--force` flags. Verified
-> via `cargo run -- grant-admin --help`. Arc 7's and Arc 8's
-> scripts had the flag form `--did ... --role ...` from earlier
-> drafts; that form does not work against the current binary.
+Arc 11's [`dev.aurora.*`](dev-routes.md) HTTP endpoints replace
+the legacy `cargo run -- grant-admin` ceremony. The four POSTs
+below provision an admin account end-to-end against the running
+PDS — no stop, no restart, no `createSession` follow-up.
 
 ```bash
-curl -s -X POST http://localhost:2583/xrpc/com.atproto.server.createAccount \
+# 1. Create the admin account.
+#    dev.aurora.createAccount bypasses invite-code +
+#    email-verification gates and returns the access JWT
+#    directly. Body shape verified against
+#    src/api/dev_routes.rs:213-218 (CreateAccountBody) and
+#    response shape against src/api/dev_routes.rs:220-227
+#    (CreateAccountResponse).
+ADMIN_RESP=$(curl -s -X POST http://localhost:2583/xrpc/dev.aurora.createAccount \
   -H 'Content-Type: application/json' \
-  -d '{"email":"alice@localhost","handle":"alice.localhost","password":"TestPassword123!"}' \
+  -d '{
+    "handle": "admin.localhost",
+    "email": "admin@localhost",
+    "password": "TestPassword123!"
+  }')
+export ADMIN_DID=$(echo "$ADMIN_RESP" | jq -r '.did')
+echo "Admin DID: $ADMIN_DID"
+
+# 2. Grant SuperAdmin. Body shape per
+#    src/api/dev_routes.rs:78-86 (GrantAdminBody); response per
+#    src/api/dev_routes.rs:88-93 (GrantAdminResponse). Role
+#    parse is case-insensitive
+#    (src/admin/roles.rs:70 — `s.to_lowercase().as_str()`); the
+#    response field `role` echoes the canonical lowercase form
+#    via `Role::as_str()` (src/admin/roles.rs:52-59).
+curl -s -X POST http://localhost:2583/xrpc/dev.aurora.grantAdmin \
+  -H 'Content-Type: application/json' \
+  -d "{\"did\":\"$ADMIN_DID\",\"role\":\"superadmin\"}" \
   | jq
 
-cargo run -- grant-admin did:plc:<from-above> superadmin \
-  --notes "Arc 9 Phase B sweep"
-
-SESSION=$(curl -s -X POST http://localhost:2583/xrpc/com.atproto.server.createSession \
+# 3. Mint a fresh JWT carrying the new role. The admin scope
+#    is queried from `admin_roles` at request time by
+#    AdminAuthContext Layer 1 (src/auth.rs:230-332); the JWT
+#    itself just identifies the DID. Body shape per
+#    src/api/dev_routes.rs:271-274 (MintTokenBody); response
+#    per src/api/dev_routes.rs:276-281 (MintTokenResponse —
+#    wire field is `accessJwt` per the struct's
+#    `rename_all = "camelCase"`).
+export ADMIN_TOKEN=$(curl -s -X POST http://localhost:2583/xrpc/dev.aurora.mintToken \
   -H 'Content-Type: application/json' \
-  -d '{"identifier":"alice.localhost","password":"TestPassword123!"}')
-export ADMIN_TOKEN=$(echo "$SESSION" | jq -r '.accessJwt')
+  -d "{\"did\":\"$ADMIN_DID\"}" \
+  | jq -r '.accessJwt')
+echo "Token prefix: ${ADMIN_TOKEN:0:32}..."
+
+# 4. Verify the token works against an admin-tier endpoint.
+#    describeCapabilities uses the same AdminAuthContext
+#    extractor (src/api/admin.rs:204 binding ->
+#    src/auth.rs:196-207) that emitEvent and
+#    exportAccountForensic use, so passing here means the
+#    same token will pass on Sections A1 and A2-A5.
+curl -s http://localhost:2583/xrpc/tools.aurora.describeCapabilities \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  | jq 'keys'
 ```
 
-Tokens last ~1 hour; re-mint if a 401 appears mid-sweep.
+Expected: step 4 returns
+`["extensions","families","implementation","version"]`. If
+step 4 returns a 401/403 instead, the grant didn't land
+correctly — re-check step 2's response (`role` field should
+be `"superadmin"`).
+
+Tokens last ~1 hour; if a 401 appears mid-sweep, re-run step 3
+(no PDS restart needed).
+
+### Provision a sacrificial subject account
+
+Section A's seed emits `TakedownAccount` against a subject DID.
+**Do not use the admin's own DID** — the takedown removes the
+admin account and breaks every subsequent step. The Arc 11
+workflow makes a second account a single extra POST.
+
+```bash
+SUBJECT_RESP=$(curl -s -X POST http://localhost:2583/xrpc/dev.aurora.createAccount \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "handle": "subject.localhost",
+    "email": "subject@localhost",
+    "password": "TestPassword123!"
+  }')
+export SUBJECT_DID=$(echo "$SUBJECT_RESP" | jq -r '.did')
+echo "Subject DID: $SUBJECT_DID"
+```
+
+The subject account is unprivileged (no admin grant); Section
+A's `emitEvent` runs against `$SUBJECT_DID` under
+`$ADMIN_TOKEN`'s authority.
 
 ### Seed an audit chain entry for the forensic exercises
 
 Section A reads `audit-entries.json` from the bundle; it needs
 at least one chain entry against the subject. Easiest path:
-emit one moderation event against alice via `emitEvent`. If
-local state already has audit-chain rows for the account, skip.
+emit one moderation event against the subject account via
+`emitEvent`.
 
 `ModEventAction` is a tagged enum with `#[serde(tag = "kind")]`
-and no `rename_all` — the wire form is an object
-`{"kind": "TakedownAccount"}`, not the bare string
-`"TakedownAccount"`. Verified against the canonical-shape unit
-test [src/api/aurora_admin.rs:4513-4523](../../src/api/aurora_admin.rs#L4513-L4523)
-and the variant's docstring at [src/api/aurora_admin.rs:233](../../src/api/aurora_admin.rs#L233).
+and **no `rename_all`** — the wire form is an object
+`{"kind": "TakedownAccount"}` (PascalCase verbatim), not the
+bare string `"TakedownAccount"` and not the camelCase
+`"takedownAccount"`. Verified against the variant docstring at
+[src/api/aurora_admin.rs:233](../../src/api/aurora_admin.rs#L233),
+the enum declaration at
+[src/api/aurora_admin.rs:236-282](../../src/api/aurora_admin.rs#L236-L282),
+and the canonical-shape unit test at
+[src/api/aurora_admin.rs:4513-4523](../../src/api/aurora_admin.rs#L4513-L4523).
 `EmitEventOutput` uses `rename_all = "camelCase"`
 ([src/api/aurora_admin.rs:211-230](../../src/api/aurora_admin.rs#L211-L230));
 the response field name on the wire is `auditEntryId`, not the
-snake_case Rust name.
+snake_case Rust name `audit_entry_id`.
 
 ```bash
 curl -s -X POST http://localhost:2583/xrpc/tools.aurora.admin.emitEvent \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{
-    "action": {"kind": "TakedownAccount"},
-    "subjects": [{"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:<alice-did>"}],
-    "rationale": "phase-b seed",
-    "snapshotCapture": true
-  }' | jq '.auditEntryId'
+  -d "{
+    \"action\": {\"kind\": \"TakedownAccount\"},
+    \"subjects\": [{\"\$type\": \"com.atproto.admin.defs#repoRef\", \"did\": \"$SUBJECT_DID\"}],
+    \"rationale\": \"phase-b seed\",
+    \"snapshotCapture\": true
+  }" | jq '.auditEntryId'
 ```
 
 Expected: a stringified i64 (the chain entry id). Confirms a
-chain row exists for the Section A export to surface.
+chain row exists for the Section A export to surface against
+`$SUBJECT_DID`.
 
 ---
 
@@ -124,26 +206,40 @@ shape matches `getAuditTrail` field-for-field + the manifest
 carries the new `schemaVersion`.
 
 `exportAccountForensic` is a **POST** with a JSON body — not a
-GET with query params. `rationale` is required and non-empty.
-`include_audit_chain: true` requires SuperAdmin role (alice has
-it per Setup).
+GET with query params. `rationale` is required and non-empty
+([src/api/aurora_admin.rs:2960-2962](../../src/api/aurora_admin.rs#L2960-L2962)).
+`includeAuditChain: true` requires SuperAdmin role
+([src/api/aurora_admin.rs:2963-2968](../../src/api/aurora_admin.rs#L2963-L2968));
+the admin account provisioned in Setup carries that role.
+Auth-extractor parity: `exportAccountForensic` uses
+`AdminAuthContext`
+([src/api/aurora_admin.rs:2944-2948](../../src/api/aurora_admin.rs#L2944-L2948))
+— the same extractor `emitEvent`
+([src/api/aurora_admin.rs:618-622](../../src/api/aurora_admin.rs#L618-L622))
+and `describeCapabilities` use, so the token that passed
+Setup's step 4 will pass this endpoint too. If Setup's step 4
+returns 200, A1 will too.
 
-### A1. POST the export, save the TAR
+### A1. POST the export against the subject DID
+
+The forensic export targets `$SUBJECT_DID` (not `$ADMIN_DID`)
+— the subject is the account A1's audit-chain-seed step emitted
+against, so `audit-entries.json` will surface that row in A3.
 
 ```bash
 curl -s -o /tmp/forensic.tar \
   -X POST http://localhost:2583/xrpc/tools.aurora.admin.exportAccountForensic \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{
-    "did": "did:plc:<alice-did>",
-    "rationale": "phase-b A1 forensic-shape verification",
-    "includeRepo": false,
-    "includeBlobs": false,
-    "includeModerationHistory": false,
-    "includeAccountMetadata": false,
-    "includeAuditChain": true
-  }'
+  -d "{
+    \"did\": \"$SUBJECT_DID\",
+    \"rationale\": \"phase-b A1 forensic-shape verification\",
+    \"includeRepo\": false,
+    \"includeBlobs\": false,
+    \"includeModerationHistory\": false,
+    \"includeAccountMetadata\": false,
+    \"includeAuditChain\": true
+  }"
 
 ls -la /tmp/forensic.tar
 file /tmp/forensic.tar
@@ -153,8 +249,11 @@ Expected: `/tmp/forensic.tar` exists with non-zero size; `file`
 identifies it as `POSIX tar archive`. If the body is JSON
 instead (with an `error` field), the request failed before
 bundling — common causes: missing/empty `rationale`, missing
-SuperAdmin role on the bearer, or DID mismatch with no
-backing account row.
+SuperAdmin role on the bearer (Setup's step 2 didn't land), or
+DID mismatch with no backing account row. The body shape
+matches `ExportAccountForensicInput` exactly per
+[src/api/aurora_admin.rs:2927-2942](../../src/api/aurora_admin.rs#L2927-L2942)
+(`rename_all = "camelCase"`).
 
 ### A2. Unpack the TAR; inspect manifest.json
 
@@ -239,7 +338,7 @@ anywhere is a Phase B regression signal.
 ### A5. Field-for-field parity with getAuditTrail
 
 ```bash
-curl -s "http://localhost:2583/xrpc/tools.aurora.admin.getAuditTrail?subjectDid=did:plc:<alice-did>" \
+curl -s "http://localhost:2583/xrpc/tools.aurora.admin.getAuditTrail?subjectDid=$SUBJECT_DID" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   | jq '.items[0]' > /tmp/trail_entry.json
 
@@ -265,7 +364,7 @@ the same property in unit-test scope.
 sqlite3 data/account.sqlite \
   "SELECT subject_uri, subject_cid, cascade_subjects, cascade_snapshot_ids \
    FROM audit_chain_entry \
-   WHERE subject_did = 'did:plc:<alice-did>' \
+   WHERE subject_did = '$SUBJECT_DID' \
    ORDER BY sequence DESC LIMIT 1;"
 ```
 
@@ -627,8 +726,9 @@ the upgrade work is discoverable.
 
 ## Notes
 
-- **Token expiry**: JWT lasts ~1 hour; re-mint via Setup's
-  `createSession` curl if a 401 appears mid-sweep.
+- **Token expiry**: JWT lasts ~1 hour; re-mint via
+  `dev.aurora.mintToken` if a 401 appears mid-sweep. No
+  `createSession` cycle, no PDS restart.
 
 - **No mode toggles in Arc 9**: unlike Arc 7's
   `PDS_DISTRIBUTED_STATE_MODE`, Arc 9 introduces no env-var-
@@ -637,19 +737,51 @@ the upgrade work is discoverable.
 
 - **`exportAccountForensic` is POST, not GET**: takes a JSON
   body with `did`, `rationale` (required, non-empty), and
-  several `include*` flags. `include_audit_chain: true`
-  requires SuperAdmin role on the bearer. A GET-style query-
-  string invocation would fail with a 405 / 415; the script's
+  several `include*` flags. `includeAuditChain: true` requires
+  SuperAdmin role on the bearer. A GET-style query-string
+  invocation would fail with a 405 / 415; the script's
   examples all use the correct POST shape.
 
-- **`grant-admin` CLI signature**: positional `<DID> <ROLE>`
-  followed by `--notes <NOTES>` and `--force` optional flags.
-  Verified via `cargo run -- grant-admin --help`. The Arc 7
-  and Arc 8 Phase B scripts contained the wrong flag form
+- **Admin account provisioning via Arc 11 dev endpoints**:
+  Setup uses [`dev.aurora.createAccount`](dev-routes.md) +
+  `dev.aurora.grantAdmin` + `dev.aurora.mintToken` (four
+  POSTs total including the auth-verification step). No PDS
+  restart, no `cargo run -- grant-admin` ceremony. The Arc 11
+  endpoints are debug-build-only via
+  `#[cfg(debug_assertions)]`; if running Phase B against a
+  release build, fall back to the legacy CLI and pay the
+  stop-PDS / restart-PDS cost.
+
+- **Sacrificial subject account**: Section A's `emitEvent`
+  seed emits `TakedownAccount` against `$SUBJECT_DID`, not
+  `$ADMIN_DID`. Earlier Phase B attempts used the admin's
+  own DID and self-destructed the admin account mid-sweep —
+  the takedown removes the account row, and subsequent
+  exercises 401 because the JWT's underlying session row is
+  invalidated. Setup provisions both accounts up front so
+  the script is restartable without re-doing admin-grant
+  work.
+
+- **Re-minting tokens after grant changes**: any time a
+  grant changes mid-session (revoke + re-grant, role
+  change), re-mint via `dev.aurora.mintToken`. The token
+  doesn't carry the scope itself — `admin_roles` is the
+  authority, queried per-request by `AdminAuthContext`
+  Layer 1 at [src/auth.rs:230-332](../../src/auth.rs#L230-L332)
+  — but a fresh token avoids ambiguity if the same operator
+  used both pre-grant and post-grant tokens within the same
+  sweep.
+
+- **`grant-admin` CLI signature (legacy fallback)**: if a
+  release-build operator falls back to the CLI, the
+  signature is positional `<DID> <ROLE>` followed by
+  `--notes <NOTES>` and `--force` optional flags. Verified
+  via `cargo run -- grant-admin --help`. The Arc 7 and Arc 8
+  Phase B scripts contained the wrong flag form
   (`--did ... --role ...`) carried over from earlier-draft
-  versions of the CLI; the current binary's argument parser
-  rejects that form with a clap error. Use the positional
-  form above.
+  CLI versions; the current binary's argument parser rejects
+  that form. Arc 9 has no reason to use the CLI when Arc 11
+  is available.
 
 - **Forensic-bundle inspection**: the TAR is binary; use
   `tar -xf` to unpack before inspecting individual files.
