@@ -21,6 +21,34 @@ use crate::error::PdsResult;
 use async_trait::async_trait;
 use std::path::PathBuf;
 
+/// A page of blobs from a paginated storage walk.
+///
+/// Returned by [`BlobBackend::list_all_blobs`]. The
+/// `next_cursor` is an opaque continuation token suitable for
+/// passing back into a subsequent call; `None` means the walk
+/// is complete.
+#[derive(Debug, Clone)]
+pub struct BlobListPage {
+    pub entries: Vec<BlobListEntry>,
+    pub next_cursor: Option<String>,
+}
+
+/// A single blob entry from a storage walk.
+#[derive(Debug, Clone)]
+pub struct BlobListEntry {
+    /// The blob CID, with any backend-specific prefix or
+    /// sharding stripped. Round-trips through `get` / `put` /
+    /// `delete` without further normalisation.
+    pub cid: String,
+    /// Storage-side last-modified timestamp. Used by Arc 10's
+    /// GC sweep to apply the belt-and-braces freshness threshold
+    /// for orphan classification (the authoritative in-flight
+    /// signal is the `temp_blob_metadata` table; this timestamp
+    /// is a secondary check for blobs that escaped the upload
+    /// tracking surface entirely).
+    pub last_modified: chrono::DateTime<chrono::Utc>,
+}
+
 /// Blob storage backend trait
 ///
 /// Implementations handle the actual storage and retrieval of blob data.
@@ -43,6 +71,36 @@ pub trait BlobBackend: Send + Sync {
     /// Get the size of a blob in bytes
     #[allow(dead_code)] // Trait method for future blob backends
     async fn size(&self, cid: &str) -> PdsResult<Option<u64>>;
+
+    /// List blobs in storage, paginated.
+    ///
+    /// `cursor` is an opaque continuation token from a previous
+    /// call's response, or `None` to start from the beginning.
+    /// `page_size` is a hint; backends may return fewer entries.
+    ///
+    /// Returns the next page of CIDs paired with storage-side
+    /// last-modified timestamps. `next_cursor` is `None` when
+    /// iteration is complete.
+    ///
+    /// Added in Arc 10 (chainlink #57) to support the GC sweep
+    /// for orphaned blob storage. Backend-specific cursor
+    /// semantics:
+    ///
+    /// - `DiskBlobBackend`: cursor is a synthesised
+    ///   `"{shard}/{filename}"` string. Walks shards
+    ///   lexicographically; within each shard, files
+    ///   lexicographically.
+    /// - `S3BlobBackend`: cursor is the S3 `ContinuationToken`
+    ///   pass-through; `ListObjectsV2` is the underlying call.
+    ///
+    /// Both backends consistently propagate `last_modified` from
+    /// their respective storage metadata (FS `metadata().modified()`,
+    /// S3 `Object::last_modified`).
+    async fn list_all_blobs(
+        &self,
+        cursor: Option<String>,
+        page_size: usize,
+    ) -> PdsResult<BlobListPage>;
 }
 
 /// Configuration for blob storage
