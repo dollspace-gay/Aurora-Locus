@@ -354,9 +354,9 @@ fn verify_pkce_challenge(code_verifier: &str, code_challenge: &str) -> PdsResult
 /// Three-state outcome:
 ///   - `Ok(None)`           — no DPoP header sent; bearer-token flow
 ///   - `Ok(Some(thumbprint))` — proof present and verified; bind the
-///                              issued token to this JWK thumbprint
+///     issued token to this JWK thumbprint
 ///   - `Err(_)`             — proof present but invalid; caller maps
-///                              to 400 invalid_dpop_proof
+///     to 400 invalid_dpop_proof
 ///
 /// The verification dispatches to `ctx.dpop_verifier`, which performs
 /// signature verification, claim validation (htm/htu/jti replay/exp),

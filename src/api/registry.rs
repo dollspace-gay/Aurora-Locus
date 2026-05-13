@@ -87,6 +87,7 @@ pub fn admin_tier_regex() -> &'static Regex {
 /// corresponding endpoints are not yet shipped:
 ///   - `invite-lineage-v1`     (no shipped endpoint as of v0.4)
 ///   - `reporter-context-v1`   (no shipped endpoint as of v0.4)
+///
 /// Add them here when their handlers land.
 ///
 /// The snapshot test `describe_capabilities_snapshot` in

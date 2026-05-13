@@ -2267,7 +2267,7 @@ pub struct TriggerPasswordResetOutput {
     pub reset_email_sent: bool,
     /// Format: "e****@example.com" — first character + asterisks + @
     /// + domain. Confirms the right email was used without exposing
-    /// full PII to the operator session.
+    ///   full PII to the operator session.
     pub masked_email: String,
     pub audit_entry_id: String,
 }

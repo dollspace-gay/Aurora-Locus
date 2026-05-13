@@ -65,9 +65,9 @@ pub enum DistributedStateMode {
 impl DistributedStateMode {
     /// Parse from an env-var value with the same case-insensitive
     /// + aliased-form pattern `DatabaseBackend::from_env_values`
-    /// uses. Returns an error naming the valid options on
-    /// unrecognised input so operator typos surface
-    /// actionably.
+    ///   uses. Returns an error naming the valid options on
+    ///   unrecognised input so operator typos surface
+    ///   actionably.
     pub fn from_env_value(s: &str) -> PdsResult<Self> {
         match s.to_ascii_lowercase().as_str() {
             "distributed" => Ok(Self::Distributed),
