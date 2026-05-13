@@ -342,6 +342,17 @@ pub async fn run_sweep<B: BlobBackend + ?Sized>(
     }
 
     report.duration_seconds = start.elapsed().as_secs_f64();
+
+    // Emit Prometheus metrics per V04_DESIGN.md §9.3.3. The
+    // safety-cap-hit signal is derivable from
+    // `orphans_found_total - orphans_deleted_total > 0` (with
+    // `dry_run` off), so no separate counter is registered.
+    crate::metrics::GC_SWEEP_ORPHANS_FOUND_TOTAL
+        .inc_by(report.confirmed_orphans_found as u64);
+    crate::metrics::GC_SWEEP_ORPHANS_DELETED_TOTAL
+        .inc_by(report.orphans_deleted as u64);
+    crate::metrics::GC_SWEEP_DURATION_SECONDS.observe(report.duration_seconds);
+
     Ok(report)
 }
 

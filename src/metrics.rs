@@ -13,9 +13,9 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_gauge, register_histogram_vec, register_int_counter, register_int_counter_vec,
-    register_int_gauge, register_int_gauge_vec, Encoder, Gauge, HistogramVec, IntCounter,
-    IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
+    register_gauge, register_histogram, register_histogram_vec, register_int_counter,
+    register_int_counter_vec, register_int_gauge, register_int_gauge_vec, Encoder, Gauge,
+    Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
 
 lazy_static! {
@@ -253,6 +253,35 @@ lazy_static! {
     pub static ref BLOB_COUNT_TOTAL: IntGauge = register_int_gauge!(
         "blob_count_total",
         "Total number of blobs stored"
+    )
+    .unwrap();
+
+    // ========== GC Sweep Metrics (Arc 10 / chainlink #57, V04_DESIGN.md §9.3.3) ==========
+
+    /// Blobs classified as confirmed orphans during GC sweeps.
+    /// Counts all candidates eligible for deletion, regardless of
+    /// dry-run mode — useful for sizing the orphan backlog before
+    /// promoting a sweep from report-only to delete mode.
+    pub static ref GC_SWEEP_ORPHANS_FOUND_TOTAL: IntCounter = register_int_counter!(
+        "gc_sweep_orphans_found_total",
+        "Total blobs classified as confirmed orphans during GC sweeps"
+    )
+    .unwrap();
+
+    /// Orphans actually deleted by GC sweeps (after dry-run /
+    /// report-only filtering + safety-cap clamping). Steady
+    /// `orphans_found > orphans_deleted` indicates either dry_run
+    /// is on or the safety cap is biting.
+    pub static ref GC_SWEEP_ORPHANS_DELETED_TOTAL: IntCounter = register_int_counter!(
+        "gc_sweep_orphans_deleted_total",
+        "Total orphans deleted during GC sweeps"
+    )
+    .unwrap();
+
+    /// Wall-clock duration of a single GC sweep run.
+    pub static ref GC_SWEEP_DURATION_SECONDS: Histogram = register_histogram!(
+        "gc_sweep_duration_seconds",
+        "Duration of GC sweep runs (seconds)"
     )
     .unwrap();
 
