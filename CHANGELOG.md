@@ -6,6 +6,169 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Arc 9 — Hygiene pass (v0.4-cycle)
+
+Four-step cycle (Step 0 recon, Steps 1-4 implementation) bundling
+eight items from `docs/v04-candidates.md` whose individual scope
+didn't warrant separate arcs: clippy lint cleanup, `AppContext`
+Debug derive, test-clock primitive for identity::cache,
+`validate_config.rs` audit closure, subscribe-parity-test
+closure-as-done, `AURORA_ADMIN_UI_DESIGN.md` prose audit,
+`file-tier-config.md` value-format consolidation, and
+`exportAccountForensic` shape rationalization.
+
+Tracked via chainlink #55. Design at
+[`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §8.
+
+#### Added
+
+- **`Clock` trait abstraction** (`src/identity/clock.rs`) with
+  `SystemClock` (production) and `MockClock` (`#[cfg(test)]`-gated).
+  Initially adopted by `identity::cache` to make
+  `test_stale_handle_detection` and `test_stale_did_doc_detection`
+  deterministic; the prior implementation slept against real
+  wall-clock TTLs and flaked under suite-wide load. Broader
+  adoption across the ~218 other `Utc::now()` call sites in `src/`
+  is a v0.6 candidate. [Arc 9 Step 2, Item 12]
+- **Manual `impl Debug for AppContext`** (`src/context.rs`) with
+  per-field redaction. `Arc<dyn IdentityResolverApi>` and
+  `Option<Arc<dyn DistributedStore>>` print as opaque
+  `<dyn TraitName>` placeholders because the underlying traits
+  lack a `Debug` supertrait; secret-bearing fields (`config`,
+  `mailer`, DPoP/nonce stores, `local_records_cache`) print as
+  opaque `<TypeName>`. The regression-gate test
+  `app_context_debug_redacts_sensitive_fields` (in
+  `src/api/aurora_subscribe.rs`) asserts no known sentinel
+  secret value appears in the Debug output. No `derive_more`
+  helper crate added. [Arc 9 Step 2, Item 8]
+- **`audit_chain::audit_entry_from_row`** — shared row-to-AuditEntry
+  converter used by `exportAccountForensic` to keep its
+  `audit-entries.json` payload lock-step with `getAuditTrail`'s
+  per-item shape. The existing `getAuditTrail` loop retains its
+  inline construction (the stable contract surface stays
+  byte-identical); the new parity test pins the two paths
+  against each other. [Arc 9 Step 4, Item 2]
+- **`schemaVersion: "2"` field** on the forensic-export bundle's
+  `manifest.json`, marking the audit-entries wire-format
+  migration. Consumers dispatch on this field; the binary
+  always emits v2 going forward. [Arc 9 Step 4, Item 2]
+- **`Per-key value formats` section** in
+  `docs/operator/file-tier-config.md` documenting
+  `moderation-mode` and `moderation-mode-redirect-url`
+  validation rules with a four-step "Adding a new runtime
+  setting" procedure tying the source-side allowlist to the
+  operator-facing doc. [Arc 9 Step 3, Item 19]
+
+#### Changed
+
+- **`exportAccountForensic` bundle's `audit-entries.json`** now
+  uses the canonical `AuditEntry` wire shape — same as
+  `getAuditTrail`'s `items[]`. Previously diverged in field
+  names (`id` raw-i64 → stringified, `createdAt` → `timestamp`),
+  types (`snapshotId`/`eventId` raw-i64 → stringified), and
+  membership (missing `subjectRef`, `verified`, `cascadeSubjects`,
+  `cascadeSnapshotIds` now all present). Manifest's
+  `schemaVersion` bumped to `"2"` to signal the change.
+  **BREAKING** for any consumer scripted against the v1 forensic
+  bundle shape. [Arc 9 Step 4, Item 2]
+- **Identity-cache time source** migrated from direct
+  `chrono::Utc::now()` to `Arc<dyn Clock>` injection. Production
+  semantics unchanged via `SystemClock`; tests inject `MockClock`
+  for deterministic TTL-boundary assertions. The six `Utc::now()`
+  call sites inside `DidCache` (`get_did_doc`, `cache_did_doc`,
+  `get_handle`, `cache_handle`, `cleanup_expired` ×2) now read
+  from the injected clock. [Arc 9 Step 2, Item 12]
+- **`SubscribeMessage::AuditEntry`'s `entry` field** changed from
+  `AuditEntry` to `Box<AuditEntry>` (resolution for the
+  `large_enum_variant` lint flagging the enum at ~344 B vs ~40 B
+  largest peer). Wire shape preserved via serde's transparent
+  `Box<T>` (de)serialization; the existing parity test
+  `audit_entry_wire_shape_matches_get_audit_trail_items`
+  re-confirmed after the refactor. [Arc 9 Step 1, Item 7]
+- **`PaginationParams::effective_limit`** uses `.clamp(1, MAX_LIMIT)`
+  instead of the prior `.min().max()` chain (clippy
+  `manual_clamp`). [Arc 9 Step 1, Item 7]
+- **`com.atproto.admin.updateHandle` error mapping** collapsed two
+  adjacent `if matches!` arms (Validation / Conflict both → 409)
+  into a single `|` pattern (clippy `if_same_then_else`). [Arc 9
+  Step 1, Item 7]
+- **`docs/AURORA_ADMIN_UI_DESIGN.md`**: comprehensive prose audit
+  historicizing v0.2-era framing across ~20 sections. Header
+  reframed to `Cycle: v0.2 (with v0.3 + v0.4 additive amendments
+  — see §15 for v0.4 specifics)`. Four stale `AURORA_DESIGN.md`
+  cross-references updated to `V02_DESIGN.md`. "v0.3 may add" /
+  "v0.3 evaluates" framings throughout §2, §5, §6, §8.7, §9.5,
+  §14 rewritten to acknowledge that v0.3 + v0.4 didn't absorb
+  the items; future-cycle aspirations now route through
+  `docs/v05-candidates.md`. §15 stays current. [Arc 9 Step 3,
+  Item 15]
+
+#### Removed
+
+- **3 dead-code helper functions** in `src/api/aurora_admin.rs`
+  (`require_repo_did`, `subject_uri_cid`, `require_blob_cid`),
+  each superseded by `_pds` variants visible at
+  `aurora_admin.rs:1018+`. The companion `subject_columns` is
+  still used and stays. [Arc 9 Step 1, Item 7]
+- **`docs/AURORA_DESIGN.md`** — rename-closure to
+  `docs/V02_DESIGN.md`. The file had been pending deletion in the
+  working tree since Arc 7's mid-cycle rename to the
+  cycle-archive naming convention. Cross-references in
+  `docs/AURORA_ADMIN_UI_DESIGN.md` updated to point at the
+  renamed file. [Arc 9 Step 3, Item 15]
+
+#### Fixed
+
+- **24 clippy `-D warnings` errors cleared**: 3 `dead_code`, 1
+  `manual_clamp`, 1 `if_same_then_else`, 5
+  `doc_lazy_continuation` (in `aurora_admin.rs`, `registry.rs`,
+  `config.rs` ×3), 1 `useless_format`, 10 `redundant_closure`
+  (`|e| internal(e)` → `internal`), 1 `large_enum_variant`, 2
+  `doc_overindented_list_items` (in `oauth/token.rs`).
+  `cargo clippy --lib --no-deps -- -D warnings` now produces
+  zero errors; no new lints introduced. [Arc 9 Step 1, Item 7]
+- **`test_stale_handle_detection` flakiness** resolved by
+  migrating from `tokio::time::sleep` against real-wall-clock
+  TTLs to programmatic `MockClock` advancement. 10/10 flakiness
+  loop passes deterministically; total runtime drops from ~22s
+  to ~0.15s combined with the sibling
+  `test_stale_did_doc_detection` (also migrated). [Arc 9 Step
+  2, Item 12]
+
+#### Documentation
+
+- **`src/cli/validate_config.rs`**: audit-date comment confirming
+  all 18 emitted warnings classified as still valid as of Arc 9
+  Step 2. No rephrasing or removal needed. Re-audit anchor when
+  major auth, federation, or storage features change. [Arc 9
+  Step 2, Item 17]
+
+#### Closure-as-done items
+
+- **Item 14 (Subscribe parity test)**: closed as already-done.
+  The existing serde-shape unit test
+  `audit_entry_wire_shape_matches_get_audit_trail_items` IS the
+  parity test; it has passed throughout Arc 9's cycle work
+  (including across the Item 7 `Box<AuditEntry>` refactor). The
+  v0.3-cycle "tooling-side issue" referenced in
+  `docs/v04-candidates.md:166-169` couldn't be located in any
+  tracked design corpus. If a WebSocket-integration-level
+  parity test was the original intent, that's v0.6 candidate
+  territory (new tokio-tungstenite + axum-test scaffolding).
+
+#### Known limitations (v0.4)
+
+- **`Clock` adoption is scoped to `identity::cache`**. ~218 other
+  `Utc::now()` call sites in the codebase remain on direct
+  wall-clock. Broader adoption is a v0.6 candidate gated by
+  whether other tests show flakiness signal.
+- **`getAuditTrail` retains its inline row-to-AuditEntry
+  construction**. The shared `audit_chain::audit_entry_from_row`
+  helper is currently used only by `exportAccountForensic`.
+  DRYing `getAuditTrail` onto the helper is a v0.5+ refactor
+  candidate; the new parity test pins the duplication so drift
+  is caught immediately.
+
 ### Arc 8 — Runtime route enumeration (v0.4-cycle)
 
 Four-step cycle (Step 0 recon, Steps 1-4 implementation + docs)
