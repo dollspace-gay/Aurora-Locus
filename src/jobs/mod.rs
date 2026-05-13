@@ -137,6 +137,24 @@ impl JobScheduler {
         tokio::spawn(Self::oauth_authorization_request_cleanup_job(Arc::clone(&self)));
         info!("OAuth authorization_request cleanup job started");
 
+        // Spawn Arc 10 GC sweep job (chainlink #57). Off-by-
+        // default — operators opt in via PDS_GC_SWEEP_ENABLED.
+        // When enabled, the job reconciles blob storage
+        // against `blob` + `temp_blob_metadata` and deletes
+        // confirmed orphans subject to dry_run +
+        // max_deletes_per_run safety mechanisms.
+        if self.context.config.gc_sweep.enabled {
+            tokio::spawn(Self::gc_sweep_job(Arc::clone(&self)));
+            info!(
+                interval_secs = self.context.config.gc_sweep.interval_secs,
+                dry_run = self.context.config.gc_sweep.dry_run,
+                max_deletes_per_run = self.context.config.gc_sweep.max_deletes_per_run,
+                "GC sweep job scheduled"
+            );
+        } else {
+            tracing::debug!("GC sweep job disabled (gc_sweep.enabled = false)");
+        }
+
         info!("Background jobs started");
     }
 
@@ -274,6 +292,59 @@ impl JobScheduler {
                     }
                 }
                 Err(e) => error!("Failed to cleanup orphaned temp blobs: {}", e),
+            }
+        }
+    }
+
+    /// Arc 10 GC sweep (V04_DESIGN.md §9.4.3, chainlink #57).
+    /// Reconciles blob storage against `blob` +
+    /// `temp_blob_metadata`; deletes confirmed orphans subject
+    /// to dry_run + max_deletes_per_run safety mechanisms.
+    /// Cadence + safety parameters come from
+    /// `config.gc_sweep`; only spawned when
+    /// `config.gc_sweep.enabled = true` (see `start()`).
+    async fn gc_sweep_job(scheduler: Arc<Self>) {
+        let interval_secs = scheduler.context.config.gc_sweep.interval_secs;
+        let mut interval = interval(Duration::from_secs(interval_secs));
+
+        loop {
+            interval.tick().await;
+
+            let params = scheduler
+                .context
+                .config
+                .gc_sweep
+                .to_sweep_params(false);
+            let now = chrono::Utc::now();
+
+            info!(
+                dry_run = params.dry_run,
+                max_deletes_per_run = params.max_deletes_per_run,
+                page_size = params.page_size,
+                "Running GC sweep job"
+            );
+
+            match scheduler
+                .context
+                .blob_store
+                .run_gc_sweep(params, now)
+                .await
+            {
+                Ok(report) => {
+                    info!(
+                        pages_scanned = report.pages_scanned,
+                        blobs_examined = report.blobs_examined,
+                        authorized = report.authorized,
+                        in_flight = report.in_flight,
+                        too_young = report.too_young,
+                        confirmed_orphans_found = report.confirmed_orphans_found,
+                        orphans_deleted = report.orphans_deleted,
+                        orphans_skipped_safety_cap = report.orphans_skipped_safety_cap,
+                        duration_seconds = report.duration_seconds,
+                        "GC sweep complete"
+                    );
+                }
+                Err(e) => error!("GC sweep failed: {}", e),
             }
         }
     }

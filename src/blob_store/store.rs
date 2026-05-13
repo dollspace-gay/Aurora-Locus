@@ -413,6 +413,27 @@ impl BlobStore {
         self.backend.delete(cid).await
     }
 
+    /// Run an Arc 10 GC sweep against this store's backend and pool.
+    ///
+    /// Thin wrapper around [`crate::blob_store::gc::run_sweep`] —
+    /// keeps the backend and DB pool encapsulated inside `BlobStore`
+    /// rather than leaking them to consumers. Matches the
+    /// [`Self::backend_delete`] wrapper pattern.
+    ///
+    /// Production callers are the scheduled
+    /// `JobScheduler::gc_sweep_job` and the
+    /// `aurora-locus gc-sweep` CLI subcommand; both pass
+    /// [`chrono::Utc::now()`] for `now`. Tests can pass a fixed
+    /// `now` to age fresh blobs past the freshness threshold without
+    /// backdating filesystem mtimes (see `blob_store::gc::tests`).
+    pub async fn run_gc_sweep(
+        &self,
+        params: crate::blob_store::gc::SweepParams,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> PdsResult<crate::blob_store::gc::SweepReport> {
+        crate::blob_store::gc::run_sweep(&*self.backend, &self.db, params, now).await
+    }
+
     /// Calculate CID for data using SHA-256
     fn calculate_cid(&self, data: &[u8]) -> String {
         let hash = Sha256::digest(data);
