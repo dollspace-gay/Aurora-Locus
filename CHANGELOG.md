@@ -6,6 +6,139 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Arc 10 — GC sweep for orphaned blob storage (v0.4-cycle)
+
+Four-step cycle (Step 0 recon, Steps 1-4 implementation)
+introducing an optional background reconciliation mechanism
+for blob storage. Identifies and (operator-opt-in) deletes
+storage entries with no corresponding row in the
+authoritative `blob` table — the rare case where Arc 4's
+`DeferredAction` queue's best-effort cleanup fails to land.
+
+Tracked via chainlink #57. Design at
+[`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §9.
+
+The sweep is **off by default** in v0.4. Existing deployments
+gain no new background task; operators opt in via
+`PDS_GC_SWEEP_ENABLED=true` (env-var) or the `gc_sweep` config
+section (file tier). When enabled, `dry_run: true` is the
+safe default — operators promote to destructive mode only
+after observing the report cadence in production.
+
+#### Added
+
+- **`BlobBackend::list_all_blobs(cursor, page_size) ->
+  BlobListPage`** trait method exposing paginated storage
+  walks. Both backends (`DiskBlobBackend`, `S3BlobBackend`)
+  implement against their native primitives — `DiskBlobBackend`
+  uses `tokio::fs::read_dir` with a synthesized
+  `"{shard}/{filename}"` cursor; `S3BlobBackend` passes the
+  S3 `ContinuationToken` through. [Arc 10 Step 1]
+- **`src/blob_store/gc.rs`** — sweep primitive. Reconciles
+  blob storage against `blob` and `temp_blob_metadata`;
+  classifies each candidate via the two-stage `classify_blob`
+  function (precedence: `Authorized > InFlight > age`);
+  applies actions per `SweepParams`. Library-callable via
+  `BlobStore::run_gc_sweep`. [Arc 10 Step 2]
+- **Scheduled background job
+  `JobScheduler::gc_sweep_job`** at configurable cadence
+  (default 24h). Gated on `gc_sweep.enabled`; matches
+  `temp_blob_cleanup_job`'s shape (interval-loop + structured
+  tracing logs of the 9-counter report). [Arc 10 Step 3]
+- **CLI subcommand `aurora-locus gc-sweep`** for operator-
+  initiated one-off sweeps. Offline-only: acquires
+  `LivenessLock` and fails fast if a PDS is running against
+  the same DB. Five overrides (`--dry-run`, `--report-only`,
+  `--max-deletes`, `--threshold-secs`, `--page-size`); no
+  `--no-dry-run` (destructive mode requires editing config +
+  restarting). [Arc 10 Step 3]
+- **`GcSweepConfig`** config section with six fields:
+  `enabled`, `interval_secs`, `dry_run`,
+  `max_deletes_per_run`, `freshness_threshold_secs`,
+  `page_size`. Env-var loading via `PDS_GC_SWEEP_*` prefixes;
+  zero `interval_secs` and `page_size` rejected at startup;
+  unparseable values surface as validation errors. New
+  `parse_bool_env` and `parse_usize_env` helpers added
+  alongside the existing typed parse helpers. [Arc 10 Step 3]
+- **Four `validate-config` warnings** for risky `gc_sweep`
+  configurations, gated on `gc_sweep.enabled = true`:
+  `dry_run: false` general advisory; `dry_run: false` AND
+  `max_deletes_per_run > 100000` (blast-radius);
+  `freshness_threshold_secs < 600` (in-flight false-positive
+  risk); `interval_secs < 3600` (cadence vs. throughput).
+  [Arc 10 Step 3]
+- **Three Prometheus metrics** in `src/metrics.rs`:
+  `gc_sweep_orphans_found_total` (counter),
+  `gc_sweep_orphans_deleted_total` (counter),
+  `gc_sweep_duration_seconds` (histogram). Cap-hit and
+  duration-vs-interval signals are derivable from these
+  three; no separate cap-hit counter. [Arc 10 Step 2]
+- **`docs/operator/blob-gc-sweep.md`** — operator-facing
+  reference: what the sweep does, when to enable it, the
+  mandatory dry-run shakedown procedure, both configuration
+  paths, the CLI subcommand, metrics + derivable signals,
+  troubleshooting, and the full configuration reference
+  table. [Arc 10 Step 4]
+
+#### Rationale
+
+- The Arc 4 `DeferredAction` queue handles the common case
+  where storage and DB go out of sync; the sweep is for
+  edge cases where the queue's retries are exhausted, the
+  PDS was forcibly terminated mid-cleanup, or manual
+  operator action created divergence.
+- Off-by-default + dry-run-default + safety-cap-default
+  preserve existing deployment behavior; opt-in destructive
+  mode requires explicit operator action through both
+  config changes (no CLI-flag override of `dry_run` in the
+  destructive direction).
+- Stateless mode for v0.4 — each sweep starts fresh from the
+  first storage page. Stateful mode (persistent cursor
+  between runs) is a v0.6 candidate if operational
+  telemetry shows probabilistic coverage is insufficient.
+- Tracking-surface-driven classification per Step 0 Q9:
+  `temp_blob_metadata` is authoritative for in-flight
+  uploads; the 1-hour freshness threshold is belt-and-braces
+  for the rare race where a row hasn't committed yet at the
+  moment storage lists the CID.
+
+#### Verification
+
+- `cargo test --lib` — 991 passed (Arc 9 baseline 951 + 21
+  `blob_store::gc::tests` + 8 `config::gc_sweep_tests` + 11
+  miscellaneous Arc 10/11 additions across other modules).
+- Synthetic IN-clause benchmark
+  (`tests/blob_in_clause_benchmark.rs`, `--ignored`) — 1
+  passed; query at `page_size=500` against 100k synthetic
+  blob rows runs in ~7ms (well under the 50ms threshold).
+  Plan stays `SEARCH blob USING COVERING INDEX
+  sqlite_autoindex_blob_1 (cid=?)`.
+- `cargo test --test distributed_substrate_test` — 11.
+- `cargo test --test contract_phrases` — 14.
+- `cargo test --test grant_admin_test` — 8.
+- `cargo clippy --lib --no-deps -- -D warnings` — 0 errors.
+- `cargo build --release --bin aurora-locus` — succeeds; no
+  new warnings introduced.
+
+#### Out of scope (v0.6 candidates)
+
+- Stateful sweep mode with persistent cursor between runs.
+- Graceful cancellation handle for the scheduled job
+  (shared with the broader `JobScheduler` shutdown story).
+- Live S3 integration tests against an S3 mock
+  (`aws-sdk-mock` or LocalStack testcontainers).
+- Promote `now: DateTime<Utc>` parameter on `run_sweep` /
+  `run_gc_sweep` to full `Clock` injection if telemetry
+  surfaces a need.
+- `--config-show` CLI mode that prints resolved params
+  without acquiring the `LivenessLock` first.
+- Per-account orphan-rate metric (the current metrics are
+  process-wide totals).
+- Postgres-side `EXPLAIN ANALYZE` benchmark equivalent to
+  the SQLite synthetic benchmark (requires
+  `testcontainers` scaffolding equivalent to
+  `tests/distributed_substrate_test.rs`).
+
 ### Arc 11 — Dev curl framework (v0.4-cycle)
 
 Single-step cycle item shipping a localhost-only HTTP namespace
