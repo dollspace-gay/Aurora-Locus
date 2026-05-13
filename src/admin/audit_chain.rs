@@ -165,6 +165,115 @@ pub struct AuditEntry {
     pub cascade_snapshot_ids: Vec<Option<String>>,
 }
 
+/// Build an [`AuditEntry`] from a fetched `audit_chain_entry` row.
+///
+/// Centralises the column-extraction + cascade-parsing +
+/// `verify_entry` + `Subject::from_columns` wiring used to surface
+/// the canonical `AuditEntry` wire shape. `exportAccountForensic`
+/// calls this helper to keep its `audit-entries.json` payload
+/// lock-step with what `getAuditTrail` emits per item (Arc 9 Step 4
+/// / chainlink #55 Item 2).
+///
+/// The row MUST include the columns the production SELECT statements
+/// fetch: `id, sequence, created_at, actor_did, action, subject_did,
+/// subject_uri, subject_cid, rationale, snapshot_id, event_id,
+/// current_hash, previous_hash, cascade_subjects, cascade_snapshot_ids`.
+/// Missing columns surface as `PdsError::Internal`.
+///
+/// Tolerates malformed `cascade_subjects` / `cascade_snapshot_ids`
+/// JSON by falling back to empty vectors, mirroring `getAuditTrail`'s
+/// behaviour. SQL column errors and `created_at` parse failures
+/// propagate as `PdsError::Internal`.
+///
+/// `getAuditTrail`'s loop in `src/api/aurora_admin.rs` retains its
+/// inline construction for now per the Arc 9 Step 4 scope discipline
+/// (the stable contract surface must stay byte-identical). The unit
+/// test `forensic_audit_entries_match_get_audit_trail_shape` pins the
+/// two paths against each other so a future cycle can DRY both onto
+/// this helper with confidence.
+pub fn audit_entry_from_row(row: &sqlx::any::AnyRow) -> Result<AuditEntry, PdsError> {
+    use sqlx::Row as _;
+    let to_internal = |e: sqlx::Error| PdsError::Internal(e.to_string());
+
+    let id: i64 = row.try_get("id").map_err(to_internal)?;
+    let sequence: i64 = row.try_get("sequence").map_err(to_internal)?;
+    let created_at_str: String = row.try_get("created_at").map_err(to_internal)?;
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+        .map_err(|e| PdsError::Internal(e.to_string()))?
+        .with_timezone(&chrono::Utc);
+    let actor_did: String = row.try_get("actor_did").map_err(to_internal)?;
+    let action: String = row.try_get("action").map_err(to_internal)?;
+    let subject_did: Option<String> = row.try_get("subject_did").ok().flatten();
+    let subject_uri: Option<String> = row.try_get("subject_uri").ok().flatten();
+    let subject_cid: Option<String> = row.try_get("subject_cid").ok().flatten();
+    let rationale: String = row.try_get("rationale").map_err(to_internal)?;
+    let snapshot_id: Option<i64> = row.try_get("snapshot_id").ok().flatten();
+    let event_id: Option<i64> = row.try_get("event_id").ok().flatten();
+    let current_hash: String = row.try_get("current_hash").map_err(to_internal)?;
+    let previous_hash: Option<String> = row.try_get("previous_hash").ok().flatten();
+
+    let cascade_str: Option<String> = row.try_get("cascade_subjects").ok().flatten();
+    let cascade_subjects: Vec<Subject> = cascade_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let cascade_snapshot_ids_str: Option<String> =
+        row.try_get("cascade_snapshot_ids").ok().flatten();
+    // Parse the on-disk numeric JSON for the wire field. The
+    // verify_entry call below still receives the raw string form
+    // because the canonical hash sees the JSON-encoded string
+    // nested inside the canonical object (Arc 3 Step 2 documents
+    // the wire-vs-canonical asymmetry).
+    let cascade_snapshot_ids_i64: Vec<Option<i64>> = cascade_snapshot_ids_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let cascade_snapshot_ids: Vec<Option<String>> = cascade_snapshot_ids_i64
+        .iter()
+        .map(|opt| opt.map(|v| v.to_string()))
+        .collect();
+
+    let verified = verify_entry(
+        sequence,
+        &created_at_str,
+        &actor_did,
+        &action,
+        subject_did.as_deref(),
+        subject_uri.as_deref(),
+        subject_cid.as_deref(),
+        &rationale,
+        snapshot_id,
+        event_id,
+        previous_hash.as_deref(),
+        cascade_str.as_deref(),
+        cascade_snapshot_ids_str.as_deref(),
+        &current_hash,
+    );
+    let subject_ref = Subject::from_columns(
+        subject_did.as_deref(),
+        subject_uri.as_deref(),
+        subject_cid.as_deref(),
+    );
+
+    Ok(AuditEntry {
+        id: id.to_string(),
+        sequence,
+        timestamp,
+        actor_did,
+        action,
+        subject_ref,
+        rationale,
+        snapshot_id: snapshot_id.map(|i| i.to_string()),
+        event_id: event_id.map(|i| i.to_string()),
+        current_hash,
+        previous_hash,
+        verified,
+        cascade_subjects,
+        cascade_snapshot_ids,
+    })
+}
+
 /// Compact subject capture for snapshot content. v0.2 ships the
 /// account-shape; record/blob shapes added in v0.3 when per-record
 /// state is more meaningful (Phase 3.7 aggregations open the door).

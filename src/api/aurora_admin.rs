@@ -3031,35 +3031,31 @@ pub async fn export_account_forensic(
         serde_json::Value::Null
     };
 
-    // Audit chain entries (SuperAdmin-gated)
+    // Audit chain entries (SuperAdmin-gated). The audit-entries.json
+    // payload uses the canonical `AuditEntry` wire shape — same as
+    // `getAuditTrail`'s `items[]` — by routing each fetched row
+    // through `audit_chain::audit_entry_from_row`. Arc 9 Step 4 /
+    // chainlink #55 Item 2 closed the prior divergence (raw-i64 ids,
+    // `createdAt` instead of `timestamp`, missing `subjectRef` /
+    // `verified` / cascade fields); see V04_DESIGN.md §8.4.4.
     let audit_entries: serde_json::Value = if input.include_audit_chain {
         let rows = sqlx::query(
             "SELECT id, sequence, created_at, actor_did, action, subject_did, \
-                    rationale, snapshot_id, event_id, current_hash, previous_hash \
+                    subject_uri, subject_cid, rationale, snapshot_id, event_id, \
+                    current_hash, previous_hash, cascade_subjects, cascade_snapshot_ids \
              FROM audit_chain_entry WHERE subject_did = $1 ORDER BY sequence ASC",
         )
         .bind(&input.did)
         .fetch_all(&ctx.account_db)
         .await
         .map_err(internal)?;
-        use sqlx::Row as _;
         let entries: Vec<serde_json::Value> = rows
             .iter()
             .map(|r| {
-                serde_json::json!({
-                    "id": r.try_get::<i64, _>("id").unwrap_or(0),
-                    "sequence": r.try_get::<i64, _>("sequence").unwrap_or(0),
-                    "createdAt": r.try_get::<String, _>("created_at").unwrap_or_default(),
-                    "actorDid": r.try_get::<String, _>("actor_did").unwrap_or_default(),
-                    "action": r.try_get::<String, _>("action").unwrap_or_default(),
-                    "rationale": r.try_get::<String, _>("rationale").unwrap_or_default(),
-                    "snapshotId": r.try_get::<Option<i64>, _>("snapshot_id").ok().flatten(),
-                    "eventId": r.try_get::<Option<i64>, _>("event_id").ok().flatten(),
-                    "currentHash": r.try_get::<String, _>("current_hash").unwrap_or_default(),
-                    "previousHash": r.try_get::<Option<String>, _>("previous_hash").ok().flatten(),
-                })
+                let entry = audit_chain::audit_entry_from_row(r).map_err(internal)?;
+                serde_json::to_value(&entry).map_err(internal)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         serde_json::Value::Array(entries)
     } else {
         serde_json::Value::Null
@@ -3096,7 +3092,16 @@ pub async fn export_account_forensic(
         h.update(bytes);
         file_hashes.insert(name.clone(), serde_json::Value::String(hex::encode(h.finalize())));
     }
+    // schemaVersion="2" marks the audit-entries.json wire-format
+    // migration (Arc 9 Step 4 / chainlink #55 Item 2) where each row
+    // now uses the canonical `AuditEntry` shape instead of the prior
+    // inline serde_json::json! literal. Consumers scripted against the
+    // v1 shape (raw-i64 `id`, `createdAt` field name, missing
+    // `subjectRef` / `verified` / cascade fields) dispatch on this
+    // field. No backwards-compatibility logic inside Aurora-Locus —
+    // the binary always emits v2 going forward.
     let manifest = serde_json::json!({
+        "schemaVersion": "2",
         "did": input.did,
         "exportedAt": started_at.to_rfc3339(),
         "exportedBy": auth.did,
@@ -3112,7 +3117,7 @@ pub async fn export_account_forensic(
         "deferredContents": {
             "repoCar": input.include_repo,
             "blobs": input.include_blobs,
-            "note": "v0.2 forensic bundles ship metadata only; CAR + blob streaming lands in v0.3"
+            "note": "v0.2 forensic bundles ship metadata only; CAR + blob streaming remains a v0.5+ candidate"
         },
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(internal)?;
@@ -6793,6 +6798,181 @@ mod tests {
             h.update(&bytes);
             assert_eq!(hex::encode(h.finalize()), header);
         }
+    }
+
+    /// Arc 9 Step 4 / chainlink #55 Item 2: the forensic bundle's
+    /// `audit-entries.json` must match `getAuditTrail`'s wire shape
+    /// field-for-field. Prior to this migration the two surfaces
+    /// diverged on field names (`createdAt` vs `timestamp`), types
+    /// (raw `i64` vs stringified), and four entirely-missing fields
+    /// (`subjectRef`, `verified`, `cascadeSubjects`,
+    /// `cascadeSnapshotIds`). This test pins the two paths against
+    /// each other so a future cycle can DRY both onto
+    /// `audit_chain::audit_entry_from_row` with confidence.
+    #[tokio::test]
+    async fn forensic_audit_entries_match_get_audit_trail_shape() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:parity", "parity.test").await;
+        // Seed the account row so the forensic handler's account
+        // lookup resolves.
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES ($1, $2, $3, NULL, FALSE)",
+        )
+        .bind("did:plc:parity")
+        .bind("parity@example.com")
+        .bind("$argon2id$dummy")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        // Append one chain entry against the subject so both paths
+        // have something non-empty to render.
+        crate::admin::audit_chain::append_entry(
+            &ctx.account_db,
+            crate::admin::audit_chain::AppendEntryParams {
+                actor_did: "did:plc:moderator",
+                action: "TakedownAccount",
+                subject: Some(&repo_subject("did:plc:parity")),
+                rationale: "spam-parity",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+
+        // Fetch via getAuditTrail filtered to this subject.
+        let trail = get_audit_trail(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: Some("did:plc:parity".to_string()),
+                subject_uri: None,
+                subject_cid: None,
+                after_created: None,
+                before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(trail.items.len(), 1, "expect one chain entry for the subject");
+        let trail_entry_json = serde_json::to_value(&trail.items[0]).unwrap();
+
+        // Fetch the same row via the forensic-export handler (with
+        // include_audit_chain, which requires SuperAdmin).
+        let resp = export_account_forensic(
+            State(ctx.clone()),
+            super_admin_auth(),
+            Json(ExportAccountForensicInput {
+                did: "did:plc:parity".to_string(),
+                rationale: "parity check".to_string(),
+                include_repo: false,
+                include_blobs: false,
+                include_moderation_history: false,
+                include_account_metadata: false,
+                include_audit_chain: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        // Extract audit-entries.json from the TAR.
+        let mut archive = tar::Archive::new(&body_bytes[..]);
+        let mut forensic_entries_json: Option<serde_json::Value> = None;
+        for entry in archive.entries().expect("archive iterates") {
+            let mut entry = entry.expect("entry readable");
+            let path = entry.path().expect("path readable").to_path_buf();
+            let name = path.to_string_lossy();
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            entry.read_to_end(&mut buf).expect("entry body readable");
+            if name == "audit-entries.json" {
+                forensic_entries_json =
+                    Some(serde_json::from_slice(&buf).expect("audit-entries.json parses"));
+            }
+        }
+        let forensic_entries =
+            forensic_entries_json.expect("tar must contain audit-entries.json");
+        let forensic_array = forensic_entries
+            .as_array()
+            .expect("audit-entries.json is a JSON array");
+        assert_eq!(forensic_array.len(), 1, "expect one chain entry in the bundle");
+
+        // Field-for-field equality with the getAuditTrail item. If
+        // either path drifts in field names, types, or membership,
+        // this assertion fires.
+        assert_eq!(
+            forensic_array[0], trail_entry_json,
+            "forensic audit-entries.json must match getAuditTrail's per-item shape"
+        );
+    }
+
+    /// Arc 9 Step 4: manifest.json in the forensic bundle carries
+    /// `schemaVersion: "2"` marking the audit-entries wire-format
+    /// migration. Consumers dispatch on this field.
+    #[tokio::test]
+    async fn forensic_bundle_manifest_has_schema_version_2() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:schema", "schema.test").await;
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES ($1, $2, $3, NULL, FALSE)",
+        )
+        .bind("did:plc:schema")
+        .bind("schema@example.com")
+        .bind("$argon2id$dummy")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        let resp = export_account_forensic(
+            State(ctx.clone()),
+            admin_auth(),
+            Json(ExportAccountForensicInput {
+                did: "did:plc:schema".to_string(),
+                rationale: "schemaVersion check".to_string(),
+                include_repo: false,
+                include_blobs: false,
+                include_moderation_history: false,
+                include_account_metadata: false,
+                include_audit_chain: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        let mut archive = tar::Archive::new(&body_bytes[..]);
+        let mut manifest_json: Option<serde_json::Value> = None;
+        for entry in archive.entries().expect("archive iterates") {
+            let mut entry = entry.expect("entry readable");
+            let path = entry.path().expect("path readable").to_path_buf();
+            let name = path.to_string_lossy();
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            entry.read_to_end(&mut buf).expect("entry body readable");
+            if name == "manifest.json" {
+                manifest_json = Some(
+                    serde_json::from_slice(&buf).expect("manifest.json parses"),
+                );
+            }
+        }
+        let manifest = manifest_json.expect("tar must contain manifest.json");
+        assert_eq!(
+            manifest.get("schemaVersion").and_then(|v| v.as_str()),
+            Some("2"),
+            "manifest.schemaVersion must be \"2\" after Arc 9 Step 4 migration"
+        );
     }
 
     // ---------- Phase 3.10 — runtime settings (§8.16) ----------
