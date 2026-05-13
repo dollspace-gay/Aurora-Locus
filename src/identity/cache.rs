@@ -1,10 +1,11 @@
 //! DID Cache - Database layer for caching DID documents and handle mappings
 use crate::{
     error::{PdsError, PdsResult},
-    identity::{CachedDidDoc, CachedHandle},
+    identity::{clock::Clock, CachedDidDoc, CachedHandle},
 };
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{AnyPool, Row};
+use std::sync::Arc;
 
 /// DID cache manager with two-tier TTL support
 ///
@@ -29,6 +30,10 @@ pub struct DidCache {
     handle_stale_ttl: Duration,
     /// Maximum TTL for handle cache (default: 1 hour)
     handle_max_ttl: Duration,
+    /// Source of "now" for staleness checks. Production wires
+    /// `SystemClock`; tests inject a `MockClock` via
+    /// `with_clock` to make TTL-boundary assertions deterministic.
+    clock: Arc<dyn Clock>,
 }
 
 impl DidCache {
@@ -44,7 +49,16 @@ impl DidCache {
             did_doc_max_ttl: Duration::hours(24),
             handle_stale_ttl: Duration::minutes(5),
             handle_max_ttl: Duration::hours(1),
+            clock: Arc::new(crate::identity::clock::SystemClock),
         }
+    }
+
+    /// Override the time source. Test-only — production constructs
+    /// `DidCache::new(db)` which wires `SystemClock`.
+    #[cfg(test)]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Set custom TTLs for DID documents
@@ -100,7 +114,7 @@ impl DidCache {
             let updated_at = parse_timestamp(&row.try_get::<String, _>("updated_at")?)?;
             let cached_at = parse_timestamp(&row.try_get::<String, _>("cached_at")?)?;
 
-            let age = Utc::now() - cached_at;
+            let age = self.clock.now() - cached_at;
 
             // Check if past max TTL (truly expired)
             if age >= self.did_doc_max_ttl {
@@ -126,7 +140,7 @@ impl DidCache {
 
     /// Cache DID document
     pub async fn cache_did_doc(&self, did: &str, doc: &str) -> PdsResult<()> {
-        let now = Utc::now().to_rfc3339();
+        let now = self.clock.now().to_rfc3339();
 
         sqlx::query(
             r#"
@@ -191,7 +205,7 @@ impl DidCache {
                 .and_then(|s| parse_timestamp(&s).ok());
             let updated_at = parse_timestamp(&row.try_get::<String, _>("updated_at")?)?;
 
-            let age = Utc::now() - updated_at;
+            let age = self.clock.now() - updated_at;
 
             // Check if past max TTL (truly expired)
             if age >= self.handle_max_ttl {
@@ -218,7 +232,7 @@ impl DidCache {
     /// Cache handle mapping
     pub async fn cache_handle(&self, handle: &str, did: &str) -> PdsResult<()> {
         let normalized = handle.to_lowercase();
-        let now = Utc::now().to_rfc3339();
+        let now = self.clock.now().to_rfc3339();
 
         sqlx::query(
             r#"
@@ -280,8 +294,8 @@ impl DidCache {
     /// Only deletes entries that are past max_ttl.
     /// Stale entries (between stale_ttl and max_ttl) are kept for fallback.
     pub async fn cleanup_expired(&self) -> PdsResult<()> {
-        let did_doc_cutoff = (Utc::now() - self.did_doc_max_ttl).to_rfc3339();
-        let handle_cutoff = (Utc::now() - self.handle_max_ttl).to_rfc3339();
+        let did_doc_cutoff = (self.clock.now() - self.did_doc_max_ttl).to_rfc3339();
+        let handle_cutoff = (self.clock.now() - self.handle_max_ttl).to_rfc3339();
 
         // Delete DID documents past max_ttl
         let did_result = sqlx::query("DELETE FROM did_doc WHERE cached_at < $1")
@@ -425,6 +439,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stale_did_doc_detection() {
+        use crate::identity::clock::MockClock;
+
         let db = open_any_memory_pool().await;
 
         // Create tables
@@ -442,9 +458,14 @@ mod tests {
         .await
         .unwrap();
 
-        // Create cache with short TTLs: stale=1s, max=10s
-        let cache =
-            DidCache::new(db).with_did_doc_ttls(Duration::seconds(1), Duration::seconds(10));
+        // Test-controlled clock starting at a fixed instant; advances
+        // are programmatic rather than wall-clock sleeps so the
+        // stale-then-expired boundary is deterministic regardless of
+        // suite load (Arc 9 Step 2 / Item 12).
+        let mock_clock = Arc::new(MockClock::new(Utc::now()));
+        let cache = DidCache::new(db)
+            .with_did_doc_ttls(Duration::seconds(1), Duration::seconds(10))
+            .with_clock(mock_clock.clone());
 
         let did = "did:plc:staletest";
         let doc = r#"{"id":"did:plc:staletest"}"#;
@@ -457,8 +478,8 @@ mod tests {
         assert!(cached.is_some());
         assert!(!cached.unwrap().stale);
 
-        // Wait for stale TTL (1 second)
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        // Advance past stale TTL (1s) but well within max TTL (10s).
+        mock_clock.advance(Duration::seconds(2));
 
         // Fetch again - should be stale but present
         let cached_stale = cache.get_did_doc(did).await.unwrap();
@@ -467,8 +488,8 @@ mod tests {
         assert!(doc_stale.stale); // Should be marked as stale
         assert_eq!(doc_stale.doc, doc); // Data should still be available
 
-        // Wait for max TTL (10 seconds total)
-        tokio::time::sleep(tokio::time::Duration::from_secs(9)).await;
+        // Advance past max TTL (total 11s past insert).
+        mock_clock.advance(Duration::seconds(9));
 
         // Fetch again - should be expired (None)
         let cached_expired = cache.get_did_doc(did).await.unwrap();
@@ -477,6 +498,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stale_handle_detection() {
+        use crate::identity::clock::MockClock;
+
         let db = open_any_memory_pool().await;
 
         // Create tables
@@ -494,8 +517,13 @@ mod tests {
         .await
         .unwrap();
 
-        // Create cache with short TTLs: stale=1s, max=5s
-        let cache = DidCache::new(db).with_handle_ttls(Duration::seconds(1), Duration::seconds(5));
+        // Test-controlled clock — replaces the prior
+        // `tokio::time::sleep` against real-wall-clock TTLs that
+        // flaked under suite-wide load (Arc 9 Step 2 / Item 12).
+        let mock_clock = Arc::new(MockClock::new(Utc::now()));
+        let cache = DidCache::new(db)
+            .with_handle_ttls(Duration::seconds(1), Duration::seconds(5))
+            .with_clock(mock_clock.clone());
 
         let handle = "stale.test";
         let did = "did:plc:stalehandle";
@@ -508,8 +536,8 @@ mod tests {
         assert!(cached.is_some());
         assert!(!cached.unwrap().stale);
 
-        // Wait for stale TTL
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        // Advance past stale TTL (1s) but within max TTL (5s).
+        mock_clock.advance(Duration::seconds(2));
 
         // Fetch again - should be stale but present
         let cached_stale = cache.get_handle(handle).await.unwrap();
@@ -518,8 +546,8 @@ mod tests {
         assert!(handle_stale.stale); // Should be marked as stale
         assert_eq!(handle_stale.did, did); // Data should still be available
 
-        // Wait for max TTL
-        tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+        // Advance past max TTL (total 6s past insert).
+        mock_clock.advance(Duration::seconds(4));
 
         // Fetch again - should be expired (None)
         let cached_expired = cache.get_handle(handle).await.unwrap();
