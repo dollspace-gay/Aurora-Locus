@@ -6,6 +6,8 @@ pub mod extractors;
 pub mod aurora_moderator;
 pub mod aurora_subscribe;
 pub mod blob;
+#[cfg(debug_assertions)]
+pub mod dev_routes;
 pub mod federation;
 pub mod firehose;
 pub mod health;
@@ -61,6 +63,15 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
         .merge(oauth_admin::routes(oauth_state_store))
         // OAuth server routes (for third-party app authorization)
         .merge(oauth_server::routes());
+
+    // Arc 11 (chainlink #56): localhost-only dev curl framework
+    // under `dev.aurora.*`. Compiled into debug builds only —
+    // release builds never include the merge. List C by design;
+    // not registered in `RouteRegistry` and not advertised by
+    // `tools.aurora.describeCapabilities`. See
+    // `docs/internal/dev-routes.md`.
+    #[cfg(debug_assertions)]
+    let router = router.merge(dev_routes::routes());
 
     (router, registry)
 }
