@@ -6,6 +6,85 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Arc 11 — Dev curl framework (v0.4-cycle)
+
+Single-step cycle item shipping a localhost-only HTTP namespace
+for development workflow. Compiled into debug builds only via
+`#[cfg(debug_assertions)]`; release builds do not include the
+surface and the routes do not exist on production binaries.
+
+Tracked via chainlink #56. Pulled forward from end-of-v0.4 to
+mid-cycle because Arc 9 Phase B's stop-PDS / `cargo run --
+grant-admin` / restart-PDS cycle was unbearable; the new
+framework collapses each admin operation to a single HTTP POST
+against the running PDS.
+
+#### Added
+
+- **`dev.aurora.*` HTTP namespace** under
+  `src/api/dev_routes.rs`, gated by `#[cfg(debug_assertions)]`
+  at the module level. Five endpoints:
+  - `dev.aurora.grantAdmin` — POST `{did, role, notes?}`; grant
+    admin role without stopping the PDS. Routes through the
+    same `AdminRoleManager::grant_role` the CLI uses, minus the
+    PDS-liveness lock.
+  - `dev.aurora.revokeAdmin` — POST `{did, role?, reason?}`;
+    revoke an active admin grant via
+    `AdminRoleManager::revoke_role`.
+  - `dev.aurora.listAdmins` — GET; enumerate every
+    `admin_roles` row, active and revoked, ordered by
+    `granted_at DESC`. Surfaces revoked history that the
+    manager's `list_active_roles` filters out.
+  - `dev.aurora.createAccount` — POST `{handle, email,
+    password}`; bypass handler-layer invite-code +
+    email-verification gates. Preserves DB-invariant checks
+    (handle/email uniqueness, password hashing, DID generation,
+    repository init). Returns `accessJwt` directly.
+  - `dev.aurora.mintToken` — POST `{did}`; mint a fresh
+    local-session JWT. Admin authority is queried from
+    `admin_roles` at request time by `AdminAuthContext` Layer 1
+    (`src/auth.rs:230-332`), so a grant followed by `mintToken`
+    is sufficient to get an admin-capable token without a
+    `createSession` cycle.
+- **Conditional router mount in `src/api/mod.rs`** under the
+  same `#[cfg(debug_assertions)]` gate, with a comment block
+  documenting the List C status (NEVER registered in
+  `RouteRegistry`, never advertised by `describeCapabilities`).
+- **`docs/internal/dev-routes.md`** — operator-facing doc with
+  verified curl examples for each endpoint, a typical
+  five-step workflow, and a verification recipe confirming the
+  surface is absent from release builds.
+
+#### Threat model
+
+The `#[cfg(debug_assertions)]` gate IS the auth. Localhost
+development is the trusted environment; release builds never
+include the surface, so production deployment risk is zero. The
+path namespace is List C by design — operators running release
+builds against these paths see 404. The CLI counterpart
+(`cargo run -- grant-admin`) remains the offline-only path
+that holds the PDS-liveness lock; the dev HTTP surface is
+explicitly for use against a running PDS.
+
+#### Verification
+
+- `cargo build --lib` — succeeds with dev_routes module.
+- `cargo build --release --lib` — succeeds without dev_routes.
+- `nm target/release/aurora-locus | grep dev_routes` — zero
+  symbols (the module is stripped at compile time).
+- `cargo clippy --lib --no-deps -- -D warnings` — zero errors
+  (Arc 9 Step 1 baseline preserved).
+- `cargo test --lib` — 951 passed (Arc 9 baseline preserved;
+  Arc 11 adds no unit tests — the surface is dev-only and Phase
+  B exercises validate end-to-end).
+
+#### Out of scope (v0.6 candidates)
+
+- `dev.aurora.inspectState` — read substrate state via HTTP.
+- `dev.aurora.triggerReaper` — fire background reapers manually.
+- `dev.aurora.inspectInMemory` — read in-process state
+  (`DPopNonceStore.nonces`, governor counters).
+
 ### Arc 9 — Hygiene pass (v0.4-cycle)
 
 Four-step cycle (Step 0 recon, Steps 1-4 implementation) bundling
