@@ -3069,18 +3069,18 @@ pub async fn export_account_forensic(
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     files.push((
         "account-state.json".to_string(),
-        serde_json::to_vec_pretty(&account_state).map_err(|e| internal(e))?,
+        serde_json::to_vec_pretty(&account_state).map_err(internal)?,
     ));
     if input.include_moderation_history {
         files.push((
             "moderation-history.json".to_string(),
-            serde_json::to_vec_pretty(&mod_history).map_err(|e| internal(e))?,
+            serde_json::to_vec_pretty(&mod_history).map_err(internal)?,
         ));
     }
     if input.include_audit_chain {
         files.push((
             "audit-entries.json".to_string(),
-            serde_json::to_vec_pretty(&audit_entries).map_err(|e| internal(e))?,
+            serde_json::to_vec_pretty(&audit_entries).map_err(internal)?,
         ));
     }
 
@@ -3115,7 +3115,7 @@ pub async fn export_account_forensic(
             "note": "v0.2 forensic bundles ship metadata only; CAR + blob streaming lands in v0.3"
         },
     });
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| internal(e))?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(internal)?;
 
     // audit-trail.json — included unconditionally as the bundle's own
     // chain anchor. The chain entry id and bundle hash both live in
@@ -3134,7 +3134,7 @@ pub async fn export_account_forensic(
     });
     files.push((
         "audit-trail.json".to_string(),
-        serde_json::to_vec_pretty(&trail).map_err(|e| internal(e))?,
+        serde_json::to_vec_pretty(&trail).map_err(internal)?,
     ));
 
     // TAR assembly — must complete before bundle hashing so the hash
@@ -3153,7 +3153,7 @@ pub async fn export_account_forensic(
         header.set_cksum();
         builder
             .append_data(&mut header, "manifest.json", &manifest_bytes[..])
-            .map_err(|e| internal(e))?;
+            .map_err(internal)?;
         for (name, bytes) in &files {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
@@ -3162,9 +3162,9 @@ pub async fn export_account_forensic(
             header.set_cksum();
             builder
                 .append_data(&mut header, name.as_str(), &bytes[..])
-                .map_err(|e| internal(e))?;
+                .map_err(internal)?;
         }
-        builder.finish().map_err(|e| internal(e))?;
+        builder.finish().map_err(internal)?;
     }
 
     // Bundle hash over the complete tar bytes. This is what the chain
@@ -3445,7 +3445,7 @@ pub async fn get_audit_trail(
         let sequence: i64 = row.try_get("sequence").map_err(internal)?;
         let created_at_str: String = row.try_get("created_at").map_err(internal)?;
         let timestamp = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-            .map_err(|e| internal(e))?
+            .map_err(internal)?
             .with_timezone(&chrono::Utc);
         let actor_did: String = row.try_get("actor_did").map_err(internal)?;
         let action: String = row.try_get("action").map_err(internal)?;
@@ -3927,7 +3927,7 @@ pub async fn set_runtime_setting(
     };
     let now = chrono::Utc::now().to_rfc3339();
     let value_json =
-        serde_json::to_string(&input.value).map_err(|e| internal(e))?;
+        serde_json::to_string(&input.value).map_err(internal)?;
 
     // LB-1 Session 12 / chainlink #129: runtime_settings upsert +
     // chain entry in one transaction. Upsert uses DELETE then INSERT
