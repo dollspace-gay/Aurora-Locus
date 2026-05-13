@@ -1,8 +1,8 @@
 # Aurora-Locus admin UI design
 
-**Cycle:** v0.2
-**Status:** Design — implementation phasing per section 9
-**Last updated:** 2026-05-03
+**Cycle:** v0.2 (with v0.3 + v0.4 additive amendments — see §15 for v0.4 specifics)
+**Status:** Design — v0.2 implementation phasing per section 9; subsequent cycles preserve the substrate and amend additively
+**Last updated:** 2026-05-13
 
 ---
 
@@ -336,7 +336,7 @@ Concrete consequences:
 
 - The moderation mode setting (`moderation-mode`, a runtime-settings table key configured via `tools.aurora.admin.setRuntimeSetting`) takes values `full`, `reduced`, `disabled`. It does not take values like "external-tool-X-paired" or "running-with-Y-system." Operators choose modes based on their deployment posture; the UI doesn't infer the deployment from external signals.
 
-> **Reconciliation.** Earlier drafts of this section referenced `AURORA_ADMIN_UI_MODERATION_MODE` as an env var. As-built, moderation mode is a runtime-settings table key (`moderation-mode`) configured via `tools.aurora.admin.setRuntimeSetting` (see [docs/AURORA_DESIGN.md §4.3.2](AURORA_DESIGN.md) for the runtime-settings endpoint pair); `AURORA_RECOVERY_MODE` is a separate env var read at startup for the recovery override path (per §4.3 below). This section uses the as-built names.
+> **Reconciliation.** Earlier drafts of this section referenced `AURORA_ADMIN_UI_MODERATION_MODE` as an env var. As-built, moderation mode is a runtime-settings table key (`moderation-mode`) configured via `tools.aurora.admin.setRuntimeSetting` (see [docs/V02_DESIGN.md §4.3.2](V02_DESIGN.md) for the runtime-settings endpoint pair); `AURORA_RECOVERY_MODE` is a separate env var read at startup for the recovery override path (per §4.3 below). This section uses the as-built names.
 - The capability detection system (`tools.aurora.describeCapabilities`) reports what *Aurora-Locus* exposes. It does not probe for or report on external systems.
 - The external labels panel (substrate primitive 13) accepts a configured list of labeler service DIDs. It treats them uniformly. It does not have a special "this is the well-known labeler" path.
 - File names, class names, NSIDs, route paths, log lines, and string keys never contain names of external systems.
@@ -1547,7 +1547,7 @@ The unified audit feed — every administrative decision in one chronological st
 
 Audit is the comprehensive accountability surface. In v0.2 every entry is a hash-chained `audit_chain_entry` row carrying a `verified` badge derived from re-hashing the row content. The page is the operator's first stop when investigating "what happened" and the auditor's surface for cryptographic accountability.
 
-The page is shaped as a unified feed that surfaces both `com.atproto.admin.getAuditLog` and `tools.aurora.admin.getAuditTrail` for forward-compatibility — both endpoints read from the same `audit_chain_entry` backing table in v0.2 (per [AURORA_DESIGN.md §4.4.1](AURORA_DESIGN.md), the legacy `admin_audit_log` table was dropped by `migrations/0004_drop_admin_audit_log.sql`), so the merge is structural rather than data-bearing today. The two-endpoint shape is preserved as a hook for future deployments that may restore legacy pre-chain data.
+The page is shaped as a unified feed that surfaces both `com.atproto.admin.getAuditLog` and `tools.aurora.admin.getAuditTrail` for forward-compatibility — both endpoints read from the same `audit_chain_entry` backing table in v0.2 (per [V02_DESIGN.md §4.4.1](V02_DESIGN.md), the legacy `admin_audit_log` table was dropped by `migrations/0004_drop_admin_audit_log.sql`), so the merge is structural rather than data-bearing today. The two-endpoint shape is preserved as a hook for future deployments that may restore legacy pre-chain data.
 
 #### Endpoint mapping
 
@@ -4146,14 +4146,14 @@ struct AuditEntry {
 }
 ```
 
-The `items` field follows the Phase 3 [`PaginatedResponse<T>`](AURORA_DESIGN.md) convention used by every paginated `tools.aurora.*` endpoint; reusing the same field name across the namespace keeps consumers writing one paginator helper rather than per-endpoint name dispatch.
+The `items` field follows the Phase 3 [`PaginatedResponse<T>`](V02_DESIGN.md) convention used by every paginated `tools.aurora.*` endpoint; reusing the same field name across the namespace keeps consumers writing one paginator helper rather than per-endpoint name dispatch.
 
 ### Behavior
 
 - Returns audit entries matching filters in reverse chronological order (newest first).
 - `previous_hash` field links entries into chain.
 - Hash verification can be performed by re-hashing entry content and comparing against `current_hash`. Per-row results land in each entry's `verified` field.
-- Chain-level verification (`chain_verified` + `chain_verified_through`) walks the response window and confirms each row's `previous_hash` matches the prior row's `current_hash`. Per-row `verified` flags catch row-local tampering; `chain_verified` catches the consistent-rewrite attack where an attacker rewrote a prior entry's content AND its `current_hash` together — per-row would pass on every row but the linkage between entries breaks. `chain_verified_through` is the highest sequence covered by the verification window and is meaningful only when `chain_verified` is true. Specified at [AURORA_DESIGN.md §4.4.2](AURORA_DESIGN.md) (chain semantics) and [§4.3.2](AURORA_DESIGN.md) (response shape).
+- Chain-level verification (`chain_verified` + `chain_verified_through`) walks the response window and confirms each row's `previous_hash` matches the prior row's `current_hash`. Per-row `verified` flags catch row-local tampering; `chain_verified` catches the consistent-rewrite attack where an attacker rewrote a prior entry's content AND its `current_hash` together — per-row would pass on every row but the linkage between entries breaks. `chain_verified_through` is the highest sequence covered by the verification window and is meaningful only when `chain_verified` is true. Specified at [V02_DESIGN.md §4.4.2](V02_DESIGN.md) (chain semantics) and [§4.3.2](V02_DESIGN.md) (response shape).
 - The `current_hash = "pre-chain"` sentinel is reserved for legacy rows predating the chain; in v0.2 deployments no such rows exist (see Notes below). Consumers may treat this case as defensive-only.
 
 ### Notes
