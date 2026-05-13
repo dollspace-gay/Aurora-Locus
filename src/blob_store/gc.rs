@@ -20,9 +20,12 @@
 //! `gc-sweep` subcommand; Step 2 does not. Added in Arc 10
 //! (chainlink #57).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+
+use crate::blob_store::BlobListEntry;
 
 /// Sweep configuration parameters.
 ///
@@ -150,9 +153,82 @@ pub struct SweepReport {
     pub duration_seconds: f64,
 }
 
+/// Classify a single blob candidate from storage given the
+/// page-level DB lookup results.
+///
+/// Pure function — no I/O, no async — so the two-stage
+/// classification logic is unit-testable without a running
+/// storage backend. `now` is parameterised for testability
+/// (the production caller passes `Utc::now()`; tests pass a
+/// fixed time).
+///
+/// The precedence is `Authorized` > `InFlight` > age-based:
+///
+/// 1. If the CID is present in `authorized_cids` (the page-
+///    level read of `blob.cid IN (...)`), the blob is
+///    legitimately tracked; classify `Authorized`.
+/// 2. Else if it's present in `in_flight_cids` (the page-level
+///    read of `temp_blob_metadata.cid IN (...)`), it's a
+///    staged upload; classify `InFlight`. Per V04_DESIGN.md
+///    §9.3.2 the tracking surface is authoritative, so this
+///    takes priority over age.
+/// 3. Else apply the freshness threshold. Age younger than
+///    the threshold → `TooYoung` (skip and re-evaluate next
+///    sweep). Age ≥ threshold → `ConfirmedOrphan` (eligible
+///    for deletion).
+// The sweep loop in this module will be the production caller
+// (Commit 3 of the Step 2 series); `#[allow(dead_code)]` keeps
+// clippy `-D warnings` green between commits 2 and 3.
+#[allow(dead_code)]
+pub(crate) fn classify_blob(
+    entry: &BlobListEntry,
+    authorized_cids: &HashSet<String>,
+    in_flight_cids: &HashSet<String>,
+    freshness_threshold: Duration,
+    now: DateTime<Utc>,
+) -> BlobClassification {
+    if authorized_cids.contains(&entry.cid) {
+        return BlobClassification::Authorized {
+            cid: entry.cid.clone(),
+        };
+    }
+    if in_flight_cids.contains(&entry.cid) {
+        return BlobClassification::InFlight {
+            cid: entry.cid.clone(),
+        };
+    }
+
+    let age = now.signed_duration_since(entry.last_modified);
+    let threshold_chrono =
+        chrono::Duration::from_std(freshness_threshold).unwrap_or(chrono::Duration::MAX);
+
+    if age < threshold_chrono {
+        BlobClassification::TooYoung {
+            cid: entry.cid.clone(),
+            last_modified: entry.last_modified,
+        }
+    } else {
+        BlobClassification::ConfirmedOrphan {
+            cid: entry.cid.clone(),
+            last_modified: entry.last_modified,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(cid: &str, last_modified: DateTime<Utc>) -> BlobListEntry {
+        BlobListEntry {
+            cid: cid.to_string(),
+            last_modified,
+        }
+    }
+
+    fn set(cids: &[&str]) -> HashSet<String> {
+        cids.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn default_sweep_params_match_v04_design_safety_stance() {
@@ -201,5 +277,147 @@ mod tests {
         assert_ne!(i, y);
         assert_ne!(i, o);
         assert_ne!(y, o);
+    }
+
+    // ====================================================================
+    // classify_blob — pure-function unit tests for the two-stage
+    // classification logic. The Arc 10 Step 0 Q9 decision: tracking
+    // surface (temp_blob_metadata) is authoritative; age is belt-and-
+    // braces. These tests pin the precedence and the threshold boundary.
+    // ====================================================================
+
+    const ONE_HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn test_classify_authorized() {
+        // CID in `authorized_cids` -> Authorized regardless of age or
+        // in_flight membership. `blob` is authoritative.
+        let now = Utc::now();
+        let stale_ts = now - chrono::Duration::hours(48);
+        let e = entry("bafyA", stale_ts);
+        let authorized = set(&["bafyA"]);
+        let in_flight = set(&["bafyA"]); // contrived overlap
+
+        let c = classify_blob(&e, &authorized, &in_flight, ONE_HOUR, now);
+        assert_eq!(
+            c,
+            BlobClassification::Authorized {
+                cid: "bafyA".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_in_flight() {
+        // CID only in `in_flight_cids` -> InFlight.
+        let now = Utc::now();
+        let e = entry("bafyB", now - chrono::Duration::minutes(30));
+        let authorized = HashSet::new();
+        let in_flight = set(&["bafyB"]);
+
+        let c = classify_blob(&e, &authorized, &in_flight, ONE_HOUR, now);
+        assert_eq!(
+            c,
+            BlobClassification::InFlight {
+                cid: "bafyB".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_in_flight_takes_priority_over_age() {
+        // CID in in_flight but storage age exceeds threshold -> still
+        // InFlight. Tracking surface authoritative per Step 0 Q9.
+        let now = Utc::now();
+        let very_old = now - chrono::Duration::days(7);
+        let e = entry("bafyC", very_old);
+        let authorized = HashSet::new();
+        let in_flight = set(&["bafyC"]);
+
+        let c = classify_blob(&e, &authorized, &in_flight, ONE_HOUR, now);
+        assert_eq!(
+            c,
+            BlobClassification::InFlight {
+                cid: "bafyC".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_too_young() {
+        // CID in neither set, age < threshold -> TooYoung.
+        let now = Utc::now();
+        let recent = now - chrono::Duration::minutes(5);
+        let e = entry("bafyD", recent);
+
+        let c = classify_blob(&e, &HashSet::new(), &HashSet::new(), ONE_HOUR, now);
+        assert_eq!(
+            c,
+            BlobClassification::TooYoung {
+                cid: "bafyD".to_string(),
+                last_modified: recent,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_confirmed_orphan() {
+        // CID in neither set, age >= threshold -> ConfirmedOrphan.
+        let now = Utc::now();
+        let old = now - chrono::Duration::hours(2);
+        let e = entry("bafyE", old);
+
+        let c = classify_blob(&e, &HashSet::new(), &HashSet::new(), ONE_HOUR, now);
+        assert_eq!(
+            c,
+            BlobClassification::ConfirmedOrphan {
+                cid: "bafyE".to_string(),
+                last_modified: old,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_at_threshold_boundary() {
+        // Age exactly equal to the freshness threshold -> ConfirmedOrphan.
+        // The classifier uses `<` for the TooYoung branch, so the
+        // boundary case falls into the ConfirmedOrphan (delete-eligible)
+        // bucket — preferring deletion at the edge over an indefinite
+        // skip-loop on the same CID.
+        let now = Utc::now();
+        let exactly_threshold = now - chrono::Duration::seconds(3600);
+        let e = entry("bafyF", exactly_threshold);
+
+        let c = classify_blob(&e, &HashSet::new(), &HashSet::new(), ONE_HOUR, now);
+        assert_eq!(
+            c,
+            BlobClassification::ConfirmedOrphan {
+                cid: "bafyF".to_string(),
+                last_modified: exactly_threshold,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_pre_epoch_timestamp() {
+        // `entry.last_modified` clamped to UNIX_EPOCH (the Step 1
+        // disk-backend defensive output for unreadable mtimes) is far
+        // older than any conceivable freshness threshold -> classify as
+        // ConfirmedOrphan. The "very old" direction is safe: storage
+        // age is always above threshold so the blob enters the
+        // delete-eligible bucket, which is the correct end-state for a
+        // truly stuck CID.
+        let now = Utc::now();
+        let epoch = DateTime::<Utc>::UNIX_EPOCH;
+        let e = entry("bafyG", epoch);
+
+        let c = classify_blob(&e, &HashSet::new(), &HashSet::new(), ONE_HOUR, now);
+        assert_eq!(
+            c,
+            BlobClassification::ConfirmedOrphan {
+                cid: "bafyG".to_string(),
+                last_modified: epoch,
+            }
+        );
     }
 }
