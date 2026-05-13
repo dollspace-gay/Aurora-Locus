@@ -4,6 +4,7 @@
 //! Supports multiple backend implementations (disk, S3, etc.)
 
 pub mod disk;
+pub mod gc;
 pub mod mime;
 pub mod models;
 pub mod quarantine;
