@@ -905,6 +905,40 @@ mod tests {
         );
     }
 
+    /// Arc 9 Step 2 / Item 8: the manual `Debug` impl on
+    /// `AppContext` must redact every secret-bearing field
+    /// (jwt_secret, repo signing key, PLC rotation key, SMTP
+    /// creds, S3 secret_access_key). `create_test_context`
+    /// constructs a context with well-known sentinel values; the
+    /// Debug output must not contain any of them. Future changes
+    /// to the impl that drop a redaction will fail this test.
+    #[tokio::test]
+    async fn app_context_debug_redacts_sensitive_fields() {
+        let ctx = create_test_context().await;
+        let rendered = format!("{:?}", ctx);
+        // jwt_secret literal from create_test_context.
+        assert!(
+            !rendered.contains("test-secret-key-aurora-subscribe-32xx"),
+            "AppContext Debug leaked jwt_secret: {}",
+            rendered
+        );
+        // repo_signing_key / plc_rotation_key — 64-char sentinels.
+        assert!(
+            !rendered.contains(&"a".repeat(64)),
+            "AppContext Debug leaked repo_signing_key"
+        );
+        assert!(
+            !rendered.contains(&"b".repeat(64)),
+            "AppContext Debug leaked plc_rotation_key"
+        );
+        // Shape sanity: the redacted placeholder text appears.
+        assert!(
+            rendered.contains("<redacted: ServerConfig>"),
+            "AppContext Debug missing redacted-config placeholder: {}",
+            rendered
+        );
+    }
+
     // ---- DB-backed tests for fetch_new_chain_entries + collect_tick ----
     //
     // Mirror create_test_context's pattern from aurora_admin's tests

@@ -123,6 +123,87 @@ pub struct AppContext {
     pub route_registry: Arc<crate::api::registry::RouteRegistry>,
 }
 
+/// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
+/// §8.4.1 Item 8). Two constraints drove the shape:
+///
+/// - `identity_resolver: Arc<dyn IdentityResolverApi>` and
+///   `distributed_store: Option<Arc<dyn DistributedStore>>` hold
+///   trait objects whose traits have no `Debug` supertrait;
+///   `#[derive(Debug)]` would not compile.
+/// - Many fields hold secret or auth-flow-relevant material that
+///   must never appear in test logs, panic messages, or snapshot
+///   fixtures: `config` (jwt_secret, repo signing key, PLC
+///   rotation key, S3 secret_access_key, SMTP creds), `mailer`,
+///   `nonce_store`, `dpop_nonce_store`, `dpop_verifier`, and the
+///   user-record cache `local_records_cache`.
+///
+/// The impl prints opaque `<TypeName>` placeholders for those
+/// fields. Pool / registry / file-tier-config fields print
+/// normally — `sqlx::AnyPool::Debug` already redacts URLs, and
+/// `RouteRegistry` plus `file_tier_settings` carry public
+/// registration / configuration data. Future fields default to
+/// opaque unless the author confirms they hold no secrets.
+impl std::fmt::Debug for AppContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppContext")
+            .field("config", &"<redacted: ServerConfig>")
+            .field("account_db", &self.account_db)
+            .field("account_manager", &"<AccountManager>")
+            .field("actor_store", &"<ActorStore>")
+            .field("blob_store", &"<BlobStore>")
+            .field("identity_resolver", &"<dyn IdentityResolverApi>")
+            .field("admin_role_manager", &"<AdminRoleManager>")
+            .field("moderation_manager", &"<ModerationManager>")
+            .field("label_manager", &"<LabelManager>")
+            .field("invite_manager", &"<InviteCodeManager>")
+            .field("report_manager", &"<ReportManager>")
+            .field("oauth_client_manager", &"<ClientManager>")
+            .field("oauth_device_manager", &"<DeviceManager>")
+            .field("sequencer", &"<Sequencer>")
+            .field(
+                "relay_client",
+                &self.relay_client.as_ref().map(|_| "<RelayClient>"),
+            )
+            .field(
+                "federation_auth",
+                &self.federation_auth.as_ref().map(|_| "<FederationAuthenticator>"),
+            )
+            .field(
+                "pds_discovery",
+                &self.pds_discovery.as_ref().map(|_| "<PdsDiscovery>"),
+            )
+            .field(
+                "federated_search",
+                &self.federated_search.as_ref().map(|_| "<FederatedSearch>"),
+            )
+            .field(
+                "nonce_store",
+                &self.nonce_store.as_ref().map(|_| "<NonceStore>"),
+            )
+            .field(
+                "dpop_nonce_store",
+                &self.dpop_nonce_store.as_ref().map(|_| "<DPopNonceStore>"),
+            )
+            .field("dpop_verifier", &"<DPopVerifier>")
+            .field("rate_limiter", &"<RateLimiter>")
+            .field(
+                "distributed_rate_limiter",
+                &self.distributed_rate_limiter.as_ref().map(|_| "<DistributedRateLimiter>"),
+            )
+            .field("mailer", &"<Mailer>")
+            .field("local_records_cache", &"<LocalRecordsCache>")
+            .field("cache_invalidator", &"<CacheInvalidator>")
+            .field("file_tier_settings", &self.file_tier_settings)
+            .field("maintenance_pool", &self.maintenance_pool)
+            .field(
+                "distributed_store",
+                &self.distributed_store.as_ref().map(|_| "<dyn DistributedStore>"),
+            )
+            .field("route_registry", &self.route_registry)
+            .finish()
+    }
+}
+
 impl AppContext {
     /// Create a new application context from configuration.
     ///
