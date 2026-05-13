@@ -96,6 +96,7 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
         validation_mode: ValidationMode::Optimistic,
         distributed_state_mode: Default::default(),
         maintenance_pool: Default::default(),
+        gc_sweep: Default::default(),
     };
     let ctx = AppContext::new(
         config,

@@ -1021,6 +1021,7 @@ mod tests {
                 .unwrap_or(crate::validation::ValidationMode::Required),
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
         };
         AppContext::new(
             config,

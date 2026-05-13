@@ -95,6 +95,7 @@ async fn create_test_manager() -> AccountManager {
         validation_mode: ValidationMode::Optimistic,
         distributed_state_mode: Default::default(),
         maintenance_pool: Default::default(),
+        gc_sweep: Default::default(),
     });
 
     AccountManager::new(db, config)

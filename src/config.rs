@@ -36,6 +36,16 @@ pub struct ServerConfig {
     /// ignored in `SingleInstanceInmemory` mode.
     #[serde(default)]
     pub maintenance_pool: MaintenancePoolConfig,
+    /// GC sweep configuration (Arc 10, V04_DESIGN.md §9.4.3).
+    /// Off-by-default: `enabled = false` so existing
+    /// deployments don't gain a new background task silently.
+    /// When enabled, the scheduled `gc_sweep_job` reconciles
+    /// blob storage against `blob` / `temp_blob_metadata` and
+    /// deletes confirmed orphans subject to the safety cap.
+    /// The Arc 10 sweep primitive
+    /// ([`crate::blob_store::gc::run_sweep`]) is the consumer.
+    #[serde(default)]
+    pub gc_sweep: GcSweepConfig,
 }
 
 /// Distributed-state substrate selector (Arc 7, V04_DESIGN.md
@@ -147,6 +157,162 @@ impl MaintenancePoolConfig {
             min_connections,
             acquire_timeout_secs,
         })
+    }
+}
+
+/// GC sweep configuration (Arc 10, V04_DESIGN.md §9.4.3 /
+/// chainlink #57). Controls the scheduled background sweep
+/// that reconciles blob storage against the `blob` /
+/// `temp_blob_metadata` tables and deletes confirmed orphans
+/// subject to the safety cap. The Arc 10 sweep primitive
+/// ([`crate::blob_store::gc::run_sweep`]) is the consumer.
+///
+/// Off-by-default (`enabled = false`) so v0.4 ships without
+/// adding a new background task to existing deployments.
+/// Operators opt in by setting `PDS_GC_SWEEP_ENABLED=true`.
+/// `dry_run` defaults to `true` — the first runs are
+/// classify-and-log so operators can observe orphan rates
+/// before promoting to destructive mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcSweepConfig {
+    /// If `true`, the scheduled background sweep runs at
+    /// `interval_secs` cadence. Default `false` — operators
+    /// opt in explicitly per the v0.4 design.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Cadence between scheduled sweep runs, in seconds.
+    /// Default 86400 (24 hours).
+    #[serde(default = "default_gc_sweep_interval_secs")]
+    pub interval_secs: u64,
+
+    /// If `true`, the sweep classifies and logs but does not
+    /// delete. Default `true` — operators promote to
+    /// destructive mode only after observing the report
+    /// cadence in production.
+    #[serde(default = "default_gc_sweep_dry_run")]
+    pub dry_run: bool,
+
+    /// Safety cap: max blobs to delete per sweep run.
+    /// Default 10000. Confirmed orphans beyond the cap are
+    /// logged and deferred to the next run.
+    #[serde(default = "default_gc_sweep_max_deletes")]
+    pub max_deletes_per_run: usize,
+
+    /// Belt-and-braces freshness threshold in seconds. Blobs
+    /// younger than this are never classified as orphans, even
+    /// when absent from `temp_blob_metadata`. Default 3600
+    /// (1 hour) per Step 0 Q9's analysis: the tracking surface
+    /// is authoritative; this threshold catches the rare race
+    /// where a `temp_blob_metadata` row hasn't committed yet.
+    #[serde(default = "default_gc_sweep_threshold_secs")]
+    pub freshness_threshold_secs: u64,
+
+    /// Storage page size for the sweep's pagination. Default
+    /// 500 — Step 1 benchmark validated this stays index-driven
+    /// on SQLite at 100k seeded rows (6.98ms / well under the
+    /// 50ms threshold).
+    #[serde(default = "default_gc_sweep_page_size")]
+    pub page_size: usize,
+}
+
+impl Default for GcSweepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_gc_sweep_interval_secs(),
+            dry_run: default_gc_sweep_dry_run(),
+            max_deletes_per_run: default_gc_sweep_max_deletes(),
+            freshness_threshold_secs: default_gc_sweep_threshold_secs(),
+            page_size: default_gc_sweep_page_size(),
+        }
+    }
+}
+
+fn default_gc_sweep_interval_secs() -> u64 {
+    86_400
+}
+fn default_gc_sweep_dry_run() -> bool {
+    true
+}
+fn default_gc_sweep_max_deletes() -> usize {
+    10_000
+}
+fn default_gc_sweep_threshold_secs() -> u64 {
+    3_600
+}
+fn default_gc_sweep_page_size() -> usize {
+    500
+}
+
+impl GcSweepConfig {
+    /// Construct from explicit option-typed env-var values.
+    /// Mirrors the pattern in `MaintenancePoolConfig::from_env_values`.
+    pub fn from_env_values(
+        enabled: Option<String>,
+        interval_secs: Option<String>,
+        dry_run: Option<String>,
+        max_deletes_per_run: Option<String>,
+        freshness_threshold_secs: Option<String>,
+        page_size: Option<String>,
+    ) -> PdsResult<Self> {
+        let defaults = Self::default();
+        let enabled = parse_bool_env("PDS_GC_SWEEP_ENABLED", enabled, defaults.enabled)?;
+        let interval_secs = parse_u64_env(
+            "PDS_GC_SWEEP_INTERVAL_SECS",
+            interval_secs,
+            defaults.interval_secs,
+        )?;
+        let dry_run = parse_bool_env("PDS_GC_SWEEP_DRY_RUN", dry_run, defaults.dry_run)?;
+        let max_deletes_per_run = parse_usize_env(
+            "PDS_GC_SWEEP_MAX_DELETES_PER_RUN",
+            max_deletes_per_run,
+            defaults.max_deletes_per_run,
+        )?;
+        let freshness_threshold_secs = parse_u64_env(
+            "PDS_GC_SWEEP_FRESHNESS_THRESHOLD_SECS",
+            freshness_threshold_secs,
+            defaults.freshness_threshold_secs,
+        )?;
+        let page_size =
+            parse_usize_env("PDS_GC_SWEEP_PAGE_SIZE", page_size, defaults.page_size)?;
+
+        if interval_secs == 0 {
+            return Err(PdsError::Validation(
+                "PDS_GC_SWEEP_INTERVAL_SECS must be greater than 0".to_string(),
+            ));
+        }
+        if page_size == 0 {
+            return Err(PdsError::Validation(
+                "PDS_GC_SWEEP_PAGE_SIZE must be greater than 0".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            enabled,
+            interval_secs,
+            dry_run,
+            max_deletes_per_run,
+            freshness_threshold_secs,
+            page_size,
+        })
+    }
+
+    /// Convert to [`crate::blob_store::gc::SweepParams`] for
+    /// the GC sweep primitive. `report_only` is supplied by
+    /// the caller — `false` from the scheduled-job path,
+    /// driven by the `--report-only` flag from the CLI path.
+    pub fn to_sweep_params(
+        &self,
+        report_only: bool,
+    ) -> crate::blob_store::gc::SweepParams {
+        crate::blob_store::gc::SweepParams {
+            dry_run: self.dry_run,
+            report_only,
+            max_deletes_per_run: self.max_deletes_per_run,
+            freshness_threshold: std::time::Duration::from_secs(self.freshness_threshold_secs),
+            page_size: self.page_size,
+        }
     }
 }
 
@@ -309,6 +475,30 @@ fn parse_u64_env(name: &str, raw: Option<String>, default: u64) -> PdsResult<u64
         Some(v) => v.parse::<u64>().map_err(|_| {
             PdsError::Validation(format!(
                 "{name} must be a non-negative integer (got: {:?})",
+                v
+            ))
+        }),
+    }
+}
+
+fn parse_usize_env(name: &str, raw: Option<String>, default: usize) -> PdsResult<usize> {
+    match raw {
+        None => Ok(default),
+        Some(v) => v.parse::<usize>().map_err(|_| {
+            PdsError::Validation(format!(
+                "{name} must be a non-negative integer (got: {:?})",
+                v
+            ))
+        }),
+    }
+}
+
+fn parse_bool_env(name: &str, raw: Option<String>, default: bool) -> PdsResult<bool> {
+    match raw {
+        None => Ok(default),
+        Some(v) => v.parse::<bool>().map_err(|_| {
+            PdsError::Validation(format!(
+                "{name} must be 'true' or 'false' (got: {:?})",
                 v
             ))
         }),
@@ -861,6 +1051,15 @@ impl ServerConfig {
             env::var("PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS").ok(),
         )?;
 
+        let gc_sweep = GcSweepConfig::from_env_values(
+            env::var("PDS_GC_SWEEP_ENABLED").ok(),
+            env::var("PDS_GC_SWEEP_INTERVAL_SECS").ok(),
+            env::var("PDS_GC_SWEEP_DRY_RUN").ok(),
+            env::var("PDS_GC_SWEEP_MAX_DELETES_PER_RUN").ok(),
+            env::var("PDS_GC_SWEEP_FRESHNESS_THRESHOLD_SECS").ok(),
+            env::var("PDS_GC_SWEEP_PAGE_SIZE").ok(),
+        )?;
+
         Ok(ServerConfig {
             service: ServiceConfig {
                 hostname,
@@ -921,6 +1120,7 @@ impl ServerConfig {
             validation_mode,
             distributed_state_mode,
             maintenance_pool,
+            gc_sweep,
         })
     }
 
@@ -1403,5 +1603,122 @@ mod blobstore_tests {
             BlobstoreConfig::S3 { prefix, .. } => assert_eq!(prefix, "custom/"),
             _ => panic!("expected S3"),
         }
+    }
+}
+
+#[cfg(test)]
+mod gc_sweep_tests {
+    use super::*;
+
+    #[test]
+    fn default_matches_v04_design_safety_stance() {
+        let c = GcSweepConfig::default();
+        assert!(!c.enabled, "default must be disabled");
+        assert!(c.dry_run, "default must be dry_run=true");
+        assert_eq!(c.interval_secs, 86_400);
+        assert_eq!(c.max_deletes_per_run, 10_000);
+        assert_eq!(c.freshness_threshold_secs, 3_600);
+        assert_eq!(c.page_size, 500);
+    }
+
+    #[test]
+    fn from_env_values_all_none_yields_default() {
+        let c = GcSweepConfig::from_env_values(None, None, None, None, None, None).unwrap();
+        assert_eq!(c.enabled, GcSweepConfig::default().enabled);
+        assert_eq!(c.dry_run, GcSweepConfig::default().dry_run);
+        assert_eq!(c.interval_secs, GcSweepConfig::default().interval_secs);
+        assert_eq!(c.max_deletes_per_run, GcSweepConfig::default().max_deletes_per_run);
+        assert_eq!(
+            c.freshness_threshold_secs,
+            GcSweepConfig::default().freshness_threshold_secs
+        );
+        assert_eq!(c.page_size, GcSweepConfig::default().page_size);
+    }
+
+    #[test]
+    fn from_env_values_parses_all_fields() {
+        let c = GcSweepConfig::from_env_values(
+            Some("true".to_string()),
+            Some("3600".to_string()),
+            Some("false".to_string()),
+            Some("500".to_string()),
+            Some("1800".to_string()),
+            Some("250".to_string()),
+        )
+        .unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.interval_secs, 3_600);
+        assert!(!c.dry_run);
+        assert_eq!(c.max_deletes_per_run, 500);
+        assert_eq!(c.freshness_threshold_secs, 1_800);
+        assert_eq!(c.page_size, 250);
+    }
+
+    #[test]
+    fn from_env_values_zero_interval_rejected() {
+        let err = GcSweepConfig::from_env_values(
+            Some("true".to_string()),
+            Some("0".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("zero interval must be rejected");
+        assert!(err.to_string().contains("PDS_GC_SWEEP_INTERVAL_SECS"));
+    }
+
+    #[test]
+    fn from_env_values_zero_page_size_rejected() {
+        let err = GcSweepConfig::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0".to_string()),
+        )
+        .expect_err("zero page size must be rejected");
+        assert!(err.to_string().contains("PDS_GC_SWEEP_PAGE_SIZE"));
+    }
+
+    #[test]
+    fn from_env_values_invalid_bool_rejected() {
+        let err = GcSweepConfig::from_env_values(
+            Some("yes".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("'yes' is not a valid bool");
+        assert!(err.to_string().contains("PDS_GC_SWEEP_ENABLED"));
+    }
+
+    #[test]
+    fn to_sweep_params_propagates_fields() {
+        let cfg = GcSweepConfig {
+            enabled: true,
+            interval_secs: 7200,
+            dry_run: false,
+            max_deletes_per_run: 250,
+            freshness_threshold_secs: 600,
+            page_size: 100,
+        };
+        let p = cfg.to_sweep_params(true);
+        assert!(!p.dry_run);
+        assert!(p.report_only);
+        assert_eq!(p.max_deletes_per_run, 250);
+        assert_eq!(p.freshness_threshold, std::time::Duration::from_secs(600));
+        assert_eq!(p.page_size, 100);
+    }
+
+    #[test]
+    fn to_sweep_params_report_only_false_passes_through() {
+        let cfg = GcSweepConfig::default();
+        let p = cfg.to_sweep_params(false);
+        assert!(!p.report_only);
+        assert!(p.dry_run, "config dry_run propagates to params");
     }
 }

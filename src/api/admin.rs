@@ -6341,6 +6341,7 @@ mod tests {
             validation_mode: crate::validation::ValidationMode::Required,
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
         };
 
         // The admin module hosts `describe_capabilities`, which

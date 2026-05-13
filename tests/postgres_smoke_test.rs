@@ -408,6 +408,7 @@ async fn account_manager_round_trip_on_postgres() {
         validation_mode: ValidationMode::Optimistic,
         distributed_state_mode: Default::default(),
         maintenance_pool: Default::default(),
+        gc_sweep: Default::default(),
     });
 
     let mgr = AccountManager::new(pool, config);

@@ -2679,6 +2679,7 @@ mod tests {
             validation_mode: crate::validation::ValidationMode::Optimistic,
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
         });
 
         AccountManager::new(db, config)

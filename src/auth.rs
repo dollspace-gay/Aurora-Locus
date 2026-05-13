@@ -966,6 +966,7 @@ mod admin_auth_third_path_tests {
                 .unwrap_or(crate::validation::ValidationMode::Required),
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
         };
         let mut ctx = AppContext::new(
             config,
