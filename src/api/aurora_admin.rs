@@ -2716,7 +2716,7 @@ async fn compute_metric(
     } else if metric == MetricType::AverageTimeToResolution {
         "reported_at, reviewed_at".to_string()
     } else {
-        format!("{}", time_col)
+        time_col.to_string()
     };
     let sql = format!(
         "SELECT {} FROM {} WHERE {} >= $1 AND {} < $2 {}",

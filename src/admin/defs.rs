@@ -274,8 +274,7 @@ impl PaginationParams {
     pub fn effective_limit(&self) -> u32 {
         self.limit
             .unwrap_or(Self::DEFAULT_LIMIT)
-            .min(Self::MAX_LIMIT)
-            .max(1)
+            .clamp(1, Self::MAX_LIMIT)
     }
 
     /// Decode the opaque cursor into its internal representation.

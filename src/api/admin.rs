@@ -1387,9 +1387,7 @@ async fn update_account_handle(
                     StatusCode::NOT_FOUND,
                     format!("Account not found: {}", req.did),
                 )
-            } else if matches!(e, PdsError::Validation(_)) {
-                (StatusCode::CONFLICT, e.to_string())
-            } else if matches!(e, PdsError::Conflict(_)) {
+            } else if matches!(e, PdsError::Validation(_) | PdsError::Conflict(_)) {
                 (StatusCode::CONFLICT, e.to_string())
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
