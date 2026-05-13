@@ -89,16 +89,27 @@ at least one chain entry against the subject. Easiest path:
 emit one moderation event against alice via `emitEvent`. If
 local state already has audit-chain rows for the account, skip.
 
+`ModEventAction` is a tagged enum with `#[serde(tag = "kind")]`
+and no `rename_all` — the wire form is an object
+`{"kind": "TakedownAccount"}`, not the bare string
+`"TakedownAccount"`. Verified against the canonical-shape unit
+test [src/api/aurora_admin.rs:4513-4523](../../src/api/aurora_admin.rs#L4513-L4523)
+and the variant's docstring at [src/api/aurora_admin.rs:233](../../src/api/aurora_admin.rs#L233).
+`EmitEventOutput` uses `rename_all = "camelCase"`
+([src/api/aurora_admin.rs:211-230](../../src/api/aurora_admin.rs#L211-L230));
+the response field name on the wire is `auditEntryId`, not the
+snake_case Rust name.
+
 ```bash
 curl -s -X POST http://localhost:2583/xrpc/tools.aurora.admin.emitEvent \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-    "action": "TakedownAccount",
+    "action": {"kind": "TakedownAccount"},
     "subjects": [{"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:<alice-did>"}],
     "rationale": "phase-b seed",
     "snapshotCapture": true
-  }' | jq '.audit_entry_id'
+  }' | jq '.auditEntryId'
 ```
 
 Expected: a stringified i64 (the chain entry id). Confirms a
