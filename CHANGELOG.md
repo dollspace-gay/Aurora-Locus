@@ -6,7 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-### Arc 10 — GC sweep for orphaned blob storage (v0.4-cycle)
+_Future v0.5 cycle work lands here._
+
+## [0.4.0] - 2026-05-13
+
+v0.4 makes Aurora-Locus production-deployable at scale. The
+multi-instance work (Arc 7) introduces a `DistributedStore`
+trait substrate so DPoP JTI replay, OAuth flow state, and
+rate-limit buckets become cross-instance-coherent against a
+shared Postgres database. The runtime capability registry
+(Arc 8) replaces the hand-curated `aurora_capability_families`
+list with introspection against the actual mounted routes.
+A hygiene pass (Arc 9) clears 24 clippy warnings, adds a
+`Clock` primitive that resolves identity-cache test flakiness,
+adds `Debug`-redaction for secret-bearing `AppContext` fields,
+and rationalizes the forensic-export bundle's
+`audit-entries.json` wire shape to match `getAuditTrail`. The
+GC sweep (Arc 10) provides optional reconciliation between
+blob storage and DB metadata for the rare cases where the
+Arc 4 `DeferredAction` queue's cleanup fails — off by default,
+dry-run by default once enabled. A debug-build-only HTTP
+endpoint family (Arc 11) collapses the local-development
+admin-grant ceremony from multi-step CLI workflows to single
+HTTP POSTs; release builds do not include the surface. Arc 6
+migrates the Aurora Admin UI to v0.3 wire shapes with
+dual-shape backend acceptance during the transition window.
+
+### Arc 10 — GC sweep for orphaned blob storage (chainlink #57)
 
 Four-step cycle (Step 0 recon, Steps 1-4 implementation)
 introducing an optional background reconciliation mechanism
@@ -14,9 +40,6 @@ for blob storage. Identifies and (operator-opt-in) deletes
 storage entries with no corresponding row in the
 authoritative `blob` table — the rare case where Arc 4's
 `DeferredAction` queue's best-effort cleanup fails to land.
-
-Tracked via chainlink #57. Design at
-[`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §9.
 
 The sweep is **off by default** in v0.4. Existing deployments
 gain no new background task; operators opt in via
@@ -139,18 +162,21 @@ after observing the report cadence in production.
   `testcontainers` scaffolding equivalent to
   `tests/distributed_substrate_test.rs`).
 
-### Arc 11 — Dev curl framework (v0.4-cycle)
+### Arc 11 — Debug-build-only dev HTTP endpoints (chainlink #56)
 
 Single-step cycle item shipping a localhost-only HTTP namespace
-for development workflow. Compiled into debug builds only via
-`#[cfg(debug_assertions)]`; release builds do not include the
-surface and the routes do not exist on production binaries.
+(`dev.aurora.*`) for development workflow. Compiled into debug
+builds only via `#[cfg(debug_assertions)]`; release builds do
+not include the surface, and `nm target/release/aurora-locus
+| grep dev_routes` returns zero symbols (the module is
+stripped at compile time). The path namespace is List C by
+design — operators running release builds against these paths
+see 404.
 
-Tracked via chainlink #56. Pulled forward from end-of-v0.4 to
-mid-cycle because Arc 9 Phase B's stop-PDS / `cargo run --
-grant-admin` / restart-PDS cycle was unbearable; the new
-framework collapses each admin operation to a single HTTP POST
-against the running PDS.
+Pulled forward from end-of-v0.4 to mid-cycle because Arc 9
+Phase B's stop-PDS / `cargo run -- grant-admin` / restart-PDS
+cycle was unbearable; the new endpoint family collapses each
+admin operation to a single HTTP POST against the running PDS.
 
 #### Added
 
@@ -218,7 +244,7 @@ explicitly for use against a running PDS.
 - `dev.aurora.inspectInMemory` — read in-process state
   (`DPopNonceStore.nonces`, governor counters).
 
-### Arc 9 — Hygiene pass (v0.4-cycle)
+### Arc 9 — Hygiene pass (chainlink #55)
 
 Four-step cycle (Step 0 recon, Steps 1-4 implementation) bundling
 eight items from `docs/v04-candidates.md` whose individual scope
@@ -228,9 +254,6 @@ Debug derive, test-clock primitive for identity::cache,
 closure-as-done, `AURORA_ADMIN_UI_DESIGN.md` prose audit,
 `file-tier-config.md` value-format consolidation, and
 `exportAccountForensic` shape rationalization.
-
-Tracked via chainlink #55. Design at
-[`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §8.
 
 #### Added
 
@@ -307,11 +330,11 @@ Tracked via chainlink #55. Design at
 - **`docs/AURORA_ADMIN_UI_DESIGN.md`**: comprehensive prose audit
   historicizing v0.2-era framing across ~20 sections. Header
   reframed to `Cycle: v0.2 (with v0.3 + v0.4 additive amendments
-  — see §15 for v0.4 specifics)`. Four stale `AURORA_DESIGN.md`
-  cross-references updated to `V02_DESIGN.md`. "v0.3 may add" /
-  "v0.3 evaluates" framings throughout §2, §5, §6, §8.7, §9.5,
-  §14 rewritten to acknowledge that v0.3 + v0.4 didn't absorb
-  the items; future-cycle aspirations now route through
+  — see §15 for v0.4 specifics)`. Stale internal cross-references
+  refreshed to the cycle-archive naming convention. "v0.3 may
+  add" / "v0.3 evaluates" framings throughout §2, §5, §6, §8.7,
+  §9.5, §14 rewritten to acknowledge that v0.3 + v0.4 didn't
+  absorb the items; future-cycle aspirations now route through
   `docs/v05-candidates.md`. §15 stays current. [Arc 9 Step 3,
   Item 15]
 
@@ -322,10 +345,9 @@ Tracked via chainlink #55. Design at
   each superseded by `_pds` variants visible at
   `aurora_admin.rs:1018+`. The companion `subject_columns` is
   still used and stays. [Arc 9 Step 1, Item 7]
-- **`docs/AURORA_DESIGN.md`** — rename-closure to
-  `docs/V02_DESIGN.md`. The file had been pending deletion in the
-  working tree since Arc 7's mid-cycle rename to the
-  cycle-archive naming convention. Cross-references in
+- **Internal design-corpus file rename-closure** to the
+  cycle-archive naming convention; pending deletion since
+  Arc 7's mid-cycle rename. Cross-references in
   `docs/AURORA_ADMIN_UI_DESIGN.md` updated to point at the
   renamed file. [Arc 9 Step 3, Item 15]
 
@@ -381,7 +403,7 @@ Tracked via chainlink #55. Design at
   candidate; the new parity test pins the duplication so drift
   is caught immediately.
 
-### Arc 8 — Runtime route enumeration (v0.4-cycle)
+### Arc 8 — Runtime route enumeration (chainlink #54)
 
 Four-step cycle (Step 0 recon, Steps 1-4 implementation + docs)
 replacing the hand-curated `aurora_capability_families()` /
@@ -390,10 +412,8 @@ replacing the hand-curated `aurora_capability_families()` /
 queried by `tools.aurora.describeCapabilities` at request time.
 Byte-identical wire output preserved across the migration —
 single-source-of-truth advertisement that can no longer drift
-from the actual route table.
-
-Tracked via chainlink #54 (closes chainlink #123 from v0.3).
-Design at [`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §7.
+from the actual route table. Closes the v0.3 #123 carry-forward
+for runtime route enumeration.
 
 #### Added
 
@@ -416,12 +436,11 @@ Design at [`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §7.
   `aurora_capability_extensions` function). [Arc 8 Step 2-3]
 - **`ADMIN_TIER_PATH_REGEX` constant** —
   `^/xrpc/tools\.aurora\.(admin|moderator|superadmin|ops)(\.|$)`
-  — centralized in `src/api/registry.rs` per V04_DESIGN.md
-  §7.3.6's "shared-constant requirement." `admin_tier_regex()`
-  returns a `&'static Regex` cached via `OnceLock`. The starting
-  regex was missing `ops` (admin-tier by authority but advertised
-  through the existing curated list); Step 0 Q6 added it.
-  [Arc 8 Step 1]
+  — centralized in `src/api/registry.rs` (shared-constant
+  requirement). `admin_tier_regex()` returns a `&'static Regex`
+  cached via `OnceLock`. The starting regex was missing `ops`
+  (admin-tier by authority but advertised through the existing
+  curated list); Step 0 Q6 added it. [Arc 8 Step 1]
 - **`Arc<RouteRegistry>` field on `AppContext`** populated by
   `crate::api::routes()`'s builder pair and threaded through
   `AppContext::new(config, route_registry)`. Test fixtures pass
@@ -430,12 +449,11 @@ Design at [`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §7.
   snapshot test exercises the real wire output. [Arc 8 Step 1-3]
 - **Structural-invariant assertions on
   `test_admin_route_registry_completeness`** (renamed from
-  `describe_capabilities_snapshot` per V04_DESIGN.md §7.4.4):
-  the byte-for-byte literal stays in place as contract
-  protection; the new structural assertions (every family
-  namespace appears, extensions match `WIRE_EXTENSION_ORDER`
-  element-for-element) give human-readable diagnostics when
-  the registry drifts. [Arc 8 Step 4]
+  `describe_capabilities_snapshot`): the byte-for-byte literal
+  stays in place as contract protection; the new structural
+  assertions (every family namespace appears, extensions match
+  `WIRE_EXTENSION_ORDER` element-for-element) give human-readable
+  diagnostics when the registry drifts. [Arc 8 Step 4]
 
 #### Changed
 
@@ -510,13 +528,6 @@ Design at [`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §7.
   public XRPC, health checks and well-known endpoints, admin
   UI static assets, public OAuth surface, internal OAuth
   bootstrap, Prometheus scrape). [Arc 8 Step 4]
-- **`docs/V04_DESIGN.md` §7** cross-references to
-  `AURORA_DESIGN.md §8.15` corrected to
-  `AURORA_ADMIN_UI_DESIGN.md §8.15` — the file was mislabeled
-  in the initial Arc 8 design prose (`AURORA_DESIGN.md` was
-  renamed to `V02_DESIGN.md` mid-Arc-7). 10 occurrences fixed.
-  [Arc 8 Step 4]
-
 #### Known limitations (v0.4)
 
 - **`RouteEntry.methods`** field exists but is left empty.
@@ -533,7 +544,7 @@ Design at [`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §7.
   from the `<namespace>.<method>` shape loudly rather than
   silently shipping a malformed wire entry.
 
-### Arc 7 — Multi-instance auth state + rate limiting (v0.4-cycle)
+### Arc 7 — Multi-instance auth state + rate limiting (chainlink #53)
 
 Four-step cycle (Step 0 recon, Step 0.6 schema, Steps 1-4
 implementation + docs) introducing the `DistributedStore`
@@ -543,9 +554,6 @@ cross-instance-coherent. Backed by Postgres-CAS; the existing
 in-process governor + in-memory JTI tracker remain functional
 as the `single_instance_inmemory` opt-out and as
 defense-in-depth in the default `distributed` mode.
-
-Tracked via chainlink #53. Design at
-[`docs/V04_DESIGN.md`](docs/V04_DESIGN.md) §6.
 
 #### Added
 
@@ -569,9 +577,9 @@ Tracked via chainlink #53. Design at
   helper. [Arc 7 Step 1]
 - **`TtlCache` parse-result optimization layer**
   (`src/distributed/cache.rs`) — dashmap-backed concurrent
-  cache for cryptographic parse caching per V04_DESIGN.md
-  §6.3.4. Built but not yet wired to a consumer; ready for
-  v0.6 DPoP parse-caching work. [Arc 7 Step 1]
+  cache for cryptographic parse caching. Built but not yet
+  wired to a consumer; ready for v0.6 DPoP parse-caching
+  work. [Arc 7 Step 1]
 - **`OAuthFlowStateAdapter`**
   (`src/oauth/flow_state_adapter.rs`) — sibling
   `DistributedStore` impl wrapping the existing
@@ -803,7 +811,8 @@ the v0.4 cycle's headline arc.
 - **Role-revoke flow with canonical destructive-confirm**:
   typed-confirm gate `"REVOKE"`, required rationale,
   audit-entry click-through. The role-revoke is the canonical
-  example in V04_DESIGN §5.3.3. [Arc 6 Steps 4 + 5]
+  destructive-confirm reference for the Aurora Admin UI.
+  [Arc 6 Steps 4 + 5]
 - **Dual-shape acceptance** on backend admin endpoints:
   - `tools.aurora.admin.emitEvent` accepts both canonical v0.3
     `subjects: Vec<Subject>` and legacy v0.2
@@ -842,7 +851,7 @@ the v0.4 cycle's headline arc.
 #### Changed
 
 - **13 native `confirm()` / `prompt()` call sites migrated** to
-  `AuroraModal` helpers per the V04_DESIGN §5.3.3 classification
+  `AuroraModal` helpers per the destructive-action classification
   (7 destructive → `destructiveConfirm`; 3 form-input → `form`;
   3 non-destructive yes/no → `form` with zero fields). The
   Sequencer.js generic dispatcher path converted blanket; the
@@ -905,14 +914,14 @@ the v0.4 cycle's headline arc.
   `Response`, which ripples through ~43 pre-existing test call
   sites across `emit_event` and `update_subject_status`. Counter
   + structured tracing log alone meet the operator-side
-  observability goal of V04_DESIGN §5.3.6; deferred to v0.5+
-  (federation-aligned since federated PDS consumers of those
-  endpoints benefit from the client-side deprecation signal).
+  observability goal; deferred to v0.5+ (federation-aligned
+  since federated PDS consumers of those endpoints benefit from
+  the client-side deprecation signal).
   Documented in
   [`docs/operator/v03-wire-deprecation-rollout.md`](docs/operator/v03-wire-deprecation-rollout.md).
   [Arc 6 Step 7]
-- **Dual-link audit-trail UX on role-tier cards** (V04_DESIGN
-  §5.3.2 option (c)). Requires extending `Audit.js` to parse
+- **Dual-link audit-trail UX on role-tier cards**. Requires
+  extending `Audit.js` to parse
   hash query params on mount or extending the router to surface
   query params in route-match results — both substrate
   additions beyond Arc 6's scope. Carryover to v0.5+. [Arc 6
@@ -931,11 +940,6 @@ the v0.4 cycle's headline arc.
   (Node `node:test`, 12 tests, ~250ms total) is not invoked
   by `.github/workflows/ci.yml`. Low-cost to add; flagged for
   cycle-close audit. [Arc 6 Step 5]
-
-_Future v0.4 cycle work lands here. See
-[`docs/v04-candidates.md`](docs/v04-candidates.md) for the
-named deferrals from v0.3 and the running candidate
-accumulator._
 
 ## [0.3.0] - 2026-05-10
 
