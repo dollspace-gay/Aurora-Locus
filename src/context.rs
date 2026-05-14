@@ -4,8 +4,9 @@ use crate::{
     actor_store::{ActorStore, ActorStoreConfig},
     admin::{AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager, ReportManager},
     blob_store::{BlobBackendType, BlobStorageConfig, BlobStore, BlobStoreConfig},
-    config::{BlobstoreConfig, ServerConfig},
+    config::{BlobstoreConfig, DatabaseConfig, DistributedStateMode, ServerConfig},
     db,
+    distributed::{DistributedStore, DistributedStoreRegistry, PostgresCasStore},
     error::{PdsError, PdsResult},
     federation::{
         authentication::FederationAuthenticator,
@@ -69,11 +70,15 @@ pub struct AppContext {
     /// JTI replay set is shared with the federation §8 challenge
     /// store when federation is enabled (see field above).
     pub dpop_verifier: Arc<DPopVerifier>,
-    // Rate limiter
+    // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
-    // Distributed rate limiter (Redis-backed, for multi-instance deployments)
-    #[allow(dead_code)] // Future distributed rate limiting
-    pub distributed_rate_limiter: Option<Arc<crate::rate_limit_new::DistributedRateLimiter>>,
+    // Cross-instance rate-limit primitive (Arc 7 Step 3).
+    // `Some` in Distributed mode, `None` in SingleInstanceInmemory.
+    // The middleware consults this BEFORE the governor's
+    // per-endpoint check so cross-instance correctness is
+    // enforced first; the governor still runs as
+    // per-instance defense-in-depth.
+    pub distributed_rate_limiter: Option<Arc<crate::rate_limit::DistributedRateLimiter>>,
     // Email mailer
     pub mailer: Arc<Mailer>,
     // Read-after-write cache
@@ -93,11 +98,126 @@ pub struct AppContext {
     /// v0.4 follow-up — runtime_settings rows are the hot path for
     /// in-process changes.
     pub file_tier_settings: Arc<std::collections::HashMap<String, serde_json::Value>>,
+    /// Dedicated maintenance pool for the distributed-state
+    /// substrate (Arc 7, V04_DESIGN.md §6.4.0 Q8b). Isolated from
+    /// the main `account_db` pool so DPoP / OAuth-state /
+    /// rate-limit roundtrips can't starve regular request
+    /// handling. `None` in `DistributedStateMode::SingleInstanceInmemory`
+    /// — the substrate isn't constructed in that mode.
+    pub maintenance_pool: Option<Arc<sqlx::AnyPool>>,
+    /// Distributed-state substrate (Arc 7, V04_DESIGN.md §6.3.2).
+    /// Operates against `maintenance_pool` when present. `None`
+    /// in `SingleInstanceInmemory` mode; consumers (DPoP, OAuth
+    /// state, rate-limit — wired in Steps 2-3) fall back to
+    /// in-process state when the substrate is absent.
+    pub distributed_store: Option<Arc<dyn DistributedStore>>,
+    /// Route registry for capability advertisement (Arc 8,
+    /// V04_DESIGN.md §7.3.2 + §7.3.3). Populated at startup by
+    /// `aurora_route_builder()` in `main.rs` and threaded
+    /// through `AppContext::new`; consumed by
+    /// `describe_capabilities` at request time once Step 3
+    /// switches that handler over to the registry. Test
+    /// fixtures pass an empty default — the field exists for
+    /// every consumer but only `describe_capabilities` reads
+    /// it once Step 3 lands. See [`crate::api::registry`].
+    pub route_registry: Arc<crate::api::registry::RouteRegistry>,
+}
+
+/// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
+/// §8.4.1 Item 8). Two constraints drove the shape:
+///
+/// - `identity_resolver: Arc<dyn IdentityResolverApi>` and
+///   `distributed_store: Option<Arc<dyn DistributedStore>>` hold
+///   trait objects whose traits have no `Debug` supertrait;
+///   `#[derive(Debug)]` would not compile.
+/// - Many fields hold secret or auth-flow-relevant material that
+///   must never appear in test logs, panic messages, or snapshot
+///   fixtures: `config` (jwt_secret, repo signing key, PLC
+///   rotation key, S3 secret_access_key, SMTP creds), `mailer`,
+///   `nonce_store`, `dpop_nonce_store`, `dpop_verifier`, and the
+///   user-record cache `local_records_cache`.
+///
+/// The impl prints opaque `<TypeName>` placeholders for those
+/// fields. Pool / registry / file-tier-config fields print
+/// normally — `sqlx::AnyPool::Debug` already redacts URLs, and
+/// `RouteRegistry` plus `file_tier_settings` carry public
+/// registration / configuration data. Future fields default to
+/// opaque unless the author confirms they hold no secrets.
+impl std::fmt::Debug for AppContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppContext")
+            .field("config", &"<redacted: ServerConfig>")
+            .field("account_db", &self.account_db)
+            .field("account_manager", &"<AccountManager>")
+            .field("actor_store", &"<ActorStore>")
+            .field("blob_store", &"<BlobStore>")
+            .field("identity_resolver", &"<dyn IdentityResolverApi>")
+            .field("admin_role_manager", &"<AdminRoleManager>")
+            .field("moderation_manager", &"<ModerationManager>")
+            .field("label_manager", &"<LabelManager>")
+            .field("invite_manager", &"<InviteCodeManager>")
+            .field("report_manager", &"<ReportManager>")
+            .field("oauth_client_manager", &"<ClientManager>")
+            .field("oauth_device_manager", &"<DeviceManager>")
+            .field("sequencer", &"<Sequencer>")
+            .field(
+                "relay_client",
+                &self.relay_client.as_ref().map(|_| "<RelayClient>"),
+            )
+            .field(
+                "federation_auth",
+                &self.federation_auth.as_ref().map(|_| "<FederationAuthenticator>"),
+            )
+            .field(
+                "pds_discovery",
+                &self.pds_discovery.as_ref().map(|_| "<PdsDiscovery>"),
+            )
+            .field(
+                "federated_search",
+                &self.federated_search.as_ref().map(|_| "<FederatedSearch>"),
+            )
+            .field(
+                "nonce_store",
+                &self.nonce_store.as_ref().map(|_| "<NonceStore>"),
+            )
+            .field(
+                "dpop_nonce_store",
+                &self.dpop_nonce_store.as_ref().map(|_| "<DPopNonceStore>"),
+            )
+            .field("dpop_verifier", &"<DPopVerifier>")
+            .field("rate_limiter", &"<RateLimiter>")
+            .field(
+                "distributed_rate_limiter",
+                &self.distributed_rate_limiter.as_ref().map(|_| "<DistributedRateLimiter>"),
+            )
+            .field("mailer", &"<Mailer>")
+            .field("local_records_cache", &"<LocalRecordsCache>")
+            .field("cache_invalidator", &"<CacheInvalidator>")
+            .field("file_tier_settings", &self.file_tier_settings)
+            .field("maintenance_pool", &self.maintenance_pool)
+            .field(
+                "distributed_store",
+                &self.distributed_store.as_ref().map(|_| "<dyn DistributedStore>"),
+            )
+            .field("route_registry", &self.route_registry)
+            .finish()
+    }
 }
 
 impl AppContext {
-    /// Create a new application context from configuration
-    pub async fn new(config: ServerConfig) -> PdsResult<Self> {
+    /// Create a new application context from configuration.
+    ///
+    /// `route_registry` is the populated registry returned by
+    /// `crate::api::routes()`'s builder pair, threaded in by the
+    /// startup flow so this constructor doesn't need to know
+    /// about route declarations. Tests use
+    /// `Arc::new(crate::api::registry::RouteRegistry::default())`
+    /// — the empty registry is fine for non-`describe_capabilities`
+    /// code paths.
+    pub async fn new(
+        config: ServerConfig,
+        route_registry: Arc<crate::api::registry::RouteRegistry>,
+    ) -> PdsResult<Self> {
         // Validate configuration
         config.validate()?;
 
@@ -130,6 +250,81 @@ impl AppContext {
         let account_db =
             db::create_any_pool(&config.database, &config.storage.account_db).await?;
         db::run_any_migrations(&account_db, &config.database).await?;
+
+        // Distributed-state substrate's dedicated maintenance pool
+        // (Arc 7, V04_DESIGN.md §6.4.0 Q8b). Same database as
+        // `account_db` (so migrations run once against the shared
+        // pool above), but a separate pool so DPoP / OAuth-state /
+        // rate-limit roundtrips have their own connection budget
+        // and can't starve regular request handling under load.
+        // Constructed only in `Distributed` mode;
+        // `SingleInstanceInmemory` mode skips the substrate
+        // entirely. `Redis` is rejected at `config.validate()`
+        // time so it never reaches this branch.
+        // Substrate (DPoP + rate-limit tables, in the
+        // maintenance pool). Optional — `SingleInstanceInmemory`
+        // mode skips it. `Redis` mode is rejected at
+        // config.validate() so it never reaches this match.
+        let (maintenance_pool, substrate) = match config.distributed_state_mode {
+            DistributedStateMode::Distributed => {
+                let maintenance_db_config = DatabaseConfig {
+                    backend: config.database.backend,
+                    url: config.database.url.clone(),
+                    max_connections: config.maintenance_pool.max_connections,
+                    min_connections: config.maintenance_pool.min_connections,
+                    acquire_timeout_secs: config.maintenance_pool.acquire_timeout_secs,
+                    idle_timeout_secs: config.database.idle_timeout_secs,
+                    max_lifetime_secs: config.database.max_lifetime_secs,
+                    leader_retry_interval_ms: config.database.leader_retry_interval_ms,
+                };
+                let pool = Arc::new(
+                    db::create_any_pool(&maintenance_db_config, &config.storage.account_db)
+                        .await?,
+                );
+                let substrate: Arc<dyn DistributedStore> =
+                    Arc::new(PostgresCasStore::new(Arc::clone(&pool)));
+                tracing::info!(
+                    max_connections = config.maintenance_pool.max_connections,
+                    min_connections = config.maintenance_pool.min_connections,
+                    "Distributed-state substrate initialized (Postgres-CAS)"
+                );
+                (Some(pool), Some(substrate))
+            }
+            DistributedStateMode::SingleInstanceInmemory => {
+                tracing::info!(
+                    "Distributed-state substrate disabled \
+                     (PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory) — \
+                     auth state lost on restart"
+                );
+                (None, None)
+            }
+            DistributedStateMode::Redis => {
+                // Unreachable: config.validate() rejects Redis at
+                // startup. Defensive return for completeness.
+                return Err(PdsError::Validation(
+                    "Redis distributed-state mode not implemented in v0.4".to_string(),
+                ));
+            }
+        };
+
+        // OAuth-state adapter (wraps account_db, not the
+        // maintenance pool) — always present. The underlying
+        // authorization_request table lives in account_db
+        // regardless of substrate mode, and OAuth flows need
+        // cross-instance coherence even in
+        // SingleInstanceInmemory mode (where the substrate
+        // skipping is fine because there are no siblings).
+        let oauth_adapter: Arc<dyn DistributedStore> = Arc::new(
+            crate::oauth::OAuthFlowStateAdapter::new(Arc::new(account_db.clone())),
+        );
+
+        // Registry: consumer-facing facade routing per-table
+        // operations to the right impl. AppContext consumers
+        // depend on Arc<dyn DistributedStore>; the registry
+        // hides the dispatch.
+        let distributed_store: Option<Arc<dyn DistributedStore>> = Some(Arc::new(
+            DistributedStoreRegistry::new(substrate, Arc::clone(&oauth_adapter)),
+        ));
 
         // Initialize account manager
         let account_manager = Arc::new(AccountManager::new(
@@ -290,18 +485,34 @@ impl AppContext {
         // when federation is off the verifier still has its own JTI
         // replay tracker (separate Arc), which is what RFC 9449 §11.1
         // requires regardless of the §8 challenge flow.
+        //
+        // Arc 7 Step 3: in Distributed mode the JTI-replay path
+        // additionally routes through the substrate (cross-instance
+        // single-use enforcement). The substrate handle is wired
+        // through the `with_distributed_store` builder; the
+        // server-nonce half stays in-memory regardless of mode
+        // (federation-scoped, no cross-instance correctness story
+        // in v0.4 per Step 0 OQ3).
+        let make_dpop_store = || {
+            let store = DPopNonceStore::new();
+            if let Some(substrate) = distributed_store.as_ref() {
+                store.with_distributed_store(Arc::clone(substrate))
+            } else {
+                store
+            }
+        };
         let dpop_nonce_store: Option<Arc<DPopNonceStore>> = if config.federation.enabled {
             tracing::info!(
                 "Initializing DPoP §8 nonce challenge store (federation enabled)"
             );
-            Some(Arc::new(DPopNonceStore::new()))
+            Some(Arc::new(make_dpop_store()))
         } else {
             None
         };
         let dpop_verifier = {
             let store_for_verifier = match &dpop_nonce_store {
                 Some(s) => Arc::clone(s),
-                None => Arc::new(DPopNonceStore::new()),
+                None => Arc::new(make_dpop_store()),
             };
             Arc::new(DPopVerifier::new(store_for_verifier))
         };
@@ -367,33 +578,6 @@ impl AppContext {
 
         let sequencer = Arc::new(seq);
 
-        // Initialize distributed rate limiter if Redis is enabled
-        let distributed_rate_limiter = if config.rate_limit.use_redis {
-            if let Some(ref redis_url) = config.rate_limit.redis_url {
-                tracing::info!(
-                    "Initializing distributed Redis-backed rate limiter: {}",
-                    redis_url
-                );
-                // Create cache client for Redis
-                let cache_config = crate::cache::CacheConfig {
-                    enabled: true,
-                    redis_url: redis_url.clone(),
-                    ..Default::default()
-                };
-                let cache_client = crate::cache::CacheClient::new(cache_config).await?;
-                let dist_limiter = crate::rate_limit_new::DistributedRateLimiter::new(
-                    cache_client,
-                    config.rate_limit.global_requests_per_minute,
-                );
-                Some(Arc::new(dist_limiter))
-            } else {
-                tracing::warn!("Redis rate limiting enabled but no redis_url configured");
-                None
-            }
-        } else {
-            None
-        };
-
         // Initialize rate limiter with Bluesky-compatible endpoint limits.
         // The `exempt_admin_assets` flag is the only env-driven runtime
         // tuning currently plumbed through; the rest of the runtime quotas
@@ -404,6 +588,16 @@ impl AppContext {
                 ..crate::rate_limit::RateLimitConfig::default()
             },
         ));
+
+        // Distributed rate-limit primitive (Arc 7 Step 3). One
+        // construction site, mode-gated on the maintenance pool's
+        // presence — `Distributed` mode has both; the other modes
+        // have neither. The middleware consults this for
+        // cross-instance bucket coherence; the governor above
+        // stays running as per-instance defense.
+        let distributed_rate_limiter = maintenance_pool.as_ref().map(|pool| {
+            Arc::new(crate::rate_limit::DistributedRateLimiter::new(Arc::clone(pool)))
+        });
 
         // Initialize mailer
         let mailer = Arc::new(Mailer::new(config.email.clone())?);
@@ -462,6 +656,17 @@ impl AppContext {
             }
         }
 
+        // Route registry — threaded in by the caller (Step 2:
+        // `main.rs` builds `aurora_route_builder()` first, then
+        // passes the populated registry here). Step 3 will
+        // switch `describe_capabilities` to read from this
+        // field; until then, the handler still reads the
+        // hand-curated lists at `admin.rs`, so the registry's
+        // contents are write-only at runtime — but the
+        // construction-time wiring is load-bearing so the test
+        // fixtures' empty-registry paths also flow through this
+        // arg.
+
         Ok(Self {
             config: Arc::new(config),
             account_db,
@@ -490,6 +695,9 @@ impl AppContext {
             local_records_cache,
             cache_invalidator,
             file_tier_settings,
+            maintenance_pool,
+            distributed_store,
+            route_registry,
         })
     }
 

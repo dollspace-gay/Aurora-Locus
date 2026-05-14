@@ -235,24 +235,32 @@
       const sent = res.resetEmailSent
         ? 'Password reset email sent to ' + (res.maskedEmail || '')
         : 'Token generated; email not sent (mailer not configured).';
-      global.AuroraToast.success(sent);
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success(sent, auditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
     } catch (e) {
       global.AuroraToast.danger('Password reset failed: ' + (e && e.message ? e.message : ''));
     }
   }
 
   async function overridePassword() {
-    const rationale = await promptRationaleAndConfirmation(
-      'Override password',
-      'This is irreversible. The operator must communicate the new credential to the account holder out-of-band.',
-      'I understand this overrides without notifying the account holder',
-    );
-    if (!rationale) return;
-    const newPwd = prompt('New password:');
-    if (!newPwd) return;
+    const result = await global.AuroraModal.form({
+      heading: 'Override password',
+      body: 'Sets a new password directly on the account. The operator must communicate the new credential to the account holder out-of-band.',
+      fields: [
+        { name: 'newPwd', label: 'New password', type: 'password', required: true },
+        { name: 'rationale', label: 'Rationale (recorded in audit log)', type: 'textarea', required: true },
+      ],
+      submitLabel: 'Override password',
+    });
+    if (!result.submitted) return;
     try {
       await global.AuroraClient.post('com.atproto.admin.updateAccountPassword', {
-        did: currentDid, password: newPwd,
+        did: currentDid, password: result.values.newPwd,
       });
       global.AuroraToast.success('Password override applied.');
     } catch (e) {
@@ -261,17 +269,19 @@
   }
 
   async function updateSigningKey() {
-    const rationale = await promptRationaleAndConfirmation(
-      'Update signing key',
-      'Updating the signing key affects identity verification across federation. This is irreversible.',
-      'I understand this is irreversible',
-    );
-    if (!rationale) return;
-    const key = prompt('New signing key (DID-key form):');
-    if (!key) return;
+    const result = await global.AuroraModal.form({
+      heading: 'Update signing key',
+      body: 'Updates the account\'s signing key. Affects identity verification across federation.',
+      fields: [
+        { name: 'didKey', label: 'New signing key (DID-key form)', type: 'text', required: true },
+        { name: 'rationale', label: 'Rationale (recorded in audit log)', type: 'textarea', required: true },
+      ],
+      submitLabel: 'Update signing key',
+    });
+    if (!result.submitted) return;
     try {
       await global.AuroraClient.post('com.atproto.admin.updateAccountSigningKey', {
-        did: currentDid, signingKey: key,
+        did: currentDid, signingKey: result.values.didKey,
       });
       global.AuroraToast.success('Signing key updated.');
     } catch (e) {
@@ -312,14 +322,41 @@
   }
 
   async function toggleInvites() {
-    const enable = !confirm('Press OK to disable account invites, Cancel to enable.');
-    const rationale = await promptRationale((enable ? 'Enable' : 'Disable') + ' account invites?');
-    if (rationale == null) return;
+    // The prior native confirm() inverted OK/Cancel (OK to disable,
+    // Cancel to enable) — cognitive load operators routinely
+    // misread. The modal makes the binary explicit via a select
+    // dropdown; the operator picks the target state.
+    const result = await global.AuroraModal.form({
+      heading: 'Toggle account invites',
+      body: 'Set the invite state for this account.',
+      fields: [
+        {
+          name: 'state',
+          label: 'New state',
+          type: 'select',
+          options: [
+            { value: 'disabled', label: 'Disabled' },
+            { value: 'enabled',  label: 'Enabled' },
+          ],
+          default: 'disabled',
+          required: true,
+        },
+        {
+          name: 'rationale',
+          label: 'Rationale (recorded in audit log)',
+          type: 'textarea',
+          required: true,
+        },
+      ],
+      submitLabel: 'Save state',
+    });
+    if (!result.submitted) return;
+    const enable = result.values.state === 'enabled';
     try {
       const ep = enable
         ? 'com.atproto.admin.enableAccountInvites'
         : 'com.atproto.admin.disableAccountInvites';
-      await global.AuroraClient.post(ep, { account: currentDid, note: rationale });
+      await global.AuroraClient.post(ep, { account: currentDid, note: result.values.rationale });
       global.AuroraToast.success((enable ? 'Enabled' : 'Disabled') + ' invites.');
     } catch (e) {
       global.AuroraToast.danger('Toggle failed: ' + (e && e.message ? e.message : ''));
@@ -328,17 +365,15 @@
 
   async function deleteAccount() {
     const handle = currentAccount.handle || '';
-    const typed = prompt('Type the account handle (' + handle + ') to confirm deletion:');
-    if (typed !== handle) {
-      if (typed != null) global.AuroraToast.warning('Handle did not match; cancelled.');
-      return;
-    }
-    const rationale = await promptRationaleAndConfirmation(
-      'Delete account',
-      'This permanently removes the account, its records, and its invite lineage. Irreversible.',
-      'I understand this is irreversible',
-    );
-    if (!rationale) return;
+    const result = await global.AuroraModal.destructiveConfirm({
+      heading: 'Delete account',
+      body: 'This permanently removes the account, its records, and its invite lineage. Irreversible.',
+      typedConfirmGate: handle,
+      rationaleRequired: true,
+      ackCheckbox: 'I understand this is irreversible',
+      confirmLabel: 'Delete account',
+    });
+    if (!result.confirmed) return;
     try {
       await global.AuroraClient.post('com.atproto.admin.deleteAccount', {
         did: currentDid,
@@ -420,7 +455,16 @@
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
       modalHandle.close();
-      global.AuroraToast.success('Export complete. Audit entry: ' + auditId + ', bundle hash: ' + bundleHash);
+      // Bundle hash stays inline (it's the verification token operators
+      // need to keep with the bundle); the audit-entry id moves into a
+      // click-through action link per Arc 6 Step 3 sub-3e.
+      const msg = 'Export complete. Bundle hash: ' + bundleHash;
+      global.AuroraToast.success(msg, auditId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditId),
+        },
+      } : undefined);
     } catch (e) {
       global.AuroraToast.danger('Export failed: ' + (e && e.message ? e.message : ''));
     }

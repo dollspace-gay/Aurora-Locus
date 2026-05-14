@@ -93,3 +93,115 @@
   font-size: var(--font-size-sm);
   color: var(--text-secondary);
 }
+
+/* Settings — source-tier suffix (Runtime/File/Default/RecoveryMode)
+ * per Arc 6 Step 2 §5.2.1/§5.3.5. Visually subdued; placed inline
+ * after the setting label without distracting from the form. */
+.settings-source-tag {
+  color: var(--text-tertiary);
+  font-style: italic;
+  margin-left: var(--space-2);
+  font-weight: normal;
+}
+
+/* Audit-entry detail — cascade-subjects list (Arc 6 Step 3 sub-3a).
+ * One line per cascade subject, paired with its snapshot id. */
+.audit-cascade-list {
+  list-style: disc;
+  padding-left: var(--space-5);
+  margin: var(--space-2) 0;
+  font-size: var(--font-size-sm);
+}
+
+.audit-cascade-list li {
+  margin: var(--space-1) 0;
+}
+
+/* Audit-page header — chain-verification indicator (Arc 6 Step 3
+ * sub-3c). Surfaces top-level chainVerified + chainVerifiedThrough
+ * from getAuditTrail per V04_DESIGN §5.3.5 case (a). Three states:
+ * ok (green), warn (yellow, partial verification), bad (red, total
+ * failure at sequence 1). */
+.audit-header-indicators {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.chain-indicator-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  color: var(--text-primary);
+}
+
+.chain-indicator-badge:hover {
+  background: var(--background);
+}
+
+.chain-indicator-ok .chain-indicator-icon  { color: var(--success-color); }
+.chain-indicator-warn .chain-indicator-icon { color: var(--warning-color); }
+.chain-indicator-bad .chain-indicator-icon { color: var(--danger-color); }
+
+.chain-indicator-ok {
+  border-color: var(--success-color);
+}
+
+.chain-indicator-warn {
+  border-color: var(--warning-color);
+}
+
+.chain-indicator-bad {
+  border-color: var(--danger-color);
+}
+
+.chain-indicator-detail {
+  background: var(--surface);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  margin-bottom: var(--space-4);
+  font-size: var(--font-size-sm);
+}
+
+.chain-indicator-cmd {
+  background: var(--background);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  overflow-x: auto;
+}
+
+/* Dashboard — moderation metrics header (Arc 6 Step 3 sub-3d).
+ * Hosts the time-range preset selector next to the section title. */
+.metrics-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.metrics-header h3 {
+  margin: 0;
+}
+
+.metrics-range-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.metrics-range-select {
+  font-size: var(--font-size-sm);
+}

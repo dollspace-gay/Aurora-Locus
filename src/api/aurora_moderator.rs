@@ -1636,8 +1636,6 @@ mod tests {
             rate_limit: RateLimitConfig {
                 enabled: false,
                 global_requests_per_minute: 3000,
-                use_redis: false,
-                redis_url: None,
                 exempt_admin_assets: true,
             },
             logging: LoggingConfig {
@@ -1653,8 +1651,16 @@ mod tests {
                 auto_stream_events: false,
             },
             validation_mode: PathBuf::from("required").into_os_string().to_string_lossy().parse().unwrap_or(crate::validation::ValidationMode::Required),
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
         };
-        AppContext::new(config).await.unwrap()
+        AppContext::new(
+            config,
+            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .unwrap()
     }
 
     /// Insert an actor + a moderation_event for a clean test fixture.

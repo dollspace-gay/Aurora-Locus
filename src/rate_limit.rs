@@ -997,6 +997,63 @@ pub async fn rate_limit_middleware(
     // Check if user is authenticated (has Authorization header)
     let has_auth_header = request.headers().get("authorization").is_some();
 
+    // PRIORITY 0: cross-instance distributed-rate-limit check
+    // (Arc 7 Step 3). In Distributed mode this runs BEFORE the
+    // governor's per-endpoint check so cross-instance correctness
+    // is enforced first. The governor still runs as
+    // per-instance defense-in-depth (PRIORITY 1+ below).
+    //
+    // Bucket key is `endpoint|<path>` — one bucket per
+    // endpoint path, no IP/DID composite. IP/DID-keyed limits
+    // remain governor-only (per-instance limits are about
+    // protecting one instance from a single source; the
+    // distributed substrate addresses the
+    // per-endpoint-across-the-deployment view).
+    //
+    // Rate parameters: 100 tokens/sec, max=100. Tuned to be
+    // tighter than the governor's default per-endpoint
+    // quotas (which are typically minutes/day-scaled) so
+    // the distributed check rate-limits FIRST under
+    // contention; tuneability lands in a v0.6 candidate
+    // entry alongside per-endpoint-config plumbing.
+    if let Some(dist) = ctx.distributed_rate_limiter.as_ref() {
+        let bucket_key = format!("endpoint|{}", endpoint_path);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        match dist
+            .try_consume(&bucket_key, 1, 100, 100, now_ms)
+            .await
+        {
+            Ok(RateLimitOutcome::Allowed { .. }) => {
+                // Continue to governor checks below.
+            }
+            Ok(RateLimitOutcome::RateLimited) => {
+                let mut response =
+                    Response::new(axum::body::Body::from("Too Many Requests"));
+                *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                response
+                    .headers_mut()
+                    .insert("Retry-After", "1".parse().unwrap());
+                return Ok(response);
+            }
+            Err(e) => {
+                // Distributed-store failure is operator-meaningful
+                // but request-non-fatal: log and fall through to
+                // the governor's per-instance check. Operators
+                // with monitoring on `distributed_store_errors`
+                // see this surface; end users see the request
+                // continue.
+                tracing::warn!(
+                    bucket = %bucket_key,
+                    error = %e,
+                    "distributed rate-limit consult failed, falling through to governor"
+                );
+            }
+        }
+    }
+
     // PRIORITY 1: Check endpoint-specific rate limit first
     let rate_limit_result =
         if let Some(endpoint_result) = ctx.rate_limiter.check_endpoint(endpoint_path) {
@@ -1116,6 +1173,408 @@ pub async fn rate_limit_middleware(
 
             Ok(response)
         }
+    }
+}
+
+// ============================================================================
+// Arc 7 Step 3 — distributed-store rate-limit primitive.
+//
+// Sits alongside the in-process governor `RateLimiter` above.
+// Selected by `DistributedStateMode`: `Distributed` constructs
+// a `DistributedRateLimiter` that runs server-side arithmetic
+// UPDATEs against `rate_limit_buckets`;
+// `SingleInstanceInmemory` skips construction and the
+// governor path runs unchanged. Per V04_DESIGN.md §6.3.5 the
+// arithmetic UPDATE replaces the CAS-loop-and-retries pattern
+// — concurrent requests for the same bucket serialise through
+// Postgres's row lock rather than spinning on version
+// conflicts.
+//
+// The SQL stays within sqlx::Any's portable subset: `CASE
+// WHEN ... THEN ... ELSE ... END` instead of Postgres-only
+// `LEAST(...)`. Verbose but works on both backends without
+// runtime dispatch.
+// ============================================================================
+
+use sqlx::AnyPool;
+
+/// Distributed rate-limit primitive. One pool reference + a
+/// table-name constant. Mode-gated construction in
+/// `AppContext::new` (Distributed mode only).
+#[derive(Clone)]
+pub struct DistributedRateLimiter {
+    /// Maintenance pool — same one the substrate's
+    /// `PostgresCasStore` uses. Isolated from `account_db` so
+    /// rate-limit roundtrips can't starve regular request
+    /// handling.
+    pool: Arc<AnyPool>,
+}
+
+/// Outcome of a [`DistributedRateLimiter::try_consume`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitOutcome {
+    /// Request allowed; the row's `tokens_remaining` after the
+    /// deduction is included for caller-side observability
+    /// (Prometheus gauges, rate-limit-headers, etc.).
+    Allowed { tokens_remaining: i64 },
+    /// Request rate-limited; insufficient tokens after refill.
+    /// The caller decides the retry-after policy.
+    RateLimited,
+}
+
+impl DistributedRateLimiter {
+    pub fn new(pool: Arc<AnyPool>) -> Self {
+        Self { pool }
+    }
+
+    /// Try to consume `cost` tokens from the bucket identified
+    /// by `bucket_key`. Server-side arithmetic UPDATE per
+    /// V04_DESIGN.md §6.3.5:
+    ///
+    /// 1. Compute the time-based refill: current tokens +
+    ///    `(now - window_start) * refill_rate / 1000`, capped
+    ///    at `max_tokens`.
+    /// 2. If the refilled total is `>= cost`, deduct cost,
+    ///    update `window_start` to now, increment version.
+    ///    Otherwise the UPDATE affects zero rows — the
+    ///    caller sees `RateLimited`.
+    ///
+    /// First-touch buckets (no row yet) get a best-effort
+    /// INSERT at `max_tokens - cost`. Concurrent first-touch
+    /// races resolve via the table's PRIMARY KEY: the loser
+    /// retries the UPDATE.
+    ///
+    /// `refill_rate` is tokens-per-second (BIGINT). Sub-second
+    /// precision requires scaling at the caller (multiply
+    /// both refill_rate and the time-divisor).
+    pub async fn try_consume(
+        &self,
+        bucket_key: &str,
+        cost: i64,
+        refill_rate: i64,
+        max_tokens: i64,
+        now_epoch_ms: i64,
+    ) -> PdsResult<RateLimitOutcome> {
+        // Single-statement atomic UPDATE: compute refill, check
+        // sufficiency, deduct, all in one trip. Returns the
+        // post-deduction `tokens_remaining` on success; affects
+        // zero rows when either (a) bucket doesn't exist or
+        // (b) bucket exists but is exhausted post-refill.
+        //
+        // CASE-based portability: Postgres LEAST() is not
+        // portable to SQLite scalar form. The CASE expression
+        // computes the capped refill twice (once in SET, once
+        // in WHERE); both branches are folded into Postgres's
+        // query plan, no measurable cost vs LEAST().
+        let updated: Option<(i64,)> = sqlx::query_as(
+            r#"
+            UPDATE rate_limit_buckets
+            SET
+                tokens_remaining = CASE
+                    WHEN tokens_remaining + (($1 - window_start_at_epoch_ms) * refill_rate / 1000) > max_tokens
+                        THEN max_tokens - $2
+                    ELSE tokens_remaining + (($1 - window_start_at_epoch_ms) * refill_rate / 1000) - $2
+                END,
+                window_start_at_epoch_ms = $1,
+                version = version + 1
+            WHERE bucket_key = $3
+              AND (
+                CASE
+                    WHEN tokens_remaining + (($1 - window_start_at_epoch_ms) * refill_rate / 1000) > max_tokens
+                        THEN max_tokens
+                    ELSE tokens_remaining + (($1 - window_start_at_epoch_ms) * refill_rate / 1000)
+                END
+              ) >= $2
+            RETURNING tokens_remaining
+            "#,
+        )
+        .bind(now_epoch_ms)
+        .bind(cost)
+        .bind(bucket_key)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(PdsError::Database)?;
+
+        if let Some((remaining,)) = updated {
+            return Ok(RateLimitOutcome::Allowed {
+                tokens_remaining: remaining,
+            });
+        }
+
+        // Zero rows affected — disambiguate. Probe for the row's
+        // existence in a separate (small) SELECT. This path runs
+        // on first-touch and on rate-limited buckets; both are
+        // less common than the happy path above.
+        let exists: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM rate_limit_buckets WHERE bucket_key = $1 LIMIT 1",
+        )
+        .bind(bucket_key)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(PdsError::Database)?;
+
+        if exists.is_some() {
+            // Bucket exists; the UPDATE's WHERE refused. That's
+            // a real rate-limit rejection (tokens insufficient
+            // even after refill).
+            return Ok(RateLimitOutcome::RateLimited);
+        }
+
+        // First-touch: INSERT a fresh bucket at (max_tokens - cost).
+        // PRIMARY KEY collision with a concurrent first-touch
+        // resolves by retrying the UPDATE — the racing caller
+        // succeeded, and now the UPDATE path should work.
+        let initial_tokens = max_tokens - cost;
+        let insert_result = sqlx::query(
+            r#"
+            INSERT INTO rate_limit_buckets
+                (bucket_key, tokens_remaining, max_tokens, refill_rate,
+                 window_start_at_epoch_ms, version)
+            VALUES ($1, $2, $3, $4, $5, 0)
+            "#,
+        )
+        .bind(bucket_key)
+        .bind(initial_tokens)
+        .bind(max_tokens)
+        .bind(refill_rate)
+        .bind(now_epoch_ms)
+        .execute(self.pool.as_ref())
+        .await;
+
+        match insert_result {
+            Ok(_) => Ok(RateLimitOutcome::Allowed {
+                tokens_remaining: initial_tokens,
+            }),
+            Err(e) if is_unique_violation_sql_err(&e) => {
+                // Concurrent first-touch happened. The bucket
+                // now exists; retry the UPDATE. Bounded retry —
+                // one extra UPDATE max; if it again returns
+                // zero rows the bucket was created and
+                // immediately exhausted (legitimate rate-limit).
+                let retry: Option<(i64,)> = sqlx::query_as(
+                    r#"
+                    UPDATE rate_limit_buckets
+                    SET
+                        tokens_remaining = CASE
+                            WHEN tokens_remaining + (($1 - window_start_at_epoch_ms) * refill_rate / 1000) > max_tokens
+                                THEN max_tokens - $2
+                            ELSE tokens_remaining + (($1 - window_start_at_epoch_ms) * refill_rate / 1000) - $2
+                        END,
+                        window_start_at_epoch_ms = $1,
+                        version = version + 1
+                    WHERE bucket_key = $3
+                      AND (
+                        CASE
+                            WHEN tokens_remaining + (($1 - window_start_at_epoch_ms) * refill_rate / 1000) > max_tokens
+                                THEN max_tokens
+                            ELSE tokens_remaining + (($1 - window_start_at_epoch_ms) * refill_rate / 1000)
+                        END
+                      ) >= $2
+                    RETURNING tokens_remaining
+                    "#,
+                )
+                .bind(now_epoch_ms)
+                .bind(cost)
+                .bind(bucket_key)
+                .fetch_optional(self.pool.as_ref())
+                .await
+                .map_err(PdsError::Database)?;
+
+                Ok(match retry {
+                    Some((remaining,)) => RateLimitOutcome::Allowed {
+                        tokens_remaining: remaining,
+                    },
+                    None => RateLimitOutcome::RateLimited,
+                })
+            }
+            Err(e) => Err(PdsError::Database(e)),
+        }
+    }
+}
+
+/// Backend-specific unique-violation detection — mirrors the
+/// helper in `src/distributed/postgres_cas.rs`. Not re-exported
+/// because the dependency direction is inverted (this is the
+/// rate-limit module reusing the substrate's pattern locally).
+fn is_unique_violation_sql_err(err: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db_err) = err {
+        matches!(
+            db_err.code().as_deref(),
+            Some("23505") | Some("1555") | Some("2067")
+        )
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod distributed_tests {
+    //! `DistributedRateLimiter` unit tests against in-memory
+    //! SQLite. Cross-instance behavior against real Postgres
+    //! is exercised by `tests/distributed_substrate_test.rs`.
+    use super::*;
+    use sqlx::any::AnyPoolOptions;
+    use std::sync::Once;
+
+    async fn fresh_pool() -> Arc<AnyPool> {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE rate_limit_buckets (
+                bucket_key                 TEXT PRIMARY KEY,
+                tokens_remaining           BIGINT NOT NULL,
+                max_tokens                 BIGINT NOT NULL,
+                refill_rate                BIGINT NOT NULL,
+                window_start_at_epoch_ms   BIGINT NOT NULL,
+                version                    BIGINT NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        Arc::new(pool)
+    }
+
+    #[tokio::test]
+    async fn first_touch_creates_bucket_and_allows() {
+        let pool = fresh_pool().await;
+        let limiter = DistributedRateLimiter::new(pool);
+        let now = chrono::Utc::now().timestamp_millis();
+        let outcome = limiter
+            .try_consume("first-touch", 1, 10, 100, now)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RateLimitOutcome::Allowed { .. }));
+        if let RateLimitOutcome::Allowed { tokens_remaining } = outcome {
+            assert_eq!(tokens_remaining, 99, "max_tokens=100, cost=1 → 99");
+        }
+    }
+
+    #[tokio::test]
+    async fn second_consume_deducts_from_existing_bucket() {
+        let pool = fresh_pool().await;
+        let limiter = DistributedRateLimiter::new(Arc::clone(&pool));
+        let now = chrono::Utc::now().timestamp_millis();
+        // First-touch creates at 99/100.
+        limiter
+            .try_consume("steady", 1, 10, 100, now)
+            .await
+            .unwrap();
+        // Second consume 1ms later: refill ≈ 0 (no time), deduct
+        // 1 more. Remaining = 98.
+        let outcome = limiter
+            .try_consume("steady", 1, 10, 100, now + 1)
+            .await
+            .unwrap();
+        match outcome {
+            RateLimitOutcome::Allowed { tokens_remaining } => {
+                assert_eq!(tokens_remaining, 98);
+            }
+            other => panic!("expected Allowed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_bucket_returns_rate_limited() {
+        let pool = fresh_pool().await;
+        let limiter = DistributedRateLimiter::new(pool);
+        let now = chrono::Utc::now().timestamp_millis();
+        // First-touch creates at 1/2 (max=2, cost=1).
+        limiter
+            .try_consume("small", 1, 0, 2, now)
+            .await
+            .unwrap();
+        // Second deducts to 0.
+        limiter
+            .try_consume("small", 1, 0, 2, now + 1)
+            .await
+            .unwrap();
+        // Third must rate-limit (refill_rate=0 → no refill).
+        let outcome = limiter.try_consume("small", 1, 0, 2, now + 2).await.unwrap();
+        assert!(matches!(outcome, RateLimitOutcome::RateLimited));
+    }
+
+    #[tokio::test]
+    async fn refill_recovers_capacity_over_time() {
+        let pool = fresh_pool().await;
+        let limiter = DistributedRateLimiter::new(pool);
+        let now = chrono::Utc::now().timestamp_millis();
+        // 10 tokens/sec refill, max=10. Drain everything.
+        for _ in 0..10 {
+            limiter
+                .try_consume("refilling", 1, 10, 10, now)
+                .await
+                .unwrap();
+        }
+        // Empty now. Without refill, next call rate-limits.
+        let outcome = limiter
+            .try_consume("refilling", 1, 10, 10, now + 1)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RateLimitOutcome::RateLimited));
+
+        // Wait 1 second → refill_rate * 1000ms / 1000 = 10 tokens.
+        // Capped at max=10. Deduct 1 → 9 remaining.
+        let later = now + 1000;
+        let outcome = limiter
+            .try_consume("refilling", 1, 10, 10, later)
+            .await
+            .unwrap();
+        match outcome {
+            RateLimitOutcome::Allowed { tokens_remaining } => {
+                assert_eq!(tokens_remaining, 9, "refill capped at max, then deduct");
+            }
+            other => panic!("expected Allowed post-refill, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn refill_respects_max_tokens_cap() {
+        let pool = fresh_pool().await;
+        let limiter = DistributedRateLimiter::new(pool);
+        let now = chrono::Utc::now().timestamp_millis();
+        // First-touch at 1/10 (drained-ish).
+        limiter
+            .try_consume("capped", 9, 100, 10, now)
+            .await
+            .unwrap();
+        // Wait an absurdly long time (one day). Refill would
+        // overflow without the cap; should saturate at max=10
+        // minus the next request's cost.
+        let later = now + 86_400_000;
+        let outcome = limiter
+            .try_consume("capped", 1, 100, 10, later)
+            .await
+            .unwrap();
+        match outcome {
+            RateLimitOutcome::Allowed { tokens_remaining } => {
+                assert_eq!(tokens_remaining, 9, "refill capped, then deduct 1");
+            }
+            other => panic!("expected Allowed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_buckets_have_independent_state() {
+        let pool = fresh_pool().await;
+        let limiter = DistributedRateLimiter::new(pool);
+        let now = chrono::Utc::now().timestamp_millis();
+        // Drain bucket A.
+        limiter
+            .try_consume("bucket-A", 1, 0, 1, now)
+            .await
+            .unwrap();
+        let a_again = limiter.try_consume("bucket-A", 1, 0, 1, now + 1).await.unwrap();
+        assert!(matches!(a_again, RateLimitOutcome::RateLimited));
+
+        // Bucket B is independent — first-touch, fresh budget.
+        let b = limiter.try_consume("bucket-B", 1, 0, 1, now + 1).await.unwrap();
+        assert!(matches!(b, RateLimitOutcome::Allowed { .. }));
     }
 }
 

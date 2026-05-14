@@ -155,7 +155,7 @@ enum SubscribeMessage<'a> {
     /// stays an explicit getAuditTrail request because it walks the
     /// whole chain.
     #[serde(rename = "auditEntry", rename_all = "camelCase")]
-    AuditEntry { entry: AuditEntry, sequence: i64 },
+    AuditEntry { entry: Box<AuditEntry>, sequence: i64 },
     #[serde(rename = "heartbeat")]
     Heartbeat { sequence: i64 },
     /// Per §8.5: emitted when the caller's `cursor` is older than the
@@ -421,7 +421,10 @@ fn merge_event_and_chain_streams(
         } else {
             let entry = chain_rows[ci].clone();
             let sequence = entry.sequence;
-            out.push(SubscribeMessage::AuditEntry { entry, sequence });
+            out.push(SubscribeMessage::AuditEntry {
+                entry: Box::new(entry),
+                sequence,
+            });
             ci += 1;
         }
     }
@@ -820,7 +823,7 @@ mod tests {
         // cascadeSubjects. Pinning the wrapped shape so future
         // refactors don't silently flatten or drop fields.
         let msg = SubscribeMessage::AuditEntry {
-            entry: AuditEntry {
+            entry: Box::new(AuditEntry {
                 id: "100".to_string(),
                 sequence: 42,
                 timestamp: DateTime::parse_from_rfc3339("2026-05-04T00:00:00Z")
@@ -839,7 +842,7 @@ mod tests {
                 verified: true,
                 cascade_subjects: Vec::new(),
                 cascade_snapshot_ids: Vec::new(),
-            },
+            }),
             sequence: 42,
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -892,13 +895,47 @@ mod tests {
         };
         let standalone = serde_json::to_value(&entry).unwrap();
         let wrapped = serde_json::to_value(&SubscribeMessage::AuditEntry {
-            entry,
+            entry: Box::new(entry),
             sequence: 42,
         })
         .unwrap();
         assert_eq!(
             wrapped["entry"], standalone,
             "subscribe entry payload must equal getAuditTrail's per-item shape"
+        );
+    }
+
+    /// Arc 9 Step 2 / Item 8: the manual `Debug` impl on
+    /// `AppContext` must redact every secret-bearing field
+    /// (jwt_secret, repo signing key, PLC rotation key, SMTP
+    /// creds, S3 secret_access_key). `create_test_context`
+    /// constructs a context with well-known sentinel values; the
+    /// Debug output must not contain any of them. Future changes
+    /// to the impl that drop a redaction will fail this test.
+    #[tokio::test]
+    async fn app_context_debug_redacts_sensitive_fields() {
+        let ctx = create_test_context().await;
+        let rendered = format!("{:?}", ctx);
+        // jwt_secret literal from create_test_context.
+        assert!(
+            !rendered.contains("test-secret-key-aurora-subscribe-32xx"),
+            "AppContext Debug leaked jwt_secret: {}",
+            rendered
+        );
+        // repo_signing_key / plc_rotation_key — 64-char sentinels.
+        assert!(
+            !rendered.contains(&"a".repeat(64)),
+            "AppContext Debug leaked repo_signing_key"
+        );
+        assert!(
+            !rendered.contains(&"b".repeat(64)),
+            "AppContext Debug leaked plc_rotation_key"
+        );
+        // Shape sanity: the redacted placeholder text appears.
+        assert!(
+            rendered.contains("<redacted: ServerConfig>"),
+            "AppContext Debug missing redacted-config placeholder: {}",
+            rendered
         );
     }
 
@@ -963,8 +1000,6 @@ mod tests {
             rate_limit: RateLimitConfig {
                 enabled: false,
                 global_requests_per_minute: 3000,
-                use_redis: false,
-                redis_url: None,
                 exempt_admin_assets: true,
             },
             logging: LoggingConfig {
@@ -984,8 +1019,16 @@ mod tests {
                 .to_string_lossy()
                 .parse()
                 .unwrap_or(crate::validation::ValidationMode::Required),
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
         };
-        AppContext::new(config).await.unwrap()
+        AppContext::new(
+            config,
+            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .unwrap()
     }
 
     async fn write_test_chain_entry(ctx: &AppContext, action: &'static str) -> i64 {

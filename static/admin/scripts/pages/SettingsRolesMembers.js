@@ -4,6 +4,28 @@
 (function (global) {
   'use strict';
 
+  // Map UI tier slugs (plural; derived from role.name in
+  // SettingsRoles.groupRoles and embedded in route URLs like
+  // #settings/roles/moderators, which this page reads as
+  // params.role) to canonical Role enum strings (singular,
+  // lowercase) per src/admin/roles.rs:67-78 `Role::from_str`.
+  // The backend's grantRole / revokeRole handlers call
+  // .parse::<Role>() on the wire `role` field; passing the
+  // plural slug returns Validation("Invalid role: moderators")
+  // and a 400.
+  //
+  // Duplicated verbatim in pages/SettingsRoles.js per Arc 6's
+  // anti-restructuring convention (see the parallel
+  // `settingSourceSuffix` duplication from Step 2).
+  function tierToRoleString(tier) {
+    switch (tier) {
+      case 'moderators':     return 'moderator';
+      case 'administrators': return 'admin';
+      case 'superadmins':    return 'superadmin';
+      default:               return tier;
+    }
+  }
+
   async function mount({ params, container }) {
     const role = params && params.role;
     const session = global.AuroraSession;
@@ -64,41 +86,94 @@
   }
 
   async function revoke(role, did) {
-    const rationale = prompt('Rationale (required, recorded in audit log):');
-    if (!rationale) return;
+    // Canonical destructive-confirm example per V04_DESIGN §5.3.3:
+    // REVOKE typed gate + required rationale. The role + target are
+    // surfaced in the heading; the operator types REVOKE to unlock
+    // submit and supplies the rationale that lands in the audit log.
+    const result = await global.AuroraModal.destructiveConfirm({
+      heading: 'Revoke ' + role + ' role from ' + did,
+      body: 'This action will be recorded in the audit trail.',
+      typedConfirmGate: 'REVOKE',
+      rationaleRequired: true,
+      confirmLabel: 'Revoke role',
+    });
+    if (!result.confirmed) return;
+    // Map the route's plural tier slug to the canonical Role enum
+    // string the server's `Role::from_str` accepts. See
+    // tierToRoleString comment above.
+    const wireRole = tierToRoleString(role);
     try {
-      await global.AuroraEndpoints.superadmin.revokeRole({ did: did, role: role, rationale: rationale });
-      global.AuroraToast.success('Role revoked.');
+      const res = await global.AuroraEndpoints.superadmin.revokeRole({ did: did, role: wireRole, rationale: result.rationale });
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success('Role revoked.', auditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
       if (global.AuroraRouter) global.AuroraRouter.dispatch();
     } catch (e) {
-      global.AuroraToast.danger('Revoke failed: ' + (e && e.message ? e.message : ''));
+      // Surface err.message directly so Step 1's translation layer
+      // (or the fallback 'HTTP <status>: <msg>' rendering) shows
+      // through. The prior 'Revoke failed: <msg>' hand-prefix
+      // shadowed the translated prose for recognized error codes.
+      global.AuroraToast.danger(e && e.message ? e.message : 'Revoke failed.');
     }
   }
 
-  function openGrant(role) {
-    const div = document.createElement('div');
-    div.innerHTML =
-      '<div class="form-group"><label>Account DID or handle</label><input type="text" id="rmm-grant-target"></div>' +
-      '<div class="form-group"><label>Rationale (required)</label><textarea id="rmm-grant-r" rows="2" style="width:100%;"></textarea></div>' +
-      '<div class="action-panel-buttons">' +
-      '  <button class="btn-secondary" id="rmm-grant-cancel">Cancel</button>' +
-      '  <button class="btn-primary" id="rmm-grant-submit">Grant role</button>' +
-      '</div>';
-    const handle = global.AuroraModal.open({ title: 'Grant ' + role + ' role', body: div });
-    div.querySelector('#rmm-grant-cancel').addEventListener('click', () => handle.close());
-    div.querySelector('#rmm-grant-submit').addEventListener('click', async () => {
-      const target = div.querySelector('#rmm-grant-target').value.trim();
-      const rationale = div.querySelector('#rmm-grant-r').value.trim();
-      if (!target || !rationale) { global.AuroraToast.warning('Target and rationale required.'); return; }
-      try {
-        await global.AuroraEndpoints.superadmin.grantRole({ did: target, role: role, rationale: rationale });
-        global.AuroraToast.success('Role granted.');
-        handle.close();
-        if (global.AuroraRouter) global.AuroraRouter.dispatch();
-      } catch (e) {
-        global.AuroraToast.danger('Grant failed: ' + (e && e.message ? e.message : ''));
-      }
+  async function openGrant(role) {
+    // Mirror of SettingsRoles.js:openGrantModal. The members page
+    // exposes its own "Grant role" entry point on the per-role
+    // detail view; both flows go through the same backend wire
+    // contract { did, role, rationale }. See V04_DESIGN §5.4.5
+    // and the cross-page comment in SettingsRoles.js.
+    const result = await global.AuroraModal.form({
+      heading: 'Grant ' + role + ' role',
+      body: 'Grant this role to a member by DID. The grant lands as one audit-chain entry.',
+      fields: [
+        {
+          name: 'did',
+          label: 'DID',
+          type: 'text',
+          required: true,
+          placeholder: 'did:plc:…',
+          validate: (value) => {
+            if (!value || !value.startsWith('did:')) {
+              return 'DID must start with "did:" (e.g., did:plc:…).';
+            }
+            return null;
+          },
+        },
+        {
+          name: 'rationale',
+          label: 'Rationale (recorded in audit log)',
+          type: 'textarea',
+          required: true,
+        },
+      ],
+      submitLabel: 'Grant role',
     });
+    if (!result.submitted) return;
+    // Map the route's plural tier slug to the canonical Role enum
+    // string. Same fix as the revoke path above.
+    const wireRole = tierToRoleString(role);
+    try {
+      const res = await global.AuroraEndpoints.superadmin.grantRole({
+        did: result.values.did,
+        role: wireRole,
+        rationale: result.values.rationale,
+      });
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success('Granted ' + role + ' role to ' + result.values.did + '.', auditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
+      if (global.AuroraRouter) global.AuroraRouter.dispatch();
+    } catch (e) {
+      global.AuroraToast.danger(e && e.message ? e.message : 'Grant failed.');
+    }
   }
 
   function normalize(s) { return String(s || '').toLowerCase().replace(/s$/, ''); }

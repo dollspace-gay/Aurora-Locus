@@ -529,9 +529,15 @@
         if (v != null && v !== '') action[f.key] = v;
       }
     }
+    // v0.3 wire shape: emitEvent takes `subjects: Vec<Subject>`.
+    // Single-subject callers wrap in a one-element array; ActionPanel
+    // is always single-subject (BulkActionPanel handles the multi-
+    // subject case). Per V04_DESIGN §5.3.6 the request side keeps
+    // dual-shape acceptance during the deprecation window, but the
+    // UI emits the canonical v0.3 shape unconditionally.
     const payload = {
       action: action,
-      subject: this.subject,
+      subjects: [this.subject],
       rationale: this.state.rationale,
       snapshotCapture: true,
     };
@@ -575,6 +581,25 @@
         this._statusEl.classList.remove('action-panel-status-error');
       }
       this.refreshConfirmButton();
+      // v0.3 emitEvent (and onConfirm dispatchers built on it) surface
+      // auditEntryId on the response. Per V04_DESIGN §5.4.3 sub-3e,
+      // a success toast with a click-through to the audit-trail
+      // detail view lets operators inspect the recorded action. The
+      // toast is additive — the in-panel status remains for callers
+      // that lean on it.
+      const auditEntryId = result && result.auditEntryId;
+      if (global.AuroraToast) {
+        if (auditEntryId) {
+          global.AuroraToast.success('Action complete.', {
+            action: {
+              label: 'View audit entry',
+              href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+            },
+          });
+        } else {
+          global.AuroraToast.success('Action complete.');
+        }
+      }
       return result;
     } catch (e) {
       this.state.submitting = false;

@@ -6,6 +6,7 @@ use crate::{
         defs::Subject,
         InviteCode,
     },
+    api::registry::{aurora_route_builder, CapsBuilder, Family, RouteRegistry},
     auth::AdminAuthContext,
     error::{PdsError, PdsResult},
     AppContext,
@@ -18,6 +19,7 @@ use axum::{
 };
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Build admin API routes.
 ///
@@ -42,9 +44,28 @@ use serde::{Deserialize, Serialize};
 /// reaching it without an NSID rename, and the richer per-event reads
 /// that benefit from the new `tools.aurora.moderator.*` shape ship
 /// there alongside the unrelocated stream.
-pub fn routes() -> Router<AppContext> {
-    Router::new()
+pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
+    // Arc 8 Step 2 (chainlink #54): registration sites for the
+    // four `tools.aurora.<family>.*` namespaces flow through
+    // `aurora_route_builder()` so each admin-tier route emits a
+    // `RouteEntry` alongside its `axum::Router` registration.
+    // Non-admin-tier routes (`com.atproto.admin.*` and
+    // `tools.aurora.describeCapabilities`) use the builder's
+    // pass-through `.route(...)` — they live in the same router
+    // but contribute zero registry entries (Step 0 Q6 List C).
+    //
+    // Extension attribution policy: each capability extension is
+    // attributed to a single canonical endpoint (the
+    // capability-introducing route for that phase). The wire
+    // ordering is independent of per-route order — see
+    // `crate::api::registry::WIRE_EXTENSION_ORDER` for the
+    // declaration spec and the rationale.
+    aurora_route_builder::<AppContext>()
         // ---- com.atproto.admin.* (moderation/admin tier) ----
+        //
+        // Step 0 Q6 List C: out-of-Aurora-scope namespace. These
+        // routes register on the same Router but don't contribute
+        // to `tools.aurora.describeCapabilities`.
 
         // Account read
         .route("/xrpc/com.atproto.admin.getUsers", get(get_users))
@@ -175,7 +196,9 @@ pub fn routes() -> Router<AppContext> {
         //
         // Capability probe — clients call this to discover which
         // Aurora extensions this instance supports without trial-
-        // and-error against individual endpoints.
+        // and-error against individual endpoints. List C: meta-
+        // endpoint that *describes* the registry, so it can't be
+        // an entry in the registry it describes (Step 0 Q6).
         .route(
             "/xrpc/tools.aurora.describeCapabilities",
             get(describe_capabilities),
@@ -183,35 +206,48 @@ pub fn routes() -> Router<AppContext> {
         // ---- tools.aurora.ops.* (operator / infrastructure tier) ----
         //
         // Stats and account-listing.
-        .route("/xrpc/tools.aurora.ops.getStats", get(get_stats))
-        .route(
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.getStats",
+            get(get_stats),
+            CapsBuilder::new(Family::Ops, 1),
+        )
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.listAccounts",
             get(ops_list_accounts),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        // Phase 2.3.8 — `getInstanceMetrics` is the
+        // `instance-metrics-v1` introducer.
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getInstanceMetrics",
             get(ops_get_instance_metrics),
+            CapsBuilder::new(Family::Ops, 1).extensions(["instance-metrics-v1"]),
         )
         // Health, metrics, validation, nonce store.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getValidationFailures",
             get(get_validation_failures),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getSystemHealth",
             get(get_system_health),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getDatabaseStatus",
             get(get_database_status),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getResourceUsage",
             get(get_resource_usage),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.listBackgroundJobs",
             get(list_background_jobs),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // POST: this is an action that triggers health-check execution
         // (with side effects in the form of probe RPCs / DB queries),
@@ -219,93 +255,129 @@ pub fn routes() -> Router<AppContext> {
         // (cleanupNonceStores, runBlobGC, pauseSequencer, etc.) all
         // use POST; this entry was an outlier that the admin UI's
         // SystemHealth page hit with POST and got a 405 in return.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.runHealthChecks",
             post(run_health_checks),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getVersionInfo",
             get(get_version_info),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getSystemMetrics",
             get(get_system_metrics),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getNonceStoreStatus",
             get(get_nonce_store_status),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.cleanupNonceStores",
             post(cleanup_nonce_stores),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // Blob storage.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getBlobStatistics",
             get(get_blob_statistics),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route("/xrpc/tools.aurora.ops.listBlobs", get(list_blobs))
-        .route("/xrpc/tools.aurora.ops.deleteBlob", post(delete_blob))
-        .route(
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.listBlobs",
+            get(list_blobs),
+            CapsBuilder::new(Family::Ops, 1),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.deleteBlob",
+            post(delete_blob),
+            CapsBuilder::new(Family::Ops, 1),
+        )
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.quarantineBlob",
             post(quarantine_blob),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route("/xrpc/tools.aurora.ops.restoreBlob", post(restore_blob))
-        .route("/xrpc/tools.aurora.ops.runBlobGC", post(run_blob_gc))
-        .route(
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.restoreBlob",
+            post(restore_blob),
+            CapsBuilder::new(Family::Ops, 1),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.runBlobGC",
+            post(run_blob_gc),
+            CapsBuilder::new(Family::Ops, 1),
+        )
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getBlobQuotas",
             get(get_blob_quotas),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // Sequencer infrastructure.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getSequencerStatus",
             get(get_sequencer_status),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.pauseSequencer",
             post(pause_sequencer),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.resumeSequencer",
             post(resume_sequencer),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.resetSequencerCursor",
             post(reset_sequencer_cursor),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.rebuildSequencer",
             post(rebuild_sequencer),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // Rate limiting.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getRateLimitConfig",
             get(get_rate_limit_config),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getRateLimitStatus",
             get(get_rate_limit_status),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.cleanupRateLimitState",
             post(cleanup_rate_limit_state),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // Federation / relay.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getFederationStatus",
             get(get_federation_status),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.getRelayConfig",
             get(get_relay_config),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.listKnownInstances",
             get(list_known_instances),
+            CapsBuilder::new(Family::Ops, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.ops.triggerPdsDiscovery",
             post(trigger_pds_discovery),
+            CapsBuilder::new(Family::Ops, 1),
         )
         // ---- tools.aurora.moderator.* (chainlink #100 / Phase 3.3) ----
         //
@@ -314,39 +386,56 @@ pub fn routes() -> Router<AppContext> {
         // src/api/aurora_moderator.rs. Auth: AdminAuthContext
         // (Moderator+); namespace middleware also gates
         // tools.aurora.moderator.* to atproto:admin.moderation.
-        .route(
+        //
+        // Extension attribution: `moderator-activity-v1` ships on
+        // queryEvents (the primary activity query); `getEvent` and
+        // `queryStatuses` share that capability without
+        // re-declaring it. `subject-context-v1` is Phase 3.2's
+        // capability-probe companion attributed to its endpoint.
+        // `subject-history-v1` is Phase 3.3 attributed to its
+        // endpoint.
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.queryEvents",
             get(crate::api::aurora_moderator::query_events),
+            CapsBuilder::new(Family::Moderator, 1).extensions(["moderator-activity-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.getEvent",
             get(crate::api::aurora_moderator::get_event),
+            CapsBuilder::new(Family::Moderator, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.queryStatuses",
             get(crate::api::aurora_moderator::query_statuses),
+            CapsBuilder::new(Family::Moderator, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.getSubjectContext",
             get(crate::api::aurora_moderator::get_subject_context),
+            CapsBuilder::new(Family::Moderator, 1).extensions(["subject-context-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.getSubjectHistory",
             get(crate::api::aurora_moderator::get_subject_history),
+            CapsBuilder::new(Family::Moderator, 1).extensions(["subject-history-v1"]),
         )
         // ---- tools.aurora.moderator.* appeals reads (chainlink #101 / Phase 3.4) ----
         //
         // Two endpoints reusing 3.3's foundation types and rich-context
         // helpers (resolve_handles + new fetch_action_summaries batch
         // lookup). Auth: same AdminAuthContext + namespace scope as
-        // the other moderator-tier endpoints.
-        .route(
+        // the other moderator-tier endpoints. `appeals-v1` is
+        // attributed to `listAppeals` (the first appeals route);
+        // `getAppeal` shares the capability.
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.listAppeals",
             get(crate::api::aurora_moderator::list_appeals),
+            CapsBuilder::new(Family::Moderator, 1).extensions(["appeals-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.moderator.getAppeal",
             get(crate::api::aurora_moderator::get_appeal),
+            CapsBuilder::new(Family::Moderator, 1),
         )
         // ---- tools.aurora.admin.* (chainlink #102 / Phase 3.5) ----
         //
@@ -359,91 +448,120 @@ pub fn routes() -> Router<AppContext> {
         // Auth: AdminModeration scope (namespace middleware); within-
         // tier role checks happen at handler level (Moderator+ for
         // content actions, Admin+ for account-infrastructure actions).
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.emitEvent",
             post(crate::api::aurora_admin::emit_event),
+            CapsBuilder::new(Family::Admin, 1).extensions(["mod-events-emit-v1"]),
         )
         // Batch endpoints (Phase 3.5, §8.8–§8.13). Six atomic
         // multi-subject procedures driven by BulkActionPanel
-        // (substrate primitive 4). 50-subject hard cap per design doc.
-        .route(
+        // (substrate primitive 4). 50-subject hard cap per design
+        // doc. `batch-takedown-v1` is attributed to
+        // `batchTakedownAccounts` (the first batch route in
+        // registration order); the other five share the
+        // capability.
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchTakedownAccounts",
             post(crate::api::aurora_admin::batch_takedown_accounts),
+            CapsBuilder::new(Family::Admin, 1).extensions(["batch-takedown-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchSuspendAccounts",
             post(crate::api::aurora_admin::batch_suspend_accounts),
+            CapsBuilder::new(Family::Admin, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchRestoreAccounts",
             post(crate::api::aurora_admin::batch_restore_accounts),
+            CapsBuilder::new(Family::Admin, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchTakedownRecords",
             post(crate::api::aurora_admin::batch_takedown_records),
+            CapsBuilder::new(Family::Admin, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchApplyLabel",
             post(crate::api::aurora_admin::batch_apply_label),
+            CapsBuilder::new(Family::Admin, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.batchRemoveLabel",
             post(crate::api::aurora_admin::batch_remove_label),
+            CapsBuilder::new(Family::Admin, 1),
         )
         // triggerPasswordReset (Phase 3.5, §8.6). Admin+ role check
         // happens at handler level. Rationale recorded in the
         // hash-chained audit_chain_entry per design doc §3.4.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.triggerPasswordReset",
             post(crate::api::aurora_admin::trigger_password_reset),
+            CapsBuilder::new(Family::Admin, 1).extensions(["trigger-password-reset-v1"]),
         )
         // Phase 3.7 (chainlink #104) — moderation aggregations.
         // Auth: AdminModeration scope, Moderator+ role enforced at
         // handler level. Powers Dashboard Moderator flavor + bell
         // badge. Per §8.2 / §8.3.
-        .route(
+        //
+        // Wire order quirk: `moderation-metrics-v1` precedes
+        // `queue-stats-v1` in the curated extensions list, but
+        // `getQueueStats` is registered before `getModerationMetrics`
+        // (the natural alphabetical/grouped order from the original
+        // hand-written router). Wire ordering is preserved by
+        // WIRE_EXTENSION_ORDER rather than registration order, so
+        // the per-route attribution below is the natural one.
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.getQueueStats",
             get(crate::api::aurora_admin::get_queue_stats),
+            CapsBuilder::new(Family::Admin, 1).extensions(["queue-stats-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.getModerationMetrics",
             get(crate::api::aurora_admin::get_moderation_metrics),
+            CapsBuilder::new(Family::Admin, 1).extensions(["moderation-metrics-v1"]),
         )
         // Phase 3.8 (chainlink #105) — hash-chained audit trail.
         // Auth: AdminModeration scope, Moderator+ role at handler.
         // Per design doc §8.4: cursor-paginated newest-first; verified
         // flag computed at query time by re-hashing entry content.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.getAuditTrail",
             get(crate::api::aurora_admin::get_audit_trail),
+            CapsBuilder::new(Family::Admin, 1).extensions(["audit-trail-v1"]),
         )
         // Phase 3.8 (chainlink #105) — chain-of-custody forensic
         // export. AdminServer scope; Admin+ baseline at handler with
         // SuperAdmin gates on metadata + chain-inclusion params per
         // design doc §8.7.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.exportAccountForensic",
             post(crate::api::aurora_admin::export_account_forensic),
+            CapsBuilder::new(Family::Admin, 1).extensions(["forensic-export-v1"]),
         )
         // Phase 3.9 (chainlink #106) — real-time subscription via
         // WebSocket. Auth: AdminModeration scope, Moderator+ role.
         // Polling-driven (5s tick) over moderation_event with
         // heartbeat at 30s; wire protocol per §8.5 message shapes.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.subscribeModEvents",
             get(crate::api::aurora_subscribe::subscribe_mod_events),
+            CapsBuilder::new(Family::Admin, 1).extensions(["mod-events-stream-v1"]),
         )
         // Phase 3.10 (chainlink #117) — runtime settings infrastructure.
         // Two-tier config (runtime > file). Read at most-Admin-or-key-
         // dependent role; write SuperAdmin only with audit-chained
-        // rationale per design doc §8.16.
-        .route(
+        // rationale per design doc §8.16. `runtime-settings-v1`
+        // attributed to `getRuntimeSetting` (the read endpoint);
+        // `setRuntimeSetting` shares the capability.
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.getRuntimeSetting",
             get(crate::api::aurora_admin::get_runtime_setting),
+            CapsBuilder::new(Family::Admin, 1).extensions(["runtime-settings-v1"]),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.admin.setRuntimeSetting",
             post(crate::api::aurora_admin::set_runtime_setting),
+            CapsBuilder::new(Family::Admin, 1),
         )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
@@ -452,14 +570,17 @@ pub fn routes() -> Router<AppContext> {
         // (auth.role.can_act_as(Role::SuperAdmin)) — the namespace
         // alone doesn't gate this; the handler does. Per pre-deployment
         // framing, no deprecation aliases — clean wire-break.
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.superadmin.grantRole",
             post(grant_role),
+            CapsBuilder::new(Family::SuperAdmin, 1),
         )
-        .route(
+        .route_with_caps(
             "/xrpc/tools.aurora.superadmin.revokeRole",
             post(revoke_role),
+            CapsBuilder::new(Family::SuperAdmin, 1),
         )
+        .build()
 }
 
 // ============================================================================
@@ -1266,9 +1387,7 @@ async fn update_account_handle(
                     StatusCode::NOT_FOUND,
                     format!("Account not found: {}", req.did),
                 )
-            } else if matches!(e, PdsError::Validation(_)) {
-                (StatusCode::CONFLICT, e.to_string())
-            } else if matches!(e, PdsError::Conflict(_)) {
+            } else if matches!(e, PdsError::Validation(_) | PdsError::Conflict(_)) {
                 (StatusCode::CONFLICT, e.to_string())
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -2903,7 +3022,7 @@ async fn search_accounts(
 /// New fields may be added; existing field names and shapes do not
 /// change across releases. Capability strings within `extensions`
 /// follow the `<kebab-family>-v<integer>` versioning convention
-/// (committed separately on `aurora_capability_extensions` per
+/// (committed on `crate::api::registry::WIRE_EXTENSION_ORDER` per
 /// Step 4).
 ///
 /// Snapshot test: `describe_capabilities_snapshot` in this file's
@@ -2911,8 +3030,8 @@ async fn search_accounts(
 /// Both top-level fields (alphabetical via canonical-JSON) and
 /// inner namespace keys (alphabetical via `serde_json::Map`'s
 /// default `BTreeMap` backing) sort deterministically; endpoint
-/// arrays preserve the source-order of the `aurora_capability_families`
-/// JSON literal.
+/// arrays preserve the per-family `registration_order` of the
+/// `RouteRegistry` populated by `aurora_route_builder()`.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DescribeCapabilitiesResponse {
@@ -2925,157 +3044,77 @@ struct DescribeCapabilitiesResponse {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CapabilityExtension {
-    name: &'static str,
+    name: String,
     /// Optional structured value (e.g. `event-variants` carries the list of
     /// supported ModEvent variant names). Omitted when not applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<serde_json::Value>,
 }
 
-// TODO(#123, v0.4): runtime route enumeration deferred per V03_DESIGN.md §9 and docs/v04-candidates.md
-/// Endpoint names per Aurora namespace, as currently shipped. Updated
-/// by future sub-phases as they land. Phase 3.2's snapshot reflects
-/// the surface present at this commit; sub-phases 3.3-3.9 each add
-/// their endpoint names to the appropriate family.
-fn aurora_capability_families() -> serde_json::Value {
-    serde_json::json!({
-        "tools.aurora.ops": [
-            "getStats",
-            "listAccounts",
-            "getInstanceMetrics",
-            "getValidationFailures",
-            "getSystemHealth",
-            "getDatabaseStatus",
-            "getResourceUsage",
-            "listBackgroundJobs",
-            "runHealthChecks",
-            "getVersionInfo",
-            "getSystemMetrics",
-            "getNonceStoreStatus",
-            "cleanupNonceStores",
-            "getBlobStatistics",
-            "listBlobs",
-            "deleteBlob",
-            "quarantineBlob",
-            "restoreBlob",
-            "runBlobGC",
-            "getBlobQuotas",
-            "getSequencerStatus",
-            "pauseSequencer",
-            "resumeSequencer",
-            "resetSequencerCursor",
-            "rebuildSequencer",
-            "getRateLimitConfig",
-            "getRateLimitStatus",
-            "cleanupRateLimitState",
-            "getFederationStatus",
-            "getRelayConfig",
-            "listKnownInstances",
-            "triggerPdsDiscovery"
-        ],
-        // Phase 3.3 (chainlink #100) — moderator-tier reads.
-        // Phase 3.4 (chainlink #101) — appeals reads (listAppeals, getAppeal).
-        "tools.aurora.moderator": [
-            "queryEvents",
-            "getEvent",
-            "queryStatuses",
-            "getSubjectContext",
-            "getSubjectHistory",
-            "listAppeals",
-            "getAppeal"
-        ],
-        // Phase 3.5 (chainlink #102) — emitEvent unified action surface,
-        // six batch endpoints, triggerPasswordReset companion.
-        // Phase 3.7 (chainlink #104) — moderation aggregations.
-        "tools.aurora.admin": [
-            "emitEvent",
-            "batchTakedownAccounts",
-            "batchSuspendAccounts",
-            "batchRestoreAccounts",
-            "batchTakedownRecords",
-            "batchApplyLabel",
-            "batchRemoveLabel",
-            "triggerPasswordReset",
-            "getQueueStats",
-            "getModerationMetrics",
-            "getAuditTrail",
-            "exportAccountForensic",
-            "subscribeModEvents",
-            "getRuntimeSetting",
-            "setRuntimeSetting"
-        ],
-        // Phase 3.6 (chainlink #103) — role management relocated from
-        // com.atproto.admin.{grantRole,revokeRole}.
-        "tools.aurora.superadmin": [
-            "grantRole",
-            "revokeRole"
-        ]
-    })
-}
-
-// TODO(#123, v0.4): runtime route enumeration deferred per V03_DESIGN.md §9 and docs/v04-candidates.md
-/// Static capability advertisement reflecting what's structurally
-/// present in this build. The `name` strings are the canonical
-/// vocabulary from §8.15 and double as the keys clients use to gate
-/// UI affordances. A capability is advertised iff its underlying
-/// endpoint(s) are actually registered as routes in this binary.
+/// Build the `families` `serde_json::Value` by walking
+/// `RouteRegistry::advertised_by_family`.
 ///
-/// Two §8.15 capabilities are intentionally omitted because the
-/// corresponding endpoints are not yet shipped:
-///   - `invite-lineage-v1`     (no shipped endpoint as of v0.2 cycle)
-///   - `reporter-context-v1`   (no shipped endpoint as of v0.2 cycle)
-/// Add them here when their handlers land.
+/// Family iteration order: `advertised_by_family()` returns a
+/// `BTreeMap<Family, _>` which iterates in `Family::Ord` order —
+/// alphabetical per the enum declaration. Inserting into a
+/// `serde_json::Map` (BTreeMap-backed) is also alphabetical by
+/// the namespace string. Both orderings coincide because the
+/// `Family` enum's variant order and its `Display` strings are
+/// alphabetical (`admin` < `moderator` < `ops` < `superadmin`).
 ///
-/// # Versioning contract
+/// Endpoint iteration order: each family's `Vec<&RouteEntry>` is
+/// pre-sorted by `registration_order` (per Step 0 Q5 disposition
+/// (a): freeze accidental orderings to the source declaration
+/// order in `admin::routes()`).
 ///
-/// Per `docs/V03_DESIGN.md` §6.3.1: capability strings follow the pattern `<kebab-family>-v<integer>`.
-/// Kebab-case family name, hyphen, lowercase `v`, integer
-/// version. Breaking changes ship as a NEW version suffix (e.g.
-/// `subject-context-v2`); the OLD version is removed only after
-/// the new version has shipped and consumers have had time to
-/// migrate. Bumping the integer is the wire signal that breaking
-/// change has landed.
-///
-/// The snapshot test `describe_capabilities_snapshot` (Step 3) pins
-/// the advertised set; the contract-phrase test
-/// `tests/contract_phrases.rs` (Step 4) pins this versioning
-/// commitment by grepping for the pattern in this doc comment.
-fn aurora_capability_extensions() -> Vec<CapabilityExtension> {
-    vec![
-        // Phase 3.2 — capability probe ships alongside getSubjectContext.
-        CapabilityExtension { name: "subject-context-v1", value: None },
-        // Phase 3.3 — moderator-tier reads.
-        CapabilityExtension { name: "moderator-activity-v1", value: None },
-        CapabilityExtension { name: "subject-history-v1", value: None },
-        // Phase 3.4 — appeals reads.
-        CapabilityExtension { name: "appeals-v1", value: None },
-        // Phase 2.3.8 — operator instance metrics.
-        CapabilityExtension { name: "instance-metrics-v1", value: None },
-        // Phase 3.5 — emitEvent unified action surface + batch suite.
-        CapabilityExtension { name: "mod-events-emit-v1", value: None },
-        CapabilityExtension { name: "batch-takedown-v1", value: None },
-        CapabilityExtension { name: "trigger-password-reset-v1", value: None },
-        // Phase 3.7 — moderation aggregations.
-        CapabilityExtension { name: "moderation-metrics-v1", value: None },
-        CapabilityExtension { name: "queue-stats-v1", value: None },
-        // Phase 3.8 — hash-chained audit + forensic export.
-        CapabilityExtension { name: "audit-trail-v1", value: None },
-        CapabilityExtension { name: "forensic-export-v1", value: None },
-        // Phase 3.9 — live event tail (HTTP-polling-driven in v0.2).
-        CapabilityExtension { name: "mod-events-stream-v1", value: None },
-        // Phase 3.10 — runtime settings read/write.
-        CapabilityExtension { name: "runtime-settings-v1", value: None },
-    ]
+/// Method-name extraction: every admin-tier route is an XRPC
+/// path shaped `/xrpc/<namespace>.<method>`. `rsplit('.').next()`
+/// returns the trailing segment after the last dot. The `.path`
+/// fallback only triggers if a future route deviates from this
+/// shape — in which case the snapshot test will fail loudly
+/// rather than silently shipping a malformed wire entry.
+fn build_families_value(
+    registry: &crate::api::registry::RouteRegistry,
+) -> serde_json::Value {
+    let by_family = registry.advertised_by_family();
+    let mut map = serde_json::Map::new();
+    for (family, entries) in by_family.iter() {
+        let endpoints: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                let method = e
+                    .path
+                    .strip_prefix("/xrpc/")
+                    .and_then(|p| p.rsplit('.').next())
+                    .unwrap_or(&e.path);
+                serde_json::Value::String(method.to_string())
+            })
+            .collect();
+        map.insert(family.to_string(), serde_json::Value::Array(endpoints));
+    }
+    serde_json::Value::Object(map)
 }
 
 /// `tools.aurora.describeCapabilities` — top-level probe.
+///
+/// Reads from `ctx.route_registry` populated by
+/// `aurora_route_builder()` in `admin::routes()`. Wire output is
+/// byte-identical to the prior hand-curated implementation — the
+/// snapshot test `describe_capabilities_snapshot` pins this.
 async fn describe_capabilities(
-    State(_ctx): State<AppContext>,
+    State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
 ) -> Result<Json<DescribeCapabilitiesResponse>, (StatusCode, String)> {
+    let registry = ctx.route_registry.as_ref();
+    let families = build_families_value(registry);
+    let extensions = registry
+        .advertised_extensions()
+        .into_iter()
+        .map(|name| CapabilityExtension { name, value: None })
+        .collect();
     Ok(Json(DescribeCapabilitiesResponse {
-        families: aurora_capability_families(),
-        extensions: aurora_capability_extensions(),
+        families,
+        extensions,
         implementation: "aurora-locus",
         // Cargo.toml's package version. Bumped as part of release work.
         version: env!("CARGO_PKG_VERSION"),
@@ -3473,7 +3512,16 @@ enum SubjectUnion {
     RepoBlobRef {
         did: String,
         cid: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        // Arc 6 Step 7 dual-shape acceptance (V04_DESIGN §5.3.6):
+        // accept both the canonical `record_uri` (snake_case, the
+        // v0.3 wire byte form) and the legacy `recordUri` (camelCase,
+        // v0.2 wire byte form). The `alias` attribute makes serde
+        // parse either form into this single field; serialization
+        // continues to emit only `record_uri` per the byte-equality
+        // contract above. Detection of WHICH form was used happens
+        // at the request level in `UpdateSubjectStatusRequest`'s
+        // custom Deserialize, which inspects the raw JSON.
+        #[serde(default, alias = "recordUri", skip_serializing_if = "Option::is_none")]
         record_uri: Option<String>,
     },
 }
@@ -3484,14 +3532,91 @@ enum SubjectUnion {
 /// shape with the spec-conformant declarative status-patch model. Both
 /// `takedown` and `deactivated` are optional patches; restore is implicit
 /// via `takedown: {applied: false}`.
+///
+/// **Dual-shape acceptance** (Arc 6 Step 7, V04_DESIGN §5.3.6):
+/// `RepoBlobRef` subjects accept both the canonical `record_uri`
+/// (snake_case) and the legacy `recordUri` (camelCase) field
+/// names. The custom Deserialize impl peeks at the raw JSON to
+/// detect which form was used, sets `legacy_record_uri_used`
+/// accordingly, and rejects requests that include both forms
+/// simultaneously. The handler reads the flag to record a
+/// legacy-wire-shape counter increment.
+#[derive(Debug)]
+struct UpdateSubjectStatusRequest {
+    subject: SubjectUnion,
+    takedown: Option<StatusAttr>,
+    deactivated: Option<StatusAttr>,
+    /// True when the request's `RepoBlobRef` subject (if any) used
+    /// the legacy `recordUri` camelCase field rather than the
+    /// canonical `record_uri` snake_case. Not part of the wire
+    /// shape; set by the Deserialize impl; consumed by the handler
+    /// to record a [`crate::metrics::record_legacy_wire_ingest`]
+    /// increment.
+    legacy_record_uri_used: bool,
+}
+
+/// Wire-side scaffold for [`UpdateSubjectStatusRequest`]'s custom
+/// Deserialize. Mirrors the original derive without the legacy flag.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UpdateSubjectStatusRequest {
+struct UpdateSubjectStatusRequestRaw {
     subject: SubjectUnion,
     #[serde(default)]
     takedown: Option<StatusAttr>,
     #[serde(default)]
     deactivated: Option<StatusAttr>,
+}
+
+impl<'de> Deserialize<'de> for UpdateSubjectStatusRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        // Parse to Value first so we can peek at the raw subject
+        // object's key set BEFORE serde normalizes the `recordUri`
+        // alias into `record_uri`. The alias attribute on the
+        // RepoBlobRef variant accepts both names transparently, but
+        // it does NOT tell us which one was actually present —
+        // that's what this peek is for.
+        let value = serde_json::Value::deserialize(d)?;
+
+        // Look at the subject object's keys when the variant is
+        // RepoBlobRef. If both `record_uri` and `recordUri` are
+        // present, reject — the alias would otherwise silently pick
+        // one and the operator wouldn't see the ambiguity.
+        let (legacy_record_uri_used, has_both) = value
+            .as_object()
+            .and_then(|obj| obj.get("subject"))
+            .and_then(|s| s.as_object())
+            .map(|s| {
+                let is_blob = s.get("$type").and_then(|v| v.as_str())
+                    == Some("com.atproto.admin.defs#repoBlobRef");
+                if !is_blob {
+                    return (false, false);
+                }
+                let has_canonical = s.contains_key("record_uri");
+                let has_legacy = s.contains_key("recordUri");
+                (has_legacy && !has_canonical, has_canonical && has_legacy)
+            })
+            .unwrap_or((false, false));
+
+        if has_both {
+            return Err(D::Error::custom(
+                "RepoBlobRef subject accepts either canonical 'record_uri' \
+                 (snake_case) or legacy 'recordUri' (camelCase), not both; \
+                 pick exactly one shape per request",
+            ));
+        }
+
+        // Standard deserialize via the scaffold; the `alias` attribute
+        // on RepoBlobRef.record_uri handles the field-name folding.
+        let raw: UpdateSubjectStatusRequestRaw =
+            serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(UpdateSubjectStatusRequest {
+            subject: raw.subject,
+            takedown: raw.takedown,
+            deactivated: raw.deactivated,
+            legacy_record_uri_used,
+        })
+    }
 }
 
 /// Response shape for `com.atproto.admin.updateSubjectStatus`.
@@ -3523,14 +3648,34 @@ struct UpdateSubjectStatusResponse {
 async fn update_subject_status(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
-    Json(req): Json<UpdateSubjectStatusRequest>,
+    crate::api::extractors::AuroraJson(req): crate::api::extractors::AuroraJson<UpdateSubjectStatusRequest>,
 ) -> Result<Json<UpdateSubjectStatusResponse>, axum::response::Response> {
     use axum::response::IntoResponse;
+
+    // Arc 6 Step 7: legacy wire-shape observability. When the request
+    // used the legacy camelCase `recordUri` on a RepoBlobRef subject,
+    // record a counter + structured-log line. See the matching
+    // emit_event handler comment for the deviation from the kickoff's
+    // response-header pattern.
+    if req.legacy_record_uri_used {
+        crate::metrics::record_legacy_wire_ingest(
+            "com.atproto.admin.updateSubjectStatus",
+            "v0.2_camelCase_record_uri",
+            "recordUri",
+        );
+        tracing::info!(
+            endpoint = "com.atproto.admin.updateSubjectStatus",
+            shape = "v0.2_camelCase_record_uri",
+            field = "recordUri",
+            "legacy_wire_shape_ingested"
+        );
+    }
 
     let UpdateSubjectStatusRequest {
         subject,
         takedown,
         deactivated,
+        legacy_record_uri_used: _,
     } = req;
 
     // Per §3.4 "one decision = one chain entry": each updateSubjectStatus
@@ -6179,8 +6324,6 @@ mod tests {
             rate_limit: RateLimitConfig {
                 enabled: true,
                 global_requests_per_minute: 3000,
-                use_redis: false,
-                redis_url: None,
                 exempt_admin_assets: true,
             },
             logging: LoggingConfig {
@@ -6196,9 +6339,21 @@ mod tests {
                 auto_stream_events: false,
             },
             validation_mode: crate::validation::ValidationMode::Required,
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
         };
 
-        AppContext::new(config).await.unwrap()
+        // The admin module hosts `describe_capabilities`, which
+        // Step 3 made registry-driven. Tests in this module
+        // construct the context with the populated registry
+        // returned by `routes()` so the
+        // `describe_capabilities_snapshot` test sees the same
+        // wire output a real PDS would emit. Other test
+        // fixtures (auth.rs, aurora_*.rs, tests/) keep the empty
+        // default — they don't exercise the capability probe.
+        let (_router, registry) = super::routes();
+        AppContext::new(config, registry).await.unwrap()
     }
 
     #[tokio::test]
@@ -7196,8 +7351,16 @@ mod tests {
 
     // ---- tools.aurora.describeCapabilities (chainlink #99 / Phase 3.2) ----
 
-    /// Arc 2 Step 3 (§6.4.3) — full canonical-JSON snapshot of the
-    /// `tools.aurora.admin.describeCapabilities` response. Pins:
+    /// Admin route registry completeness — pins the
+    /// `tools.aurora.admin.describeCapabilities` wire output AND
+    /// asserts structural invariants the registry must satisfy.
+    /// Renamed from `describe_capabilities_snapshot` during Arc 8
+    /// Step 4 (chainlink #54): the test still snapshots the wire
+    /// shape, but its load-bearing purpose post-Arc-8 is to prove
+    /// every advertised family and every `WIRE_EXTENSION_ORDER`
+    /// entry round-trip through the registry-driven handler.
+    ///
+    /// What the byte-for-byte literal pins:
     ///
     /// - Top-level field set (`extensions`, `families`,
     ///   `implementation`, `version`) and ordering (alphabetical via
@@ -7213,15 +7376,28 @@ mod tests {
     ///   `version` string from CARGO_PKG_VERSION (bumped in lockstep
     ///   with the cycle).
     ///
+    /// What the structural assertions (run after the byte-for-byte
+    /// equality) add: inspectable invariant failures (`families`
+    /// contains the four namespace keys; `extensions` matches
+    /// `WIRE_EXTENSION_ORDER` element-for-element). When the test
+    /// fails the byte-for-byte assertion has the canonical
+    /// diagnostic, but the structural assertions give a
+    /// human-readable second opinion on what specifically drifted.
+    ///
     /// Determinism rationale: `serde_json::Map` defaults to a
     /// `BTreeMap` (no `preserve_order` feature) so namespace keys
-    /// inside `families` come out alphabetically; `extensions` is
-    /// `Vec<CapabilityExtension>` with hardcoded declaration order;
-    /// endpoint arrays inside `families` preserve the JSON-literal
-    /// source order. No `HashMap` iteration anywhere on the wire
-    /// path.
+    /// inside `families` come out alphabetically. Extensions output
+    /// comes from `WIRE_EXTENSION_ORDER` filtered by present-set
+    /// across registry entries
+    /// (`RouteRegistry::advertised_extensions`). Endpoint arrays
+    /// inside each family come from
+    /// `RouteRegistry::advertised_by_family`, which sorts by
+    /// `registration_order` within each family (preserving phase-
+    /// introduction order per Step 0 Q5 disposition (a) for
+    /// accidental orderings). No `HashMap` iteration anywhere on
+    /// the wire path.
     #[tokio::test]
-    async fn describe_capabilities_snapshot() {
+    async fn test_admin_route_registry_completeness() {
         let ctx = create_test_context().await;
         let resp = describe_capabilities(State(ctx), admin_test_auth())
             .await
@@ -7328,6 +7504,48 @@ mod tests {
             "describeCapabilities wire shape changed — \
              update the snapshot AND the §6.3.1 commitment if the \
              change is intentional, otherwise revert"
+        );
+
+        // Structural invariants — surface drift with
+        // human-readable failures alongside the byte-for-byte
+        // diagnostic above. Both pass-together / fail-together
+        // in normal operation; a structural-only failure points
+        // at a registry/wire-order mismatch the byte-for-byte
+        // assertion would also catch but with less direct
+        // signal.
+
+        let families_obj = resp
+            .families
+            .as_object()
+            .expect("describeCapabilities.families is a JSON object");
+        for namespace in [
+            "tools.aurora.admin",
+            "tools.aurora.moderator",
+            "tools.aurora.ops",
+            "tools.aurora.superadmin",
+        ] {
+            assert!(
+                families_obj.contains_key(namespace),
+                "families output missing namespace {} — \
+                 RouteRegistry::advertised_by_family didn't emit it; \
+                 check that admin::routes() registers at least one \
+                 route_with_caps() for the family",
+                namespace,
+            );
+        }
+
+        let extension_names: Vec<&str> =
+            resp.extensions.iter().map(|e| e.name.as_str()).collect();
+        let expected_extensions: Vec<&str> =
+            crate::api::registry::WIRE_EXTENSION_ORDER.to_vec();
+        assert_eq!(
+            extension_names, expected_extensions,
+            "extensions output diverges from WIRE_EXTENSION_ORDER — \
+             either a registered route is attributing an extension \
+             not in the wire-order constant (debug_assert! in \
+             RouteRegistry::advertised_extensions catches this in \
+             dev/test builds) or the present-set filter is missing \
+             an extension that should be advertised"
         );
     }
 
@@ -7559,7 +7777,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let names: Vec<&str> = resp.extensions.iter().map(|e| e.name).collect();
+        let names: Vec<&str> = resp.extensions.iter().map(|e| e.name.as_str()).collect();
         let expected = [
             "subject-context-v1",
             "moderator-activity-v1",
@@ -8147,8 +8365,9 @@ mod tests {
                 applied: true,
                 ref_field: None,
             }),
+            legacy_record_uri_used: false,
         };
-        update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+        update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect("update_subject_status succeeds");
 
@@ -8526,8 +8745,9 @@ mod tests {
                 ref_field: Some("ticket-99".to_string()),
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap()
             .0;
@@ -8566,8 +8786,9 @@ mod tests {
                 ref_field: None,
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap()
             .0;
@@ -8591,8 +8812,9 @@ mod tests {
                 applied: true,
                 ref_field: None,
             }),
+            legacy_record_uri_used: false,
         };
-        let _ = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+        let _ = update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap();
         assert!(account_deactivated(&ctx, "did:plc:dorm").await);
@@ -8611,8 +8833,9 @@ mod tests {
                 ref_field: None,
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect_err("strongRef should return 501 until record-level setter exists");
         let status = resp.status();
@@ -8656,8 +8879,9 @@ mod tests {
                 ref_field: Some("legal-1".to_string()),
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap()
             .0;
@@ -8697,8 +8921,9 @@ mod tests {
                 applied: true,
                 ref_field: None,
             }),
+            legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect_err("blob + deactivated should reject");
         let (status, body) = read_xrpc_error(resp).await;
@@ -8723,8 +8948,9 @@ mod tests {
                 applied: true,
                 ref_field: None,
             }),
+            legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect_err("record + deactivated should reject");
         let (status, body) = read_xrpc_error(resp).await;
@@ -8752,8 +8978,9 @@ mod tests {
                 ref_field: None,
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect_err("non-existent blob should 404");
         let (status, body) = read_xrpc_error(resp).await;
@@ -8783,8 +9010,9 @@ mod tests {
                 ref_field: None,
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap()
             .0;
@@ -8822,8 +9050,9 @@ mod tests {
                 ref_field: Some("second-takedown".to_string()),
             }),
             deactivated: None,
+            legacy_record_uri_used: false,
         };
-        let resp = update_subject_status(State(ctx), admin_test_auth(), Json(req))
+        let resp = update_subject_status(State(ctx), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .unwrap()
             .0;
@@ -9370,5 +9599,112 @@ mod tests {
         assert_eq!(page2.accounts.len(), 1);
         assert_eq!(page2.accounts[0].did, "did:plc:c");
         assert!(page2.cursor.is_none());
+    }
+
+    // ---------- Arc 6 Step 7: updateSubjectStatus dual-shape ----------
+    //
+    // Per V04_DESIGN §5.3.6 + Step 0 Q9. RepoBlobRef subjects accept
+    // both canonical `record_uri` (snake_case) and legacy `recordUri`
+    // (camelCase). The custom Deserialize on UpdateSubjectStatusRequest
+    // peeks at the raw JSON to flag which form was used; the handler
+    // reads the flag to record a legacy-wire-shape counter increment.
+
+    #[test]
+    fn update_subject_status_parses_canonical_record_uri_shape() {
+        let json = r#"{
+            "subject": {
+                "$type": "com.atproto.admin.defs#repoBlobRef",
+                "did": "did:plc:owner",
+                "cid": "bafyblob",
+                "record_uri": "at://did:plc:owner/app.bsky.feed.post/x"
+            },
+            "takedown": {"applied": true}
+        }"#;
+        let req: UpdateSubjectStatusRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            !req.legacy_record_uri_used,
+            "canonical 'record_uri' must not flag legacy"
+        );
+        if let SubjectUnion::RepoBlobRef { record_uri, .. } = &req.subject {
+            assert_eq!(
+                record_uri.as_deref(),
+                Some("at://did:plc:owner/app.bsky.feed.post/x")
+            );
+        } else {
+            panic!("expected RepoBlobRef variant");
+        }
+    }
+
+    #[test]
+    fn update_subject_status_parses_legacy_camelcase_shape_and_flags_it() {
+        let json = r#"{
+            "subject": {
+                "$type": "com.atproto.admin.defs#repoBlobRef",
+                "did": "did:plc:owner",
+                "cid": "bafyblob",
+                "recordUri": "at://did:plc:owner/app.bsky.feed.post/x"
+            },
+            "takedown": {"applied": true}
+        }"#;
+        let req: UpdateSubjectStatusRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            req.legacy_record_uri_used,
+            "legacy 'recordUri' must flag for handler-side observability"
+        );
+        if let SubjectUnion::RepoBlobRef { record_uri, .. } = &req.subject {
+            assert_eq!(
+                record_uri.as_deref(),
+                Some("at://did:plc:owner/app.bsky.feed.post/x"),
+                "alias must normalize recordUri → record_uri"
+            );
+        } else {
+            panic!("expected RepoBlobRef variant");
+        }
+    }
+
+    #[test]
+    fn update_subject_status_rejects_both_record_uri_shapes_simultaneously() {
+        let json = r#"{
+            "subject": {
+                "$type": "com.atproto.admin.defs#repoBlobRef",
+                "did": "did:plc:owner",
+                "cid": "bafyblob",
+                "record_uri": "at://x/y/1",
+                "recordUri": "at://x/y/2"
+            },
+            "takedown": {"applied": true}
+        }"#;
+        let err = serde_json::from_str::<UpdateSubjectStatusRequest>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("not both"),
+            "error must point at the both-shapes-present case; got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn update_subject_status_non_blob_subjects_dont_flag_legacy() {
+        // RepoRef and StrongRef subjects don't have record_uri at all,
+        // so the legacy flag must remain false regardless.
+        let repo_ref_json = r#"{
+            "subject": {
+                "$type": "com.atproto.admin.defs#repoRef",
+                "did": "did:plc:owner"
+            },
+            "takedown": {"applied": true}
+        }"#;
+        let req: UpdateSubjectStatusRequest = serde_json::from_str(repo_ref_json).unwrap();
+        assert!(!req.legacy_record_uri_used);
+
+        let strong_ref_json = r#"{
+            "subject": {
+                "$type": "com.atproto.repo.strongRef",
+                "uri": "at://did:plc:foo/app.bsky.feed.post/x",
+                "cid": "bafyabc"
+            },
+            "takedown": {"applied": true}
+        }"#;
+        let req: UpdateSubjectStatusRequest = serde_json::from_str(strong_ref_json).unwrap();
+        assert!(!req.legacy_record_uri_used);
     }
 }

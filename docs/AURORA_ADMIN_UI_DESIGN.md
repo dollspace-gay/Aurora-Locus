@@ -1,18 +1,18 @@
 # Aurora-Locus admin UI design
 
-**Cycle:** v0.2
-**Status:** Design — implementation phasing per section 9
-**Last updated:** 2026-05-03
+**Cycle:** v0.2 (with v0.3 + v0.4 additive amendments — see §15 for v0.4 specifics)
+**Status:** Design — v0.2 implementation phasing per section 9; subsequent cycles preserve the substrate and amend additively
+**Last updated:** 2026-05-13
 
 ---
 
 # 1. Executive summary
 
-This document specifies the Aurora-Locus administrative UI for the v0.2 cycle. It commits to a comprehensive substrate — information architecture, page-level specifications, reusable component library, accessibility contract, and forthcoming-endpoint integration patterns — sufficient to ship a complete first-class moderator and operator interface against the v0.2 endpoint surface.
+This document originated in the v0.2 cycle and specifies the Aurora-Locus administrative UI substrate — information architecture, page-level specifications, reusable component library, accessibility contract, and forthcoming-endpoint integration patterns. v0.2 shipped the substrate end-to-end against the v0.2 endpoint surface; v0.3 and v0.4 added additive amendments (see §15 for the v0.4 / Arc 6 surface) on top of the v0.2 foundation rather than restructuring this spec. Read §1-§14 as the v0.2-cycle baseline plus historical context; read §15 for the current v0.4 surface.
 
-The cycle's scope on the UI front is ambitious by intent. Aurora-Locus is positioning as the next-tier PDS implementation: when the upstream reference exists as a parity floor and operators rely on shell scripts and direct database queries for everything beyond it, "comprehensive admin UI" is a meaningful axis on which Aurora can lead. The current `static/admin/` scaffolding is honest prototype-grade work — clean visual vocabulary, structurally underbuilt — and the v0.2 cycle is the right time to extend it into something operators can rely on.
+The v0.2-cycle scope was ambitious by intent. Aurora-Locus positioned as the next-tier PDS implementation: when the upstream reference exists as a parity floor and operators rely on shell scripts and direct database queries for everything beyond it, "comprehensive admin UI" is a meaningful axis on which Aurora can lead. The pre-v0.2 `static/admin/` scaffolding was honest prototype-grade work — clean visual vocabulary, structurally underbuilt — and the v0.2 cycle was the right time to extend it into something operators could rely on. That extension shipped; subsequent cycles maintained and amended the substrate.
 
-This design doc is the spec. Implementation across the remaining v0.2 sub-phases (3.5 emitEvent, 3.7 aggregations, 3.8 audit chain, 3.9 real-time subscription, 3.10 runtime settings, plus #108 UI completion pass) follows the design doc rather than driving it.
+This design doc was the spec for v0.2. Implementation across v0.2's sub-phases (3.5 emitEvent, 3.7 aggregations, 3.8 audit chain, 3.9 real-time subscription, 3.10 runtime settings, plus #108 UI completion pass) followed the design doc rather than driving it. Those sub-phases all shipped; the v0.3 and v0.4 changes layered on top are in §15.
 
 ## 1.1 What ships
 
@@ -24,7 +24,7 @@ Three top-level navigation domains structuring the UI:
 
 Account detail is a shared destination both Moderation and Operations link into; per-drawer role gating determines what's visible to whom.
 
-Substrate primitives the UI is built from, all shipped in v0.2:
+Substrate primitives the UI is built from, all shipped in v0.2 and carried forward unchanged through v0.4:
 
 1. Unified action affordance pattern with mandatory rationale and snapshot-at-decision capture
 2. Inline subject preview with server-side hardened render and media proxy
@@ -90,19 +90,20 @@ The doc is structured to support both linear reading and reference lookup:
 - Sections 10 and 11 cover accessibility and i18n in depth.
 - Section 12 covers the file-level transition from current `static/admin/` to the new structure.
 - Section 13 covers testing strategy.
-- Section 14 captures deferred work for v0.3 and beyond.
+- Section 14 captures deferred work — items here originated as "v0.3 candidates" during v0.2 cycle close; v0.3 / v0.4 absorbed or re-deferred them; treat the section as a historical capture, not a forward roadmap (current v0.5+ candidate tracking lives in `docs/v05-candidates.md` and successors).
+- Section 15 (added v0.4 / Arc 6) covers the v0.4 amendments to §5.6, §7.6, §7.10, §8.4.1, §8.8-§8.13, §5.3.8, §5.3.9, §6.7, §5.5.3, §5.5.4, §6.1, and §7.6 — read alongside the v0.2 sections it amends.
 
 Cross-references between sections use anchored links where helpful. Endpoint references use the full NSID (e.g. `tools.aurora.moderator.queryEvents`) so they're greppable.
 
 # 2. Scope and non-scope
 
-This section lists what the v0.2 UI explicitly includes and excludes. The intent is to make boundaries unambiguous so implementation across sub-phases doesn't accumulate scope drift, and so that decisions deferred to v0.3 are visible as deferred rather than missed.
+This section captures the v0.2-cycle scope and non-scope as originally specified. The page list, substrate primitives, and endpoint set all shipped in v0.2 and persist through v0.4 with the additive amendments documented in §15. "Deferred to v0.3" framings below are historical — v0.3 either absorbed or re-deferred each item; current candidate tracking lives in `docs/v05-candidates.md`.
 
 ## 2.1 In scope
 
 ### 2.1.1 Pages and surfaces
 
-The complete list of pages shipping in v0.2:
+The complete page list as shipped in v0.2 (all 27 surfaces persist through v0.4):
 
 **Moderation domain:**
 - Queue (filtered active-work view of reports + appeals needing attention)
@@ -139,27 +140,27 @@ Total: 27 distinct pages plus inline drawers and modals.
 
 ### 2.1.2 Substrate primitives
 
-The 21 substrate primitives enumerated in section 1.1 all ship in v0.2. Each is fully specified in section 6. The substrate is the foundation; pages compose primitives. New pages added in v0.3 should compose existing primitives rather than introduce new ones unless a genuinely novel pattern is needed.
+The 21 substrate primitives enumerated in section 1.1 shipped in v0.2. Each is fully specified in section 6. The substrate is the foundation; pages compose primitives. v0.3 and v0.4 added new affordances (§15) to existing primitives rather than introducing new ones, validating the substrate's reusability.
 
 ### 2.1.3 New endpoints
 
-The 14 forthcoming endpoints enumerated in section 1.1 are committed for v0.2 — meaning the UI specifies behavior against them and the lexicon shapes are fixed in this design doc. Each lands in its respective sub-phase. Where an endpoint is not yet shipped at the time a UI surface depending on it is built, the capability-routed substrate (primitive 21) provides a fallback path against the parity-floor `com.atproto.admin.*` endpoints. Section 8 specifies each endpoint; section 9 specifies the phase in which each lands.
+The 14 forthcoming endpoints enumerated in section 1.1 shipped during v0.2 — the UI specified behavior against them and fixed the lexicon shapes in this design doc. Each landed in its respective sub-phase. The capability-routed substrate (primitive 21) provided the fallback path against parity-floor `com.atproto.admin.*` endpoints during the sub-phase rollout window. Section 8 specifies each endpoint; section 9 specifies the phase in which each landed. v0.3 reshaped two of these surfaces — `emitEvent` is now multi-subject and the batch handlers are whole-batch atomic; see §15.3 for the v0.4 absorption pattern.
 
 ### 2.1.4 Real-time integration
 
-Subscription-driven real-time updates for moderation events and audit entries via `tools.aurora.admin.subscribeModEvents` (Phase 3.9). The subscription substrate (primitive 5) is built in v0.2; surfaces consuming it (Mod Events page, Audit page, Subject detail) integrate when the endpoint lands. Pre-3.9, those surfaces poll on a 10s interval as a fallback per the capability-routed pattern.
+Subscription-driven real-time updates for moderation events and audit entries via `tools.aurora.admin.subscribeModEvents` (Phase 3.9, shipped in v0.2). The subscription substrate (primitive 5) was built in v0.2; surfaces consuming it (Mod Events page, Audit page, Subject detail) integrated when the endpoint landed. The pre-3.9 fallback (10s polling per the capability-routed pattern) is no longer reached on current builds.
 
 ### 2.1.5 Accessibility
 
-WCAG 2.2 Level AA compliance across every component shipping in v0.2. Section 10 specifies the contract per primitive: keyboard contracts, screen reader semantics, contrast ratios, focus management, motion preferences, target sizes, form semantics, structural landmarks. Accessibility is not a polish pass — it's a substrate property of every component.
+WCAG 2.2 Level AA compliance across every component shipping in v0.2, preserved through v0.4. Section 10 specifies the contract per primitive: keyboard contracts, screen reader semantics, contrast ratios, focus management, motion preferences, target sizes, form semantics, structural landmarks. Accessibility is a substrate property of every component, not a polish pass.
 
 ### 2.1.6 Theming
 
-Light, Dark, and System theme modes. Three-state toggle in sidebar footer. Cmd/Ctrl+Shift+L keyboard shortcut. Parallel CSS variable set under `[data-theme="dark"]`. `prefers-color-scheme` media query for System mode. Persistence via `localStorage`. Full color audit for both modes including all status badge variants. Section 7.2 specifies the dark-mode palette.
+Light, Dark, and System theme modes (shipped in v0.2; unchanged through v0.4). Three-state toggle in sidebar footer. Cmd/Ctrl+Shift+L keyboard shortcut. Parallel CSS variable set under `[data-theme="dark"]`. `prefers-color-scheme` media query for System mode. Persistence via `localStorage`. Full color audit for both modes including all status badge variants. Section 7.2 specifies the dark-mode palette.
 
 ### 2.1.7 Internationalization
 
-i18n-ready scaffolding: all user-facing strings routed through a `t()` helper, English-only string file shipped at `static/admin/i18n/en.json`, locale-aware date and number formatting via `Intl.DateTimeFormat` and `Intl.NumberFormat`. Language selector in Settings populated from available locale files. v0.2 ships English-only; future contributors add languages by dropping new locale files into the i18n directory. Section 11 specifies the contract.
+i18n-ready scaffolding: all user-facing strings routed through a `t()` helper, English-only string file shipped at `static/admin/i18n/en.json`, locale-aware date and number formatting via `Intl.DateTimeFormat` and `Intl.NumberFormat`. Language selector in Settings populated from available locale files. v0.2 shipped English-only and that remained unchanged through v0.4 — additional locale files are added by dropping new files into the i18n directory. Section 11 specifies the contract.
 
 ### 2.1.8 Stylistic preservation
 
@@ -167,55 +168,55 @@ The current `static/admin/` visual language carries forward: color palette via C
 
 ## 2.2 Not in scope for v0.2
 
-Items deliberately excluded from this cycle. Each carries a brief rationale and notes the natural future home.
+Items deliberately excluded from the v0.2 cycle. Each subsection captures the v0.2-era exclusion rationale and the original "natural future home" framing. Where v0.3 or v0.4 actually resolved an exclusion, the entry calls that out; otherwise the exclusion still holds at the v0.4 freeze and the future-cycle pointer has been updated to v0.5+ candidate tracking.
 
 ### 2.2.1 Hover-card context previews
 
-Hover tooltips that show contextual information about an entity reference (account preview, record preview, etc.) are deferred. The substrate primitive `<EntityRef>` is built without hover content. v0.3 can layer hover on top by extending `<EntityRef>` to fetch and render preview cards. Rationale: hover events fire frequently and add real backend traffic and rendering overhead even with debouncing; the canonical detail page is one click away and provides full information. Operators who need information now click through.
+Hover tooltips that show contextual information about an entity reference (account preview, record preview, etc.) were deferred from v0.2. The substrate primitive `<EntityRef>` was built without hover content and remains so at v0.4. The original "v0.3 can layer hover on top" framing did not land in v0.3 or v0.4; the v0.5+ candidate list carries it forward. Rationale unchanged: hover events fire frequently and add real backend traffic and rendering overhead even with debouncing; the canonical detail page is one click away and provides full information.
 
 ### 2.2.2 Calendar widget upgrade beyond v0.2 baseline
 
-The v0.2 calendar widget supports range selection with preset chips (Today, Last 7 days, Last 30 days, This month, Last month). What v0.2 does not include: month/year jump navigation beyond standard prev/next, multi-month side-by-side view, or relative-date tokens like "yesterday + 3 days." These extensions are v0.3 if operator usage indicates they're needed.
+The v0.2 calendar widget supports range selection with preset chips (Today, Last 7 days, Last 30 days, This month, Last month). v0.4 preserves the same surface — no month/year jump navigation beyond standard prev/next, no multi-month side-by-side view, no relative-date tokens like "yesterday + 3 days." These extensions remain v0.5+ candidates pending operator-usage signal.
 
 ### 2.2.3 Bulk operations beyond the six batch endpoints
 
-The six batch endpoints (`batchTakedownAccounts`, `batchSuspendAccounts`, `batchRestoreAccounts`, `batchTakedownRecords`, `batchApplyLabel`, `batchRemoveLabel`) cover the highest-frequency bulk moderation workflows. Other bulk operations — bulk role grant, bulk invite generation with per-account binding, bulk email send — are not in v0.2. Operators needing those workflows for v0.2 use scripted access against single-subject endpoints. v0.3 evaluates which additional batch endpoints are warranted.
+The six batch endpoints (`batchTakedownAccounts`, `batchSuspendAccounts`, `batchRestoreAccounts`, `batchTakedownRecords`, `batchApplyLabel`, `batchRemoveLabel`) cover the highest-frequency bulk moderation workflows. v0.3 reshaped these endpoints to whole-batch-atomic semantics (chainlink #113; see §15.3) but did not add new batch endpoints. Other bulk operations — bulk role grant, bulk invite generation with per-account binding, bulk email send — remain out of scope at v0.4; operators needing those workflows use scripted access against single-subject endpoints.
 
 ### 2.2.4 Time-bounded historical export
 
-`exportAccountForensic` produces a current-state bundle. Reconstructing past account states for historical export ("the account as it was on March 1") requires sequencer replay infrastructure that is not in v0.2 scope. Forensic exports in v0.2 are point-in-time snapshots taken at the moment of export. Past actions are visible via audit chain entries (which are immutable by construction post-Phase-3.8) but past content state is not reconstructable.
+`exportAccountForensic` produces a current-state bundle. Reconstructing past account states for historical export ("the account as it was on March 1") requires sequencer replay infrastructure that was out of scope for v0.2 and remains so at v0.4. Forensic exports are point-in-time snapshots taken at the moment of export. Past actions are visible via audit chain entries (immutable by construction post-Phase-3.8) but past content state is not reconstructable.
 
 ### 2.2.5 Hardened SSR for record render
 
-Aurora-Locus v0.2 renders ATProto records server-side with sanitization and routes media through a server-side proxy. This is a meaningful step beyond client-side render with direct media fetches. What v0.2 does not include: the maximally hardened pattern of full SSR with no JavaScript execution context whatsoever, used by some forensic-tier moderation tooling for embeds shown to moderators investigating sensitive content. The Aurora UI is admin-tier and trusted-environment; the additional hardening is unnecessary overhead for the v0.2 threat model. v0.3 can extend the render layer if a deployment posture warrants it.
+Aurora-Locus has rendered ATProto records server-side with sanitization and routed media through a server-side proxy since v0.2 — a meaningful step beyond client-side render with direct media fetches. The maximally hardened pattern (full SSR with no JavaScript execution context whatsoever, used by some forensic-tier moderation tooling for embeds shown to moderators investigating sensitive content) was out of scope for v0.2 and remains so at v0.4. The Aurora UI is admin-tier and trusted-environment; the additional hardening is unnecessary overhead for the threat model. Deployment postures that warrant it can pursue it as a v0.5+ candidate.
 
 ### 2.2.6 Multi-tenant or per-namespace UI configuration
 
-The UI assumes a single Aurora-Locus deployment serving a single set of operators. Per-tenant or per-namespace UI customization (different branding per service, different admin scopes per tenant) is not in scope. v0.3 evaluates if multi-tenant deployments emerge as a use case.
+The UI assumes a single Aurora-Locus deployment serving a single set of operators. Per-tenant or per-namespace UI customization (different branding per service, different admin scopes per tenant) was out of scope for v0.2 and remains so at v0.4 — multi-tenant deployments haven't emerged as a use case. Re-evaluation is a v0.5+ candidate.
 
 ### 2.2.7 Wholesale visual redesign
 
-The v0.2 cycle preserves the current visual identity. A future cycle could propose a redesign — different palette, different layout vocabulary, different design language — but this design doc does not contemplate that work. Operators upgrading to v0.2 will find the UI extended and modernized, not visually unrecognizable.
+The v0.2 cycle preserved the visual identity inherited from the pre-v0.2 `static/admin/` scaffolding. v0.3 and v0.4 also preserved it. A future cycle could propose a redesign — different palette, different layout vocabulary, different design language — but this design doc does not contemplate that work. Operators upgrading from pre-v0.2 found the UI extended and modernized, not visually unrecognizable; v0.3 / v0.4 upgrades are visually continuous.
 
 ### 2.2.8 Browser support beyond modern evergreen
 
-The UI targets Chrome, Firefox, Safari, and Edge in their currently-supported releases as of the v0.2 ship date. No support for legacy browsers, no IE-era polyfills, no compatibility shims for non-evergreen deployments. Operators using ancient browsers can use the parity `com.atproto.admin.*` endpoints directly via curl or scripted access.
+The UI targets Chrome, Firefox, Safari, and Edge in their currently-supported releases (target window set at v0.2 ship; the policy stayed evergreen-only through v0.4). No support for legacy browsers, no IE-era polyfills, no compatibility shims for non-evergreen deployments. Operators using ancient browsers can use the parity `com.atproto.admin.*` endpoints directly via curl or scripted access.
 
 ### 2.2.9 Mobile-first design
 
-The UI is desktop-first. The current responsive breakpoint at `max-width: 768px` is preserved and extended for usability on tablets, but v0.2 does not optimize for phone-shaped viewports. Operators doing administrative work on mobile use a tablet or laptop. v0.3 evaluates if mobile-first treatment is worthwhile based on actual operator usage patterns.
+The UI is desktop-first. The responsive breakpoint at `max-width: 768px` shipped in v0.2 and persists through v0.4 — usable on tablets but not optimized for phone-shaped viewports. Operators doing administrative work on mobile use a tablet or laptop. Mobile-first treatment was originally a v0.3-evaluation item; neither v0.3 nor v0.4 acted on it, and operator usage patterns still don't signal demand. Re-evaluation is a v0.5+ candidate.
 
 ### 2.2.10 Operator activity dashboards beyond per-page metrics
 
-The Operator dashboard shows instance metrics. The Moderator dashboard shows moderation metrics. What v0.2 does not include: a per-operator activity dashboard ("here is what @somemod has done this week, with throughput stats and decision patterns"). This is administrative-of-administrators visibility — relevant for team leads but not in v0.2 scope. v0.3 can introduce it as a SuperAdmin-tier surface.
+The Operator dashboard shows instance metrics. The Moderator dashboard shows moderation metrics. A per-operator activity dashboard ("here is what @somemod has done this week, with throughput stats and decision patterns") was out of scope for v0.2 and remains so at v0.4 — neither v0.3 nor v0.4 introduced this SuperAdmin-tier surface. v0.5+ candidate.
 
 ### 2.2.11 Rich text editing for rationale fields
 
-Rationale fields are plain `<textarea>` in v0.2. No markdown rendering, no rich text controls, no @-mentions of other operators, no image attachments. Rationales are operational notes; plain text is sufficient. Future cycles can extend if operator workflows demand richer authoring.
+Rationale fields are plain `<textarea>` (shipped in v0.2; unchanged through v0.4). No markdown rendering, no rich text controls, no @-mentions of other operators, no image attachments. Rationales are operational notes; plain text is sufficient. Future cycles can extend if operator workflows demand richer authoring.
 
 ### 2.2.12 Federated cross-PDS subject views
 
-When viewing an account or record on this PDS, the UI surfaces only data this PDS has authority over or has explicitly cached. It does not render content from other PDSes inline (parent thread rendering for replies, for example, only renders if the parent record is on this PDS). Cross-PDS context fetching is not in v0.2 scope. References to external content render as references with link-out, not inline content.
+When viewing an account or record on this PDS, the UI surfaces only data this PDS has authority over or has explicitly cached. It does not render content from other PDSes inline (parent thread rendering for replies, for example, only renders if the parent record is on this PDS). Cross-PDS context fetching was out of scope for v0.2 and remains so at v0.4. References to external content render as references with link-out, not inline content.
 
 ## 2.3 Out of scope, will not be added in any future v0.x cycle
 
@@ -280,7 +281,7 @@ This extends to error semantics. When a server rejects an action because the act
 
 ## 3.4 Snapshots-at-decision and audit chain are co-equal substrate
 
-Two pieces of forensic infrastructure ship in v0.2: snapshot-at-decision-time (substrate primitive 8) and the hash-chained audit log (`tools.aurora.admin.getAuditTrail`, Phase 3.8). They are co-equal substrate, not optional features.
+Two pieces of forensic infrastructure shipped in v0.2 and persist through v0.4: snapshot-at-decision-time (substrate primitive 8) and the hash-chained audit log (`tools.aurora.admin.getAuditTrail`, Phase 3.8). They are co-equal substrate, not optional features.
 
 A snapshot captures *what the subject looked like at the moment a decision was taken on it*. An audit chain entry captures *what decision was taken, by whom, when, with what rationale*. Together they answer the forensic question: "show me this decision, the reasoning behind it, and the artifact it was made on." Neither alone is sufficient.
 
@@ -336,7 +337,7 @@ Concrete consequences:
 
 - The moderation mode setting (`moderation-mode`, a runtime-settings table key configured via `tools.aurora.admin.setRuntimeSetting`) takes values `full`, `reduced`, `disabled`. It does not take values like "external-tool-X-paired" or "running-with-Y-system." Operators choose modes based on their deployment posture; the UI doesn't infer the deployment from external signals.
 
-> **Reconciliation.** Earlier drafts of this section referenced `AURORA_ADMIN_UI_MODERATION_MODE` as an env var. As-built, moderation mode is a runtime-settings table key (`moderation-mode`) configured via `tools.aurora.admin.setRuntimeSetting` (see [docs/AURORA_DESIGN.md §4.3.2](AURORA_DESIGN.md) for the runtime-settings endpoint pair); `AURORA_RECOVERY_MODE` is a separate env var read at startup for the recovery override path (per §4.3 below). This section uses the as-built names.
+> **Reconciliation.** Earlier drafts of this section referenced `AURORA_ADMIN_UI_MODERATION_MODE` as an env var. As-built, moderation mode is a runtime-settings table key (`moderation-mode`) configured via `tools.aurora.admin.setRuntimeSetting` (see [docs/V02_DESIGN.md §4.3.2](V02_DESIGN.md) for the runtime-settings endpoint pair); `AURORA_RECOVERY_MODE` is a separate env var read at startup for the recovery override path (per §4.3 below). This section uses the as-built names.
 - The capability detection system (`tools.aurora.describeCapabilities`) reports what *Aurora-Locus* exposes. It does not probe for or report on external systems.
 - The external labels panel (substrate primitive 13) accepts a configured list of labeler service DIDs. It treats them uniformly. It does not have a special "this is the well-known labeler" path.
 - File names, class names, NSIDs, route paths, log lines, and string keys never contain names of external systems.
@@ -759,7 +760,7 @@ The Dashboard has no action affordances. Stat cards and activity rows are displa
 
 - Stat card → relevant page (e.g., Pending Reports stat card → Reports page)
 - Activity feed row → event detail or originating subject (whichever is more useful per row)
-- Chart legends are not interactive in v0.2 (no click-to-filter from chart)
+- Chart legends are not interactive (v0.2 baseline; unchanged through v0.4 — no click-to-filter from chart)
 
 ### Empty / loading / error states
 
@@ -894,7 +895,7 @@ Three sub-sections:
 
 **Identity sub-section:**
 - Update email — inline form within drawer
-  - Default path: trigger user-mediated change-email flow (deferred to v0.3 if endpoint absent)
+  - Default path: trigger user-mediated change-email flow (the v0.2-era defer-if-endpoint-absent fallback; the endpoint shipped subsequently so the fallback is no longer reached)
   - Override path: direct set via `updateAccountEmail` with rationale + typed confirmation
 - Update handle — inline form within drawer
   - Same two-track pattern as email
@@ -1091,7 +1092,7 @@ Reports lists every report ever filed against subjects on this PDS, regardless o
 |---|---|---|
 | Reports list | `com.atproto.admin.listReports` | Paginated, cursor-based |
 | Filter chips | Filter parameters on `listReports` | See FilterStrip per section 6 |
-| Search input | None in v0.2 | Reports don't have full-text search; filtering is by structured fields |
+| Search input | None (v0.2 baseline; v0.4 unchanged) | Reports don't have full-text search; filtering is by structured fields |
 | Report status update (inline) | None — happens on detail page | List is read; detail is write |
 
 #### Layout
@@ -1547,21 +1548,21 @@ The unified audit feed — every administrative decision in one chronological st
 
 Audit is the comprehensive accountability surface. In v0.2 every entry is a hash-chained `audit_chain_entry` row carrying a `verified` badge derived from re-hashing the row content. The page is the operator's first stop when investigating "what happened" and the auditor's surface for cryptographic accountability.
 
-The page is shaped as a unified feed that surfaces both `com.atproto.admin.getAuditLog` and `tools.aurora.admin.getAuditTrail` for forward-compatibility — both endpoints read from the same `audit_chain_entry` backing table in v0.2 (per [AURORA_DESIGN.md §4.4.1](AURORA_DESIGN.md), the legacy `admin_audit_log` table was dropped by `migrations/0004_drop_admin_audit_log.sql`), so the merge is structural rather than data-bearing today. The two-endpoint shape is preserved as a hook for future deployments that may restore legacy pre-chain data.
+The page is shaped as a unified feed that surfaces both `com.atproto.admin.getAuditLog` and `tools.aurora.admin.getAuditTrail` for forward-compatibility — both endpoints read from the same `audit_chain_entry` backing table in v0.2 (per [V02_DESIGN.md §4.4.1](V02_DESIGN.md), the legacy `admin_audit_log` table was dropped by `migrations/0004_drop_admin_audit_log.sql`), so the merge is structural rather than data-bearing today. The two-endpoint shape is preserved as a hook for future deployments that may restore legacy pre-chain data.
 
 #### Endpoint mapping
 
 | Element | Endpoint | Notes |
 |---|---|---|
-| Audit feed | `com.atproto.admin.getAuditLog` + `tools.aurora.admin.getAuditTrail` (Phase 3.8) | Both endpoints read the same `audit_chain_entry` table in v0.2; merge is forward-compat structural |
-| Filter chips | actor, action type, subject, date range, verified-only toggle | |
-| Bulk export | None in v0.2 | Consider for v0.3 |
+| Audit feed | `com.atproto.admin.getAuditLog` + `tools.aurora.admin.getAuditTrail` (Phase 3.8) | Both endpoints read the same `audit_chain_entry` table since v0.2; merge is forward-compat structural. v0.3 added `cascadeSnapshotIds` + `subject_cid` filter to the chain entries (§15.4) |
+| Filter chips | actor, action type, subject, date range, verified-only toggle, subject_cid (v0.3+, §15.4) | |
+| Bulk export | None (v0.2 baseline; v0.4 unchanged) | v0.5+ candidate |
 
 #### Layout
 
 Tabular pattern. Columns: timestamp, verified badge, actor, action, subject, hash (truncated, click to copy).
 
-The "verified-only" toggle in FilterStrip filters to chain entries only. In v0.2 every entry is already a chain entry, so the toggle is effectively a no-op — preserved as a forward-compatibility hook for future deployments where legacy pre-chain rows might appear (see [§8.4](#84-phase-38--toolsauroraadmingetaudittrail)).
+The "verified-only" toggle in FilterStrip filters to chain entries only. Since v0.2, every entry is already a chain entry, so the toggle is effectively a no-op — preserved as a forward-compatibility hook for future deployments where legacy pre-chain rows might appear (see [§8.4](#84-phase-38--toolsauroraadmingetaudittrail)).
 
 #### Real-time behavior
 
@@ -1584,8 +1585,8 @@ Standard patterns. The "no audit data" empty state is unlikely on any production
 
 #### Notes
 
-- The "merge two endpoints client-side" pattern is preserved in the page-level shape but is a no-op for data in v0.2: both `getAuditLog` and `getAuditTrail` resolve to the same `audit_chain_entry` rows. The cursor-scheme divergence the merge would otherwise navigate is also moot today; the page can use either endpoint's native pagination directly. The two-endpoint structure carries forward as a forward-compatibility hook so a future deployment could restore legacy pre-chain rows under `getAuditLog` without page-level rework.
-- The Audit page is forensic, not operational — operators don't reach for it dozens of times per shift. v0.3 may normalize the wire-format relationship between the two endpoints (deprecate one, fold one into the other, or keep both for protocol compatibility), at which point the page-level shape may simplify.
+- The "merge two endpoints client-side" pattern is preserved in the page-level shape but has been a no-op for data since v0.2: both `getAuditLog` and `getAuditTrail` resolve to the same `audit_chain_entry` rows. The cursor-scheme divergence the merge would otherwise navigate is also moot; the page can use either endpoint's native pagination directly. The two-endpoint structure persists through v0.4 as a forward-compatibility hook so a future deployment could restore legacy pre-chain rows under `getAuditLog` without page-level rework.
+- The Audit page is forensic, not operational — operators don't reach for it dozens of times per shift. Normalizing the wire-format relationship between the two endpoints (deprecate one, fold one into the other, or keep both for protocol compatibility) remained out of scope through v0.4; it is a v0.5+ candidate.
 
 ### 5.3.9 Audit entry detail
 
@@ -1660,7 +1661,7 @@ Similar to Event detail but emphasizing the chain structure. Includes a "Verify 
 #### Empty / loading / error states
 
 - **404:** audit entry does not exist
-- **Pre-chain entry (forward-compat only):** does not occur in v0.2 deployments — `migrations/0004_drop_admin_audit_log.sql` dropped the legacy table outright rather than producing `current_hash="pre-chain"` sentinel rows (see [§8.4](#84-phase-38--toolsauroraadmingetaudittrail)). Reserved for future deployments that may restore legacy data; if such a row is ever loaded, the UI displays "This entry predates the cryptographic chain (sentinel: pre-chain). No hash verification available." and renders content as best as possible.
+- **Pre-chain entry (forward-compat only):** does not occur in v0.2-v0.4 deployments — `migrations/0004_drop_admin_audit_log.sql` dropped the legacy table outright rather than producing `current_hash="pre-chain"` sentinel rows (see [§8.4](#84-phase-38--toolsauroraadmingetaudittrail)). Reserved for future deployments that may restore legacy data; if such a row is ever loaded, the UI displays "This entry predates the cryptographic chain (sentinel: pre-chain). No hash verification available." and renders content as best as possible.
 - **Hash mismatch on recompute:** explicit "Hash mismatch — entry may be corrupted" warning with surrounding context. This is the case the chain exists to detect; UI surfaces it loudly when found.
 
 #### Notes
@@ -1691,7 +1692,7 @@ Accounts is the canonical entry to per-account work. Operators arrive here to fi
 | Search input (text) | `com.atproto.admin.searchAccounts` | Debounced 400ms + Enter submit |
 | Filter chips (status, created, invite source) | `tools.aurora.ops.listAccounts` | Phase 2.4 endpoint, broader filters |
 | Account row stat (records, blobs, status) | Embedded in `listAccounts` response | No per-row separate fetch |
-| Bulk multi-select | (no bulk operations in v0.2 against accounts list — bulk goes through batch endpoints from individual account selections elsewhere) | |
+| Bulk multi-select | (no bulk operations against the accounts list itself — v0.2 baseline, unchanged through v0.4; bulk goes through batch endpoints from individual account selections elsewhere) | |
 
 The two endpoints behind search vs filter are intentional per cluster 4: search is for finding-by-text, filter is for finding-by-attributes. They serve different access patterns and the UI branches by intent.
 
@@ -1735,7 +1736,7 @@ The "Bulk" toggle does enable a multi-select column, but the available bulk oper
 - Bulk suspend accounts (Moderator+)
 - Bulk restore accounts (Moderator+)
 
-Account-management bulk operations (bulk delete, bulk password reset, etc.) are not in v0.2 — those workflows are too high-impact to expose as bulk operations on a list page; they require per-account confirmation.
+Account-management bulk operations (bulk delete, bulk password reset, etc.) are intentionally absent — v0.2 baseline, preserved through v0.4 — because those workflows are too high-impact to expose as bulk operations on a list page; they require per-account confirmation.
 
 #### Cross-pivots
 
@@ -1981,7 +1982,7 @@ Read on load; no auto-refresh.
 
 #### Notes
 
-- Lineage visualization in v0.2: simple indented list (parent/child relationships shown by indentation). v0.3 may add a tree visualization.
+- Lineage visualization: simple indented list (parent/child relationships shown by indentation) — v0.2 baseline, unchanged through v0.4. A tree visualization remains a v0.5+ candidate.
 
 ### 5.4.6 Operations sub-pages
 
@@ -2138,8 +2139,8 @@ Standard patterns. Form validation errors render inline below the relevant field
 
 #### Notes
 
-- The current `static/admin/index.html` Settings page contains four cards (General, Registration, Moderation Settings, Aurora Capabilities). The General page in v0.2 absorbs the General and Registration cards and keeps the same logical structure. Moderation Settings moves to UI & modes (5.5.2). Aurora Capabilities moves to its own page (5.5.5).
-- Many of the existing Moderation Settings card's settings ("Enable Automatic Content Filtering", "Report Threshold") are placeholder-grade scaffolding — they don't map to actual server-side behavior in the current Aurora-Locus build. They're not preserved in v0.2 unless they connect to real backing endpoints. Section 12 (migration from current static/admin/) specifies which scaffolded controls are removed vs preserved.
+- The pre-v0.2 `static/admin/index.html` Settings page contained four cards (General, Registration, Moderation Settings, Aurora Capabilities). v0.2's General page absorbed the General and Registration cards and kept the same logical structure. Moderation Settings moved to UI & modes (5.5.2). Aurora Capabilities moved to its own page (5.5.5). The split is preserved through v0.4.
+- Many of the pre-v0.2 Moderation Settings card's settings ("Enable Automatic Content Filtering", "Report Threshold") were placeholder-grade scaffolding — they didn't map to actual server-side behavior in the pre-v0.2 Aurora-Locus build. v0.2 did not preserve them, and v0.4 has not reintroduced them. Section 12 (migration from current static/admin/) specifies which scaffolded controls were removed vs preserved.
 
 ### 5.5.2 UI & modes
 
@@ -2583,8 +2584,8 @@ EntityRef:
 
 - DID-to-handle resolution cache is in-memory, keyed by DID. LRU with 500-entry default cap. Hits during page navigation populate the cache lazily.
 - Cache is populated by responses from other endpoints (anywhere a handle is resolved alongside a DID), not by speculative pre-fetching.
-- For touch devices, no hover behavior — link is just a link. The hover-card extension (substrate primitive 1's v0.3 hover layer) would not apply to touch.
-- v0.2 ships without hover-card content (per cluster 5 decision). The substrate is positioned to support hover layer in v0.3 by extending the component's render to optionally include a hover wrapper.
+- For touch devices, no hover behavior — link is just a link. The hover-card extension (substrate primitive 1's deferred hover layer; see §2.2.1) would not apply to touch.
+- The substrate ships without hover-card content (v0.2 baseline, preserved through v0.4 per the §2.2.1 deferral). It is positioned to support a hover layer in a later cycle by extending the component's render to optionally include a hover wrapper.
 
 ## 6.2 Inline subject preview (server-side hardened render)
 
@@ -3150,7 +3151,7 @@ Every UI surface that uses icons. Sidebar navigation (replacing 📊 👥 🛡�
 
 ### Implementation
 
-Lucide icons embed inline as SVG. v0.2 ships a curated subset matching the UI's usage rather than the full Lucide library.
+Lucide icons embed inline as SVG. v0.2 shipped a curated subset matching the UI's usage rather than the full Lucide library; the subset has been extended additively through v0.4 (e.g., chain-verification badges per §15.4) but otherwise carries forward.
 
 Subset shipped:
 
@@ -3460,7 +3461,7 @@ Date filtering on FilterStrip's date-range chip. Used wherever an operator picks
 
 ### Used by
 
-FilterStrip date-range filter chip (Reports, Events, Audit, Accounts pages), forensic export modal's "events from {date} to {date}" filter (deferred to v0.3 unless surfaces emerge needing it).
+FilterStrip date-range filter chip (Reports, Events, Audit, Accounts pages). The forensic export modal's "events from {date} to {date}" filter was deferred from v0.2 pending a surface that needed it; neither v0.3 nor v0.4 surfaced one, so the deferral carries forward.
 
 ### Layout
 
@@ -4146,21 +4147,21 @@ struct AuditEntry {
 }
 ```
 
-The `items` field follows the Phase 3 [`PaginatedResponse<T>`](AURORA_DESIGN.md) convention used by every paginated `tools.aurora.*` endpoint; reusing the same field name across the namespace keeps consumers writing one paginator helper rather than per-endpoint name dispatch.
+The `items` field follows the Phase 3 [`PaginatedResponse<T>`](V02_DESIGN.md) convention used by every paginated `tools.aurora.*` endpoint; reusing the same field name across the namespace keeps consumers writing one paginator helper rather than per-endpoint name dispatch.
 
 ### Behavior
 
 - Returns audit entries matching filters in reverse chronological order (newest first).
 - `previous_hash` field links entries into chain.
 - Hash verification can be performed by re-hashing entry content and comparing against `current_hash`. Per-row results land in each entry's `verified` field.
-- Chain-level verification (`chain_verified` + `chain_verified_through`) walks the response window and confirms each row's `previous_hash` matches the prior row's `current_hash`. Per-row `verified` flags catch row-local tampering; `chain_verified` catches the consistent-rewrite attack where an attacker rewrote a prior entry's content AND its `current_hash` together — per-row would pass on every row but the linkage between entries breaks. `chain_verified_through` is the highest sequence covered by the verification window and is meaningful only when `chain_verified` is true. Specified at [AURORA_DESIGN.md §4.4.2](AURORA_DESIGN.md) (chain semantics) and [§4.3.2](AURORA_DESIGN.md) (response shape).
-- The `current_hash = "pre-chain"` sentinel is reserved for legacy rows predating the chain; in v0.2 deployments no such rows exist (see Notes below). Consumers may treat this case as defensive-only.
+- Chain-level verification (`chain_verified` + `chain_verified_through`) walks the response window and confirms each row's `previous_hash` matches the prior row's `current_hash`. Per-row `verified` flags catch row-local tampering; `chain_verified` catches the consistent-rewrite attack where an attacker rewrote a prior entry's content AND its `current_hash` together — per-row would pass on every row but the linkage between entries breaks. `chain_verified_through` is the highest sequence covered by the verification window and is meaningful only when `chain_verified` is true. Specified at [V02_DESIGN.md §4.4.2](V02_DESIGN.md) (chain semantics) and [§4.3.2](V02_DESIGN.md) (response shape).
+- The `current_hash = "pre-chain"` sentinel is reserved for legacy rows predating the chain; v0.2-v0.4 deployments contain no such rows (see Notes below). Consumers may treat this case as defensive-only.
 
 ### Notes
 
 - Chain walk: client navigates "previous in chain" by querying for the entry whose `current_hash` matches the current entry's `previous_hash`.
 - Forensic export (`exportAccountForensic`) writes its own audit entries here. The chain encompasses all administrative actions, not just moderation actions.
-- **Pre-chain sentinel rows do not exist in v0.2.** The `current_hash = "pre-chain"` sentinel is the wire-format placeholder for chain entries predating the Phase 3.8 hash chain. The legacy `admin_audit_log` table was dropped by `migrations/0004_drop_admin_audit_log.sql` rather than migrated as sentinel rows, so no v0.2 deployment produces or stores them. The sentinel-handling commitment is preserved as a future-compatibility hook only — consumers writing against this endpoint in v0.2 will not encounter `current_hash: "pre-chain"` rows in any response.
+- **Pre-chain sentinel rows do not exist in v0.2-v0.4 deployments.** The `current_hash = "pre-chain"` sentinel is the wire-format placeholder for chain entries predating the Phase 3.8 hash chain. The legacy `admin_audit_log` table was dropped by `migrations/0004_drop_admin_audit_log.sql` rather than migrated as sentinel rows, so no v0.2-v0.4 deployment produces or stores them. The sentinel-handling commitment is preserved as a future-compatibility hook only — consumers writing against this endpoint will not encounter `current_hash: "pre-chain"` rows in any response.
 
 ## 8.5 Phase 3.9 — `tools.aurora.admin.subscribeModEvents`
 
@@ -4336,13 +4337,11 @@ Bundle contents:
 
 > **Reconciliation.** Earlier drafts of this section implied `audit-trail.json` would carry the chain entry id and bundle hash inline ("this export's own audit entry"). As-built, the file ships a redirect-string instead, because either field would create a chicken-and-egg cycle: the bundle hash must cover all bytes including this file (so the hash isn't known until after tar assembly), and the chain entry id is only known after the chain row is appended (which itself records the bundle hash). The redirect-string pattern resolves the cycle by deferring both fields to the response headers (`X-Aurora-Audit-Entry-Id`, `X-Aurora-Bundle-Hash`) and the chain row's rationale. See the `chainAnchor` sentinel and rationale at [src/api/aurora_admin.rs:2454-2472](../src/api/aurora_admin.rs#L2454-L2472).
 
-### Implementation status (v0.2)
+### Implementation status (v0.2 baseline; v0.4 unchanged)
 
-v0.2 ships **metadata-only forensic export**. The bundle contains: account metadata (`manifest.json`), moderation history (`moderation-history.json`), audit chain entries for the subject when `includeAuditChain` is set (`audit-entries.json`), and `audit-trail.json` (chain anchor reference only). CAR data and blob bytes are NOT included in v0.2; the `includeRepo` and `includeBlobs` parameters are accepted but their content is recorded as "deferred" in the manifest's `deferredContents` field. The bundle is assembled in-memory and shipped as a single response body; streaming and full-content inclusion are deferred to v0.3.
+v0.2 shipped **metadata-only forensic export** and v0.4 preserves the same shape. The bundle contains: account metadata (`manifest.json`), moderation history (`moderation-history.json`), audit chain entries for the subject when `includeAuditChain` is set (`audit-entries.json`), and `audit-trail.json` (chain anchor reference only). CAR data and blob bytes are NOT included; the `includeRepo` and `includeBlobs` parameters are accepted but their content is recorded as "deferred" in the manifest's `deferredContents` field. The bundle is assembled in-memory and shipped as a single response body; streaming response body for large bundles, CAR data inclusion, blob byte inclusion, and the bundle-shape decisions those expansions imply are v0.5+ candidates (originally targeted at v0.3 but not absorbed by v0.3 or v0.4).
 
 Operators can verify bundle integrity by recomputing SHA-256 over the response body and comparing to the `X-Aurora-Bundle-Hash` header at issuance time, or by querying the chain entry's rationale for the canonical hash record.
-
-v0.3 will revisit: streaming response body for large bundles, CAR data inclusion, blob byte inclusion, and the bundle-shape decisions that those expansions imply.
 
 ## 8.8 New endpoint — `tools.aurora.admin.batchTakedownAccounts`
 
@@ -4543,12 +4542,65 @@ reporter-context-v1            — reporter context aggregation
 runtime-settings-v1            — runtime settings infrastructure (Phase 3.10)
 ```
 
-Adding new capabilities requires design-doc update before the server starts advertising them. Removing capabilities is a breaking change requiring major version bump (v1 → v2).
+### Adding a new capability
+
+Per Arc 8's runtime route enumeration (chainlink #54), capability advertisement is now driven by the `RouteRegistry` substrate at `src/api/registry.rs`. Adding a new capability is a three-step procedure:
+
+1. **Design-doc update.** Add the capability string to the vocabulary list above (`<kebab-family>-v<integer>` shape — kebab-case family name, hyphen, lowercase `v`, integer version).
+2. **`RouteRegistry` entry.** Attach the capability string to the appropriate route in `src/api/admin.rs::routes()` via `.route_with_caps(path, handler, CapsBuilder::new(family, version).extensions(["<capability-string>"]))`. Canonical-introducer attribution: each capability goes on its single phase-introducing endpoint; companion endpoints in the same phase share the capability without re-declaring it.
+3. **`WIRE_EXTENSION_ORDER` addition.** Insert the capability string into `WIRE_EXTENSION_ORDER` (`src/api/registry.rs`) at its declaration position — wire output follows this constant's order, independent of route registration order.
+
+Forgetting step 2 means the route exists but the capability isn't advertised; forgetting step 3 means the capability string silently drops from the wire output. The `debug_assert!` in `RouteRegistry::advertised_extensions` catches the missing-from-`WIRE_EXTENSION_ORDER` case in dev/test builds.
+
+Removing a capability is a breaking change requiring major version bump (v1 → v2). The new version ships as a new string; the old version is removed only after consumers have had time to migrate.
+
+### Omission policy
+
+Capabilities that exist structurally but are intentionally not advertised use `.omitted()` on the `CapsBuilder`:
+
+```rust
+.route_with_caps(
+    "/xrpc/tools.aurora.example.someEndpoint",
+    get(handler),
+    CapsBuilder::new(Family::Example, 1).omitted(),
+)
+```
+
+Omitted routes are excluded from `describeCapabilities`'s output but still registered in axum's router (so they remain HTTP-reachable). The rationale for each omitted route is documented alongside its entry above.
+
+**At the v0.4 freeze, no admin-tier routes are omitted** (List A is empty per Step 0 Q6 classification). The two §8.15 vocabulary capabilities that lack backing endpoints (`invite-lineage-v1`, `reporter-context-v1`) are vocabulary-level omissions; no routes exist to mark. When those endpoints ship, their capability strings are added per the three-step procedure above and the omission notes here are removed.
+
+### Admin-tier scope
+
+The capability registry covers `tools.aurora.{admin,moderator,ops,superadmin}.*` — verified by the regex centralized at `src/api/registry.rs::ADMIN_TIER_PATH_REGEX`:
+
+```
+^/xrpc/tools\.aurora\.(admin|moderator|superadmin|ops)(\.|$)
+```
+
+Routes outside this regex are out of capability-registry scope. The categorization below (List C) documents those out-of-scope categories.
+
+### Non-admin-tier routes (List C) — out of capability-registry scope
+
+The application registers a number of routes outside the admin-tier regex. They're intentionally not tracked in the registry; each category has a different advertisement mechanism:
+
+- **bsky-PDS-compat namespace** (`com.atproto.admin.*`): the Aurora capability registry advertises Aurora extensions, not the bsky-base admin surface. These endpoints remain functional and discoverable via lexicon-based discovery; they're advertised through the AT Protocol's lexicon mechanisms, not this registry.
+- **Capability-registry meta-endpoint** (`tools.aurora.describeCapabilities`): the meta-endpoint that describes the registry can't itself be in the registry it describes (self-referential). The endpoint exists and is HTTP-reachable; its presence is the precondition for capability discovery.
+- **Public XRPC namespaces** (`com.atproto.server.*`, `.sync.*`, `.identity.*`, `.repo.*`, `.label.*`, `.federation.*`, `.moderation.*`, `.temp.*`, and other public surfaces): non-admin authority; advertised through lexicon-based discovery, not the admin capability surface.
+- **Health checks and well-known endpoints** (`/health`, `/.well-known/atproto-did`, `/.well-known/did.json`, etc.): infrastructure routes with no admin authority and no XRPC shape.
+- **Admin UI static assets** (`/admin/*` via `ServeDir`): static file routes; not XRPC; not capability-bearing.
+- **Public OAuth surface** (`/oauth/authorize`, `/consent`, `/token`, `/grant`, `/deny`, and other OAuth-dance endpoints): required for the OAuth flow to work for non-admin users; no admin authority.
+- **Internal OAuth bootstrap** (`/oauth/admin/*`): admin-flavored but private to the OAuth machinery; not user-facing capability advertisement.
+- **Prometheus scrape endpoint** (`/metrics`): public per scrape convention; not capability-bearing.
+
+Routes added to any of these categories follow the existing per-category convention (i.e., register via `.route(...)` on the same builder, with no `CapsBuilder`). Adding a new category — i.e., a class of admin-flavored routes that intentionally aren't capability-bearing — requires a §8.15 update so future readers know why.
 
 ### Notes
 
 - Capability strings are versioned (`-v1`) so future incompatible changes can ship as `-v2` while v1 remains advertised for clients depending on the original shape.
 - The substrate primitive 21 reads this list on session start and uses it to route requests. Adding a capability to the server's response automatically activates the corresponding UI path.
+- The byte-for-byte wire snapshot is pinned by `test_admin_route_registry_completeness` in `src/api/admin.rs`'s test module; the structural invariants (every family appears, extensions match `WIRE_EXTENSION_ORDER`) are pinned by the same test's structural assertions.
+- The `<kebab-family>-v<integer>` versioning convention is locked by the contract-phrase test `wire_extension_order_has_versioning_pattern` in `tests/contract_phrases.rs`, which anchors on `WIRE_EXTENSION_ORDER`'s docstring in `src/api/registry.rs`.
 
 ## 8.16 New endpoint — `tools.aurora.admin.getRuntimeSetting` and `setRuntimeSetting`
 
@@ -4804,23 +4856,23 @@ Some UI work can land before the first endpoint-bearing sub-phase if the substra
 
 In practice, this work most likely clusters in #108 because that's where the comprehensive overhaul lands, but if any sub-phase has UI bandwidth and benefits from these incremental wins, they can ship early without dependency conflicts.
 
-## 9.5 Post-cycle (deferred to v0.3)
+## 9.5 Post-cycle deferrals (originally for v0.3; carried forward through v0.4)
 
-The Section 2.2 deferred items are explicitly out of scope for v0.2. Implementation phasing acknowledges:
+The Section 2.2 items below were out of scope for v0.2 and originally framed as v0.3-evaluation candidates. v0.3 and v0.4 didn't absorb any of them; each remains a v0.5+ candidate. Per-item current state lives in §2.2 above:
 
-- Hover-card context previews
-- Calendar widget enhancements (multi-month view, etc.)
-- Bulk operations beyond the six batch endpoints
-- Time-bounded historical export
-- Hardened SSR for record render
-- Multi-tenant UI configuration
-- Visual redesign work
-- Mobile-first treatment
-- Operator activity dashboards
-- Rich text editing for rationale
-- Federated cross-PDS subject views
+- Hover-card context previews (§2.2.1)
+- Calendar widget enhancements (§2.2.2)
+- Bulk operations beyond the six batch endpoints (§2.2.3)
+- Time-bounded historical export (§2.2.4)
+- Hardened SSR for record render (§2.2.5)
+- Multi-tenant UI configuration (§2.2.6)
+- Visual redesign work (§2.2.7)
+- Mobile-first treatment (§2.2.9)
+- Operator activity dashboards (§2.2.10)
+- Rich text editing for rationale (§2.2.11)
+- Federated cross-PDS subject views (§2.2.12)
 
-These items may sequence into a v0.3 cycle plan once v0.2 ships and operator usage informs priority. The design doc commits to v0.2 boundaries; v0.3 planning is separate work.
+Current candidate tracking lives in `docs/v05-candidates.md` and successors; this section captures the original v0.2-cycle list for archaeological context.
 
 ## 9.6 Phase milestones
 
@@ -5627,11 +5679,9 @@ Implementation of these primitives must reference `t()` and `Intl` APIs througho
 
 # 12. Migration from current static/admin/
 
-This section specifies the file-level transition from the current `static/admin/` scaffolding to the v0.2 structure. It answers "where does the new code live, what happens to existing files, and how do we get from here to there without breaking the deployed UI."
+This section captures the v0.2-cycle file-level transition from the pre-v0.2 `static/admin/` scaffolding to the v0.2 structure — historical record of "where does the new code live, what happens to existing files, and how do we get from here to there without breaking the deployed UI." The migration completed during the v0.2 cycle (chainlink #108 — UI completion pass); v0.3 and v0.4 have layered additive changes onto the v0.2 target structure rather than restructuring it. Read this section as archival context.
 
-The transition lands within #108 (UI completion pass) but the planning happens here so chainlink work can sequence file moves cleanly.
-
-## 12.1 Current structure
+## 12.1 Pre-v0.2 structure (historical)
 
 ```
 static/admin/
@@ -6166,7 +6216,7 @@ The v0.2 cycle's CI is documented in CLAUDE.md and existing chainlink work; the 
 - Layer 3 (manual verification) runs once per phase milestone, not on every push. Performed during #108 work and documented per the checklist format.
 - Cycle-end audits run once at end-of-cycle as part of #107, #109, #110 chainlink work.
 
-The CI commitment is realistic for the cycle bandwidth. Adding heavy test infrastructure (extensive E2E suites, visual regression testing, etc.) is deferred to v0.3 if the v0.2 testing approach proves insufficient.
+The CI commitment was realistic for the v0.2 cycle bandwidth and has held through v0.4. Heavier test infrastructure (extensive E2E suites, visual regression testing, etc.) was originally deferred to v0.3; neither v0.3 nor v0.4 absorbed it, and the v0.2 testing approach has not proved insufficient. Re-evaluation is a v0.5+ candidate.
 
 ## 13.7 Known testing gaps
 
@@ -6210,33 +6260,33 @@ Items here are not commitments to ship in v0.3 specifically. They're catalog of 
 
 ## 14.3 Forensic and audit enhancements
 
-**Time-bounded historical export.** `exportAccountForensic` produces a current-state bundle. Reconstructing past account states for historical export ("the account as it was on March 1") requires sequencer replay infrastructure that is not in v0.2 scope. Forensic exports in v0.2 are point-in-time snapshots taken at the moment of export. v0.3 may add temporal export if operator needs justify the implementation cost.
+**Time-bounded historical export.** `exportAccountForensic` produces a current-state bundle. Reconstructing past account states for historical export ("the account as it was on March 1") requires sequencer replay infrastructure that was out of scope for v0.2 and remains so at v0.4. Forensic exports are point-in-time snapshots taken at the moment of export. A future cycle could add temporal export if operator needs justify the implementation cost.
 
-**Per-account export browser.** v0.2's Account detail page launches forensic export but doesn't surface previous exports for the account. Operators wanting "what exports of this account have happened" reference the audit chain. v0.3 may add a "previous exports" list directly on Account detail.
+**Per-account export browser.** Account detail launches forensic export but doesn't surface previous exports for the account (v0.2 baseline; v0.4 unchanged). Operators wanting "what exports of this account have happened" reference the audit chain. A future cycle could add a "previous exports" list directly on Account detail.
 
-**Bulk forensic export.** v0.2 supports single-account forensic export. Bulk export across multiple accounts is deferred to v0.3.
+**Bulk forensic export.** Bulk export across multiple accounts has been deferred since v0.2 and remained out of scope through v0.4. v0.5+ candidate.
 
-**Audit chain export.** Operators wanting to share or archive the audit chain (or a slice of it) currently have no UI for that. v0.3 may add audit chain export with chain-of-custody verification metadata.
+**Audit chain export.** Operators wanting to share or archive the audit chain (or a slice of it) have no dedicated UI for that (v0.2 baseline; v0.4 unchanged). A future cycle could add audit chain export with chain-of-custody verification metadata.
 
-**Snapshot comparison view.** When viewing an event detail page, the snapshot at decision time is shown. Comparing the snapshot to current subject state ("what changed since the action was taken") is potentially useful for forensic investigation but not in v0.2. v0.3 may add diff visualization.
+**Snapshot comparison view.** When viewing an event detail page, the snapshot at decision time is shown. Comparing the snapshot to current subject state ("what changed since the action was taken") is potentially useful for forensic investigation; it remained out of scope through v0.4. A future cycle could add diff visualization.
 
 ## 14.4 Accessibility extensions
 
-**WCAG 2.2 Level AAA.** v0.2 commits to WCAG 2.2 Level AA. AAA is stricter (7:1 contrast for normal text instead of 4.5:1, longer focus retention requirements, etc.) and exceeds typical enterprise UI standards. v0.3 evaluates if the additional rigor is worth the constraint cost; v0.2 stops at AA.
+**WCAG 2.2 Level AAA.** v0.2 committed to WCAG 2.2 Level AA and v0.4 preserves that floor. AAA is stricter (7:1 contrast for normal text instead of 4.5:1, longer focus retention requirements, etc.) and exceeds typical enterprise UI standards. A future cycle could evaluate if the additional rigor is worth the constraint cost.
 
-**Right-to-left language support.** v0.2 ships English-only with i18n-ready scaffolding. Adding RTL languages (Arabic, Hebrew) requires layout flipping, bidirectional text handling, and CSS logical properties throughout. v0.3 evaluates if RTL is warranted based on translator interest.
+**Right-to-left language support.** English-only with i18n-ready scaffolding (v0.2 baseline; v0.4 unchanged). Adding RTL languages (Arabic, Hebrew) requires layout flipping, bidirectional text handling, and CSS logical properties throughout. A future cycle could evaluate if RTL is warranted based on translator interest.
 
-**Mobile-first design.** v0.2 is desktop-first with responsive breakpoints down to 768px. Phone-shaped viewports (< 480px) aren't optimized. v0.3 may evaluate mobile-first treatment if operator usage on mobile becomes significant — typically operators use tablets or laptops for administrative work.
+**Mobile-first design.** Desktop-first with responsive breakpoints down to 768px (v0.2 baseline; v0.4 unchanged). Phone-shaped viewports (< 480px) aren't optimized. A future cycle could evaluate mobile-first treatment if operator usage on mobile becomes significant — typically operators use tablets or laptops for administrative work.
 
-**High-contrast mode.** Some operating systems have high-contrast modes that benefit users with severe contrast needs. v0.2's color palette respects `prefers-contrast: high` via CSS but doesn't ship dedicated high-contrast variants. v0.3 may add explicit high-contrast variants if the system-level support proves insufficient.
+**High-contrast mode.** The color palette respects `prefers-contrast: high` via CSS but doesn't ship dedicated high-contrast variants (v0.2 baseline; v0.4 unchanged). A future cycle could add explicit high-contrast variants if the system-level support proves insufficient.
 
 ## 14.5 Render and content handling
 
-**Maximally hardened SSR for record render.** v0.2 ships server-side render with sanitization and media proxy. The most hardened pattern (full SSR with no JavaScript execution context, dedicated sandboxed render environment) is deferred. v0.3 may extend if a deployment posture warrants it.
+**Maximally hardened SSR for record render.** Server-side render with sanitization and media proxy shipped in v0.2 and persists through v0.4. The most hardened pattern (full SSR with no JavaScript execution context, dedicated sandboxed render environment) remains deferred. A future cycle could extend if a deployment posture warrants it.
 
-**Federated cross-PDS subject views.** When viewing a record on this PDS, references to records on other PDSes render as references with link-out, not inline content. Cross-PDS context fetching is not in v0.2 scope. v0.3 may add if operator workflows indicate the value exceeds the implementation cost (which includes federation reliability concerns and performance under network failures).
+**Federated cross-PDS subject views.** When viewing a record on this PDS, references to records on other PDSes render as references with link-out, not inline content (v0.2 baseline; v0.4 unchanged). A future cycle could add cross-PDS context fetching if operator workflows indicate the value exceeds the implementation cost (which includes federation reliability concerns and performance under network failures).
 
-**Rich text editing for rationale fields.** Rationale fields are plain `<textarea>` in v0.2. Markdown rendering, rich text controls, @-mentions of other operators, image attachments are deferred. Rationales are operational notes; plain text is sufficient. Future cycles may extend if operator workflows demand richer authoring.
+**Rich text editing for rationale fields.** Rationale fields are plain `<textarea>` (v0.2 baseline; v0.4 unchanged). Markdown rendering, rich text controls, @-mentions of other operators, image attachments remain deferred. Rationales are operational notes; plain text is sufficient. Future cycles may extend if operator workflows demand richer authoring.
 
 ## 14.6 Multi-tenant and deployment variants
 
@@ -6267,3 +6317,97 @@ A few directional thoughts that aren't specific deferred features but inform how
 **Deferred items aren't second-class.** The list above isn't "things that don't matter." It's "things that don't fit v0.2's ambitious-but-finite scope." Several items would meaningfully improve operator experience and may rank high in v0.3 prioritization. The cycle planning makes the call; this doc just records what's open.
 
 **Aurora-Locus's UI is its own product.** It interoperates with the broader ATProto ecosystem but stands alone. Future cycles preserve that independence. The UI doesn't become coupled to specific external systems even when those systems prove popular pairings.
+
+# 15. v0.4 (Arc 6) migration notes
+
+Section added during the v0.4 cycle close. This section is additive: it documents the substantive changes Arc 6 landed against the UI substrate without restructuring the v0.2-era prose above. Each subsection cross-references the section it amends.
+
+## 15.1 Modal substrate API extension (amends §5.6, §7.10)
+
+`AuroraModal` gained two static helper methods that compose the existing `open()` / `close()` substrate. Both return promises that resolve on submit/cancel/escape, with focus management, focus-trap, and aria-modal preserved from the base substrate.
+
+```javascript
+// Generic form input — collects 1+ fields with validation.
+// fields: [] is the zero-field shape used for non-destructive yes/no
+// confirms; body text becomes the question, submitting confirms.
+AuroraModal.form({ heading, body, fields, submitLabel })
+  → Promise<{ submitted, values? }>
+
+// Destructive confirmation — typed-confirm gate + optional rationale +
+// optional ack checkbox. Used for the canonical role-revoke pattern
+// (typedConfirmGate: 'REVOKE', rationaleRequired: true).
+AuroraModal.destructiveConfirm({ heading, body, typedConfirmGate,
+  rationaleRequired, ackCheckbox, confirmLabel })
+  → Promise<{ confirmed, rationale?, ackChecked? }>
+```
+
+Supported `form` field types: `text`, `password`, `textarea`, `checkbox`, `select`. The `select` type was added during Arc 6 Step 4 to support the `AccountDetail.toggleInvites` migration (replacing an inverted-OK-Cancel native confirm).
+
+13 native `confirm()` / `prompt()` call sites migrated to the helpers per Arc 6's modal-consolidation work. Operator UX is now uniform across destructive actions, form input, and informational yes/no prompts.
+
+## 15.2 Error-translation infrastructure (amends §7.6)
+
+A new module `static/admin/scripts/api/error-translations.js` provides server-error-code → operator-friendly prose translation. The 4xx handling path in `client.js` consults this table when a structured `error` field is present on the response body; falls back to the legacy `'HTTP <status>: <message>'` rendering when the code is unknown.
+
+Seeded with the four v0.3 codes: `SubjectVariantMismatch`, `SubjectTargetMismatch`, `OrphanedAppeal`, `SubjectsArrayInvalidForAction`. New error codes shipping on the backend land as one-line table entries in the module.
+
+The thrown `Error` from `client.js`'s 4xx path now carries: `status`, `code`, `serverMessage`, `detailsAvailable` (true when translation hit), `failingSubject`, `failingSubjectId`. The per-subject envelope fields (`failingSubject`, `failingSubjectId`) inline-render after the message when present — operators see which subject in a batch caused an atomic abort.
+
+## 15.3 v0.3 wire-format absorbing (amends §8.4.1, §8.8–§8.13)
+
+The UI now constructs canonical v0.3 wire shapes against all admin-tier endpoints:
+
+- **`emitEvent` multi-subject**: `ActionPanel.buildPayload()` emits `subjects: [this.subject]` (single-subject wrapped in a one-element array) per the v0.3 reshape. The legacy `subject: Subject` shape is no longer constructed by the UI.
+- **Batch handlers**: the response shape's dropped `failures` field is no longer read; the `affected_count` field renders as "Processed N subject(s)" (the v0.3 atomic-batch semantic) rather than as partial-success counts.
+- **`BulkActionPanel` per-action caps**: `MAX_BATCH_SIZE` is now a per-action lookup `{ DeleteAccount: 10, DeleteBlob: 25, default: 50 }`. The cap is consulted via `currentMaxBatchSize()` which follows the selected action.
+- **`SettingSource` parity**: `SettingsGeneral` and `SettingsUiModes` both render all four tier values (Runtime, File, Default, RecoveryMode) with informational suffixes. Runtime renders bare (operator-set normal case); the others get muted-italic `(default)` / `(file)` / `(recovery override)` tags inline with the setting label.
+
+## 15.4 v0.3 wire-format adopting features (amends §5.3.8, §5.3.9, §6.7)
+
+Five net-new feature surfaces from v0.3 are now consumed:
+
+- **`cascadeSnapshotIds` display** on audit-entry detail: paired-by-index with `cascadeSubjects`, rendered as a structured `<ul>` with per-subject click-throughs via `AuroraEntityRef.fromSubject` and inline `<code>` for the snapshot id (no detail-page route for snapshots today; rendered as plain code).
+- **`subject_cid` filter** on the audit-list filter strip: free-text input adjacent to the existing subject-DID field.
+- **`chainVerified` indicator** on the audit page header: three-state badge (✓ verified through entry M / ⚠ verified through M, failure at M+1 / ✗ failed at entry 1) with click-to-expand inline detail panel. The detail panel surfaces the chain-walk CLI suggestion (`aurora-locus debug verify-audit-chain`) for operator diagnostic use.
+- **`timeRange` preset dropdown** on the Dashboard's moderation-metrics card: `last_hour` / `last_24h` / `last_7d` / `last_30d` presets; default `last_30d` preserves the prior 30-day window.
+- **`auditEntryId` toast click-through** on 11 success toasts (emit_event via ActionPanel + 6 batch endpoints via BulkActionPanel + triggerPasswordReset + exportAccountForensic + setRuntimeSetting + revokeRole). The `AuroraToast` API gained an optional `action: { label, href }` argument; clicking the action link navigates to the audit-entry detail via the existing `#mod/audit/<id>` hash route.
+
+## 15.5 Role-management action UI (amends §5.5.3, §5.5.4)
+
+`SettingsRoles.js` and `SettingsRolesMembers.js` gained grant + revoke affordances:
+
+- **Grant flow**: per-tier "Grant role" button opens an `AuroraModal.form` with `did` (text, required, `did:` prefix validated client-side) and `rationale` (textarea, required) fields. On success, surfaces an audit-entry click-through toast.
+- **Revoke flow**: per-member "Revoke" button opens an `AuroraModal.destructiveConfirm` with `typedConfirmGate: 'REVOKE'` + `rationaleRequired: true`. Canonical destructive-confirm example for the design.
+
+The "View role audit trail" dual-link UX described in earlier drafts is **deferred to v0.5+** — the audit-list page doesn't currently read hash query params on mount, and adding that capability is a substrate addition beyond Arc 6's scope. Operators reach the audit trail via the sidebar entry and apply filters manually for now.
+
+## 15.6 CLI sentinel rendering (amends §6.1)
+
+`AuroraEntityRef.account(did, handle?)` gained a `cli:`-prefix detection branch that returns a non-clickable `<span class="entity-ref entity-ref--cli">CLI: <suffix></span>` badge. CLI-emitted audit entries set `actor_did` to sentinel strings like `cli:bootstrap` or `cli:gc-sweep`; rendering them as clickable links to `#ops/accounts/...` 404'd, since the CLI isn't a runtime account.
+
+The patch lives in one place (`EntityRef.js`) and propagates automatically to all seven actor-rendering surfaces (Audit list, Audit detail, Events list + live-prepend, Event detail, AccountDetail recent-actions). The `entity-ref--cli` CSS rule uses a subdued bordered chip with monospace font + `cursor: default` to visually distinguish CLI identities from runtime users.
+
+## 15.7 Backend dual-shape observability (amends §8.4.1, §7.6)
+
+Two backend endpoints gained dual-shape request acceptance for clients still on v0.2 wire shapes during the migration window:
+
+- **`tools.aurora.admin.emitEvent`**: accepts canonical `subjects: Vec<Subject>` (v0.3) and legacy `subject: Subject` (v0.2). Normalizes legacy to `vec![s]` during Deserialize.
+- **`com.atproto.admin.updateSubjectStatus`**: accepts canonical `record_uri` (snake_case) and legacy `recordUri` (camelCase) on the `RepoBlobRef` subject variant.
+
+Both reject requests that send both shapes simultaneously with a 400 + explicit error message.
+
+Operator observability:
+
+- **Metrics counter** `aurora_legacy_wire_ingest_total{endpoint, shape, field}`: incremented once per legacy-shape request. Operators query via Prometheus to track migration progress.
+- **Structured tracing log** `legacy_wire_shape_ingested` at INFO level with `endpoint`, `shape`, `field` structured fields. Cross-reference with access logs to identify specific clients.
+
+**Response headers** (`Deprecation`, `Sunset`, `Warning`, `X-Wire-Migration-Guide`) are **not emitted in v0.4**. The `emit_legacy_wire_headers()` helper is in place at `src/api/middleware.rs` but isn't called from the dual-shape handlers — wiring would require restructuring handler return types from `Json<T>` to `Response`, which ripples through ~43 test call sites. Deferred to v0.5+; documented in `docs/operator/v03-wire-deprecation-rollout.md` so operators don't expect them today.
+
+The JWT-deprecation middleware (`jwt_deprecation_headers` in `src/api/middleware.rs`) was wired into the router stack during Arc 6 Step 8 — previously defined but never registered as a layer. The wiring pattern serves as a reference for the deferred wire-shape response-header work.
+
+## 15.8 Operator docs added
+
+Two new operator-facing docs landed during Arc 6:
+
+- `docs/operator/running-ui-tests.md` — how to run `static/admin/scripts/api/__tests__/` against the working tree (Node ≥ 18, per-file invocation). Resolves the "didn't run the tests" friction that recurred across Arc 6 Steps 2–4.
+- `docs/operator/v03-wire-deprecation-rollout.md` — affected endpoints, the metrics counter + PromQL snippets, the structured tracing event, the response-header gap explicitly flagged, the per-endpoint migration checklist with before/after request body samples, and the `PDS_V03_WIRE_SUNSET_DATE` env var documentation.

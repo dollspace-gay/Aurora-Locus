@@ -61,7 +61,13 @@
   }
 
   async function runGC() {
-    if (!confirm('Run blob garbage collection? This may take a few minutes.')) return;
+    const result = await global.AuroraModal.form({
+      heading: 'Run blob garbage collection?',
+      body: 'This may take a few minutes. The operation is safe to interrupt.',
+      fields: [],
+      submitLabel: 'Run GC',
+    });
+    if (!result.submitted) return;
     try {
       await global.AuroraClient.post('tools.aurora.ops.runBlobGC', {});
       global.AuroraToast.success('Blob GC started.');

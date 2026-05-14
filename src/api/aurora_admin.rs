@@ -66,8 +66,15 @@ use std::collections::HashSet;
 /// Per-action support and per-action `subjects.len()` caps are
 /// enforced in Phase 0 of the handler. See §8.3.4 for the action
 /// vocabulary and §8.3.1 for the atomicity scope.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// **Dual-shape acceptance** (Arc 6 Step 7, V04_DESIGN §5.3.6):
+/// requests using the legacy v0.2 `subject: Subject` shape are
+/// accepted and normalized to the canonical `subjects: vec![s]`
+/// during Deserialize. When the legacy shape is parsed,
+/// `legacy_subject_used` is set to `true`; the handler reads this
+/// to record a metrics counter increment for operator-visible
+/// migration tracking.
+#[derive(Debug)]
 pub struct EmitEventInput {
     pub action: ModEventAction,
     pub subjects: Vec<Subject>,
@@ -77,14 +84,73 @@ pub struct EmitEventInput {
     /// transaction opens (Phase 1 of the handler) so a snapshot can
     /// outlive a rolled-back mutation — an intentional carve-out from
     /// whole-tx atomicity per §8.3.1's orphan-snapshot rule.
-    #[serde(default = "default_true")]
     pub snapshot_capture: bool,
     /// Action-specific options (e.g. `{"durationDays": 7}` for
     /// SuspendAccount, `{"reason": "csam", "legalReference": "..."}`
     /// for QuarantineBlob). Per-action interpretation documented in
     /// the dispatch matrix below.
-    #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// True when this input was deserialized from the legacy v0.2
+    /// `subject: Subject` single-subject shape (vs. the canonical
+    /// v0.3 `subjects: Vec<Subject>` array). Set by the custom
+    /// Deserialize impl; the handler reads it to record a
+    /// legacy-wire-shape counter increment via
+    /// [`crate::metrics::record_legacy_wire_ingest`]. Not part of
+    /// the wire shape — purely an in-memory observability flag.
+    pub legacy_subject_used: bool,
+}
+
+/// Wire-side scaffold for [`EmitEventInput`]'s custom Deserialize.
+/// Holds both shape variants as optional fields; the manual impl
+/// matches on which were present and normalizes.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EmitEventInputRaw {
+    action: ModEventAction,
+    /// Canonical v0.3 multi-subject shape.
+    #[serde(default)]
+    subjects: Option<Vec<Subject>>,
+    /// Legacy v0.2 single-subject shape; accepted during dual-shape
+    /// window per V04_DESIGN §5.3.6.
+    #[serde(default)]
+    subject: Option<Subject>,
+    rationale: String,
+    #[serde(default = "default_true")]
+    snapshot_capture: bool,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for EmitEventInput {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let raw = EmitEventInputRaw::deserialize(d)?;
+        let (subjects, legacy_subject_used) = match (raw.subjects, raw.subject) {
+            (Some(ss), None) => (ss, false),
+            (None, Some(s)) => (vec![s], true),
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "emitEvent accepts either canonical 'subjects' \
+                     (array of Subject) or legacy 'subject' (single Subject), \
+                     not both; pick exactly one shape per request",
+                ));
+            }
+            (None, None) => {
+                return Err(D::Error::custom(
+                    "emitEvent requires either canonical 'subjects' \
+                     (array of Subject) or legacy 'subject' (single Subject)",
+                ));
+            }
+        };
+        Ok(EmitEventInput {
+            action: raw.action,
+            subjects,
+            rationale: raw.rationale,
+            snapshot_capture: raw.snapshot_capture,
+            metadata: raw.metadata,
+            legacy_subject_used,
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -289,40 +355,6 @@ fn forbidden(reason: &str) -> (StatusCode, Json<serde_json::Value>) {
             "message": reason,
         })),
     )
-}
-
-/// Subject → DID extractor for actions that target an account.
-/// Returns `None` for non-Repo subjects.
-fn require_repo_did(subject: &Subject) -> Result<&str, (StatusCode, Json<serde_json::Value>)> {
-    match subject {
-        Subject::Repo { did } => Ok(did.as_str()),
-        _ => Err(validation(
-            "action requires a Repo subject (did:plc:...) but got a Record or Blob subject",
-        )),
-    }
-}
-
-/// Subject → (URI, optional CID) for actions targeting a record or
-/// label-able subject. Records use `(uri, Some(cid))`; account labels
-/// can target a Repo subject's DID-as-URI form.
-fn subject_uri_cid(
-    subject: &Subject,
-) -> Result<(String, Option<String>), (StatusCode, Json<serde_json::Value>)> {
-    match subject {
-        Subject::Record { uri, cid } => Ok((uri.clone(), Some(cid.clone()))),
-        Subject::Repo { did } => Ok((format!("at://{}", did), None)),
-        Subject::Blob { did, cid, .. } => Ok((format!("at://{}", did), Some(cid.clone()))),
-    }
-}
-
-/// Subject → CID for blob-targeting actions.
-fn require_blob_cid(subject: &Subject) -> Result<&str, (StatusCode, Json<serde_json::Value>)> {
-    match subject {
-        Subject::Blob { cid, .. } => Ok(cid.as_str()),
-        _ => Err(validation(
-            "action requires a Blob subject ($type=com.atproto.admin.defs#repoBlobRef)",
-        )),
-    }
 }
 
 /// Bridge `Subject` → flat columns for `moderation_event` insertion.
@@ -583,8 +615,33 @@ impl DispatchEffects {
 pub async fn emit_event(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
-    Json(input): Json<EmitEventInput>,
+    crate::api::extractors::AuroraJson(input): crate::api::extractors::AuroraJson<EmitEventInput>,
 ) -> Result<Json<EmitEventOutput>, (StatusCode, Json<serde_json::Value>)> {
+    // Arc 6 Step 7: legacy wire-shape observability. When the input
+    // was deserialized from the v0.2 `subject: Subject` shape, record
+    // a counter increment + structured log so operators tracking
+    // migration progress can see which clients still send the legacy
+    // shape. Response headers (Deprecation, Sunset, Warning,
+    // X-Wire-Migration-Guide) are NOT emitted here — adding them
+    // would require restructuring the handler return type from
+    // `Json<EmitEventOutput>` to `Response`, which would ripple
+    // through 29 test call sites. Counter + log is sufficient for
+    // the observability goal of §5.3.6; headers are a follow-up
+    // cycle decision (flagged in Step 7 report).
+    if input.legacy_subject_used {
+        crate::metrics::record_legacy_wire_ingest(
+            "tools.aurora.admin.emitEvent",
+            "v0.2_single_subject",
+            "subject",
+        );
+        tracing::info!(
+            endpoint = "tools.aurora.admin.emitEvent",
+            shape = "v0.2_single_subject",
+            field = "subject",
+            "legacy_wire_shape_ingested"
+        );
+    }
+
     // === Phase 0: input validation ===
     check_role(&auth, &input.action)?;
 
@@ -2210,7 +2267,7 @@ pub struct TriggerPasswordResetOutput {
     pub reset_email_sent: bool,
     /// Format: "e****@example.com" — first character + asterisks + @
     /// + domain. Confirms the right email was used without exposing
-    /// full PII to the operator session.
+    ///   full PII to the operator session.
     pub masked_email: String,
     pub audit_entry_id: String,
 }
@@ -2659,7 +2716,7 @@ async fn compute_metric(
     } else if metric == MetricType::AverageTimeToResolution {
         "reported_at, reviewed_at".to_string()
     } else {
-        format!("{}", time_col)
+        time_col.to_string()
     };
     let sql = format!(
         "SELECT {} FROM {} WHERE {} >= $1 AND {} < $2 {}",
@@ -2974,35 +3031,31 @@ pub async fn export_account_forensic(
         serde_json::Value::Null
     };
 
-    // Audit chain entries (SuperAdmin-gated)
+    // Audit chain entries (SuperAdmin-gated). The audit-entries.json
+    // payload uses the canonical `AuditEntry` wire shape — same as
+    // `getAuditTrail`'s `items[]` — by routing each fetched row
+    // through `audit_chain::audit_entry_from_row`. Arc 9 Step 4 /
+    // chainlink #55 Item 2 closed the prior divergence (raw-i64 ids,
+    // `createdAt` instead of `timestamp`, missing `subjectRef` /
+    // `verified` / cascade fields); see V04_DESIGN.md §8.4.4.
     let audit_entries: serde_json::Value = if input.include_audit_chain {
         let rows = sqlx::query(
             "SELECT id, sequence, created_at, actor_did, action, subject_did, \
-                    rationale, snapshot_id, event_id, current_hash, previous_hash \
+                    subject_uri, subject_cid, rationale, snapshot_id, event_id, \
+                    current_hash, previous_hash, cascade_subjects, cascade_snapshot_ids \
              FROM audit_chain_entry WHERE subject_did = $1 ORDER BY sequence ASC",
         )
         .bind(&input.did)
         .fetch_all(&ctx.account_db)
         .await
         .map_err(internal)?;
-        use sqlx::Row as _;
         let entries: Vec<serde_json::Value> = rows
             .iter()
             .map(|r| {
-                serde_json::json!({
-                    "id": r.try_get::<i64, _>("id").unwrap_or(0),
-                    "sequence": r.try_get::<i64, _>("sequence").unwrap_or(0),
-                    "createdAt": r.try_get::<String, _>("created_at").unwrap_or_default(),
-                    "actorDid": r.try_get::<String, _>("actor_did").unwrap_or_default(),
-                    "action": r.try_get::<String, _>("action").unwrap_or_default(),
-                    "rationale": r.try_get::<String, _>("rationale").unwrap_or_default(),
-                    "snapshotId": r.try_get::<Option<i64>, _>("snapshot_id").ok().flatten(),
-                    "eventId": r.try_get::<Option<i64>, _>("event_id").ok().flatten(),
-                    "currentHash": r.try_get::<String, _>("current_hash").unwrap_or_default(),
-                    "previousHash": r.try_get::<Option<String>, _>("previous_hash").ok().flatten(),
-                })
+                let entry = audit_chain::audit_entry_from_row(r).map_err(internal)?;
+                serde_json::to_value(&entry).map_err(internal)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         serde_json::Value::Array(entries)
     } else {
         serde_json::Value::Null
@@ -3012,18 +3065,18 @@ pub async fn export_account_forensic(
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     files.push((
         "account-state.json".to_string(),
-        serde_json::to_vec_pretty(&account_state).map_err(|e| internal(e))?,
+        serde_json::to_vec_pretty(&account_state).map_err(internal)?,
     ));
     if input.include_moderation_history {
         files.push((
             "moderation-history.json".to_string(),
-            serde_json::to_vec_pretty(&mod_history).map_err(|e| internal(e))?,
+            serde_json::to_vec_pretty(&mod_history).map_err(internal)?,
         ));
     }
     if input.include_audit_chain {
         files.push((
             "audit-entries.json".to_string(),
-            serde_json::to_vec_pretty(&audit_entries).map_err(|e| internal(e))?,
+            serde_json::to_vec_pretty(&audit_entries).map_err(internal)?,
         ));
     }
 
@@ -3039,7 +3092,16 @@ pub async fn export_account_forensic(
         h.update(bytes);
         file_hashes.insert(name.clone(), serde_json::Value::String(hex::encode(h.finalize())));
     }
+    // schemaVersion="2" marks the audit-entries.json wire-format
+    // migration (Arc 9 Step 4 / chainlink #55 Item 2) where each row
+    // now uses the canonical `AuditEntry` shape instead of the prior
+    // inline serde_json::json! literal. Consumers scripted against the
+    // v1 shape (raw-i64 `id`, `createdAt` field name, missing
+    // `subjectRef` / `verified` / cascade fields) dispatch on this
+    // field. No backwards-compatibility logic inside Aurora-Locus —
+    // the binary always emits v2 going forward.
     let manifest = serde_json::json!({
+        "schemaVersion": "2",
         "did": input.did,
         "exportedAt": started_at.to_rfc3339(),
         "exportedBy": auth.did,
@@ -3055,10 +3117,10 @@ pub async fn export_account_forensic(
         "deferredContents": {
             "repoCar": input.include_repo,
             "blobs": input.include_blobs,
-            "note": "v0.2 forensic bundles ship metadata only; CAR + blob streaming lands in v0.3"
+            "note": "v0.2 forensic bundles ship metadata only; CAR + blob streaming remains a v0.5+ candidate"
         },
     });
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| internal(e))?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(internal)?;
 
     // audit-trail.json — included unconditionally as the bundle's own
     // chain anchor. The chain entry id and bundle hash both live in
@@ -3077,7 +3139,7 @@ pub async fn export_account_forensic(
     });
     files.push((
         "audit-trail.json".to_string(),
-        serde_json::to_vec_pretty(&trail).map_err(|e| internal(e))?,
+        serde_json::to_vec_pretty(&trail).map_err(internal)?,
     ));
 
     // TAR assembly — must complete before bundle hashing so the hash
@@ -3096,7 +3158,7 @@ pub async fn export_account_forensic(
         header.set_cksum();
         builder
             .append_data(&mut header, "manifest.json", &manifest_bytes[..])
-            .map_err(|e| internal(e))?;
+            .map_err(internal)?;
         for (name, bytes) in &files {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
@@ -3105,9 +3167,9 @@ pub async fn export_account_forensic(
             header.set_cksum();
             builder
                 .append_data(&mut header, name.as_str(), &bytes[..])
-                .map_err(|e| internal(e))?;
+                .map_err(internal)?;
         }
-        builder.finish().map_err(|e| internal(e))?;
+        builder.finish().map_err(internal)?;
     }
 
     // Bundle hash over the complete tar bytes. This is what the chain
@@ -3388,7 +3450,7 @@ pub async fn get_audit_trail(
         let sequence: i64 = row.try_get("sequence").map_err(internal)?;
         let created_at_str: String = row.try_get("created_at").map_err(internal)?;
         let timestamp = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-            .map_err(|e| internal(e))?
+            .map_err(internal)?
             .with_timezone(&chrono::Utc);
         let actor_did: String = row.try_get("actor_did").map_err(internal)?;
         let action: String = row.try_get("action").map_err(internal)?;
@@ -3870,7 +3932,7 @@ pub async fn set_runtime_setting(
     };
     let now = chrono::Utc::now().to_rfc3339();
     let value_json =
-        serde_json::to_string(&input.value).map_err(|e| internal(e))?;
+        serde_json::to_string(&input.value).map_err(internal)?;
 
     // LB-1 Session 12 / chainlink #129: runtime_settings upsert +
     // chain entry in one transaction. Upsert uses DELETE then INSERT
@@ -4010,8 +4072,6 @@ mod tests {
             rate_limit: RateLimitConfig {
                 enabled: false,
                 global_requests_per_minute: 3000,
-                use_redis: false,
-                redis_url: None,
                 exempt_admin_assets: true,
             },
             logging: LoggingConfig {
@@ -4027,8 +4087,16 @@ mod tests {
                 auto_stream_events: false,
             },
             validation_mode: PathBuf::from("required").into_os_string().to_string_lossy().parse().unwrap_or(crate::validation::ValidationMode::Required),
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
         };
-        AppContext::new(config).await.unwrap()
+        AppContext::new(
+            config,
+            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .unwrap()
     }
 
     /// Insert a minimal actor row so account-targeted actions resolve.
@@ -4055,12 +4123,13 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![repo_subject("did:plc:victim")],
                 rationale: "spam".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4101,12 +4170,13 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![repo_subject("did:plc:victim")],
                 rationale: "   ".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4120,7 +4190,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![Subject::Record {
                     uri: "at://did:plc:abc/app.bsky.feed.post/123".to_string(),
@@ -4129,6 +4199,7 @@ mod tests {
                 rationale: "wrong subject type".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4142,12 +4213,13 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::DeleteAccount,
                 subjects: vec![repo_subject("did:plc:victim")],
                 rationale: "test".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4169,7 +4241,7 @@ mod tests {
         let err = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::SendEmail {
                     template: None,
                     subject: "test subject".to_string(),
@@ -4179,6 +4251,7 @@ mod tests {
                 rationale: "Moderator may not emit SendEmail".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4193,7 +4266,7 @@ mod tests {
         let result = emit_event(
             State(ctx.clone()),
             admin_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::SendEmail {
                     template: None,
                     subject: "test subject".to_string(),
@@ -4203,6 +4276,7 @@ mod tests {
                 rationale: "Admin may emit SendEmail".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await;
@@ -4225,7 +4299,7 @@ mod tests {
         let resp = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ApplyLabel {
                     val: "regression".to_string(),
                     neg: false,
@@ -4237,6 +4311,7 @@ mod tests {
                 rationale: "moderator-flavored event still allowed".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4251,7 +4326,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ApplyLabel {
                     val: "spam".to_string(),
                     neg: false,
@@ -4263,6 +4338,7 @@ mod tests {
                 rationale: "obvious spam".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4321,7 +4397,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ResolveAppeal {
                     appeal_id: appeal.id,
                     resolution: AppealResolutionDecision::Approve,
@@ -4330,6 +4406,7 @@ mod tests {
                 rationale: "appeal valid".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4380,7 +4457,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ResolveAppeal {
                     appeal_id: appeal.id,
                     resolution: AppealResolutionDecision::Deny,
@@ -4389,6 +4466,7 @@ mod tests {
                 rationale: "denied".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -4417,12 +4495,13 @@ mod tests {
         let resp = emit_event(
             State(ctx),
             admin_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::DeleteAccount,
                 subjects: vec![repo_subject("did:plc:deleteme")],
                 rationale: "voluntary deletion".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -5565,12 +5644,13 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![repo_subject("did:plc:victim")],
                 rationale: "spam".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -5600,12 +5680,13 @@ mod tests {
         emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![repo_subject("did:plc:victim")],
                 rationale: "spam".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -6720,6 +6801,181 @@ mod tests {
         }
     }
 
+    /// Arc 9 Step 4 / chainlink #55 Item 2: the forensic bundle's
+    /// `audit-entries.json` must match `getAuditTrail`'s wire shape
+    /// field-for-field. Prior to this migration the two surfaces
+    /// diverged on field names (`createdAt` vs `timestamp`), types
+    /// (raw `i64` vs stringified), and four entirely-missing fields
+    /// (`subjectRef`, `verified`, `cascadeSubjects`,
+    /// `cascadeSnapshotIds`). This test pins the two paths against
+    /// each other so a future cycle can DRY both onto
+    /// `audit_chain::audit_entry_from_row` with confidence.
+    #[tokio::test]
+    async fn forensic_audit_entries_match_get_audit_trail_shape() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:parity", "parity.test").await;
+        // Seed the account row so the forensic handler's account
+        // lookup resolves.
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES ($1, $2, $3, NULL, FALSE)",
+        )
+        .bind("did:plc:parity")
+        .bind("parity@example.com")
+        .bind("$argon2id$dummy")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        // Append one chain entry against the subject so both paths
+        // have something non-empty to render.
+        crate::admin::audit_chain::append_entry(
+            &ctx.account_db,
+            crate::admin::audit_chain::AppendEntryParams {
+                actor_did: "did:plc:moderator",
+                action: "TakedownAccount",
+                subject: Some(&repo_subject("did:plc:parity")),
+                rationale: "spam-parity",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .unwrap();
+
+        // Fetch via getAuditTrail filtered to this subject.
+        let trail = get_audit_trail(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: Some("did:plc:parity".to_string()),
+                subject_uri: None,
+                subject_cid: None,
+                after_created: None,
+                before_created: None,
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(trail.items.len(), 1, "expect one chain entry for the subject");
+        let trail_entry_json = serde_json::to_value(&trail.items[0]).unwrap();
+
+        // Fetch the same row via the forensic-export handler (with
+        // include_audit_chain, which requires SuperAdmin).
+        let resp = export_account_forensic(
+            State(ctx.clone()),
+            super_admin_auth(),
+            Json(ExportAccountForensicInput {
+                did: "did:plc:parity".to_string(),
+                rationale: "parity check".to_string(),
+                include_repo: false,
+                include_blobs: false,
+                include_moderation_history: false,
+                include_account_metadata: false,
+                include_audit_chain: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        // Extract audit-entries.json from the TAR.
+        let mut archive = tar::Archive::new(&body_bytes[..]);
+        let mut forensic_entries_json: Option<serde_json::Value> = None;
+        for entry in archive.entries().expect("archive iterates") {
+            let mut entry = entry.expect("entry readable");
+            let path = entry.path().expect("path readable").to_path_buf();
+            let name = path.to_string_lossy();
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            entry.read_to_end(&mut buf).expect("entry body readable");
+            if name == "audit-entries.json" {
+                forensic_entries_json =
+                    Some(serde_json::from_slice(&buf).expect("audit-entries.json parses"));
+            }
+        }
+        let forensic_entries =
+            forensic_entries_json.expect("tar must contain audit-entries.json");
+        let forensic_array = forensic_entries
+            .as_array()
+            .expect("audit-entries.json is a JSON array");
+        assert_eq!(forensic_array.len(), 1, "expect one chain entry in the bundle");
+
+        // Field-for-field equality with the getAuditTrail item. If
+        // either path drifts in field names, types, or membership,
+        // this assertion fires.
+        assert_eq!(
+            forensic_array[0], trail_entry_json,
+            "forensic audit-entries.json must match getAuditTrail's per-item shape"
+        );
+    }
+
+    /// Arc 9 Step 4: manifest.json in the forensic bundle carries
+    /// `schemaVersion: "2"` marking the audit-entries wire-format
+    /// migration. Consumers dispatch on this field.
+    #[tokio::test]
+    async fn forensic_bundle_manifest_has_schema_version_2() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:schema", "schema.test").await;
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES ($1, $2, $3, NULL, FALSE)",
+        )
+        .bind("did:plc:schema")
+        .bind("schema@example.com")
+        .bind("$argon2id$dummy")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        let resp = export_account_forensic(
+            State(ctx.clone()),
+            admin_auth(),
+            Json(ExportAccountForensicInput {
+                did: "did:plc:schema".to_string(),
+                rationale: "schemaVersion check".to_string(),
+                include_repo: false,
+                include_blobs: false,
+                include_moderation_history: false,
+                include_account_metadata: false,
+                include_audit_chain: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        let mut archive = tar::Archive::new(&body_bytes[..]);
+        let mut manifest_json: Option<serde_json::Value> = None;
+        for entry in archive.entries().expect("archive iterates") {
+            let mut entry = entry.expect("entry readable");
+            let path = entry.path().expect("path readable").to_path_buf();
+            let name = path.to_string_lossy();
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            entry.read_to_end(&mut buf).expect("entry body readable");
+            if name == "manifest.json" {
+                manifest_json = Some(
+                    serde_json::from_slice(&buf).expect("manifest.json parses"),
+                );
+            }
+        }
+        let manifest = manifest_json.expect("tar must contain manifest.json");
+        assert_eq!(
+            manifest.get("schemaVersion").and_then(|v| v.as_str()),
+            Some("2"),
+            "manifest.schemaVersion must be \"2\" after Arc 9 Step 4 migration"
+        );
+    }
+
     // ---------- Phase 3.10 — runtime settings (§8.16) ----------
 
     fn super_admin_auth() -> AdminAuthContext {
@@ -6815,8 +7071,6 @@ mod tests {
             rate_limit: RateLimitConfig {
                 enabled: false,
                 global_requests_per_minute: 3000,
-                use_redis: false,
-                redis_url: None,
                 exempt_admin_assets: true,
             },
             logging: LoggingConfig {
@@ -6836,8 +7090,15 @@ mod tests {
                 .to_string_lossy()
                 .parse()
                 .unwrap_or(crate::validation::ValidationMode::Required),
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
         };
-        AppContext::new(config).await
+        AppContext::new(
+            config,
+            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
     }
 
     /// Arc 5 §9.4.2 / chainlink #124: file-tier value resolves
@@ -7317,12 +7578,13 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![],
                 rationale: "no subjects".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7343,7 +7605,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ResolveReport {
                     report_id: 42,
                     resolution: ReportResolution::Resolved,
@@ -7355,6 +7617,7 @@ mod tests {
                 rationale: "two subjects on a length-1 action".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7377,7 +7640,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![
                     repo_subject("did:plc:a"),
@@ -7387,6 +7650,7 @@ mod tests {
                 rationale: "spam ring".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7411,7 +7675,7 @@ mod tests {
         let resp = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ApplyLabel {
                     val: "spam".to_string(),
                     neg: false,
@@ -7429,6 +7693,7 @@ mod tests {
                 rationale: "spam wave".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7450,7 +7715,7 @@ mod tests {
         emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownRecord,
                 subjects: vec![
                     Subject::Record {
@@ -7465,6 +7730,7 @@ mod tests {
                 rationale: "spam posts".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7514,7 +7780,7 @@ mod tests {
         let err = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::RestoreBlob,
                 subjects: vec![
                     Subject::Blob {
@@ -7531,6 +7797,7 @@ mod tests {
                 rationale: "test rollback".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7597,7 +7864,7 @@ mod tests {
         let result = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![
                     repo_subject("did:plc:s0"),
@@ -7607,6 +7874,7 @@ mod tests {
                 rationale: "exercise orphan-snapshot semantics".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await;
@@ -7650,12 +7918,13 @@ mod tests {
         emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![repo_subject("did:plc:single")],
                 rationale: "single subject".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7687,7 +7956,7 @@ mod tests {
         emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ApplyLabel {
                     val: "test".to_string(),
                     neg: false,
@@ -7699,6 +7968,7 @@ mod tests {
                 rationale: "no snapshot".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7729,7 +7999,7 @@ mod tests {
         emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::TakedownAccount,
                 subjects: vec![
                     repo_subject("did:plc:m1"),
@@ -7738,6 +8008,7 @@ mod tests {
                 rationale: "multi-subject batch".to_string(),
                 snapshot_capture: true,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7777,7 +8048,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ResolveReport {
                     report_id: report.id,
                     resolution: ReportResolution::Resolved,
@@ -7789,6 +8060,7 @@ mod tests {
                 rationale: "wrong subject type".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7843,7 +8115,7 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::ResolveAppeal {
                     appeal_id: appeal.id,
                     resolution: AppealResolutionDecision::Approve,
@@ -7852,6 +8124,7 @@ mod tests {
                 rationale: "wrong target".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7875,12 +8148,13 @@ mod tests {
         let err = emit_event(
             State(ctx),
             admin_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::DeleteAccount,
                 subjects,
                 rationale: "over the cap".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7908,12 +8182,13 @@ mod tests {
         let err = emit_event(
             State(ctx),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::DeleteBlob,
                 subjects,
                 rationale: "over the cap".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -7962,7 +8237,7 @@ mod tests {
         let err = emit_event(
             State(ctx.clone()),
             moderator_auth(),
-            Json(EmitEventInput {
+            crate::api::extractors::AuroraJson(EmitEventInput {
                 action: ModEventAction::QuarantineBlob,
                 subjects: vec![
                     Subject::Blob {
@@ -7979,6 +8254,7 @@ mod tests {
                 rationale: "expect rollback".to_string(),
                 snapshot_capture: false,
                 metadata: None,
+                legacy_subject_used: false,
             }),
         )
         .await
@@ -8000,5 +8276,75 @@ mod tests {
         );
         // No new chain entry.
         assert_eq!(count_chain_entries(&ctx).await, chain_before);
+    }
+
+    // ---------- Arc 6 Step 7: emitEvent dual-shape Deserialize ----------
+    //
+    // Per V04_DESIGN §5.3.6 + Step 0 Q9. The input accepts both the
+    // canonical v0.3 `subjects: [Subject]` shape and the legacy v0.2
+    // `subject: Subject` shape during the deprecation window.
+
+    #[test]
+    fn emit_event_input_parses_canonical_subjects_shape() {
+        let json = r#"{
+            "action": {"kind": "TakedownAccount"},
+            "subjects": [{"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:abc"}],
+            "rationale": "spam"
+        }"#;
+        let input: EmitEventInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.subjects.len(), 1);
+        assert!(
+            !input.legacy_subject_used,
+            "canonical shape must not set legacy_subject_used"
+        );
+    }
+
+    #[test]
+    fn emit_event_input_parses_legacy_subject_shape_and_flags_it() {
+        let json = r#"{
+            "action": {"kind": "TakedownAccount"},
+            "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:abc"},
+            "rationale": "spam"
+        }"#;
+        let input: EmitEventInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.subjects.len(), 1);
+        assert!(
+            matches!(input.subjects[0], Subject::Repo { ref did } if did == "did:plc:abc"),
+            "legacy single-subject normalizes to subjects[0]"
+        );
+        assert!(
+            input.legacy_subject_used,
+            "legacy shape must set legacy_subject_used for handler-side observability"
+        );
+    }
+
+    #[test]
+    fn emit_event_input_rejects_both_shapes_simultaneously() {
+        let json = r#"{
+            "action": {"kind": "TakedownAccount"},
+            "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:abc"},
+            "subjects": [{"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:def"}],
+            "rationale": "spam"
+        }"#;
+        let err = serde_json::from_str::<EmitEventInput>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("not both"),
+            "error message must point at the both-shapes-present case; got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn emit_event_input_rejects_neither_shape() {
+        let json = r#"{
+            "action": {"kind": "TakedownAccount"},
+            "rationale": "spam"
+        }"#;
+        let err = serde_json::from_str::<EmitEventInput>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("requires either"),
+            "error message must point at the missing-shape case; got: {}",
+            err
+        );
     }
 }

@@ -1,6 +1,6 @@
 /// HTTP server setup and routing
 use crate::{
-    api::middleware::{check_account_moderation, namespace_scope_check},
+    api::middleware::{check_account_moderation, jwt_deprecation_headers, namespace_scope_check},
     context::AppContext,
     error::{PdsError, PdsResult},
     metrics,
@@ -24,9 +24,18 @@ use tower_http::{
 };
 use tracing::info;
 
-/// Build the main application router
-/// Returns Router<()> because state is already provided
-pub fn build_router(ctx: AppContext) -> Router {
+/// Build the main application router.
+///
+/// `api_router` is the pre-built `Router<AppContext>` returned by
+/// `crate::api::routes()`. Arc 8 Step 2 (chainlink #54): the
+/// api routes are constructed before `AppContext::new` so the
+/// `RouteRegistry` produced by `aurora_route_builder()` is
+/// available to thread into the context. Splitting the router
+/// construction out of this function keeps that ordering
+/// explicit at the `main.rs` callsite.
+///
+/// Returns `Router<()>` because state is already provided.
+pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
     // Create CORS layer
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -68,7 +77,7 @@ pub fn build_router(ctx: AppContext) -> Router {
         .route("/metrics", get(metrics_handler))
         // API routes (Phase 2) - merge before with_state
         // Note: describeServer route is registered in api/server.rs
-        .merge(crate::api::routes())
+        .merge(api_router)
         // Provide state - converts Router<AppContext> to Router<()>
         .with_state(ctx.clone())
         // Merge admin static files (after with_state so it doesn't need state)
@@ -86,7 +95,16 @@ pub fn build_router(ctx: AppContext) -> Router {
             namespace_scope_check,
         ))
         // Apply rate limiting middleware (after state so it can access AppContext)
-        .layer(middleware::from_fn_with_state(ctx, rate_limit_middleware))
+        .layer(middleware::from_fn_with_state(ctx.clone(), rate_limit_middleware))
+        // JWT-deprecation observability per Arc 6 Step 8: emits
+        // Deprecation/Sunset/Warning/X-OAuth-Migration-Guide
+        // response headers + increments the
+        // jwt_deprecation_warnings_total counter when the request
+        // carries a JWT-shaped bearer token (detected
+        // structurally — see token_looks_like_jwt). Outermost of
+        // the per-request layers so the headers reach the client
+        // verbatim.
+        .layer(middleware::from_fn_with_state(ctx, jwt_deprecation_headers))
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -117,8 +135,12 @@ async fn not_found() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// Start the HTTP server
-pub async fn serve(ctx: AppContext) -> PdsResult<()> {
+/// Start the HTTP server.
+///
+/// `api_router` is the pre-built `Router<AppContext>` produced by
+/// `crate::api::routes()`; see [`build_router`] for why this
+/// construction is hoisted out of the context flow.
+pub async fn serve(ctx: AppContext, api_router: Router<AppContext>) -> PdsResult<()> {
     // Bind to 0.0.0.0 to listen on all interfaces (IPv4 and IPv6)
     let bind_addr = format!("0.0.0.0:{}", ctx.config.service.port);
 
@@ -134,7 +156,7 @@ pub async fn serve(ctx: AppContext) -> PdsResult<()> {
     // `src/db/liveness_lock.rs`.
     let _liveness_lock = crate::db::liveness_lock::LivenessLock::acquire(&ctx.config).await?;
 
-    let app = build_router(ctx);
+    let app = build_router(ctx, api_router);
 
     // Create TCP listener
     let listener = tokio::net::TcpListener::bind(&bind_addr)

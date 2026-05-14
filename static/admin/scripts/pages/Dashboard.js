@@ -11,6 +11,28 @@
   let pollHandle = null;
   let activeFlavor = 'operator';
 
+  // Active preset for the moderation-metrics card. v0.3's
+  // getModerationMetrics added canonical `timeRange` preset accepting
+  // last_hour / last_24h / last_7d / last_30d; the server still
+  // accepts legacy `start`/`end` pairs via dual-shape Deserialize
+  // (aurora_admin.rs:2545-2597). The UI now sends the canonical
+  // shape unconditionally. Default preserves the prior 30-day window.
+  //
+  // No "Custom range" option ships with this preset selector — there
+  // is no existing custom-window picker on the Dashboard to preserve.
+  // Adding one is substantive UI work beyond Step 3 sub-3d's scope.
+  let metricsTimeRange = 'last_30d';
+
+  function metricsGranularityFor(preset) {
+    switch (preset) {
+      case 'last_hour': return 'hour';
+      case 'last_24h':  return 'hour';
+      case 'last_7d':   return 'day';
+      case 'last_30d':  return 'day';
+      default:          return 'day';
+    }
+  }
+
   function mount({ container }) {
     const session = global.AuroraSession;
     const isModerator = session ? session.hasRole('moderator') : false;
@@ -75,7 +97,18 @@
            statCard('clock', 'Oldest open report', 'mod-stat-oldest-age', '—') +
            '</div>' +
            '<div class="activity-card" style="margin-top: 1rem;">' +
-           '  <h3>Moderation metrics — last 30 days</h3>' +
+           '  <div class="metrics-header">' +
+           '    <h3>Moderation metrics</h3>' +
+           '    <label class="metrics-range-label" for="mod-metrics-range">' +
+           '      Time range' +
+           '      <select id="mod-metrics-range" class="metrics-range-select">' +
+           '        <option value="last_hour">Last hour</option>' +
+           '        <option value="last_24h">Last 24 hours</option>' +
+           '        <option value="last_7d">Last 7 days</option>' +
+           '        <option value="last_30d" selected>Last 30 days</option>' +
+           '      </select>' +
+           '    </label>' +
+           '  </div>' +
            '  <div id="mod-metrics-chart">' +
            (global.AuroraEmptyState ? global.AuroraEmptyState.render({ icon: 'loader-2', primary: 'Loading…' }) : 'Loading…') +
            '  </div>' +
@@ -165,6 +198,7 @@
   async function refreshModerator() {
     const ep = global.AuroraEndpoints;
     if (!ep) return;
+    wireMetricsRangeSelect();
     try {
       const stats = await ep.admin.getQueueStats();
       if (stats) {
@@ -176,16 +210,27 @@
       }
     } catch (e) { /* ignore */ }
     try {
-      const end = new Date();
-      const start = new Date(end.getTime() - 30 * 24 * 3600 * 1000);
       const data = await ep.admin.getModerationMetrics({
-        start: start.toISOString(),
-        end: end.toISOString(),
-        granularity: 'day',
+        timeRange: metricsTimeRange,
+        granularity: metricsGranularityFor(metricsTimeRange),
         metrics: ['reportsFiled', 'reportsResolved', 'actionsTaken'],
       });
       renderMetrics(data);
     } catch (e) { /* ignore */ }
+  }
+
+  // Wire up the metrics time-range select. Called from refresh() to
+  // pick up the select element after each render (the moderator body
+  // is re-rendered when tabs switch, so the listener is idempotent).
+  function wireMetricsRangeSelect() {
+    const sel = document.getElementById('mod-metrics-range');
+    if (!sel || sel.dataset.wired === 'true') return;
+    sel.dataset.wired = 'true';
+    sel.value = metricsTimeRange;
+    sel.addEventListener('change', () => {
+      metricsTimeRange = sel.value;
+      if (activeFlavor === 'moderator') refreshModerator();
+    });
   }
 
   function renderMetrics(data) {

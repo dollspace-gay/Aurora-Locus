@@ -24,6 +24,296 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
     pub federation: FederationConfig,
     pub validation_mode: ValidationMode,
+    /// Distributed-state substrate mode (Arc 7, V04_DESIGN.md
+    /// §6.3.6). Default `Distributed` — Postgres-CAS substrate
+    /// for multi-instance correctness. See
+    /// [`DistributedStateMode`] for variants.
+    #[serde(default)]
+    pub distributed_state_mode: DistributedStateMode,
+    /// Connection-pool sizing for the substrate's dedicated
+    /// maintenance pool (Arc 7, V04_DESIGN.md §6.4.0 Q8b).
+    /// Constructed when `distributed_state_mode == Distributed`;
+    /// ignored in `SingleInstanceInmemory` mode.
+    #[serde(default)]
+    pub maintenance_pool: MaintenancePoolConfig,
+    /// GC sweep configuration (Arc 10, V04_DESIGN.md §9.4.3).
+    /// Off-by-default: `enabled = false` so existing
+    /// deployments don't gain a new background task silently.
+    /// When enabled, the scheduled `gc_sweep_job` reconciles
+    /// blob storage against `blob` / `temp_blob_metadata` and
+    /// deletes confirmed orphans subject to the safety cap.
+    /// The Arc 10 sweep primitive
+    /// ([`crate::blob_store::gc::run_sweep`]) is the consumer.
+    #[serde(default)]
+    pub gc_sweep: GcSweepConfig,
+}
+
+/// Distributed-state substrate selector (Arc 7, V04_DESIGN.md
+/// §6.3.6 amended). Controls which backing store the
+/// `DistributedStore` trait is wired against at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedStateMode {
+    /// Postgres-CAS substrate (the v0.4 default). Required for
+    /// multi-instance correctness; works on single-instance
+    /// deployments too at the cost of a few extra Postgres
+    /// roundtrips per request.
+    #[default]
+    Distributed,
+    /// In-process state only. Auth state is lost on restart.
+    /// Operator-confirmed opt-in for single-instance
+    /// deployments that want the perf of in-memory state and
+    /// accept the durability trade-off.
+    SingleInstanceInmemory,
+    /// Forward-compat slot for a Redis backend. Not implemented
+    /// in v0.4 — selecting this fails at startup with a clear
+    /// error. Kept as an enum variant so the config surface is
+    /// stable across cycles even before the backend ships.
+    Redis,
+}
+
+impl DistributedStateMode {
+    /// Parse from an env-var value with the same case-insensitive
+    /// + aliased-form pattern `DatabaseBackend::from_env_values`
+    ///   uses. Returns an error naming the valid options on
+    ///   unrecognised input so operator typos surface
+    ///   actionably.
+    pub fn from_env_value(s: &str) -> PdsResult<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "distributed" => Ok(Self::Distributed),
+            "single_instance_inmemory" => Ok(Self::SingleInstanceInmemory),
+            "redis" => Ok(Self::Redis),
+            other => Err(PdsError::Validation(format!(
+                "PDS_DISTRIBUTED_STATE_MODE must be one of \
+                 'distributed', 'single_instance_inmemory', \
+                 'redis' (got: {:?})",
+                other
+            ))),
+        }
+    }
+}
+
+/// Connection-pool sizing for the substrate's dedicated
+/// maintenance pool. Defaults sized for typical multi-instance
+/// deployments (Step 0 Q8 recon recommendation): smaller than
+/// the main pool to keep total Postgres connection count
+/// predictable, with a faster acquire timeout so DPoP / rate-
+/// limit hot paths fail fast under contention rather than
+/// blocking the request thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenancePoolConfig {
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout_secs: u64,
+}
+
+impl Default for MaintenancePoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 15,
+            min_connections: 2,
+            acquire_timeout_secs: 10,
+        }
+    }
+}
+
+impl MaintenancePoolConfig {
+    /// Construct from explicit option-typed env-var values.
+    /// Mirrors the pattern in `DatabaseConfig::from_env_values`.
+    pub fn from_env_values(
+        max_connections: Option<String>,
+        min_connections: Option<String>,
+        acquire_timeout_secs: Option<String>,
+    ) -> PdsResult<Self> {
+        let defaults = Self::default();
+        let max_connections =
+            parse_u32_env("PDS_MAINTENANCE_DB_MAX_CONNECTIONS", max_connections, defaults.max_connections)?;
+        let min_connections =
+            parse_u32_env("PDS_MAINTENANCE_DB_MIN_CONNECTIONS", min_connections, defaults.min_connections)?;
+        let acquire_timeout_secs = parse_u64_env(
+            "PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS",
+            acquire_timeout_secs,
+            defaults.acquire_timeout_secs,
+        )?;
+        if max_connections == 0 {
+            return Err(PdsError::Validation(
+                "PDS_MAINTENANCE_DB_MAX_CONNECTIONS must be greater than 0".to_string(),
+            ));
+        }
+        if min_connections > max_connections {
+            return Err(PdsError::Validation(format!(
+                "PDS_MAINTENANCE_DB_MIN_CONNECTIONS ({}) must not exceed \
+                 PDS_MAINTENANCE_DB_MAX_CONNECTIONS ({})",
+                min_connections, max_connections
+            )));
+        }
+        if acquire_timeout_secs == 0 {
+            return Err(PdsError::Validation(
+                "PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS must be greater than 0".to_string(),
+            ));
+        }
+        Ok(Self {
+            max_connections,
+            min_connections,
+            acquire_timeout_secs,
+        })
+    }
+}
+
+/// GC sweep configuration (Arc 10, V04_DESIGN.md §9.4.3 /
+/// chainlink #57). Controls the scheduled background sweep
+/// that reconciles blob storage against the `blob` /
+/// `temp_blob_metadata` tables and deletes confirmed orphans
+/// subject to the safety cap. The Arc 10 sweep primitive
+/// ([`crate::blob_store::gc::run_sweep`]) is the consumer.
+///
+/// Off-by-default (`enabled = false`) so v0.4 ships without
+/// adding a new background task to existing deployments.
+/// Operators opt in by setting `PDS_GC_SWEEP_ENABLED=true`.
+/// `dry_run` defaults to `true` — the first runs are
+/// classify-and-log so operators can observe orphan rates
+/// before promoting to destructive mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcSweepConfig {
+    /// If `true`, the scheduled background sweep runs at
+    /// `interval_secs` cadence. Default `false` — operators
+    /// opt in explicitly per the v0.4 design.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Cadence between scheduled sweep runs, in seconds.
+    /// Default 86400 (24 hours).
+    #[serde(default = "default_gc_sweep_interval_secs")]
+    pub interval_secs: u64,
+
+    /// If `true`, the sweep classifies and logs but does not
+    /// delete. Default `true` — operators promote to
+    /// destructive mode only after observing the report
+    /// cadence in production.
+    #[serde(default = "default_gc_sweep_dry_run")]
+    pub dry_run: bool,
+
+    /// Safety cap: max blobs to delete per sweep run.
+    /// Default 10000. Confirmed orphans beyond the cap are
+    /// logged and deferred to the next run.
+    #[serde(default = "default_gc_sweep_max_deletes")]
+    pub max_deletes_per_run: usize,
+
+    /// Belt-and-braces freshness threshold in seconds. Blobs
+    /// younger than this are never classified as orphans, even
+    /// when absent from `temp_blob_metadata`. Default 3600
+    /// (1 hour) per Step 0 Q9's analysis: the tracking surface
+    /// is authoritative; this threshold catches the rare race
+    /// where a `temp_blob_metadata` row hasn't committed yet.
+    #[serde(default = "default_gc_sweep_threshold_secs")]
+    pub freshness_threshold_secs: u64,
+
+    /// Storage page size for the sweep's pagination. Default
+    /// 500 — Step 1 benchmark validated this stays index-driven
+    /// on SQLite at 100k seeded rows (6.98ms / well under the
+    /// 50ms threshold).
+    #[serde(default = "default_gc_sweep_page_size")]
+    pub page_size: usize,
+}
+
+impl Default for GcSweepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_gc_sweep_interval_secs(),
+            dry_run: default_gc_sweep_dry_run(),
+            max_deletes_per_run: default_gc_sweep_max_deletes(),
+            freshness_threshold_secs: default_gc_sweep_threshold_secs(),
+            page_size: default_gc_sweep_page_size(),
+        }
+    }
+}
+
+fn default_gc_sweep_interval_secs() -> u64 {
+    86_400
+}
+fn default_gc_sweep_dry_run() -> bool {
+    true
+}
+fn default_gc_sweep_max_deletes() -> usize {
+    10_000
+}
+fn default_gc_sweep_threshold_secs() -> u64 {
+    3_600
+}
+fn default_gc_sweep_page_size() -> usize {
+    500
+}
+
+impl GcSweepConfig {
+    /// Construct from explicit option-typed env-var values.
+    /// Mirrors the pattern in `MaintenancePoolConfig::from_env_values`.
+    pub fn from_env_values(
+        enabled: Option<String>,
+        interval_secs: Option<String>,
+        dry_run: Option<String>,
+        max_deletes_per_run: Option<String>,
+        freshness_threshold_secs: Option<String>,
+        page_size: Option<String>,
+    ) -> PdsResult<Self> {
+        let defaults = Self::default();
+        let enabled = parse_bool_env("PDS_GC_SWEEP_ENABLED", enabled, defaults.enabled)?;
+        let interval_secs = parse_u64_env(
+            "PDS_GC_SWEEP_INTERVAL_SECS",
+            interval_secs,
+            defaults.interval_secs,
+        )?;
+        let dry_run = parse_bool_env("PDS_GC_SWEEP_DRY_RUN", dry_run, defaults.dry_run)?;
+        let max_deletes_per_run = parse_usize_env(
+            "PDS_GC_SWEEP_MAX_DELETES_PER_RUN",
+            max_deletes_per_run,
+            defaults.max_deletes_per_run,
+        )?;
+        let freshness_threshold_secs = parse_u64_env(
+            "PDS_GC_SWEEP_FRESHNESS_THRESHOLD_SECS",
+            freshness_threshold_secs,
+            defaults.freshness_threshold_secs,
+        )?;
+        let page_size =
+            parse_usize_env("PDS_GC_SWEEP_PAGE_SIZE", page_size, defaults.page_size)?;
+
+        if interval_secs == 0 {
+            return Err(PdsError::Validation(
+                "PDS_GC_SWEEP_INTERVAL_SECS must be greater than 0".to_string(),
+            ));
+        }
+        if page_size == 0 {
+            return Err(PdsError::Validation(
+                "PDS_GC_SWEEP_PAGE_SIZE must be greater than 0".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            enabled,
+            interval_secs,
+            dry_run,
+            max_deletes_per_run,
+            freshness_threshold_secs,
+            page_size,
+        })
+    }
+
+    /// Convert to [`crate::blob_store::gc::SweepParams`] for
+    /// the GC sweep primitive. `report_only` is supplied by
+    /// the caller — `false` from the scheduled-job path,
+    /// driven by the `--report-only` flag from the CLI path.
+    pub fn to_sweep_params(
+        &self,
+        report_only: bool,
+    ) -> crate::blob_store::gc::SweepParams {
+        crate::blob_store::gc::SweepParams {
+            dry_run: self.dry_run,
+            report_only,
+            max_deletes_per_run: self.max_deletes_per_run,
+            freshness_threshold: std::time::Duration::from_secs(self.freshness_threshold_secs),
+            page_size: self.page_size,
+        }
+    }
 }
 
 /// Shared-database backend selector.
@@ -185,6 +475,30 @@ fn parse_u64_env(name: &str, raw: Option<String>, default: u64) -> PdsResult<u64
         Some(v) => v.parse::<u64>().map_err(|_| {
             PdsError::Validation(format!(
                 "{name} must be a non-negative integer (got: {:?})",
+                v
+            ))
+        }),
+    }
+}
+
+fn parse_usize_env(name: &str, raw: Option<String>, default: usize) -> PdsResult<usize> {
+    match raw {
+        None => Ok(default),
+        Some(v) => v.parse::<usize>().map_err(|_| {
+            PdsError::Validation(format!(
+                "{name} must be a non-negative integer (got: {:?})",
+                v
+            ))
+        }),
+    }
+}
+
+fn parse_bool_env(name: &str, raw: Option<String>, default: bool) -> PdsResult<bool> {
+    match raw {
+        None => Ok(default),
+        Some(v) => v.parse::<bool>().map_err(|_| {
+            PdsError::Validation(format!(
+                "{name} must be 'true' or 'false' (got: {:?})",
                 v
             ))
         }),
@@ -530,10 +844,6 @@ pub struct InviteConfig {
 pub struct RateLimitConfig {
     pub enabled: bool,
     pub global_requests_per_minute: u32,
-    /// Enable distributed Redis-backed rate limiting for multi-instance deployments
-    pub use_redis: bool,
-    /// Redis connection URL for distributed rate limiting (e.g., redis://localhost:6379)
-    pub redis_url: Option<String>,
     /// Bypass the limiter for GET requests to admin UI static assets.
     /// Defaults to `true`; see `crate::rate_limit::is_admin_asset_exempt`
     /// for the exact path/method matrix. Set to `false` to opt admin
@@ -675,11 +985,12 @@ impl ServerConfig {
             .unwrap_or_else(|_| "3000".to_string())
             .parse()
             .unwrap_or(3000);
-        let rate_limit_use_redis = env::var("PDS_RATE_LIMIT_USE_REDIS")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false);
-        let rate_limit_redis_url = env::var("PDS_RATE_LIMIT_REDIS_URL").ok();
+        // PDS_RATE_LIMIT_USE_REDIS / PDS_RATE_LIMIT_REDIS_URL
+        // were inputs to the now-retired rate_limit_new module
+        // (Arc 7 Step 1 disposition). Reading them here would
+        // mislead operators into thinking they still affect
+        // anything; the substrate's Redis hook is reserved for
+        // a future cycle under DistributedStateMode::Redis.
         let rate_limit_exempt_admin_assets = env::var("PDS_RATE_LIMIT_EXEMPT_ADMIN_ASSETS")
             .unwrap_or_else(|_| "true".to_string())
             .parse()
@@ -729,6 +1040,26 @@ impl ServerConfig {
             env::var("PDS_SEQUENCER_LEADER_RETRY_MS").ok(),
         )?;
 
+        let distributed_state_mode = match env::var("PDS_DISTRIBUTED_STATE_MODE") {
+            Ok(s) => DistributedStateMode::from_env_value(&s)?,
+            Err(_) => DistributedStateMode::default(),
+        };
+
+        let maintenance_pool = MaintenancePoolConfig::from_env_values(
+            env::var("PDS_MAINTENANCE_DB_MAX_CONNECTIONS").ok(),
+            env::var("PDS_MAINTENANCE_DB_MIN_CONNECTIONS").ok(),
+            env::var("PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS").ok(),
+        )?;
+
+        let gc_sweep = GcSweepConfig::from_env_values(
+            env::var("PDS_GC_SWEEP_ENABLED").ok(),
+            env::var("PDS_GC_SWEEP_INTERVAL_SECS").ok(),
+            env::var("PDS_GC_SWEEP_DRY_RUN").ok(),
+            env::var("PDS_GC_SWEEP_MAX_DELETES_PER_RUN").ok(),
+            env::var("PDS_GC_SWEEP_FRESHNESS_THRESHOLD_SECS").ok(),
+            env::var("PDS_GC_SWEEP_PAGE_SIZE").ok(),
+        )?;
+
         Ok(ServerConfig {
             service: ServiceConfig {
                 hostname,
@@ -774,8 +1105,6 @@ impl ServerConfig {
             rate_limit: RateLimitConfig {
                 enabled: rate_limit_enabled,
                 global_requests_per_minute: rate_limit_requests,
-                use_redis: rate_limit_use_redis,
-                redis_url: rate_limit_redis_url,
                 exempt_admin_assets: rate_limit_exempt_admin_assets,
             },
             logging: LoggingConfig { level: log_level },
@@ -789,6 +1118,9 @@ impl ServerConfig {
                 auto_stream_events,
             },
             validation_mode,
+            distributed_state_mode,
+            maintenance_pool,
+            gc_sweep,
         })
     }
 
@@ -805,6 +1137,49 @@ impl ServerConfig {
         }
 
         // Admin password removed - OAuth uses DID-based authentication
+
+        // Redis substrate is a forward-compat slot in the enum
+        // but not implemented in v0.4. Fail-fast at startup so
+        // an operator selecting it gets a clear error instead of
+        // silently falling through to default behaviour.
+        if matches!(self.distributed_state_mode, DistributedStateMode::Redis) {
+            return Err(PdsError::Validation(
+                "PDS_DISTRIBUTED_STATE_MODE=redis is not implemented in v0.4; \
+                 use 'distributed' (default) or 'single_instance_inmemory'"
+                    .to_string(),
+            ));
+        }
+
+        // Distributed mode needs Postgres — SQLite is single-
+        // instance by definition and the maintenance pool would
+        // operate against the same DB as the application pool
+        // with no isolation benefit. Surface the mismatch
+        // explicitly rather than producing a confusing runtime
+        // behavior; operators on SQLite who want the substrate
+        // can either switch to Postgres or run in
+        // SingleInstanceInmemory mode.
+        if matches!(
+            self.distributed_state_mode,
+            DistributedStateMode::Distributed
+        ) && matches!(self.database.backend, DatabaseBackend::Sqlite)
+        {
+            // Note: this is a warning rather than a hard error
+            // because single-instance SQLite deployments may
+            // legitimately want the substrate tables present
+            // (for tooling, future migration). Log loudly but
+            // don't refuse startup. Production operators
+            // generally combine PDS_DB_BACKEND=postgres with
+            // PDS_DISTRIBUTED_STATE_MODE=distributed; mismatches
+            // mostly come from incomplete env-var copies during
+            // upgrade.
+            tracing::warn!(
+                "PDS_DISTRIBUTED_STATE_MODE=distributed combined with \
+                 PDS_DB_BACKEND=sqlite — distributed substrate operates \
+                 against the same SQLite database as the application pool; \
+                 no multi-instance benefit. Consider Postgres or \
+                 PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory."
+            );
+        }
 
         Ok(())
     }
@@ -1228,5 +1603,122 @@ mod blobstore_tests {
             BlobstoreConfig::S3 { prefix, .. } => assert_eq!(prefix, "custom/"),
             _ => panic!("expected S3"),
         }
+    }
+}
+
+#[cfg(test)]
+mod gc_sweep_tests {
+    use super::*;
+
+    #[test]
+    fn default_matches_v04_design_safety_stance() {
+        let c = GcSweepConfig::default();
+        assert!(!c.enabled, "default must be disabled");
+        assert!(c.dry_run, "default must be dry_run=true");
+        assert_eq!(c.interval_secs, 86_400);
+        assert_eq!(c.max_deletes_per_run, 10_000);
+        assert_eq!(c.freshness_threshold_secs, 3_600);
+        assert_eq!(c.page_size, 500);
+    }
+
+    #[test]
+    fn from_env_values_all_none_yields_default() {
+        let c = GcSweepConfig::from_env_values(None, None, None, None, None, None).unwrap();
+        assert_eq!(c.enabled, GcSweepConfig::default().enabled);
+        assert_eq!(c.dry_run, GcSweepConfig::default().dry_run);
+        assert_eq!(c.interval_secs, GcSweepConfig::default().interval_secs);
+        assert_eq!(c.max_deletes_per_run, GcSweepConfig::default().max_deletes_per_run);
+        assert_eq!(
+            c.freshness_threshold_secs,
+            GcSweepConfig::default().freshness_threshold_secs
+        );
+        assert_eq!(c.page_size, GcSweepConfig::default().page_size);
+    }
+
+    #[test]
+    fn from_env_values_parses_all_fields() {
+        let c = GcSweepConfig::from_env_values(
+            Some("true".to_string()),
+            Some("3600".to_string()),
+            Some("false".to_string()),
+            Some("500".to_string()),
+            Some("1800".to_string()),
+            Some("250".to_string()),
+        )
+        .unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.interval_secs, 3_600);
+        assert!(!c.dry_run);
+        assert_eq!(c.max_deletes_per_run, 500);
+        assert_eq!(c.freshness_threshold_secs, 1_800);
+        assert_eq!(c.page_size, 250);
+    }
+
+    #[test]
+    fn from_env_values_zero_interval_rejected() {
+        let err = GcSweepConfig::from_env_values(
+            Some("true".to_string()),
+            Some("0".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("zero interval must be rejected");
+        assert!(err.to_string().contains("PDS_GC_SWEEP_INTERVAL_SECS"));
+    }
+
+    #[test]
+    fn from_env_values_zero_page_size_rejected() {
+        let err = GcSweepConfig::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0".to_string()),
+        )
+        .expect_err("zero page size must be rejected");
+        assert!(err.to_string().contains("PDS_GC_SWEEP_PAGE_SIZE"));
+    }
+
+    #[test]
+    fn from_env_values_invalid_bool_rejected() {
+        let err = GcSweepConfig::from_env_values(
+            Some("yes".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("'yes' is not a valid bool");
+        assert!(err.to_string().contains("PDS_GC_SWEEP_ENABLED"));
+    }
+
+    #[test]
+    fn to_sweep_params_propagates_fields() {
+        let cfg = GcSweepConfig {
+            enabled: true,
+            interval_secs: 7200,
+            dry_run: false,
+            max_deletes_per_run: 250,
+            freshness_threshold_secs: 600,
+            page_size: 100,
+        };
+        let p = cfg.to_sweep_params(true);
+        assert!(!p.dry_run);
+        assert!(p.report_only);
+        assert_eq!(p.max_deletes_per_run, 250);
+        assert_eq!(p.freshness_threshold, std::time::Duration::from_secs(600));
+        assert_eq!(p.page_size, 100);
+    }
+
+    #[test]
+    fn to_sweep_params_report_only_false_passes_through() {
+        let cfg = GcSweepConfig::default();
+        let p = cfg.to_sweep_params(false);
+        assert!(!p.report_only);
+        assert!(p.dry_run, "config dry_run propagates to params");
     }
 }

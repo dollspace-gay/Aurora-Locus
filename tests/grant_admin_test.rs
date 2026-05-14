@@ -79,8 +79,6 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
         rate_limit: RateLimitConfig {
             enabled: false,
             global_requests_per_minute: 3000,
-            use_redis: false,
-            redis_url: None,
             exempt_admin_assets: true,
         },
         logging: LoggingConfig {
@@ -96,8 +94,16 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
             auto_stream_events: false,
         },
         validation_mode: ValidationMode::Optimistic,
+        distributed_state_mode: Default::default(),
+        maintenance_pool: Default::default(),
+        gc_sweep: Default::default(),
     };
-    let ctx = AppContext::new(config).await.expect("AppContext::new");
+    let ctx = AppContext::new(
+        config,
+        std::sync::Arc::new(aurora_locus::api::registry::RouteRegistry::default()),
+    )
+    .await
+    .expect("AppContext::new");
     (ctx, dir)
 }
 

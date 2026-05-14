@@ -391,8 +391,6 @@ async fn account_manager_round_trip_on_postgres() {
         rate_limit: RateLimitConfig {
             enabled: false,
             global_requests_per_minute: 3000,
-            redis_url: None,
-            use_redis: false,
             exempt_admin_assets: true,
         },
         logging: LoggingConfig {
@@ -408,6 +406,9 @@ async fn account_manager_round_trip_on_postgres() {
             auto_stream_events: false,
         },
         validation_mode: ValidationMode::Optimistic,
+        distributed_state_mode: Default::default(),
+        maintenance_pool: Default::default(),
+        gc_sweep: Default::default(),
     });
 
     let mgr = AccountManager::new(pool, config);

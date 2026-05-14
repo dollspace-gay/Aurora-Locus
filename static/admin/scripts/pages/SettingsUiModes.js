@@ -4,6 +4,27 @@
 (function (global) {
   'use strict';
 
+  // Suffix appended to a setting value to indicate its source tier
+  // (Runtime / File / Default / RecoveryMode). Runtime is the
+  // operator-set normal case and renders bare; the other three are
+  // informational annotations. Per V04_DESIGN.md §5.2.1 / §5.3.5.
+  // Unknown values render bare so a future wire-additive source value
+  // doesn't break rendering.
+  //
+  // Duplicated verbatim in pages/SettingsGeneral.js — the codebase
+  // doesn't have a cross-page utility location for view helpers, and
+  // manufacturing a module just for two callers is over-investment
+  // per Step 2's scope.
+  function settingSourceSuffix(source) {
+    switch (source) {
+      case 'Runtime':      return '';
+      case 'Default':      return ' (default)';
+      case 'File':         return ' (file)';
+      case 'RecoveryMode': return ' (recovery override)';
+      default:             return '';
+    }
+  }
+
   async function mount({ container }) {
     const session = global.AuroraSession;
     const isSuper = session && session.hasRole('superadmin');
@@ -70,7 +91,7 @@
       const data = await ep.admin.getRuntimeSetting('moderation-mode');
       const value = (data && typeof data.value === 'string') ? data.value : 'full';
       const cur = document.getElementById('mod-mode-current');
-      if (cur) cur.textContent = value + (data.source === 'RecoveryMode' ? ' (recovery override)' : '');
+      if (cur) cur.textContent = value + settingSourceSuffix(data && data.source);
       const radio = document.querySelector('input[name="mod-mode"][value="' + value + '"]');
       if (radio) radio.checked = true;
       if (global.AuroraSettings) global.AuroraSettings.setModerationModeCache(value);
@@ -88,12 +109,26 @@
     if (!selected) { global.AuroraToast.warning('Select a mode.'); return; }
     const rationale = document.getElementById('mod-mode-rationale').value.trim();
     if (!rationale) { global.AuroraToast.warning('Rationale is required.'); return; }
-    if (!confirm('Switch moderation mode to "' + selected.value + '"? This affects all operators.')) return;
+    const confirmResult = await global.AuroraModal.destructiveConfirm({
+      heading: 'Switch moderation mode',
+      body: 'Switch moderation mode to "' + selected.value + '"? This affects all operators using this PDS.',
+      confirmLabel: 'Switch mode',
+    });
+    if (!confirmResult.confirmed) return;
     const redirect = document.getElementById('mod-mode-redirect').value.trim();
     try {
       await global.AuroraEndpoints.admin.setRuntimeSetting({ key: 'moderation-mode', value: selected.value, rationale: rationale });
-      await global.AuroraEndpoints.admin.setRuntimeSetting({ key: 'moderation-mode-redirect-url', value: redirect, rationale: rationale });
-      global.AuroraToast.success('Mode change saved. Sidebar may re-render.');
+      // Two setRuntimeSetting calls land two audit entries. Link the
+      // toast to the most-recent (redirect-url) entry per the same
+      // pragmatic last-entry rule used in SettingsGeneral.saveCard.
+      const res = await global.AuroraEndpoints.admin.setRuntimeSetting({ key: 'moderation-mode-redirect-url', value: redirect, rationale: rationale });
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success('Mode change saved. Sidebar may re-render.', auditEntryId ? {
+        action: {
+          label: 'View audit entry',
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
       await loadModerationMode();
     } catch (e) {
       global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));

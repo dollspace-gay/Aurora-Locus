@@ -259,6 +259,7 @@ dependencies = [
  "proto-blue",
  "rand 0.8.6",
  "redis",
+ "regex",
  "reqwest",
  "serde",
  "serde_cbor",

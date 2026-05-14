@@ -1,6 +1,12 @@
 //! Configuration Validation CLI Command
 //!
 //! Provides comprehensive configuration validation with security and production readiness checks.
+//!
+//! Last audited for staleness: 2026-05-13 (Arc 10 Step 3 / chainlink
+//! #57). Step 3 added the four `validate_gc_sweep_config` warnings
+//! covering risky operator opt-ins for the scheduled GC sweep; all
+//! previously emitted warnings classified as still valid. Re-audit
+//! when major auth, federation, or storage features change.
 
 use crate::config::{BlobstoreConfig, ServerConfig};
 use crate::error::PdsResult;
@@ -64,6 +70,7 @@ pub fn validate_config(config: &ServerConfig) -> PdsResult<()> {
     validate_email_config(config, &mut issues);
     validate_rate_limit_config(config, &mut issues);
     validate_federation_config(config, &mut issues);
+    validate_gc_sweep_config(config, &mut issues);
     check_production_readiness(config, &mut issues);
 
     // Categorize and display issues
@@ -580,6 +587,69 @@ fn validate_federation_config(config: &ServerConfig, issues: &mut Vec<Validation
         issues.push(ValidationIssue::info(
             "Federation",
             "Federation is disabled - server will not connect to Bluesky network".to_string(),
+        ));
+    }
+}
+
+/// Validate GC sweep configuration (Arc 10 Step 3, V04_DESIGN.md
+/// §9.4.3). Off-by-default; warnings only fire when the operator
+/// has opted in via `PDS_GC_SWEEP_ENABLED=true`. Each warning
+/// targets a specific operator-misconfiguration mode the v0.4
+/// design flagged as worth surfacing at validate-time rather than
+/// at sweep-time.
+fn validate_gc_sweep_config(config: &ServerConfig, issues: &mut Vec<ValidationIssue>) {
+    if !config.gc_sweep.enabled {
+        // Sweep disabled — config knobs irrelevant. No warnings.
+        return;
+    }
+
+    if !config.gc_sweep.dry_run {
+        issues.push(ValidationIssue::warning(
+            "GcSweep",
+            "dry_run is false - sweep will perform real deletes. \
+             Recommend running with dry_run=true for at least 7 days \
+             before enabling destructive mode to verify classification \
+             accuracy on this deployment's workload."
+                .to_string(),
+        ));
+
+        if config.gc_sweep.max_deletes_per_run > 100_000 {
+            issues.push(ValidationIssue::warning(
+                "GcSweep",
+                format!(
+                    "max_deletes_per_run is {} (>100,000) and dry_run is \
+                     false - a single misclassification could delete many \
+                     blobs. Consider a lower cap until operational data \
+                     confirms classification accuracy.",
+                    config.gc_sweep.max_deletes_per_run
+                ),
+            ));
+        }
+    }
+
+    if config.gc_sweep.freshness_threshold_secs < 600 {
+        issues.push(ValidationIssue::warning(
+            "GcSweep",
+            format!(
+                "freshness_threshold_secs is {} (<10 minutes) - increases \
+                 risk of classifying genuine in-flight uploads as orphans \
+                 if the upload's `temp_blob_metadata` row hasn't committed \
+                 by sweep time. Recommend >=3600 (1 hour) unless operational \
+                 data justifies tightening.",
+                config.gc_sweep.freshness_threshold_secs
+            ),
+        ));
+    }
+
+    if config.gc_sweep.interval_secs < 3600 {
+        issues.push(ValidationIssue::warning(
+            "GcSweep",
+            format!(
+                "interval_secs is {} (<1 hour) - sweep cadence may exceed \
+                 throughput on large stores. Recommend >=21600 (6 hours) \
+                 unless operational data justifies tightening.",
+                config.gc_sweep.interval_secs
+            ),
         ));
     }
 }

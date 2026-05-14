@@ -14,10 +14,13 @@ pub mod authorize;
 pub mod client;
 pub mod consent;
 pub mod device;
+pub mod flow_state_adapter;
 pub mod models;
 pub mod scope;
 pub mod token;
 pub mod token_rotation;
+
+pub use flow_state_adapter::OAuthFlowStateAdapter;
 
 pub use authorize::authorize;
 pub use client::ClientManager;

@@ -23,19 +23,46 @@
     return root;
   }
 
+  // Reject hrefs that could execute JavaScript or escape the SPA. Only
+  // same-origin hash routes (#...) and same-origin paths (/...) are
+  // allowed; javascript:, data:, vbscript:, http(s):, etc. are
+  // rejected so an upstream caller can't construct a phishing toast.
+  function isSafeActionHref(href) {
+    if (typeof href !== 'string') return false;
+    return href.charAt(0) === '#' || href.charAt(0) === '/';
+  }
+
   function show(message, opts) {
     const root = ensureRoot();
     opts = opts || {};
     const variant = opts.variant || 'info';
     const duration = opts.duration == null ? DEFAULT_DURATION : opts.duration;
+    const action = opts.action;
     const id = 'toast-' + (++counter);
     const el = document.createElement('div');
     el.id = id;
     el.className = 'toast toast-' + variant;
     el.setAttribute('role', 'status');
-    const safe = global.AuroraDom ? global.AuroraDom.esc(message) : String(message);
+    const esc = global.AuroraDom ? global.AuroraDom.esc : (s) => String(s == null ? '' : s);
+    const safe = esc(message);
+    // Optional inline action link (e.g., "View audit entry"). When
+    // present, renders between the message and the close button as
+    // an anchor the browser dispatches via the existing hash router.
+    // Per V04_DESIGN §5.4.3 sub-3e. Defensive: only render when both
+    // label + href are present and href is same-origin (see
+    // isSafeActionHref). Missing or malformed action silently degrades
+    // to a no-action toast.
+    let actionHtml = '';
+    if (action
+        && typeof action.label === 'string'
+        && action.label.length > 0
+        && isSafeActionHref(action.href)) {
+      actionHtml = '<a class="toast-action" href="' + esc(action.href) +
+                   '">' + esc(action.label) + '</a>';
+    }
     el.innerHTML =
       '<span class="toast-message">' + safe + '</span>' +
+      actionHtml +
       '<button class="toast-close" aria-label="Dismiss">×</button>';
     el.querySelector('.toast-close').addEventListener('click', () => dismiss(id));
     root.appendChild(el);

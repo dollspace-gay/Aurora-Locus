@@ -127,38 +127,70 @@ impl AdminRoleManager {
     ) -> PdsResult<AdminRole> {
         let now = Utc::now();
 
-        // Check if role already exists and is active. Read inside
-        // the same tx so the check + insert are linearizable —
-        // otherwise two concurrent grants could both pass the
-        // "no existing active role" check.
-        let existing: Option<(String, bool)> = sqlx::query_as(
-            "SELECT role, revoked FROM admin_roles WHERE did = $1 \
-             AND NOT revoked ORDER BY granted_at DESC LIMIT 1",
+        // Read the (id, role, revoked) row for this DID inside the
+        // same tx so the check + write are linearizable — otherwise
+        // two concurrent grants could both pass the existing-row
+        // check. `read_bool` papers over the SQLite INTEGER /
+        // Postgres BOOLEAN difference for the `revoked` column.
+        let existing = sqlx::query(
+            "SELECT id, role, revoked FROM admin_roles WHERE did = $1 LIMIT 1",
         )
         .bind(did)
         .fetch_optional(&mut **tx)
         .await?;
-        if let Some((existing_role, _)) = existing {
-            return Err(PdsError::Conflict(format!(
-                "User already has active role: {}",
-                existing_role
-            )));
-        }
 
-        let id: i64 = sqlx::query_scalar(
-            r#"
-            INSERT INTO admin_roles (did, role, granted_by, granted_at, notes)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id
-            "#,
-        )
-        .bind(did)
-        .bind(role.as_str())
-        .bind(granted_by)
-        .bind(now.to_rfc3339())
-        .bind(&notes)
-        .fetch_one(&mut **tx)
-        .await?;
+        // Three cases:
+        //   - no row → fresh INSERT;
+        //   - row with revoked = false → Conflict (active role);
+        //   - row with revoked = true → UPDATE in place to re-grant
+        //     (matches the CLI `grant-admin --force` path in
+        //     src/cli/admin.rs:188-200). UNIQUE(did) on admin_roles
+        //     means a fresh INSERT would collide on the lingering
+        //     revoked row, which is the bug this branch fixes; the
+        //     runtime path doesn't gate behind a separate `--force`
+        //     flag because the UI grant already requires explicit
+        //     operator intent (DID + audit rationale) and the audit
+        //     chain preserves the prior grant/revoke history.
+        let id: i64 = if let Some(row) = existing {
+            let is_revoked = crate::db::read_bool(&row, "revoked")?;
+            if !is_revoked {
+                let existing_role: String = row.get("role");
+                return Err(PdsError::Conflict(format!(
+                    "User already has active role: {}",
+                    existing_role
+                )));
+            }
+            let existing_id: i64 = row.get("id");
+            sqlx::query(
+                "UPDATE admin_roles \
+                 SET role = $1, granted_by = $2, granted_at = $3, notes = $4, \
+                     revoked = false, revoked_at = NULL, revoked_by = NULL \
+                 WHERE id = $5",
+            )
+            .bind(role.as_str())
+            .bind(granted_by)
+            .bind(now.to_rfc3339())
+            .bind(&notes)
+            .bind(existing_id)
+            .execute(&mut **tx)
+            .await?;
+            existing_id
+        } else {
+            sqlx::query_scalar(
+                r#"
+                INSERT INTO admin_roles (did, role, granted_by, granted_at, notes)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+                "#,
+            )
+            .bind(did)
+            .bind(role.as_str())
+            .bind(granted_by)
+            .bind(now.to_rfc3339())
+            .bind(&notes)
+            .fetch_one(&mut **tx)
+            .await?
+        };
 
         Ok(AdminRole {
             id,
@@ -421,6 +453,170 @@ mod tests {
             .has_role("did:plc:alice", Role::SuperAdmin)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_grant_role_rejects_when_did_already_has_active_role() {
+        // Phase B regression test: a second grant_role call for a
+        // DID that already holds an active role must return
+        // PdsError::Conflict from the existing-role check at the
+        // top of `grant_role_in_tx`. Pre-fix, the check's
+        // `SELECT role, revoked FROM admin_roles` decoded into
+        // `Option<(String, bool)>`, which fires the SQLite
+        // bool/BIGINT decode mismatch under `sqlx::Any` and 500s
+        // before reaching the Conflict branch. This test
+        // exercises the path on SQLite (the only backend test_pool
+        // configures) and would have surfaced the bug.
+        let db = open_test_pool().await;
+        sqlx::query(
+            r#"
+            CREATE TABLE admin_roles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                did TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL,
+                granted_by TEXT,
+                granted_at TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                revoked_at TEXT,
+                revoked_by TEXT,
+                notes TEXT
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let manager = AdminRoleManager::new(db);
+
+        // First grant: succeeds.
+        manager
+            .grant_role(
+                "did:plc:carol",
+                Role::Moderator,
+                "did:plc:superadmin",
+                None,
+            )
+            .await
+            .expect("first grant succeeds");
+
+        // Second grant for the same DID with a different role:
+        // must return Conflict, not a Database error.
+        let err = manager
+            .grant_role(
+                "did:plc:carol",
+                Role::Admin,
+                "did:plc:superadmin",
+                Some("attempt to upgrade".to_string()),
+            )
+            .await
+            .expect_err("second grant must reject with Conflict");
+
+        match err {
+            PdsError::Conflict(msg) => {
+                assert!(
+                    msg.contains("moderator"),
+                    "Conflict message should name the existing role; got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "expected PdsError::Conflict, got {:?} — if this is a \
+                 Database decode error, the existing-role check's SELECT \
+                 has regressed to including a bool-typed column",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grant_role_succeeds_after_revoke_of_same_did() {
+        // Phase B regression test: granting a role to a DID whose
+        // prior grant was revoked must succeed. Pre-fix, the
+        // existing-role check filtered to `NOT revoked` and found
+        // nothing, so the Conflict path didn't fire — but the
+        // subsequent INSERT collided with the still-present revoked
+        // row on the UNIQUE(did) constraint and 500'd with
+        // "UNIQUE constraint failed: admin_roles.did".
+        //
+        // The fix replaces the existing-role check with a row-wide
+        // lookup that distinguishes active vs revoked, and re-grants
+        // by UPDATE-in-place when the row is already revoked. The
+        // test exercises grant → revoke → grant on the same DID
+        // and verifies the third call returns Ok with the new role.
+        let db = open_test_pool().await;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE admin_roles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                did TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL,
+                granted_by TEXT,
+                granted_at TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                revoked_at TEXT,
+                revoked_by TEXT,
+                notes TEXT
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let manager = AdminRoleManager::new(db);
+        let did = "did:plc:dave";
+
+        // Step 1: grant Moderator.
+        manager
+            .grant_role(did, Role::Moderator, "did:plc:superadmin", None)
+            .await
+            .expect("initial grant succeeds");
+
+        // Step 2: revoke Moderator.
+        manager
+            .revoke_role(did, "did:plc:superadmin", Some("step 2".to_string()))
+            .await
+            .expect("revoke succeeds");
+
+        // Confirm the row is gone from the active-role view but
+        // still present in the table (the bug precondition).
+        assert!(
+            manager.get_role(did).await.unwrap().is_none(),
+            "post-revoke get_role should return None"
+        );
+
+        // Step 3: re-grant — this time as Admin. Pre-fix this 500'd
+        // with UNIQUE constraint failure on admin_roles.did.
+        let regranted = manager
+            .grant_role(
+                did,
+                Role::Admin,
+                "did:plc:superadmin",
+                Some("regrant after revoke".to_string()),
+            )
+            .await
+            .expect("regrant after revoke must succeed");
+
+        assert_eq!(regranted.role, Role::Admin);
+        assert!(!regranted.revoked);
+
+        // Confirm the active-role view now reflects the new role.
+        let active = manager.get_role(did).await.unwrap().unwrap();
+        assert_eq!(active.role, Role::Admin);
+        assert!(!active.revoked);
+
+        // Confirm exactly one row in admin_roles for this DID —
+        // UPDATE in place, not a second row.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM admin_roles WHERE did = $1",
+        )
+        .bind(did)
+        .fetch_one(&manager.db)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "UPDATE-in-place must not create a second row");
     }
 
     #[tokio::test]

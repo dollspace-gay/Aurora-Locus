@@ -945,8 +945,6 @@ mod admin_auth_third_path_tests {
             rate_limit: RateLimitConfig {
                 enabled: false,
                 global_requests_per_minute: 3000,
-                use_redis: false,
-                redis_url: None,
                 exempt_admin_assets: true,
             },
             logging: LoggingConfig {
@@ -966,8 +964,16 @@ mod admin_auth_third_path_tests {
                 .to_string_lossy()
                 .parse()
                 .unwrap_or(crate::validation::ValidationMode::Required),
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
         };
-        let mut ctx = AppContext::new(config).await.unwrap();
+        let mut ctx = AppContext::new(
+            config,
+            Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .unwrap();
         let mock: Arc<MockIdentityResolver> = Arc::new(MockIdentityResolver::new());
         ctx.identity_resolver = mock.clone();
         (ctx, mock)

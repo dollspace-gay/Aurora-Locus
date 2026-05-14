@@ -366,34 +366,45 @@ pub async fn deny_authorization(
     Ok(Redirect::to(redirect_url.as_str()))
 }
 
-/// Mark authorization code as used
+/// Mark authorization code as used.
 ///
-/// Updates the authorization_request to mark the code as used.
-/// This prevents replay attacks where an attacker tries to reuse
-/// an authorization code.
+/// Step-2 trait-routed implementation: looks up the
+/// request_id by authorization_code via the (still direct-SQL)
+/// secondary-key path, then calls
+/// `store.delete("oauth_flow_state", request_id)` — the
+/// trait's "consume" semantic. Cross-instance correctness is
+/// the substrate's `delete` returning exactly one `true` per
+/// authorization code, even when multiple instances race the
+/// same redemption.
 ///
-/// # Arguments
-/// * `ctx` - Application context
-/// * `authorization_code` - The authorization code to mark as used
-///
-/// # Returns
-/// Ok if successful, error if code not found or already used
+/// Pre-Arc-7 this was a direct `UPDATE … WHERE
+/// authorization_code = $1 AND code_used = FALSE`. The new
+/// shape is functionally equivalent for single-instance
+/// deployments and adds cross-instance coherence for
+/// multi-instance ones.
 pub async fn mark_code_as_used(ctx: &AppContext, authorization_code: &str) -> PdsResult<()> {
-    let now = Utc::now();
+    // Secondary-key lookup (direct SQL — the trait keys on
+    // request_id, not authorization_code).
+    let request = get_request_by_code(ctx, authorization_code).await?;
 
-    let result = sqlx::query(
-        r#"
-        UPDATE authorization_request
-        SET code_used = TRUE, code_used_at = $1
-        WHERE authorization_code = $2 AND code_used = FALSE
-        "#,
-    )
-    .bind(now.to_rfc3339())
-    .bind(authorization_code)
-    .execute(&ctx.account_db)
-    .await?;
-
-    if result.rows_affected() == 0 {
+    let store = ctx
+        .distributed_store
+        .as_ref()
+        .ok_or_else(|| {
+            PdsError::Internal(
+                "distributed_store not constructed; AppContext::new \
+                 contract violation"
+                    .to_string(),
+            )
+        })?;
+    let consumed = store
+        .delete("oauth_flow_state", &request.request_id)
+        .await
+        .map_err(|e| match e {
+            crate::distributed::DistributedError::Database(db) => PdsError::Database(db),
+            other => PdsError::Internal(format!("distributed-store bug: {}", other)),
+        })?;
+    if !consumed {
         return Err(PdsError::Authentication(
             "Authorization code invalid or already used".to_string(),
         ));
@@ -422,12 +433,18 @@ pub async fn get_request_by_code(
     ctx: &AppContext,
     authorization_code: &str,
 ) -> PdsResult<crate::oauth::models::AuthorizationRequest> {
+    // `id` and `code_used_at` columns don't exist in the
+    // 0001_initial schema. The model still has those fields
+    // (pre-Arc-7 mismatch) but they're effectively dead
+    // state; we synthesise defaults below. Same workaround as
+    // the OAuth adapter's `get`. See the adapter for
+    // cross-reference.
     let row = sqlx::query(
         r#"
         SELECT
-            id, request_id, did, client_id, code_challenge, code_challenge_method,
+            request_id, did, client_id, code_challenge, code_challenge_method,
             authorization_code, scope, redirect_uri, state, created_at, expires_at,
-            code_used, code_used_at
+            code_used
         FROM authorization_request
         WHERE authorization_code = $1
         "#,
@@ -459,7 +476,7 @@ pub async fn get_request_by_code(
     }
 
     Ok(crate::oauth::models::AuthorizationRequest {
-        id: row.get("id"),
+        id: 0,
         request_id: row.get("request_id"),
         did: row.get("did"),
         client_id: row.get("client_id"),
@@ -472,11 +489,7 @@ pub async fn get_request_by_code(
         created_at: parse_ts(&row.get::<String, _>("created_at"))?,
         expires_at: parse_ts(&row.get::<String, _>("expires_at"))?,
         code_used: crate::db::read_bool(&row, "code_used")?,
-        code_used_at: row
-            .get::<Option<String>, _>("code_used_at")
-            .as_deref()
-            .map(parse_ts)
-            .transpose()?,
+        code_used_at: None,
     })
 }
 

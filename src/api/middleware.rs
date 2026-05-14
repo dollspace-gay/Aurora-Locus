@@ -696,6 +696,96 @@ pub fn enforce_scope(auth: &UnifiedAuthContext, required_scope: &AtProtoScope) -
     }
 }
 
+/// Emit v0.3-wire-shape deprecation headers on a response built
+/// from a legacy-shape request. Increments the
+/// `aurora_legacy_wire_ingest_total` counter and emits a tracing
+/// info event.
+///
+/// Per V04_DESIGN §5.3.6 + Step 0 Q12 recon. Structurally parallel
+/// to the JWT-deprecation middleware below, but called inline from
+/// each dual-shape handler rather than wired as a layer — there are
+/// only two dual-shape endpoints (`emitEvent`, `updateSubjectStatus`)
+/// and an inline helper is less surface area than a full middleware
+/// for that footprint. The Deserialize impls can't set request
+/// extensions (no request context), and the handler-set marker
+/// can't be read post-`next.run` (request consumed), so the
+/// JWT-style middleware shape doesn't fit cleanly anyway.
+///
+/// Header set, mirroring the JWT pattern:
+/// - `Deprecation: true`
+/// - `Sunset: <date>` (only when `PDS_V03_WIRE_SUNSET_DATE` is set
+///   to a real HTTP-date string; omitted when the env var is unset
+///   or "deprecated").
+/// - `Warning: 299 - "<message>"` naming the legacy fields + endpoint.
+/// - `X-Wire-Migration-Guide` pointing at the operator doc.
+pub fn emit_legacy_wire_headers(
+    response: &mut Response,
+    endpoint: &str,
+    shape: &str,
+    fields: &[&str],
+) {
+    use axum::http::HeaderValue;
+
+    let headers = response.headers_mut();
+    headers.insert("Deprecation", HeaderValue::from_static("true"));
+
+    let sunset_raw =
+        std::env::var("PDS_V03_WIRE_SUNSET_DATE").unwrap_or_else(|_| "deprecated".to_string());
+    if sunset_raw != "deprecated" {
+        if let Ok(val) = HeaderValue::from_str(&sunset_raw) {
+            headers.insert("Sunset", val);
+        }
+    }
+
+    let warning = format!(
+        "299 - \"v0.3 wire shape is canonical; legacy fields [{}] on {} are deprecated\"",
+        fields.join(", "),
+        endpoint,
+    );
+    if let Ok(val) = HeaderValue::from_str(&warning) {
+        headers.insert("Warning", val);
+    }
+
+    headers.insert(
+        "X-Wire-Migration-Guide",
+        HeaderValue::from_static("/docs/operator/v03-wire-deprecation-rollout.md"),
+    );
+
+    for field in fields {
+        crate::metrics::record_legacy_wire_ingest(endpoint, shape, field);
+    }
+
+    info!(
+        endpoint = endpoint,
+        shape = shape,
+        fields = ?fields,
+        "legacy_wire_shape_ingested"
+    );
+}
+
+/// Detect a JWT-shaped bearer token by its structural signature.
+///
+/// JWTs are three base64url segments separated by `.` (header,
+/// payload, signature). Aurora-Locus's OAuth bearer tokens are
+/// opaque strings without that structure. This structural check
+/// is sufficient for the deprecation-header path because false
+/// positives (a non-JWT token that happens to have two dots) are
+/// rare and the cost of an extra Deprecation header on a
+/// non-JWT request is negligible.
+///
+/// Arc 6 Step 8: this detection is **in-middleware** rather than
+/// reading `req.extensions().get::<AuthMethod>()` because the
+/// `FromRequestParts` extractor that sets that extension runs
+/// INSIDE `next.run(req)` — by the time the middleware reads
+/// `req.extensions()` before `next.run`, the extension isn't set
+/// yet, and after `next.run` the request has been consumed. The
+/// extractor-route was the original design but never worked; the
+/// structural-detection route is what actually fires at runtime.
+fn token_looks_like_jwt(token: &str) -> bool {
+    let parts: Vec<&str> = token.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
+}
+
 /// Add JWT deprecation headers to responses
 ///
 /// This middleware checks if the request used JWT authentication (vs OAuth 2.1)
@@ -707,16 +797,23 @@ pub fn enforce_scope(auth: &UnifiedAuthContext, required_scope: &AtProtoScope) -
 /// - Sunset: <date> (from config)
 /// - Warning: "299 - \"JWT authentication is deprecated. Migrate to OAuth 2.1.\""
 /// - X-OAuth-Migration-Guide: <url> (from config)
+///
+/// Arc 6 Step 8 wired this middleware into the router stack (it
+/// was previously defined but never registered). The detection
+/// path uses the structural `token_looks_like_jwt` helper because
+/// the extractor-set request extension isn't visible from a
+/// middleware in axum's layer model — see the helper's doc.
 pub async fn jwt_deprecation_headers(
     State(ctx): State<AppContext>,
     req: Request,
     next: Next,
 ) -> Response {
-    // Check if JWT auth was used (stored in request extensions by AuthContext)
-    let is_jwt = req
-        .extensions()
-        .get::<crate::auth::AuthMethod>()
-        .map(|method| matches!(method, crate::auth::AuthMethod::Jwt))
+    // Detect JWT auth from the Authorization header structure
+    // directly. Requests without an Authorization header (or
+    // with a non-JWT token) flow through unchanged.
+    let is_jwt = extract_bearer_token(req.headers())
+        .as_deref()
+        .map(token_looks_like_jwt)
         .unwrap_or(false);
 
     // Run the request handler
@@ -987,5 +1084,30 @@ mod namespace_scope_tests {
             ),
             NamespaceScopeOutcome::Deny(_)
         ));
+    }
+
+    // ---------- Arc 6 Step 8: JWT structural detection ----------
+
+    #[test]
+    fn token_looks_like_jwt_accepts_three_segment_token() {
+        // header.payload.signature shape — what JWTs use.
+        assert!(token_looks_like_jwt("aaa.bbb.ccc"));
+        assert!(token_looks_like_jwt(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ.fakeSig"
+        ));
+    }
+
+    #[test]
+    fn token_looks_like_jwt_rejects_non_jwt_shapes() {
+        // Opaque OAuth tokens — no dots.
+        assert!(!token_looks_like_jwt("opaque_token_uuid_like"));
+        assert!(!token_looks_like_jwt(""));
+        // Wrong segment count.
+        assert!(!token_looks_like_jwt("aaa.bbb"));
+        assert!(!token_looks_like_jwt("aaa.bbb.ccc.ddd"));
+        // Empty segments — JWTs require non-empty header/payload/signature.
+        assert!(!token_looks_like_jwt("aaa..ccc"));
+        assert!(!token_looks_like_jwt(".bbb.ccc"));
+        assert!(!token_looks_like_jwt("aaa.bbb."));
     }
 }

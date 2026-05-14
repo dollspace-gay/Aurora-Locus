@@ -6,10 +6,940 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-_Future v0.4 cycle work lands here. See
-[`docs/v04-candidates.md`](docs/v04-candidates.md) for the
-named deferrals from v0.3 and the running candidate
-accumulator._
+_Future v0.5 cycle work lands here._
+
+## [0.4.0] - 2026-05-13
+
+v0.4 makes Aurora-Locus production-deployable at scale. The
+multi-instance work (Arc 7) introduces a `DistributedStore`
+trait substrate so DPoP JTI replay, OAuth flow state, and
+rate-limit buckets become cross-instance-coherent against a
+shared Postgres database. The runtime capability registry
+(Arc 8) replaces the hand-curated `aurora_capability_families`
+list with introspection against the actual mounted routes.
+A hygiene pass (Arc 9) clears 24 clippy warnings, adds a
+`Clock` primitive that resolves identity-cache test flakiness,
+adds `Debug`-redaction for secret-bearing `AppContext` fields,
+and rationalizes the forensic-export bundle's
+`audit-entries.json` wire shape to match `getAuditTrail`. The
+GC sweep (Arc 10) provides optional reconciliation between
+blob storage and DB metadata for the rare cases where the
+Arc 4 `DeferredAction` queue's cleanup fails — off by default,
+dry-run by default once enabled. A debug-build-only HTTP
+endpoint family (Arc 11) collapses the local-development
+admin-grant ceremony from multi-step CLI workflows to single
+HTTP POSTs; release builds do not include the surface. Arc 6
+migrates the Aurora Admin UI to v0.3 wire shapes with
+dual-shape backend acceptance during the transition window.
+
+### Arc 10 — GC sweep for orphaned blob storage (chainlink #57)
+
+Four-step cycle (Step 0 recon, Steps 1-4 implementation)
+introducing an optional background reconciliation mechanism
+for blob storage. Identifies and (operator-opt-in) deletes
+storage entries with no corresponding row in the
+authoritative `blob` table — the rare case where Arc 4's
+`DeferredAction` queue's best-effort cleanup fails to land.
+
+The sweep is **off by default** in v0.4. Existing deployments
+gain no new background task; operators opt in via
+`PDS_GC_SWEEP_ENABLED=true` (env-var) or the `gc_sweep` config
+section (file tier). When enabled, `dry_run: true` is the
+safe default — operators promote to destructive mode only
+after observing the report cadence in production.
+
+#### Added
+
+- **`BlobBackend::list_all_blobs(cursor, page_size) ->
+  BlobListPage`** trait method exposing paginated storage
+  walks. Both backends (`DiskBlobBackend`, `S3BlobBackend`)
+  implement against their native primitives — `DiskBlobBackend`
+  uses `tokio::fs::read_dir` with a synthesized
+  `"{shard}/{filename}"` cursor; `S3BlobBackend` passes the
+  S3 `ContinuationToken` through. [Arc 10 Step 1]
+- **`src/blob_store/gc.rs`** — sweep primitive. Reconciles
+  blob storage against `blob` and `temp_blob_metadata`;
+  classifies each candidate via the two-stage `classify_blob`
+  function (precedence: `Authorized > InFlight > age`);
+  applies actions per `SweepParams`. Library-callable via
+  `BlobStore::run_gc_sweep`. [Arc 10 Step 2]
+- **Scheduled background job
+  `JobScheduler::gc_sweep_job`** at configurable cadence
+  (default 24h). Gated on `gc_sweep.enabled`; matches
+  `temp_blob_cleanup_job`'s shape (interval-loop + structured
+  tracing logs of the 9-counter report). [Arc 10 Step 3]
+- **CLI subcommand `aurora-locus gc-sweep`** for operator-
+  initiated one-off sweeps. Offline-only: acquires
+  `LivenessLock` and fails fast if a PDS is running against
+  the same DB. Five overrides (`--dry-run`, `--report-only`,
+  `--max-deletes`, `--threshold-secs`, `--page-size`); no
+  `--no-dry-run` (destructive mode requires editing config +
+  restarting). [Arc 10 Step 3]
+- **`GcSweepConfig`** config section with six fields:
+  `enabled`, `interval_secs`, `dry_run`,
+  `max_deletes_per_run`, `freshness_threshold_secs`,
+  `page_size`. Env-var loading via `PDS_GC_SWEEP_*` prefixes;
+  zero `interval_secs` and `page_size` rejected at startup;
+  unparseable values surface as validation errors. New
+  `parse_bool_env` and `parse_usize_env` helpers added
+  alongside the existing typed parse helpers. [Arc 10 Step 3]
+- **Four `validate-config` warnings** for risky `gc_sweep`
+  configurations, gated on `gc_sweep.enabled = true`:
+  `dry_run: false` general advisory; `dry_run: false` AND
+  `max_deletes_per_run > 100000` (blast-radius);
+  `freshness_threshold_secs < 600` (in-flight false-positive
+  risk); `interval_secs < 3600` (cadence vs. throughput).
+  [Arc 10 Step 3]
+- **Three Prometheus metrics** in `src/metrics.rs`:
+  `gc_sweep_orphans_found_total` (counter),
+  `gc_sweep_orphans_deleted_total` (counter),
+  `gc_sweep_duration_seconds` (histogram). Cap-hit and
+  duration-vs-interval signals are derivable from these
+  three; no separate cap-hit counter. [Arc 10 Step 2]
+- **`docs/operator/blob-gc-sweep.md`** — operator-facing
+  reference: what the sweep does, when to enable it, the
+  mandatory dry-run shakedown procedure, both configuration
+  paths, the CLI subcommand, metrics + derivable signals,
+  troubleshooting, and the full configuration reference
+  table. [Arc 10 Step 4]
+
+#### Rationale
+
+- The Arc 4 `DeferredAction` queue handles the common case
+  where storage and DB go out of sync; the sweep is for
+  edge cases where the queue's retries are exhausted, the
+  PDS was forcibly terminated mid-cleanup, or manual
+  operator action created divergence.
+- Off-by-default + dry-run-default + safety-cap-default
+  preserve existing deployment behavior; opt-in destructive
+  mode requires explicit operator action through both
+  config changes (no CLI-flag override of `dry_run` in the
+  destructive direction).
+- Stateless mode for v0.4 — each sweep starts fresh from the
+  first storage page. Stateful mode (persistent cursor
+  between runs) is a v0.6 candidate if operational
+  telemetry shows probabilistic coverage is insufficient.
+- Tracking-surface-driven classification per Step 0 Q9:
+  `temp_blob_metadata` is authoritative for in-flight
+  uploads; the 1-hour freshness threshold is belt-and-braces
+  for the rare race where a row hasn't committed yet at the
+  moment storage lists the CID.
+
+#### Verification
+
+- `cargo test --lib` — 991 passed (Arc 9 baseline 951 + 21
+  `blob_store::gc::tests` + 8 `config::gc_sweep_tests` + 11
+  miscellaneous Arc 10/11 additions across other modules).
+- Synthetic IN-clause benchmark
+  (`tests/blob_in_clause_benchmark.rs`, `--ignored`) — 1
+  passed; query at `page_size=500` against 100k synthetic
+  blob rows runs in ~7ms (well under the 50ms threshold).
+  Plan stays `SEARCH blob USING COVERING INDEX
+  sqlite_autoindex_blob_1 (cid=?)`.
+- `cargo test --test distributed_substrate_test` — 11.
+- `cargo test --test contract_phrases` — 14.
+- `cargo test --test grant_admin_test` — 8.
+- `cargo clippy --lib --no-deps -- -D warnings` — 0 errors.
+- `cargo build --release --bin aurora-locus` — succeeds; no
+  new warnings introduced.
+
+#### Out of scope (v0.6 candidates)
+
+- Stateful sweep mode with persistent cursor between runs.
+- Graceful cancellation handle for the scheduled job
+  (shared with the broader `JobScheduler` shutdown story).
+- Live S3 integration tests against an S3 mock
+  (`aws-sdk-mock` or LocalStack testcontainers).
+- Promote `now: DateTime<Utc>` parameter on `run_sweep` /
+  `run_gc_sweep` to full `Clock` injection if telemetry
+  surfaces a need.
+- `--config-show` CLI mode that prints resolved params
+  without acquiring the `LivenessLock` first.
+- Per-account orphan-rate metric (the current metrics are
+  process-wide totals).
+- Postgres-side `EXPLAIN ANALYZE` benchmark equivalent to
+  the SQLite synthetic benchmark (requires
+  `testcontainers` scaffolding equivalent to
+  `tests/distributed_substrate_test.rs`).
+
+### Arc 11 — Debug-build-only dev HTTP endpoints (chainlink #56)
+
+Single-step cycle item shipping a localhost-only HTTP namespace
+(`dev.aurora.*`) for development workflow. Compiled into debug
+builds only via `#[cfg(debug_assertions)]`; release builds do
+not include the surface, and `nm target/release/aurora-locus
+| grep dev_routes` returns zero symbols (the module is
+stripped at compile time). The path namespace is List C by
+design — operators running release builds against these paths
+see 404.
+
+Pulled forward from end-of-v0.4 to mid-cycle because Arc 9
+Phase B's stop-PDS / `cargo run -- grant-admin` / restart-PDS
+cycle was unbearable; the new endpoint family collapses each
+admin operation to a single HTTP POST against the running PDS.
+
+#### Added
+
+- **`dev.aurora.*` HTTP namespace** under
+  `src/api/dev_routes.rs`, gated by `#[cfg(debug_assertions)]`
+  at the module level. Five endpoints:
+  - `dev.aurora.grantAdmin` — POST `{did, role, notes?}`; grant
+    admin role without stopping the PDS. Routes through the
+    same `AdminRoleManager::grant_role` the CLI uses, minus the
+    PDS-liveness lock.
+  - `dev.aurora.revokeAdmin` — POST `{did, role?, reason?}`;
+    revoke an active admin grant via
+    `AdminRoleManager::revoke_role`.
+  - `dev.aurora.listAdmins` — GET; enumerate every
+    `admin_roles` row, active and revoked, ordered by
+    `granted_at DESC`. Surfaces revoked history that the
+    manager's `list_active_roles` filters out.
+  - `dev.aurora.createAccount` — POST `{handle, email,
+    password}`; bypass handler-layer invite-code +
+    email-verification gates. Preserves DB-invariant checks
+    (handle/email uniqueness, password hashing, DID generation,
+    repository init). Returns `accessJwt` directly.
+  - `dev.aurora.mintToken` — POST `{did}`; mint a fresh
+    local-session JWT. Admin authority is queried from
+    `admin_roles` at request time by `AdminAuthContext` Layer 1
+    (`src/auth.rs:230-332`), so a grant followed by `mintToken`
+    is sufficient to get an admin-capable token without a
+    `createSession` cycle.
+- **Conditional router mount in `src/api/mod.rs`** under the
+  same `#[cfg(debug_assertions)]` gate, with a comment block
+  documenting the List C status (NEVER registered in
+  `RouteRegistry`, never advertised by `describeCapabilities`).
+- **`docs/internal/dev-routes.md`** — operator-facing doc with
+  verified curl examples for each endpoint, a typical
+  five-step workflow, and a verification recipe confirming the
+  surface is absent from release builds.
+
+#### Threat model
+
+The `#[cfg(debug_assertions)]` gate IS the auth. Localhost
+development is the trusted environment; release builds never
+include the surface, so production deployment risk is zero. The
+path namespace is List C by design — operators running release
+builds against these paths see 404. The CLI counterpart
+(`cargo run -- grant-admin`) remains the offline-only path
+that holds the PDS-liveness lock; the dev HTTP surface is
+explicitly for use against a running PDS.
+
+#### Verification
+
+- `cargo build --lib` — succeeds with dev_routes module.
+- `cargo build --release --lib` — succeeds without dev_routes.
+- `nm target/release/aurora-locus | grep dev_routes` — zero
+  symbols (the module is stripped at compile time).
+- `cargo clippy --lib --no-deps -- -D warnings` — zero errors
+  (Arc 9 Step 1 baseline preserved).
+- `cargo test --lib` — 951 passed (Arc 9 baseline preserved;
+  Arc 11 adds no unit tests — the surface is dev-only and Phase
+  B exercises validate end-to-end).
+
+#### Out of scope (v0.6 candidates)
+
+- `dev.aurora.inspectState` — read substrate state via HTTP.
+- `dev.aurora.triggerReaper` — fire background reapers manually.
+- `dev.aurora.inspectInMemory` — read in-process state
+  (`DPopNonceStore.nonces`, governor counters).
+
+### Arc 9 — Hygiene pass (chainlink #55)
+
+Four-step cycle (Step 0 recon, Steps 1-4 implementation) bundling
+eight items from `docs/v04-candidates.md` whose individual scope
+didn't warrant separate arcs: clippy lint cleanup, `AppContext`
+Debug derive, test-clock primitive for identity::cache,
+`validate_config.rs` audit closure, subscribe-parity-test
+closure-as-done, `AURORA_ADMIN_UI_DESIGN.md` prose audit,
+`file-tier-config.md` value-format consolidation, and
+`exportAccountForensic` shape rationalization.
+
+#### Added
+
+- **`Clock` trait abstraction** (`src/identity/clock.rs`) with
+  `SystemClock` (production) and `MockClock` (`#[cfg(test)]`-gated).
+  Initially adopted by `identity::cache` to make
+  `test_stale_handle_detection` and `test_stale_did_doc_detection`
+  deterministic; the prior implementation slept against real
+  wall-clock TTLs and flaked under suite-wide load. Broader
+  adoption across the ~218 other `Utc::now()` call sites in `src/`
+  is a v0.6 candidate. [Arc 9 Step 2, Item 12]
+- **Manual `impl Debug for AppContext`** (`src/context.rs`) with
+  per-field redaction. `Arc<dyn IdentityResolverApi>` and
+  `Option<Arc<dyn DistributedStore>>` print as opaque
+  `<dyn TraitName>` placeholders because the underlying traits
+  lack a `Debug` supertrait; secret-bearing fields (`config`,
+  `mailer`, DPoP/nonce stores, `local_records_cache`) print as
+  opaque `<TypeName>`. The regression-gate test
+  `app_context_debug_redacts_sensitive_fields` (in
+  `src/api/aurora_subscribe.rs`) asserts no known sentinel
+  secret value appears in the Debug output. No `derive_more`
+  helper crate added. [Arc 9 Step 2, Item 8]
+- **`audit_chain::audit_entry_from_row`** — shared row-to-AuditEntry
+  converter used by `exportAccountForensic` to keep its
+  `audit-entries.json` payload lock-step with `getAuditTrail`'s
+  per-item shape. The existing `getAuditTrail` loop retains its
+  inline construction (the stable contract surface stays
+  byte-identical); the new parity test pins the two paths
+  against each other. [Arc 9 Step 4, Item 2]
+- **`schemaVersion: "2"` field** on the forensic-export bundle's
+  `manifest.json`, marking the audit-entries wire-format
+  migration. Consumers dispatch on this field; the binary
+  always emits v2 going forward. [Arc 9 Step 4, Item 2]
+- **`Per-key value formats` section** in
+  `docs/operator/file-tier-config.md` documenting
+  `moderation-mode` and `moderation-mode-redirect-url`
+  validation rules with a four-step "Adding a new runtime
+  setting" procedure tying the source-side allowlist to the
+  operator-facing doc. [Arc 9 Step 3, Item 19]
+
+#### Changed
+
+- **`exportAccountForensic` bundle's `audit-entries.json`** now
+  uses the canonical `AuditEntry` wire shape — same as
+  `getAuditTrail`'s `items[]`. Previously diverged in field
+  names (`id` raw-i64 → stringified, `createdAt` → `timestamp`),
+  types (`snapshotId`/`eventId` raw-i64 → stringified), and
+  membership (missing `subjectRef`, `verified`, `cascadeSubjects`,
+  `cascadeSnapshotIds` now all present). Manifest's
+  `schemaVersion` bumped to `"2"` to signal the change.
+  **BREAKING** for any consumer scripted against the v1 forensic
+  bundle shape. [Arc 9 Step 4, Item 2]
+- **Identity-cache time source** migrated from direct
+  `chrono::Utc::now()` to `Arc<dyn Clock>` injection. Production
+  semantics unchanged via `SystemClock`; tests inject `MockClock`
+  for deterministic TTL-boundary assertions. The six `Utc::now()`
+  call sites inside `DidCache` (`get_did_doc`, `cache_did_doc`,
+  `get_handle`, `cache_handle`, `cleanup_expired` ×2) now read
+  from the injected clock. [Arc 9 Step 2, Item 12]
+- **`SubscribeMessage::AuditEntry`'s `entry` field** changed from
+  `AuditEntry` to `Box<AuditEntry>` (resolution for the
+  `large_enum_variant` lint flagging the enum at ~344 B vs ~40 B
+  largest peer). Wire shape preserved via serde's transparent
+  `Box<T>` (de)serialization; the existing parity test
+  `audit_entry_wire_shape_matches_get_audit_trail_items`
+  re-confirmed after the refactor. [Arc 9 Step 1, Item 7]
+- **`PaginationParams::effective_limit`** uses `.clamp(1, MAX_LIMIT)`
+  instead of the prior `.min().max()` chain (clippy
+  `manual_clamp`). [Arc 9 Step 1, Item 7]
+- **`com.atproto.admin.updateHandle` error mapping** collapsed two
+  adjacent `if matches!` arms (Validation / Conflict both → 409)
+  into a single `|` pattern (clippy `if_same_then_else`). [Arc 9
+  Step 1, Item 7]
+- **`docs/AURORA_ADMIN_UI_DESIGN.md`**: comprehensive prose audit
+  historicizing v0.2-era framing across ~20 sections. Header
+  reframed to `Cycle: v0.2 (with v0.3 + v0.4 additive amendments
+  — see §15 for v0.4 specifics)`. Stale internal cross-references
+  refreshed to the cycle-archive naming convention. "v0.3 may
+  add" / "v0.3 evaluates" framings throughout §2, §5, §6, §8.7,
+  §9.5, §14 rewritten to acknowledge that v0.3 + v0.4 didn't
+  absorb the items; future-cycle aspirations now route through
+  `docs/v05-candidates.md`. §15 stays current. [Arc 9 Step 3,
+  Item 15]
+
+#### Removed
+
+- **3 dead-code helper functions** in `src/api/aurora_admin.rs`
+  (`require_repo_did`, `subject_uri_cid`, `require_blob_cid`),
+  each superseded by `_pds` variants visible at
+  `aurora_admin.rs:1018+`. The companion `subject_columns` is
+  still used and stays. [Arc 9 Step 1, Item 7]
+- **Internal design-corpus file rename-closure** to the
+  cycle-archive naming convention; pending deletion since
+  Arc 7's mid-cycle rename. Cross-references in
+  `docs/AURORA_ADMIN_UI_DESIGN.md` updated to point at the
+  renamed file. [Arc 9 Step 3, Item 15]
+
+#### Fixed
+
+- **24 clippy `-D warnings` errors cleared**: 3 `dead_code`, 1
+  `manual_clamp`, 1 `if_same_then_else`, 5
+  `doc_lazy_continuation` (in `aurora_admin.rs`, `registry.rs`,
+  `config.rs` ×3), 1 `useless_format`, 10 `redundant_closure`
+  (`|e| internal(e)` → `internal`), 1 `large_enum_variant`, 2
+  `doc_overindented_list_items` (in `oauth/token.rs`).
+  `cargo clippy --lib --no-deps -- -D warnings` now produces
+  zero errors; no new lints introduced. [Arc 9 Step 1, Item 7]
+- **`test_stale_handle_detection` flakiness** resolved by
+  migrating from `tokio::time::sleep` against real-wall-clock
+  TTLs to programmatic `MockClock` advancement. 10/10 flakiness
+  loop passes deterministically; total runtime drops from ~22s
+  to ~0.15s combined with the sibling
+  `test_stale_did_doc_detection` (also migrated). [Arc 9 Step
+  2, Item 12]
+
+#### Documentation
+
+- **`src/cli/validate_config.rs`**: audit-date comment confirming
+  all 18 emitted warnings classified as still valid as of Arc 9
+  Step 2. No rephrasing or removal needed. Re-audit anchor when
+  major auth, federation, or storage features change. [Arc 9
+  Step 2, Item 17]
+
+#### Closure-as-done items
+
+- **Item 14 (Subscribe parity test)**: closed as already-done.
+  The existing serde-shape unit test
+  `audit_entry_wire_shape_matches_get_audit_trail_items` IS the
+  parity test; it has passed throughout Arc 9's cycle work
+  (including across the Item 7 `Box<AuditEntry>` refactor). The
+  v0.3-cycle "tooling-side issue" referenced in
+  `docs/v04-candidates.md:166-169` couldn't be located in any
+  tracked design corpus. If a WebSocket-integration-level
+  parity test was the original intent, that's v0.6 candidate
+  territory (new tokio-tungstenite + axum-test scaffolding).
+
+#### Known limitations (v0.4)
+
+- **`Clock` adoption is scoped to `identity::cache`**. ~218 other
+  `Utc::now()` call sites in the codebase remain on direct
+  wall-clock. Broader adoption is a v0.6 candidate gated by
+  whether other tests show flakiness signal.
+- **`getAuditTrail` retains its inline row-to-AuditEntry
+  construction**. The shared `audit_chain::audit_entry_from_row`
+  helper is currently used only by `exportAccountForensic`.
+  DRYing `getAuditTrail` onto the helper is a v0.5+ refactor
+  candidate; the new parity test pins the duplication so drift
+  is caught immediately.
+
+### Arc 8 — Runtime route enumeration (chainlink #54)
+
+Four-step cycle (Step 0 recon, Steps 1-4 implementation + docs)
+replacing the hand-curated `aurora_capability_families()` /
+`aurora_capability_extensions()` functions with a runtime
+`RouteRegistry` substrate populated during route registration and
+queried by `tools.aurora.describeCapabilities` at request time.
+Byte-identical wire output preserved across the migration —
+single-source-of-truth advertisement that can no longer drift
+from the actual route table. Closes the v0.3 #123 carry-forward
+for runtime route enumeration.
+
+#### Added
+
+- **`RouteRegistry` substrate** (`src/api/registry.rs`) with
+  `RouteEntry`, `Family` enum, `FamilyKind`, `CapsBuilder`, and
+  `RouteRegistryBuilder` typestate. The registry is built at
+  startup, consumed by handlers at request time, and is the
+  single source of truth for the capability advertisement.
+  [Arc 8 Step 1]
+- **`aurora_route_builder()` constructor** + `.route_with_caps()`
+  / `.route()` / `.merge()` / `.build()` chain. Each
+  `.route_with_caps()` call emits a `RouteEntry` alongside the
+  axum `Router` registration; pass-through `.route()` registers
+  without contributing a registry entry (List C routes).
+  [Arc 8 Step 1]
+- **`WIRE_EXTENSION_ORDER` constant** (`src/api/registry.rs`)
+  pinning the capability-extension wire-output order across the
+  migration. The `<kebab-family>-v<integer>` versioning contract
+  doc-comment lives here (moved from the deleted
+  `aurora_capability_extensions` function). [Arc 8 Step 2-3]
+- **`ADMIN_TIER_PATH_REGEX` constant** —
+  `^/xrpc/tools\.aurora\.(admin|moderator|superadmin|ops)(\.|$)`
+  — centralized in `src/api/registry.rs` (shared-constant
+  requirement). `admin_tier_regex()` returns a `&'static Regex`
+  cached via `OnceLock`. The starting regex was missing `ops`
+  (admin-tier by authority but advertised through the existing
+  curated list); Step 0 Q6 added it. [Arc 8 Step 1]
+- **`Arc<RouteRegistry>` field on `AppContext`** populated by
+  `crate::api::routes()`'s builder pair and threaded through
+  `AppContext::new(config, route_registry)`. Test fixtures pass
+  an empty default; `api::admin::tests::create_test_context`
+  passes the populated registry from `super::routes()` so the
+  snapshot test exercises the real wire output. [Arc 8 Step 1-3]
+- **Structural-invariant assertions on
+  `test_admin_route_registry_completeness`** (renamed from
+  `describe_capabilities_snapshot`): the byte-for-byte literal
+  stays in place as contract protection; the new structural
+  assertions (every family namespace appears, extensions match
+  `WIRE_EXTENSION_ORDER` element-for-element) give human-readable
+  diagnostics when the registry drifts. [Arc 8 Step 4]
+
+#### Changed
+
+- **`describeCapabilities` handler** (`src/api/admin.rs`) now
+  reads from `ctx.route_registry` via a `build_families_value`
+  helper plus `RouteRegistry::advertised_extensions()`.
+  Byte-identical wire output preserved (the
+  `test_admin_route_registry_completeness` snapshot literal
+  is unchanged across Steps 1-4). [Arc 8 Step 3]
+- **`api::admin::routes()` return type** changed from
+  `Router<AppContext>` to `(Router<AppContext>, Arc<RouteRegistry>)`.
+  All 56 admin-tier routes use `.route_with_caps()` with
+  canonical-introducer capability attribution; ≈35 List C
+  routes (`com.atproto.admin.*` plus `describeCapabilities`)
+  use pass-through `.route()`. [Arc 8 Step 2]
+- **`api::routes()` return type** changed in lockstep to
+  `(Router<AppContext>, Arc<RouteRegistry>)` propagating
+  admin's registry tuple up. [Arc 8 Step 2]
+- **`AppContext::new(config)`** → `AppContext::new(config,
+  route_registry: Arc<RouteRegistry>)`. 8 callsites updated
+  (`main.rs`, 6 in-source test fixtures, 1 integration test).
+  [Arc 8 Step 2]
+- **`server::build_router(ctx)`** → `build_router(ctx, api_router)`
+  and **`server::serve(ctx)`** → `serve(ctx, api_router)`
+  accepting the pre-built `Router<AppContext>`. The startup
+  flow in `main.rs` is now: build `api::routes()` →
+  `AppContext::new` with the registry → `server::serve` with
+  the router. [Arc 8 Step 2]
+- **`CapabilityExtension.name`** type changed from
+  `&'static str` to `String` (registry returns owned strings;
+  `Box::leak`-per-request would accumulate leaked memory).
+  [Arc 8 Step 3]
+- **Contract-phrase test** renamed
+  `aurora_capability_extensions_has_versioning_pattern` →
+  `wire_extension_order_has_versioning_pattern`, with the anchor
+  moved from `fn aurora_capability_extensions(` in
+  `src/api/admin.rs` to `pub const WIRE_EXTENSION_ORDER:` in
+  `src/api/registry.rs`. Per Step 0 OQ1 disposition (b).
+  [Arc 8 Step 3]
+- **Direct `regex` crate dependency** (`Cargo.toml`) added for
+  `ADMIN_TIER_PATH_REGEX`. The crate was already in the tree
+  transitively via `tracing-subscriber`'s env-filter feature;
+  the direct dep makes the substrate's use explicit. [Arc 8
+  Step 1]
+
+#### Removed
+
+- **`aurora_capability_families()`** (~75 lines) and
+  **`aurora_capability_extensions()`** (~27 lines) from
+  `src/api/admin.rs`. Replaced by registry-driven generation;
+  the snapshot test confirms byte-identical wire output.
+  [Arc 8 Step 3]
+- **`// TODO(#123, v0.4): runtime route enumeration deferred …`**
+  anchors at the call sites — Arc 8 is the v0.4 cycle's
+  resolution of chainlink #123. [Arc 8 Step 3]
+- **`wire_extension_order_matches_curated_list_byte_identical`
+  test** (the Step 2 substrate test that locked the wire-order
+  constant against the curated list during the Step 1-2
+  intermediate; collapsed after Step 3 removed the curated
+  list). [Arc 8 Step 3]
+
+#### Documentation
+
+- **`docs/AURORA_ADMIN_UI_DESIGN.md` §8.15** rewritten with: the
+  three-step capability-addition procedure (design-doc update
+  → registry entry → `WIRE_EXTENSION_ORDER` insertion); the
+  `.omitted()` flag mechanism for vocabulary-level
+  intentionally-not-advertised capabilities; the admin-tier
+  scope definition with the verified `ADMIN_TIER_PATH_REGEX`;
+  and the representative-per-category List C rationale list
+  (bsky-PDS-compat namespace, capability-registry meta-endpoint,
+  public XRPC, health checks and well-known endpoints, admin
+  UI static assets, public OAuth surface, internal OAuth
+  bootstrap, Prometheus scrape). [Arc 8 Step 4]
+#### Known limitations (v0.4)
+
+- **`RouteEntry.methods`** field exists but is left empty.
+  `axum::routing::MethodRouter` doesn't expose its accepted
+  methods publicly, and the current `describeCapabilities`
+  wire output doesn't include methods. Populating the field
+  would require either an explicit `methods: &[Method]`
+  parameter at every `.route_with_caps()` call site or
+  upstream axum changes. v0.6 candidate.
+- **Method-name extraction** in `build_families_value` uses
+  `path.rsplit('.').next()` to pull the trailing segment from
+  `/xrpc/<namespace>.<method>` paths. The fallback returns the
+  raw path; the snapshot test catches any future deviation
+  from the `<namespace>.<method>` shape loudly rather than
+  silently shipping a malformed wire entry.
+
+### Arc 7 — Multi-instance auth state + rate limiting (chainlink #53)
+
+Four-step cycle (Step 0 recon, Step 0.6 schema, Steps 1-4
+implementation + docs) introducing the `DistributedStore`
+trait substrate so Aurora-Locus's per-request authentication
+state (DPoP JTI replay) and rate-limit buckets become
+cross-instance-coherent. Backed by Postgres-CAS; the existing
+in-process governor + in-memory JTI tracker remain functional
+as the `single_instance_inmemory` opt-out and as
+defense-in-depth in the default `distributed` mode.
+
+#### Added
+
+- **`DistributedStore` trait abstraction**
+  (`src/distributed/mod.rs`) with five async methods —
+  insert / get / delete / cas / reap_expired — and three
+  error variants (`KeyExists`, `UnsupportedTable`,
+  `Database`). The trait is the consumer contract; backends
+  plug in behind it. [Arc 7 Step 1]
+- **`Lease` primitive** (`src/distributed/lease.rs`) —
+  epoch-ms BIGINT-backed expiry abstraction matching the
+  schema's portable arithmetic. saturating_add on
+  construction defeats i64 overflow on extreme durations.
+  [Arc 7 Step 1]
+- **`PostgresCasStore`** (`src/distributed/postgres_cas.rs`)
+  — Postgres-CAS substrate implementation via `sqlx::Any`
+  so a single backend serves SQLite (dev) and Postgres
+  (production) deployments. Per-table dispatch over
+  `dpop_jti_replay` and `rate_limit_buckets`. Backend-
+  specific unique-violation detection centralized in one
+  helper. [Arc 7 Step 1]
+- **`TtlCache` parse-result optimization layer**
+  (`src/distributed/cache.rs`) — dashmap-backed concurrent
+  cache for cryptographic parse caching. Built but not yet
+  wired to a consumer; ready for v0.6 DPoP parse-caching
+  work. [Arc 7 Step 1]
+- **`OAuthFlowStateAdapter`**
+  (`src/oauth/flow_state_adapter.rs`) — sibling
+  `DistributedStore` impl wrapping the existing
+  `authorization_request` table without schema change. The
+  trait's opaque value parameter is JSON-encoded
+  `AuthorizationRequestData` on insert and
+  `AuthorizationRequest` on read. [Arc 7 Step 2]
+- **`DistributedStoreRegistry`**
+  (`src/distributed/registry.rs`) — per-table dispatch
+  facade implementing `DistributedStore`, routing consumers
+  to the right impl by table name. Substrate is `Option`
+  (skipped in `SingleInstanceInmemory` mode); OAuth adapter
+  is mandatory (table lives in `account_db` regardless of
+  mode). [Arc 7 Step 2]
+- **`DistributedRateLimiter`** in `src/rate_limit.rs` —
+  cross-instance rate-limit primitive built on the §6.3.5
+  atomic UPDATE-with-arithmetic pattern. First-touch INSERT
+  fallback with bounded retry on PK-collision races.
+  Portable CASE-WHEN SQL (no Postgres-only `LEAST`).
+  [Arc 7 Step 3]
+- **`dpop_jti_replay` and `rate_limit_buckets` tables**
+  (migration `0007_distributed_state.sql` + Postgres twin).
+  Schema stays within `sqlx::Any`'s portable subset —
+  TEXT primary keys, BIGINT epoch-millis timestamps. [Arc 7
+  Step 0.6]
+- **`PDS_DISTRIBUTED_STATE_MODE` config enum** —
+  `distributed` (default), `single_instance_inmemory`,
+  `redis` (forward-compat slot; rejected at startup).
+  [Arc 7 Step 1]
+- **Maintenance pool sizing env vars** —
+  `PDS_MAINTENANCE_DB_MAX_CONNECTIONS` (default 15),
+  `PDS_MAINTENANCE_DB_MIN_CONNECTIONS` (default 2),
+  `PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS` (default 10).
+  Dedicated pool isolates substrate load from the main
+  application pool. [Arc 7 Step 1]
+- **Three background reapers** in
+  `src/jobs/mod.rs:JobScheduler::start`:
+  `dpop_jti_replay_reaper_job` (300s),
+  `oauth_authorization_request_cleanup_job` (300s, fold-
+  in of pre-existing-but-unwired sweeper from Step 0 Q1
+  finding), `rate_limit_buckets_reaper_job` (3600s, 7-day
+  inactivity threshold). [Arc 7 Steps 1, 2, 3]
+- **`docs/operator/multi-instance-deployment.md`** —
+  485-line operator guide covering when multi-instance
+  makes sense, Postgres prerequisites with connection-
+  budget worked example, configuration env-var inventory,
+  migration path, verification smoke checks, monitoring
+  guidance, six known v0.4 limitations, and troubleshooting
+  for the most common operator surprises. [Arc 7 Step 4]
+- **`tests/distributed_substrate_test.rs`** — 11 cross-
+  instance integration tests against testcontainers
+  Postgres covering JTI replay rejection, OAuth state
+  visibility + consume-and-replay-rejection, rate-limit
+  exhaustion across instances, concurrent first-touch
+  race resolution, and reaper sweeps visible to siblings.
+  [Arc 7 Steps 1-3]
+
+#### Changed
+
+- **OAuth handlers route through the `DistributedStore`
+  trait**: `src/oauth/authorize.rs:create_authorization_request`
+  and `get_authorization_request` now call
+  `store.insert / get` for cross-instance-relevant
+  operations. `mark_code_as_used` in
+  `src/oauth/consent.rs` does a secondary-key lookup
+  (direct SQL, unchanged) then routes the consume through
+  `store.delete`. The trait's atomic UPDATE-with-predicate
+  IS the cross-instance single-use guarantee for OAuth
+  code redemption. [Arc 7 Step 2]
+- **DPoP JTI replay routes through the trait in
+  `distributed` mode**: `DPopNonceStore.check_and_record_jti`
+  in `src/federation/dpop.rs` calls
+  `store.insert("dpop_jti_replay", ...)` when configured;
+  `KeyExists` translates to "replay". In
+  `single_instance_inmemory` mode the pre-Arc-7
+  `HashMap<String, i64>` path runs unchanged.
+  `check_and_record_jti`'s signature widened from
+  `(jti, exp)` to `(jti, jkt, exp)` so the substrate's
+  `jkt` observability column is populated; the verifier
+  computes the JWK thumbprint earlier so it can be
+  passed through. [Arc 7 Step 3]
+- **Rate-limit middleware adds a PRIORITY-0 distributed
+  pre-check**: in `distributed` mode the middleware runs
+  the substrate's `try_consume` against a per-endpoint
+  bucket BEFORE the existing governor's PRIORITY-1+
+  checks. Returns 429 directly on substrate denial; falls
+  through with a `tracing::warn!` on substrate-consult
+  failure (non-fatal — request continues via the
+  governor's per-instance defense). [Arc 7 Step 3]
+- **Migration `0007_distributed_state.sql` retroactively
+  cites chainlink #53** in its header comment, matching
+  the existing `chainlink #NNN` convention from migrations
+  0005 and 0006. [Arc 7 Step 1]
+- **Background-task scheduling**: three new reapers
+  spawned through the existing `JobScheduler::start`
+  pattern, matching `dpop_nonce_cleanup_job`'s shape.
+  No new shutdown-handling infrastructure; reapers run
+  for process lifetime like the rest of the existing
+  background tasks. [Arc 7 Steps 1-3]
+- **`get_authorization_request` collapses "expired" and
+  "not found" into a single `NotFound`**. Pre-Arc-7 the
+  function raised separate `Authentication("Authorization
+  request expired")` for the expired case; the trait's
+  `get` filters lease-expired rows as `None` and the
+  handler collapses both into 404. Documented in the
+  function body — consent screen treats both identically.
+  [Arc 7 Step 2]
+
+#### Fixed
+
+- **Pre-existing `authorization_request` schema/model
+  mismatch surfaced and worked around**: the
+  `AuthorizationRequest` model declared `id: i64` and
+  `code_used_at: Option<DateTime<Utc>>` fields, but the
+  `0001_initial.sql` migrations never created backing
+  columns. Step 0 recon copied the model verbatim and
+  missed the inconsistency; the existing direct-SQL paths
+  that SELECTed those columns would have failed on
+  Postgres but were latent because the pre-Arc-7 test
+  suite never exercised them against real Postgres.
+  Step 2's testcontainers tests are the first to hit it.
+  Fixed in-scope (no schema migration per Step 2
+  kickoff): the adapter's `get`/`delete` and
+  `consent.rs:get_request_by_code` SELECT/UPDATE only
+  the columns that actually exist; the model fields are
+  populated with synthetic defaults (`0` / `None`). The
+  dead model fields stay for API compat — no consumer
+  reads them. v0.6 model audit should remove them.
+  [Arc 7 Step 2]
+
+#### Removed
+
+- **`src/rate_limit_new/distributed.rs`** (pre-existing
+  Redis-backed `DistributedRateLimiter`, 276 lines) —
+  retired per Step 1 disposition. Was wired through
+  `AppContext.distributed_rate_limiter` but marked
+  `#[allow(dead_code)]` and never consulted by the
+  rate-limit middleware. Replaced by Arc 7's trait
+  surface; the `DistributedStateMode::Redis` enum
+  variant preserves the forward-compat door for a future
+  cycle's clean Redis backend against the trait.
+  [Arc 7 Step 1]
+- **`RateLimitConfig.use_redis` and `RateLimitConfig.redis_url`
+  fields** plus the corresponding
+  `PDS_RATE_LIMIT_USE_REDIS` / `PDS_RATE_LIMIT_REDIS_URL`
+  env-var reads — only consumers were the now-deleted
+  rate_limit_new module. [Arc 7 Step 1]
+- **`crate::oauth::authorize::cleanup_expired_requests`
+  function** — only caller was the JobScheduler, which
+  now routes through `store.reap_expired("oauth_flow_state",
+  ...)` directly. [Arc 7 Step 2]
+
+#### Known v0.4 limitations (v0.6 candidates)
+
+- Distributed rate-limit defaults hardcoded
+  (100 tokens / 100 tokens/sec). Per-endpoint
+  configurability TBD.
+- 7-day `rate_limit_buckets` retention hardcoded.
+  Operator-tunable threshold TBD.
+- DPoP server-side nonce issuance stays in-memory
+  (federation `getDpopNonce` endpoint). Substrate's DPoP
+  scope is JTI replay only; the `dpop_jti_replay` table
+  name reflects this.
+- No DPoP parse-result cache wired in v0.4. `TtlCache`
+  primitive is in place from Step 1 (`src/distributed/cache.rs`);
+  no consumer yet. Deferred pending profiling.
+- No dedicated Arc-7 Prometheus metric families
+  (`aurora_distributed_store_operations_total`,
+  `aurora_distributed_store_latency_seconds`,
+  `rate_limit_substrate_fallthrough_total`). Monitoring
+  uses existing `background_jobs_*` and
+  `db_query_duration_seconds`; substrate-consult
+  fall-through is via `tracing::warn!` only.
+- Redis backend implementation deferred. Enum slot
+  reserved; setting `PDS_DISTRIBUTED_STATE_MODE=redis`
+  fails fast at startup.
+- `AuthorizationRequest.id` and `code_used_at` vestigial
+  model fields with no backing schema columns. Removing
+  is a model audit; would touch every fixture and any
+  external consumer that deserializes the JSON.
+
+### Arc 6 — Aurora Admin UI v0.3 migration (v0.4-cycle)
+
+Eight-step migration of the admin UI to v0.3 wire shapes, with
+modal consolidation, role-management action UI, CLI sentinel
+handling, and backend-side dual-shape observability. Arc 6 is
+the v0.4 cycle's headline arc.
+
+#### Added
+
+- **`AuroraErrorTranslations` module** at
+  `static/admin/scripts/api/error-translations.js`. Server
+  structured-error-code → operator-friendly prose translation
+  consumed by `client.js`'s 4xx rendering path. Seeded with the
+  four v0.3 codes (`SubjectVariantMismatch`,
+  `SubjectTargetMismatch`, `OrphanedAppeal`,
+  `SubjectsArrayInvalidForAction`). [Arc 6 Step 1]
+- **`AuroraModal.form` + `AuroraModal.destructiveConfirm`**
+  static helper API on the existing modal substrate. Promise-
+  returning; supports text/password/textarea/checkbox/select
+  field types; live validation; typed-confirm gates; required
+  rationale; ack checkboxes. [Arc 6 Step 4]
+- **`chainVerified` indicator** on the audit page header with
+  three-state semantics (✓ verified through entry M / ⚠
+  verified through M, failure at M+1 / ✗ failed at entry 1)
+  and click-to-expand inline detail panel surfacing the
+  chain-walk CLI suggestion. [Arc 6 Step 3]
+- **`cascadeSnapshotIds` cascade-subjects rendering** on
+  audit-entry detail. Subjects route via
+  `AuroraEntityRef.fromSubject`; snapshot ids render as inline
+  `<code>`. Section omitted entirely when the entry has no
+  cascade. [Arc 6 Step 3]
+- **`subject_cid` filter** on the audit list. [Arc 6 Step 3]
+- **`timeRange` preset dropdown** on the Dashboard moderation-
+  metrics card (`last_hour` / `last_24h` / `last_7d` /
+  `last_30d`). [Arc 6 Step 3]
+- **`auditEntryId` toast click-through** on 11 success toasts.
+  `AuroraToast` API extended with optional
+  `action: { label, href }` argument; clicking navigates to
+  `#mod/audit/<id>` via the existing hash router. [Arc 6 Step 3]
+- **CLI sentinel rendering** for `cli:`-prefixed actor strings:
+  non-clickable badges across all seven actor-rendering
+  surfaces, applied via a single `EntityRef.account()` patch.
+  [Arc 6 Step 6]
+- **Role-grant affordance** on `SettingsRoles.js` and
+  `SettingsRolesMembers.js`; both consume the new
+  `AuroraModal.form` substrate with `did:` prefix validation +
+  audit-entry click-through toast. [Arc 6 Step 5]
+- **Role-revoke flow with canonical destructive-confirm**:
+  typed-confirm gate `"REVOKE"`, required rationale,
+  audit-entry click-through. The role-revoke is the canonical
+  destructive-confirm reference for the Aurora Admin UI.
+  [Arc 6 Steps 4 + 5]
+- **Dual-shape acceptance** on backend admin endpoints:
+  - `tools.aurora.admin.emitEvent` accepts both canonical v0.3
+    `subjects: Vec<Subject>` and legacy v0.2
+    `subject: Subject`.
+  - `com.atproto.admin.updateSubjectStatus` accepts both
+    canonical `record_uri` (snake_case) and legacy `recordUri`
+    (camelCase) on the `RepoBlobRef` subject variant.
+
+  Both reject requests sending both shapes simultaneously with
+  a 400 + explicit error. [Arc 6 Step 7]
+- **Metrics counter `aurora_legacy_wire_ingest_total`** with
+  labels (endpoint, shape, field). Operators query Prometheus
+  to track per-field migration progress. [Arc 6 Step 7]
+- **Structured tracing event** `legacy_wire_shape_ingested`
+  at INFO level with endpoint/shape/field structured fields.
+  [Arc 6 Step 7]
+- **JWT-deprecation middleware wired into the router stack.**
+  Previously defined but never registered as a layer; counter
+  + headers never fired. Step 8 wires it and replaces the
+  broken extractor-extension detection with structural
+  Authorization-header inspection (`token_looks_like_jwt`).
+  [Arc 6 Step 8]
+- **Operator doc**
+  [`docs/operator/v03-wire-deprecation-rollout.md`](docs/operator/v03-wire-deprecation-rollout.md):
+  dual-shape rollout reference for operators with custom UI
+  builds or third-party admin tooling. [Arc 6 Step 7]
+- **Operator doc**
+  [`docs/operator/running-ui-tests.md`](docs/operator/running-ui-tests.md):
+  how to run the admin UI test suite under bare Node ≥ 18.
+  Resolves the "harness invocation isn't documented" friction
+  that recurred across Arc 6 Steps 2-4. [Arc 6 Step 5]
+- **`AURORA_ADMIN_UI_DESIGN.md` §15**: additive prose audit
+  documenting Arc 6 changes against the v0.2-era reference
+  doc. [Arc 6 Step 8]
+
+#### Changed
+
+- **13 native `confirm()` / `prompt()` call sites migrated** to
+  `AuroraModal` helpers per the destructive-action classification
+  (7 destructive → `destructiveConfirm`; 3 form-input → `form`;
+  3 non-destructive yes/no → `form` with zero fields). The
+  Sequencer.js generic dispatcher path converted blanket; the
+  AccountDetail delete-account flow collapses a two-step
+  prompt+confirm into a single typed-gated modal. [Arc 6 Step 4]
+- **`SettingsGeneral` + `SettingsUiModes`** source-tier
+  rendering: all four `SettingSource` values
+  (Runtime / File / Default / RecoveryMode) render with
+  informational suffixes via a shared `settingSourceSuffix()`
+  helper. Runtime renders bare; the others get muted-italic
+  `(default)` / `(file)` / `(recovery override)` tags. [Arc 6
+  Step 2]
+- **`BulkActionPanel` `MAX_BATCH_SIZE`** switched from singleton
+  constant to per-action lookup
+  (`{ DeleteAccount: 10, DeleteBlob: 25, default: 50 }`).
+  `currentMaxBatchSize()` follows the selected action; existing
+  bulk actions fall through to `default` → 50, preserving
+  pre-Arc-6 behavior. [Arc 6 Step 2]
+- **`ActionPanel.js` payload construction** now emits
+  `subjects: [this.subject]` (v0.3 canonical) rather than
+  `subject: this.subject` (v0.2 legacy). [Arc 6 Step 2]
+- **`AuroraToast.show()` API** gained an optional
+  `opts.action: { label, href }` argument. `isSafeActionHref`
+  guard rejects non-same-origin hrefs defensively. [Arc 6
+  Step 3]
+- **JWT-deprecation middleware detection logic**: replaced the
+  unworking `req.extensions().get::<AuthMethod>()` read (which
+  was always empty pre-`next.run` and unreachable post-) with
+  structural `token_looks_like_jwt(token)` Authorization-header
+  inspection. [Arc 6 Step 8]
+
+#### Removed
+
+- **Dead `failures` field reading** in admin batch-handler
+  response consumers. v0.3's Arc 4 Step 2 made batch handlers
+  atomic (all-or-nothing); the `failures` field is no longer
+  emitted on success responses. UI had no live consumer to
+  remove (one false-positive grep hit on
+  `tools.aurora.ops.getValidationFailures`, unrelated).
+  [Arc 6 Step 2]
+- **`affected_count` partial-success rendering branch** in
+  `BulkActionPanel`. v0.3 atomic-batch semantics mean
+  `affectedCount` is now "total subjects processed"; the prior
+  `'Affected N subject(s), M skipped'` rendering with its
+  `r.skipped` array branch is dead. Reworded to
+  `'Processed N subject(s)'`. [Arc 6 Step 2]
+- **Inverted-OK-Cancel toggle** in `AccountDetail.toggleInvites`:
+  the prior native `confirm()` had OK to disable / Cancel to
+  enable, a routinely-misread cognitive trap. Replaced with an
+  explicit select-field `AuroraModal.form` where the operator
+  picks the target state directly. [Arc 6 Step 4]
+
+#### Deferred
+
+- **Response-header emission** for legacy wire shapes
+  (`Deprecation`, `Sunset`, `Warning`, `X-Wire-Migration-Guide`).
+  The `emit_legacy_wire_headers()` helper substrate is in place
+  at `src/api/middleware.rs`; wiring requires restructuring
+  handler return types from `Json<EmitEventOutput>` to
+  `Response`, which ripples through ~43 pre-existing test call
+  sites across `emit_event` and `update_subject_status`. Counter
+  + structured tracing log alone meet the operator-side
+  observability goal; deferred to v0.5+ (federation-aligned
+  since federated PDS consumers of those endpoints benefit from
+  the client-side deprecation signal).
+  Documented in
+  [`docs/operator/v03-wire-deprecation-rollout.md`](docs/operator/v03-wire-deprecation-rollout.md).
+  [Arc 6 Step 7]
+- **Dual-link audit-trail UX on role-tier cards**. Requires
+  extending `Audit.js` to parse
+  hash query params on mount or extending the router to surface
+  query params in route-match results — both substrate
+  additions beyond Arc 6's scope. Carryover to v0.5+. [Arc 6
+  Step 5]
+- **Chain-indicator detail panel migration to AuroraModal**.
+  Currently inline-expansion; migrating to `AuroraModal.form`
+  would require extending `form` to accept Node body (chain-
+  indicator detail has HTML content with code blocks). Two
+  substantive changes, not one — deferred. [Arc 6 Step 4]
+- **Backend error shape for `grant_role` / `revoke_role`**:
+  handlers return `(StatusCode, String)` plain text rather
+  than structured JSON, so Step 1's translation layer can't
+  match them on those endpoints. Reshape is its own
+  wire-shape work; carryover to v0.5+. [Arc 6 Step 5]
+- **CI integration for UI tests**: the admin UI test suite
+  (Node `node:test`, 12 tests, ~250ms total) is not invoked
+  by `.github/workflows/ci.yml`. Low-cost to add; flagged for
+  cycle-close audit. [Arc 6 Step 5]
 
 ## [0.3.0] - 2026-05-10
 

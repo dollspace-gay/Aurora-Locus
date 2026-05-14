@@ -113,6 +113,48 @@ impl JobScheduler {
             info!("DPoP nonce cleanup job started");
         }
 
+        // Spawn dpop_jti_replay reaper (Arc 7, chainlink #53).
+        // Substrate-level cleanup for the cross-instance JTI
+        // replay table; spawn unconditionally — the loop itself
+        // skips the sweep in SingleInstanceInmemory mode where
+        // distributed_store is None.
+        tokio::spawn(Self::dpop_jti_replay_reaper_job(Arc::clone(&self)));
+        info!("dpop_jti_replay reaper job started");
+
+        // Spawn rate_limit_buckets reaper (Arc 7 Step 3).
+        // Inactivity-based GC: rows whose window_start hasn't
+        // moved in 7 days are presumed cold and swept. Hourly
+        // cadence — the 7-day threshold is coarse so frequent
+        // sweeps add no value.
+        tokio::spawn(Self::rate_limit_buckets_reaper_job(Arc::clone(&self)));
+        info!("rate_limit_buckets reaper job started");
+
+        // Spawn OAuth authorization_request cleanup job. The
+        // sweeper has existed since Arc 7 Step 0 recon Q1 but
+        // was previously unwired (no JobScheduler entry). Step 1
+        // folds this in alongside the new reaper since Step 2
+        // would need it wired anyway.
+        tokio::spawn(Self::oauth_authorization_request_cleanup_job(Arc::clone(&self)));
+        info!("OAuth authorization_request cleanup job started");
+
+        // Spawn Arc 10 GC sweep job (chainlink #57). Off-by-
+        // default — operators opt in via PDS_GC_SWEEP_ENABLED.
+        // When enabled, the job reconciles blob storage
+        // against `blob` + `temp_blob_metadata` and deletes
+        // confirmed orphans subject to dry_run +
+        // max_deletes_per_run safety mechanisms.
+        if self.context.config.gc_sweep.enabled {
+            tokio::spawn(Self::gc_sweep_job(Arc::clone(&self)));
+            info!(
+                interval_secs = self.context.config.gc_sweep.interval_secs,
+                dry_run = self.context.config.gc_sweep.dry_run,
+                max_deletes_per_run = self.context.config.gc_sweep.max_deletes_per_run,
+                "GC sweep job scheduled"
+            );
+        } else {
+            tracing::debug!("GC sweep job disabled (gc_sweep.enabled = false)");
+        }
+
         info!("Background jobs started");
     }
 
@@ -254,6 +296,59 @@ impl JobScheduler {
         }
     }
 
+    /// Arc 10 GC sweep (V04_DESIGN.md §9.4.3, chainlink #57).
+    /// Reconciles blob storage against `blob` +
+    /// `temp_blob_metadata`; deletes confirmed orphans subject
+    /// to dry_run + max_deletes_per_run safety mechanisms.
+    /// Cadence + safety parameters come from
+    /// `config.gc_sweep`; only spawned when
+    /// `config.gc_sweep.enabled = true` (see `start()`).
+    async fn gc_sweep_job(scheduler: Arc<Self>) {
+        let interval_secs = scheduler.context.config.gc_sweep.interval_secs;
+        let mut interval = interval(Duration::from_secs(interval_secs));
+
+        loop {
+            interval.tick().await;
+
+            let params = scheduler
+                .context
+                .config
+                .gc_sweep
+                .to_sweep_params(false);
+            let now = chrono::Utc::now();
+
+            info!(
+                dry_run = params.dry_run,
+                max_deletes_per_run = params.max_deletes_per_run,
+                page_size = params.page_size,
+                "Running GC sweep job"
+            );
+
+            match scheduler
+                .context
+                .blob_store
+                .run_gc_sweep(params, now)
+                .await
+            {
+                Ok(report) => {
+                    info!(
+                        pages_scanned = report.pages_scanned,
+                        blobs_examined = report.blobs_examined,
+                        authorized = report.authorized,
+                        in_flight = report.in_flight,
+                        too_young = report.too_young,
+                        confirmed_orphans_found = report.confirmed_orphans_found,
+                        orphans_deleted = report.orphans_deleted,
+                        orphans_skipped_safety_cap = report.orphans_skipped_safety_cap,
+                        duration_seconds = report.duration_seconds,
+                        "GC sweep complete"
+                    );
+                }
+                Err(e) => error!("GC sweep failed: {}", e),
+            }
+        }
+    }
+
     /// Health check job (runs every 5 minutes)
     async fn health_check_job(scheduler: Arc<Self>) {
         let mut interval = interval(Duration::from_secs(300)); // Every 5 minutes
@@ -372,6 +467,117 @@ impl JobScheduler {
                     }
                     Err(e) => error!("Failed to cleanup expired DPoP nonces: {}", e),
                 }
+            }
+        }
+    }
+
+    /// `rate_limit_buckets` reaper sweep (Arc 7 Step 3).
+    /// Inactivity-based GC at a 7-day threshold (constant
+    /// inside the substrate impl) — buckets with no recent
+    /// `window_start_at_epoch_ms` updates are presumed cold
+    /// and swept. The next first-touch self-reconstructs at
+    /// full max_tokens, so the cost of an over-eager sweep is
+    /// one extra INSERT.
+    ///
+    /// Hourly cadence: the 7-day threshold is coarse; minute-
+    /// scale sweeps add no value. Per V04_DESIGN.md §6.3.7 the
+    /// sweep is idempotent (DELETE WHERE) so concurrent
+    /// invocations from sibling instances are fine.
+    async fn rate_limit_buckets_reaper_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(3600)); // 1 hour
+
+        loop {
+            interval.tick().await;
+            let Some(store) = scheduler.context.distributed_store.as_ref() else {
+                continue;
+            };
+            let now_epoch_ms = chrono::Utc::now().timestamp_millis();
+            match store.reap_expired("rate_limit_buckets", now_epoch_ms).await {
+                Ok(count) if count > 0 => info!(
+                    table = "rate_limit_buckets",
+                    count,
+                    "Rate-limit bucket reaper swept inactive buckets"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(
+                    table = "rate_limit_buckets",
+                    error = %e,
+                    "Rate-limit bucket reaper failed"
+                ),
+            }
+        }
+    }
+
+    /// `dpop_jti_replay` reaper sweep (Arc 7, V04_DESIGN.md
+    /// §6.3.7). Substrate-level cleanup for the cross-instance
+    /// JTI replay table. Runs every 5 minutes; per V04_DESIGN.md
+    /// §6.3.7 the sweep is idempotent so concurrent invocations
+    /// from sibling instances are fine.
+    ///
+    /// In `SingleInstanceInmemory` mode `distributed_store` is
+    /// `None` and this loop tick is a continue/no-op. The task
+    /// stays alive for process lifetime regardless of mode so a
+    /// future runtime-toggle of the mode doesn't require
+    /// respawning.
+    async fn dpop_jti_replay_reaper_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(300)); // Every 5 minutes
+
+        loop {
+            interval.tick().await;
+            let Some(store) = scheduler.context.distributed_store.as_ref() else {
+                continue;
+            };
+            let now_epoch_ms = chrono::Utc::now().timestamp_millis();
+            match store.reap_expired("dpop_jti_replay", now_epoch_ms).await {
+                Ok(count) if count > 0 => info!(
+                    table = "dpop_jti_replay",
+                    count,
+                    "Reaper swept expired entries"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(
+                    table = "dpop_jti_replay",
+                    error = %e,
+                    "Reaper sweep failed"
+                ),
+            }
+        }
+    }
+
+    /// Sweep expired OAuth authorization requests every 5
+    /// minutes. Step 1 wired the pre-existing sweeper here
+    /// (Step 0 Q1 finding); Step 2 routes the call through
+    /// the `DistributedStore` trait now that the OAuth adapter
+    /// exists, so the surface stays uniform with the
+    /// `dpop_jti_replay_reaper_job` shape above.
+    ///
+    /// Not gated on the distributed-state mode — the
+    /// `authorization_request` table lives in `account_db`
+    /// regardless of substrate mode, and the registry's OAuth
+    /// adapter is constructed in every mode. The
+    /// `distributed_store` check is a defensive precondition
+    /// matching the substrate reaper.
+    async fn oauth_authorization_request_cleanup_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(300)); // Every 5 minutes
+
+        loop {
+            interval.tick().await;
+            let Some(store) = scheduler.context.distributed_store.as_ref() else {
+                continue;
+            };
+            let now_epoch_ms = chrono::Utc::now().timestamp_millis();
+            match store.reap_expired("oauth_flow_state", now_epoch_ms).await {
+                Ok(count) if count > 0 => info!(
+                    table = "oauth_flow_state",
+                    count,
+                    "OAuth state reaper swept expired"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(
+                    table = "oauth_flow_state",
+                    error = %e,
+                    "OAuth state reaper failed"
+                ),
             }
         }
     }
