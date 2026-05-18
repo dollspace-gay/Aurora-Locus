@@ -52,6 +52,23 @@ pub fn routes() -> Router<AppContext> {
         .route("/xrpc/dev.aurora.listAdmins", get(list_admins))
         .route("/xrpc/dev.aurora.createAccount", post(create_account))
         .route("/xrpc/dev.aurora.mintToken", post(mint_token))
+        // Arc 12 §5.8.1 dev.aurora.federation.* — Phase B affordances.
+        .route(
+            "/xrpc/dev.aurora.federation.inspectAccount",
+            get(fed_inspect_account),
+        )
+        .route(
+            "/xrpc/dev.aurora.federation.listKnownPeers",
+            get(fed_list_known_peers),
+        )
+        .route(
+            "/xrpc/dev.aurora.federation.mintServiceToken",
+            post(fed_mint_service_token),
+        )
+        .route(
+            "/xrpc/dev.aurora.federation.simulateForward",
+            post(fed_simulate_forward),
+        )
 }
 
 /// Convert PdsError into an HTTP response. The dev surface is
@@ -342,4 +359,320 @@ async fn mint_token(
         did: body.did,
         access_jwt: session.access_token,
     }))
+}
+
+// ============================================================
+// Arc 12 §5.8.1 — dev.aurora.federation.*
+// Phase B affordances. All four behind the file-level
+// `#[cfg(debug_assertions)]` gate; release builds return 404.
+// ============================================================
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FedInspectAccountQuery {
+    did: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FedInspectAccountResponse {
+    did: String,
+    actor_present: bool,
+    handle: Option<String>,
+    has_rotation_key: bool,
+    has_atproto_signing_key: bool,
+    is_service_did: bool,
+    is_peer_pds: bool,
+    is_entryway_did: bool,
+}
+
+/// Arc 12 §5.8.1 — inspect an account's identity surface:
+/// DID, handle, key-column presence, and trusted-iss-set membership.
+/// Read-only; safe to call repeatedly during Phase B.
+async fn fed_inspect_account(
+    State(ctx): State<AppContext>,
+    axum::extract::Query(q): axum::extract::Query<FedInspectAccountQuery>,
+) -> Result<Json<FedInspectAccountResponse>, (StatusCode, String)> {
+    let actor_row: Option<(String,)> =
+        sqlx::query_as("SELECT handle FROM actor WHERE did = $1")
+            .bind(&q.did)
+            .fetch_optional(&ctx.account_db)
+            .await
+            .map_err(|e| http_error(PdsError::Database(e)))?;
+    let (actor_present, handle) = match actor_row {
+        Some((h,)) => (true, Some(h)),
+        None => (false, None),
+    };
+
+    let plc_row: Option<(String, String)> = sqlx::query_as(
+        "SELECT rotation_key, atproto_signing_key FROM plc_keys WHERE did = $1",
+    )
+    .bind(&q.did)
+    .fetch_optional(&ctx.account_db)
+    .await
+    .map_err(|e| http_error(PdsError::Database(e)))?;
+    let (has_rotation_key, has_atproto_signing_key) = match plc_row {
+        Some((rot, atp)) => (!rot.is_empty(), !atp.is_empty()),
+        None => (false, false),
+    };
+
+    let is_service_did = q.did == ctx.service_did();
+    let is_peer_pds = ctx
+        .config
+        .federation
+        .peer_pds
+        .iter()
+        .any(|p| p.did == q.did);
+    let is_entryway_did = ctx.entryway_did() == Some(q.did.as_str());
+
+    Ok(Json(FedInspectAccountResponse {
+        did: q.did,
+        actor_present,
+        handle,
+        has_rotation_key,
+        has_atproto_signing_key,
+        is_service_did,
+        is_peer_pds,
+        is_entryway_did,
+    }))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FedListKnownPeersResponse {
+    peers: Vec<FedPeerEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FedPeerEntry {
+    did: String,
+    url: String,
+    /// Source of the registration: `config` (Step 0.5 Gap 3
+    /// bootstrap from `PDS_FEDERATION_PEER_PDS`) vs `discovery`
+    /// (runtime via `PdsDiscovery::add_instance`).
+    source: &'static str,
+}
+
+/// Arc 12 §5.8.1 — enumerate this PDS's registered peer-PDS map.
+/// In standalone mode with no `peer_pds` configured returns an
+/// empty list (200 OK). When `PdsDiscovery` is wired (federation
+/// enabled), iterates its known instances; otherwise falls back
+/// to the static `config.federation.peer_pds` list.
+async fn fed_list_known_peers(
+    State(ctx): State<AppContext>,
+) -> Result<Json<FedListKnownPeersResponse>, (StatusCode, String)> {
+    let mut peers: Vec<FedPeerEntry> = ctx
+        .config
+        .federation
+        .peer_pds
+        .iter()
+        .map(|p| FedPeerEntry {
+            did: p.did.clone(),
+            url: p.url.clone(),
+            source: "config",
+        })
+        .collect();
+
+    if let Some(discovery) = ctx.pds_discovery.as_ref() {
+        let instances = discovery.get_known_instances().await;
+        for inst in instances {
+            // De-dupe by DID against the config-bootstrap list.
+            if !peers.iter().any(|p| p.did == inst.did) {
+                peers.push(FedPeerEntry {
+                    did: inst.did,
+                    url: inst.url,
+                    source: "discovery",
+                });
+            }
+        }
+    }
+
+    Ok(Json(FedListKnownPeersResponse { peers }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FedMintServiceTokenBody {
+    user_did: String,
+    aud: String,
+    lxm: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FedMintServiceTokenResponse {
+    access_jwt: String,
+}
+
+/// Arc 12 §5.8.1 — mint a service-auth JWT against a specified
+/// `user_did + aud + lxm` for Phase B exercise. Reads
+/// `plc_keys.atproto_signing_key` (Step 1.5 column) and signs an
+/// ES256K JWT with `kid="aurora-local-v1"`. Same crypto path as
+/// `entryway_auth_headers`, but `aud` is caller-supplied so Phase
+/// B scripts can drive arbitrary audiences (e.g., a stub
+/// entryway DID, the test PDS's own DID, etc.) without standing
+/// up an entryway configuration first.
+async fn fed_mint_service_token(
+    State(ctx): State<AppContext>,
+    Json(body): Json<FedMintServiceTokenBody>,
+) -> Result<Json<FedMintServiceTokenResponse>, (StatusCode, String)> {
+    let headers = crate::federation::entryway_auth_headers(
+        &ctx.account_db,
+        &body.user_did,
+        &body.aud,
+        &body.lxm,
+    )
+    .await
+    .map_err(http_error)?;
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .ok_or_else(|| {
+            http_error(PdsError::Internal(
+                "entryway_auth_headers returned without Authorization header".to_string(),
+            ))
+        })?
+        .to_str()
+        .map_err(|e| http_error(PdsError::Internal(format!("non-ASCII header: {}", e))))?
+        .to_string();
+    let jwt = auth
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| {
+            http_error(PdsError::Internal(
+                "Authorization header missing Bearer prefix".to_string(),
+            ))
+        })?
+        .to_string();
+    Ok(Json(FedMintServiceTokenResponse { access_jwt: jwt }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FedSimulateForwardBody {
+    /// One of the four §5.3.8 forwarded NSIDs.
+    nsid: String,
+    /// Caller-supplied user_did. Required for mint-pattern NSIDs;
+    /// ignored for `requestPasswordReset`.
+    user_did: Option<String>,
+    /// Stub URL — typically a localhost echo server during Phase B
+    /// so the test can read back what Aurora-Locus actually sent.
+    stub_url: String,
+    /// Opaque body to forward. Defaults to `{}` if omitted.
+    #[serde(default)]
+    body: serde_json::Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FedSimulateForwardResponse {
+    /// Final outbound URL Aurora-Locus would POST/GET against.
+    outbound_url: String,
+    /// Headers Aurora-Locus would attach. Captured pre-send.
+    headers: std::collections::BTreeMap<String, String>,
+    /// Upstream response status code from the stub.
+    stub_status: u16,
+    /// Upstream response body (text). May be empty.
+    stub_body: String,
+}
+
+/// Arc 12 §5.8.1 — exercise the forwarded-handler dispatch against
+/// a caller-supplied stub URL. Constructs the auth/passthru headers
+/// per the NSID's pattern, sends to the stub, and returns
+/// (outbound_url, headers, stub_status, stub_body) for inspection.
+///
+/// Useful Phase B scenarios: point at a local echo server, mint
+/// the headers a real forwarded call would carry, and confirm
+/// shape without standing up a full entryway.
+async fn fed_simulate_forward(
+    State(ctx): State<AppContext>,
+    Json(body): Json<FedSimulateForwardBody>,
+) -> Result<Json<FedSimulateForwardResponse>, (StatusCode, String)> {
+    let mint_nsids = [
+        "com.atproto.identity.signPlcOperation",
+        "com.atproto.identity.updateHandle",
+        "com.atproto.server.getSession",
+    ];
+    let passthru_nsids = ["com.atproto.server.requestPasswordReset"];
+    let is_mint = mint_nsids.contains(&body.nsid.as_str());
+    let is_passthru = passthru_nsids.contains(&body.nsid.as_str());
+    if !is_mint && !is_passthru {
+        return Err(http_error(PdsError::Validation(format!(
+            "nsid {:?} is not a §5.3.8 forwarded handler",
+            body.nsid
+        ))));
+    }
+
+    let headers_axum = if is_mint {
+        let user_did = body.user_did.as_deref().ok_or_else(|| {
+            http_error(PdsError::Validation(
+                "mint-pattern nsid requires userDid".to_string(),
+            ))
+        })?;
+        // Use the requested stub URL's host as a synthetic aud so
+        // the JWT is exercise-shaped without requiring a configured
+        // entryway. The aud is just a string here; the stub doesn't
+        // verify it.
+        let synthetic_aud = format!("did:web:{}", host_from_url(&body.stub_url));
+        crate::federation::entryway_auth_headers(
+            &ctx.account_db,
+            user_did,
+            &synthetic_aud,
+            &body.nsid,
+        )
+        .await
+        .map_err(http_error)?
+    } else {
+        // Passthru handler: simulate an empty incoming request set
+        // (no auth header, no proxy headers). Real Phase B drivers
+        // can prepend headers to the stub side.
+        crate::federation::entryway_passthru_headers(&axum::http::HeaderMap::new(), None)
+            .map_err(http_error)?
+    };
+
+    let outbound_url = format!("{}/xrpc/{}", body.stub_url.trim_end_matches('/'), body.nsid);
+    let mut headers_out: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (k, v) in headers_axum.iter() {
+        if let Ok(v_str) = v.to_str() {
+            headers_out.insert(k.as_str().to_string(), v_str.to_string());
+        }
+    }
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| http_error(PdsError::Internal(format!("reqwest: {}", e))))?;
+    let mut req = http.post(&outbound_url).json(&body.body);
+    for (k, v) in headers_axum.iter() {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            req = req.header(name, value);
+        }
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| http_error(PdsError::Internal(format!("stub call failed: {}", e))))?;
+    let status = resp.status().as_u16();
+    let body_text = resp.text().await.unwrap_or_default();
+
+    Ok(Json(FedSimulateForwardResponse {
+        outbound_url,
+        headers: headers_out,
+        stub_status: status,
+        stub_body: body_text,
+    }))
+}
+
+fn host_from_url(url: &str) -> String {
+    let no_scheme = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    no_scheme
+        .split('/')
+        .next()
+        .unwrap_or(no_scheme)
+        .to_string()
 }
