@@ -8,6 +8,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Arc 12 — entryway architecture (v4.1)** (#68).
+  Aurora-Locus gains entryway-attached deployment mode. When
+  `PDS_ENTRYWAY_*` env vars are configured, four §5.3.8 handlers
+  (`signPlcOperation`, `updateHandle`, `getSession`,
+  `requestPasswordReset`) forward to the entryway with appropriate
+  auth headers; standalone-mode behavior is byte-preserved. Lib
+  tests: 1007 pass (up from 991 pre-arc). Six mid-arc commits
+  including Step 1.5 substrate-gap closure
+  (`plc_keys.atproto_signing_key` column per skydeval resolution
+  A + distinct-key). Two documented divergences from locked design:
+  §5.3.6 narrows to bsky-PDS's actual passthru set
+  (`authorization` + `x-forwarded-for` only with DPoP rejection,
+  not v4.1's 9-header enumeration); 8 routing-matrix integration
+  cases ignored with documented follow-up reasons (4 need entryway-
+  configured test ctx variant; 4 blocked by `verify_service_jwt`'s
+  pre-existing HS256-only first-decode, deferrable to v0.6 or
+  paired with Arc 13's signing-surface refactor). Substrate for
+  Arc 13 v4.1 §6.3.2 (rotation_key rename + legacy-row backfill).
+
 - **Arc 16a — proto-blue 0.3.1 bump** (#67, closes #59).
   Aurora-Locus's proto-blue dependency moves from 0.2.6 to
   0.3.1 via `Cargo.toml` caret-constraint + `cargo update -p
