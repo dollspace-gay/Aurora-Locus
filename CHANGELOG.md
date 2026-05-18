@@ -6,7 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-_Future v0.5 cycle work lands here._
+### Changed
+
+- **Arc 16a — proto-blue 0.3.1 bump** (#67, closes #59).
+  Aurora-Locus's proto-blue dependency moves from 0.2.6 to
+  0.3.1 via `Cargo.toml` caret-constraint + `cargo update -p
+  proto-blue --precise 0.3.1`. Zero callsite changes per
+  chainlink #65 §5.3 prediction (verified via Step 4 audit
+  item 8: pre/post-bump `^use proto_blue::` grep returns
+  byte-identical 13-line use-set across 7 files). The 13
+  proto-blue sub-crates resolve to 0.3.2 per caret semantics
+  inside proto-blue 0.3.1's own deps. LexValue surface
+  byte-identical between 0.2.6 and 0.3.1 (SHA256-verified at
+  Step 0.2). First arc of v0.5 cycle's federation activation
+  workstream; substrate for Arc 16b helpers + Arc 16c-f blob
+  lifecycle work + Arc 17 dynamic lexicon loading.
 
 ## [0.4.0] - 2026-05-13
 
