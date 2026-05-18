@@ -212,7 +212,10 @@ mod tests {
 
     // ---------- entryway_auth_headers tests (§5.4 Step 2.1) ----------
 
-    async fn seed_plc_keys(db: &AnyPool, did: &str, rotation: &str, atproto: &str) {
+    async fn seed_plc_keys(db: &AnyPool, did: &str, _rotation: &str, atproto: &str) {
+        // Arc 13 Step 0.7.1 dropped the rotation_key column; the
+        // `_rotation` param is retained for call-site signature
+        // parity (test bodies still pass it) but no longer stored.
         sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
             .bind(did)
             .bind(format!("{}-handle", did.replace(':', "-")))
@@ -221,12 +224,10 @@ mod tests {
             .await
             .expect("seed actor");
         sqlx::query(
-            "INSERT INTO plc_keys (did, rotation_key, rotation_key_public, last_operation_cid, atproto_signing_key) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO plc_keys (did, last_operation_cid, atproto_signing_key) \
+             VALUES ($1, $2, $3)",
         )
         .bind(did)
-        .bind(rotation)
-        .bind("rot-pub")
         .bind(Option::<String>::None)
         .bind(atproto)
         .execute(db)

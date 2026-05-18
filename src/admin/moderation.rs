@@ -412,7 +412,7 @@ mod tests {
             authentication: AuthConfig {
                 jwt_secret: "test-secret-key".to_string(),
                 repo_signing_key: "test-key".to_string(),
-                plc_rotation_key: "test-rotation-key".to_string(),
+                plc_rotation_key: "b".repeat(64),
                 oauth: OAuthConfig {
                     client_id: "test-client".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),

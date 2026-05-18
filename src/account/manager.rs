@@ -85,9 +85,13 @@ impl AccountManager {
         let password_hash = crate::auth::PasswordHasher::hash(&password)
             .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
 
-        // Generate DID with PLC registration
-        let (did, plc_key, plc_key_public, plc_operation_cid) =
+        // Generate DID with PLC registration. Arc 13 §6.3.2:
+        // returns the per-actor atproto signing key (NOT a per-
+        // account rotation key — the rotation key is PDS-wide
+        // and lives in config).
+        let (did, atproto_signing_key_hex, atproto_public_key_hex, plc_operation_cid) =
             self.generate_plc_did(&handle).await?;
+        let _ = atproto_public_key_hex; // currently unused at insert site
 
         let now = Utc::now();
 
@@ -118,32 +122,19 @@ impl AccountManager {
         .await
         .map_err(PdsError::Database)?;
 
-        // Arc 12 Step 1.5: generate a per-actor atproto signing key
-        // distinct from the rotation key. Fresh 32-byte k256 private
-        // key, hex-encoded to match the existing rotation_key
-        // storage format. Distinct generation (separate
-        // `rand::thread_rng` draw) guarantees byte-distinct
-        // material so service-auth signing can't be confused with
-        // PLC rotation per the §6 Arc-12/Arc-13 scope split.
-        let atproto_signing_key = {
-            use rand::RngCore;
-            let mut bytes = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut bytes);
-            hex::encode(bytes)
-        };
-
         // Insert into plc_keys table (cryptographic material).
-        // Arc 12 Step 1.5 adds the `atproto_signing_key` column per
-        // V05_DESIGN.md §5.4 Step 2.1.
+        // Arc 13 §6.4 Step 0.7.1: `rotation_key` +
+        // `rotation_key_public` columns dropped — the PDS-wide
+        // rotation key lives in config, not per-account state.
+        // Only the per-actor atproto signing key returned from
+        // `generate_plc_did` is persisted here.
         sqlx::query(
-            "INSERT INTO plc_keys (did, rotation_key, rotation_key_public, last_operation_cid, atproto_signing_key)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO plc_keys (did, last_operation_cid, atproto_signing_key)
+             VALUES ($1, $2, $3)",
         )
         .bind(&did)
-        .bind(&plc_key)
-        .bind(&plc_key_public)
         .bind(&plc_operation_cid)
-        .bind(&atproto_signing_key)
+        .bind(&atproto_signing_key_hex)
         .execute(&mut *tx)
         .await
         .map_err(PdsError::Database)?;
@@ -735,24 +726,31 @@ impl AccountManager {
         use rand::RngCore;
         use std::collections::BTreeMap;
 
-        // Generate a random 32-byte private key for PLC rotation.
-        //
-        // NOTE (Arc 13 Step 0.7): this is interim; Step 0.7.2
-        // refactors `generate_plc_did` to use the PDS-wide rotation
-        // key from `config.authentication.plc_rotation_key` (so the
-        // signer's key is in every account's rotation_keys per
-        // §6.3.2 key separation) and generates a separate per-actor
-        // atproto signing key for `verification_methods["atproto"]`.
-        // For Step 0.5/0.6, the per-account key still serves both
-        // roles — wire shape is correct; key story not yet
-        // separated.
-        let mut private_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut private_key);
-        let private_key_hex = hex::encode(private_key);
+        // §6.3.2 key separation: the PDS-wide rotation key signs
+        // every account's genesis op (and every later update op).
+        // It comes from `config.authentication.plc_rotation_key`
+        // — one key per PDS deployment, loaded once at startup,
+        // shared across every account. Its `did:key` URI is what
+        // ends up in `rotation_keys[N-1]` so the signer's key
+        // satisfies the spec-required invariant from chainlink
+        // #61 §1.4.5.
+        let rotation_signer =
+            PlcSigner::from_hex(&self.config.authentication.plc_rotation_key)?;
+        let rotation_did_key = rotation_signer.public_key_did_key();
 
-        let signer = PlcSigner::new(&private_key)?;
-        let public_key_hex = signer.public_key_hex();
-        let public_key_did_key = signer.public_key_did_key();
+        // §6.3.2 key separation: the per-actor atproto signing key
+        // is a *separate* fresh ES256K key, generated here per
+        // account. Its `did:key` URI goes into
+        // `verification_methods["atproto"]` and it's stored in
+        // `plc_keys.atproto_signing_key` for later use by
+        // `entryway_auth_headers` (Arc 12 §5.3.5) + repo commit
+        // signing.
+        let mut atproto_private_key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut atproto_private_key);
+        let atproto_signing_key_hex = hex::encode(atproto_private_key);
+        let atproto_signer = PlcSigner::new(&atproto_private_key)?;
+        let atproto_public_key_hex = atproto_signer.public_key_hex();
+        let atproto_did_key = atproto_signer.public_key_did_key();
 
         // Arc 12 §5.3.2 Gap 1 closure: read effective_public_url()
         // so localhost / explicit PDS_SERVICE_PUBLIC_URL deployments
@@ -793,11 +791,17 @@ impl AccountManager {
             },
         );
 
+        // §6.3.2 mapping: verification_methods["atproto"] points
+        // at the per-actor signing key (NOT the rotation key).
         let mut verification_methods = BTreeMap::new();
-        verification_methods.insert("atproto".to_string(), public_key_did_key.clone());
+        verification_methods.insert("atproto".to_string(), atproto_did_key);
 
+        // §6.3.3 recovery-key support is Step 2 work; for Step 0.7
+        // rotation_keys contains only the PDS-wide rotation key.
+        // Step 2.3 prepends configured + per-account recovery
+        // keys.
         let unsigned = PlcOperationBuilder::new()
-            .rotation_keys(vec![public_key_did_key])
+            .rotation_keys(vec![rotation_did_key])
             .verification_methods(verification_methods)
             .also_known_as(vec![format!("at://{}", full_handle)])
             .services(services)
@@ -805,12 +809,14 @@ impl AccountManager {
 
         // §6.3.1 / Step 0.6.1: DID suffix is SHA-256 of canonical
         // DAG-CBOR of unsigned op, base32-lower (no padding), first
-        // 24 chars. Computed from the unsigned form so the signer's
-        // signature itself doesn't influence the DID.
+        // 24 chars.
         let did_suffix = derive_did_suffix(&unsigned)?;
         let did = format!("did:plc:{}", did_suffix);
 
-        let signed_operation = signer.sign_operation(unsigned)?;
+        // §6.3.2: the PDS-wide rotation key signs (its `did:key`
+        // is in `rotation_keys[0]`, satisfying chainlink #61 §1.4.5
+        // signer-in-rotation-keys invariant).
+        let signed_operation = rotation_signer.sign_operation(unsigned)?;
 
         let plc_url = self.config.identity.did_plc_url.as_str();
 
@@ -822,19 +828,32 @@ impl AccountManager {
                 // of signed op (the proper PLC-spec CID).
                 let operation_cid = compute_op_cid(&signed_operation)?;
 
-                Ok((did, private_key_hex, public_key_hex, operation_cid))
+                // Return shape: (did, atproto_signing_key_hex,
+                // atproto_public_key_hex, operation_cid). The
+                // rotation key isn't returned — it's the PDS-wide
+                // key, stored in config, not per-account state.
+                Ok((
+                    did,
+                    atproto_signing_key_hex,
+                    atproto_public_key_hex,
+                    operation_cid,
+                ))
             }
             Err(e) => {
                 // NOTE: §6.3.7 / Step 5 will hard-fail here
                 // (remove silent did:web fallback) per Arc 13
-                // design. For Step 0.5/0.6 the fallback is kept
-                // to avoid breaking the foundation-only landing.
+                // design.
                 tracing::warn!(
                     "Failed to register DID with PLC directory: {}. Falling back to did:web",
                     e
                 );
                 let did_web = format!("did:web:{}", full_handle);
-                Ok((did_web, private_key_hex, public_key_hex, "".to_string()))
+                Ok((
+                    did_web,
+                    atproto_signing_key_hex,
+                    atproto_public_key_hex,
+                    "".to_string(),
+                ))
             }
         }
     }
@@ -2669,7 +2688,7 @@ mod tests {
             authentication: AuthConfig {
                 jwt_secret: "test-secret-key-for-testing-only".to_string(),
                 repo_signing_key: "test-key".to_string(),
-                plc_rotation_key: "test-rotation-key".to_string(),
+                plc_rotation_key: "b".repeat(64),
                 oauth: crate::config::OAuthConfig {
                     client_id: "test-client".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -3613,11 +3632,12 @@ mod tests {
         assert_eq!(token_count, 0, "rolled-back tx must not leave a token row");
     }
 
-    /// Arc 12 Step 1.5 — substrate-gap closure for §5.4 Step 2.1.
+    /// Arc 13 §6.4 Step 0.7 — key separation completion.
     /// New accounts MUST populate `plc_keys.atproto_signing_key`
     /// with a non-empty value that is byte-distinct from the
-    /// rotation key, so service-auth signing can't be confused
-    /// with PLC rotation.
+    /// PDS-wide rotation key in config (§6.3.2). The rotation key
+    /// column was dropped in Step 0.7.1; what's stored per-account
+    /// is *only* the per-actor signing key.
     #[tokio::test]
     async fn test_create_account_populates_distinct_atproto_signing_key() {
         let manager = setup_test_db().await;
@@ -3632,15 +3652,15 @@ mod tests {
             .await
             .expect("create_account");
 
-        let row: (String, String) = sqlx::query_as(
-            "SELECT rotation_key, atproto_signing_key FROM plc_keys WHERE did = $1",
+        let row: (String,) = sqlx::query_as(
+            "SELECT atproto_signing_key FROM plc_keys WHERE did = $1",
         )
         .bind(&account.did)
         .fetch_one(&manager.db)
         .await
         .expect("plc_keys row");
 
-        let (rotation_key, atproto_signing_key) = row;
+        let (atproto_signing_key,) = row;
         assert!(
             !atproto_signing_key.is_empty(),
             "atproto_signing_key must be populated for new accounts"
@@ -3657,8 +3677,10 @@ mod tests {
             "atproto_signing_key must be valid hex"
         );
         assert_ne!(
-            atproto_signing_key, rotation_key,
-            "atproto_signing_key must be byte-distinct from rotation_key"
+            atproto_signing_key,
+            manager.config.authentication.plc_rotation_key,
+            "per-actor atproto_signing_key must be byte-distinct from \
+             the PDS-wide rotation key (§6.3.2 key separation)"
         );
     }
 }

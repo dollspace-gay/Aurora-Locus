@@ -379,7 +379,9 @@ struct FedInspectAccountResponse {
     did: String,
     actor_present: bool,
     handle: Option<String>,
-    has_rotation_key: bool,
+    /// Arc 13 Step 0.7.1 removed the per-account rotation_key
+    /// column; the PDS-wide rotation key lives in config and is
+    /// not surfaced per-account here.
     has_atproto_signing_key: bool,
     is_service_did: bool,
     is_peer_pds: bool,
@@ -404,16 +406,16 @@ async fn fed_inspect_account(
         None => (false, None),
     };
 
-    let plc_row: Option<(String, String)> = sqlx::query_as(
-        "SELECT rotation_key, atproto_signing_key FROM plc_keys WHERE did = $1",
+    let plc_row: Option<(String,)> = sqlx::query_as(
+        "SELECT atproto_signing_key FROM plc_keys WHERE did = $1",
     )
     .bind(&q.did)
     .fetch_optional(&ctx.account_db)
     .await
     .map_err(|e| http_error(PdsError::Database(e)))?;
-    let (has_rotation_key, has_atproto_signing_key) = match plc_row {
-        Some((rot, atp)) => (!rot.is_empty(), !atp.is_empty()),
-        None => (false, false),
+    let has_atproto_signing_key = match plc_row {
+        Some((atp,)) => !atp.is_empty(),
+        None => false,
     };
 
     let is_service_did = q.did == ctx.service_did();
@@ -429,7 +431,6 @@ async fn fed_inspect_account(
         did: q.did,
         actor_present,
         handle,
-        has_rotation_key,
         has_atproto_signing_key,
         is_service_did,
         is_peer_pds,
