@@ -1305,10 +1305,19 @@ impl ServerConfig {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false);
-        let relay_urls = env::var("PDS_FEDERATION_RELAY_URLS")
+        // Empty-entry filter is load-bearing: `AppContext::new` gates
+        // RelayClient construction (and JobScheduler's
+        // relay_firehose_subscription_job spawn) on
+        // `!relay_urls.is_empty()`. Setting `PDS_FEDERATION_RELAY_URLS=""`
+        // is the explicit "federation on for peer_pds + entryway forwarding,
+        // but no relay loop" override; without this filter, `""` would
+        // collect to `vec![""]` (length 1) and spawn a connect loop
+        // against an empty URL.
+        let relay_urls: Vec<String> = env::var("PDS_FEDERATION_RELAY_URLS")
             .unwrap_or_else(|_| "https://bsky.network".to_string())
             .split(',')
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .collect();
         let appview_url = env::var("PDS_APPVIEW_URL").ok();
         let firehose_enabled = env::var("PDS_FEDERATION_FIREHOSE_ENABLED")
@@ -2041,5 +2050,70 @@ mod gc_sweep_tests {
         let p = cfg.to_sweep_params(false);
         assert!(!p.report_only);
         assert!(p.dry_run, "config dry_run propagates to params");
+    }
+}
+
+#[cfg(test)]
+mod relay_urls_parse_tests {
+    //! Inline parser-shape tests for `PDS_FEDERATION_RELAY_URLS`.
+    //! The filter is load-bearing: `AppContext::new`
+    //! gates `RelayClient` construction (and its background
+    //! `JobScheduler::relay_firehose_subscription_job` spawn) on
+    //! `!relay_urls.is_empty()`. Setting the env var to `""` is the
+    //! explicit "federation on, no relay loop" override.
+
+    /// Mirror the exact parse pipeline used in `ServerConfig::from_env`
+    /// so this test verifies the contract by-shape rather than by
+    /// poking process-global env vars (which races with parallel
+    /// tests).
+    fn parse(raw: &str) -> Vec<String> {
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn empty_string_yields_empty_vec_so_relay_client_is_none() {
+        assert_eq!(parse(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn whitespace_only_yields_empty_vec() {
+        assert_eq!(parse("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn commas_with_no_entries_yield_empty_vec() {
+        assert_eq!(parse(",,, ,"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn single_url_default_shape() {
+        assert_eq!(parse("https://bsky.network"), vec!["https://bsky.network"]);
+    }
+
+    #[test]
+    fn multi_url_comma_split() {
+        assert_eq!(
+            parse("https://a.example,https://b.example"),
+            vec!["https://a.example", "https://b.example"]
+        );
+    }
+
+    #[test]
+    fn empty_entries_between_real_urls_are_dropped() {
+        assert_eq!(
+            parse("https://a,,https://b,"),
+            vec!["https://a", "https://b"]
+        );
+    }
+
+    #[test]
+    fn whitespace_around_entries_is_trimmed() {
+        assert_eq!(
+            parse("  https://a  ,  https://b  "),
+            vec!["https://a", "https://b"]
+        );
     }
 }
