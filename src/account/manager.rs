@@ -118,15 +118,32 @@ impl AccountManager {
         .await
         .map_err(PdsError::Database)?;
 
-        // Insert into plc_keys table (cryptographic material)
+        // Arc 12 Step 1.5: generate a per-actor atproto signing key
+        // distinct from the rotation key. Fresh 32-byte k256 private
+        // key, hex-encoded to match the existing rotation_key
+        // storage format. Distinct generation (separate
+        // `rand::thread_rng` draw) guarantees byte-distinct
+        // material so service-auth signing can't be confused with
+        // PLC rotation per the §6 Arc-12/Arc-13 scope split.
+        let atproto_signing_key = {
+            use rand::RngCore;
+            let mut bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut bytes);
+            hex::encode(bytes)
+        };
+
+        // Insert into plc_keys table (cryptographic material).
+        // Arc 12 Step 1.5 adds the `atproto_signing_key` column per
+        // V05_DESIGN.md §5.4 Step 2.1.
         sqlx::query(
-            "INSERT INTO plc_keys (did, rotation_key, rotation_key_public, last_operation_cid)
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO plc_keys (did, rotation_key, rotation_key_public, last_operation_cid, atproto_signing_key)
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(&did)
         .bind(&plc_key)
         .bind(&plc_key_public)
         .bind(&plc_operation_cid)
+        .bind(&atproto_signing_key)
         .execute(&mut *tx)
         .await
         .map_err(PdsError::Database)?;
@@ -3596,5 +3613,54 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(token_count, 0, "rolled-back tx must not leave a token row");
+    }
+
+    /// Arc 12 Step 1.5 — substrate-gap closure for §5.4 Step 2.1.
+    /// New accounts MUST populate `plc_keys.atproto_signing_key`
+    /// with a non-empty value that is byte-distinct from the
+    /// rotation key, so service-auth signing can't be confused
+    /// with PLC rotation.
+    #[tokio::test]
+    async fn test_create_account_populates_distinct_atproto_signing_key() {
+        let manager = setup_test_db().await;
+
+        let account = manager
+            .create_account(
+                "arc12testuser".to_string(),
+                Some("arc12@example.com".to_string()),
+                "password123".to_string(),
+                None,
+            )
+            .await
+            .expect("create_account");
+
+        let row: (String, String) = sqlx::query_as(
+            "SELECT rotation_key, atproto_signing_key FROM plc_keys WHERE did = $1",
+        )
+        .bind(&account.did)
+        .fetch_one(&manager.db)
+        .await
+        .expect("plc_keys row");
+
+        let (rotation_key, atproto_signing_key) = row;
+        assert!(
+            !atproto_signing_key.is_empty(),
+            "atproto_signing_key must be populated for new accounts"
+        );
+        assert_eq!(
+            atproto_signing_key.len(),
+            64,
+            "atproto_signing_key must be 32-byte hex (64 chars)"
+        );
+        assert!(
+            atproto_signing_key
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "atproto_signing_key must be valid hex"
+        );
+        assert_ne!(
+            atproto_signing_key, rotation_key,
+            "atproto_signing_key must be byte-distinct from rotation_key"
+        );
     }
 }
