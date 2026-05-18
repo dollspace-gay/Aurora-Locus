@@ -81,6 +81,13 @@ pub enum PdsError {
     #[error("Account suspended: {0}")]
     AccountSuspended(String),
 
+    /// Arc 13 §6.3.4 / §6.3.6 — PLC directory's audit log for
+    /// this DID's last accepted op is a `plc_tombstone`. The DID
+    /// is terminally retired; no further ops are valid. Mapped
+    /// to HTTP 400 in handler contexts.
+    #[error("DID tombstoned: {0}")]
+    DidTombstoned(String),
+
     /// Sequencer leader is on a different instance — caller should retry
     /// (load balancer will route to the leader on retry). Mapped to HTTP
     /// 503 Service Unavailable. See chainlink #89 / docs/AURORA_DESIGN.md §5.4.1.
@@ -191,6 +198,11 @@ impl IntoResponse for PdsError {
             PdsError::AccountSuspended(_) => {
                 (StatusCode::FORBIDDEN, "AccountSuspended", self.to_string())
             }
+            PdsError::DidTombstoned(_) => (
+                StatusCode::BAD_REQUEST,
+                "DidTombstoned",
+                self.to_string(),
+            ),
             PdsError::NotLeader(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "NotLeader",

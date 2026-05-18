@@ -50,6 +50,109 @@ impl PlcClient {
         })
     }
 
+    /// Arc 13 §6.3.4 — fetch the last accepted (non-nullified) PLC
+    /// operation for `did` from the directory's audit log, plus its
+    /// CID. The CID becomes the `prev` of the next op the caller
+    /// builds (snapshot-mutator pattern at §6.3.6).
+    ///
+    /// Errors:
+    /// - `PdsError::IdentityResolution` — network failure, non-2xx
+    ///   from directory, malformed audit-log JSON, empty log
+    ///   (no genesis op present).
+    /// - `PdsError::DidTombstoned` — last accepted op is a
+    ///   `plc_tombstone`. The DID is terminally retired.
+    pub async fn get_last_op(
+        &self,
+        did: &str,
+    ) -> PdsResult<(crate::crypto::plc::PlcOperation, String)> {
+        if !did.starts_with("did:plc:") {
+            return Err(PdsError::Validation(
+                "Only did:plc identifiers are supported".to_string(),
+            ));
+        }
+
+        let url = format!(
+            "{}/{}/log/audit",
+            self.config.plc_url.trim_end_matches('/'),
+            did
+        );
+
+        let response = self.http_client.get(&url).send().await.map_err(|e| {
+            PdsError::IdentityResolution(format!("Failed to fetch PLC audit log: {}", e))
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(PdsError::IdentityResolution(format!(
+                "PLC audit log returned error {}: {}",
+                status, error_body
+            )));
+        }
+
+        // PLC audit log shape (per @did-plc/lib): array of
+        // `{cid, did, operation, nullified, createdAt}`, oldest
+        // first. We filter `nullified=true` and take the last.
+        let entries: Vec<serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| PdsError::IdentityResolution(format!("Invalid PLC audit log JSON: {}", e)))?;
+
+        let last_accepted = entries
+            .iter()
+            .filter(|e| !e.get("nullified").and_then(|n| n.as_bool()).unwrap_or(false))
+            .next_back()
+            .ok_or_else(|| {
+                PdsError::IdentityResolution(format!(
+                    "PLC audit log for {} has no accepted (non-nullified) entries",
+                    did
+                ))
+            })?;
+
+        let cid = last_accepted
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                PdsError::IdentityResolution(format!(
+                    "PLC audit-log entry for {} missing cid field",
+                    did
+                ))
+            })?
+            .to_string();
+
+        let op_value = last_accepted.get("operation").ok_or_else(|| {
+            PdsError::IdentityResolution(format!(
+                "PLC audit-log entry for {} missing operation field",
+                did
+            ))
+        })?;
+
+        // §6.3.4: tombstone last op → DidTombstoned, not the
+        // generic IdentityResolution path. Caller dispatches on
+        // this distinctly so handlers can map to HTTP 400
+        // `DidTombstoned`.
+        let op_type = op_value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if op_type == "plc_tombstone" {
+            return Err(PdsError::DidTombstoned(did.to_string()));
+        }
+
+        let op: crate::crypto::plc::PlcOperation =
+            serde_json::from_value(op_value.clone()).map_err(|e| {
+                PdsError::IdentityResolution(format!(
+                    "Failed to parse last accepted PLC operation for {}: {}",
+                    did, e
+                ))
+            })?;
+
+        Ok((op, cid))
+    }
+
     /// Fetch DID document from PLC directory
     pub async fn get_document(&self, did: &str) -> PdsResult<DidDocument> {
         if !did.starts_with("did:plc:") {

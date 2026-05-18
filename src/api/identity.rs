@@ -104,91 +104,53 @@ pub async fn update_handle(
     // Normalize handle to lowercase
     let new_handle = req.handle.to_lowercase();
 
-    // For did:plc, submit handle update to PLC directory
+    // For did:plc, submit handle update to PLC directory.
+    //
+    // Arc 13 §6.3.6 / Step 1.2 snapshot-mutator pattern: fetch
+    // the last accepted op via `PlcClient::get_last_op` (§6.3.4),
+    // inherit ALL its fields (rotation_keys, verification_methods,
+    // services), mutate ONLY `also_known_as` for the new handle,
+    // set `prev` to the prior op's CID, sign with the PDS-wide
+    // rotation key (§6.3.2), submit. Diff-build is gone.
     if did.starts_with("did:plc:") {
-        // Get current DID document to extract previous operation CID
-        let plc_url = &ctx.config.identity.did_plc_url;
-        let audit_endpoint = format!("{}/{}/log/audit", plc_url, did);
+        use crate::crypto::plc::{register_plc_did, PlcOperationBuilder, PlcSigner};
+        use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
 
-        let http_client = reqwest::Client::new();
-        let audit_response = http_client
-            .get(&audit_endpoint)
-            .send()
-            .await
-            .map_err(|e| PdsError::Internal(format!("Failed to fetch PLC audit log: {}", e)))?;
+        let plc_client = PlcClient::new(PlcClientConfig {
+            plc_url: ctx.config.identity.did_plc_url.clone(),
+            ..Default::default()
+        })?;
 
-        if !audit_response.status().is_success() {
-            return Err(PdsError::Internal(format!(
-                "PLC directory returned error: {}",
-                audit_response.status()
-            )));
-        }
+        // §6.3.4: full-fetch the last accepted op. Tombstoned →
+        // PdsError::DidTombstoned → HTTP 400 via IntoResponse.
+        let (last_op, last_cid) = plc_client.get_last_op(&did).await?;
 
-        // Parse audit log to get last operation CID
-        let audit_log: serde_json::Value = audit_response
-            .json()
-            .await
-            .map_err(|e| PdsError::Internal(format!("Failed to parse PLC audit log: {}", e)))?;
+        // §6.3.6 mutator: inherit every field from last_op,
+        // override `also_known_as` with `[at://{new_handle}]`,
+        // set prev to last_cid, sign.
+        let unsigned = PlcOperationBuilder::new()
+            .rotation_keys(last_op.rotation_keys.clone())
+            .verification_methods(last_op.verification_methods.clone())
+            .services(last_op.services.clone())
+            .also_known_as(vec![format!("at://{}", new_handle)])
+            .prev(last_cid)
+            .build()?;
 
-        let prev_cid = if let Some(operations) = audit_log.as_array() {
-            if let Some(last_op) = operations.last() {
-                last_op
-                    .get("cid")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            } else {
-                None // Genesis operation (no previous)
-            }
-        } else {
-            return Err(PdsError::Internal(
-                "Invalid PLC audit log format".to_string(),
-            ));
-        };
-
-        // Build PLC operation for handle update.
-        //
-        // NOTE (Arc 13 Step 1.2): this builds a *diff* op (only
-        // `also_known_as` set), which the PLC spec rejects on
-        // strict-mode directories — update ops MUST include the
-        // full snapshot inherited from the prior op via the
-        // mutator pattern at §6.3.6. Step 1.2 rewrites this
-        // handler to use `PlcClient::get_last_op` + snapshot
-        // mutator. Step 0.5/0.6 only lands the wire-shape
-        // foundation; the diff-build bug is tracked here for
-        // Step 1.2 closure.
-        let mut operation_builder = PlcOperationBuilder::new()
-            .also_known_as(vec![format!("at://{}", new_handle)]);
-
-        if let Some(prev) = prev_cid {
-            operation_builder = operation_builder.prev(prev);
-        }
-
-        let operation = operation_builder.build()?;
-
-        // Sign the operation with the configured PLC rotation key.
+        // §6.3.2: PDS-wide rotation key from config signs every
+        // update op (its did:key is in `rotation_keys` inherited
+        // from the genesis op, satisfying chainlink #61 §1.4.5
+        // signer-in-rotation-keys invariant).
         let signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)?;
-        let signed_operation = signer.sign_operation(operation)?;
+        let signed_operation = signer.sign_operation(unsigned)?;
 
-        // Submit to PLC directory.
-        let submit_endpoint = format!("{}/{}", plc_url, did);
-        let submit_response = http_client
-            .post(&submit_endpoint)
-            .json(&signed_operation)
-            .send()
-            .await
-            .map_err(|e| PdsError::Internal(format!("Failed to submit PLC operation: {}", e)))?;
-
-        if !submit_response.status().is_success() {
-            let status = submit_response.status();
-            let error_body = submit_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(PdsError::Internal(format!(
-                "PLC directory rejected operation {}: {}",
-                status, error_body
-            )));
-        }
+        // Submit via the spec-correct register_plc_did helper
+        // (POSTs the signed op JSON to `{plc_url}/{did}`).
+        register_plc_did(
+            &ctx.config.identity.did_plc_url,
+            &did,
+            signed_operation,
+        )
+        .await?;
 
         tracing::info!(
             "Successfully submitted PLC handle update for {}: {}",
@@ -363,22 +325,37 @@ pub async fn sign_plc_operation(
         ));
     }
 
-    // Arc 13 Step 0.5/0.6 status: the new wire-shape requires
-    // verification_methods to be BTreeMap<String, String> (name →
-    // did:key URI) and services to be BTreeMap<String, ServiceEntry>
-    // — the legacy `Vec<String>` / `serde_json::Value` input shapes
-    // on `SignPlcOperationRequest` can't be safely mapped to the
-    // new types without a redesign. Step 3.4 rewrites this handler
-    // per §6.3.6 (snapshot-mutator + email-token two-phase flow);
-    // until then, standalone-mode call returns 501.
+    // Arc 13 Step 1.3: snapshot-mutator skeleton lands here.
+    // Step 3.4 layers email-token two-phase (validate-only first,
+    // consume-after-sign) on top of this; until Step 3.4 the
+    // standalone-mode handler still returns 501 because the
+    // SignPlcOperationRequest input shape (`Vec<String>` for
+    // verification_methods, `serde_json::Value` for services)
+    // can't safely express the new BTreeMap-keyed wire shape per
+    // §6.3.1 — Step 3.4 also updates the input shape.
+    //
+    // The snapshot-mutator scaffolding below (full-fetch via
+    // get_last_op, inherit-all-fields-from-last_op) is what
+    // Step 3.4's email-token-enabled rewrite will build on. We
+    // exercise it here (read-only) so the code path is verified
+    // against the directory shape before Step 3.4 adds the
+    // token + override logic.
     //
     // Entryway-mode forwarding (the branch above this point) still
     // works — Arc 12's §5.3.8 handler-forward path is unchanged
     // and is the production code path when entryway is configured.
-    let _ = (did, req);
+    use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
+    let plc_client = PlcClient::new(PlcClientConfig {
+        plc_url: ctx.config.identity.did_plc_url.clone(),
+        ..Default::default()
+    })?;
+    let (_last_op, _last_cid) = plc_client.get_last_op(&did).await?;
+
+    let _ = req;
     Err(PdsError::Internal(
         "sign_plc_operation standalone-mode path pending Arc 13 Step 3.4 rewrite \
-         (snapshot-mutator + email-token two-phase flow per V05_DESIGN.md §6.3.6)"
+         (snapshot-mutator scaffolding is in place; email-token two-phase flow + \
+         caller-override-shape redesign land at Step 3.4 per V05_DESIGN.md §6.3.6)"
             .to_string(),
     ))
 }
