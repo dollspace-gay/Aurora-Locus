@@ -145,9 +145,18 @@ pub async fn update_handle(
             ));
         };
 
-        // Build PLC operation for handle update
+        // Build PLC operation for handle update.
+        //
+        // NOTE (Arc 13 Step 1.2): this builds a *diff* op (only
+        // `also_known_as` set), which the PLC spec rejects on
+        // strict-mode directories — update ops MUST include the
+        // full snapshot inherited from the prior op via the
+        // mutator pattern at §6.3.6. Step 1.2 rewrites this
+        // handler to use `PlcClient::get_last_op` + snapshot
+        // mutator. Step 0.5/0.6 only lands the wire-shape
+        // foundation; the diff-build bug is tracked here for
+        // Step 1.2 closure.
         let mut operation_builder = PlcOperationBuilder::new()
-            .did(did.clone())
             .also_known_as(vec![format!("at://{}", new_handle)]);
 
         if let Some(prev) = prev_cid {
@@ -156,11 +165,11 @@ pub async fn update_handle(
 
         let operation = operation_builder.build()?;
 
-        // Sign the operation with rotation key
+        // Sign the operation with the configured PLC rotation key.
         let signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)?;
         let signed_operation = signer.sign_operation(operation)?;
 
-        // Submit to PLC directory
+        // Submit to PLC directory.
         let submit_endpoint = format!("{}/{}", plc_url, did);
         let submit_response = http_client
             .post(&submit_endpoint)
@@ -354,58 +363,24 @@ pub async fn sign_plc_operation(
         ));
     }
 
-    // Load the PLC rotation key from config
-    let plc_key_hex = &ctx.config.authentication.plc_rotation_key;
-    let signer = PlcSigner::from_hex(plc_key_hex)?;
-
-    // Get current DID document to extract previous operation CID
-    let _did_doc = ctx.identity_resolver.resolve_did(&did).await?;
-    // In production, extract prev CID from DID doc metadata
-
-    // Build PLC operation
-    let mut builder = PlcOperationBuilder::new().did(did.clone());
-
-    // Add previous operation CID if available
-    if let Some(token) = req.token {
-        // Token from PLC directory contains previous CID
-        builder = builder.prev(token);
-    }
-
-    // Add rotation keys
-    if let Some(rotation_keys) = req.rotation_keys {
-        builder = builder.rotation_keys(rotation_keys);
-    }
-
-    // Add also known as (handles)
-    if let Some(also_known_as) = req.also_known_as {
-        builder = builder.also_known_as(also_known_as);
-    }
-
-    // Add verification methods
-    if let Some(verification_methods) = req.verification_methods {
-        let vm_json = serde_json::to_value(verification_methods)
-            .map_err(|e| PdsError::Validation(format!("Invalid verification methods: {}", e)))?;
-        builder = builder.verification_methods(vm_json);
-    }
-
-    // Add services
-    if let Some(services) = req.services {
-        builder = builder.services(services);
-    }
-
-    // Build unsigned operation
-    let operation = builder.build()?;
-
-    // Sign the operation
-    let signed_operation = signer.sign_operation(operation)?;
-
-    // Convert to JSON value
-    let operation_json = serde_json::to_value(&signed_operation)
-        .map_err(|e| PdsError::Internal(format!("Failed to serialize operation: {}", e)))?;
-
-    Ok(Json(SignPlcOperationResponse {
-        operation: operation_json,
-    }))
+    // Arc 13 Step 0.5/0.6 status: the new wire-shape requires
+    // verification_methods to be BTreeMap<String, String> (name →
+    // did:key URI) and services to be BTreeMap<String, ServiceEntry>
+    // — the legacy `Vec<String>` / `serde_json::Value` input shapes
+    // on `SignPlcOperationRequest` can't be safely mapped to the
+    // new types without a redesign. Step 3.4 rewrites this handler
+    // per §6.3.6 (snapshot-mutator + email-token two-phase flow);
+    // until then, standalone-mode call returns 501.
+    //
+    // Entryway-mode forwarding (the branch above this point) still
+    // works — Arc 12's §5.3.8 handler-forward path is unchanged
+    // and is the production code path when entryway is configured.
+    let _ = (did, req);
+    Err(PdsError::Internal(
+        "sign_plc_operation standalone-mode path pending Arc 13 Step 3.4 rewrite \
+         (snapshot-mutator + email-token two-phase flow per V05_DESIGN.md §6.3.6)"
+            .to_string(),
+    ))
 }
 
 /// com.atproto.identity.submitPlcOperation

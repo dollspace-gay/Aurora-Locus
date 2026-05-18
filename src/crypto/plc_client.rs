@@ -134,22 +134,26 @@ impl PlcClient {
         // For now, we'll leave prev as None - PLC directory can handle this
         // TODO: Extract prev CID from _current_doc once PLC format is stable
 
-        // Build verification methods JSON with the new signing key
-        let verification_methods = serde_json::json!({
-            "atproto": new_signing_key
-        });
+        // Arc 13 §6.3.1 wire-shape: verification_methods is
+        // BTreeMap<String, String> (name → did:key URI).
+        let mut verification_methods = std::collections::BTreeMap::new();
+        verification_methods.insert("atproto".to_string(), new_signing_key.to_string());
 
-        // Build the PLC operation
+        // Build the PLC operation. Note: this builds a *diff* op
+        // (only verification_methods set, no rotation_keys /
+        // services / also_known_as carried over). Arc 13 Step 1.2
+        // will refactor to snapshot-mutator pattern. For now this
+        // operates correctly only against a directory in
+        // weak-mode; strict-mode rejects diff ops.
         let operation = PlcOperationBuilder::new()
-            .did(did.to_string())
             .verification_methods(verification_methods)
             .build()?;
 
-        // Sign the operation with the rotation key
+        // Sign with the rotation key.
         let signed_operation = rotation_key_signer.sign_operation(operation)?;
 
-        // Submit to PLC directory
-        register_plc_did(&self.config.plc_url, signed_operation).await?;
+        // Submit to PLC directory.
+        register_plc_did(&self.config.plc_url, did, signed_operation).await?;
 
         tracing::info!(did = %did, "Successfully updated signing key in PLC directory");
 

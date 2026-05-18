@@ -728,40 +728,42 @@ impl AccountManager {
     ///
     /// Returns: (did, rotation_key_hex, rotation_key_public_hex, operation_cid)
     async fn generate_plc_did(&self, handle: &str) -> PdsResult<(String, String, String, String)> {
-        use crate::crypto::plc::{register_plc_did, PlcOperationBuilder, PlcSigner};
+        use crate::crypto::plc::{
+            compute_op_cid, derive_did_suffix, register_plc_did, PlcOperationBuilder, PlcSigner,
+            ServiceEntry,
+        };
         use rand::RngCore;
-        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
 
-        // Generate a random 32-byte private key for PLC rotation
+        // Generate a random 32-byte private key for PLC rotation.
+        //
+        // NOTE (Arc 13 Step 0.7): this is interim; Step 0.7.2
+        // refactors `generate_plc_did` to use the PDS-wide rotation
+        // key from `config.authentication.plc_rotation_key` (so the
+        // signer's key is in every account's rotation_keys per
+        // §6.3.2 key separation) and generates a separate per-actor
+        // atproto signing key for `verification_methods["atproto"]`.
+        // For Step 0.5/0.6, the per-account key still serves both
+        // roles — wire shape is correct; key story not yet
+        // separated.
         let mut private_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut private_key);
         let private_key_hex = hex::encode(private_key);
 
-        // Create PLC signer
         let signer = PlcSigner::new(&private_key)?;
         let public_key_hex = signer.public_key_hex();
+        let public_key_did_key = signer.public_key_did_key();
 
-        // Generate DID from hash of public key (PLC method)
-        // did:plc uses base32-encoded hash of the genesis operation
-        let mut hasher = Sha256::new();
-        hasher.update(&public_key_hex);
-        let hash = hasher.finalize();
-
-        // Use full hash and encode as base32 lowercase (RFC4648, no padding), then truncate to 24 chars
-        // This follows the PLC spec: did:plc:${base32Encode(sha256(createOp)).slice(0,24)}
-        let base32_hash = base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, &hash);
-        let did_suffix = &base32_hash[..24]; // Truncate to 24 characters
-        let did = format!("did:plc:{}", did_suffix);
-
-        // Build PLC operation. Arc 12 §5.3.2 Gap 1 closure:
-        // read effective_public_url() so localhost / explicit-
-        // PDS_SERVICE_PUBLIC_URL deployments produce the
-        // correct scheme + port rather than baking
-        // `https://hostname` (with no port) into the immutable
-        // PLC genesis op CBOR.
+        // Arc 12 §5.3.2 Gap 1 closure: read effective_public_url()
+        // so localhost / explicit PDS_SERVICE_PUBLIC_URL deployments
+        // produce the correct scheme + port rather than baking
+        // `https://hostname` (no port) into the immutable PLC
+        // genesis op CBOR.
         let service_url = self.config.service.effective_public_url();
 
-        // Check if handle already includes the domain
+        // Handle-to-full-handle. (#69 will fix the double-dot bug
+        // where service_handle_domains entries with leading-dot
+        // produce malformed `usera..localhost` shapes.)
         let full_handle = if handle.contains('.')
             && self
                 .config
@@ -770,71 +772,67 @@ impl AccountManager {
                 .iter()
                 .any(|d| handle.ends_with(d))
         {
-            // Handle is already full (e.g., "test.locus.dollsky.social")
             handle.to_string()
         } else {
-            // Handle needs domain appended (e.g., "test" -> "test.locus.dollsky.social")
             format!(
                 "{}.{}",
                 handle, self.config.identity.service_handle_domains[0]
             )
         };
 
-        let services = serde_json::json!([{
-            "id": "#atproto_pds",
-            "type": "AtprotoPersonalDataServer",
-            "serviceEndpoint": service_url
-        }]);
+        // Arc 13 §6.3.1 wire-shape: services as map keyed by
+        // service name (`atproto_pds`), verification_methods as
+        // map keyed by purpose name (`atproto`), rotation_keys
+        // as plain Vec.
+        let mut services = BTreeMap::new();
+        services.insert(
+            "atproto_pds".to_string(),
+            ServiceEntry {
+                type_: "AtprotoPersonalDataServer".to_string(),
+                endpoint: service_url,
+            },
+        );
 
-        // Get proper multibase encoding for public key
-        let public_key_multibase = signer.public_key_multibase();
-        let public_key_did_key = signer.public_key_did_key();
+        let mut verification_methods = BTreeMap::new();
+        verification_methods.insert("atproto".to_string(), public_key_did_key.clone());
 
-        let verification_methods = serde_json::json!([{
-            "id": format!("{}#atproto", did),
-            "type": "Multikey",
-            "controller": did.clone(),
-            "publicKeyMultibase": public_key_multibase
-        }]);
-
-        let also_known_as = vec![format!("at://{}", full_handle)];
-
-        let operation = PlcOperationBuilder::new()
-            .did(did.clone())
+        let unsigned = PlcOperationBuilder::new()
             .rotation_keys(vec![public_key_did_key])
-            .also_known_as(also_known_as)
-            .services(services)
             .verification_methods(verification_methods)
+            .also_known_as(vec![format!("at://{}", full_handle)])
+            .services(services)
             .build()?;
 
-        // Sign the operation
-        let signed_operation = signer.sign_operation(operation)?;
+        // §6.3.1 / Step 0.6.1: DID suffix is SHA-256 of canonical
+        // DAG-CBOR of unsigned op, base32-lower (no padding), first
+        // 24 chars. Computed from the unsigned form so the signer's
+        // signature itself doesn't influence the DID.
+        let did_suffix = derive_did_suffix(&unsigned)?;
+        let did = format!("did:plc:{}", did_suffix);
 
-        // Get PLC directory URL from config or use default
+        let signed_operation = signer.sign_operation(unsigned)?;
+
         let plc_url = self.config.identity.did_plc_url.as_str();
 
-        // Register with PLC directory
-        match register_plc_did(plc_url, signed_operation.clone()).await {
+        match register_plc_did(plc_url, &did, signed_operation.clone()).await {
             Ok(_) => {
                 tracing::info!("Successfully registered DID with PLC directory: {}", did);
 
-                // For operation CID, we'll use a simplified hash of the operation
-                // In production, this should be a proper CID
-                let operation_json = serde_json::to_string(&signed_operation).unwrap_or_default();
-                let mut cid_hasher = Sha256::new();
-                cid_hasher.update(operation_json.as_bytes());
-                let cid_hash = cid_hasher.finalize();
-                let operation_cid = format!("bafyrei{}", hex::encode(&cid_hash[..16]));
+                // §6.3.1 / Step 0.6.2: CID over canonical DAG-CBOR
+                // of signed op (the proper PLC-spec CID).
+                let operation_cid = compute_op_cid(&signed_operation)?;
 
                 Ok((did, private_key_hex, public_key_hex, operation_cid))
             }
             Err(e) => {
+                // NOTE: §6.3.7 / Step 5 will hard-fail here
+                // (remove silent did:web fallback) per Arc 13
+                // design. For Step 0.5/0.6 the fallback is kept
+                // to avoid breaking the foundation-only landing.
                 tracing::warn!(
                     "Failed to register DID with PLC directory: {}. Falling back to did:web",
                     e
                 );
-                // Fallback to did:web if PLC registration fails
-                // full_handle is already constructed above (line 463)
                 let did_web = format!("did:web:{}", full_handle);
                 Ok((did_web, private_key_hex, public_key_hex, "".to_string()))
             }
