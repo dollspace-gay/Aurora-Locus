@@ -10,6 +10,7 @@ pub mod authentication;
 pub mod discovery;
 pub mod dpop;
 pub mod entryway;
+pub mod entryway_headers;
 pub mod nonce_store;
 pub mod relay;
 pub mod search;
@@ -17,6 +18,7 @@ pub mod service_auth;
 
 pub use discovery::PdsInstance;
 pub use entryway::{EntrywayAdminClient, EntrywayClient};
+pub use entryway_headers::{entryway_auth_headers, entryway_passthru_headers};
 pub use nonce_store::NonceStore;
 pub use relay::{RelayClient, RelayConfig};
 pub use service_auth::ServiceAuthenticator;

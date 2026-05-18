@@ -897,6 +897,31 @@ impl AppContext {
     ) -> PdsResult<crate::api::middleware::UnifiedAuthContext> {
         crate::auth::verify_jwt_with_allowlist_impl(self, token, audience_allowlist).await
     }
+
+    /// Arc 12 §5.4 Step 2.1 — build the `Authorization: Bearer <jwt>`
+    /// header set required when forwarding `lxm` to the entryway on
+    /// behalf of `user_did`. Thin wrapper around
+    /// `crate::federation::entryway_auth_headers` that also resolves
+    /// the configured entryway DID. Returns
+    /// `PdsError::Internal("...without EntrywayConfig")` when called
+    /// in standalone mode — callers (the §5.3.8 forwarded handlers)
+    /// gate on `ctx.entryway_client.is_some()` before invoking, so
+    /// reaching this error path is a programming bug.
+    pub async fn entryway_auth_headers(
+        &self,
+        user_did: &str,
+        lxm: &str,
+    ) -> PdsResult<axum::http::HeaderMap> {
+        let entryway_did = self.entryway_did().ok_or_else(|| {
+            PdsError::Internal(
+                "entryway_auth_headers called without EntrywayConfig — \
+                 forwarded handlers must gate on entryway_client.is_some()"
+                    .to_string(),
+            )
+        })?;
+        crate::federation::entryway_auth_headers(&self.account_db, user_did, entryway_did, lxm)
+            .await
+    }
 }
 
 /// Convert the configuration-layer `BlobstoreConfig` (S3 vs Disk variants
