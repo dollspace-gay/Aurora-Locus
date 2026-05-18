@@ -27,6 +27,28 @@ fn opt_parse_timestamp(s: Option<String>) -> PdsResult<Option<DateTime<Utc>>> {
 }
 
 
+/// Arc 13 §6.3.6 round-4 F2 closure — outcome of
+/// [`AccountManager::consume_plc_operation_token`]. Four variants
+/// for observability; handler dispatch is two-way (`Consumed` →
+/// proceed; everything else → reject as `TokenAlreadyConsumed`).
+#[derive(Debug)]
+pub enum ConsumeResult {
+    /// CAS UPDATE flipped `used: false → true`; the token row
+    /// transitioned because of this call.
+    Consumed,
+    /// CAS UPDATE found zero rows but a follow-up SELECT shows
+    /// the token exists and was already used.
+    AlreadyConsumed,
+    /// CAS UPDATE found zero rows and a follow-up SELECT shows
+    /// no matching token row. Effectively impossible if
+    /// `validate_plc_operation_token` succeeded immediately
+    /// before; logged at warn if seen.
+    NotFound,
+    /// Database-layer failure on either the UPDATE or the
+    /// follow-up SELECT.
+    Error(PdsError),
+}
+
 /// Account manager service
 pub struct AccountManager {
     db: AnyPool,
@@ -1230,6 +1252,152 @@ impl AccountManager {
         tracing::info!("Password reset successful for DID: {}", did);
 
         Ok(())
+    }
+
+    // ============================================================
+    // Arc 13 §6.3.6 + Step 3.1 — `plc_operation` email-token surface.
+    // Three helpers paired with §6.3.6 two-phase flow: validate-only
+    // first (no consume), build + sign the op, then CAS-style
+    // consume. Pattern follows existing per-purpose email-token
+    // helpers (chainlink #62 Case B confirmation).
+    // ============================================================
+
+    /// Generate a `plc_operation` email token. TTL = 30 minutes per
+    /// §6.3.6 (matches bsky-PDS pattern). Single-use; cleaned up at
+    /// consume time via the CAS UPDATE in [`consume_plc_operation_token`].
+    pub async fn generate_plc_operation_token(&self, did: &str) -> PdsResult<String> {
+        let token = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let expires_at = now + Duration::minutes(30);
+
+        sqlx::query(
+            r#"
+            INSERT INTO email_token (token, did, purpose, created_at, expires_at, used)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(&token)
+        .bind(did)
+        .bind("plc_operation")
+        .bind(now.to_rfc3339())
+        .bind(expires_at.to_rfc3339())
+        .bind(false)
+        .execute(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        Ok(token)
+    }
+
+    /// §6.3.6 two-phase step 2: validate-only, **NO consume**. On
+    /// success the token row remains untouched so a transient
+    /// failure between validate and consume (e.g., transient PLC
+    /// directory outage at step 3) leaves the token intact for
+    /// retry.
+    ///
+    /// Fails with `PdsError::Authentication("InvalidToken: ...")` on
+    /// missing token, mismatched DID, already-used, or expired. The
+    /// `InvalidToken` prefix in the message lets the handler map
+    /// uniformly to HTTP 400 `InvalidToken` without dispatching on
+    /// the inner cause (cause is logged at debug for observability).
+    pub async fn validate_plc_operation_token(
+        &self,
+        did: &str,
+        token: &str,
+    ) -> PdsResult<()> {
+        let now = Utc::now();
+        let row = sqlx::query(
+            r#"
+            SELECT token, did, purpose, expires_at, used
+            FROM email_token
+            WHERE token = $1 AND purpose = 'plc_operation'
+            "#,
+        )
+        .bind(token)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?
+        .ok_or_else(|| {
+            PdsError::Authentication("InvalidToken: no matching plc_operation token".to_string())
+        })?;
+
+        let token_did: String = row.try_get("did")?;
+        let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
+        let used: bool = row.try_get("used")?;
+
+        if token_did != did {
+            return Err(PdsError::Authentication(
+                "InvalidToken: token DID does not match authenticated user".to_string(),
+            ));
+        }
+        if used {
+            return Err(PdsError::Authentication(
+                "InvalidToken: plc_operation token has already been used".to_string(),
+            ));
+        }
+        if now > expires_at {
+            return Err(PdsError::Authentication(
+                "InvalidToken: plc_operation token has expired".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// §6.3.6 two-phase step 7: CAS-style consume. Single atomic
+    /// UPDATE flips `used: false → true` and reports whether the
+    /// row was the one to make the transition. Two simultaneous
+    /// calls with the same token race: exactly one returns
+    /// `Consumed`; the other returns `AlreadyConsumed`. No double-
+    /// consume is possible.
+    ///
+    /// Per round-4 F2 closure (§6.3.6 enum semantics): CAS UPDATE
+    /// returns zero affected rows for BOTH `AlreadyConsumed` AND
+    /// `NotFound`. We do a follow-up SELECT for logging
+    /// distinguishability only — both map to `TokenAlreadyConsumed`
+    /// (HTTP 409) on the wire. In practice `NotFound` is impossible
+    /// if [`validate_plc_operation_token`] succeeded immediately
+    /// before, but distinguishing logs help debug if the assumption
+    /// is ever violated.
+    pub async fn consume_plc_operation_token(
+        &self,
+        did: &str,
+        token: &str,
+    ) -> ConsumeResult {
+        let result = sqlx::query(
+            r#"
+            UPDATE email_token
+            SET used = true
+            WHERE token = $1
+              AND did = $2
+              AND purpose = 'plc_operation'
+              AND used = false
+            "#,
+        )
+        .bind(token)
+        .bind(did)
+        .execute(&self.db)
+        .await;
+
+        let exec = match result {
+            Ok(e) => e,
+            Err(e) => return ConsumeResult::Error(PdsError::Database(e)),
+        };
+
+        if exec.rows_affected() >= 1 {
+            return ConsumeResult::Consumed;
+        }
+
+        // Disambiguate AlreadyConsumed vs NotFound for logging.
+        let probe = sqlx::query("SELECT used FROM email_token WHERE token = $1 AND purpose = 'plc_operation'")
+            .bind(token)
+            .fetch_optional(&self.db)
+            .await;
+        match probe {
+            Ok(Some(_)) => ConsumeResult::AlreadyConsumed,
+            Ok(None) => ConsumeResult::NotFound,
+            Err(e) => ConsumeResult::Error(PdsError::Database(e)),
+        }
     }
 
     /// Generate account deletion token

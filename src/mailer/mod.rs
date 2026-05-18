@@ -287,6 +287,59 @@ Aurora Locus PDS
         .await
     }
 
+    /// Arc 13 §6.3.6 / Step 3.2 — send a PLC-operation signing
+    /// token email. The token authenticates the user's
+    /// `signPlcOperation` call (key rotation, recovery, handle
+    /// migration, etc.). TTL is 30 minutes (§6.3.6 — matches
+    /// bsky-PDS pattern).
+    pub async fn send_plc_operation_email(
+        &self,
+        to_email: &str,
+        handle: &str,
+        token: &str,
+    ) -> PdsResult<()> {
+        if self.config.is_none() {
+            tracing::warn!(
+                "Email not configured, skipping plc_operation email to {}",
+                to_email
+            );
+            return Ok(());
+        }
+        let config = self.config.as_ref().unwrap();
+
+        let body = format!(
+            r#"
+Hello {},
+
+We received a request to sign a PLC operation for your account on our
+AT Protocol Personal Data Server. PLC operations are how your DID
+itself is updated — for example, rotating signing keys, adding a
+recovery key, or migrating your account.
+
+To complete the operation, present the following token to your client:
+
+{}
+
+This token expires in 30 minutes. Single-use.
+
+If you did not request this, please ignore this email. No changes will
+be made to your DID.
+
+Best regards,
+Aurora Locus PDS
+"#,
+            handle, token
+        );
+
+        self.send_email(
+            to_email,
+            "Confirm PLC operation",
+            &body,
+            &config.from_address,
+        )
+        .await
+    }
+
     /// Send a generic email
     async fn send_email(&self, to: &str, subject: &str, body: &str, from: &str) -> PdsResult<()> {
         if let Some(transport) = &self.transport {

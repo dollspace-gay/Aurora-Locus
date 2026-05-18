@@ -4,7 +4,7 @@
 
 mod manager;
 
-pub use manager::AccountManager;
+pub use manager::{AccountManager, ConsumeResult};
 
 use serde::{Deserialize, Serialize};
 

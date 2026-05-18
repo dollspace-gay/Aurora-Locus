@@ -218,71 +218,129 @@ pub async fn get_recommended_did_credentials(
     State(ctx): State<AppContext>,
     auth: AuthContext,
 ) -> PdsResult<Json<RecommendedDidCredentialsResponse>> {
+    // Arc 13 §6.3.6 Step 3.6 rewrite — return *server-recommended*
+    // credentials (what an account migrating TO this PDS should
+    // adopt), not the credentials currently in the resolved DID
+    // document.
+    //
+    // Per §6.3.2 + §6.3.3 the recommended set is:
+    //   - rotation_keys = §6.3.3 priority-ordered list
+    //     [account_recovery? (not knowable server-side),
+    //      config.identity.recovery_did_key?,
+    //      config.authentication.plc_rotation_key.did_key()]
+    //   - verification_methods = {atproto: <per-actor signing key
+    //     did:key from plc_keys.atproto_signing_key>}
+    //   - services = {atproto_pds: {type, endpoint}}
+    //   - also_known_as = the account's handle
+    //
+    // The per-account recovery_key isn't included here — it's
+    // known only to the account holder; the server's recommendation
+    // is "your existing recovery_key + the server's PDS recovery +
+    // rotation keys."
+    use crate::crypto::plc::PlcSigner;
+
     let did = auth.did;
 
-    // Fetch current DID document
-    let doc = ctx.identity_resolver.resolve_did(&did).await?;
+    // PDS-wide rotation key did:key (always present).
+    let pds_rotation_signer =
+        PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)?;
+    let pds_rotation_did_key = pds_rotation_signer.public_key_did_key();
 
-    // Extract rotation keys
-    let rotation_keys: Vec<String> = doc
-        .verification_method
-        .iter()
-        .filter_map(|vm| {
-            // Only include keys that can be used for rotation
-            if vm.id.contains("#atproto") {
-                vm.public_key_multibase.clone()
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Per-actor atproto signing key from plc_keys (Arc 12 Step 1.5
+    // column).
+    let plc_row: Option<(String,)> =
+        sqlx::query_as("SELECT atproto_signing_key FROM plc_keys WHERE did = $1")
+            .bind(&did)
+            .fetch_optional(&ctx.account_db)
+            .await
+            .map_err(PdsError::Database)?;
+    let atproto_signing_key_hex = plc_row
+        .map(|(k,)| k)
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| {
+            PdsError::NotFound(format!(
+                "No plc_keys.atproto_signing_key for {} \
+                 (account either pre-Arc-12-Step-1.5 vintage or absent)",
+                did
+            ))
+        })?;
+    let atproto_signer = PlcSigner::from_hex(&atproto_signing_key_hex)?;
+    let atproto_did_key = atproto_signer.public_key_did_key();
 
-    // Map verification methods
-    let verification_methods: Vec<VerificationMethod> = doc
-        .verification_method
-        .iter()
-        .map(|vm| VerificationMethod {
-            id: vm.id.clone(),
-            method_type: vm.key_type.clone(),
-            controller: vm.controller.clone(),
-            public_key_multibase: vm.public_key_multibase.clone().unwrap_or_default(),
-        })
-        .collect();
+    // §6.3.3 priority order. Per-account recovery_key isn't
+    // surfaced here (server-side doesn't know it).
+    let mut rotation_keys = Vec::with_capacity(2);
+    if let Some(pds_recovery) = &ctx.config.identity.recovery_did_key {
+        if !pds_recovery.is_empty() {
+            rotation_keys.push(pds_recovery.clone());
+        }
+    }
+    rotation_keys.push(pds_rotation_did_key);
 
-    // Map services
-    let services: Vec<Service> = doc
-        .service
-        .iter()
-        .map(|s| Service {
-            id: s.id.clone(),
-            service_type: s.service_type.clone(),
-            service_endpoint: s.service_endpoint.clone(),
-        })
-        .collect();
+    // verification_methods + services match what generate_plc_did
+    // wires for new accounts.
+    let verification_methods = vec![VerificationMethod {
+        id: format!("{}#atproto", did),
+        method_type: "Multikey".to_string(),
+        controller: did.clone(),
+        public_key_multibase: atproto_signer.public_key_multibase(),
+    }];
+    let services = vec![Service {
+        id: "#atproto_pds".to_string(),
+        service_type: "AtprotoPersonalDataServer".to_string(),
+        service_endpoint: ctx.service_url(),
+    }];
+
+    // also_known_as from the account's handle.
+    let account = ctx.account_manager.get_account(&did).await?;
+    let also_known_as = account
+        .handle
+        .map(|h| vec![format!("at://{}", h)])
+        .unwrap_or_default();
+
+    // Forget pds_rotation_did_key after use (its private key is
+    // never returned; only the did:key URI).
+    let _ = pds_rotation_signer;
 
     Ok(Json(RecommendedDidCredentialsResponse {
         rotation_keys,
-        also_known_as: doc.also_known_as,
+        also_known_as,
         verification_methods,
         services,
     }))
 }
 
-/// com.atproto.identity.signPlcOperation
+/// com.atproto.identity.signPlcOperation request shape per
+/// Arc 13 §6.3.6 Step 3.4.
 ///
-/// Sign a PLC operation for DID:PLC update
+/// `token` is REQUIRED — the email-token-confirmation flow gives
+/// the caller a 30-minute single-use token via
+/// `requestPlcOperationSignature`.
+///
+/// `verification_methods` / `services` are JSON map shapes
+/// matching the on-wire PLC spec (compatible with bsky-PDS's
+/// signPlcOperation lexicon — both crates pass serde_json::Value
+/// here and parse at handler time):
+///   - verification_methods: `{"<name>": "<did:key URI>", …}`
+///   - services: `{"<name>": {"type": "<type>", "endpoint": "<url>"}, …}`
+///
+/// Any field absent from input means "inherit from prior op"
+/// (snapshot mutator pattern per §6.3.6); any field present
+/// overrides the inherited value.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignPlcOperationRequest {
-    /// Token from PLC directory
-    pub token: Option<String>,
-    /// Rotation keys
+    /// Email confirmation token (Arc 13 §6.3.6 — required).
+    pub token: String,
+    /// Override `rotation_keys`. Absent → inherit from prior op.
     pub rotation_keys: Option<Vec<String>>,
-    /// Also known as
+    /// Override `also_known_as`. Absent → inherit.
     pub also_known_as: Option<Vec<String>>,
-    /// Verification methods
-    pub verification_methods: Option<Vec<String>>,
-    /// Services
+    /// Override `verification_methods`. JSON `{name: did:key, …}`.
+    /// Absent → inherit.
+    pub verification_methods: Option<serde_json::Value>,
+    /// Override `services`. JSON
+    /// `{name: {type, endpoint}, …}`. Absent → inherit.
     pub services: Option<serde_json::Value>,
 }
 
@@ -325,39 +383,186 @@ pub async fn sign_plc_operation(
         ));
     }
 
-    // Arc 13 Step 1.3: snapshot-mutator skeleton lands here.
-    // Step 3.4 layers email-token two-phase (validate-only first,
-    // consume-after-sign) on top of this; until Step 3.4 the
-    // standalone-mode handler still returns 501 because the
-    // SignPlcOperationRequest input shape (`Vec<String>` for
-    // verification_methods, `serde_json::Value` for services)
-    // can't safely express the new BTreeMap-keyed wire shape per
-    // §6.3.1 — Step 3.4 also updates the input shape.
+    // Arc 13 §6.3.6 / Step 3.4 — two-phase email-token flow:
     //
-    // The snapshot-mutator scaffolding below (full-fetch via
-    // get_last_op, inherit-all-fields-from-last_op) is what
-    // Step 3.4's email-token-enabled rewrite will build on. We
-    // exercise it here (read-only) so the code path is verified
-    // against the directory shape before Step 3.4 adds the
-    // token + override logic.
-    //
-    // Entryway-mode forwarding (the branch above this point) still
-    // works — Arc 12's §5.3.8 handler-forward path is unchanged
-    // and is the production code path when entryway is configured.
+    // 1. Validate request (above): did is did:plc.
+    // 2. Validate the email token (validate-only, NO consume yet).
+    //    On invalid → PdsError::Authentication → HTTP 401 in
+    //    IntoResponse — close enough to the spec's HTTP 400
+    //    InvalidToken; for the Arc 13 sweep we accept this as a
+    //    Path B documented deviation (HTTP 401 vs 400) since
+    //    the existing IntoResponse for Authentication is HTTP 401
+    //    and adding a dedicated InvalidToken variant is Step 7
+    //    audit cleanup. The wire message string contains
+    //    "InvalidToken" so clients can string-match.
+    // 3. Fetch full last op (get_last_op) — tombstoned → 400.
+    // 4. Build new op via mutator: inherit all fields from
+    //    last_op, override any field provided in input.
+    // 5. Set prev to last_op's CID.
+    // 6. Sign with PDS-wide rotation key.
+    // 7. Consume token via CAS. On race-lose → HTTP 409
+    //    TokenAlreadyConsumed (Path B per round-4 F4 closure —
+    //    proto-blue's lexicon doesn't declare this error, so it's
+    //    emitted as a non-declared error with warning logging).
+    // 8. Return signed op.
+    use crate::crypto::plc::{PlcOperationBuilder, PlcSigner, ServiceEntry};
     use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
+    use crate::account::ConsumeResult;
+    use std::collections::BTreeMap;
+
+    // Step 2: validate-only.
+    ctx.account_manager
+        .validate_plc_operation_token(&did, &req.token)
+        .await?;
+
+    // Step 3: full-fetch last op.
     let plc_client = PlcClient::new(PlcClientConfig {
         plc_url: ctx.config.identity.did_plc_url.clone(),
         ..Default::default()
     })?;
-    let (_last_op, _last_cid) = plc_client.get_last_op(&did).await?;
+    let (last_op, last_cid) = plc_client.get_last_op(&did).await?;
 
-    let _ = req;
-    Err(PdsError::Internal(
-        "sign_plc_operation standalone-mode path pending Arc 13 Step 3.4 rewrite \
-         (snapshot-mutator scaffolding is in place; email-token two-phase flow + \
-         caller-override-shape redesign land at Step 3.4 per V05_DESIGN.md §6.3.6)"
-            .to_string(),
-    ))
+    // Step 4: build mutator. Start from inherited values, apply
+    // overrides. Parse JSON map shapes per §6.3.6 Step 3.4 contract.
+    let rotation_keys = req
+        .rotation_keys
+        .clone()
+        .unwrap_or_else(|| last_op.rotation_keys.clone());
+    let also_known_as = req
+        .also_known_as
+        .clone()
+        .unwrap_or_else(|| last_op.also_known_as.clone());
+
+    let verification_methods: BTreeMap<String, String> = match req.verification_methods.as_ref() {
+        Some(v) => parse_verification_methods(v)?,
+        None => last_op.verification_methods.clone(),
+    };
+    let services: BTreeMap<String, ServiceEntry> = match req.services.as_ref() {
+        Some(v) => parse_services(v)?,
+        None => last_op.services.clone(),
+    };
+
+    let unsigned = PlcOperationBuilder::new()
+        .rotation_keys(rotation_keys)
+        .verification_methods(verification_methods)
+        .also_known_as(also_known_as)
+        .services(services)
+        .prev(last_cid)
+        .build()?;
+
+    // Step 6: sign with PDS-wide rotation key.
+    let signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)?;
+    let signed = signer.sign_operation(unsigned)?;
+
+    // Step 7: CAS-style consume. Path B for TokenAlreadyConsumed:
+    // proto-blue's signPlcOperation lexicon doesn't declare this
+    // error variant; we emit it as a non-declared XRPC error with
+    // warning log per §6.3.6 round-4 F4 closure.
+    match ctx
+        .account_manager
+        .consume_plc_operation_token(&did, &req.token)
+        .await
+    {
+        ConsumeResult::Consumed => {}
+        ConsumeResult::AlreadyConsumed => {
+            tracing::warn!(
+                did = %did,
+                token_prefix = %req.token.chars().take(8).collect::<String>(),
+                "TokenAlreadyConsumed (race lost between validate and consume; \
+                 Path B non-declared XRPC error per §6.3.6 round-4 F4)"
+            );
+            return Err(PdsError::Conflict(
+                "TokenAlreadyConsumed: plc_operation token was consumed by a concurrent call"
+                    .to_string(),
+            ));
+        }
+        ConsumeResult::NotFound => {
+            // Effectively impossible if validate succeeded; log
+            // at warn if observed.
+            tracing::warn!(
+                did = %did,
+                "consume_plc_operation_token returned NotFound after validate succeeded \
+                 (contract violation — investigate)"
+            );
+            return Err(PdsError::Conflict(
+                "TokenAlreadyConsumed".to_string(),
+            ));
+        }
+        ConsumeResult::Error(e) => return Err(e),
+    }
+
+    // Step 8: return signed op JSON.
+    let operation_json = serde_json::to_value(&signed)
+        .map_err(|e| PdsError::Internal(format!("Failed to serialize signed op: {}", e)))?;
+    Ok(Json(SignPlcOperationResponse {
+        operation: operation_json,
+    }))
+}
+
+/// §6.3.6 Step 3.4 helper — convert JSON
+/// `{"<name>": "<did:key URI>", …}` (bsky-PDS wire shape) into
+/// the canonical `BTreeMap<String, String>` consumed by
+/// `PlcOperationBuilder::verification_methods`.
+fn parse_verification_methods(
+    v: &serde_json::Value,
+) -> PdsResult<std::collections::BTreeMap<String, String>> {
+    let obj = v.as_object().ok_or_else(|| {
+        PdsError::Validation(
+            "verification_methods must be a JSON object {name: did:key}".to_string(),
+        )
+    })?;
+    let mut out = std::collections::BTreeMap::new();
+    for (k, val) in obj {
+        let s = val.as_str().ok_or_else(|| {
+            PdsError::Validation(format!(
+                "verification_methods[{:?}] must be a string did:key URI",
+                k
+            ))
+        })?;
+        out.insert(k.clone(), s.to_string());
+    }
+    Ok(out)
+}
+
+/// §6.3.6 Step 3.4 helper — convert JSON
+/// `{"<name>": {"type": "<type>", "endpoint": "<url>"}, …}` into
+/// `BTreeMap<String, ServiceEntry>`.
+fn parse_services(
+    v: &serde_json::Value,
+) -> PdsResult<std::collections::BTreeMap<String, crate::crypto::plc::ServiceEntry>> {
+    let obj = v.as_object().ok_or_else(|| {
+        PdsError::Validation(
+            "services must be a JSON object {name: {type, endpoint}}".to_string(),
+        )
+    })?;
+    let mut out = std::collections::BTreeMap::new();
+    for (k, val) in obj {
+        let inner = val.as_object().ok_or_else(|| {
+            PdsError::Validation(format!(
+                "services[{:?}] must be an object with `type` and `endpoint`",
+                k
+            ))
+        })?;
+        let type_ = inner
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| {
+                PdsError::Validation(format!("services[{:?}] missing string `type`", k))
+            })?
+            .to_string();
+        let endpoint = inner
+            .get("endpoint")
+            .and_then(|e| e.as_str())
+            .ok_or_else(|| {
+                PdsError::Validation(format!("services[{:?}] missing string `endpoint`", k))
+            })?
+            .to_string();
+        out.insert(
+            k.clone(),
+            crate::crypto::plc::ServiceEntry { type_, endpoint },
+        );
+    }
+    Ok(out)
 }
 
 /// com.atproto.identity.submitPlcOperation
@@ -384,54 +589,115 @@ pub async fn submit_plc_operation(
         ));
     }
 
-    // Validate operation format - must have required fields
-    let operation = &req.operation;
+    // Arc 13 §6.3.6 Step 3.5 — submit_plc_operation rewrite.
+    //
+    // Sum-type dispatch: parse input as either PlcOperation
+    // (regular update) or PlcTombstone (terminal retire). Reject
+    // malformed via PdsError::Validation → HTTP 400.
+    //
+    // For PlcOperation, validate service-endpoint matches
+    // `ctx.service_url()` (signers can't redirect their account
+    // to a third-party PDS via submit). Accept ops that remove
+    // the server's rotation key from `op.rotation_keys`
+    // (migration-away scenario per §6.7.1).
+    //
+    // For PlcTombstone, skip the service-endpoint check (tombstones
+    // carry no services).
+    //
+    // The pre-Arc-13 `op.did` check is gone — the new wire shape
+    // has no `did` field; the DID is the URL path component the
+    // caller specifies via their authenticated session.
+    use crate::crypto::plc::{PlcOperation, ServiceEntry};
 
-    // Check that operation contains required fields
-    if !operation.is_object() {
-        return Err(PdsError::Validation(
-            "Operation must be a JSON object".to_string(),
-        ));
-    }
+    // Sum-type dispatch by `type` field.
+    let op_type = req
+        .operation
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            PdsError::Validation("Operation must have string `type` field".to_string())
+        })?;
 
-    let obj = operation.as_object().unwrap();
-
-    // Validate required fields
-    if !obj.contains_key("type")
-        || obj.get("type").and_then(|v| v.as_str()) != Some("plc_operation")
-    {
-        return Err(PdsError::Validation(
-            "Operation must have type=plc_operation".to_string(),
-        ));
-    }
-
-    if !obj.contains_key("did") {
-        return Err(PdsError::Validation(
-            "Operation must contain 'did'".to_string(),
-        ));
-    }
-
-    if !obj.contains_key("sig") {
-        return Err(PdsError::Validation("Operation must be signed".to_string()));
-    }
-
-    // Verify the DID in the operation matches the authenticated user
-    if let Some(op_did) = obj.get("did").and_then(|v| v.as_str()) {
-        if op_did != did {
-            return Err(PdsError::Authorization(
-                "Operation DID does not match authenticated user".to_string(),
-            ));
+    match op_type {
+        "plc_operation" => {
+            let op: PlcOperation = serde_json::from_value(req.operation.clone())
+                .map_err(|e| PdsError::Validation(format!("Malformed plc_operation: {}", e)))?;
+            // §6.3.6 step 3: services["atproto_pds"] must match
+            // `ctx.service_url()`. Reject if absent or mismatched.
+            let pds_svc: &ServiceEntry =
+                op.services.get("atproto_pds").ok_or_else(|| {
+                    PdsError::Validation(
+                        "InvalidServiceEndpoint: op.services must include \
+                         `atproto_pds` entry"
+                            .to_string(),
+                    )
+                })?;
+            if pds_svc.type_ != "AtprotoPersonalDataServer" {
+                return Err(PdsError::Validation(format!(
+                    "InvalidServiceEndpoint: services.atproto_pds.type must be \
+                     `AtprotoPersonalDataServer`, got {:?}",
+                    pds_svc.type_
+                )));
+            }
+            if pds_svc.endpoint != ctx.service_url() {
+                return Err(PdsError::Validation(format!(
+                    "InvalidServiceEndpoint: services.atproto_pds.endpoint must \
+                     match this PDS's service URL ({}); got {}",
+                    ctx.service_url(),
+                    pds_svc.endpoint
+                )));
+            }
+            // §6.3.6 step 5: sig present and base64url-decodable.
+            crate::crypto::plc::validate_plc_operation(&op)?;
+            // Step 4 in §6.3.6 — accept ops that remove server's
+            // rotation key. No additional check here; the caller's
+            // rotation_keys decision flows through.
+        }
+        "plc_tombstone" => {
+            // Tombstones carry only `type`, `prev`, `sig`. Parse
+            // shape-check; service-endpoint validation skipped.
+            let prev = req
+                .operation
+                .get("prev")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    PdsError::Validation(
+                        "Malformed plc_tombstone: missing string `prev` (CID of last op)"
+                            .to_string(),
+                    )
+                })?;
+            let sig = req
+                .operation
+                .get("sig")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    PdsError::Validation(
+                        "Malformed plc_tombstone: missing string `sig` (base64url)"
+                            .to_string(),
+                    )
+                })?;
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+            URL_SAFE_NO_PAD.decode(sig).map_err(|e| {
+                PdsError::Validation(format!(
+                    "Malformed plc_tombstone: sig is not valid base64url: {}",
+                    e
+                ))
+            })?;
+            let _ = prev; // No further validation beyond presence.
+        }
+        other => {
+            return Err(PdsError::Validation(format!(
+                "Operation type must be `plc_operation` or `plc_tombstone`; got {:?}",
+                other
+            )));
         }
     }
 
-    // Submit to PLC directory
+    // §6.3.6 step 7: submit to PLC directory.
     let plc_url = &ctx.config.identity.did_plc_url;
     let submit_endpoint = format!("{}/{}", plc_url, did);
 
-    // Create HTTP client
     let http_client = reqwest::Client::new();
-
-    // Submit the operation
     let response = http_client
         .post(&submit_endpoint)
         .json(&req.operation)
@@ -439,7 +705,6 @@ pub async fn submit_plc_operation(
         .await
         .map_err(|e| PdsError::Internal(format!("Failed to submit to PLC directory: {}", e)))?;
 
-    // Check response status
     if !response.status().is_success() {
         let status = response.status();
         let error_body = response
@@ -452,7 +717,7 @@ pub async fn submit_plc_operation(
         )));
     }
 
-    // Invalidate cached DID document so it will be refreshed on next resolution
+    // Invalidate cached DID document so it'll be refreshed.
     ctx.identity_resolver.invalidate_did(&did).await?;
 
     Ok(Json(()))
@@ -460,73 +725,66 @@ pub async fn submit_plc_operation(
 
 /// com.atproto.identity.requestPlcOperationSignature
 ///
-/// Request a signature token from PLC directory for updating DID
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestPlcOperationSignatureResponse {
-    /// Token for signing operation
-    pub token: String,
-}
-
+/// Arc 13 §6.3.6 / Step 3.3 — generates a single-use email
+/// confirmation token, sends it to the account holder's email, and
+/// returns 200 with an empty body. Pre-Arc-13 this returned the
+/// PLC-directory prev-CID synchronously; that was the wrong
+/// endpoint purpose entirely (chainlink #61 §6.1).
+///
+/// The returned token is consumed by `sign_plc_operation`. TTL: 30
+/// minutes. Single-use via CAS at consume time.
 pub async fn request_plc_operation_signature(
     State(ctx): State<AppContext>,
     auth: AuthContext,
-) -> PdsResult<Json<RequestPlcOperationSignatureResponse>> {
+) -> PdsResult<Json<serde_json::Value>> {
     let did = auth.did;
 
-    // Ensure this is a did:plc
+    // Ensure this is a did:plc — only did:plc supports PLC ops.
     if !did.starts_with("did:plc:") {
         return Err(PdsError::Validation(
             "Only did:plc identifiers support PLC operations".to_string(),
         ));
     }
 
-    // Make request to PLC directory for signature token
-    let plc_url = &ctx.config.identity.did_plc_url;
-    let token_endpoint = format!("{}/{}/log/audit", plc_url, did);
+    // Fetch the account so we have an email + handle to send to.
+    let account = ctx.account_manager.get_account(&did).await?;
+    let email = account.email.clone().ok_or_else(|| {
+        PdsError::Validation(
+            "Account does not have an email address; cannot send PLC operation token"
+                .to_string(),
+        )
+    })?;
 
-    // Create HTTP client for this request
-    let http_client = reqwest::Client::new();
+    // §6.3.6 step 2: generate the token row. Persisted; consumed
+    // later by sign_plc_operation's CAS UPDATE.
+    let token = ctx
+        .account_manager
+        .generate_plc_operation_token(&did)
+        .await?;
 
-    // Request signature token from PLC directory
-    let response = http_client
-        .get(&token_endpoint)
-        .send()
-        .await
-        .map_err(|e| PdsError::Internal(format!("Failed to contact PLC directory: {}", e)))?;
-
-    if !response.status().is_success() {
-        return Err(PdsError::Internal(format!(
-            "PLC directory returned error: {}",
-            response.status()
-        )));
+    // §6.3.6 step 3: send via mailer. Mailer no-ops + warns when
+    // SMTP isn't configured (dev paths) — the token still exists
+    // in the DB and can be retrieved by Phase B operators via
+    // MailHog (or, in dev with no MailHog, via direct DB query;
+    // see Step 3.7 for the operator-side procedure).
+    if ctx.mailer.is_configured() {
+        ctx.mailer
+            .send_plc_operation_email(
+                &email,
+                account.handle.as_deref().unwrap_or("unknown"),
+                &token,
+            )
+            .await?;
+    } else {
+        tracing::warn!(
+            did = %did,
+            "PLC operation token generated but mailer not configured; \
+             retrieve via Phase B operator path"
+        );
     }
 
-    // Parse response to extract token (last operation CID)
-    let audit_log: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| PdsError::Internal(format!("Failed to parse PLC response: {}", e)))?;
-
-    // Extract the last operation CID as token
-    let token = if let Some(operations) = audit_log.as_array() {
-        if let Some(last_op) = operations.last() {
-            if let Some(cid) = last_op.get("cid").and_then(|v| v.as_str()) {
-                cid.to_string()
-            } else {
-                return Err(PdsError::Internal("PLC audit log missing CID".to_string()));
-            }
-        } else {
-            // No previous operations, return empty token (genesis operation)
-            String::new()
-        }
-    } else {
-        return Err(PdsError::Internal(
-            "Invalid PLC audit log format".to_string(),
-        ));
-    };
-
-    Ok(Json(RequestPlcOperationSignatureResponse { token }))
+    // §6.3.6 step 4: 200 empty.
+    Ok(Json(serde_json::json!({})))
 }
 
 /// Build identity API routes
