@@ -8,6 +8,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Arc 13 — PLC operations correctness + completeness (v4.1)**
+  (#70). Aurora-Locus's PLC client moves to spec correctness:
+  chainlink #61's ten wire-shape bugs are fixed, key separation
+  lands (PDS-wide rotation key in config, per-actor atproto
+  signing key in plc_keys), the four handlers
+  (`requestPlcOperationSignature`, `signPlcOperation`,
+  `submitPlcOperation`, `getRecommendedDidCredentials`,
+  `updateHandle`) get semantic rewrites per §6.3.6 including a
+  two-phase email-token flow with CAS-style consume, recovery-key
+  support per §6.3.3, the PlcTombstone primitive per §6.3.5 with
+  a `dev.aurora.tombstoneDid` debug endpoint, and the silent
+  did:web fallback at account creation is removed per §6.3.7.
+  Schema migration 0009 drops the `plc_keys.rotation_key` /
+  `rotation_key_public` columns. Cross-arc handoff to Arc 12
+  (chainlink #68) preserved verbatim: Arc 12's
+  `entryway_auth_headers` reads `plc_keys.atproto_signing_key`
+  unchanged. Lib tests: 1019 pass (up from 1007 post-Arc-12).
+  Six mid-arc commits + a v4-body restoration package applied at
+  session start. Four documented divergences from locked design,
+  all noted as v0.6+ or paired-arc work: §6.3.6 Path B applied
+  for `TokenAlreadyConsumed` (proto-blue lexicon vendored;
+  non-declared XRPC error + HTTP 409); HTTP 401 vs 400 for
+  InvalidToken pending a dedicated PdsError variant;
+  #[cfg(test)] short-circuit in `generate_plc_did` so existing
+  account-creation tests don't require a running mock PLC;
+  Arc 12 Scenario 5b semantic re-interpretation per Step 6.
+  Substrate for future Arc 14+ work and v0.5 cycle close.
+
 - **Arc 12 — entryway architecture (v4.1)** (#68).
   Aurora-Locus gains entryway-attached deployment mode. When
   `PDS_ENTRYWAY_*` env vars are configured, four §5.3.8 handlers
