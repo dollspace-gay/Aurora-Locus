@@ -69,6 +69,13 @@ pub fn routes() -> Router<AppContext> {
             "/xrpc/dev.aurora.federation.simulateForward",
             post(fed_simulate_forward),
         )
+        // Arc 13 §6.3.5 — operator-driven tombstone primitive.
+        // Builds + signs + submits a plc_tombstone op against the
+        // PLC directory for the requested DID. Debug-build-only.
+        .route(
+            "/xrpc/dev.aurora.tombstoneDid",
+            post(tombstone_did),
+        )
 }
 
 /// Convert PdsError into an HTTP response. The dev surface is
@@ -676,4 +683,136 @@ fn host_from_url(url: &str) -> String {
         .next()
         .unwrap_or(no_scheme)
         .to_string()
+}
+
+// ============================================================
+// Arc 13 §6.3.5 — dev.aurora.tombstoneDid
+// Operator-driven PLC tombstone submission. Debug-build-only;
+// release builds 404 via the file-level #[cfg(debug_assertions)]
+// gate.
+// ============================================================
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TombstoneDidBody {
+    /// The DID to tombstone (terminal-state retire).
+    did: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TombstoneDidResponse {
+    did: String,
+    tombstone_cid: String,
+    /// CID of the prior accepted op that the tombstone's `prev`
+    /// field points at.
+    prev_cid: String,
+}
+
+/// §6.3.5 dev.aurora.tombstoneDid: fetch last op via get_last_op,
+/// build PlcTombstone with prior op's CID as `prev`, sign with
+/// PDS-wide rotation key, submit to PLC directory. Returns the
+/// tombstone's own CID + the prev CID it referenced.
+///
+/// Pre-conditions:
+/// - DID is did:plc:.
+/// - Last accepted op for the DID is not itself a tombstone
+///   (would be redundant; get_last_op returns DidTombstoned in
+///   that case and we surface 400).
+///
+/// Post-conditions:
+/// - The DID is terminal-state at the PLC directory; subsequent
+///   ops referencing the tombstone CID as `prev` will be
+///   rejected by the directory.
+async fn tombstone_did(
+    State(ctx): State<AppContext>,
+    Json(body): Json<TombstoneDidBody>,
+) -> Result<Json<TombstoneDidResponse>, (StatusCode, String)> {
+    use crate::crypto::plc::{compute_op_cid, register_plc_did, PlcOperation, PlcSigner, PlcTombstone};
+    use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
+
+    if !body.did.starts_with("did:plc:") {
+        return Err(http_error(PdsError::Validation(
+            "Only did:plc identifiers support PLC tombstone".to_string(),
+        )));
+    }
+
+    // Fetch last op (DidTombstoned → 400 via http_error pathway
+    // when the existing IntoResponse maps it).
+    let plc_client = PlcClient::new(PlcClientConfig {
+        plc_url: ctx.config.identity.did_plc_url.clone(),
+        ..Default::default()
+    })
+    .map_err(http_error)?;
+    let (last_op, last_cid) = plc_client.get_last_op(&body.did).await.map_err(http_error)?;
+    let _: &PlcOperation = &last_op; // ensure we got a regular op (tombstone case returned DidTombstoned)
+
+    // Build tombstone + sign with PDS-wide rotation key.
+    let unsigned = PlcTombstone::new(last_cid.clone());
+    let signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)
+        .map_err(http_error)?;
+    let signed = signer.sign_tombstone(unsigned).map_err(http_error)?;
+
+    // Submit. The PLC directory's tombstone-acceptance rules
+    // (signature against any rotation key from prior op; prev
+    // matches last op CID) are mock-side concerns per §6.4 Step
+    // 4.5; we just POST the signed tombstone.
+    //
+    // Compute tombstone CID for the response. The cid_for_lex
+    // helper takes a LexValue; we synthesize one via the same
+    // tombstone canonical-CBOR path.
+    let tombstone_cid_value = {
+        let lex = crate::crypto::plc::tombstone_to_canonical_lex_value(&signed);
+        let cid = proto_blue::lex_cbor::cid_for_lex(&lex)
+            .map_err(|e| http_error(PdsError::Internal(format!("CID computation failed: {}", e))))?;
+        cid.to_string()
+    };
+    let _ = compute_op_cid; // imported for parity with mint helpers
+
+    // Submit. register_plc_did expects PlcOperation; for tombstones
+    // we use the raw http client (the directory accepts any
+    // JSON-serializable signed op at POST /{did}).
+    let endpoint = format!(
+        "{}/{}",
+        ctx.config.identity.did_plc_url.trim_end_matches('/'),
+        body.did
+    );
+    let http = reqwest::Client::new();
+    let response = http
+        .post(&endpoint)
+        .json(&signed)
+        .send()
+        .await
+        .map_err(|e| {
+            http_error(PdsError::Internal(format!(
+                "PLC directory tombstone submission failed: {}",
+                e
+            )))
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        return Err(http_error(PdsError::Internal(format!(
+            "PLC directory rejected tombstone {}: {}",
+            status, body_text
+        ))));
+    }
+
+    // Invalidate cached DID document so subsequent resolves see
+    // the terminal state.
+    if let Err(e) = ctx.identity_resolver.invalidate_did(&body.did).await {
+        tracing::warn!(
+            did = %body.did,
+            error = %e,
+            "tombstone_did: invalidate_did failed (non-fatal)"
+        );
+    }
+
+    let _ = register_plc_did; // imported for parity
+
+    Ok(Json(TombstoneDidResponse {
+        did: body.did,
+        tombstone_cid: tombstone_cid_value,
+        prev_cid: last_cid,
+    }))
 }

@@ -83,6 +83,63 @@ pub struct ServiceEntry {
     pub endpoint: String,
 }
 
+/// Arc 13 §6.3.5 — PLC tombstone op shape. Terminal-state op that
+/// retires a DID. Carries only `type` ("plc_tombstone"), `prev`
+/// (CID of the last accepted op), and `sig` (base64url ECDSA over
+/// canonical CBOR of the unsigned tombstone).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcTombstone {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub prev: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+}
+
+impl PlcTombstone {
+    /// Construct an unsigned tombstone targeting `prev_cid` (the
+    /// CID of the last accepted op for the DID being tombstoned).
+    pub fn new(prev_cid: String) -> Self {
+        Self {
+            type_: "plc_tombstone".to_string(),
+            prev: prev_cid,
+            sig: None,
+        }
+    }
+}
+
+/// §6.3.5 canonical-CBOR converter for tombstones — Case II
+/// equivalent of [`op_to_canonical_lex_value`]. Omits `sig` when
+/// `None`.
+pub fn tombstone_to_canonical_lex_value(op: &PlcTombstone) -> LexValue {
+    let mut m = BTreeMap::<String, LexValue>::new();
+    m.insert("type".to_string(), LexValue::String(op.type_.clone()));
+    m.insert("prev".to_string(), LexValue::String(op.prev.clone()));
+    if let Some(sig) = &op.sig {
+        m.insert("sig".to_string(), LexValue::String(sig.clone()));
+    }
+    LexValue::Map(m)
+}
+
+impl PlcSigner {
+    /// §6.3.5 — sign a tombstone. Same flow as [`Self::sign_operation`]:
+    /// clear sig → canonical CBOR → SHA-256+ECDSA → base64url-no-pad.
+    pub fn sign_tombstone(&self, mut op: PlcTombstone) -> PdsResult<PlcTombstone> {
+        op.sig = None;
+        let lex = tombstone_to_canonical_lex_value(&op);
+        let cbor_bytes = lex_encode(&lex).map_err(|e| {
+            PdsError::Internal(format!("DAG-CBOR encode failed during tombstone sign: {}", e))
+        })?;
+        let signature: Signature = self.keypair.signing_key().sign(&cbor_bytes);
+        // PLC spec: raw r||s 64-byte form, base64url-no-pad
+        // (matches [`Self::sign_operation`]; do NOT DER-encode).
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+        op.sig = Some(sig_b64);
+        Ok(op)
+    }
+}
+
 /// Builder for [`PlcOperation`]. No `did` setter (the new spec
 /// disallows a `did` field on the op itself). All four collection
 /// fields default to empty; the builder caller is responsible for
@@ -300,6 +357,27 @@ impl PlcSigner {
     /// Verifying key (public).
     pub fn verifying_key(&self) -> k256::ecdsa::VerifyingKey {
         self.keypair.verifying_key()
+    }
+
+    /// Arc 13 §6.4 Step 4.6 + round-4 F1 closure — raw ECDSA
+    /// primitive accessor for the synthetic pre-Arc-13 test
+    /// utility at `tests/support/pre_arc13_signing.rs`.
+    ///
+    /// The "test utility MUST NOT share code" prohibition (per
+    /// §6.4 Step 4.6) applies to op-construction, serialization,
+    /// canonicalization, and signature-encoding code — the four
+    /// layers the wire-shape deviations target. **Below those
+    /// layers, the raw ECDSA primitive is the same whether test
+    /// or production calls it; reusing it preserves test-utility
+    /// independence at the layer that matters.**
+    ///
+    /// `sign_raw` signs arbitrary bytes (k256 hashes them via
+    /// SHA-256 internally per its Signer trait). Returns the
+    /// raw 64-byte r||s form. Callers (the pre-Arc-13 utility)
+    /// own all encoding/canonicalization decisions on either
+    /// side of this call.
+    pub fn sign_raw(&self, msg: &[u8]) -> Signature {
+        self.keypair.signing_key().sign(msg)
     }
 }
 

@@ -754,6 +754,50 @@ impl AccountManager {
         use rand::RngCore;
         use std::collections::BTreeMap;
 
+        // §6.3.7 + §6.6.6 — hard-fail on PLC registration failure.
+        // In #[cfg(test)] builds we short-circuit the actual PLC
+        // HTTP call so unit tests that need accounts (~22 tests
+        // pre-Step-5 relied on the silent did:web fallback) don't
+        // require a running mock PLC directory. The hard-fail
+        // behavior itself is verified by Phase B Scenario 6
+        // (§6.8.2) which is operator-driven.
+        #[cfg(test)]
+        let test_short_circuit_did_plc_url = {
+            // If the test fixture points at the prod PLC URL,
+            // synthesize a fake DID + signing key. Real PLC tests
+            // (Scenario 6) point at an unreachable URL and assert
+            // the hard-fail error explicitly via the production
+            // path (no #[cfg(test)] short-circuit applies).
+            //
+            // Treat https://plc.directory and 127.0.0.1:0 as
+            // "synthesize" markers; any other URL goes through
+            // the real path.
+            let url = self.config.identity.did_plc_url.as_str();
+            url == "https://plc.directory" || url.contains("127.0.0.1:0")
+        };
+        #[cfg(test)]
+        if test_short_circuit_did_plc_url {
+            let mut atproto_private_key = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut atproto_private_key);
+            let atproto_signing_key_hex = hex::encode(atproto_private_key);
+            let atproto_signer = PlcSigner::new(&atproto_private_key)?;
+            let atproto_public_key_hex = atproto_signer.public_key_hex();
+            // Synthesize a stable-shape DID for test fixtures.
+            let synthetic_suffix: String = atproto_public_key_hex
+                .chars()
+                .take(24)
+                .collect();
+            let did = format!("did:plc:{}", synthetic_suffix);
+            let _ = recovery_key;
+            let _ = handle;
+            return Ok((
+                did,
+                atproto_signing_key_hex,
+                atproto_public_key_hex,
+                String::new(),
+            ));
+        }
+
         // §6.3.2 key separation: the PDS-wide rotation key signs
         // every account's genesis op (and every later update op).
         // It comes from `config.authentication.plc_rotation_key`
@@ -884,20 +928,28 @@ impl AccountManager {
                 ))
             }
             Err(e) => {
-                // NOTE: §6.3.7 / Step 5 will hard-fail here
-                // (remove silent did:web fallback) per Arc 13
-                // design.
-                tracing::warn!(
-                    "Failed to register DID with PLC directory: {}. Falling back to did:web",
-                    e
+                // §6.3.7 / §6.4 Step 5 — hard-fail. Silent
+                // did:web fallback removed. PLC directory
+                // unreachable → no account creation succeeds.
+                //
+                // Partial-state cleanup: generate_plc_did is
+                // called BEFORE create_account opens its
+                // transaction (line 88-89 of create_account),
+                // so no DB rows have been inserted at this
+                // point. The early return from create_account
+                // leaves no partial actor state to clean up.
+                // The PDS-wide rotation key is unaffected (it's
+                // config-resident, not allocated here). The
+                // per-actor atproto_signing_key generated above
+                // is in stack memory only; dropped when the
+                // function returns.
+                tracing::error!(
+                    did = %did,
+                    handle = %full_handle,
+                    error = %e,
+                    "PLC directory registration failed; hard-failing account creation per §6.3.7"
                 );
-                let did_web = format!("did:web:{}", full_handle);
-                Ok((
-                    did_web,
-                    atproto_signing_key_hex,
-                    atproto_public_key_hex,
-                    "".to_string(),
-                ))
+                Err(e)
             }
         }
     }

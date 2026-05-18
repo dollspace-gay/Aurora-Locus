@@ -48,6 +48,52 @@ Node.js script (~150-250 LoC). The script lives in the operator's
 Phase B working tree, not the Aurora-Locus repo — Phase B environment
 state is per-operator.
 
+### Signature-verification mode (Arc 13 §6.4 Step 4.5)
+
+**Mode (b) — strict, required for Arc 13 Phase B**: the mock
+performs full canonical-CBOR signature verification per the PLC
+spec. Specifically:
+
+- Decode the submitted op JSON.
+- Reconstruct the unsigned form (clear `sig`).
+- Encode to canonical DAG-CBOR (RFC 8949 strict mode: integers
+  smallest-form, map keys sorted by byte-length then
+  lexicographically).
+- For genesis ops: verify the `sig` (base64url-decoded raw r||s
+  64-byte ECDSA signature) against any rotation key declared in
+  the op itself.
+- For update ops: verify against any rotation key from the prior
+  accepted op.
+- Reject wrongly-signed ops with HTTP 400
+  `{"error": "InvalidSignature"}`.
+
+A "weak" mode (a) that skips signature verification or accepts
+JSON-canonical-signed pre-Arc-13 ops MUST NOT be used for Arc 13
+Phase B — the negative-path test in Scenario 1 (§6.8.2)
+synthesizes a pre-Arc-13-style op and expects the mock to reject
+it. A weak-mode mock would silently accept the bad op and the
+test would falsely pass.
+
+Operators implementing a fresh mock for Arc 13 land in mode (b)
+by definition. Operators reusing an Arc 12 / pre-Arc-13 mock
+should audit the script to confirm mode (b) and upgrade if
+necessary.
+
+### Tombstone-op contract (Arc 13 §6.4 Step 4.5)
+
+The mock must accept `plc_tombstone` ops in addition to
+`plc_operation`:
+
+- Op shape: `{type: "plc_tombstone", prev: <cid>, sig: <base64url>}`.
+- Sig verification: same as update ops (any rotation key from
+  the prior accepted op).
+- `prev` chaining: same as update ops.
+- **Terminal-state semantics**: after a tombstone is accepted,
+  the mock rejects any subsequent op (regular or tombstone)
+  referencing the tombstone's CID as `prev`. Suggested
+  rejection: HTTP 400 `{"error": "InvalidPrev"}` (matches the
+  `prev`-chain error code).
+
 Reference contract checklist (verify against the mock before running
 Scenarios 3, 5b, or any other PLC-touching scenario):
 
@@ -55,12 +101,15 @@ Scenarios 3, 5b, or any other PLC-touching scenario):
 |------------------------|-------------------------------------------------|
 | genesis-op accept      | Sig verifies against any rotation key in op     |
 | update-op accept       | Sig verifies against prior op's rotation keys   |
+| tombstone-op accept    | Sig verifies (same as update); `prev` matches   |
+| post-tombstone reject  | Subsequent ops referencing tombstone CID rejected |
 | `prev` chain           | `prev` must equal current head CID              |
 | append-only            | Rejected ops do not mutate log                  |
 | malformed JSON         | 400 `{"error":"InvalidRequest", ...}`           |
 | update-before-genesis  | 400 `{"error":"DidNotFound"}`                   |
 | missing required field | 400 `{"error":"InvalidRequest", ...}`           |
 | duplicate-op submit    | 400 `{"error":"InvalidPrev"}`                   |
+| pre-Arc-13-shape op    | 400 `{"error":"InvalidSignature"}` (mode b)     |
 
 ## PDS A and PDS B startup
 

@@ -302,6 +302,48 @@ nm target/release/aurora-locus 2>/dev/null | grep dev_routes
 # Expect: no output (zero symbols)
 ```
 
+## Arc 13 §6.3.5 — `dev.aurora.tombstoneDid`
+
+Operator-driven PLC tombstone primitive. Builds + signs +
+submits a `plc_tombstone` op against the configured PLC directory
+for the requested DID. Terminal: after a tombstone is accepted by
+the directory, subsequent ops referencing the tombstone's CID as
+`prev` are rejected (per the PLC spec's terminal-state
+semantics).
+
+**Pre-conditions**: DID is `did:plc:`; the directory's audit log
+for the DID is not already tombstone-terminal (else `get_last_op`
+returns `DidTombstoned` and the call surfaces HTTP 400).
+
+**Side effects**: cached DID document for the target DID is
+invalidated locally on success so subsequent resolves see
+terminal state.
+
+```bash
+curl -s -X POST http://localhost:2583/xrpc/dev.aurora.tombstoneDid \
+  -H 'Content-Type: application/json' \
+  -d '{"did":"did:plc:example1234567890abcdef"}' \
+  | jq
+```
+
+Response:
+
+```json
+{
+  "did": "did:plc:example1234567890abcdef",
+  "tombstoneCid": "bafyrei...",
+  "prevCid": "bafyrei..."
+}
+```
+
+`prevCid` is the CID of the last accepted op the tombstone's
+`prev` references; `tombstoneCid` is the CID of the tombstone
+itself (the new terminal entry in the directory's log).
+
+Per `V05_DESIGN.md §6.3.5`, this endpoint is the only operator
+path to tombstoning. Account deletion does NOT auto-tombstone
+(matches bsky-PDS behavior per recon §3.2).
+
 ## Out of scope
 
 The following endpoints were considered but explicitly excluded
