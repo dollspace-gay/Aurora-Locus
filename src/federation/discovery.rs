@@ -141,7 +141,11 @@ impl PdsDiscovery {
 
     /// Discover PDS via well-known endpoint
     pub async fn discover_via_wellknown(&self, domain: &str) -> PdsResult<PdsInstance> {
-        let url = format!("https://{}/.well-known/atproto-did", domain);
+        // Arc 12 §5.3.2 Gap 1: localhost-aware scheme for
+        // remote peer URLs so two-instance Phase B against
+        // localhost:2584 doesn't try https://.
+        let scheme = crate::config::derive_url_scheme(domain);
+        let url = format!("{}://{}/.well-known/atproto-did", scheme, domain);
 
         debug!("Discovering PDS via well-known: {}", url);
 
@@ -158,7 +162,7 @@ impl PdsDiscovery {
             .map_err(|e| PdsError::Internal(format!("Failed to read response: {}", e)))?;
 
         // Fetch PDS info
-        let pds_url = format!("https://{}", domain);
+        let pds_url = format!("{}://{}", scheme, domain);
         self.fetch_pds_info(&pds_url, &did).await
     }
 

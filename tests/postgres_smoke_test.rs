@@ -350,6 +350,7 @@ async fn account_manager_round_trip_on_postgres() {
             service_did: "did:web:localhost".to_string(),
             version: "0.1.0-test".to_string(),
             blob_upload_limit: 5_242_880,
+                public_url: None,
         },
         storage: StorageConfig {
             data_directory: PathBuf::from("./data"),
@@ -404,11 +405,13 @@ async fn account_manager_round_trip_on_postgres() {
             crawl_enabled: false,
             public_url: None,
             auto_stream_events: false,
+                peer_pds: vec![],
         },
         validation_mode: ValidationMode::Optimistic,
         distributed_state_mode: Default::default(),
         maintenance_pool: Default::default(),
         gc_sweep: Default::default(),
+        entryway: None,
     });
 
     let mgr = AccountManager::new(pool, config);

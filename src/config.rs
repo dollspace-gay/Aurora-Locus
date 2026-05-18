@@ -46,6 +46,16 @@ pub struct ServerConfig {
     /// ([`crate::blob_store::gc::run_sweep`]) is the consumer.
     #[serde(default)]
     pub gc_sweep: GcSweepConfig,
+    /// Entryway-mode configuration per Arc 12 §5.3.9 + §5.4 Step 1.1.
+    /// `None` = standalone mode. `Some` = forwarded handlers proxy
+    /// to the entryway and OAuth metadata advertises the entryway
+    /// as the authorization server. Populated from
+    /// `PDS_ENTRYWAY_*` env vars (all-or-nothing per §5.4 Step 1.2).
+    /// Marked `#[serde(skip)]` because the parsed `VerifyingKey`
+    /// is not round-trippable through standard serde derives —
+    /// env-var loading is the sole construction path.
+    #[serde(skip)]
+    pub entryway: Option<EntrywayConfig>,
 }
 
 /// Distributed-state substrate selector (Arc 7, V04_DESIGN.md
@@ -526,6 +536,61 @@ pub struct ServiceConfig {
     pub service_did: String,
     pub version: String,
     pub blob_upload_limit: usize,
+    /// Externally-reachable public URL. Arc 12 §5.3.2 Gap 1
+    /// closure: when set (typically via `PDS_SERVICE_PUBLIC_URL`),
+    /// every site that needs the self-PDS public URL reads
+    /// this. When unset, the URL is derived from
+    /// `derive_url_scheme(hostname)` + hostname + port —
+    /// preserving v0.4 backward compatibility for deployments
+    /// that don't set the env var. `https` is the default for
+    /// non-localhost hostnames; `http` for localhost / 127.x.x.x
+    /// / 0.0.0.0.
+    #[serde(default)]
+    pub public_url: Option<String>,
+}
+
+impl ServiceConfig {
+    /// Effective public URL per Arc 12 §5.3.2 Gap 1.
+    ///
+    /// Returns `self.public_url` when set; otherwise derives
+    /// `{scheme}://{hostname}[:{port}]` with scheme picked by
+    /// `derive_url_scheme(hostname)`. Standard ports (80 for
+    /// http, 443 for https) are omitted from the derived form.
+    #[must_use]
+    pub fn effective_public_url(&self) -> String {
+        if let Some(url) = &self.public_url {
+            return url.clone();
+        }
+        let scheme = derive_url_scheme(&self.hostname);
+        let port_is_standard = (scheme == "http" && self.port == 80)
+            || (scheme == "https" && self.port == 443);
+        if port_is_standard {
+            format!("{}://{}", scheme, self.hostname)
+        } else {
+            format!("{}://{}:{}", scheme, self.hostname, self.port)
+        }
+    }
+}
+
+/// Pick `http` for localhost-shaped hosts; `https` otherwise.
+///
+/// Arc 12 §5.3.2 Gap 1 helper. Used by `ServiceConfig::effective_public_url`
+/// for self-URL derivation, and by remote-PDS-URL formatters
+/// (`src/federation/discovery.rs`, `src/identity/resolver.rs`)
+/// for peer-URL scheme selection.
+#[must_use]
+pub fn derive_url_scheme(host: &str) -> &'static str {
+    // `host` may be hostname-only or hostname:port; strip the port
+    // before classifying.
+    let host_only = host.split(':').next().unwrap_or(host);
+    if host_only == "localhost"
+        || host_only == "0.0.0.0"
+        || host_only.starts_with("127.")
+    {
+        "http"
+    } else {
+        "https"
+    }
 }
 
 /// Storage configuration
@@ -874,6 +939,223 @@ pub struct FederationConfig {
     pub public_url: Option<String>,
     /// Enable automatic event streaming to relay
     pub auto_stream_events: bool,
+    /// Trusted peer PDS list (Arc 12 §5.3.2 Gap 2 + §5.3.7
+    /// env-var parser). Populated from
+    /// `PDS_FEDERATION_PEER_PDS=did1@url1,did2@url2,...` at
+    /// startup; consumed by Arc 12 §5.3.3.1 trusted-iss
+    /// allowlist and Arc 12 §5.3.2 Gap 3 `PdsDiscovery`
+    /// bootstrap. Empty Vec when env var unset.
+    #[serde(default)]
+    pub peer_pds: Vec<PeerPdsConfig>,
+}
+
+/// Trusted peer-PDS entry parsed from
+/// `PDS_FEDERATION_PEER_PDS`. Format per Arc 12 §5.3.7:
+/// `did@url`. Malformed entries reject at startup per
+/// §5.4 Step 1.2 all-or-nothing discipline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerPdsConfig {
+    pub did: String,
+    pub url: String,
+}
+
+impl PeerPdsConfig {
+    /// Parse a single `did@url` entry. Returns `Err` with a
+    /// descriptive message naming the offending input on
+    /// any of: missing `@`, empty did, empty url, non-DID
+    /// `did` (no `did:` prefix), non-URL `url` (no `http://`
+    /// or `https://` prefix).
+    pub fn parse_entry(entry: &str) -> PdsResult<Self> {
+        let (did, url) = entry.split_once('@').ok_or_else(|| {
+            PdsError::Validation(format!(
+                "PDS_FEDERATION_PEER_PDS entry missing '@' separator: {:?}",
+                entry
+            ))
+        })?;
+        let did = did.trim();
+        let url = url.trim();
+        if did.is_empty() {
+            return Err(PdsError::Validation(format!(
+                "PDS_FEDERATION_PEER_PDS entry has empty did: {:?}",
+                entry
+            )));
+        }
+        if url.is_empty() {
+            return Err(PdsError::Validation(format!(
+                "PDS_FEDERATION_PEER_PDS entry has empty url: {:?}",
+                entry
+            )));
+        }
+        if !did.starts_with("did:") {
+            return Err(PdsError::Validation(format!(
+                "PDS_FEDERATION_PEER_PDS entry did missing 'did:' prefix: {:?}",
+                entry
+            )));
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(PdsError::Validation(format!(
+                "PDS_FEDERATION_PEER_PDS entry url must start with http:// or https://: {:?}",
+                entry
+            )));
+        }
+        Ok(PeerPdsConfig {
+            did: did.to_string(),
+            url: url.to_string(),
+        })
+    }
+
+    /// Parse a comma-separated list per Arc 12 §5.3.7
+    /// (`did1@url1,did2@url2,...`). Empty input → empty Vec.
+    /// Any malformed entry → Err with the offending entry
+    /// named.
+    pub fn parse_list(raw: &str) -> PdsResult<Vec<Self>> {
+        if raw.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Self::parse_entry)
+            .collect()
+    }
+}
+
+/// Entryway-mode configuration (Arc 12 §5.3.9 + §5.4 Step 1.1).
+///
+/// When `Some`, Aurora-Locus runs in entryway-attached mode:
+/// forwarded handlers proxy to the entryway, the OAuth
+/// protected-resource metadata advertises the entryway as the
+/// authorization server, and the §5.3.3 routing's "ES256K + known
+/// entryway kid" row is enabled. When `None`, Aurora-Locus runs
+/// in standalone mode (default).
+///
+/// All four `PDS_ENTRYWAY_*` env vars are required together
+/// (all-or-nothing per §5.4 Step 1.2). Partial config (any subset)
+/// is rejected at startup with a clear error naming the missing
+/// variable(s).
+///
+/// The `jwt_public_key` field holds the entryway's ES256K JWT-signing
+/// public key as a parsed `k256::ecdsa::VerifyingKey`, decoded once
+/// at env-load time from `PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX`. The
+/// hex form (33 bytes SEC1-compressed, 66 hex chars) is the wire
+/// format Aurora-Locus shares with the entryway operator.
+#[derive(Debug, Clone)]
+pub struct EntrywayConfig {
+    /// Base URL of the entryway (e.g., `https://entryway.example.com`).
+    /// Populated from `PDS_ENTRYWAY_URL`.
+    pub url: String,
+    /// Admin Basic-auth token, pre-bound on `entryway_admin_client`
+    /// per §5.3.9. Populated from `PDS_ENTRYWAY_ADMIN_TOKEN`.
+    pub admin_token: String,
+    /// Entryway's ES256K JWT-signing public key, parsed at startup
+    /// from `PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX`. Consumed by
+    /// `validate_external_access_token` (§5.3.3) when the routing
+    /// table's "ES256K + known entryway kid" row fires.
+    pub jwt_public_key: k256::ecdsa::VerifyingKey,
+    /// Entryway DID. Populated from `PDS_ENTRYWAY_DID`. Joins the
+    /// trusted-iss allowlist (§5.3.3.1) and becomes an accepted
+    /// audience for `require_auth_forwarded` (§5.3.4) routes.
+    pub did: String,
+}
+
+impl EntrywayConfig {
+    /// Parse from env-var values. Implements the all-or-nothing
+    /// rule per §5.4 Step 1.2:
+    ///
+    /// - All four `Some` → returns `Ok(Some(EntrywayConfig{..}))`
+    ///   if every value validates; rejection otherwise names the
+    ///   offending input.
+    /// - All four `None` → returns `Ok(None)` (standalone mode).
+    /// - Any other subset → returns `Err(PdsError::Validation(..))`
+    ///   identifying which variable(s) are missing.
+    ///
+    /// Each input is the env-var value (`env::var(..).ok()`).
+    pub fn from_env_values(
+        url: Option<String>,
+        admin_token: Option<String>,
+        jwt_public_key_hex: Option<String>,
+        did: Option<String>,
+    ) -> PdsResult<Option<Self>> {
+        let any_set = url.is_some()
+            || admin_token.is_some()
+            || jwt_public_key_hex.is_some()
+            || did.is_some();
+        if !any_set {
+            return Ok(None);
+        }
+
+        let mut missing: Vec<&'static str> = Vec::new();
+        if url.is_none() {
+            missing.push("PDS_ENTRYWAY_URL");
+        }
+        if admin_token.is_none() {
+            missing.push("PDS_ENTRYWAY_ADMIN_TOKEN");
+        }
+        if jwt_public_key_hex.is_none() {
+            missing.push("PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX");
+        }
+        if did.is_none() {
+            missing.push("PDS_ENTRYWAY_DID");
+        }
+        if !missing.is_empty() {
+            return Err(PdsError::Validation(format!(
+                "EntrywayConfig is partially specified \
+                 (PDS_ENTRYWAY_* are all-or-nothing per §5.4 Step 1.2); \
+                 missing: {}",
+                missing.join(", ")
+            )));
+        }
+
+        let url = url.expect("checked Some above");
+        let admin_token = admin_token.expect("checked Some above");
+        let jwt_public_key_hex = jwt_public_key_hex.expect("checked Some above");
+        let did = did.expect("checked Some above");
+
+        if url.is_empty() {
+            return Err(PdsError::Validation(
+                "PDS_ENTRYWAY_URL must not be empty".to_string(),
+            ));
+        }
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(PdsError::Validation(format!(
+                "PDS_ENTRYWAY_URL must start with http:// or https:// — got {:?}",
+                url
+            )));
+        }
+        if admin_token.is_empty() {
+            return Err(PdsError::Validation(
+                "PDS_ENTRYWAY_ADMIN_TOKEN must not be empty".to_string(),
+            ));
+        }
+        if !did.starts_with("did:") {
+            return Err(PdsError::Validation(format!(
+                "PDS_ENTRYWAY_DID must be a DID (start with 'did:') — got {:?}",
+                did
+            )));
+        }
+
+        let key_bytes = hex::decode(&jwt_public_key_hex).map_err(|e| {
+            PdsError::Validation(format!(
+                "PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX is not valid hex: {}",
+                e
+            ))
+        })?;
+        let jwt_public_key =
+            k256::ecdsa::VerifyingKey::from_sec1_bytes(&key_bytes).map_err(|e| {
+                PdsError::Validation(format!(
+                    "PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX is not a valid \
+                     SEC1-encoded k256 public key: {}",
+                    e
+                ))
+            })?;
+
+        Ok(Some(EntrywayConfig {
+            url,
+            admin_token,
+            jwt_public_key,
+            did,
+        }))
+    }
 }
 
 impl ServerConfig {
@@ -932,11 +1214,25 @@ impl ServerConfig {
         let plc_rotation_key = env::var("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX")
             .map_err(|_| PdsError::Validation("PLC rotation key required".to_string()))?;
 
-        // OAuth configuration for admin login
-        let oauth_client_id = env::var("PDS_OAUTH_CLIENT_ID")
-            .unwrap_or_else(|_| format!("https://{}/oauth/client-metadata.json", hostname));
-        let oauth_redirect_uri = env::var("PDS_OAUTH_REDIRECT_URI")
-            .unwrap_or_else(|_| format!("https://{}/admin-oauth/callback", hostname));
+        // OAuth configuration for admin login.
+        // Arc 12 §5.3.2 Gap 1: classified (C) in recon but promoted
+        // to (M) — these defaults baked hostname directly without
+        // routing through service_url(). Use derive_url_scheme()
+        // for localhost-aware scheme so localhost deployments
+        // don't default to https.
+        let oauth_default_scheme = derive_url_scheme(&hostname);
+        let oauth_client_id = env::var("PDS_OAUTH_CLIENT_ID").unwrap_or_else(|_| {
+            format!(
+                "{}://{}/oauth/client-metadata.json",
+                oauth_default_scheme, hostname
+            )
+        });
+        let oauth_redirect_uri = env::var("PDS_OAUTH_REDIRECT_URI").unwrap_or_else(|_| {
+            format!(
+                "{}://{}/admin-oauth/callback",
+                oauth_default_scheme, hostname
+            )
+        });
         let oauth_pds_url =
             env::var("PDS_OAUTH_PDS_URL").unwrap_or_else(|_| "https://bsky.social".to_string());
 
@@ -1029,6 +1325,13 @@ impl ServerConfig {
             .parse()
             .unwrap_or(false);
 
+        // Arc 12 §5.3.2 Gap 2 + §5.3.7: peer-PDS env-var parser
+        // with all-or-nothing validation per §5.4 Step 1.2.
+        let peer_pds = match env::var("PDS_FEDERATION_PEER_PDS") {
+            Ok(raw) => PeerPdsConfig::parse_list(&raw)?,
+            Err(_) => Vec::new(),
+        };
+
         let database = DatabaseConfig::from_env_values(
             env::var("PDS_DB_BACKEND").ok(),
             env::var("PDS_DB_URL").ok(),
@@ -1060,6 +1363,21 @@ impl ServerConfig {
             env::var("PDS_GC_SWEEP_PAGE_SIZE").ok(),
         )?;
 
+        // Arc 12 §5.3.2 Gap 1: public_url override via env var.
+        // Renamed locally to avoid shadowing federation's
+        // existing `public_url` binding (different env var,
+        // different field, same name).
+        let service_public_url = env::var("PDS_SERVICE_PUBLIC_URL").ok();
+
+        // Arc 12 §5.4 Step 1.1 + 1.2: EntrywayConfig from
+        // `PDS_ENTRYWAY_*` env vars, all-or-nothing.
+        let entryway = EntrywayConfig::from_env_values(
+            env::var("PDS_ENTRYWAY_URL").ok(),
+            env::var("PDS_ENTRYWAY_ADMIN_TOKEN").ok(),
+            env::var("PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX").ok(),
+            env::var("PDS_ENTRYWAY_DID").ok(),
+        )?;
+
         Ok(ServerConfig {
             service: ServiceConfig {
                 hostname,
@@ -1067,6 +1385,7 @@ impl ServerConfig {
                 service_did,
                 version,
                 blob_upload_limit,
+                public_url: service_public_url,
             },
             storage: StorageConfig {
                 data_directory,
@@ -1116,11 +1435,13 @@ impl ServerConfig {
                 crawl_enabled,
                 public_url,
                 auto_stream_events,
+                peer_pds,
             },
             validation_mode,
             distributed_state_mode,
             maintenance_pool,
             gc_sweep,
+            entryway,
         })
     }
 

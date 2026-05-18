@@ -257,7 +257,8 @@ where
         user_did.to_string(),
         Arc::clone(&ctx.account_manager),
         Arc::clone(&ctx.actor_store),
-        format!("https://{}", ctx.config.service.hostname),
+        // Arc 12 §5.3.2 Gap 1: localhost-aware self-URL.
+        ctx.service_url(),
         ctx.config.federation.appview_url.clone(),
     );
 

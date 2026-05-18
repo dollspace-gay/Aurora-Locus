@@ -121,6 +121,29 @@ pub struct AppContext {
     /// every consumer but only `describe_capabilities` reads
     /// it once Step 3 lands. See [`crate::api::registry`].
     pub route_registry: Arc<crate::api::registry::RouteRegistry>,
+    /// Arc 12 §5.3.3.1 trusted-iss allowlist for the
+    /// service-auth fallback path. Constructed at
+    /// `AppContext::new` from `[ctx.service_did(),
+    /// ctx.entryway_did()?, config.federation.peer_pds[*].did,
+    /// local_service_dids]` and **immutable for the process
+    /// lifetime** per §5.5.7 restart-requirement. Constant-
+    /// time membership lookup via `AppContext::is_trusted_iss`.
+    /// Iss values failing the membership check reject at
+    /// routing without PLC fetch per §5.3.3.1 boundary-case
+    /// rejection (also rejects empty / non-DID / missing iss).
+    pub trusted_iss: Arc<std::collections::HashSet<String>>,
+    /// Arc 12 §5.3.9 + §5.4 Step 1.4 — forwarded-handler entryway
+    /// HTTP client. `Some` when `config.entryway` is set; `None`
+    /// in standalone mode. Used by §5.3.8 forwarded handlers
+    /// (`signPlcOperation`, `updateHandle`, `getSession`,
+    /// `requestPasswordReset`) to forward XRPC calls to the
+    /// entryway.
+    pub entryway_client: Option<Arc<crate::federation::EntrywayClient>>,
+    /// Arc 12 §5.3.9 — admin-tier entryway client with the
+    /// `Basic` auth header pre-bound from
+    /// `config.entryway.admin_token`. `Some`/`None` symmetrically
+    /// with `entryway_client`.
+    pub entryway_admin_client: Option<Arc<crate::federation::EntrywayAdminClient>>,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -449,6 +472,31 @@ impl AppContext {
             // PDS discovery for finding other instances
             let discovery = Arc::new(PdsDiscovery::new(config.federation.relay_urls.clone()));
 
+            // Arc 12 §5.3.2 Gap 3: at-startup bootstrap of
+            // peer-PDS map from `config.federation.peer_pds`.
+            // The map is populated once here; runtime mutation
+            // surfaces (`refresh_instances`, ops endpoints)
+            // continue to layer on top. Per §5.5.1, two-instance
+            // Phase B doesn't require runtime cross-instance
+            // routing — config-bootstrap suffices for v0.5.
+            for peer in &config.federation.peer_pds {
+                let instance = crate::federation::discovery::PdsInstance {
+                    did: peer.did.clone(),
+                    url: peer.url.clone(),
+                    name: None,
+                    open_registrations: false,
+                    user_count: None,
+                    last_seen: None,
+                    features: Vec::new(),
+                };
+                discovery.add_instance(instance).await;
+                tracing::info!(
+                    did = %peer.did,
+                    url = %peer.url,
+                    "Arc 12 §5.3.2 Gap 3: registered peer-PDS at startup"
+                );
+            }
+
             (Some(auth), Some(discovery))
         } else {
             (None, None)
@@ -667,6 +715,64 @@ impl AppContext {
         // fixtures' empty-registry paths also flow through this
         // arg.
 
+        // Arc 12 §5.3.3.1 trusted-iss allowlist — built once at
+        // construction time and frozen for the process lifetime
+        // (§5.5.7 restart-requirement). Pre-Step-1, the entryway
+        // DID slot is absent; Step 1.1 lands EntrywayConfig and
+        // a follow-up amendment extends this construction.
+        // local_service_dids is a forward-compatibility slot for
+        // admin-tier service identities from src/service_auth.rs
+        // flows — currently empty; future cycles may populate.
+        let mut trusted_iss_set = std::collections::HashSet::new();
+        trusted_iss_set.insert(config.service.service_did.clone());
+        for peer in &config.federation.peer_pds {
+            trusted_iss_set.insert(peer.did.clone());
+        }
+        // Arc 12 §5.4 Step 1.1: seed the entryway DID once
+        // EntrywayConfig is set. The set remains immutable for the
+        // process lifetime per §5.5.7 — toggling entryway mode
+        // requires a restart.
+        if let Some(entryway) = &config.entryway {
+            trusted_iss_set.insert(entryway.did.clone());
+        }
+        let trusted_iss = Arc::new(trusted_iss_set);
+
+        // Arc 12 §5.4 Step 1.4: entryway HTTP clients. Constructed
+        // once at startup when entryway mode is configured;
+        // `None`/`None` in standalone mode. The clients are
+        // dispatch-only wrappers in Step 1; method surfaces for
+        // mint-pattern forwarding (`entryway_auth_headers`) and
+        // passthru forwarding (`entryway_passthru_headers`) land in
+        // Step 2, and per-handler dispatch lands in Step 3.
+        let (entryway_client, entryway_admin_client) = match &config.entryway {
+            Some(entryway_cfg) => {
+                let client = crate::federation::EntrywayClient::new(entryway_cfg.url.clone())
+                    .map_err(|e| {
+                        PdsError::Internal(format!(
+                            "Failed to build entryway forwarded-handler HTTP client: {}",
+                            e
+                        ))
+                    })?;
+                let admin_client = crate::federation::EntrywayAdminClient::new(
+                    entryway_cfg.url.clone(),
+                    &entryway_cfg.admin_token,
+                )
+                .map_err(|e| {
+                    PdsError::Internal(format!(
+                        "Failed to build entryway admin HTTP client: {}",
+                        e
+                    ))
+                })?;
+                tracing::info!(
+                    entryway_url = %entryway_cfg.url,
+                    entryway_did = %entryway_cfg.did,
+                    "Arc 12 §5.3.9: constructed entryway clients (forwarded + admin)"
+                );
+                (Some(Arc::new(client)), Some(Arc::new(admin_client)))
+            }
+            None => (None, None),
+        };
+
         Ok(Self {
             config: Arc::new(config),
             account_db,
@@ -698,7 +804,22 @@ impl AppContext {
             maintenance_pool,
             distributed_store,
             route_registry,
+            trusted_iss,
+            entryway_client,
+            entryway_admin_client,
         })
+    }
+
+    /// Arc 12 §5.3.3.1: constant-time membership check for the
+    /// trusted-iss allowlist. Empty / non-DID / missing iss
+    /// uniformly rejects (the HashSet stores fully-qualified
+    /// DIDs; shape-invalid values can't be members). Caller
+    /// MUST reject without PLC fetch when this returns `false`.
+    pub fn is_trusted_iss(&self, iss: &str) -> bool {
+        if iss.is_empty() || !iss.starts_with("did:") {
+            return false;
+        }
+        self.trusted_iss.contains(iss)
     }
 
     /// Ensure required directories exist
@@ -729,17 +850,52 @@ impl AppContext {
         Ok(())
     }
 
-    /// Get service URL
+    /// Get service URL.
+    ///
+    /// Arc 12 §5.3.2 Gap 1 closure: delegates to
+    /// `ServiceConfig::effective_public_url()` which reads
+    /// `service.public_url` when set (via
+    /// `PDS_SERVICE_PUBLIC_URL`), otherwise derives
+    /// `{scheme}://{hostname}[:{port}]` with localhost-aware
+    /// scheme selection. Preserves v0.4 behavior when
+    /// `public_url` is unset on a localhost deployment.
     pub fn service_url(&self) -> String {
-        format!(
-            "http://{}:{}",
-            self.config.service.hostname, self.config.service.port
-        )
+        self.config.service.effective_public_url()
     }
 
     /// Get service DID
     pub fn service_did(&self) -> &str {
         &self.config.service.service_did
+    }
+
+    /// Arc 12 §5.3.4 / §5.3.9: configured entryway DID, `None` in
+    /// standalone mode. Used by `require_auth_forwarded` to build
+    /// the multi-audience allowlist and by `AppContext::new` to
+    /// seed the trusted-iss set with the entryway DID.
+    pub fn entryway_did(&self) -> Option<&str> {
+        self.config.entryway.as_ref().map(|c| c.did.as_str())
+    }
+
+    /// Arc 12 §5.3.4.1 shared verification helper. Routes a bearer
+    /// token through the §5.3.3 tuple table, honoring the caller-
+    /// supplied audience allowlist for the destination routes that
+    /// check audience. The two middleware variants
+    /// (`require_auth_unified` / `require_auth_forwarded`) are thin
+    /// wrappers around this method that differ only in their
+    /// allowlist.
+    ///
+    /// Returns a `UnifiedAuthContext` whose variant identifies the
+    /// validated path: `Local` for the DB-lookup local-verify path,
+    /// `OAuth` for the opaque-token DB-lookup OAuth path, and
+    /// `CrossPDS` for both the entryway external-verify and the
+    /// trusted-iss service-auth fallback (both produce a verified
+    /// did-bearing claim from a remote-trust path).
+    pub async fn verify_jwt_with_allowlist(
+        &self,
+        token: &str,
+        audience_allowlist: &[&str],
+    ) -> PdsResult<crate::api::middleware::UnifiedAuthContext> {
+        crate::auth::verify_jwt_with_allowlist_impl(self, token, audience_allowlist).await
     }
 }
 

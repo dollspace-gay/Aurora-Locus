@@ -37,6 +37,7 @@ async fn create_test_manager() -> AccountManager {
             service_did: "did:web:localhost".to_string(),
             version: "0.1.0".to_string(),
             blob_upload_limit: 5242880,
+                public_url: None,
         },
         storage: StorageConfig {
             data_directory: PathBuf::from("./data"),
@@ -91,11 +92,13 @@ async fn create_test_manager() -> AccountManager {
             crawl_enabled: false,
             public_url: None,
             auto_stream_events: false,
+                peer_pds: vec![],
         },
         validation_mode: ValidationMode::Optimistic,
         distributed_state_mode: Default::default(),
         maintenance_pool: Default::default(),
         gc_sweep: Default::default(),
+        entryway: None,
     });
 
     AccountManager::new(db, config)

@@ -401,11 +401,15 @@ impl IdentityResolver {
             .first()
             .ok_or_else(|| PdsError::IdentityResolution("Missing domain in did:web".to_string()))?;
 
+        // Arc 12 §5.3.2 Gap 1: localhost-aware scheme for
+        // did:web resolution so a peer at localhost:NNNN resolves
+        // via http://.
+        let scheme = crate::config::derive_url_scheme(domain);
         let url = if parts.len() == 1 {
-            format!("https://{}/.well-known/did.json", domain)
+            format!("{}://{}/.well-known/did.json", scheme, domain)
         } else {
             let path = parts[1..].join("/");
-            format!("https://{}/{}/did.json", domain, path)
+            format!("{}://{}/{}/did.json", scheme, domain, path)
         };
 
         let max_retries = self.config.max_retries;
@@ -800,7 +804,11 @@ impl IdentityResolverApi for IdentityResolver {
     }
 }
 
-#[cfg(test)]
+// Exposed to integration tests in `tests/` (e.g.
+// `tests/arc12_routing_matrix.rs`). The mock has no production
+// callers; gating it behind `#[cfg(test)]` would hide it from
+// integration tests because Cargo only sets `cfg(test)` for the
+// crate currently being compiled in test mode.
 pub mod test_doubles {
     //! Test doubles for the identity-resolution surface.
     //!

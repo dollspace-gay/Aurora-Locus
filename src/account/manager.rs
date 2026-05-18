@@ -736,8 +736,13 @@ impl AccountManager {
         let did_suffix = &base32_hash[..24]; // Truncate to 24 characters
         let did = format!("did:plc:{}", did_suffix);
 
-        // Build PLC operation
-        let service_url = format!("https://{}", self.config.service.hostname);
+        // Build PLC operation. Arc 12 §5.3.2 Gap 1 closure:
+        // read effective_public_url() so localhost / explicit-
+        // PDS_SERVICE_PUBLIC_URL deployments produce the
+        // correct scheme + port rather than baking
+        // `https://hostname` (with no port) into the immutable
+        // PLC genesis op CBOR.
+        let service_url = self.config.service.effective_public_url();
 
         // Check if handle already includes the domain
         let full_handle = if handle.contains('.')
@@ -840,8 +845,19 @@ impl AccountManager {
             exp: now + 3600, // 1 hour
         };
 
+        // Arc 12 §5.4 Step 0.6.2: include kid="aurora-local-v1"
+        // in JWT header so tuple-routing per §5.3.3 can route
+        // local-mint tokens to the local-verify path
+        // unambiguously. Pre-Step-0.6 kid-less tokens still
+        // route to local-verify by HS256+kid-absent rule per
+        // §5.3.3 tuple table; the kid here makes the routing
+        // explicit + tracks issuance for future revocation
+        // surfaces (§5.5.2).
+        let mut header = Header::default();
+        header.kid = Some("aurora-local-v1".to_string());
+
         let token = encode(
-            &Header::default(),
+            &header,
             &claims,
             &EncodingKey::from_secret(self.config.authentication.jwt_secret.as_bytes()),
         )
@@ -2621,6 +2637,7 @@ mod tests {
                 service_did: "did:web:localhost".to_string(),
                 version: "0.1.0".to_string(),
                 blob_upload_limit: 5242880,
+                public_url: None,
             },
             storage: StorageConfig {
                 data_directory: PathBuf::from("./data"),
@@ -2675,11 +2692,13 @@ mod tests {
                 crawl_enabled: false,
                 public_url: None,
                 auto_stream_events: false,
+                peer_pds: vec![],
             },
             validation_mode: crate::validation::ValidationMode::Optimistic,
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            entryway: None,
         });
 
         AccountManager::new(db, config)
