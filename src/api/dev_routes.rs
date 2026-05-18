@@ -276,7 +276,7 @@ async fn create_account(
 ) -> Result<Json<CreateAccountResponse>, (StatusCode, String)> {
     let account = ctx
         .account_manager
-        .create_account(body.handle, Some(body.email), body.password, None)
+        .create_account(body.handle, Some(body.email), body.password, None, None)
         .await
         .map_err(http_error)?;
 

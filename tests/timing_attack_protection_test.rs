@@ -69,6 +69,7 @@ async fn create_test_manager() -> AccountManager {
             service_handle_domains: vec!["localhost".to_string()],
             did_cache_stale_ttl: 3600,
             did_cache_max_ttl: 86400,
+            recovery_did_key: None,
         },
         email: None,
         invites: InviteConfig {
@@ -142,6 +143,7 @@ async fn test_login_timing_protection_wrong_password() {
             Some("test@example.com".to_string()),
             "correct_password".to_string(),
             None,
+                None,
         )
         .await
         .unwrap();
@@ -178,6 +180,7 @@ async fn test_login_timing_protection_valid_login() {
             Some("test@example.com".to_string()),
             "correct_password".to_string(),
             None,
+                None,
         )
         .await
         .unwrap();
@@ -214,6 +217,7 @@ async fn test_app_password_timing_protection() {
             Some("test@example.com".to_string()),
             "correct_password".to_string(),
             None,
+                None,
         )
         .await
         .unwrap();
@@ -274,6 +278,7 @@ async fn test_timing_consistency_between_valid_and_invalid() {
             Some("test@example.com".to_string()),
             "correct_password".to_string(),
             None,
+                None,
         )
         .await
         .unwrap();

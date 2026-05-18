@@ -38,6 +38,7 @@ pub async fn create_account(
             Some(email.to_string()),
             password.to_string(),
             invite_code.map(|s| s.to_string()),
+            None,
         )
         .await?;
 

@@ -182,12 +182,15 @@ async fn create_account(
         tracing::debug!("create_account: Invite code validated successfully");
     }
 
-    // Create account (pass None for invite_code since we already validated it)
+    // Create account (pass None for invite_code since we already validated it).
+    // Arc 13 §6.3.3 / Step 2.2: pass through the optional
+    // `recovery_key` input so it ends up first in the genesis op's
+    // rotation_keys per §6.3.3 priority order.
     tracing::debug!("create_account: Creating account in database");
     let email = req.email.clone();
     let account = ctx
         .account_manager
-        .create_account(req.handle.clone(), req.email, req.password, None)
+        .create_account(req.handle.clone(), req.email, req.password, None, req.recovery_key)
         .await
         .map_err(|e| {
             tracing::error!(

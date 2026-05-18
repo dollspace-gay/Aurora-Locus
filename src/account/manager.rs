@@ -49,6 +49,7 @@ impl AccountManager {
         email: Option<String>,
         password: String,
         invite_code: Option<String>,
+        recovery_key: Option<String>,
     ) -> PdsResult<ActorAccount> {
         // Validate invite code if required
         if self.config.invites.required {
@@ -85,12 +86,13 @@ impl AccountManager {
         let password_hash = crate::auth::PasswordHasher::hash(&password)
             .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
 
-        // Generate DID with PLC registration. Arc 13 §6.3.2:
-        // returns the per-actor atproto signing key (NOT a per-
-        // account rotation key — the rotation key is PDS-wide
-        // and lives in config).
+        // Generate DID with PLC registration. Arc 13 §6.3.2 +
+        // §6.3.3: returns the per-actor atproto signing key (NOT a
+        // per-account rotation key). The per-account recovery_key
+        // (when supplied) goes into rotation_keys[0] per §6.3.3
+        // priority order.
         let (did, atproto_signing_key_hex, atproto_public_key_hex, plc_operation_cid) =
-            self.generate_plc_did(&handle).await?;
+            self.generate_plc_did(&handle, recovery_key.as_deref()).await?;
         let _ = atproto_public_key_hex; // currently unused at insert site
 
         let now = Utc::now();
@@ -718,7 +720,11 @@ impl AccountManager {
     /// Generate a PLC DID and register it with the PLC Directory
     ///
     /// Returns: (did, rotation_key_hex, rotation_key_public_hex, operation_cid)
-    async fn generate_plc_did(&self, handle: &str) -> PdsResult<(String, String, String, String)> {
+    async fn generate_plc_did(
+        &self,
+        handle: &str,
+        recovery_key: Option<&str>,
+    ) -> PdsResult<(String, String, String, String)> {
         use crate::crypto::plc::{
             compute_op_cid, derive_did_suffix, register_plc_did, PlcOperationBuilder, PlcSigner,
             ServiceEntry,
@@ -796,12 +802,28 @@ impl AccountManager {
         let mut verification_methods = BTreeMap::new();
         verification_methods.insert("atproto".to_string(), atproto_did_key);
 
-        // §6.3.3 recovery-key support is Step 2 work; for Step 0.7
-        // rotation_keys contains only the PDS-wide rotation key.
-        // Step 2.3 prepends configured + per-account recovery
-        // keys.
+        // §6.3.3 Step 2.3 priority order: rotation_keys =
+        // [input.recovery_key?, config.recovery_did_key?,
+        //  config.plc_rotation_key.did_key()].
+        // Earlier entries in the list have higher rotation
+        // authority (operator/account-owned recovery keys can
+        // override the PDS server's signing).
+        let mut rotation_keys: Vec<String> = Vec::with_capacity(3);
+        if let Some(per_account) = recovery_key {
+            let trimmed = per_account.trim();
+            if !trimmed.is_empty() {
+                rotation_keys.push(trimmed.to_string());
+            }
+        }
+        if let Some(pds_recovery) = &self.config.identity.recovery_did_key {
+            if !pds_recovery.is_empty() {
+                rotation_keys.push(pds_recovery.clone());
+            }
+        }
+        rotation_keys.push(rotation_did_key);
+
         let unsigned = PlcOperationBuilder::new()
-            .rotation_keys(vec![rotation_did_key])
+            .rotation_keys(rotation_keys)
             .verification_methods(verification_methods)
             .also_known_as(vec![format!("at://{}", full_handle)])
             .services(services)
@@ -2703,6 +2725,7 @@ mod tests {
                 service_handle_domains: vec!["localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {
@@ -2915,6 +2938,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -2955,6 +2979,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -2988,6 +3013,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3039,6 +3065,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3066,6 +3093,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3125,6 +3153,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3151,6 +3180,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3178,6 +3208,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3220,7 +3251,7 @@ mod tests {
 
         // Create test account
         let account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3252,12 +3283,12 @@ mod tests {
 
         // Create two accounts
         let _account1 = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
         let account2 = manager
-            .create_account("bob".to_string(), None, "password456".to_string(), None)
+            .create_account("bob".to_string(), None, "password456".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3283,7 +3314,7 @@ mod tests {
 
         // Create test account
         let account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3303,7 +3334,7 @@ mod tests {
 
         // Create test account
         let account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3331,7 +3362,7 @@ mod tests {
     async fn takedown_account_in_tx_rolls_back_on_caller_rollback() {
         let manager = setup_test_db().await;
         let account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3370,7 +3401,7 @@ mod tests {
     async fn takedown_account_in_tx_commits_on_caller_commit() {
         let manager = setup_test_db().await;
         let account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3398,6 +3429,7 @@ mod tests {
                 Some("alice@old.example".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3439,6 +3471,7 @@ mod tests {
                 Some("alice@example".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3448,6 +3481,7 @@ mod tests {
                 Some("bob@example".to_string()),
                 "password456".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3473,7 +3507,7 @@ mod tests {
     async fn update_handle_in_tx_rolls_back_on_caller_rollback() {
         let manager = setup_test_db().await;
         let _account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
         let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
@@ -3494,7 +3528,7 @@ mod tests {
     async fn update_password_in_tx_rolls_back_on_caller_rollback() {
         let manager = setup_test_db().await;
         let _account = manager
-            .create_account("alice".to_string(), None, "original-password".to_string(), None)
+            .create_account("alice".to_string(), None, "original-password".to_string(), None, None)
             .await
             .unwrap();
         let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
@@ -3529,7 +3563,7 @@ mod tests {
     async fn delete_account_permanent_in_tx_rolls_back_on_caller_rollback() {
         let manager = setup_test_db().await;
         let _account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
         let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
@@ -3551,7 +3585,7 @@ mod tests {
     async fn activate_deactivate_reactivate_in_tx_roll_back_on_caller_rollback() {
         let manager = setup_test_db().await;
         let _account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
         let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
@@ -3608,6 +3642,7 @@ mod tests {
                 Some("alice@example".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3648,6 +3683,7 @@ mod tests {
                 Some("arc12@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .expect("create_account");

@@ -382,6 +382,7 @@ async fn account_manager_round_trip_on_postgres() {
             service_handle_domains: vec![".localhost".to_string()],
             did_cache_stale_ttl: 3600,
             did_cache_max_ttl: 86400,
+            recovery_did_key: None,
         },
         email: None,
         invites: InviteConfig {
@@ -426,6 +427,7 @@ async fn account_manager_round_trip_on_postgres() {
             Some("smoke@example.com".to_string()),
             "supersecret-test-pw".to_string(),
             None,
+                None,
         )
         .await
         .expect("create_account");

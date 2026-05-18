@@ -4063,6 +4063,7 @@ mod tests {
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {
@@ -7065,6 +7066,7 @@ mod tests {
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {

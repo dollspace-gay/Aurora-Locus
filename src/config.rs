@@ -887,6 +887,20 @@ pub struct IdentityConfig {
     pub service_handle_domains: Vec<String>,
     pub did_cache_stale_ttl: u64,
     pub did_cache_max_ttl: u64,
+    /// Arc 13 §6.3.3 PDS-wide recovery key (did:key format), env
+    /// `PDS_IDENTITY_RECOVERY_DID_KEY`. Optional — when set, every
+    /// new account's genesis op gets this did:key prepended to its
+    /// `rotation_keys` after any per-account `recovery_key` input
+    /// but before the PDS-wide rotation key.
+    ///
+    /// Per §6.5.7: the PDS-wide rotation key is in every account's
+    /// rotation_keys; single compromise rotates every account
+    /// (until the 72-hour timelock + recovery key intervene).
+    /// Operators are expected to configure this key + hold its
+    /// private material separately so a PDS compromise doesn't
+    /// also compromise account recovery.
+    #[serde(default)]
+    pub recovery_did_key: Option<String>,
 }
 
 /// Email configuration
@@ -1243,6 +1257,14 @@ impl ServerConfig {
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
+        // Arc 13 §6.3.3 / Step 2.1: PDS-wide recovery key env var.
+        // Optional — no default. Validated as non-empty when set
+        // (empty string would silently turn into a recovery slot
+        // for the empty did:key, which is nonsense).
+        let recovery_did_key = env::var("PDS_IDENTITY_RECOVERY_DID_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let did_cache_stale_ttl = env::var("PDS_DID_CACHE_STALE_TTL")
             .unwrap_or_else(|_| "3600".to_string())
             .parse()
@@ -1423,6 +1445,7 @@ impl ServerConfig {
                 service_handle_domains,
                 did_cache_stale_ttl,
                 did_cache_max_ttl,
+                recovery_did_key,
             },
             email,
             invites: InviteConfig {
