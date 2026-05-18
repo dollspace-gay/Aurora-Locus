@@ -332,11 +332,30 @@ async fn get_session(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<Json<SessionInfo>> {
-    // Require authentication
-    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+    // Arc 12 §5.3.4: forwarded-routes auth path (single-aud in
+    // standalone mode; multi-aud accepting entryway-issued tokens in
+    // entryway mode).
+    let unified = middleware::require_auth_forwarded(State(ctx.clone()), headers.clone()).await?;
+    let did = unified.did().to_string();
 
-    // Get account info
-    let account = ctx.account_manager.get_account(&validated.did).await?;
+    // Arc 12 §5.3.8 mint-pattern forward. Entryway is the canonical
+    // source of session info in entryway mode (it owns the account
+    // identity).
+    if ctx.entryway_client.is_some() {
+        let fwd_headers = ctx
+            .entryway_auth_headers(&did, "com.atproto.server.getSession")
+            .await?;
+        let resp: SessionInfo = ctx
+            .entryway_client
+            .as_ref()
+            .expect("checked above")
+            .xrpc_get_json("com.atproto.server.getSession", fwd_headers, &[])
+            .await?;
+        return Ok(Json(resp));
+    }
+
+    // Standalone path (unchanged).
+    let account = ctx.account_manager.get_account(&did).await?;
 
     Ok(Json(SessionInfo {
         did: account.did,
@@ -457,7 +476,7 @@ async fn confirm_email(
 /// Request password reset endpoint
 ///
 /// Generates a reset token and sends it via email (public endpoint, no auth required)
-#[derive(serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct RequestPasswordResetRequest {
     identifier: String, // Email or handle
 }
@@ -467,6 +486,25 @@ async fn request_password_reset(
     headers: HeaderMap,
     Json(req): Json<RequestPasswordResetRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
+    // Arc 12 §5.3.8 passthru-pattern forward. requestPasswordReset
+    // is token-free: filter incoming headers per §5.3.6 via
+    // `entryway_passthru_headers` and forward the body as-is. The
+    // entryway is the canonical source of password-reset state in
+    // entryway mode.
+    if let Some(entryway_client) = ctx.entryway_client.as_ref() {
+        let fwd_headers =
+            crate::federation::entryway_passthru_headers(&headers, None)?;
+        let resp: serde_json::Value = entryway_client
+            .xrpc_post_json(
+                "com.atproto.server.requestPasswordReset",
+                fwd_headers,
+                &req,
+            )
+            .await?;
+        return Ok(Json(resp));
+    }
+
+    // Standalone path (unchanged).
     // IP-based rate limiting for password reset (50 per 5 minutes per IP)
     // Prevents email spam and denial of service
     if let Some(client_ip) =

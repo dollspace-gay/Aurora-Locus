@@ -52,6 +52,123 @@ impl EntrywayClient {
             .build()?;
         Ok(Self { base_url, http })
     }
+
+    /// Arc 12 §5.3.8 — POST-method XRPC forward to the entryway.
+    /// `nsid` is the lexicon NSID (e.g.
+    /// `"com.atproto.identity.signPlcOperation"`); the request URL
+    /// is `{base_url}/xrpc/{nsid}`. `headers` (from
+    /// `entryway_auth_headers` / `entryway_passthru_headers`) is
+    /// merged onto the request. Body is JSON-serialised from `req`.
+    /// Returns the upstream response deserialised into `Res`.
+    ///
+    /// Non-2xx upstream status is surfaced as `PdsError::Internal`
+    /// with the upstream body text appended for diagnosis. Network
+    /// failures become `PdsError::Internal` with the underlying
+    /// error message.
+    pub async fn xrpc_post_json<Req, Res>(
+        &self,
+        nsid: &str,
+        headers: axum::http::HeaderMap,
+        req: &Req,
+    ) -> crate::error::PdsResult<Res>
+    where
+        Req: serde::Serialize + ?Sized,
+        Res: serde::de::DeserializeOwned,
+    {
+        let url = format!("{}/xrpc/{}", self.base_url.trim_end_matches('/'), nsid);
+        let req_headers = axum_to_reqwest_headers(&headers)?;
+        let response = self
+            .http
+            .post(&url)
+            .headers(req_headers)
+            .json(req)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::error::PdsError::Internal(format!(
+                    "entryway forward POST {} failed: {}",
+                    nsid, e
+                ))
+            })?;
+        ensure_2xx_then_decode(nsid, response).await
+    }
+
+    /// Arc 12 §5.3.8 — GET-method XRPC forward to the entryway.
+    /// Same as [`xrpc_post_json`] but `method = GET` and no request
+    /// body. `query` is appended as URL query parameters (caller
+    /// can pass `&[]` for query-less forwards).
+    pub async fn xrpc_get_json<Res>(
+        &self,
+        nsid: &str,
+        headers: axum::http::HeaderMap,
+        query: &[(&str, &str)],
+    ) -> crate::error::PdsResult<Res>
+    where
+        Res: serde::de::DeserializeOwned,
+    {
+        let url = format!("{}/xrpc/{}", self.base_url.trim_end_matches('/'), nsid);
+        let req_headers = axum_to_reqwest_headers(&headers)?;
+        let response = self
+            .http
+            .get(&url)
+            .headers(req_headers)
+            .query(query)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::error::PdsError::Internal(format!(
+                    "entryway forward GET {} failed: {}",
+                    nsid, e
+                ))
+            })?;
+        ensure_2xx_then_decode(nsid, response).await
+    }
+}
+
+/// Convert axum's `HeaderMap` (Step 2.x builders return this) into a
+/// `reqwest::HeaderMap` for the outbound HTTP call. They are the
+/// same underlying types from the `http` crate but reqwest re-exports
+/// its own alias, so an explicit per-entry copy is the portable path.
+fn axum_to_reqwest_headers(
+    src: &axum::http::HeaderMap,
+) -> crate::error::PdsResult<reqwest::header::HeaderMap> {
+    let mut out = reqwest::header::HeaderMap::new();
+    for (k, v) in src.iter() {
+        let name = reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()).map_err(|e| {
+            crate::error::PdsError::Internal(format!("invalid forwarded header name {:?}: {}", k, e))
+        })?;
+        let value = reqwest::header::HeaderValue::from_bytes(v.as_bytes()).map_err(|e| {
+            crate::error::PdsError::Internal(format!("invalid forwarded header value: {}", e))
+        })?;
+        out.insert(name, value);
+    }
+    Ok(out)
+}
+
+async fn ensure_2xx_then_decode<Res>(
+    nsid: &str,
+    response: reqwest::Response,
+) -> crate::error::PdsResult<Res>
+where
+    Res: serde::de::DeserializeOwned,
+{
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<body read failed: {}>", e));
+        return Err(crate::error::PdsError::Internal(format!(
+            "entryway forward {} returned {}: {}",
+            nsid, status, body
+        )));
+    }
+    response.json::<Res>().await.map_err(|e| {
+        crate::error::PdsError::Internal(format!(
+            "entryway forward {} response decode failed: {}",
+            nsid, e
+        ))
+    })
 }
 
 /// Admin-tier entryway client per §5.3.9. Basic-auth header is

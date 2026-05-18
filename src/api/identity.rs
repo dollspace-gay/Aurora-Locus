@@ -47,7 +47,7 @@ pub async fn resolve_handle(
 /// com.atproto.identity.updateHandle
 ///
 /// Update the handle for the authenticated user's DID
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateHandleRequest {
     /// New handle for the user
@@ -56,11 +56,28 @@ pub struct UpdateHandleRequest {
 
 pub async fn update_handle(
     State(ctx): State<AppContext>,
-    auth: AuthContext,
+    auth: crate::auth::AuthContextForwarded,
     Json(req): Json<UpdateHandleRequest>,
 ) -> PdsResult<Json<()>> {
     let did = auth.did;
 
+    // Arc 12 §5.3.8 mint-pattern forward.
+    if ctx.entryway_client.is_some() {
+        let headers = ctx
+            .entryway_auth_headers(&did, "com.atproto.identity.updateHandle")
+            .await?;
+        // updateHandle's upstream response is empty (`{}`); decode as
+        // serde_json::Value and discard.
+        let _: serde_json::Value = ctx
+            .entryway_client
+            .as_ref()
+            .expect("checked above")
+            .xrpc_post_json("com.atproto.identity.updateHandle", headers, &req)
+            .await?;
+        return Ok(Json(()));
+    }
+
+    // Standalone path (unchanged).
     // Validate handle format
     if req.handle.is_empty() {
         return Err(PdsError::Validation("Handle cannot be empty".to_string()));
@@ -283,7 +300,7 @@ pub async fn get_recommended_did_credentials(
 /// com.atproto.identity.signPlcOperation
 ///
 /// Sign a PLC operation for DID:PLC update
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignPlcOperationRequest {
     /// Token from PLC directory
@@ -298,7 +315,7 @@ pub struct SignPlcOperationRequest {
     pub services: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignPlcOperationResponse {
     /// Signed operation
@@ -307,11 +324,29 @@ pub struct SignPlcOperationResponse {
 
 pub async fn sign_plc_operation(
     State(ctx): State<AppContext>,
-    auth: AuthContext,
+    auth: crate::auth::AuthContextForwarded,
     Json(req): Json<SignPlcOperationRequest>,
 ) -> PdsResult<Json<SignPlcOperationResponse>> {
     let did = auth.did;
 
+    // Arc 12 §5.3.8 mint-pattern forward. When entryway mode is
+    // configured, mint a service-auth JWT scoped to this NSID via
+    // `entryway_auth_headers` and proxy the request body upstream;
+    // the entryway is the canonical signer in that deployment shape.
+    if ctx.entryway_client.is_some() {
+        let headers = ctx
+            .entryway_auth_headers(&did, "com.atproto.identity.signPlcOperation")
+            .await?;
+        let resp: SignPlcOperationResponse = ctx
+            .entryway_client
+            .as_ref()
+            .expect("checked above")
+            .xrpc_post_json("com.atproto.identity.signPlcOperation", headers, &req)
+            .await?;
+        return Ok(Json(resp));
+    }
+
+    // Standalone path (unchanged).
     // Ensure this is a did:plc
     if !did.starts_with("did:plc:") {
         return Err(PdsError::Validation(

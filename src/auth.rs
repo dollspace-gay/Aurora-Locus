@@ -99,6 +99,44 @@ impl FromRequestParts<AppContext> for AuthContext {
     }
 }
 
+/// Arc 12 §5.3.4 forwarded-routes auth extractor. Thin wrapper
+/// around `AppContext::verify_jwt_with_allowlist` with the
+/// `[service_did, entryway_did]` allowlist (degrades to
+/// `[service_did]` in standalone mode where `entryway_did()` is
+/// `None`). Used by the four §5.3.8 forwarded mint-pattern handlers
+/// (`signPlcOperation`, `updateHandle`, `getSession`).
+///
+/// Returns only the resolved DID — handlers don't need the inner
+/// session/oauth/cross-pds variant distinction for forwarding
+/// decisions (the variant is purely informational at this layer).
+#[derive(Debug, Clone)]
+pub struct AuthContextForwarded {
+    pub did: String,
+}
+
+#[async_trait]
+impl FromRequestParts<AppContext> for AuthContextForwarded {
+    type Rejection = PdsError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        ctx: &AppContext,
+    ) -> Result<Self, Self::Rejection> {
+        let token = extract_bearer_token(&parts.headers)
+            .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
+        let service_did = ctx.service_did().to_string();
+        let entryway_did_owned = ctx.entryway_did().map(str::to_string);
+        let mut allowlist: Vec<&str> = vec![service_did.as_str()];
+        if let Some(eid) = entryway_did_owned.as_deref() {
+            allowlist.push(eid);
+        }
+        let auth = ctx.verify_jwt_with_allowlist(&token, &allowlist).await?;
+        Ok(Self {
+            did: auth.did().to_string(),
+        })
+    }
+}
+
 /// Optional authenticated context - does not fail if no auth provided
 #[derive(Debug, Clone)]
 pub struct OptionalAuthContext {
