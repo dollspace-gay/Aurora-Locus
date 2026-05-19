@@ -8,6 +8,80 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Arc 16b — Blob lifecycle helpers (v6 LOCKED)** (#91). DB-level
+  helpers-only arc — establishes the contract layer for
+  federation sub-feature #46 (jointly with Arc 16c + Arc 16d).
+  Ships with **zero production callers** per §9.2.5.1; Arc 16c
+  wires the helpers into uploadBlob + record-write paths; Arc
+  16d wires them into the GC sweep.
+  - **Schema**: migration 0011 adds `temp_key TEXT NULL CHECK
+    (temp_key IS NULL OR temp_key = '1')` column to
+    `blob_metadata` + partial index `idx_blob_metadata_untethered
+    ON blob_metadata(created_at) WHERE temp_key IS NOT NULL`
+    (services Arc 16d's anticipated TTL sweep query). SQLite +
+    Postgres parity.
+  - **State model** (§9.2.3.1): `temp_key = '1'` = untethered
+    (uploaded, no record refs); `temp_key = NULL` = permanent
+    (≥1 record ref). `created_at` doubles as TTL anchor —
+    refreshed on every re-entry into untethered state by
+    `track_untethered_blob`.
+  - **Three lifecycle helpers + one observability helper** on
+    `BlobStore` (instance methods; round-5 F4 closure row-lock
+    contract):
+    - `track_untethered_blob` — single UPSERT covering the three
+      cases (row absent → INSERT; permanent → no-op; untethered →
+      refresh `created_at`).
+    - `verify_blob_and_make_permanent` (STRICT) — row-lock the
+      blob_metadata row (Postgres FOR UPDATE; SQLite WAL writer-
+      lock auto), error `BlobNotFound` if absent, UPDATE
+      `temp_key = NULL`, INSERT `record_blob` with first-link-time
+      `ON CONFLICT DO NOTHING` (Step 0.2 Item 6 outcome).
+    - `unreference_blob` — DELETE record_blob row; read blob_metadata
+      + EXISTS(record_blob) under row-lock; return one of six
+      `UnreferenceOutcome` variants per the design's caller-
+      obligations table.
+    - `is_untethered` — observability-only; observes committed
+      state; NOT a control primitive.
+  - **`UnreferenceOutcome` enum** (round-5 F1 + F3 closures):
+    six variants surface races + inconsistencies explicitly —
+    `LastRefDropped`, `OtherRefsRemain`, `PhantomDelete` (no-op,
+    DEBUG), `AlreadyUntethered_RefsRemain` (deep inconsistency,
+    ERROR), `AlreadyUntethered_NoRefs` (mild anomaly, WARN),
+    `OrphanedRef` (defensive-against-corruption, ERROR).
+  - **`PdsError::BlobNotFound(String)`** new typed-error variant
+    with `#[allow(dead_code)]` (no production callers in Arc
+    16b); HTTP 404 + `{error: "BlobNotFound", message}` envelope
+    per Arc 14 v3.2 §7.6.5 typed-error pattern.
+  - **Recon-driven design adjustment**: Step 0.2 Item 9's initial
+    "tolerates-silently" outcome for `SELECT … FOR UPDATE` on
+    SQLite was empirically falsified during Step 3 testing —
+    sqlx 0.8 passes the clause through to SQLite which rejects
+    it as syntax error. Corrected outcome: `query-builder`
+    conditional emission via `BlobStore::for_update_clause()`
+    (runtime backend detection via `pg_backend_pid()` probe at
+    `BlobStore::new()`). Side effect: helpers became `&self`
+    methods rather than `BlobStore::helper(...)` free functions.
+    Recon doc updated; Step 5 audit item 10 verifies match.
+  - **Recon finding (no FK)**: per Step 0.2 Item 10, no FK
+    currently exists between `record_blob` and `blob_metadata`.
+    The design's caller-obligations table assumes "expected FK +
+    cascade configuration" not yet in place; documented as a
+    design-vs-reality delta. `OrphanedRef` test setup needs no
+    FK disablement. Adding the FK is v0.6+ hardening (separate
+    chainlink).
+
+  cargo test --lib --locked: **1082 PASS / 0 FAIL** (net +17
+  Arc 16b tests: 14 helper-variant + 3 is_untethered states +
+  1 CHECK constraint, with 1 legacy fixture column-added trivially).
+  Arc 12+13 integration regression: 19/19 PASS. Arc-close audit
+  10/10 items clean (zero production callers; gc.rs / api/blob.rs
+  / repository.rs untouched; UPSERT counts 3+3 post-diff; FOR
+  UPDATE outcome matches recorded `query-builder` via
+  `for_update_clause`).
+
+  **Federation sub-feature #46 stays OPEN** — closes only when
+  Arc 16b + 16c + 16d all lock.
+
 - **Arc 15 — Sequencer producer (v3.1)** (#81). Aurora-Locus's
   firehose now emits on every account-lifecycle handler that
   bsky-PDS does. Pre-Arc-15: 5 producer call sites (4 identity

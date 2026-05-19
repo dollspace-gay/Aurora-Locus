@@ -75,6 +75,17 @@ pub enum PdsError {
     #[error("DAG-CBOR encoding error: {0}")]
     CborEncoding(String),
 
+    /// Arc 16b §9.2 — `blob_metadata` row not found for the supplied
+    /// CID. Emitted by `verify_blob_and_make_permanent` (STRICT) when
+    /// a record-write references a CID with no upload. Mapped to HTTP
+    /// 404 + `BlobNotFound` envelope. `#[allow(dead_code)]` while
+    /// Arc 16b ships with zero production callers (§9.2.5.1); Arc
+    /// 16c removes the annotation when STRICT is wired into the
+    /// uploadBlob + record-write paths.
+    #[error("Blob not found: CID {0}")]
+    #[allow(dead_code)]
+    BlobNotFound(String),
+
     /// JWT errors
     #[error("JWT error: {0}")]
     Jwt(String),
@@ -265,6 +276,12 @@ impl IntoResponse for PdsError {
                 "RepoDesynchronized",
                 self.to_string(),
             ),
+            // Arc 16b §9.2 / Step 0.3 / Step 3.6: typed error for
+            // STRICT helper's "blob not present" path. Spec-compliant
+            // envelope per Arc 14 v3.2 §7.6.5 pattern.
+            PdsError::BlobNotFound(_) => {
+                (StatusCode::NOT_FOUND, "BlobNotFound", self.to_string())
+            }
             PdsError::NotLeader(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "NotLeader",

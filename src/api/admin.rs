@@ -5210,7 +5210,7 @@ async fn list_blobs(
         let query = if let Some(cursor) = params.cursor {
             sqlx::query(
                 r#"
-                SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
+                SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid, temp_key
                 FROM blob_metadata
                 WHERE cid > ?1
                 ORDER BY cid ASC
@@ -5222,7 +5222,7 @@ async fn list_blobs(
         } else {
             sqlx::query(
                 r#"
-                SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
+                SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid, temp_key
                 FROM blob_metadata
                 ORDER BY cid ASC
                 LIMIT ?1
@@ -5269,6 +5269,12 @@ async fn list_blobs(
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
                 thumbnail_cid: row
                     .try_get("thumbnail_cid")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                // Arc 16b §9.2.3.1: lifecycle discriminator.
+                // Admin listing reads the column; helper ships with
+                // zero production callers in Arc 16b per §9.2.5.1.
+                temp_key: row
+                    .try_get("temp_key")
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
             });
         }

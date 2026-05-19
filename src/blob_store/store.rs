@@ -35,6 +35,15 @@ pub struct BlobStore {
     config: BlobStoreConfig,
     backend: Arc<dyn BlobBackend>,
     db: AnyPool,
+    /// Arc 16b §9.2.3.2 / Step 0.2 Item 9 recon (corrected): sqlx
+    /// 0.8 does NOT silently tolerate `FOR UPDATE` on SQLite — the
+    /// clause is passed through to SQLite which rejects it as syntax
+    /// error. Backend detection happens at construction time + helpers
+    /// conditionally emit the clause via [`Self::for_update_clause`].
+    /// On SQLite the WAL writer-lock provides equivalent stronger-
+    /// but-coarser serialization (per §9.2.3.2); on Postgres the
+    /// clause provides the row-level lock the design relies on.
+    is_postgres: bool,
 }
 
 impl BlobStore {
@@ -68,11 +77,34 @@ impl BlobStore {
             ),
         };
 
+        // Arc 16b §9.2.3.2: probe backend for FOR UPDATE conditional
+        // emission. Postgres recognizes pg_backend_pid(); SQLite does
+        // not. Fall back to false on probe error (treat as SQLite —
+        // safer default since FOR UPDATE on SQLite would break).
+        let is_postgres = sqlx::query("SELECT pg_backend_pid()")
+            .fetch_one(&db)
+            .await
+            .is_ok();
+
         Ok(Self {
             config,
             backend,
             db,
+            is_postgres,
         })
+    }
+
+    /// Arc 16b §9.2.3.2: emit the SQL row-lock clause appropriate
+    /// for the backend. Postgres: `" FOR UPDATE"`; SQLite: empty
+    /// (WAL writer-lock provides equivalent serialization per
+    /// §9.2.3.2 "stronger-but-coarser" note). Leading space is
+    /// included for clean concatenation onto a `WHERE` clause.
+    fn for_update_clause(&self) -> &'static str {
+        if self.is_postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        }
     }
 
     /// Extract image dimensions from data
@@ -644,7 +676,7 @@ impl BlobStore {
     pub async fn get_metadata(&self, cid: &str) -> PdsResult<Option<BlobMetadata>> {
         let result = sqlx::query(
             r#"
-            SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
+            SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid, temp_key
             FROM blob_metadata
             WHERE cid = $1
             "#,
@@ -665,6 +697,7 @@ impl BlobStore {
                 height: row.try_get("height")?,
                 alt_text: row.try_get("alt_text")?,
                 thumbnail_cid: row.try_get("thumbnail_cid")?,
+                temp_key: row.try_get("temp_key")?,
             }))
         } else {
             Ok(None)
@@ -706,7 +739,7 @@ impl BlobStore {
     pub async fn list_for_user(&self, did: &str, limit: i64) -> PdsResult<Vec<BlobMetadata>> {
         let rows = sqlx::query(
             r#"
-            SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
+            SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid, temp_key
             FROM blob_metadata
             WHERE creator_did = $1
             ORDER BY created_at DESC
@@ -731,6 +764,7 @@ impl BlobStore {
                 height: row.try_get("height")?,
                 alt_text: row.try_get("alt_text")?,
                 thumbnail_cid: row.try_get("thumbnail_cid")?,
+                temp_key: row.try_get("temp_key")?,
             });
         }
 
@@ -890,6 +924,248 @@ impl BlobStore {
 
         Ok(cids)
     }
+
+    // ========================================================
+    // Arc 16b §9.2 — blob lifecycle helpers (chainlink #91)
+    // Recon: docs/internal/v05-recon/V05_ARC16B_RECON_R0.md
+    // ========================================================
+    //
+    // These helpers ship with zero production callers per §9.2.5.1.
+    // Arc 16c wires them into uploadBlob + record-write paths; Arc
+    // 16d wires them into the GC sweep.
+    //
+    // All write helpers take `&mut Transaction<'_, sqlx::Any>` and
+    // participate in the caller's transaction per Step 0.2 Item 3
+    // recon. Helpers do not start or commit their own transactions.
+    //
+    // Row-lock contract (round-5 F4 closure / Step 0.2 Item 9 recon):
+    // STRICT and `unreference_blob` use `SELECT … FOR UPDATE` on the
+    // read-then-write path. sqlx 0.8 tolerates the clause silently
+    // on SQLite (WAL writer-lock provides equivalent serialization);
+    // Postgres respects it as a real row lock. Single SQL string
+    // works on both backends — no cfg-gating required.
+
+    /// Arc 16b §9.2.3.2 — `track_untethered_blob`: insert (or
+    /// refresh) a `blob_metadata` row in the untethered state.
+    ///
+    /// Three cases per design:
+    /// 1. Row absent → INSERT with `temp_key = '1'`, `created_at = now`.
+    /// 2. Row present with `temp_key NULL` (permanent) → no state
+    ///    change; `mime_type`, `size`, `created_at` preserved.
+    /// 3. Row present with `temp_key NOT NULL` (already untethered)
+    ///    → UPDATE refreshes `created_at = now`; `mime_type` and
+    ///    `size` preserved per first-write-wins (§9.2.5.2).
+    ///
+    /// Atomic single UPSERT (no row lock needed; statement-atomic).
+    pub async fn track_untethered_blob<'tx>(
+        &self,
+        tx: &mut sqlx::Transaction<'tx, sqlx::Any>,
+        cid: &str,
+        mime_type: &str,
+        size: i64,
+        creator_did: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> PdsResult<()> {
+        let _ = &self.is_postgres; // silence unused-self lint; helper invariant
+        sqlx::query(
+            r#"
+            INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key)
+            VALUES ($1, $2, $3, $4, $5, '1')
+            ON CONFLICT(cid) DO UPDATE SET created_at = CASE
+                WHEN blob_metadata.temp_key IS NOT NULL THEN $5
+                ELSE blob_metadata.created_at
+            END
+            "#,
+        )
+        .bind(cid)
+        .bind(mime_type)
+        .bind(size)
+        .bind(creator_did)
+        .bind(now.to_rfc3339())
+        .execute(&mut **tx)
+        .await
+        .map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Arc 16b §9.2.3.2 — `verify_blob_and_make_permanent` (STRICT):
+    /// row-lock the `blob_metadata` row by CID; error `BlobNotFound`
+    /// if absent; UPDATE `temp_key = NULL`; INSERT `record_blob` join
+    /// row with first-link-time DO NOTHING semantic (Step 0.2 Item 6).
+    ///
+    /// Idempotent on already-permanent rows. Safe to re-call for
+    /// same `(cid, record_uri)` pair — UPDATE is a no-op when
+    /// `temp_key` already NULL; INSERT no-ops on conflict.
+    pub async fn verify_blob_and_make_permanent<'tx>(
+        &self,
+        tx: &mut sqlx::Transaction<'tx, sqlx::Any>,
+        cid: &str,
+        record_uri: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> PdsResult<()> {
+        let sql = format!(
+            "SELECT cid FROM blob_metadata WHERE cid = $1{}",
+            self.for_update_clause()
+        );
+        let row = sqlx::query(&sql)
+            .bind(cid)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(PdsError::Database)?;
+        if row.is_none() {
+            return Err(PdsError::BlobNotFound(cid.to_string()));
+        }
+        sqlx::query("UPDATE blob_metadata SET temp_key = NULL WHERE cid = $1")
+            .bind(cid)
+            .execute(&mut **tx)
+            .await
+            .map_err(PdsError::Database)?;
+        sqlx::query(
+            r#"
+            INSERT INTO record_blob (blob_cid, record_uri, indexed_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT(blob_cid, record_uri) DO NOTHING
+            "#,
+        )
+        .bind(cid)
+        .bind(record_uri)
+        .bind(now.to_rfc3339())
+        .execute(&mut **tx)
+        .await
+        .map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Arc 16b §9.2.3.2 — `unreference_blob`: drop a `record_blob`
+    /// row for `(cid, record_uri)`; if the blob has no other refs
+    /// post-DELETE, re-mark `blob_metadata.temp_key = '1'` (back to
+    /// untethered) with fresh `created_at` (TTL anchor reset).
+    ///
+    /// Returns `UnreferenceOutcome` per §9.2.3.2's six-variant enum
+    /// (round-5 F1 + F3 closures). Caller obligations per the
+    /// caller-obligations table.
+    pub async fn unreference_blob<'tx>(
+        &self,
+        tx: &mut sqlx::Transaction<'tx, sqlx::Any>,
+        cid: &str,
+        record_uri: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> PdsResult<UnreferenceOutcome> {
+        let delete_result =
+            sqlx::query("DELETE FROM record_blob WHERE blob_cid = $1 AND record_uri = $2")
+                .bind(cid)
+                .bind(record_uri)
+                .execute(&mut **tx)
+                .await
+                .map_err(PdsError::Database)?;
+
+        if delete_result.rows_affected() == 0 {
+            return Ok(UnreferenceOutcome::PhantomDelete);
+        }
+
+        // Real ref removed. Now read blob_metadata + EXISTS(record_blob)
+        // under row lock (forces serialization vs concurrent writers).
+        let sql = format!(
+            r#"
+            SELECT temp_key,
+                   EXISTS(SELECT 1 FROM record_blob WHERE blob_cid = $1) AS refs_remain
+            FROM blob_metadata
+            WHERE cid = $1{}
+            "#,
+            self.for_update_clause()
+        );
+        let row = sqlx::query(&sql)
+            .bind(cid)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(PdsError::Database)?;
+
+        let Some(row) = row else {
+            return Ok(UnreferenceOutcome::OrphanedRef);
+        };
+
+        let temp_key: Option<String> = row.try_get("temp_key").map_err(PdsError::Database)?;
+        // sqlx::Any returns EXISTS as INTEGER 0/1 on SQLite, BOOLEAN
+        // on Postgres — route through the canonical read_bool helper
+        // (same pattern as Arc 13 #71 + #86 fixes).
+        let refs_remain: bool = crate::db::read_bool(&row, "refs_remain")?;
+
+        match (temp_key.is_some(), refs_remain) {
+            (true, true) => Ok(UnreferenceOutcome::AlreadyUntethered_RefsRemain),
+            (true, false) => Ok(UnreferenceOutcome::AlreadyUntethered_NoRefs),
+            (false, true) => Ok(UnreferenceOutcome::OtherRefsRemain),
+            (false, false) => {
+                // Last ref dropped on a permanent row. Re-mark
+                // untethered with fresh TTL anchor.
+                sqlx::query(
+                    "UPDATE blob_metadata SET temp_key = '1', created_at = $1 WHERE cid = $2",
+                )
+                .bind(now.to_rfc3339())
+                .bind(cid)
+                .execute(&mut **tx)
+                .await
+                .map_err(PdsError::Database)?;
+                Ok(UnreferenceOutcome::LastRefDropped)
+            }
+        }
+    }
+
+    /// Arc 16b §9.2.3.2 — `is_untethered`: observability helper.
+    /// `Ok(true)` iff `blob_metadata` row exists with `temp_key NOT
+    /// NULL`; `Ok(false)` if row absent or `temp_key NULL`.
+    ///
+    /// Observability caveat: observes committed state only — cannot
+    /// reflect uncommitted writes in any in-flight transaction
+    /// (including the caller's own). NOT a control primitive.
+    pub async fn is_untethered(&self, cid: &str) -> PdsResult<bool> {
+        let row = sqlx::query("SELECT temp_key FROM blob_metadata WHERE cid = $1")
+            .bind(cid)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        Ok(row
+            .and_then(|r| r.try_get::<Option<String>, _>("temp_key").ok().flatten())
+            .is_some())
+    }
+}
+
+/// Arc 16b §9.2.3.2 — outcome of `unreference_blob`. Six variants
+/// (round-5 F1 + F3 closures) surface races and inconsistencies
+/// explicitly rather than papering over. See §9.2.3.2 caller
+/// obligations table for log-level + escalation guidance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+#[allow(dead_code)]
+pub enum UnreferenceOutcome {
+    /// DELETE removed a real ref; that ref was the last one; blob
+    /// re-marked untethered (TTL anchor refreshed). Normal path.
+    LastRefDropped,
+    /// DELETE removed a real ref; other refs remain; blob stays
+    /// permanent. Normal path.
+    OtherRefsRemain,
+    /// DELETE removed 0 rows because the (cid, record_uri) pair was
+    /// not present. No state change. Caller MAY log at DEBUG;
+    /// indicates caller-side bug, idempotent retry, or concurrent
+    /// `unreference_blob` on the same pair.
+    PhantomDelete,
+    /// DELETE removed a real ref; `blob_metadata` row was already
+    /// untethered AND other refs remain. Deep inconsistency: TTL
+    /// anchor was "live" while the row was referenced. Caller SHOULD
+    /// log at ERROR.
+    AlreadyUntethered_RefsRemain,
+    /// DELETE removed a real ref; `blob_metadata` row was already
+    /// untethered AND no other refs remain. Mild anomaly: the
+    /// `record_blob` row was a stray. Caller SHOULD log at WARN.
+    AlreadyUntethered_NoRefs,
+    /// DELETE removed a real ref but no `blob_metadata` row exists
+    /// for the CID. Defensive-against-corruption: reachable via
+    /// operator intervention, FK-disabled replicas, DB corruption,
+    /// or backup-restore inconsistency. Per Step 0.2 Item 10 recon
+    /// the expected FK + cascade is NOT yet in place; this variant
+    /// is therefore reachable via normal-but-incorrect call orderings
+    /// today (Arc 16c integration discipline + v0.6+ FK hardening
+    /// would close those gaps). Caller SHOULD log at ERROR.
+    OrphanedRef,
 }
 
 #[cfg(test)]
@@ -922,6 +1198,7 @@ mod tests {
             .unwrap();
 
         // Create blob_metadata table with new columns
+        // (Arc 16b §9.2.3.1: includes temp_key column + CHECK).
         sqlx::query(
             r#"
             CREATE TABLE blob_metadata (
@@ -933,7 +1210,8 @@ mod tests {
                 width INTEGER,
                 height INTEGER,
                 alt_text TEXT,
-                thumbnail_cid TEXT
+                thumbnail_cid TEXT,
+                temp_key TEXT NULL CHECK (temp_key IS NULL OR temp_key = '1')
             )
             "#,
         )
@@ -1194,5 +1472,383 @@ mod tests {
             0,
             "committed tx must remove the metadata row"
         );
+    }
+
+    // ============================================================
+    // Arc 16b §9.2.3.2 lifecycle helper tests (chainlink #91)
+    // Per §9.2.4 Step 3.7. Recon-driven: no FK between record_blob
+    // and blob_metadata (Step 0.2 Item 10), so OrphanedRef setup
+    // does NOT need FK disablement.
+    // ============================================================
+
+    /// Fresh in-memory `BlobStore` with the Arc-16b schema applied
+    /// (blob_metadata with temp_key + CHECK; record_blob). Returns
+    /// the store + the underlying pool (tests need direct pool
+    /// access for SQL setup + verification).
+    async fn arc16b_store() -> (BlobStore, sqlx::AnyPool) {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"CREATE TABLE blob_metadata (
+                cid TEXT PRIMARY KEY,
+                mime_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                creator_did TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                width INTEGER,
+                height INTEGER,
+                alt_text TEXT,
+                thumbnail_cid TEXT,
+                temp_key TEXT NULL CHECK (temp_key IS NULL OR temp_key = '1')
+            )"#,
+        )
+        .execute(&pool).await.unwrap();
+        sqlx::query(
+            r#"CREATE TABLE record_blob (
+                blob_cid TEXT NOT NULL,
+                record_uri TEXT NOT NULL,
+                indexed_at TEXT NOT NULL,
+                PRIMARY KEY (blob_cid, record_uri)
+            )"#,
+        )
+        .execute(&pool).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = BlobStoreConfig {
+            storage: BlobStorageConfig {
+                backend: BlobBackendType::Disk { location: dir.path().to_path_buf() },
+                max_blob_size: 1024 * 1024,
+                temp_dir: dir.path().join("tmp"),
+            },
+        };
+        let store = BlobStore::new(config, pool.clone()).await.unwrap();
+        (store, pool)
+    }
+
+    async fn read_temp_key(pool: &sqlx::AnyPool, cid: &str) -> Option<String> {
+        let row = sqlx::query("SELECT temp_key FROM blob_metadata WHERE cid = $1")
+            .bind(cid)
+            .fetch_optional(pool)
+            .await
+            .unwrap()?;
+        row.try_get::<Option<String>, _>("temp_key").ok().flatten()
+    }
+
+    async fn metadata_exists(pool: &sqlx::AnyPool, cid: &str) -> bool {
+        sqlx::query("SELECT 1 FROM blob_metadata WHERE cid = $1")
+            .bind(cid)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    async fn record_blob_count(pool: &sqlx::AnyPool, cid: &str) -> i64 {
+        let row = sqlx::query("SELECT COUNT(*) AS c FROM record_blob WHERE blob_cid = $1")
+            .bind(cid)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        row.try_get::<i64, _>("c").unwrap()
+    }
+
+    // ---- track_untethered_blob: 3 cases ----
+
+    #[tokio::test]
+    async fn track_untethered_case_1_row_absent_inserts_with_temp_key() {
+        let (store, pool) = arc16b_store().await;
+        let mut tx = pool.begin().await.unwrap();
+        store.track_untethered_blob(
+            &mut tx, "bafyrei-c1", "image/png", 100, "did:plc:alice",
+            chrono::Utc::now(),
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(read_temp_key(&pool, "bafyrei-c1").await.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn track_untethered_case_2_already_permanent_no_state_change() {
+        let (store, pool) = arc16b_store().await;
+        // Seed a permanent row (temp_key NULL).
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ('bafyrei-c2', 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', NULL)",
+        )
+        .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        store.track_untethered_blob(
+            &mut tx, "bafyrei-c2", "image/png", 100, "did:plc:alice",
+            chrono::Utc::now(),
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        // Row stays permanent; track_untethered does NOT flip permanent → untethered.
+        assert!(read_temp_key(&pool, "bafyrei-c2").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn track_untethered_case_3_already_untethered_refreshes_created_at() {
+        let (store, pool) = arc16b_store().await;
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ('bafyrei-c3', 'image/png', 100, 'did:plc:alice', '2020-01-01T00:00:00Z', '1')",
+        )
+        .execute(&pool).await.unwrap();
+        let new_now = chrono::DateTime::parse_from_rfc3339("2026-05-19T12:00:00Z")
+            .unwrap().with_timezone(&chrono::Utc);
+        let mut tx = pool.begin().await.unwrap();
+        store.track_untethered_blob(
+            &mut tx, "bafyrei-c3", "image/png", 100, "did:plc:alice", new_now,
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        let row = sqlx::query("SELECT created_at FROM blob_metadata WHERE cid = 'bafyrei-c3'")
+            .fetch_one(&pool).await.unwrap();
+        let ts: String = row.try_get("created_at").unwrap();
+        assert!(ts.starts_with("2026-05-19"), "created_at refreshed; got {}", ts);
+    }
+
+    // ---- STRICT: 4 cases ----
+
+    #[tokio::test]
+    async fn strict_success_makes_permanent_and_inserts_record_blob() {
+        let (store, pool) = arc16b_store().await;
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ('bafyrei-s1', 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', '1')",
+        )
+        .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        store.verify_blob_and_make_permanent(
+            &mut tx, "bafyrei-s1", "at://did:plc:alice/app.bsky.feed.post/abc",
+            chrono::Utc::now(),
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(read_temp_key(&pool, "bafyrei-s1").await.is_none(), "temp_key cleared");
+        assert_eq!(record_blob_count(&pool, "bafyrei-s1").await, 1);
+    }
+
+    #[tokio::test]
+    async fn strict_errors_blob_not_found_when_row_absent() {
+        let (store, pool) = arc16b_store().await;
+        let mut tx = pool.begin().await.unwrap();
+        let result = store.verify_blob_and_make_permanent(
+            &mut tx, "bafyrei-missing", "at://x/y/z", chrono::Utc::now(),
+        ).await;
+        match result {
+            Err(PdsError::BlobNotFound(cid)) => assert_eq!(cid, "bafyrei-missing"),
+            other => panic!("expected BlobNotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_idempotent_same_pair_no_op_on_retry() {
+        let (store, pool) = arc16b_store().await;
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ('bafyrei-s3', 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', '1')",
+        )
+        .execute(&pool).await.unwrap();
+        for _ in 0..3 {
+            let mut tx = pool.begin().await.unwrap();
+            store.verify_blob_and_make_permanent(
+                &mut tx, "bafyrei-s3", "at://did:plc:alice/coll/rkey",
+                chrono::Utc::now(),
+            ).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(record_blob_count(&pool, "bafyrei-s3").await, 1, "still single ref");
+    }
+
+    #[tokio::test]
+    async fn strict_succeeds_on_already_permanent_row() {
+        let (store, pool) = arc16b_store().await;
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ('bafyrei-s4', 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', NULL)",
+        )
+        .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        store.verify_blob_and_make_permanent(
+            &mut tx, "bafyrei-s4", "at://did:plc:alice/coll/rkey",
+            chrono::Utc::now(),
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(read_temp_key(&pool, "bafyrei-s4").await.is_none());
+        assert_eq!(record_blob_count(&pool, "bafyrei-s4").await, 1);
+    }
+
+    // ---- unreference_blob: 6 outcomes ----
+
+    async fn seed_permanent_with_refs(pool: &sqlx::AnyPool, cid: &str, uris: &[&str]) {
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ($1, 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', NULL)",
+        )
+        .bind(cid).execute(pool).await.unwrap();
+        for uri in uris {
+            sqlx::query(
+                "INSERT INTO record_blob (blob_cid, record_uri, indexed_at) \
+                 VALUES ($1, $2, '2026-01-01T00:00:00Z')",
+            )
+            .bind(cid).bind(uri).execute(pool).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unreference_last_ref_dropped_re_untethers() {
+        let (store, pool) = arc16b_store().await;
+        seed_permanent_with_refs(&pool, "bafyrei-u1", &["at://x/y/1"]).await;
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store.unreference_blob(
+            &mut tx, "bafyrei-u1", "at://x/y/1", chrono::Utc::now(),
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(outcome, UnreferenceOutcome::LastRefDropped);
+        assert_eq!(read_temp_key(&pool, "bafyrei-u1").await.as_deref(), Some("1"));
+        assert_eq!(record_blob_count(&pool, "bafyrei-u1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn unreference_other_refs_remain_stays_permanent() {
+        let (store, pool) = arc16b_store().await;
+        seed_permanent_with_refs(&pool, "bafyrei-u2", &["at://x/y/1", "at://x/y/2"]).await;
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store.unreference_blob(
+            &mut tx, "bafyrei-u2", "at://x/y/1", chrono::Utc::now(),
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(outcome, UnreferenceOutcome::OtherRefsRemain);
+        assert!(read_temp_key(&pool, "bafyrei-u2").await.is_none(), "stays permanent");
+        assert_eq!(record_blob_count(&pool, "bafyrei-u2").await, 1);
+    }
+
+    #[tokio::test]
+    async fn unreference_phantom_delete_no_state_change() {
+        let (store, pool) = arc16b_store().await;
+        seed_permanent_with_refs(&pool, "bafyrei-u3", &["at://x/y/1"]).await;
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store.unreference_blob(
+            &mut tx, "bafyrei-u3", "at://nonexistent/uri", chrono::Utc::now(),
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(outcome, UnreferenceOutcome::PhantomDelete);
+        assert!(read_temp_key(&pool, "bafyrei-u3").await.is_none(), "row unchanged");
+        assert_eq!(record_blob_count(&pool, "bafyrei-u3").await, 1);
+    }
+
+    #[tokio::test]
+    async fn unreference_already_untethered_refs_remain_deep_inconsistency() {
+        let (store, pool) = arc16b_store().await;
+        // Fabricated state: row temp_key='1' BUT refs exist (deep inconsistency).
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ('bafyrei-u4', 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', '1')",
+        )
+        .execute(&pool).await.unwrap();
+        for uri in &["at://x/y/1", "at://x/y/2"] {
+            sqlx::query(
+                "INSERT INTO record_blob (blob_cid, record_uri, indexed_at) \
+                 VALUES ('bafyrei-u4', $1, '2026-01-01T00:00:00Z')",
+            )
+            .bind(uri).execute(&pool).await.unwrap();
+        }
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store.unreference_blob(
+            &mut tx, "bafyrei-u4", "at://x/y/1", chrono::Utc::now(),
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(outcome, UnreferenceOutcome::AlreadyUntethered_RefsRemain);
+    }
+
+    #[tokio::test]
+    async fn unreference_already_untethered_no_refs_mild_anomaly() {
+        let (store, pool) = arc16b_store().await;
+        // Fabricated state: row temp_key='1' AND a stray record_blob row for the same cid.
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ('bafyrei-u5', 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', '1')",
+        )
+        .execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO record_blob (blob_cid, record_uri, indexed_at) \
+             VALUES ('bafyrei-u5', 'at://stray/ref/1', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store.unreference_blob(
+            &mut tx, "bafyrei-u5", "at://stray/ref/1", chrono::Utc::now(),
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(outcome, UnreferenceOutcome::AlreadyUntethered_NoRefs);
+    }
+
+    /// chainlink #91 / §9.2 / Step 0.2 Item 10 recon: no FK exists
+    /// between record_blob and blob_metadata, so orphan-fabrication
+    /// requires no FK disablement.
+    #[tokio::test]
+    async fn unreference_orphaned_ref_defensive_against_corruption() {
+        let (store, pool) = arc16b_store().await;
+        // Fabricated state: record_blob row exists with NO corresponding blob_metadata row.
+        sqlx::query(
+            "INSERT INTO record_blob (blob_cid, record_uri, indexed_at) \
+             VALUES ('bafyrei-orphan', 'at://x/y/1', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store.unreference_blob(
+            &mut tx, "bafyrei-orphan", "at://x/y/1", chrono::Utc::now(),
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(outcome, UnreferenceOutcome::OrphanedRef);
+    }
+
+    // ---- is_untethered: 3 states ----
+
+    #[tokio::test]
+    async fn is_untethered_true_when_row_has_temp_key() {
+        let (store, pool) = arc16b_store().await;
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ('bafyrei-i1', 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', '1')",
+        )
+        .execute(&pool).await.unwrap();
+        assert!(store.is_untethered("bafyrei-i1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_untethered_false_when_row_is_permanent() {
+        let (store, pool) = arc16b_store().await;
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ('bafyrei-i2', 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', NULL)",
+        )
+        .execute(&pool).await.unwrap();
+        assert!(!store.is_untethered("bafyrei-i2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_untethered_false_when_row_absent() {
+        let (store, pool) = arc16b_store().await;
+        assert!(!store.is_untethered("bafyrei-missing").await.unwrap());
+    }
+
+    // ---- CHECK constraint ----
+
+    /// §9.2.3.1 CHECK constraint: temp_key must be NULL or '1'.
+    /// Direct INSERT with disallowed value must error.
+    #[tokio::test]
+    async fn check_constraint_rejects_unexpected_temp_key_value() {
+        let (store, pool) = arc16b_store().await;
+        let result = sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ('bafyrei-bad', 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', 'unexpected')",
+        )
+        .execute(&pool).await;
+        assert!(result.is_err(), "CHECK constraint must reject temp_key not in {{NULL, '1'}}");
+        assert!(!metadata_exists(&pool, "bafyrei-bad").await);
     }
 }

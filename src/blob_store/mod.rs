@@ -16,7 +16,7 @@ pub use models::*;
 // then the re-export is unused at bin-scope. The allow lifts in Phase 2.
 #[allow(unused_imports)]
 pub use s3::{S3BlobBackend, S3Config};
-pub use store::{BlobStore, BlobStoreConfig};
+pub use store::{BlobStore, BlobStoreConfig, UnreferenceOutcome};
 
 use crate::error::PdsResult;
 use async_trait::async_trait;
