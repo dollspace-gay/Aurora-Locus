@@ -405,6 +405,43 @@ mod tests {
         );
     }
 
+    /// Arc 15 §8.3.7 / §8.6.3 / Step 1.7 (M2 wire-absence
+    /// regression pin): `IdentityEvent.handle = None` MUST cause
+    /// the `"handle"` key to be ABSENT from the encoded body's CBOR
+    /// map (NOT present-with-null). Per Sub-step 0.3(d) recon, the
+    /// builder owns this discipline directly (serde attributes are
+    /// inert in the wire path). This test pins the contract so a
+    /// future refactor that removes the `if let Some(h) = handle`
+    /// guard in `identity_body_to_lex_value` fails loudly.
+    #[test]
+    fn identity_handle_none_omits_key_from_wire() {
+        let body = identity_body_to_lex_value(1, "did:plc:abc", "2026-05-19T00:00:00Z", None);
+        let bytes = lex_cbor::encode(&body).expect("encode");
+        // "handle" key = 6 chars → CBOR text-string-6 prefix 0x66.
+        let handle_key: &[u8] = b"\x66handle";
+        assert!(
+            !bytes.windows(handle_key.len()).any(|w| w == handle_key),
+            "handle key MUST be absent when handle = None; got: {:02x?}",
+            bytes
+        );
+    }
+
+    /// Arc 15 §8.3.5: `IdentityEvent.handle = Some(...)` (used by
+    /// the reactivation three-emit sequence) DOES include the key.
+    /// Counter-test to the wire-absence pin.
+    #[test]
+    fn identity_handle_some_includes_key_on_wire() {
+        let body =
+            identity_body_to_lex_value(1, "did:plc:abc", "2026-05-19T00:00:00Z", Some("a.test"));
+        let bytes = lex_cbor::encode(&body).expect("encode");
+        let handle_key: &[u8] = b"\x66handle";
+        assert!(
+            bytes.windows(handle_key.len()).any(|w| w == handle_key),
+            "handle key MUST be present when handle = Some(...); got: {:02x?}",
+            bytes
+        );
+    }
+
     /// Arc 14 §7.3.2 / §7.6.2: genesis commit body MUST NOT contain
     /// the `"prevData"` key. Verify via byte-level absence check.
     #[test]

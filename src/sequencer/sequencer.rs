@@ -174,7 +174,6 @@ impl Sequencer {
     }
 
     /// Sequence an account event
-    #[allow(dead_code)] // Will be used when implementing account status changes
     pub async fn sequence_account(&self, evt: AccountEvent) -> PdsResult<i64> {
         self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)
@@ -188,6 +187,47 @@ impl Sequencer {
         self.publish_to_relay("account", &evt.did, seq, None).await;
 
         Ok(seq)
+    }
+
+    /// Arc 15 §8.3.3 — retention helper for the deletion path:
+    /// wipe every `repo_seq` row for `did` EXCEPT the seqs listed in
+    /// `excluding`. Used by `delete_account` to retain the deletion
+    /// `#account` event while clearing prior history.
+    ///
+    /// Two-await non-atomic semantics with the preceding
+    /// `sequence_account(Deleted)` call — matches bsky-PDS pattern;
+    /// race window documented in §8.5.5. Consumers
+    /// duplicate-suppress on `did`.
+    pub async fn delete_all_for_user(
+        &self,
+        did: &str,
+        excluding: &[i64],
+    ) -> PdsResult<u64> {
+        self.check_leader()?;
+        let result = if excluding.is_empty() {
+            sqlx::query("DELETE FROM repo_seq WHERE did = $1")
+                .bind(did)
+                .execute(&self.db)
+                .await
+                .map_err(PdsError::Database)?
+        } else {
+            // Build the NOT IN clause inline — `excluding` is
+            // operator-controlled (handler-supplied seqs only;
+            // not user input) so binding as integers is safe.
+            let placeholders: Vec<String> = (2..=excluding.len() + 1)
+                .map(|i| format!("${}", i))
+                .collect();
+            let sql = format!(
+                "DELETE FROM repo_seq WHERE did = $1 AND seq NOT IN ({})",
+                placeholders.join(",")
+            );
+            let mut q = sqlx::query(&sql).bind(did);
+            for seq in excluding {
+                q = q.bind(*seq);
+            }
+            q.execute(&self.db).await.map_err(PdsError::Database)?
+        };
+        Ok(result.rows_affected())
     }
 
     /// Insert event into database
@@ -637,6 +677,98 @@ mod tests {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let result = sequencer.earliest_after_time(future).await.unwrap();
         assert_eq!(result, None);
+    }
+
+    /// Arc 15 §8.3.3 / Step 1.4: `delete_all_for_user` with an empty
+    /// `excluding` list removes every event for the DID.
+    #[tokio::test]
+    async fn test_delete_all_for_user_wipes_when_excluding_empty() {
+        let sequencer = create_test_sequencer().await;
+        for i in 1..=3 {
+            sequencer
+                .sequence_commit(CommitEvent::new(
+                    "did:plc:alice".to_string(),
+                    format!("bafyrei{}", i),
+                    "3".to_string(),
+                    None,
+                    None,
+                    vec![],
+                    vec![],
+                ))
+                .await
+                .unwrap();
+        }
+        let removed = sequencer.delete_all_for_user("did:plc:alice", &[]).await.unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(sequencer.current_seq().await.unwrap(), None);
+    }
+
+    /// Arc 15 §8.3.3 / Step 1.4: with `excluding = [retain_seq]`,
+    /// only the retained seq survives the DID's wipe. Matches the
+    /// `delete_account` two-await sequence (sequence_account first,
+    /// then delete_all_for_user excluding the deletion seq).
+    #[tokio::test]
+    async fn test_delete_all_for_user_retains_excluded_seqs() {
+        let sequencer = create_test_sequencer().await;
+        for i in 1..=3 {
+            sequencer
+                .sequence_commit(CommitEvent::new(
+                    "did:plc:bob".to_string(),
+                    format!("bafyrei{}", i),
+                    "3".to_string(),
+                    None,
+                    None,
+                    vec![],
+                    vec![],
+                ))
+                .await
+                .unwrap();
+        }
+        // Seq 1, 2, 3 exist. Retain seq=2.
+        let removed = sequencer.delete_all_for_user("did:plc:bob", &[2]).await.unwrap();
+        assert_eq!(removed, 2);
+        // Verify only seq 2 remains.
+        let row = sqlx::query("SELECT seq FROM repo_seq WHERE did = $1")
+            .bind("did:plc:bob")
+            .fetch_one(&sequencer.db)
+            .await
+            .unwrap();
+        let seq: i64 = row.try_get("seq").unwrap();
+        assert_eq!(seq, 2);
+    }
+
+    /// Arc 15 §8.3.3 / Step 1.4: events for other DIDs are NOT touched.
+    #[tokio::test]
+    async fn test_delete_all_for_user_scoped_to_did() {
+        let sequencer = create_test_sequencer().await;
+        sequencer
+            .sequence_commit(CommitEvent::new(
+                "did:plc:alice".to_string(),
+                "bafyrei-alice".to_string(),
+                "3".to_string(),
+                None,
+                None,
+                vec![],
+                vec![],
+            ))
+            .await
+            .unwrap();
+        sequencer
+            .sequence_commit(CommitEvent::new(
+                "did:plc:bob".to_string(),
+                "bafyrei-bob".to_string(),
+                "3".to_string(),
+                None,
+                None,
+                vec![],
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let removed = sequencer.delete_all_for_user("did:plc:alice", &[]).await.unwrap();
+        assert_eq!(removed, 1);
+        // bob's event still present.
+        assert_eq!(sequencer.current_seq().await.unwrap(), Some(2));
     }
 
     /// Arc 14 §7.4 Step 3: with events present, `earliest_after_time`

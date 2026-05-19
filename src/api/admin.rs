@@ -1891,6 +1891,27 @@ async fn takedown_account(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Arc 15 §8.3.6: emit Takendown #account event (Pattern B).
+    // Reverse-takedown deferred to v0.6+ per §8.1.2.
+    let acc_post = ctx
+        .account_manager
+        .get_account(&req.did)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let (active, status) = crate::api::sync_helpers::get_account_status(&acc_post);
+    debug_assert_eq!(
+        status,
+        Some(crate::sequencer::events::AccountStatus::Takendown)
+    );
+    ctx.sequencer
+        .sequence_account(crate::sequencer::events::AccountEvent {
+            did: req.did.clone(),
+            active,
+            status,
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     Ok(Json(serde_json::json!({
         "success": true,
         "moderation_id": record.id,

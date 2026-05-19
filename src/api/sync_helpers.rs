@@ -4,7 +4,9 @@
 
 use crate::{
     account::AccountManager,
+    db::account::ActorAccount,
     error::{PdsError, PdsResult},
+    sequencer::events::AccountStatus,
 };
 
 /// Check if repository is available for sync access
@@ -69,6 +71,34 @@ pub async fn assert_repo_availability(
     Ok(())
 }
 
+/// Arc 15 §8.3.2 — derive emit-side account status from an account
+/// row. Matches bsky-PDS's `formatAccountStatus` body. Used by the
+/// account-lifecycle handlers (deactivate / reactivate / takedown)
+/// when they invoke `sequence_account` per Pattern B (status from
+/// freshly-read row).
+///
+/// Branches only on `takedown_ref` + `deactivated_at` — the
+/// wire-emission set per §8.1.1 is 4: Active, Takendown,
+/// Deactivated, Deleted. Suspended/Desynchronized/Throttled are
+/// out of v0.5 wire-emission scope (Arc 14's 6-variant enum is
+/// forward-compatibility); callers that need them emit via
+/// `AccountEvent::from_status` directly with the relevant variant.
+///
+/// `Deleted` is never returned here — the row is gone by the time
+/// the delete-emit fires; use `AccountEvent::from_status(did,
+/// Deleted)` at the call site (Pattern A).
+pub fn get_account_status(
+    account: &ActorAccount,
+) -> (bool, Option<AccountStatus>) {
+    if account.takedown_ref.is_some() {
+        (false, Some(AccountStatus::Takendown))
+    } else if account.deactivated_at.is_some() {
+        (false, Some(AccountStatus::Deactivated))
+    } else {
+        (true, None)
+    }
+}
+
 /// Get repository status for sync endpoints (Arc 14 §7.3.8 + §7.1.2).
 ///
 /// Returns (active, status) tuple where:
@@ -107,6 +137,55 @@ pub fn get_repo_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    fn _mk_account(
+        takedown: Option<&str>,
+        deactivated: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> ActorAccount {
+        ActorAccount {
+            did: "did:plc:test".into(),
+            handle: Some("test.localhost".into()),
+            created_at: Utc::now(),
+            takedown_ref: takedown.map(|s| s.to_string()),
+            deactivated_at: deactivated,
+            delete_after: None,
+            suspended_at: None,
+            desynchronized_at: None,
+            email: None,
+            password_hash: None,
+            email_confirmed_at: None,
+            invites_disabled: Some(false),
+        }
+    }
+
+    /// Arc 15 §8.3.2: active account → (true, None).
+    #[test]
+    fn get_account_status_active() {
+        let acc = _mk_account(None, None);
+        assert_eq!(get_account_status(&acc), (true, None));
+    }
+
+    /// Arc 15 §8.3.2: takendown → (false, Some(Takendown)).
+    #[test]
+    fn get_account_status_takendown() {
+        let acc = _mk_account(Some("admin-action"), None);
+        assert_eq!(get_account_status(&acc), (false, Some(AccountStatus::Takendown)));
+    }
+
+    /// Arc 15 §8.3.2: deactivated → (false, Some(Deactivated)).
+    #[test]
+    fn get_account_status_deactivated() {
+        let acc = _mk_account(None, Some(Utc::now()));
+        assert_eq!(get_account_status(&acc), (false, Some(AccountStatus::Deactivated)));
+    }
+
+    /// Arc 15 §8.3.2: takedown takes precedence over deactivated.
+    #[test]
+    fn get_account_status_takedown_precedence() {
+        let acc = _mk_account(Some("admin-action"), Some(Utc::now()));
+        assert_eq!(get_account_status(&acc), (false, Some(AccountStatus::Takendown)));
+    }
 
     #[test]
     fn test_get_repo_status_active() {

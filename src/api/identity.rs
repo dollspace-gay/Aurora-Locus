@@ -921,6 +921,20 @@ pub async fn submit_plc_operation(
     // Invalidate cached DID document so it'll be refreshed.
     ctx.identity_resolver.invalidate_did(&did).await?;
 
+    // Arc 15 §8.3.7: emit #identity event for the DID with handle
+    // ABSENT on the wire (signals "DID document changed but handle
+    // unchanged"). Per Sub-step 0.4 recon, all three §8.3.7
+    // conditions hold here, so append-after-success is acceptable
+    // under Arc 13's lock. The omit-if-none discipline is owned by
+    // the firehose encoder's `identity_body_to_lex_value` builder
+    // (Case M2 per Sub-step 0.3(d)).
+    ctx.sequencer
+        .sequence_identity(crate::sequencer::events::IdentityEvent {
+            did: did.clone(),
+            handle: None,
+        })
+        .await?;
+
     Ok(Json(()))
 }
 

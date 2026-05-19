@@ -487,6 +487,26 @@ impl AccountManager {
     /// Get account by DID
     ///
     /// Joins actor and account tables to get complete actor information.
+    /// Arc 15 §8.3.8 / Step 6: load the actor's `atproto_signing_key`
+    /// (per Arc 13 §6.3.2 key separation) from `plc_keys`. Used by
+    /// `create_account_emit_sequence` to construct the genesis-commit
+    /// Signer. Returns the 32-byte private-key bytes (decoded from
+    /// hex). Errors if the row is missing or the hex is malformed.
+    pub async fn get_atproto_signing_key_bytes(&self, did: &str) -> PdsResult<Vec<u8>> {
+        let row = sqlx::query("SELECT atproto_signing_key FROM plc_keys WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(PdsError::Database)?
+            .ok_or_else(|| {
+                PdsError::NotFound(format!("plc_keys row missing for did={}", did))
+            })?;
+        let hex_key: String = row.try_get("atproto_signing_key").map_err(PdsError::Database)?;
+        hex::decode(&hex_key).map_err(|e| {
+            PdsError::Internal(format!("atproto_signing_key for {} is malformed hex: {}", did, e))
+        })
+    }
+
     pub async fn get_account(&self, did: &str) -> PdsResult<ActorAccount> {
         let row = sqlx::query(
             "SELECT

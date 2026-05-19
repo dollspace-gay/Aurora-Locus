@@ -43,7 +43,7 @@ use proto_blue::lex_data::Cid;
 use proto_blue::lex_json::json_to_lex;
 use proto_blue::repo::{
     block_map::BlockMap, car::blocks_to_car, error::RepoError as ProtoRepoError,
-    storage::RepoStorage, Repo, RepoWrite,
+    storage::RepoStorage, CommitData, Repo, RepoWrite,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -136,6 +136,136 @@ impl RepositoryManager {
     pub async fn initialize(&self) -> PdsResult<()> {
         self.store.create(&self.did).await?;
         Ok(())
+    }
+
+    /// Arc 15 §8.3.8 / Step 6: explicitly produce a genesis commit
+    /// for a freshly-initialized actor. Used by
+    /// `create_account_emit_sequence` to obtain the `CommitData`
+    /// needed for the `#commit` (genesis) and `#sync` emits per the
+    /// four-frame sequence.
+    ///
+    /// Per Sub-step 0.1 recon: Aurora-Locus's `initialize()` does
+    /// NOT create the genesis commit — proto-blue's `Repo::create`
+    /// is invoked lazily on first `apply_writes`. This helper makes
+    /// the creation explicit so createAccount can sequence the
+    /// genesis frame at account-creation time (matching bsky-PDS
+    /// fidelity per §8.1).
+    ///
+    /// Runs on a blocking thread per the same discipline as
+    /// `apply_writes`. Errors if a commit already exists (genesis
+    /// MUST be the first commit; calling this on an already-seeded
+    /// repo is a caller bug).
+    pub async fn create_genesis_commit(
+        &self,
+        signer: Arc<dyn Signer>,
+    ) -> PdsResult<CommitData> {
+        let storage = self.make_storage();
+        let did = self.did.clone();
+        let signer_arc = signer;
+
+        let result: Result<CommitData, ProtoRepoError> =
+            tokio::task::spawn_blocking(move || -> Result<_, ProtoRepoError> {
+                let storage_dyn: Arc<dyn RepoStorage> = storage.clone();
+                // Refuse if storage already has a root (caller bug).
+                if storage_dyn.get_root()?.is_some() {
+                    return Err(ProtoRepoError::Storage(
+                        "create_genesis_commit called on a non-empty repo".into(),
+                    ));
+                }
+                let repo = Repo::create(storage_dyn.clone(), did, signer_arc.as_ref())?;
+
+                let commit_cid = repo.commit_cid().cloned().ok_or_else(|| {
+                    ProtoRepoError::Storage("Repo::create did not populate commit_cid".into())
+                })?;
+                let commit = repo.commit().cloned().ok_or_else(|| {
+                    ProtoRepoError::Storage("Repo::create did not populate commit".into())
+                })?;
+                let mst_root = commit.data.clone();
+
+                let mut blocks = BlockMap::new();
+                let commit_bytes = storage_dyn.get_block(&commit_cid)?.ok_or_else(|| {
+                    ProtoRepoError::Storage(format!(
+                        "genesis commit block {} missing from storage post-create",
+                        commit_cid
+                    ))
+                })?;
+                let mst_bytes = storage_dyn.get_block(&mst_root)?.ok_or_else(|| {
+                    ProtoRepoError::Storage(format!(
+                        "genesis MST root {} missing from storage post-create",
+                        mst_root
+                    ))
+                })?;
+                blocks.set(commit_cid.clone(), commit_bytes);
+                blocks.set(mst_root, mst_bytes);
+
+                Ok(CommitData {
+                    commit_cid,
+                    commit,
+                    blocks,
+                    removed_cids: Vec::new(),
+                })
+            })
+            .await
+            .map_err(|e| PdsError::Internal(format!("genesis commit join failed: {}", e)))?;
+
+        result.map_err(|e| PdsError::Internal(format!("genesis commit creation failed: {}", e)))
+    }
+
+    /// Arc 15 Sub-step 0.3(a) projection helper: load the current
+    /// repo and produce a `SyncEvtData` containing the minimal block
+    /// slice (commit block + MST root block) suitable for a `#sync`
+    /// frame. Used by the reactivate path (§8.3.5) where no fresh
+    /// commit is produced but a sync emit is still required.
+    ///
+    /// Runs `Repo::load` on a blocking thread per the same discipline
+    /// as `apply_writes` (the storage adapter's `block_on` would
+    /// dead-lock a worker thread).
+    pub async fn current_sync_event_data(
+        &self,
+    ) -> PdsResult<crate::sequencer::events::SyncEvtData> {
+        let storage = self.make_storage();
+        let storage_dyn: Arc<dyn RepoStorage> = storage;
+
+        let projection: Result<crate::sequencer::events::SyncEvtData, ProtoRepoError> =
+            tokio::task::spawn_blocking(move || -> Result<_, ProtoRepoError> {
+                let repo = Repo::load(storage_dyn.clone())?;
+                let commit_cid = repo
+                    .commit_cid()
+                    .cloned()
+                    .ok_or_else(|| ProtoRepoError::Storage("empty repo; no current commit".into()))?;
+                let commit = repo
+                    .commit()
+                    .ok_or_else(|| ProtoRepoError::Storage("empty repo; no current commit".into()))?;
+                let mst_root = commit.data.clone();
+                let rev = commit.rev.clone();
+
+                let commit_bytes = storage_dyn.get_block(&commit_cid)?.ok_or_else(|| {
+                    ProtoRepoError::Storage(format!(
+                        "commit block {} missing from storage",
+                        commit_cid
+                    ))
+                })?;
+                let mst_bytes = storage_dyn.get_block(&mst_root)?.ok_or_else(|| {
+                    ProtoRepoError::Storage(format!(
+                        "MST root block {} missing from storage",
+                        mst_root
+                    ))
+                })?;
+
+                let mut blocks = BlockMap::new();
+                blocks.set(commit_cid.clone(), commit_bytes);
+                blocks.set(mst_root, mst_bytes);
+
+                Ok(crate::sequencer::events::SyncEvtData {
+                    cid: commit_cid,
+                    rev,
+                    blocks,
+                })
+            })
+            .await
+            .map_err(|e| PdsError::Internal(format!("sync data join failed: {}", e)))?;
+
+        projection.map_err(|e| PdsError::Internal(format!("sync data load failed: {}", e)))
     }
 
     /// Build the storage adapter for this actor.

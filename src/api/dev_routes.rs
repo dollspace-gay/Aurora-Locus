@@ -298,6 +298,24 @@ async fn create_account(
     );
     repo_mgr.initialize().await.map_err(http_error)?;
 
+    // Arc 15 §8.3.8: four-emit sequence at createAccount. Best-effort;
+    // emission failure does not fail account creation.
+    if let Some(ref handle) = account.handle {
+        if let Err(e) = crate::api::account_emit::create_account_emit_sequence(
+            &ctx,
+            &account.did,
+            handle,
+        )
+        .await
+        {
+            tracing::warn!(
+                did = %account.did,
+                error = %e,
+                "dev.aurora.createAccount: four-emit sequence failed (account created OK)"
+            );
+        }
+    }
+
     let session = ctx
         .account_manager
         .create_session(&account.did, None)

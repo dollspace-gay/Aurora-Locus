@@ -9,6 +9,7 @@ pub mod blob;
 #[cfg(debug_assertions)]
 pub mod dev_routes;
 pub mod federation;
+pub mod account_emit;
 pub mod firehose;
 pub mod firehose_encoder;
 pub mod health;

@@ -8,6 +8,104 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Arc 15 — Sequencer producer (v3.1)** (#81). Aurora-Locus's
+  firehose now emits on every account-lifecycle handler that
+  bsky-PDS does. Pre-Arc-15: 5 producer call sites (4 identity
+  + 1 commit), zero `#account` or `#sync` ever emitted. Post-Arc-15:
+  full coverage on createAccount, deactivate/reactivate, takedown,
+  delete, submitPlcOperation.
+  - **`#account` emissions** wired at four sites with two patterns
+    per §8.3.4 selection rule: Pattern A (`AccountEvent::from_status`
+    hardcoded status) at `delete_account` (Deleted, with prior-
+    history retention) and `createAccount` (Active); Pattern B
+    (`get_account_status` from freshly-read row) at
+    `deactivate_account`, `activate_account`, and admin
+    `takedown_account`.
+  - **`#sync` event** now actually emits — both at `createAccount`
+    (genesis commit projection) and `activate_account` (current
+    commit projection via the new
+    `RepositoryManager::current_sync_event_data` Sub-step 0.3(a)
+    helper).
+  - **createAccount four-emit sequence** (identity → account Active
+    → commit genesis → sync) via the new `account_emit` module.
+    Bridges Sub-step 0.1 recon Case B-with-wrinkle: Aurora-Locus's
+    `initialize()` doesn't seed a genesis commit, so the helper
+    invokes `Repo::create` explicitly via the new
+    `RepositoryManager::create_genesis_commit` method, then sequences
+    the resulting `CommitData` into the four-frame chain.
+  - **`submitPlcOperation` identity emit** at the success tail of
+    `src/api/identity.rs::submit_plc_operation` per Sub-step 0.4
+    recon (Case B, all three §8.3.7 conditions hold). `handle = None`
+    triggers the spec-mandated wire-absence: the `"handle"` key is
+    omitted from the encoded body's CBOR map (NOT
+    present-with-null). Existing `identity_body_to_lex_value`
+    builder already implements the omit-if-none discipline per
+    Sub-step 0.3(d) Case M2; Step 1.7 added a regression test
+    pinning the contract.
+  - **Three-emit reactivation** (`account → identity → sync`)
+    matches bsky-PDS verbatim. Concurrent-write interleaving
+    tolerated per round-1 F9 closure; `#sync` acts as resync
+    surface.
+  - **Deletion retention** via new `Sequencer::delete_all_for_user(did,
+    excluding)` helper: post-delete, prior `repo_seq` rows for the
+    DID are wiped; the deletion `#account` event is retained.
+    Two-await non-atomic per §8.5.5 (matches bsky-PDS; consumers
+    duplicate-suppress).
+  - **AccountStatus invariant-enforcing builders**:
+    `AccountEvent::from_status` and `AccountEvent::active` now
+    canonical-shape the emission. `get_account_status` helper in
+    `src/api/sync_helpers.rs` mirrors bsky-PDS's `formatAccountStatus`
+    body (4-status wire-emission scope per §8.1.1; Arc 14's
+    Suspended/Desynchronized/Throttled remain enum-extended but
+    out-of-scope for v0.5 wire emission).
+  - **`SyncEvtData` + projection helpers**: new struct in
+    `src/sequencer/events.rs` carries the minimal `BlockMap` slice
+    (commit block + MST root block) needed for the `#sync` frame.
+    `sync_evt_data_from_commit(commit_data)` projects from a fresh
+    `CommitData` (createAccount path);
+    `RepositoryManager::current_sync_event_data()` projects from the
+    current loaded repo (reactivate path). Both feed
+    `SyncEvent::from_sync_data` which CAR-encodes to the wire shape.
+
+  Producer-side size enforcement deferred to v0.6+ per §8.5.2 +
+  §8.3.10 (Aurora-Locus's typical commit sizes well under the 10 KB
+  lex limit per Sub-step 0.2 path verification). Sequencer pause
+  toggle remains dormant per §8.3.11. Reverse-takedown deferred to
+  v0.6+ per §8.1.2.
+
+  Three v0.5-blocker fixes surfaced during Phase B re-run and
+  landed in the same cycle:
+
+  - **#82 — activateAccount unreachable from deactivated state.**
+    `deactivate_account` deletes every session + refresh_token row
+    for the DID, and `login` rejects accounts with `deactivated_at`
+    set. The spec-compliant JWT path was therefore a one-way
+    trapdoor. `activate_account` now accepts an
+    optional `{handle, password}` body as an Aurora recovery path
+    in addition to the spec's JWT path. Documented divergence;
+    chainlink #82 tracks the rationale.
+  - **#83 — deactivateAccount off-spec body shape.**
+    Pre-fix required `{did, password, token}`; atproto lexicon
+    specifies JWT-auth + optional `deleteAfter` only. Rewritten
+    to match spec. `deleteAfter` accepted but logged + ignored
+    in v0.5 (no scheduled-deletion path from deactivate; clients
+    use `requestAccountDelete` for that).
+  - **#84 — admin auth surface undocumented.**
+    New operator doc at `docs/operator/admin-auth.md` covers the
+    bootstrap flow end-to-end: `grant-admin` CLI (offline-only,
+    PDS-liveness lock), session minting via `createSession` or
+    `dev.aurora.mintToken`, the 5-layer fallthrough auth model,
+    and revocation. No env-driven admin bootstrap (no
+    `PDS_ADMIN_*` vars by design); admin authority lives in the
+    `admin_roles` table and is queried at request time.
+
+  cargo test --locked --lib: **1065 passed, 0 failed**. Arc 12+13+14
+  integration regression: 19/19 PASS. Phase B operator-driven
+  scenarios at `docs/internal/arc15-phase-b-commands.md` cover all 5
+  scenarios (createAccount four-emit + account lifecycle chain +
+  deletion retention + submitPlcOperation wire-absence + size
+  non-enforcement); Scenarios 2.1/2.2/2.3 unblocked by #82/#83/#84.
+
 - **Arc 14 — Sequencer query/error vocabulary (v3.2)** (#75).
   Aurora-Locus's consumer-facing firehose moves to spec
   correctness. Six workstreams land together as one arc:
