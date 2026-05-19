@@ -6,6 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`signPlcOperation` HTTP 500 → HTTP 200/401** (#71). Arc 13
+  Phase B Scenario 5 surfaced `signPlcOperation` returning a
+  generic HTTP 500 with no observable error class on both initial-
+  call (expected 200) and re-call (expected 409). Root cause:
+  `validate_plc_operation_token` at `src/account/manager.rs` read
+  the `used` column via `row.try_get::<bool, _>("used")?`. SQLite
+  stores `BOOLEAN` as `INTEGER` (0/1) and `sqlx::Any`'s
+  `try_get<bool>` does not auto-coerce across backends, errors
+  with `Database: mismatched types; Rust type \`bool\` is not
+  compatible with SQL type \`BIGINT\``. The handler propagated
+  this as `PdsError::Database` → HTTP 500 with no per-step
+  logging, masking the actual cause from the operator. Fix: one-
+  line swap to `crate::db::read_bool(&row, "used")?` — the
+  canonical backend-dispatching helper already in use at 11+
+  other call sites in the same file. Phase B Scenario 5 re-run
+  confirmed: HTTP 200 with full signed op on first call, HTTP 401
+  `InvalidToken: plc_operation token has already been used` on
+  re-call (semantic correctness; the HTTP 401 vs spec 409 is the
+  Arc 13 documented divergence 2 — dedicated
+  `PdsError::InvalidToken` + `PdsError::TokenAlreadyConsumed`
+  variants land in v0.6 for the spec-correct 400 + 409 status
+  codes). Same bug pattern is latent in 4 sibling validators
+  (`confirm_email`, `reset_password`,
+  `validate_account_delete_token`, `validate_email_update_token`)
+  — tracked at #74 for v0.6 hardening. Same commit also lands:
+  step-labeled `tracing::error!` at every `?` propagation point
+  in `sign_plc_operation` (the handler was silent on all failure
+  paths pre-fix); `validate_did_key_shape` input validation
+  rejects placeholder `did:key:` URIs at HTTP 400 InvalidRequest
+  before they reach the mutator+sign+submit pipeline; 10 new
+  tests (6 did:key shape + 4 plc_operation token-flow
+  integration). cargo test --locked --lib: 1029 passed, 0 failed.
+
 ### Changed
 
 - **Arc 13 — PLC operations correctness + completeness (v4.1)**
