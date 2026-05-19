@@ -1375,7 +1375,15 @@ impl AccountManager {
 
         let token_did: String = row.try_get("did")?;
         let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
-        let used: bool = row.try_get("used")?;
+        // chainlink #71 — must use crate::db::read_bool, NOT
+        // row.try_get::<bool, _>. SQLite stores BOOLEAN as
+        // BIGINT 0/1 and sqlx::Any's try_get<bool> errors with
+        // "mismatched types; Rust type 'bool' is not compatible
+        // with SQL type 'BIGINT'". read_bool dispatches on the
+        // backend. Pre-#71 this surfaced as a generic HTTP 500
+        // in sign_plc_operation since the handler propagated
+        // PdsError::Database without observable cause.
+        let used: bool = crate::db::read_bool(&row, "used")?;
 
         if token_did != did {
             return Err(PdsError::Authentication(
@@ -3937,6 +3945,170 @@ mod tests {
             manager.config.authentication.plc_rotation_key,
             "per-actor atproto_signing_key must be byte-distinct from \
              the PDS-wide rotation key (§6.3.2 key separation)"
+        );
+    }
+
+    // ============================================================
+    // Arc 13 §6.3.6 / Step 3 / chainlink #71 — end-to-end
+    // validate → consume → re-consume sequence for the
+    // plc_operation email-token surface. Pre-#71 these
+    // helpers had no integration-test coverage; the only
+    // observation was Phase B Scenario 5 surfacing HTTP 500
+    // with no error class.
+    // ============================================================
+
+    #[tokio::test]
+    async fn plc_operation_token_validate_then_consume_returns_consumed() {
+        let manager = setup_test_db().await;
+        let account = manager
+            .create_account(
+                "alicetest".to_string(),
+                Some("alice@local".to_string()),
+                "TestPassword123!".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create_account");
+
+        let token = manager
+            .generate_plc_operation_token(&account.did)
+            .await
+            .expect("generate token");
+        assert!(!token.is_empty());
+
+        // Step 1: validate-only (NO consume).
+        manager
+            .validate_plc_operation_token(&account.did, &token)
+            .await
+            .expect("validate must succeed with fresh token");
+
+        // Step 2: validate AGAIN — should still succeed (token
+        // not consumed yet — two-phase property).
+        manager
+            .validate_plc_operation_token(&account.did, &token)
+            .await
+            .expect("validate-after-validate still succeeds (two-phase preserves token)");
+
+        // Step 3: consume.
+        let result = manager
+            .consume_plc_operation_token(&account.did, &token)
+            .await;
+        assert!(
+            matches!(result, ConsumeResult::Consumed),
+            "first consume must return Consumed; got {:?}",
+            result
+        );
+
+        // Step 4: validate post-consume — should fail (token
+        // marked used).
+        let err = manager
+            .validate_plc_operation_token(&account.did, &token)
+            .await
+            .expect_err("validate-after-consume must fail");
+        assert!(
+            err.to_string().contains("InvalidToken"),
+            "post-consume validate error must contain InvalidToken: {}",
+            err
+        );
+
+        // Step 5: re-consume — must return AlreadyConsumed (per
+        // §6.3.6 round-4 F2 ConsumeResult semantics + §71's
+        // re-call → HTTP 409 expectation).
+        let re_result = manager
+            .consume_plc_operation_token(&account.did, &token)
+            .await;
+        assert!(
+            matches!(re_result, ConsumeResult::AlreadyConsumed),
+            "re-consume must return AlreadyConsumed; got {:?}",
+            re_result
+        );
+    }
+
+    #[tokio::test]
+    async fn plc_operation_token_validate_rejects_unknown_token() {
+        let manager = setup_test_db().await;
+        let account = manager
+            .create_account(
+                "bobtest".to_string(),
+                Some("bob@local".to_string()),
+                "TestPassword123!".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create_account");
+
+        let err = manager
+            .validate_plc_operation_token(&account.did, "garbage-token")
+            .await
+            .expect_err("unknown token must reject");
+        assert!(err.to_string().contains("InvalidToken"));
+    }
+
+    #[tokio::test]
+    async fn plc_operation_token_consume_unknown_returns_not_found() {
+        let manager = setup_test_db().await;
+        let account = manager
+            .create_account(
+                "carolt".to_string(),
+                Some("carol@local".to_string()),
+                "TestPassword123!".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create_account");
+
+        let result = manager
+            .consume_plc_operation_token(&account.did, "never-issued")
+            .await;
+        assert!(
+            matches!(result, ConsumeResult::NotFound),
+            "consume of unknown token must return NotFound; got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn plc_operation_token_validate_rejects_wrong_did() {
+        let manager = setup_test_db().await;
+        let alice = manager
+            .create_account(
+                "alicewrong".to_string(),
+                Some("a@local".to_string()),
+                "TestPassword123!".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create alice");
+        let bob = manager
+            .create_account(
+                "bobwrong".to_string(),
+                Some("b@local".to_string()),
+                "TestPassword123!".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create bob");
+
+        // Token belongs to alice.
+        let token = manager
+            .generate_plc_operation_token(&alice.did)
+            .await
+            .expect("generate token");
+
+        // Bob tries to use it.
+        let err = manager
+            .validate_plc_operation_token(&bob.did, &token)
+            .await
+            .expect_err("wrong-did validation must reject");
+        assert!(
+            err.to_string().contains("InvalidToken"),
+            "wrong-did err: {}",
+            err
         );
     }
 }

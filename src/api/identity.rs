@@ -410,20 +410,116 @@ pub async fn sign_plc_operation(
     use crate::account::ConsumeResult;
     use std::collections::BTreeMap;
 
-    // Step 2: validate-only.
-    ctx.account_manager
-        .validate_plc_operation_token(&did, &req.token)
-        .await?;
+    // #71 / Phase B finding 3 — wrap every `?` in this handler
+    // with a tracing::error so the actual error class surfaces
+    // (the handler previously swallowed every failure into a
+    // generic HTTP 500 with no observable cause). Each
+    // `at_step_*` label identifies the failure point uniquely
+    // in stderr so operator-side diagnosis is one grep away.
 
-    // Step 3: full-fetch last op.
-    let plc_client = PlcClient::new(PlcClientConfig {
+    // Step 2 — validate-only.
+    if let Err(e) = ctx
+        .account_manager
+        .validate_plc_operation_token(&did, &req.token)
+        .await
+    {
+        tracing::error!(
+            did = %did,
+            token_prefix = %req.token.chars().take(8).collect::<String>(),
+            at_step = "step-2-validate-token",
+            error = %e,
+            error_kind = ?std::mem::discriminant(&e),
+            "sign_plc_operation failed at validate_plc_operation_token"
+        );
+        return Err(e);
+    }
+
+    // Step 3a — caller-input validation (§71 finding-3
+    // hardening). Per the §6.3.6 spec, caller overrides for
+    // rotation_keys / verification_methods values are did:key
+    // URI strings; if any is malformed we reject as HTTP 400
+    // InvalidRequest BEFORE the get_last_op + mutator + sign
+    // pipeline runs. Pre-fix, a placeholder like
+    // `did:key:zNewRotation` survived all the way through to
+    // submit-time (or, in the standalone path, was just baked
+    // into the returned op for the caller to later submit) —
+    // either way, no early-fail signal.
+    if let Some(keys) = req.rotation_keys.as_ref() {
+        for (i, k) in keys.iter().enumerate() {
+            if let Err(reason) = validate_did_key_shape(k) {
+                tracing::error!(
+                    did = %did,
+                    at_step = "step-3a-validate-rotation-key",
+                    index = i,
+                    value = %k,
+                    reason = %reason,
+                    "sign_plc_operation: caller-supplied rotationKeys[{}] is not a parseable did:key URI",
+                    i
+                );
+                return Err(PdsError::Validation(format!(
+                    "InvalidRequest: rotationKeys[{}] is not a parseable did:key URI ({}): {}",
+                    i, reason, k
+                )));
+            }
+        }
+    }
+    if let Some(vm_val) = req.verification_methods.as_ref() {
+        if let Some(obj) = vm_val.as_object() {
+            for (name, v) in obj {
+                if let Some(s) = v.as_str() {
+                    if let Err(reason) = validate_did_key_shape(s) {
+                        tracing::error!(
+                            did = %did,
+                            at_step = "step-3a-validate-verification-method",
+                            name = %name,
+                            value = %s,
+                            reason = %reason,
+                            "sign_plc_operation: caller-supplied verificationMethods[{:?}] is not a parseable did:key URI",
+                            name
+                        );
+                        return Err(PdsError::Validation(format!(
+                            "InvalidRequest: verificationMethods[{:?}] is not a parseable did:key URI ({}): {}",
+                            name, reason, s
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 3b — full-fetch last op from the PLC directory.
+    let plc_client = match PlcClient::new(PlcClientConfig {
         plc_url: ctx.config.identity.did_plc_url.clone(),
         ..Default::default()
-    })?;
-    let (last_op, last_cid) = plc_client.get_last_op(&did).await?;
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                at_step = "step-3b-plc-client-new",
+                error = %e,
+                "sign_plc_operation: PlcClient::new failed"
+            );
+            return Err(e);
+        }
+    };
+    let (last_op, last_cid) = match plc_client.get_last_op(&did).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(
+                did = %did,
+                at_step = "step-3b-get-last-op",
+                plc_url = %ctx.config.identity.did_plc_url,
+                error = %e,
+                error_kind = ?std::mem::discriminant(&e),
+                "sign_plc_operation: PlcClient::get_last_op failed — check mock-PLC reachability + audit-log shape"
+            );
+            return Err(e);
+        }
+    };
 
-    // Step 4: build mutator. Start from inherited values, apply
-    // overrides. Parse JSON map shapes per §6.3.6 Step 3.4 contract.
+    // Step 4 — build mutator. Start from inherited values, apply
+    // overrides. Parse JSON map shapes per §6.3.6 Step 3.4
+    // contract.
     let rotation_keys = req
         .rotation_keys
         .clone()
@@ -434,27 +530,83 @@ pub async fn sign_plc_operation(
         .unwrap_or_else(|| last_op.also_known_as.clone());
 
     let verification_methods: BTreeMap<String, String> = match req.verification_methods.as_ref() {
-        Some(v) => parse_verification_methods(v)?,
+        Some(v) => match parse_verification_methods(v) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::error!(
+                    did = %did,
+                    at_step = "step-4-parse-verification-methods",
+                    error = %e,
+                    "sign_plc_operation: parse_verification_methods rejected caller input"
+                );
+                return Err(e);
+            }
+        },
         None => last_op.verification_methods.clone(),
     };
     let services: BTreeMap<String, ServiceEntry> = match req.services.as_ref() {
-        Some(v) => parse_services(v)?,
+        Some(v) => match parse_services(v) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::error!(
+                    did = %did,
+                    at_step = "step-4-parse-services",
+                    error = %e,
+                    "sign_plc_operation: parse_services rejected caller input"
+                );
+                return Err(e);
+            }
+        },
         None => last_op.services.clone(),
     };
 
-    let unsigned = PlcOperationBuilder::new()
+    let unsigned = match PlcOperationBuilder::new()
         .rotation_keys(rotation_keys)
         .verification_methods(verification_methods)
         .also_known_as(also_known_as)
         .services(services)
         .prev(last_cid)
-        .build()?;
+        .build()
+    {
+        Ok(op) => op,
+        Err(e) => {
+            tracing::error!(
+                did = %did,
+                at_step = "step-4-builder-build",
+                error = %e,
+                "sign_plc_operation: PlcOperationBuilder::build failed (unexpected — currently infallible)"
+            );
+            return Err(e);
+        }
+    };
 
-    // Step 6: sign with PDS-wide rotation key.
-    let signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)?;
-    let signed = signer.sign_operation(unsigned)?;
+    // Step 5/6 — sign with PDS-wide rotation key.
+    let signer = match PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                at_step = "step-6-signer-from-hex",
+                error = %e,
+                "sign_plc_operation: PlcSigner::from_hex on PDS rotation key failed — \
+                 check PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX env value"
+            );
+            return Err(e);
+        }
+    };
+    let signed = match signer.sign_operation(unsigned) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                did = %did,
+                at_step = "step-6-sign-operation",
+                error = %e,
+                "sign_plc_operation: signer.sign_operation failed (canonical DAG-CBOR encode + ECDSA sign)"
+            );
+            return Err(e);
+        }
+    };
 
-    // Step 7: CAS-style consume. Path B for TokenAlreadyConsumed:
+    // Step 7 — CAS-style consume. Path B for TokenAlreadyConsumed:
     // proto-blue's signPlcOperation lexicon doesn't declare this
     // error variant; we emit it as a non-declared XRPC error with
     // warning log per §6.3.6 round-4 F4 closure.
@@ -463,7 +615,14 @@ pub async fn sign_plc_operation(
         .consume_plc_operation_token(&did, &req.token)
         .await
     {
-        ConsumeResult::Consumed => {}
+        ConsumeResult::Consumed => {
+            tracing::info!(
+                did = %did,
+                token_prefix = %req.token.chars().take(8).collect::<String>(),
+                at_step = "step-7-consume-token",
+                "sign_plc_operation: token consumed cleanly"
+            );
+        }
         ConsumeResult::AlreadyConsumed => {
             tracing::warn!(
                 did = %did,
@@ -488,15 +647,57 @@ pub async fn sign_plc_operation(
                 "TokenAlreadyConsumed".to_string(),
             ));
         }
-        ConsumeResult::Error(e) => return Err(e),
+        ConsumeResult::Error(e) => {
+            tracing::error!(
+                did = %did,
+                at_step = "step-7-consume-token-db-error",
+                error = %e,
+                error_kind = ?std::mem::discriminant(&e),
+                "sign_plc_operation: consume_plc_operation_token returned Error variant"
+            );
+            return Err(e);
+        }
     }
 
-    // Step 8: return signed op JSON.
-    let operation_json = serde_json::to_value(&signed)
-        .map_err(|e| PdsError::Internal(format!("Failed to serialize signed op: {}", e)))?;
+    // Step 8 — return signed op JSON.
+    let operation_json = serde_json::to_value(&signed).map_err(|e| {
+        tracing::error!(
+            did = %did,
+            at_step = "step-8-serialize-signed",
+            error = %e,
+            "sign_plc_operation: serde_json::to_value(&signed) failed (unexpected — PlcOperation derives Serialize)"
+        );
+        PdsError::Internal(format!("Failed to serialize signed op: {}", e))
+    })?;
     Ok(Json(SignPlcOperationResponse {
         operation: operation_json,
     }))
+}
+
+/// #71 finding-3 hardening — shape-check a `did:key:zXXX` URI
+/// without doing crypto. Returns `Err(reason)` on any of:
+/// missing prefix, missing `z` multibase prefix, payload not
+/// base58btc-decodable, multicodec not secp256k1-pub
+/// (`0xe7 0x01`), pubkey not 33 bytes.
+///
+/// Catches placeholder values like `did:key:zNewRotation` BEFORE
+/// they propagate through the mutator → sign → consume pipeline
+/// and surface as a generic HTTP 500 with no observable cause.
+fn validate_did_key_shape(s: &str) -> Result<(), &'static str> {
+    if !s.starts_with("did:key:z") {
+        return Err("must start with `did:key:z`");
+    }
+    let payload = &s["did:key:z".len()..];
+    let bytes = bs58::decode(payload)
+        .into_vec()
+        .map_err(|_| "payload is not base58btc-decodable")?;
+    if bytes.len() != 35 {
+        return Err("decoded payload length mismatch (expected 35 bytes: 2 multicodec + 33 secp256k1 compressed pubkey)");
+    }
+    if bytes[0] != 0xE7 || bytes[1] != 0x01 {
+        return Err("multicodec is not secp256k1-pub (expect 0xe7 0x01)");
+    }
+    Ok(())
 }
 
 /// §6.3.6 Step 3.4 helper — convert JSON
@@ -846,5 +1047,80 @@ mod tests {
 
         let long_handle = "a".repeat(254);
         assert!(long_handle.len() > 253);
+    }
+
+    // ============================================================
+    // #71 finding-3 hardening — validate_did_key_shape tests.
+    // ============================================================
+
+    #[test]
+    fn validate_did_key_shape_accepts_real_secp256k1_did_key() {
+        // Real secp256k1 did:key derived from a known compressed
+        // pubkey. We mint a fresh signer and derive its did:key the
+        // same way Aurora-Locus does, then validate that string.
+        use crate::crypto::plc::PlcSigner;
+        let signer = PlcSigner::new(&[42u8; 32]).expect("signer");
+        let did_key = signer.public_key_did_key();
+        assert!(did_key.starts_with("did:key:z"));
+        assert!(
+            super::validate_did_key_shape(&did_key).is_ok(),
+            "real secp256k1 did:key must validate: {}",
+            did_key
+        );
+    }
+
+    #[test]
+    fn validate_did_key_shape_rejects_placeholder_did_key_z_new_rotation() {
+        // The exact placeholder skydeval used in Phase B Scenario 5
+        // that surfaced as a generic HTTP 500. Now caught as 400
+        // InvalidRequest at handler entry.
+        let result = super::validate_did_key_shape("did:key:zNewRotation");
+        assert!(
+            result.is_err(),
+            "placeholder did:key:zNewRotation must be rejected (caught the HTTP 500 → 400 InvalidRequest fix in #71)"
+        );
+    }
+
+    #[test]
+    fn validate_did_key_shape_rejects_missing_prefix() {
+        assert!(super::validate_did_key_shape("z1234").is_err());
+        assert!(super::validate_did_key_shape("did:plc:abc").is_err());
+        assert!(super::validate_did_key_shape("did:key:").is_err());
+    }
+
+    #[test]
+    fn validate_did_key_shape_rejects_non_base58btc_chars() {
+        // '0' is NOT in the base58btc alphabet (deliberately
+        // excluded to avoid 0/O confusion).
+        let bad = "did:key:z000notbase58";
+        assert!(super::validate_did_key_shape(bad).is_err());
+    }
+
+    #[test]
+    fn validate_did_key_shape_rejects_wrong_multicodec() {
+        // Construct a did:key with the ed25519 multicodec
+        // (0xed 0x01) instead of secp256k1-pub (0xe7 0x01).
+        // 35-byte payload: 0xed 0x01 + 33 zero bytes.
+        let mut payload = vec![0xED_u8, 0x01];
+        payload.extend(vec![0u8; 33]);
+        let did_key = format!("did:key:z{}", bs58::encode(&payload).into_string());
+        let result = super::validate_did_key_shape(&did_key);
+        assert!(result.is_err(), "ed25519 multicodec must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("multicodec"),
+            "error message should mention multicodec: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn validate_did_key_shape_rejects_wrong_length() {
+        // Correct multicodec + 32-byte (not 33) pubkey.
+        let mut payload = vec![0xE7_u8, 0x01];
+        payload.extend(vec![0u8; 32]);
+        let did_key = format!("did:key:z{}", bs58::encode(&payload).into_string());
+        let result = super::validate_did_key_shape(&did_key);
+        assert!(result.is_err(), "wrong-length payload must be rejected");
     }
 }
