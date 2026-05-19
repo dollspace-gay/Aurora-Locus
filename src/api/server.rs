@@ -780,57 +780,125 @@ async fn delete_account(
     headers: HeaderMap,
     Json(req): Json<DeleteAccountRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
+    // Per-? tracing pattern from Arc 13 #71 closure (chainlink #86):
+    // every error-propagation point logs at tracing::error! with an
+    // `at_step` field so operators get a one-line cause on any
+    // future failure path.
+
     // IP-based rate limiting for account deletion (50 per 5 minutes)
     if let Some(client_ip) =
         crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
     {
-        ctx.rate_limiter.check_ip(&client_ip)?;
+        ctx.rate_limiter.check_ip(&client_ip).map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:rate_limit",
+                did = %req.did,
+                client_ip = %client_ip,
+                error = %e,
+                "deleteAccount: per-IP rate limit rejected"
+            );
+            e
+        })?;
     }
 
     // Get account (include deactivated and taken down accounts)
-    let account = ctx.account_manager.get_account(&req.did).await?;
+    let account = ctx.account_manager.get_account(&req.did).await.map_err(|e| {
+        tracing::error!(
+            at_step = "delete_account:get_account",
+            did = %req.did,
+            error = %e,
+            "deleteAccount: account lookup failed"
+        );
+        e
+    })?;
 
     // Verify password - must have local account credentials
     let password_hash = account.password_hash.ok_or_else(|| {
+        tracing::error!(
+            at_step = "delete_account:no_password_hash",
+            did = %req.did,
+            "deleteAccount: account has no local password_hash (federated actor?)"
+        );
         crate::error::PdsError::Authorization("No local account credentials".to_string())
     })?;
 
     let valid =
         crate::auth::PasswordHasher::verify(&req.password, &password_hash).map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:password_verify",
+                did = %req.did,
+                error = %e,
+                "deleteAccount: password verification call failed"
+            );
             crate::error::PdsError::Internal(format!("Password verification failed: {}", e))
         })?;
 
     if !valid {
+        tracing::error!(
+            at_step = "delete_account:password_invalid",
+            did = %req.did,
+            "deleteAccount: invalid password"
+        );
         return Err(crate::error::PdsError::Authentication(
             "Invalid did or password".to_string(),
         ));
     }
 
-    // Validate deletion token
+    // Validate deletion token (chainlink #86 root cause was here:
+    // sqlx::Any bool/BIGINT mismatch on the `used` column read).
     ctx.account_manager
         .validate_account_delete_token(&req.did, &req.token)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:validate_token",
+                did = %req.did,
+                error_kind = ?std::mem::discriminant(&e),
+                error = %e,
+                "deleteAccount: token validation failed"
+            );
+            e
+        })?;
 
     // Mark token as used
     ctx.account_manager
         .mark_delete_token_used(&req.token)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:mark_token_used",
+                did = %req.did,
+                error = %e,
+                "deleteAccount: failed to mark token used"
+            );
+            e
+        })?;
 
     // Delete actor store data (repository, blobs, etc.)
-    // This should be done before deleting account records
+    // This should be done before deleting account records.
     if let Err(e) = ctx.actor_store.destroy(&req.did).await {
         tracing::warn!(
+            at_step = "delete_account:actor_store_destroy",
             did = %req.did,
             error = %e,
-            "Failed to destroy actor store during account deletion"
+            "deleteAccount: actor store cleanup failed; continuing with account row delete"
         );
-        // Continue with account deletion even if actor store cleanup fails
+        // Continue with account deletion even if actor store cleanup fails.
     }
 
     // Permanently delete account from database
     ctx.account_manager
         .delete_account_permanent(&req.did)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:delete_permanent",
+                did = %req.did,
+                error = %e,
+                "deleteAccount: permanent delete failed (actor store may be already destroyed)"
+            );
+            e
+        })?;
 
     // Arc 15 §8.3.3: emit Deleted #account event + wipe prior history.
     // Two-await non-atomic per §8.5.5 (matches bsky-PDS pattern;
@@ -841,10 +909,29 @@ async fn delete_account(
             req.did.clone(),
             crate::sequencer::events::AccountStatus::Deleted,
         ))
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:sequence_deletion_event",
+                did = %req.did,
+                error = %e,
+                "deleteAccount: failed to emit #account Deleted"
+            );
+            e
+        })?;
     ctx.sequencer
         .delete_all_for_user(&req.did, &[deletion_seq])
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:wipe_prior_events",
+                did = %req.did,
+                deletion_seq,
+                error = %e,
+                "deleteAccount: retention wipe failed (deletion event emitted OK)"
+            );
+            e
+        })?;
 
     tracing::info!(
         did = %req.did,

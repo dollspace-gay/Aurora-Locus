@@ -1149,7 +1149,9 @@ impl AccountManager {
 
         let did: String = row.try_get("did")?;
         let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
-        let used: bool = row.try_get("used")?;
+        // chainlink #74 / #86: sqlx::Any bool/BIGINT mismatch fix —
+        // same pattern as #71 closure for validate_plc_operation_token.
+        let used: bool = crate::db::read_bool(&row, "used")?;
 
         // Check if already used
         if used {
@@ -1286,7 +1288,8 @@ impl AccountManager {
 
         let did: String = row.try_get("did")?;
         let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
-        let used: bool = row.try_get("used")?;
+        // chainlink #74 / #86: sqlx::Any bool/BIGINT mismatch fix.
+        let used: bool = crate::db::read_bool(&row, "used")?;
 
         // Check if already used
         if used {
@@ -1542,9 +1545,41 @@ impl AccountManager {
         .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::Validation("Invalid deletion token".to_string()))?;
 
-        let token_did: String = row.try_get("did")?;
-        let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
-        let used: bool = row.try_get("used")?;
+        let token_did: String = row.try_get("did").map_err(|e| {
+            tracing::error!(
+                at_step = "validate_account_delete_token:read_did",
+                error = %e,
+                "deleteAccount validator: failed to read 'did' column"
+            );
+            PdsError::Database(e)
+        })?;
+        let expires_at_str: String = row.try_get("expires_at").map_err(|e| {
+            tracing::error!(
+                at_step = "validate_account_delete_token:read_expires_at",
+                error = %e,
+                "deleteAccount validator: failed to read 'expires_at' column"
+            );
+            PdsError::Database(e)
+        })?;
+        let expires_at: DateTime<Utc> = parse_timestamp(&expires_at_str).map_err(|e| {
+            tracing::error!(
+                at_step = "validate_account_delete_token:parse_expires_at",
+                error = %e,
+                "deleteAccount validator: failed to parse 'expires_at' timestamp"
+            );
+            e
+        })?;
+        // chainlink #86 / #74: sqlx::Any does not auto-coerce bool ↔
+        // SQLite BIGINT; route through crate::db::read_bool. Same fix
+        // pattern as #71 for validate_plc_operation_token.
+        let used: bool = crate::db::read_bool(&row, "used").map_err(|e| {
+            tracing::error!(
+                at_step = "validate_account_delete_token:read_used",
+                error = %e,
+                "deleteAccount validator: failed to read 'used' column"
+            );
+            e
+        })?;
 
         // Verify token is for the correct DID
         if token_did != did {
@@ -1633,7 +1668,8 @@ impl AccountManager {
 
         let token_did: String = row.try_get("did")?;
         let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
-        let used: bool = row.try_get("used")?;
+        // chainlink #74 / #86: sqlx::Any bool/BIGINT mismatch fix.
+        let used: bool = crate::db::read_bool(&row, "used")?;
 
         if token_did != did {
             return Err(PdsError::Validation(

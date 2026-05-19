@@ -222,6 +222,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **deleteAccount HTTP 500 → HTTP 200** (#86, closes #74). Phase B
+  Scenario 3 surfaced `deleteAccount` failing with a generic
+  `InternalServerError` and the email token not consumed —
+  identical failure shape to the Arc 13 #71
+  `signPlcOperation` bug. Root cause: the same `sqlx::Any`
+  bool/BIGINT mismatch on the `used` column read, this time in
+  `validate_account_delete_token` (one of the four sibling
+  validators flagged in #74 as latent post-#71). Fix routes the
+  read through `crate::db::read_bool` (the canonical helper),
+  same one-line swap as #71. The three other sibling validators
+  flagged in #74 (`confirm_email`, `reset_password`,
+  `validate_email_update_token`) also get the same fix in the
+  same commit — closes #74 (no remaining latent
+  bool/BIGINT validators in `src/account/manager.rs`).
+  Same commit adds per-`?` `tracing::error!` with `at_step`
+  fields throughout `delete_account` (handler) and
+  `validate_account_delete_token` (validator) so any future
+  failure surfaces a one-line cause to the operator. Phase B
+  Scenario 3 re-run procedure unchanged; #86 stays OPEN until
+  skydeval confirms delete + retention end-to-end.
+
 - **firehose OutdatedCursor empty-window branch** (#76). Phase B
   Scenario 3c surfaced that with
   `PDS_REPO_BACKFILL_LIMIT_MS=1000` and a non-empty `repo_seq`
