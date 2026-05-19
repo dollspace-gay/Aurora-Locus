@@ -90,6 +90,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     to match spec. `deleteAfter` accepted but logged + ignored
     in v0.5 (no scheduled-deletion path from deactivate; clients
     use `requestAccountDelete` for that).
+  - **#85 — updateSubjectStatus bypassed Arc 15 account emits.**
+    The canonical lex admin endpoint
+    `com.atproto.admin.updateSubjectStatus` mutated
+    `actor.takedown_ref` (and `deactivated_at`) without firing
+    `#account` events — bypassing the handler-level emits wired
+    into `takedown_account` / `deactivate_account` /
+    `activate_account` (§8.3.4 / §8.3.5 / §8.3.6). Downstream
+    federation peers (Ozone, cairn-mod, any spec-compliant
+    moderation tooling) wouldn't see takedowns applied via the
+    canonical path. Post-fix, the handler emits post-commit on
+    the RepoRef branch: `takedown.applied:true` → Takendown,
+    `deactivated.applied:true` → Deactivated,
+    `deactivated.applied:false` → three-emit reactivation
+    (account → identity → sync). `takedown.applied:false`
+    (reverse-takedown) remains silent per §8.1.2 v0.5 deferral;
+    DB state is still cleared, the wire emit is the v0.6+ work.
+
   - **#84 — admin auth surface undocumented.**
     New operator doc at `docs/operator/admin-auth.md` covers the
     bootstrap flow end-to-end: `grant-admin` CLI (offline-only,

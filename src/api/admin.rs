@@ -3811,6 +3811,151 @@ async fn update_subject_status(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
 
+    // Arc 15 §8.3.4 / §8.3.5 / §8.3.6 — chainlink #85: fire
+    // sequencer emits for account-level state mutations applied via
+    // this endpoint. Pre-fix, the canonical lex path bypassed the
+    // handler-level emits wired into `deactivate_account` /
+    // `activate_account` / `takedown_account`, so downstream
+    // federation peers wouldn't see takedown / deactivate applied
+    // via updateSubjectStatus.
+    //
+    // Emits run post-commit (matching the handler-level pattern)
+    // and operate on the post-patch row state (Pattern B). Only the
+    // RepoRef branch is account-level; RepoBlobRef and StrongRef
+    // are blob/record concerns with no #account emit.
+    //
+    // Reverse-takedown (takedown.applied: false) is the documented
+    // §8.1.2 v0.5 deferral — no emit fires. Tracked for v0.6.
+    if let SubjectUnion::RepoRef { did } = &subject {
+        // Read post-patch row once; we may use it for two emits below.
+        let acc_post_opt = ctx.account_manager.get_account(did).await.ok();
+
+        // Takedown apply path → #account Takendown.
+        if let Some(td) = &takedown {
+            if td.applied {
+                if let Some(ref acc_post) = acc_post_opt {
+                    let (active, status) =
+                        crate::api::sync_helpers::get_account_status(acc_post);
+                    if let Err(e) = ctx
+                        .sequencer
+                        .sequence_account(crate::sequencer::events::AccountEvent {
+                            did: did.clone(),
+                            active,
+                            status,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: takedown emit failed (state mutated OK)"
+                        );
+                    }
+                }
+            }
+            // else: takedown.applied = false → reverse-takedown,
+            // §8.1.2 v0.5 deferral; no #account emit fires.
+            // v0.6 work tracked separately.
+        }
+
+        // Deactivate / reactivate path.
+        if let Some(d) = &deactivated {
+            if d.applied {
+                // §8.3.4 deactivate → #account Deactivated.
+                if let Some(ref acc_post) = acc_post_opt {
+                    let (active, status) =
+                        crate::api::sync_helpers::get_account_status(acc_post);
+                    if let Err(e) = ctx
+                        .sequencer
+                        .sequence_account(crate::sequencer::events::AccountEvent {
+                            did: did.clone(),
+                            active,
+                            status,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: deactivate emit failed (state mutated OK)"
+                        );
+                    }
+                }
+            } else {
+                // §8.3.5 reactivate → three-emit sequence
+                // (account → identity → sync).
+                if let Some(ref acc_post) = acc_post_opt {
+                    let (active, status) =
+                        crate::api::sync_helpers::get_account_status(acc_post);
+                    if let Err(e) = ctx
+                        .sequencer
+                        .sequence_account(crate::sequencer::events::AccountEvent {
+                            did: did.clone(),
+                            active,
+                            status,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: reactivate account emit failed"
+                        );
+                    }
+                    if let Err(e) = ctx
+                        .sequencer
+                        .sequence_identity(crate::sequencer::events::IdentityEvent {
+                            did: did.clone(),
+                            handle: acc_post.handle.clone(),
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: reactivate identity emit failed"
+                        );
+                    }
+                    let repo_mgr = crate::actor_store::RepositoryManager::with_sequencer(
+                        did.clone(),
+                        ctx.actor_store.as_ref().clone(),
+                        ctx.sequencer.clone(),
+                    );
+                    match repo_mgr.current_sync_event_data().await {
+                        Ok(sync_data) => {
+                            match crate::sequencer::events::SyncEvent::from_sync_data(
+                                did.clone(),
+                                sync_data,
+                            ) {
+                                Ok(sync_evt) => {
+                                    if let Err(e) =
+                                        ctx.sequencer.sequence_sync(sync_evt).await
+                                    {
+                                        tracing::warn!(
+                                            did = %did,
+                                            error = %e,
+                                            "updateSubjectStatus: reactivate sync emit failed"
+                                        );
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    did = %did,
+                                    error = %e,
+                                    "updateSubjectStatus: reactivate sync formatter failed"
+                                ),
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: reactivate no current sync data — skipping #sync"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     Ok(Json(UpdateSubjectStatusResponse {
         subject,
         takedown: response_takedown,
