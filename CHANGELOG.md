@@ -73,7 +73,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   toggle remains dormant per §8.3.11. Reverse-takedown deferred to
   v0.6+ per §8.1.2.
 
-  Three v0.5-blocker fixes surfaced during Phase B re-run and
+  **Phase B sign-off (2026-05-19):** all 10 scenarios PASS at the
+  wire level (createAccount four-emit; deactivate; reactivate via
+  recovery path; takedown via canonical updateSubjectStatus;
+  reverse-takedown silent per §8.1.2; deactivate +
+  reactivate via updateSubjectStatus; delete + retention;
+  submitPlcOperation wire-absence M2 contract verified at byte
+  level — `handle` key absent, NOT null; size non-enforcement at
+  50KB). Lib 1065/1065 PASS; Arc 12+13 integration 19/19 PASS.
+  Five in-cycle blocker fixes closed (#82 #83 #84 #85 #86 + #74
+  folded into #86); four v0.6 follow-ups opened from Phase B
+  findings: **#87** (deleteAccount rate-limit bucket
+  persistence), **#88** (updateSubjectStatus response echoes
+  takedown:{applied:false} on deactivated patches — cosmetic),
+  **#89** (Phase B Scenario 5 over-specifies "#sync also emits"
+  — #sync emits at four wired sites only, not on every commit;
+  doc fix), **#90** (§8.6.5 oversized-commit WARN not firing
+  for 50KB commits — investigate threshold or wire the WARN).
+
+  Five v0.5-blocker fixes surfaced during Phase B re-run and
   landed in the same cycle:
 
   - **#82 — activateAccount unreachable from deactivated state.**
