@@ -182,6 +182,8 @@ impl AccountManager {
             takedown_ref: None,
             deactivated_at: None,
             delete_after: None,
+            suspended_at: None,
+            desynchronized_at: None,
             // Account fields
             email,
             password_hash: Some(password_hash),
@@ -489,6 +491,7 @@ impl AccountManager {
         let row = sqlx::query(
             "SELECT
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                a.suspended_at, a.desynchronized_at,
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              LEFT JOIN account ac ON a.did = ac.did
@@ -508,6 +511,9 @@ impl AccountManager {
             takedown_ref: row.get("takedown_ref"),
             deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
             delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+            // Arc 14 §7.3.6: suspended/desynchronized timestamps.
+            suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+            desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
             // Account fields (may be None for federated actors)
             email: row.get("email"),
             password_hash: row.get("password_hash"),
@@ -554,6 +560,7 @@ impl AccountManager {
         let row = sqlx::query(
             "SELECT
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                a.suspended_at, a.desynchronized_at,
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              LEFT JOIN account ac ON a.did = ac.did
@@ -573,6 +580,8 @@ impl AccountManager {
             takedown_ref: row.get("takedown_ref"),
             deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
             delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+            suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+            desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
             // Account fields (may be None for federated actors)
             email: row.get("email"),
             password_hash: row.get("password_hash"),
@@ -588,6 +597,7 @@ impl AccountManager {
         let row = sqlx::query(
             "SELECT
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                a.suspended_at, a.desynchronized_at,
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              INNER JOIN account ac ON a.did = ac.did
@@ -607,6 +617,8 @@ impl AccountManager {
             takedown_ref: row.get("takedown_ref"),
             deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
             delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+            suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+            desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
             // Account fields
             email: row.get("email"),
             password_hash: row.get("password_hash"),
@@ -2621,6 +2633,7 @@ impl AccountManager {
         let mut sql = String::from(
             "SELECT
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                a.suspended_at, a.desynchronized_at,
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              LEFT JOIN account ac ON a.did = ac.did
@@ -2654,6 +2667,8 @@ impl AccountManager {
                 takedown_ref: row.get("takedown_ref"),
                 deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
                 delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+                suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+                desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
                 email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
@@ -2673,6 +2688,7 @@ impl AccountManager {
             sqlx::query(
                 "SELECT
                     a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                    a.suspended_at, a.desynchronized_at,
                     ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
                  FROM actor a
                  LEFT JOIN account ac ON a.did = ac.did
@@ -2689,6 +2705,7 @@ impl AccountManager {
             sqlx::query(
                 "SELECT
                     a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                    a.suspended_at, a.desynchronized_at,
                     ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
                  FROM actor a
                  LEFT JOIN account ac ON a.did = ac.did
@@ -2711,6 +2728,8 @@ impl AccountManager {
                 takedown_ref: row.get("takedown_ref"),
                 deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
                 delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+                suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+                desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
                 // Account fields (may be None for federated actors)
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
@@ -2756,6 +2775,7 @@ impl AccountManager {
         let mut sql = String::from(
             "SELECT \
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after, \
+                a.suspended_at, a.desynchronized_at, \
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled \
              FROM actor a \
              LEFT JOIN account ac ON a.did = ac.did",
@@ -2836,6 +2856,8 @@ impl AccountManager {
                 takedown_ref: row.get("takedown_ref"),
                 deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
                 delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+                suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+                desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
                 email_confirmed_at: opt_parse_timestamp(

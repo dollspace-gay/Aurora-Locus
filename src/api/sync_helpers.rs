@@ -32,48 +32,71 @@ pub async fn assert_repo_availability(
     did: &str,
     is_admin_or_self: bool,
 ) -> PdsResult<()> {
-    // Get account
-    let account = account_manager.get_account(did).await?;
+    // Arc 14 §7.3.5 / §7.6.5: typed-error envelope per Sub-step 0.D
+    // Case A. RepoNotFound when the actor row is absent.
+    let account = match account_manager.get_account(did).await {
+        Ok(a) => a,
+        Err(PdsError::NotFound(_)) => {
+            return Err(PdsError::RepoNotFound(did.to_string()));
+        }
+        Err(e) => return Err(e),
+    };
 
-    // Admins and repo owners can access any repo state
+    // Admins and repo owners can access any repo state.
     if is_admin_or_self {
         return Ok(());
     }
 
-    // Check if account is takendown
     if account.takedown_ref.is_some() {
-        return Err(PdsError::Validation(format!(
-            "Repo has been takendown: {}",
-            did
-        )));
+        return Err(PdsError::RepoTakendown(did.to_string()));
     }
 
-    // Check if account is deactivated
     if account.deactivated_at.is_some() {
-        return Err(PdsError::Validation(format!(
-            "Repo has been deactivated: {}",
-            did
-        )));
+        return Err(PdsError::RepoDeactivated(did.to_string()));
+    }
+
+    // Arc 14 §7.3.6 / migration 0010: suspended/desync columns. In
+    // v0.5 these are populated only by test-affordance direct DB
+    // writes (no production setter yet — v0.6+ for both).
+    if account.suspended_at.is_some() {
+        return Err(PdsError::RepoSuspended(did.to_string()));
+    }
+
+    if account.desynchronized_at.is_some() {
+        return Err(PdsError::RepoDesynchronized(did.to_string()));
     }
 
     Ok(())
 }
 
-/// Get repository status for sync endpoints
+/// Get repository status for sync endpoints (Arc 14 §7.3.8 + §7.1.2).
 ///
 /// Returns (active, status) tuple where:
-/// - `active` is true if repo is not takendown or deactivated
-/// - `status` is Some("takendown") or Some("deactivated") if applicable, None otherwise
+/// - `active` is true if repo is not in any non-active state.
+/// - `status` is `Some("takendown" | "deactivated" | "suspended" | "desynchronized")`
+///   when one of those states applies, `None` for active.
+///
+/// Precedence (highest first): `takendown` > `deactivated` > `suspended`
+/// > `desynchronized`. Matches admin-action severity ordering.
 pub fn get_repo_status(
     taken_down: bool,
     deactivated_at: Option<&chrono::DateTime<chrono::Utc>>,
+    suspended_at: Option<&chrono::DateTime<chrono::Utc>>,
+    desynchronized_at: Option<&chrono::DateTime<chrono::Utc>>,
 ) -> (bool, Option<String>) {
-    let active = !taken_down && deactivated_at.is_none();
+    let active = !taken_down
+        && deactivated_at.is_none()
+        && suspended_at.is_none()
+        && desynchronized_at.is_none();
 
     let status = if taken_down {
         Some("takendown".to_string())
     } else if deactivated_at.is_some() {
         Some("deactivated".to_string())
+    } else if suspended_at.is_some() {
+        Some("suspended".to_string())
+    } else if desynchronized_at.is_some() {
+        Some("desynchronized".to_string())
     } else {
         None
     };
@@ -87,14 +110,14 @@ mod tests {
 
     #[test]
     fn test_get_repo_status_active() {
-        let (active, status) = get_repo_status(false, None);
+        let (active, status) = get_repo_status(false, None, None, None);
         assert!(active);
         assert!(status.is_none());
     }
 
     #[test]
     fn test_get_repo_status_takendown() {
-        let (active, status) = get_repo_status(true, None);
+        let (active, status) = get_repo_status(true, None, None, None);
         assert!(!active);
         assert_eq!(status, Some("takendown".to_string()));
     }
@@ -102,17 +125,47 @@ mod tests {
     #[test]
     fn test_get_repo_status_deactivated() {
         let deactivated = Some(chrono::Utc::now());
-        let (active, status) = get_repo_status(false, deactivated.as_ref());
+        let (active, status) = get_repo_status(false, deactivated.as_ref(), None, None);
         assert!(!active);
         assert_eq!(status, Some("deactivated".to_string()));
+    }
+
+    /// Arc 14 §7.3.8: suspended status emitted when only suspended_at set.
+    #[test]
+    fn test_get_repo_status_suspended() {
+        let suspended = Some(chrono::Utc::now());
+        let (active, status) = get_repo_status(false, None, suspended.as_ref(), None);
+        assert!(!active);
+        assert_eq!(status, Some("suspended".to_string()));
+    }
+
+    /// Arc 14 §7.3.8: desynchronized status emitted when only desynchronized_at set.
+    #[test]
+    fn test_get_repo_status_desynchronized() {
+        let desync = Some(chrono::Utc::now());
+        let (active, status) = get_repo_status(false, None, None, desync.as_ref());
+        assert!(!active);
+        assert_eq!(status, Some("desynchronized".to_string()));
     }
 
     #[test]
     fn test_get_repo_status_takendown_precedence() {
         // If both takendown and deactivated, takendown takes precedence
         let deactivated = Some(chrono::Utc::now());
-        let (active, status) = get_repo_status(true, deactivated.as_ref());
+        let (active, status) = get_repo_status(true, deactivated.as_ref(), None, None);
         assert!(!active);
         assert_eq!(status, Some("takendown".to_string()));
+    }
+
+    /// Arc 14 §7.3.8: precedence — takendown > deactivated > suspended > desync.
+    #[test]
+    fn test_get_repo_status_full_precedence() {
+        let t = Some(chrono::Utc::now());
+        let (_, status_all) = get_repo_status(true, t.as_ref(), t.as_ref(), t.as_ref());
+        assert_eq!(status_all, Some("takendown".to_string()));
+        let (_, status_no_td) = get_repo_status(false, t.as_ref(), t.as_ref(), t.as_ref());
+        assert_eq!(status_no_td, Some("deactivated".to_string()));
+        let (_, status_only_susp_desync) = get_repo_status(false, None, t.as_ref(), t.as_ref());
+        assert_eq!(status_only_susp_desync, Some("suspended".to_string()));
     }
 }

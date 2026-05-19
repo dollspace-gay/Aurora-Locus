@@ -207,6 +207,29 @@ impl RepositoryManager {
             self.validate_write(write).await?;
         }
 
+        // Arc 14 §7.3.2: capture prior record CIDs for update/delete
+        // ops before applying writes, so each CommitOp can carry its
+        // `prev` (prior record version CID) on the firehose event.
+        // Create ops have no prior version → not queried.
+        let mut prior_record_cids: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for write in &writes {
+            if matches!(
+                write.action,
+                WriteOpAction::Update | WriteOpAction::Delete
+            ) {
+                let uri = format!(
+                    "at://{}/{}/{}",
+                    self.did, write.collection, write.rkey
+                );
+                if let Some(prior) =
+                    self.store.get_record(&self.did, &uri).await?
+                {
+                    prior_record_cids.insert(uri, prior.cid);
+                }
+            }
+        }
+
         // Convert each WriteOp into:
         //   * a `proto_blue::repo::RepoWrite` for the MST/commit machinery
         //   * a `PreparedRecord` for the post-commit metadata writeback
@@ -286,8 +309,14 @@ impl RepositoryManager {
         let did = self.did.clone();
         let signer_arc = signer;
 
-        let (commit_cid, new_rev, prev_commit, blocks): (Cid, String, Option<Cid>, BlockMap) =
-            tokio::task::spawn_blocking(move || -> Result<_, ProtoRepoError> {
+        let (commit_cid, new_rev, prev_commit, prev_data, blocks): (
+            Cid,
+            String,
+            Option<Cid>,
+            Option<Cid>,
+            BlockMap,
+        ) = tokio::task::spawn_blocking(
+            move || -> Result<_, ProtoRepoError> {
                 // Load the existing repo, or seed an empty one on the first commit.
                 let storage_dyn: Arc<dyn RepoStorage> = storage.clone();
                 let mut repo = match Repo::load(storage_dyn.clone()) {
@@ -300,17 +329,37 @@ impl RepositoryManager {
                 };
 
                 let prev = repo.commit_cid().cloned();
+                // Arc 14 §7.3.2: prior commit's MST root CID (`data`
+                // field of the prior signed commit). `None` for
+                // genesis (no prior commit exists). Captured BEFORE
+                // apply_writes so it reflects the prior state.
+                let prev_data = repo.commit().map(|c| c.data.clone());
                 let data = repo.apply_writes(&repo_writes, signer_arc.as_ref())?;
 
-                Ok((data.commit_cid, data.commit.rev.clone(), prev, data.blocks))
-            })
-            .await
-            .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?
-            .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
+                Ok((
+                    data.commit_cid,
+                    data.commit.rev.clone(),
+                    prev,
+                    prev_data,
+                    data.blocks,
+                ))
+            },
+        )
+        .await
+        .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?
+        .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
 
         // Update the per-record metadata table now that the commit has landed.
         let mut commit_ops: Vec<CommitOp> = Vec::with_capacity(prepared.len());
         for rec in prepared {
+            // Arc 14 §7.3.2: `prev` = prior record version CID for
+            // update/delete ops; None for create ops.
+            let prev_cid = match rec.op {
+                OpAction::Update | OpAction::Delete => {
+                    prior_record_cids.get(&rec.uri).cloned()
+                }
+                OpAction::Create => None,
+            };
             match rec.op {
                 OpAction::Create | OpAction::Update => {
                     let cid = rec
@@ -331,6 +380,7 @@ impl RepositoryManager {
                         action: rec.op,
                         path: format!("{}/{}", rec.collection, rec.rkey),
                         cid: Some(cid),
+                        prev: prev_cid,
                     });
                 }
                 OpAction::Delete => {
@@ -339,6 +389,7 @@ impl RepositoryManager {
                         action: rec.op,
                         path: format!("{}/{}", rec.collection, rec.rkey),
                         cid: None,
+                        prev: prev_cid,
                     });
                 }
             }
@@ -362,6 +413,8 @@ impl RepositoryManager {
                 commit_cid.to_string(),
                 new_rev.clone(),
                 prev_commit.map(|c| c.to_string()),
+                // Arc 14 §7.3.2: prior commit's MST root CID.
+                prev_data.map(|c| c.to_string()),
                 car_bytes,
                 commit_ops,
             );

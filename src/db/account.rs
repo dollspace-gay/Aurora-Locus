@@ -59,6 +59,12 @@ pub struct ActorAccount {
     pub takedown_ref: Option<String>,
     pub deactivated_at: Option<DateTime<Utc>>,
     pub delete_after: Option<DateTime<Utc>>,
+    /// Arc 14 §7.3.6 (migration 0010): suspended-state timestamp.
+    /// v0.5: populated only by test-affordance direct DB writes.
+    pub suspended_at: Option<DateTime<Utc>>,
+    /// Arc 14 §7.3.6 (migration 0010): desync-detected timestamp.
+    /// v0.5: populated only by test-affordance direct DB writes.
+    pub desynchronized_at: Option<DateTime<Utc>>,
 
     // Account fields (optional - may be None for federated actors)
     pub email: Option<String>,

@@ -6,7 +6,139 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Arc 14 — Sequencer query/error vocabulary (v3.2)** (#75).
+  Aurora-Locus's consumer-facing firehose moves to spec
+  correctness. Six workstreams land together as one arc:
+  - **Wire-format conversion** (§7.3.1 / §7.4 Step 1):
+    `subscribeRepos` now emits DAG-CBOR-encoded binary WebSocket
+    frames (`Message::Binary`) per the atproto subscription
+    protocol — two consecutive CBOR objects (header + body)
+    packed into a single binary payload. Pre-Arc-14 Aurora-Locus
+    emitted JSON text frames with a `$type` tag, making the
+    stream unreadable by any spec-compliant consumer
+    (chainlink #63 lead bug). New `canonical_cbor_map!` macro and
+    `firehose_frame_to_cbor` helper in
+    `src/api/firehose_encoder.rs` handle map construction;
+    `proto_blue::lex_cbor::encode` enforces RFC 8949 §4.2.1
+    canonical key ordering (byte-length-then-lex).
+    `CommitEvent.blocks` flows as raw CBOR major-type-2 bytes —
+    base64 encoding removed at both producer call sites
+    (`firehose.rs:407+435`).
+  - **Inductive firehose fields** (§7.3.2 / Step 2):
+    `CommitEvent.prev_data` (prior commit's MST root CID, absent
+    on genesis) extracted from `repo.commit().map(|c| c.data)`
+    before `apply_writes`. `CommitOp.prev` (prior record version
+    CID, absent on `create` ops) captured via
+    `store.get_record(uri)` for update/delete ops. `CommitOp.cid`
+    for delete ops emits CBOR null (`0xf6`) per lexicon
+    `nullable` discipline.
+  - **Cursor semantics** (§7.3.3 / Step 3):
+    `SequencerConfig.backfill_limit_secs` default changed to
+    1 day (86400) per Step 0 sub-step 0.C recon (matching
+    bsky-PDS's `repoBackfillLimitMs = DAY`; was 14 days). New
+    `Sequencer::earliest_after_time(time)` helper. Pre-stream
+    cursor validation: live-tail | FutureCursor error frame +
+    WS close 1008 | OutdatedCursor `#info` + advance | empty-
+    window fall-through to live-tail (round-1 F8 closure).
+    `PDS_REPO_BACKFILL_LIMIT_MS` env override added.
+  - **Protocol errors + close codes** (§7.3.4 / Step 4):
+    `FutureCursor` and `ConsumerTooSlow` emit as named lexicon
+    errors via error frames (header `op: -1`), NOT as `#info`.
+    Close codes 1000 / 1008 / 1011. Spurious `#info.name` values
+    `"Connected"` and `"Error"` removed; only `"OutdatedCursor"`
+    survives.
+  - **Sync-namespace typed errors** (§7.3.5 / Step 5):
+    5 new `PdsError` variants — `RepoNotFound` (404),
+    `RepoTakendown` / `RepoDeactivated` / `RepoSuspended` /
+    `RepoDesynchronized` (400 each, matching bsky-PDS
+    `InvalidRequestError` default).
+    `sync_helpers::assert_repo_availability` rewritten to emit
+    the typed errors with the spec-compliant
+    `{error: <Name>, message: ...}` envelope per Sub-step 0.D
+    Case A recon. `RepoSuspended` and `RepoDesynchronized`
+    sourcing is test-affordance only in v0.5 (direct DB writes;
+    production setters land in v0.6 per §7.1.2 segregation).
+  - **Suspended-state + AccountStatus** (§7.3.6-§7.3.8 / Step 6):
+    Migration 0010 (SQLite + Postgres) adds `suspended_at` +
+    `desynchronized_at` columns to `actor` and `DELETE FROM
+    repo_seq` in the same commit (Sub-step 0.A / round-1 F2
+    closure). `AccountStatus` enum extended to 6 variants
+    (`Desynchronized` + `Throttled` added — full lexicon
+    `knownValues` vocabulary). `get_repo_status` helper widened
+    to 4-arg signature returning full vocabulary with takendown
+    > deactivated > suspended > desync precedence.
+  - **Auth removal on federation-public sync handlers** (§7.3.9 /
+    Step 7): `require_auth_unified` removed from 6 sync handlers
+    (`get_repo`, `get_latest_commit`, `get_blocks`, `get_blob`,
+    `list_blobs`, `get_record`) — matches bsky-PDS's
+    `authorizationOrAdminTokenOptional` posture (Sub-step 0.B
+    recon Case B). `list_repos` and `getRepoStatus` were already
+    public. `getBlocks` included as parity edge case (not in
+    §7.3.9's locked-7 list but exhibits the same divergence). All
+    sync handlers now callable without a bearer token.
+
+  cargo test --locked --lib: 1047 passed, 0 failed. Arc 12+13
+  integration regression tests: 19/19 PASS. One pre-existing
+  flaky test (`postgres_smoke_test::account_manager_round_trip_on_postgres`)
+  hits live `plc.directory` and is rejected — unrelated to Arc 14
+  (the `#[cfg(test)]` PLC short-circuit doesn't apply in
+  integration-test cfg). Phase B operator-driven scenarios at
+  `docs/internal/arc14-phase-b-commands.md` cover all 8 scenarios
+  (wire-format + inductive fields + cursor + protocol errors + 5
+  typed errors + 5 status vocab values + auth removal +
+  empty-window fall-through).
+
+  **Phase B sign-off (2026-05-19):** Scenarios 1, 2, 3a, 3b, 3c
+  (after #76 fix), 3d, 5 (all 5 typed errors), 6 (all 5 status
+  vocab values), 7 PASS. Scenario 4 ConsumerTooSlow integration
+  not verified — slow tap (10s read-delay) with 150 commits
+  consumed 24 frames then WS closed with code 1006 (abnormal
+  closure / no close handshake) instead of spec-expected named
+  error frame + close 1008. Unit-test coverage for the
+  close-code vocabulary exists; backpressure-path integration
+  tracked at #79 for v0.6 hardening. Arc 14 ships with this
+  documented gap. Three additional v0.6 follow-ups also surfaced
+  during Phase B: #77 (`dev.aurora.admin.setTakendown` affordance
+  missing — Phase B used direct DB write), #80 (`deactivateAccount`
+  requires non-spec body fields), #78 (two flaky tests
+  intermittently fail under full suite).
+
 ### Fixed
+
+- **firehose OutdatedCursor empty-window branch** (#76). Phase B
+  Scenario 3c surfaced that with
+  `PDS_REPO_BACKFILL_LIMIT_MS=1000` and a non-empty `repo_seq`
+  where every event is older than the 1-second window, the
+  firehose silently advanced cursor to `current_seq` without
+  emitting the `#info OutdatedCursor` frame. Root cause: the
+  `Ok(None)` arm of `earliest_after_time(now - backfill_secs)`
+  conflated "genuinely empty `repo_seq`" (round-1 F8 closure's
+  legitimate silent live-tail) with "window too narrow / all
+  events stale" (which is a provably-outdated cursor and warrants
+  the `#info` frame). Both cases share the same `None` return,
+  but the latter is gated by `current_seq > 0` and therefore
+  distinguishable.
+  Fix: extracted cursor validation into a pure
+  `decide_cursor(requested_cursor, current_seq, earliest_in_window)`
+  function returning a typed `CursorDecision` enum with five
+  variants (`LiveTailNoCursor` / `EmptyRepoSeq` / `FutureCursor` /
+  `Backfill` / `OutdatedCursor { reason, advanced_to }`). The
+  `OutdatedReason::WindowExcludedAllEvents` variant fires for the
+  new case and advances to `current_seq` (skip backfill, go to
+  live-tail). `handle_subscription` now delegates to
+  `decide_cursor` and pattern-matches; each branch logs at
+  `tracing::info!` with an `at_branch` field for operator
+  visibility (same per-`?` logging discipline as the Arc 13 #71
+  fix). DB-error path now logs at `tracing::error!` and closes
+  WS 1011 instead of silently advancing. 7 new unit tests cover
+  every `CursorDecision` branch including the regression boundary
+  (`decide_cursor_does_not_emit_outdated_when_repo_seq_genuinely_empty`)
+  that pins the round-1 F8 closure preserved behavior. Phase B
+  Scenario 3c re-run confirmed: `#info OutdatedCursor` frame +
+  `at_branch=outdated_cursor reason=window_excluded_all_events`
+  log line.
 
 - **`signPlcOperation` HTTP 500 → HTTP 200/401** (#71). Arc 13
   Phase B Scenario 5 surfaced `signPlcOperation` returning a

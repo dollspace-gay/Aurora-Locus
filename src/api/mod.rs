@@ -10,6 +10,7 @@ pub mod blob;
 pub mod dev_routes;
 pub mod federation;
 pub mod firehose;
+pub mod firehose_encoder;
 pub mod health;
 pub mod identity;
 pub mod labels;

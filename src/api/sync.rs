@@ -10,17 +10,14 @@
 
 use crate::{
     actor_store::car,
-    api::{
-        middleware,
-        sync_helpers::{assert_repo_availability, get_repo_status},
-    },
+    api::sync_helpers::{assert_repo_availability, get_repo_status},
     context::AppContext,
     error::{PdsError, PdsResult},
 };
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -147,20 +144,17 @@ pub struct GetRecordParams {
     pub rkey: String,
 }
 
-/// Get a repository as a CAR file export
+/// Get a repository as a CAR file export.
 ///
-/// Implements com.atproto.sync.getRepo
+/// Implements `com.atproto.sync.getRepo`. Arc 14 §7.3.9 / §7.4 Step 7:
+/// federation-public, no auth required (matches bsky-PDS
+/// `authorizationOrAdminTokenOptional` posture per Sub-step 0.B).
+/// `is_admin_or_self` is `false` for unauthenticated callers.
 pub async fn get_repo(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
     Query(params): Query<GetRepoParams>,
 ) -> PdsResult<Response> {
-    // Get authentication
-    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
-    let auth_did = auth.did();
-
-    // Check repository availability (admin support to be added in Phase 7)
-    let is_admin_or_self = auth_did == params.did;
+    let is_admin_or_self = false;
     assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
 
     // Export repository as CAR
@@ -179,20 +173,15 @@ pub async fn get_repo(
         .unwrap())
 }
 
-/// Get the latest commit for a repository
+/// Get the latest commit for a repository.
 ///
-/// Implements com.atproto.sync.getLatestCommit
+/// Implements `com.atproto.sync.getLatestCommit`. Arc 14 §7.3.9 /
+/// §7.4 Step 7: federation-public, no auth required.
 pub async fn get_latest_commit(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
     Query(params): Query<GetLatestCommitParams>,
 ) -> PdsResult<Json<LatestCommitResponse>> {
-    // Get authentication
-    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
-    let auth_did = auth.did();
-
-    // Check repository availability (admin support to be added in Phase 7)
-    let is_admin_or_self = auth_did == params.did;
+    let is_admin_or_self = false;
     assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
 
     // Get the repository root CID (latest commit)
@@ -204,20 +193,18 @@ pub async fn get_latest_commit(
     }))
 }
 
-/// Get specific blocks from a repository
+/// Get specific blocks from a repository.
 ///
-/// Implements com.atproto.sync.getBlocks
+/// Implements `com.atproto.sync.getBlocks`. Arc 14 §7.4 Step 7
+/// (parity edge case noted in recon Sub-step 0.B enumeration —
+/// `getBlocks` is not in §7.3.9's locked-7 list but exhibits the
+/// same auth-required vs bsky-PDS-optional divergence, so auth is
+/// removed for parity).
 pub async fn get_blocks(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
     Query(params): Query<GetBlocksParams>,
 ) -> PdsResult<Response> {
-    // Get authentication
-    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
-    let auth_did = auth.did();
-
-    // Check repository availability (admin support to be added in Phase 7)
-    let is_admin_or_self = auth_did == params.did;
+    let is_admin_or_self = false;
     assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
 
     // Fetch the requested blocks
@@ -255,20 +242,15 @@ pub async fn get_blocks(
         .unwrap())
 }
 
-/// Get a blob by CID
+/// Get a blob by CID.
 ///
-/// Implements com.atproto.sync.getBlob
+/// Implements `com.atproto.sync.getBlob`. Arc 14 §7.3.9 / §7.4 Step 7:
+/// federation-public, no auth required.
 pub async fn get_blob(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
     Query(params): Query<GetBlobParams>,
 ) -> PdsResult<Response> {
-    // Get authentication
-    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
-    let auth_did = auth.did();
-
-    // Check repository availability (admin support to be added in Phase 7)
-    let is_admin_or_self = auth_did == params.did;
+    let is_admin_or_self = false;
     assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
 
     // Get blob from blob store
@@ -298,20 +280,15 @@ pub async fn get_blob(
         .into_response())
 }
 
-/// List blob CIDs in a repository
+/// List blob CIDs in a repository.
 ///
-/// Implements com.atproto.sync.listBlobs
+/// Implements `com.atproto.sync.listBlobs`. Arc 14 §7.3.9 / §7.4 Step 7:
+/// federation-public, no auth required.
 pub async fn list_blobs(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
     Query(params): Query<ListBlobsParams>,
 ) -> PdsResult<Json<ListBlobsResponse>> {
-    // Get authentication
-    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
-    let auth_did = auth.did();
-
-    // Check repository availability (admin support to be added in Phase 7)
-    let is_admin_or_self = auth_did == params.did;
+    let is_admin_or_self = false;
     assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
 
     let limit = params.limit.unwrap_or(100).min(1000);
@@ -360,6 +337,8 @@ pub async fn list_repos(
             let (active, status) = get_repo_status(
                 account.takedown_ref.is_some(),
                 account.deactivated_at.as_ref(),
+                account.suspended_at.as_ref(),
+                account.desynchronized_at.as_ref(),
             );
 
             repos.push(RepoInfo {
@@ -397,6 +376,8 @@ pub async fn get_repo_status_endpoint(
     let (active, status) = get_repo_status(
         account.takedown_ref.is_some(),
         account.deactivated_at.as_ref(),
+        account.suspended_at.as_ref(),
+        account.desynchronized_at.as_ref(),
     );
 
     let rev = if active {
@@ -417,20 +398,15 @@ pub async fn get_repo_status_endpoint(
     }))
 }
 
-/// Get a specific record as CAR file
+/// Get a specific record as CAR file.
 ///
-/// Implements com.atproto.sync.getRecord
+/// Implements `com.atproto.sync.getRecord`. Arc 14 §7.3.9 / §7.4 Step 7:
+/// federation-public, no auth required.
 pub async fn get_record(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
     Query(params): Query<GetRecordParams>,
 ) -> PdsResult<Response> {
-    // Get authentication
-    let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
-    let auth_did = auth.did();
-
-    // Check repository availability (admin support to be added in Phase 7)
-    let is_admin_or_self = auth_did == params.did;
+    let is_admin_or_self = false;
     assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
 
     // Export record as CAR

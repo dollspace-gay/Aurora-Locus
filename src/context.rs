@@ -565,10 +565,22 @@ impl AppContext {
             Arc::new(DPopVerifier::new(store_for_verifier))
         };
 
-        // Initialize sequencer with relay client (using account_db for now, could be separate database)
+        // Initialize sequencer with relay client (using account_db for now, could be separate database).
+        // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
+        // window. Matches bsky-PDS's `PDS_REPO_BACKFILL_LIMIT_MS`
+        // env-var convention (Sub-step 0.C verified default 86_400_000
+        // ms = 1 day).
+        let mut sequencer_config = SequencerConfig::default();
+        if let Ok(raw) = std::env::var("PDS_REPO_BACKFILL_LIMIT_MS") {
+            if let Ok(ms) = raw.parse::<i64>() {
+                if ms > 0 {
+                    sequencer_config.backfill_limit_secs = ms / 1000;
+                }
+            }
+        }
         let mut seq = Sequencer::with_relay(
             account_db.clone(),
-            SequencerConfig::default(),
+            sequencer_config,
             relay_client.clone(),
         );
 

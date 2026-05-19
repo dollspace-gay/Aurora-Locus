@@ -69,6 +69,12 @@ pub enum PdsError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// proto-blue DAG-CBOR encoder error. Surfaces through the `?`
+    /// operator in firehose-frame encoding (Arc 14 §7.4 Step 1.0(a)(iv)).
+    /// Mapped to HTTP 500 (or WebSocket close 1011 for streaming).
+    #[error("DAG-CBOR encoding error: {0}")]
+    CborEncoding(String),
+
     /// JWT errors
     #[error("JWT error: {0}")]
     Jwt(String),
@@ -80,6 +86,39 @@ pub enum PdsError {
     /// Account suspended
     #[error("Account suspended: {0}")]
     AccountSuspended(String),
+
+    /// Arc 14 §7.3.5 — sync-namespace handler called against a DID
+    /// with no actor row. Distinct from the generic `NotFound` so
+    /// the wire-emitted `error` name is `"RepoNotFound"` per spec.
+    /// Mapped to HTTP 404.
+    #[error("Could not find repo for DID: {0}")]
+    RepoNotFound(String),
+
+    /// Arc 14 §7.3.5 — sync-namespace handler called against a
+    /// takendown repo (and the caller is not admin/self). Mapped
+    /// to HTTP 400 to match bsky-PDS `InvalidRequestError` default.
+    #[error("Repo has been takendown: {0}")]
+    RepoTakendown(String),
+
+    /// Arc 14 §7.3.5 — sync-namespace handler called against a
+    /// deactivated repo (and the caller is not admin/self). Mapped
+    /// to HTTP 400.
+    #[error("Repo has been deactivated: {0}")]
+    RepoDeactivated(String),
+
+    /// Arc 14 §7.3.5 — sync-namespace handler called against a
+    /// suspended repo (and the caller is not admin/self). Mapped
+    /// to HTTP 400. v0.5 source: test-affordance direct DB writes
+    /// (no production setter; Arc 14 §7.1.2 segregation).
+    #[error("Repo has been suspended: {0}")]
+    RepoSuspended(String),
+
+    /// Arc 14 §7.3.5 — sync-namespace handler called against a
+    /// repo whose state is detected as desynchronized. Mapped
+    /// to HTTP 400. v0.5 source: test-affordance direct DB writes
+    /// (no production setter; Arc 14 §7.1.2 segregation).
+    #[error("Repo has been desynchronized: {0}")]
+    RepoDesynchronized(String),
 
     /// Arc 13 §6.3.4 / §6.3.6 — PLC directory's audit log for
     /// this DID's last accepted op is a `plc_tombstone`. The DID
@@ -203,12 +242,38 @@ impl IntoResponse for PdsError {
                 "DidTombstoned",
                 self.to_string(),
             ),
+            // Arc 14 §7.3.5 / §7.6.5: sync-namespace typed errors.
+            // HTTP status code defaults verified against bsky-PDS via
+            // Step 0 Sub-step 0.D recon (envelope already-correct
+            // Case A; just extend allowed `error` values).
+            PdsError::RepoNotFound(_) => {
+                (StatusCode::NOT_FOUND, "RepoNotFound", self.to_string())
+            }
+            PdsError::RepoTakendown(_) => {
+                (StatusCode::BAD_REQUEST, "RepoTakendown", self.to_string())
+            }
+            PdsError::RepoDeactivated(_) => (
+                StatusCode::BAD_REQUEST,
+                "RepoDeactivated",
+                self.to_string(),
+            ),
+            PdsError::RepoSuspended(_) => {
+                (StatusCode::BAD_REQUEST, "RepoSuspended", self.to_string())
+            }
+            PdsError::RepoDesynchronized(_) => (
+                StatusCode::BAD_REQUEST,
+                "RepoDesynchronized",
+                self.to_string(),
+            ),
             PdsError::NotLeader(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "NotLeader",
                 self.to_string(),
             ),
-            PdsError::Database(_) | PdsError::Internal(_) | PdsError::Io(_) => (
+            PdsError::Database(_)
+            | PdsError::Internal(_)
+            | PdsError::Io(_)
+            | PdsError::CborEncoding(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalServerError",
                 "Internal server error".to_string(), // Don't leak details
@@ -231,3 +296,11 @@ impl IntoResponse for PdsError {
 
 /// Result type alias for PDS operations
 pub type PdsResult<T> = Result<T, PdsError>;
+
+/// Convert proto-blue's DAG-CBOR encoder error into a PdsError.
+/// Used by the `?` operator in firehose-frame encoding (Arc 14 §7.4 Step 1).
+impl From<proto_blue::lex_cbor::CborError> for PdsError {
+    fn from(e: proto_blue::lex_cbor::CborError) -> Self {
+        PdsError::CborEncoding(e.to_string())
+    }
+}
