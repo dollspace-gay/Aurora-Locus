@@ -101,6 +101,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Arc 16b + 16c + 16d all lock (Arc 16d row-driven sweep ships
   next).
 
+  **Phase B sign-off (2026-05-20):** Arc 16c → shipped. Nine
+  SQLite WAL scenarios PASS (1, 2, 3, 3b, 4, 5b, 6, 7, 8) plus
+  Postgres READ COMMITTED Scenario 2 + startup-job verification
+  (audit item 11). Scenario 2 wire verification: CID format
+  correct (post-#93 fix), `blob_metadata.temp_key='1'` written,
+  bytes at `$PDS_DATA_DIRECTORY/blobs/<shard>/<cid>`,
+  `temp_blob_metadata` cleaned, `temp/` dir empty post-commit
+  (commit_blob cleanup at `store.rs:339` verified live).
+  Scenarios 3b + 5b accepted via cargo coverage per Step 0.7
+  split-mode disposition. Live failure-injection on SQLite for
+  Scenario 3 blocked by Unix open-fd semantics (chmod 444
+  doesn't affect already-open writer handles); mechanism (b)
+  source-trace + §9.3.3.2 stage-phase addendum + chainlink #96
+  cover the gap. Three in-cycle blocker fixes closed alongside
+  #92: **#93** (malformed CID bafyrei*+hex-concat), **#94**
+  (.env.example shadowing PDS_DATA_DIRECTORY auto-derivation),
+  **#95** (datetime() Postgres-incompat — also closed a latent
+  SQLite lexicographic-comparison bug as side-effect). Five
+  v0.6 follow-ups surfaced from Phase B (separate chainlinks):
+  **#96** (stage_blob orphan-temp-file leak — documented
+  mechanism, defensive cleanup proposed; v0.6 hardening per
+  V05_DESIGN.md §3.3 dev-only scope), **#97** (`/xrpc/_health`
+  returns 404 — endpoint missing or doc-stale), **#98**
+  (uploadBlob rejects `application/octet-stream` — restrictive
+  MIME allowlist), **#99** (JWT-deprecation header emitted on
+  all authenticated responses — cosmetic), **#100**
+  (`dpop_jti_replay` + `rate_limit_buckets` reapers WARN "not
+  supported by this substrate" against Postgres despite tables
+  existing — substrate-feature-detection bug). Cycle ledger
+  meta-note: three .env/config/cross-backend hygiene issues
+  surfaced this Phase B (#94, #95, plus operator confusion
+  with PDS_BLOBSTORE_DISK_LOCATION env var name). V05_DESIGN.md
+  §4.6 "Source-trace discipline for Phase B observations"
+  codifies the recon-investigation pattern; `src/db/mod.rs`'s
+  `cross_backend_sql_lint_tests` encodes the cross-backend SQL
+  hygiene as automated enforcement. Additional Phase B-protocol
+  meta-note (informational): `chmod 444` on a SQLite DB file
+  does NOT block writes from a running PDS process due to Unix
+  open-fd semantics — future Phase B injection should reach
+  for DB-side read-only (`PRAGMA query_only=1` /
+  `ALTER USER … read_only=on`) rather than filesystem
+  permissions.
+
+  Tests: lib 1092 PASS at fix-tip. Arc 12+13 integration 19/19
+  PASS. cross_backend_sql_lint_tests + env_example_lint_tests
+  guard future arcs.
+
 - **Arc 16b — Blob lifecycle helpers (v6 LOCKED)** (#91). DB-level
   helpers-only arc — establishes the contract layer for
   federation sub-feature #46 (jointly with Arc 16c + Arc 16d).
