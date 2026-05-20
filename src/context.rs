@@ -299,6 +299,11 @@ impl AppContext {
                     idle_timeout_secs: config.database.idle_timeout_secs,
                     max_lifetime_secs: config.database.max_lifetime_secs,
                     leader_retry_interval_ms: config.database.leader_retry_interval_ms,
+                    // Arc 16d §9.4.3.6: maintenance pool inherits the same
+                    // Postgres isolation pin as the primary pool — sweep
+                    // operations against the substrate's rate-limit + DPoP
+                    // tables share the same race-analysis assumptions.
+                    pg_transaction_isolation: config.database.pg_transaction_isolation.clone(),
                 };
                 let pool = Arc::new(
                     db::create_any_pool(&maintenance_db_config, &config.storage.account_db)

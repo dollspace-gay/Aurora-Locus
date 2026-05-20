@@ -5,6 +5,11 @@
 
 pub mod account;
 pub mod advisory_locks;
+/// Arc 16d §9.4.4 Step 2.1 typed-wrapper substrate for autocommit
+/// SQL statements (`sweep_untethered_rows` issues every SQL site
+/// through these wrappers; audit-grep at Step 5 item 8 enforces
+/// the discipline scoped to `src/blob_store/gc.rs`).
+pub mod autocommit;
 pub mod liveness_lock;
 pub mod postgres;
 
@@ -113,6 +118,22 @@ pub async fn test_connection(pool: &SqlitePool) -> PdsResult<()> {
 // construct the legacy `SqlitePool` for now.
 // ============================================================================
 
+/// Arc 16d §9.4.4 Step 1.7: normalize the operator-provided isolation
+/// string to a Postgres-recognized SQL fragment. Comparison is
+/// case-insensitive; the canonical SQL form is emitted in uppercase.
+/// Unrecognized values fall through verbatim so Postgres will reject
+/// the SET statement at connect time — surfaces operator typos
+/// immediately rather than silently coercing.
+fn normalize_pg_isolation(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "read uncommitted" => "READ UNCOMMITTED".to_string(),
+        "read committed" => "READ COMMITTED".to_string(),
+        "repeatable read" => "REPEATABLE READ".to_string(),
+        "serializable" => "SERIALIZABLE".to_string(),
+        _ => raw.trim().to_string(),
+    }
+}
+
 /// Resolve the connection URL for an `AnyPool` from a `DatabaseConfig`.
 /// SQLite gets a `sqlite://` prefix and `?mode=rwc` so the file is
 /// created if missing, matching the legacy `create_pool` behaviour.
@@ -163,6 +184,27 @@ pub async fn create_any_pool(
     }
     if let Some(t) = config.max_lifetime_secs {
         opts = opts.max_lifetime(Some(Duration::from_secs(t)));
+    }
+
+    // Arc 16d §9.4.3.6 / §9.4.4 Step 1.7: Postgres connection-level
+    // transaction isolation pin. Set via `after_connect` so the value
+    // travels with every new pool connection (overriding cluster-level
+    // `postgresql.conf`). Default `"read committed"` per
+    // `default_pg_transaction_isolation`. SQLite connections skip this
+    // hook entirely (SQLite has no per-connection isolation knob; WAL
+    // snapshot isolation is fixed at file-level).
+    if config.backend == DatabaseBackend::Postgres {
+        let isolation = normalize_pg_isolation(&config.pg_transaction_isolation);
+        opts = opts.after_connect(move |conn, _meta| {
+            let stmt = format!(
+                "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {}",
+                isolation
+            );
+            Box::pin(async move {
+                sqlx::query(&stmt).execute(conn).await?;
+                Ok(())
+            })
+        });
     }
 
     let url = any_url_for(config, fallback_sqlite_path);

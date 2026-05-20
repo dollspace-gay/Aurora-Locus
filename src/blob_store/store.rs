@@ -503,6 +503,21 @@ impl BlobStore {
         crate::blob_store::gc::run_sweep(&*self.backend, &self.db, params, now).await
     }
 
+    /// Arc 16d §9.4.4 Step 3.1: thin wrapper over
+    /// [`crate::blob_store::gc::sweep_untethered_rows`] paralleling
+    /// [`Self::run_gc_sweep`]. Production caller is the scheduled
+    /// `JobScheduler::row_sweep_job` (Step 3.2). Tests can pass a
+    /// fixed `now` to age untethered rows past
+    /// `params.untethered_ttl`.
+    pub async fn run_row_sweep(
+        &self,
+        params: crate::blob_store::gc::RowSweepParams,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> PdsResult<crate::blob_store::gc::RowSweepReport> {
+        crate::blob_store::gc::sweep_untethered_rows(&self.db, &*self.backend, params, now)
+            .await
+    }
+
     /// Calculate the CIDv1 string for opaque blob data.
     ///
     /// chainlink #93 fix: blobs are opaque byte streams, so the

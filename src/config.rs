@@ -196,13 +196,24 @@ impl MaintenancePoolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcSweepConfig {
     /// If `true`, the scheduled background sweep runs at
-    /// `interval_secs` cadence. Default `false` — operators
-    /// opt in explicitly per the v0.4 design.
-    #[serde(default)]
+    /// `interval_secs` cadence. **Default `true` post-Arc-16d**
+    /// (V05_DESIGN.md §9.4.1.3 / §9.4.4 Step 1.3): Arc 16d ships
+    /// production-grade row-driven GC; both walkers are on by
+    /// default and operators opt OUT explicitly. Pre-Arc-16d
+    /// (Arc 10 only), this defaulted to `false`.
+    #[serde(default = "default_gc_sweep_enabled")]
     pub enabled: bool,
 
+    /// Arc 16d row-walker on/off (V05_DESIGN.md §9.4.2.1). When
+    /// `true` the `row_sweep_job` orchestrates
+    /// `sweep_untethered_rows`. Default `true`; cadence shared
+    /// with byte-walker via `interval_secs`.
+    #[serde(default = "default_gc_sweep_row_sweep_enabled")]
+    pub row_sweep_enabled: bool,
+
     /// Cadence between scheduled sweep runs, in seconds.
-    /// Default 86400 (24 hours).
+    /// Default 86400 (24 hours). **Shared between byte-walker
+    /// and row-walker** per V05_DESIGN.md §9.4.2.1.
     #[serde(default = "default_gc_sweep_interval_secs")]
     pub interval_secs: u64,
 
@@ -215,7 +226,8 @@ pub struct GcSweepConfig {
 
     /// Safety cap: max blobs to delete per sweep run.
     /// Default 10000. Confirmed orphans beyond the cap are
-    /// logged and deferred to the next run.
+    /// logged and deferred to the next run. **Shared between
+    /// byte-walker and row-walker** per V05_DESIGN.md §9.4.2.1.
     #[serde(default = "default_gc_sweep_max_deletes")]
     pub max_deletes_per_run: usize,
 
@@ -225,30 +237,54 @@ pub struct GcSweepConfig {
     /// (1 hour) per Step 0 Q9's analysis: the tracking surface
     /// is authoritative; this threshold catches the rare race
     /// where a `temp_blob_metadata` row hasn't committed yet.
+    /// **Arc 10 classifier knob, UNCHANGED by Arc 16d** (the
+    /// row-walker uses `untethered_ttl_seconds` instead).
     #[serde(default = "default_gc_sweep_threshold_secs")]
     pub freshness_threshold_secs: u64,
 
     /// Storage page size for the sweep's pagination. Default
     /// 500 — Step 1 benchmark validated this stays index-driven
     /// on SQLite at 100k seeded rows (6.98ms / well under the
-    /// 50ms threshold).
+    /// 50ms threshold). **Shared between byte-walker and
+    /// row-walker** per V05_DESIGN.md §9.4.2.1.
     #[serde(default = "default_gc_sweep_page_size")]
     pub page_size: usize,
+
+    /// Arc 16d row-sweep TTL anchor in seconds. Untethered
+    /// `blob_metadata` rows (`temp_key IS NOT NULL`) older than
+    /// `untethered_ttl_seconds` are eligible for sweep DELETE +
+    /// bytes-delete. Default 86400 (24h, matching the bsky-PDS
+    /// tempKey TTL parity that Arc 16c's `stage_ttl_seconds`
+    /// established for the adjacent staging surface). Per
+    /// V05_DESIGN.md §9.4.2.1 / §9.4.4 Step 1.1.
+    #[serde(default = "default_gc_sweep_untethered_ttl_secs")]
+    pub untethered_ttl_seconds: u64,
 }
 
 impl Default for GcSweepConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_gc_sweep_enabled(),
+            row_sweep_enabled: default_gc_sweep_row_sweep_enabled(),
             interval_secs: default_gc_sweep_interval_secs(),
             dry_run: default_gc_sweep_dry_run(),
             max_deletes_per_run: default_gc_sweep_max_deletes(),
             freshness_threshold_secs: default_gc_sweep_threshold_secs(),
             page_size: default_gc_sweep_page_size(),
+            untethered_ttl_seconds: default_gc_sweep_untethered_ttl_secs(),
         }
     }
 }
 
+/// Arc 16d §9.4.4 Step 1.3: default flipped `false → true`.
+/// Both walkers (byte + row) are on by default starting at v0.5.
+fn default_gc_sweep_enabled() -> bool {
+    true
+}
+/// Arc 16d §9.4.2.1: row-walker on/off; default `true`.
+fn default_gc_sweep_row_sweep_enabled() -> bool {
+    true
+}
 fn default_gc_sweep_interval_secs() -> u64 {
     86_400
 }
@@ -264,20 +300,36 @@ fn default_gc_sweep_threshold_secs() -> u64 {
 fn default_gc_sweep_page_size() -> usize {
     500
 }
+/// Arc 16d §9.4.2.1 / §9.4.4 Step 1.1: row-sweep TTL default 86400 (24h).
+fn default_gc_sweep_untethered_ttl_secs() -> u64 {
+    86_400
+}
 
 impl GcSweepConfig {
     /// Construct from explicit option-typed env-var values.
     /// Mirrors the pattern in `MaintenancePoolConfig::from_env_values`.
+    ///
+    /// Arc 16d §9.4.4 Step 1.5 adds two new env vars:
+    /// `PDS_GC_SWEEP_ROW_SWEEP_ENABLED` (boolean toggle) and
+    /// `PDS_GC_SWEEP_UNTETHERED_TTL_SECS` (TTL anchor seconds).
+    #[allow(clippy::too_many_arguments)]
     pub fn from_env_values(
         enabled: Option<String>,
+        row_sweep_enabled: Option<String>,
         interval_secs: Option<String>,
         dry_run: Option<String>,
         max_deletes_per_run: Option<String>,
         freshness_threshold_secs: Option<String>,
         page_size: Option<String>,
+        untethered_ttl_seconds: Option<String>,
     ) -> PdsResult<Self> {
         let defaults = Self::default();
         let enabled = parse_bool_env("PDS_GC_SWEEP_ENABLED", enabled, defaults.enabled)?;
+        let row_sweep_enabled = parse_bool_env(
+            "PDS_GC_SWEEP_ROW_SWEEP_ENABLED",
+            row_sweep_enabled,
+            defaults.row_sweep_enabled,
+        )?;
         let interval_secs = parse_u64_env(
             "PDS_GC_SWEEP_INTERVAL_SECS",
             interval_secs,
@@ -296,6 +348,11 @@ impl GcSweepConfig {
         )?;
         let page_size =
             parse_usize_env("PDS_GC_SWEEP_PAGE_SIZE", page_size, defaults.page_size)?;
+        let untethered_ttl_seconds = parse_u64_env(
+            "PDS_GC_SWEEP_UNTETHERED_TTL_SECS",
+            untethered_ttl_seconds,
+            defaults.untethered_ttl_seconds,
+        )?;
 
         if interval_secs == 0 {
             return Err(PdsError::Validation(
@@ -307,14 +364,21 @@ impl GcSweepConfig {
                 "PDS_GC_SWEEP_PAGE_SIZE must be greater than 0".to_string(),
             ));
         }
+        if untethered_ttl_seconds == 0 {
+            return Err(PdsError::Validation(
+                "PDS_GC_SWEEP_UNTETHERED_TTL_SECS must be greater than 0".to_string(),
+            ));
+        }
 
         Ok(Self {
             enabled,
+            row_sweep_enabled,
             interval_secs,
             dry_run,
             max_deletes_per_run,
             freshness_threshold_secs,
             page_size,
+            untethered_ttl_seconds,
         })
     }
 
@@ -397,6 +461,21 @@ pub struct DatabaseConfig {
     /// skip leader election entirely. See
     /// docs/AURORA_DESIGN.md §5.4.1.
     pub leader_retry_interval_ms: u64,
+    /// Arc 16d §9.4.3.6 / §9.4.4 Step 1.4: Postgres connection-level
+    /// transaction isolation pin. Default `"read committed"` —
+    /// Aurora-Locus's sweep DELETE predicate-disjointness argument
+    /// (§9.4.3.4) relies on statement-scoped snapshot semantics.
+    /// Higher isolation levels (REPEATABLE READ / SERIALIZABLE)
+    /// produce serialization-failure (40001) errors on the sweep's
+    /// per-row autocommit DELETE that the v0.5 sweep doesn't
+    /// retry-classify (deferred to v0.6+ per §9.4.1.2). Pool builder
+    /// reads this; `validate_gc_sweep_config` warns case-insensitively
+    /// when Postgres is the active backend and the value differs
+    /// from "read committed". SQLite-only deployments don't trip
+    /// the warning. Overrides cluster-level `postgresql.conf`
+    /// per §9.4.3.6 operator-visible-precedent note.
+    #[serde(default = "default_pg_transaction_isolation")]
+    pub pg_transaction_isolation: String,
 }
 
 impl Default for DatabaseConfig {
@@ -411,8 +490,14 @@ impl Default for DatabaseConfig {
             idle_timeout_secs: None,
             max_lifetime_secs: None,
             leader_retry_interval_ms: 2000,
+            pg_transaction_isolation: default_pg_transaction_isolation(),
         }
     }
+}
+
+/// Arc 16d §9.4.4 Step 1.4: Postgres isolation pin default.
+fn default_pg_transaction_isolation() -> String {
+    "read committed".to_string()
 }
 
 impl DatabaseConfig {
@@ -430,6 +515,7 @@ impl DatabaseConfig {
         idle_timeout_secs: Option<String>,
         max_lifetime_secs: Option<String>,
         leader_retry_interval_ms: Option<String>,
+        pg_transaction_isolation: Option<String>,
     ) -> PdsResult<Self> {
         let backend = match backend.as_deref().map(str::to_ascii_lowercase) {
             None => DatabaseBackend::Sqlite,
@@ -495,6 +581,13 @@ impl DatabaseConfig {
             )));
         }
 
+        // Arc 16d §9.4.4 Step 1.5: pg_transaction_isolation env override.
+        // Default `"read committed"`. Stored verbatim as the operator typed
+        // it (case-preserving); validator + pool builder normalize via
+        // `to_ascii_lowercase` at comparison time.
+        let pg_transaction_isolation = pg_transaction_isolation
+            .unwrap_or_else(default_pg_transaction_isolation);
+
         Ok(Self {
             backend,
             url,
@@ -504,6 +597,7 @@ impl DatabaseConfig {
             idle_timeout_secs,
             max_lifetime_secs,
             leader_retry_interval_ms,
+            pg_transaction_isolation,
         })
     }
 }
@@ -1413,6 +1507,8 @@ impl ServerConfig {
             env::var("PDS_DB_IDLE_TIMEOUT_SECS").ok(),
             env::var("PDS_DB_MAX_LIFETIME_SECS").ok(),
             env::var("PDS_SEQUENCER_LEADER_RETRY_MS").ok(),
+            // Arc 16d §9.4.4 Step 1.5: Postgres isolation pin env override.
+            env::var("PDS_DATABASE_PG_TRANSACTION_ISOLATION").ok(),
         )?;
 
         let distributed_state_mode = match env::var("PDS_DISTRIBUTED_STATE_MODE") {
@@ -1428,11 +1524,14 @@ impl ServerConfig {
 
         let gc_sweep = GcSweepConfig::from_env_values(
             env::var("PDS_GC_SWEEP_ENABLED").ok(),
+            // Arc 16d §9.4.4 Step 1.5: new row-walker env vars.
+            env::var("PDS_GC_SWEEP_ROW_SWEEP_ENABLED").ok(),
             env::var("PDS_GC_SWEEP_INTERVAL_SECS").ok(),
             env::var("PDS_GC_SWEEP_DRY_RUN").ok(),
             env::var("PDS_GC_SWEEP_MAX_DELETES_PER_RUN").ok(),
             env::var("PDS_GC_SWEEP_FRESHNESS_THRESHOLD_SECS").ok(),
             env::var("PDS_GC_SWEEP_PAGE_SIZE").ok(),
+            env::var("PDS_GC_SWEEP_UNTETHERED_TTL_SECS").ok(),
         )?;
 
         // Arc 16c §9.3.4 Step 1 / chainlink #92: blob lifecycle
@@ -1593,10 +1692,10 @@ mod database_tests {
 
     #[test]
     fn from_env_values_defaults_to_sqlite() {
-        let cfg = DatabaseConfig::from_env_values(None, None, None, None, None, None, None,
-            None,
+        let cfg = DatabaseConfig::from_env_values(
+            None, None, None, None, None, None, None, None, None,
         )
-            .unwrap();
+        .unwrap();
         assert_eq!(cfg.backend, DatabaseBackend::Sqlite);
         assert!(cfg.url.is_none());
         assert_eq!(cfg.max_connections, 25);
@@ -1617,7 +1716,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .unwrap();
         assert_eq!(cfg.backend, DatabaseBackend::Postgres);
         assert_eq!(
@@ -1637,7 +1738,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .unwrap();
         assert_eq!(cfg.backend, DatabaseBackend::Postgres);
     }
@@ -1653,7 +1756,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("postgres without URL should be rejected");
         assert!(err.to_string().contains("PDS_DB_URL is required"));
     }
@@ -1669,7 +1774,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("non-postgres URL should be rejected");
         assert!(err.to_string().contains("postgres://"));
     }
@@ -1685,7 +1792,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("unknown backend should be rejected");
         let msg = err.to_string();
         assert!(msg.contains("sqlite"));
@@ -1703,7 +1812,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("min > max should be rejected");
         let msg = err.to_string();
         assert!(msg.contains("MIN_CONNECTIONS"));
@@ -1721,7 +1832,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("max=0 should be rejected");
         assert!(err.to_string().contains("greater than 0"));
     }
@@ -1737,7 +1850,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("acquire timeout=0 should be rejected");
         assert!(err.to_string().contains("ACQUIRE_TIMEOUT_SECS"));
     }
@@ -1753,7 +1868,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("non-integer timeout should be rejected");
         assert!(err.to_string().contains("non-negative integer"));
     }
@@ -1769,7 +1886,9 @@ mod database_tests {
             Some("60".to_string()),
             Some("3600".to_string()),
         
-            None,)
+            None,
+            None,
+        )
         .unwrap();
         assert_eq!(cfg.idle_timeout_secs, Some(60));
         assert_eq!(cfg.max_lifetime_secs, Some(3600));
@@ -2012,21 +2131,43 @@ mod blobstore_tests {
 mod gc_sweep_tests {
     use super::*;
 
+    /// Updated for Arc 16d §9.4.4 Step 1.3: `gc_sweep.enabled`
+    /// default flipped from `false → true`. v0.4's "off-by-default
+    /// safety stance" is superseded by v0.5's "row-walker + byte-
+    /// walker both default-on" — Arc 16d ships production-grade
+    /// row-driven GC and the design accepts both walkers running by
+    /// default. Operators who want pre-Arc-16d behavior set
+    /// `PDS_GC_SWEEP_ENABLED=false` explicitly.
     #[test]
-    fn default_matches_v04_design_safety_stance() {
+    fn default_matches_v05_arc16d_lock_stance() {
         let c = GcSweepConfig::default();
-        assert!(!c.enabled, "default must be disabled");
-        assert!(c.dry_run, "default must be dry_run=true");
+        assert!(c.enabled, "Arc 16d §9.4.4 Step 1.3: default flipped to enabled");
+        assert!(
+            c.row_sweep_enabled,
+            "Arc 16d §9.4.2.1: row-walker default enabled"
+        );
+        assert!(c.dry_run, "default must be dry_run=true (unchanged from v0.4)");
         assert_eq!(c.interval_secs, 86_400);
         assert_eq!(c.max_deletes_per_run, 10_000);
         assert_eq!(c.freshness_threshold_secs, 3_600);
         assert_eq!(c.page_size, 500);
+        assert_eq!(
+            c.untethered_ttl_seconds, 86_400,
+            "Arc 16d §9.4.4 Step 1.1: row-sweep TTL default 86400 (24h)"
+        );
     }
 
     #[test]
     fn from_env_values_all_none_yields_default() {
-        let c = GcSweepConfig::from_env_values(None, None, None, None, None, None).unwrap();
+        let c = GcSweepConfig::from_env_values(
+            None, None, None, None, None, None, None, None,
+        )
+        .unwrap();
+        // Arc 16d §9.4.4 Step 1.3: enabled default flipped false→true.
         assert_eq!(c.enabled, GcSweepConfig::default().enabled);
+        assert!(c.enabled);
+        // Arc 16d §9.4.2.1: row_sweep_enabled default true.
+        assert!(c.row_sweep_enabled);
         assert_eq!(c.dry_run, GcSweepConfig::default().dry_run);
         assert_eq!(c.interval_secs, GcSweepConfig::default().interval_secs);
         assert_eq!(c.max_deletes_per_run, GcSweepConfig::default().max_deletes_per_run);
@@ -2035,32 +2176,40 @@ mod gc_sweep_tests {
             GcSweepConfig::default().freshness_threshold_secs
         );
         assert_eq!(c.page_size, GcSweepConfig::default().page_size);
+        // Arc 16d §9.4.4 Step 1.1: untethered_ttl_seconds default 86400.
+        assert_eq!(c.untethered_ttl_seconds, 86_400);
     }
 
     #[test]
     fn from_env_values_parses_all_fields() {
         let c = GcSweepConfig::from_env_values(
             Some("true".to_string()),
+            Some("false".to_string()), // row_sweep_enabled
             Some("3600".to_string()),
             Some("false".to_string()),
             Some("500".to_string()),
             Some("1800".to_string()),
             Some("250".to_string()),
+            Some("172800".to_string()), // untethered_ttl_seconds (48h)
         )
         .unwrap();
         assert!(c.enabled);
+        assert!(!c.row_sweep_enabled);
         assert_eq!(c.interval_secs, 3_600);
         assert!(!c.dry_run);
         assert_eq!(c.max_deletes_per_run, 500);
         assert_eq!(c.freshness_threshold_secs, 1_800);
         assert_eq!(c.page_size, 250);
+        assert_eq!(c.untethered_ttl_seconds, 172_800);
     }
 
     #[test]
     fn from_env_values_zero_interval_rejected() {
         let err = GcSweepConfig::from_env_values(
             Some("true".to_string()),
+            None,
             Some("0".to_string()),
+            None,
             None,
             None,
             None,
@@ -2078,7 +2227,9 @@ mod gc_sweep_tests {
             None,
             None,
             None,
+            None,
             Some("0".to_string()),
+            None,
         )
         .expect_err("zero page size must be rejected");
         assert!(err.to_string().contains("PDS_GC_SWEEP_PAGE_SIZE"));
@@ -2093,20 +2244,41 @@ mod gc_sweep_tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect_err("'yes' is not a valid bool");
         assert!(err.to_string().contains("PDS_GC_SWEEP_ENABLED"));
+    }
+
+    /// Arc 16d §9.4.4 Step 1.5: zero `untethered_ttl_seconds` rejected.
+    #[test]
+    fn from_env_values_zero_untethered_ttl_rejected() {
+        let err = GcSweepConfig::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0".to_string()),
+        )
+        .expect_err("zero untethered_ttl_seconds must be rejected");
+        assert!(err.to_string().contains("PDS_GC_SWEEP_UNTETHERED_TTL_SECS"));
     }
 
     #[test]
     fn to_sweep_params_propagates_fields() {
         let cfg = GcSweepConfig {
             enabled: true,
+            row_sweep_enabled: true,
             interval_secs: 7200,
             dry_run: false,
             max_deletes_per_run: 250,
             freshness_threshold_secs: 600,
             page_size: 100,
+            untethered_ttl_seconds: 86_400,
         };
         let p = cfg.to_sweep_params(true);
         assert!(!p.dry_run);

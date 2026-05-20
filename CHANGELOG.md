@@ -8,6 +8,133 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Arc 16d — Row-driven GC sweep (v5 LOCKED)** (#101). Adds
+  `sweep_untethered_rows` — a row-walker that complements Arc
+  10's byte-walker by reclaiming `blob_metadata` rows in the
+  untethered state (`temp_key IS NOT NULL`) whose `created_at`
+  (TTL anchor per Arc 16b §9.2.3.1) has elapsed. Federation
+  sub-feature **#46 closes** with this arc (Arc 16b + 16c + 16d
+  all locked).
+  - **Two-phase autocommit** (§9.4.3.1): Phase 1 SELECTs a page
+    of `(cid, created_at)` with cursor pagination ordered by
+    `(created_at, cid)`; Phase 2 issues a per-row predicate-
+    guarded DELETE. Phases run as separate statements with
+    independent statement-scoped snapshots; NOT nested in a
+    multi-statement transaction. Per-row roundtrip count
+    doubled vs v3 baseline (DELETE + fresh-row SELECT +
+    backend.delete) but absolute cost remains within v0.5
+    headroom at the default 86400s cadence.
+  - **Predicate-disjointness race defense** (§9.4.3.4): the
+    Phase 2 DELETE carries `temp_key IS NOT NULL AND created_at
+    < $cutoff` in its WHERE clause. Concurrent STRICT
+    promotion (sets `temp_key=NULL`) or re-upload Case 3
+    refresh (sets `created_at=$now`) commits before the per-row
+    DELETE → DELETE matches zero rows → `race_skip_count`
+    increments → cursor advances. Same shape as Arc 16c
+    §9.3.3.4 Case 3b/3c with table-disjointness substituted by
+    predicate-disjointness.
+  - **Post-commit byte-loss diagnostic** (§9.4.5.9 / round-4 F2
+    + F3 closures): between sweep's Phase 2 DELETE commit and
+    `backend.delete`, a fresh-row SELECT (`SELECT 1 FROM
+    blob_metadata WHERE cid = $1 LIMIT 1`) checks for Arc 16c
+    re-upload `track_untethered_blob` Case 3 commits during the
+    gap. If a fresh row exists, `backend.delete` is skipped,
+    `bytes_delete_skipped_fresh_row_count` increments, and WARN
+    log emits. Residual race window (fresh-row check → backend
+    .delete) accepted with diagnostic per v0.5 dev-only scope;
+    v0.6+ candidates include settling-window AND row-walker
+    recovery pass (round-4 F3).
+  - **Per-row INFO logging** for every successful
+    `backend.delete` with CID + timestamp (round-4 F2 closure).
+    Operators investigating residual-race events query this
+    log per §9.4.5.9 operator-action.
+  - **Autocommit-wrapper substrate** (§9.4.3.1 / §9.4.4 Step
+    2.1): new `src/db/autocommit.rs` module exposes four typed
+    wrappers (`autocommit_execute`, `autocommit_fetch_all`,
+    `autocommit_fetch_one`, `autocommit_fetch_optional`) over
+    sqlx's `AnyPool`. `sweep_untethered_rows` issues every SQL
+    statement via these wrappers; Step 5 audit grep scoped to
+    `src/blob_store/gc.rs` enforces. The wrapper bodies use
+    bare sqlx by construction and are explicitly out of audit
+    scope (round-4 F5 closure). Streaming `.fetch(` variant
+    deferred to v0.6+ — v0.5 forces page materialization via
+    `autocommit_fetch_all` (round-4 F10).
+  - **Postgres READ COMMITTED pool-pin** (§9.4.3.6 / §9.4.4
+    Step 1.7): new `database.pg_transaction_isolation` config
+    field, default `"read committed"`, applied via sqlx
+    `AnyPoolOptions::after_connect` issuing `SET SESSION
+    CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` on
+    each new Postgres connection. Overrides cluster-level
+    `postgresql.conf`. `validate_gc_sweep_config` warns
+    case-insensitively when active backend is Postgres and the
+    value differs from "read committed" (round-4 F9 closure).
+    SQLite-only deployments skip the hook and don't trip the
+    warning. New env var:
+    `PDS_DATABASE_PG_TRANSACTION_ISOLATION`.
+  - **`GcSweepConfig` extensions** (§9.4.2.1): new
+    `untethered_ttl_seconds` (default 86400, parity with Arc
+    16c's `stage_ttl_seconds`) + `row_sweep_enabled` (default
+    `true`). **`enabled` default flipped** `false → true`
+    (§9.4.1.3 / Step 1.3) — Arc 16d ships production-grade
+    GC, both walkers on by default. Operators opt OUT
+    explicitly. New env vars:
+    `PDS_GC_SWEEP_UNTETHERED_TTL_SECS`,
+    `PDS_GC_SWEEP_ROW_SWEEP_ENABLED`.
+  - **TTL-vs-interval validator warning** (§9.4.3.6):
+    `validate_gc_sweep_config` warns if
+    `untethered_ttl_seconds <= interval_secs` (a row may live
+    past TTL but never be observed by a sweep cycle — the
+    previous cycle didn't see it and the next snapshot may miss
+    it if a refresh fires).
+  - **Single-tasked orchestrator topology** (§9.4.3.7 /
+    §9.4.4 Step 3): new `JobScheduler::row_sweep_job` spawned
+    conditionally under `gc_sweep.row_sweep_enabled`; both
+    walkers (byte + row) configured with
+    `MissedTickBehavior::Skip` (Step 3.3 — without this, after
+    a slow cycle tokio fires the backlog of missed ticks
+    back-to-back which compounds load exactly when the system
+    is strained). Walkers safely concurrent per §9.4.3.9 —
+    Arc 10 doesn't touch `blob_metadata`; Arc 16d doesn't touch
+    `blob` / `temp_blob_metadata`. Cycle-completion summary
+    log includes full `RowSweepReport` counters.
+  - **`#[cfg(test)]` instrumentation hook** (round-4 F7
+    closure / §9.4.4 Step 2.5): optional
+    `after_phase2_delete_hook` field on `RowSweepParams` fires
+    between Phase 2 DELETE commit and the fresh-row SELECT.
+    Production callers leave `None`; Scenario 9b unit test +
+    Phase B harness inject synthetic INSERTs during the gap to
+    exercise the fresh-row diagnostic path.
+  - **Schema inheritance** (Step 0.1 recon): Arc 16d takes
+    `blob_metadata.temp_key` + `idx_blob_metadata_untethered`
+    partial index from Arc 16b's migration 0011 as-is. **No
+    new migration in Arc 16d** — the partial index's
+    `created_at WHERE temp_key IS NOT NULL` shape already
+    services the sweep query (Arc 16b §9.2.5.6 forward-coupling
+    note).
+
+  cargo test --lib --locked: **1107 PASS / 0 FAIL** (net +15
+  over Arc 16c sign-off at 1092: +4 autocommit-wrapper smoke +
+  +10 row-sweep unit tests covering success path,
+  permanent-row skip via partial predicate, too-young skip,
+  multi-page cursor pagination, safety cap, dry-run, bytes-
+  delete failure orphan, fresh-row diagnostic via test hook
+  (Scenario 9b unit), empty-table early exit, race-skip via
+  test hook + 1 default-test rewrite for the `enabled` flip).
+  Cross-backend SQL lint (#95) + .env shadowing lint (#94) both
+  guard untouched. Step 5 arc-close audit 13/15 items
+  cargo-verifiable (items 1-13 PASS); items 14 (V05_DESIGN.md
+  §9 LOCKED / §1.2 #46 closed) + 15 (backend matrix Phase B
+  coverage) are operator-driven Phase B work.
+
+  **Federation sub-feature #46 stays OPEN** until skydeval
+  Phase B sign-off — closes simultaneously with #101 per
+  V05_DESIGN.md §1.2.
+
+  v0.6 follow-ups parked: chainlink #102 (V05_DESIGN.md §9.4
+  line 7808 references `V05_ARC16D_RECON_PRELIM.md` but the
+  authoritative file on disk is `V05_ARC16D_RECON_R0.md` —
+  pure bookkeeping, no behavior change).
+
 - **Arc 16c — uploadBlob two-phase wiring (v5 LOCKED)** (#92).
   First arc to consume Arc 16b's `track_untethered_blob` as a
   production caller. uploadBlob now persists `blob_metadata` rows

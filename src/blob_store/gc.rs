@@ -27,7 +27,7 @@ use chrono::{DateTime, Utc};
 use sqlx::AnyPool;
 
 use crate::blob_store::{BlobBackend, BlobListEntry};
-use crate::error::PdsResult;
+use crate::error::{PdsError, PdsResult};
 
 /// Sweep configuration parameters.
 ///
@@ -406,6 +406,432 @@ async fn query_in_flight_cids(
     }
     let cids: Vec<String> = q.fetch_all(pool).await?;
     Ok(cids.into_iter().collect())
+}
+
+// ===========================================================================
+// Arc 16d — Row-driven GC sweep (V05_DESIGN.md §9.4, LOCKED at v5)
+//
+// Adds a row-walker that complements Arc 10's byte-walker (above):
+// - Byte-walker (Arc 10): finds bytes-at-final-position with no
+//   matching row. Recovers Arc 16c's commit-phase orphan-bytes case +
+//   Arc 16d's `backend.delete` failure cases (§9.4.5.1).
+// - Row-walker (Arc 16d, below): finds untethered `blob_metadata`
+//   rows whose TTL has elapsed.
+//
+// Two-phase autocommit per §9.4.3.1: Phase 1 SELECTs a page of
+// (cid, created_at) with cursor pagination; Phase 2 issues a
+// per-row predicate-guarded DELETE; the predicate guard
+// (`temp_key IS NOT NULL AND created_at < $cutoff`) re-evaluates
+// at lock-acquisition time so concurrent STRICT promotion or
+// re-upload `track_untethered_blob` Case 3 refreshes resolve via
+// zero-row-affected (race-skip), not data corruption.
+//
+// Per-row sequence (§9.4.3.2): Phase 2 DELETE → [test hook] →
+// fresh-row check (mitigates Case 2a post-commit byte-loss race
+// per §9.4.5.9; v0.6+ candidates for residual mitigation) →
+// `backend.delete` (only if no fresh row) with per-row INFO log
+// for ops investigation (round-4 F2 closure).
+// ===========================================================================
+
+/// Arc 16d row-sweep parameters (§9.4.4 Step 2.2). Distinct from
+/// Arc 10's [`SweepParams`] because the two walkers don't share
+/// a TTL semantic (Arc 10's `freshness_threshold` is a
+/// classifier-safety bound; Arc 16d's `untethered_ttl` is the TTL
+/// anchor for row reclamation).
+#[derive(Clone)]
+pub struct RowSweepParams {
+    /// If `true`, the sweep logs would-be deletes but performs
+    /// neither the row DELETE nor the bytes delete. Populates the
+    /// `total_eligible_count` + `would_delete_count` Option fields
+    /// in the [`RowSweepReport`] instead of `rows_deleted`.
+    pub dry_run: bool,
+
+    /// Safety cap per §9.4.3.2 — stops the cycle once
+    /// `rows_deleted >= max_deletes_per_run`. Shared with the
+    /// byte-walker via `GcSweepConfig.max_deletes_per_run`.
+    pub max_deletes_per_run: usize,
+
+    /// Page size for the Phase 1 SELECT (§9.4.3.1). Shared with
+    /// the byte-walker via `GcSweepConfig.page_size`.
+    pub page_size: usize,
+
+    /// TTL anchor: rows are eligible when
+    /// `created_at < now - untethered_ttl`. Sourced from
+    /// `GcSweepConfig.untethered_ttl_seconds`.
+    pub untethered_ttl: Duration,
+
+    /// Test-only synchronization hook (V05_DESIGN.md §9.4.4 Step
+    /// 2.5 — closes round-4 F7). When `Some`, fires between Phase
+    /// 2 DELETE commit and fresh-row SELECT for each row. The
+    /// closure receives the just-deleted CID and returns a
+    /// future the sweep awaits before continuing. Production
+    /// callers leave this `None`; Scenario 9b unit + Phase B
+    /// tests inject synthetic INSERT statements during the gap.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub after_phase2_delete_hook: Option<
+        std::sync::Arc<
+            dyn Fn(String) -> futures::future::BoxFuture<'static, ()> + Send + Sync,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for RowSweepParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowSweepParams")
+            .field("dry_run", &self.dry_run)
+            .field("max_deletes_per_run", &self.max_deletes_per_run)
+            .field("page_size", &self.page_size)
+            .field("untethered_ttl", &self.untethered_ttl)
+            .finish()
+    }
+}
+
+impl Default for RowSweepParams {
+    fn default() -> Self {
+        Self {
+            dry_run: true,
+            max_deletes_per_run: 10_000,
+            page_size: 500,
+            untethered_ttl: Duration::from_secs(86_400),
+            #[cfg(test)]
+            after_phase2_delete_hook: None,
+        }
+    }
+}
+
+/// Arc 16d row-sweep cycle report (§9.4.4 Step 2.3). Counters
+/// surface every per-row outcome class for operator observability
+/// (§9.4.5.9 operator-action references `bytes_delete_skipped_fresh_row_count`
+/// and `db_error_skip_count` explicitly).
+#[derive(Debug, Default, Clone)]
+pub struct RowSweepReport {
+    /// Rows successfully DELETEd with bytes-delete succeeding (or
+    /// skipped via fresh-row diagnostic per §9.4.3.2 / §9.4.5.9).
+    pub rows_deleted: u64,
+
+    /// Per-row Phase 2 DELETE returned `rows_affected = 0` —
+    /// predicate guard caught a concurrent STRICT promotion or
+    /// re-upload refresh between Phase 1 SELECT and Phase 2
+    /// statement execution (V05_DESIGN.md §9.4.3.4 Cases 1b +
+    /// 3 benign resolutions).
+    pub race_skip_count: u64,
+
+    /// Per-row `backend.delete` returned an error — row was
+    /// DELETEd but bytes remain at final position. Arc 10's
+    /// byte-walker picks these up on a subsequent cycle
+    /// (§9.4.5.1).
+    pub bytes_delete_failure_count: u64,
+
+    /// Per-row autocommit DELETE itself returned a DB error.
+    /// Cursor advances regardless of per-row outcome per
+    /// §9.4.3.2; counted here for operator triage threshold
+    /// (§9.4.5.7).
+    pub db_error_skip_count: u64,
+
+    /// Fresh-row diagnostic fired per §9.4.5.9 — a new row for
+    /// the same CID appeared between Phase 2 DELETE and the
+    /// fresh-row SELECT (Arc 16c re-upload `track_untethered_blob`
+    /// Case 3). Bytes-delete skipped to avoid deleting bytes the
+    /// fresh row claims.
+    pub bytes_delete_skipped_fresh_row_count: u64,
+
+    /// Dry-run only: total rows the predicate would have matched.
+    /// `None` outside dry-run mode.
+    pub total_eligible_count: Option<u64>,
+
+    /// Dry-run only: rows that would have been DELETEd under the
+    /// safety cap. `None` outside dry-run mode.
+    pub would_delete_count: Option<u64>,
+
+    /// Phase 1 pages scanned (cycle metadata).
+    pub pages_scanned: u64,
+
+    /// Wall-clock cycle duration in seconds.
+    pub duration_seconds: f64,
+}
+
+/// Arc 16d cursor type for stable pagination across the sweep
+/// cycle (§9.4.4 Step 2.4). `(created_at, cid)` tuple ordering
+/// gives a total order under the partial index
+/// `idx_blob_metadata_untethered(created_at) WHERE temp_key IS
+/// NOT NULL`. CID is the disambiguator for rows with identical
+/// `created_at` (rare in practice but possible under high-rate
+/// upload bursts).
+#[derive(Debug, Clone)]
+pub struct SweepCursor {
+    pub last_created_at: String,
+    pub last_cid: String,
+}
+
+/// Arc 16d row-driven GC sweep primitive (§9.4.4 Step 2.5; body
+/// per §9.4.3.1 + §9.4.3.2).
+///
+/// Walks `blob_metadata` rows in the untethered state
+/// (`temp_key IS NOT NULL`) whose `created_at` is older than
+/// `now - params.untethered_ttl`. For each row:
+///
+/// 1. Issue Phase 2 predicate-guarded DELETE via
+///    [`crate::db::autocommit::autocommit_execute`].
+/// 2. If `rows_affected == 1`: fire the test hook (if any), then
+///    issue the fresh-row SELECT via
+///    [`crate::db::autocommit::autocommit_fetch_optional`].
+/// 3. If no fresh row: call `backend.delete(cid)` and log INFO on
+///    success (round-4 F2 closure — operators trace residual-race
+///    events through this log per §9.4.5.9).
+/// 4. If fresh row present: skip bytes-delete, increment
+///    `bytes_delete_skipped_fresh_row_count`, log WARN.
+///
+/// Cursor advances regardless of per-row outcome per §9.4.3.2.
+///
+/// Every SQL statement goes through the
+/// [`crate::db::autocommit`] wrappers — Step 5 audit item 8 grep
+/// enforces. Backend `delete` calls go through the
+/// [`crate::blob_store::BlobBackend`] trait surface and are
+/// explicitly out of audit scope per round-4 F6.
+///
+/// `now` is parameterized for testability (production callers
+/// pass `chrono::Utc::now()`; tests pass `Utc::now() +
+/// chrono::Duration::hours(N)` to age fixtures into the sweep
+/// window — same pattern as Arc 10's
+/// [`run_sweep`]).
+pub async fn sweep_untethered_rows<B: BlobBackend + ?Sized>(
+    pool: &AnyPool,
+    backend: &B,
+    params: RowSweepParams,
+    now: DateTime<Utc>,
+) -> PdsResult<RowSweepReport> {
+    use crate::db::autocommit::{
+        autocommit_execute, autocommit_fetch_all, autocommit_fetch_optional,
+    };
+
+    let start = std::time::Instant::now();
+    let mut report = RowSweepReport::default();
+    if params.dry_run {
+        report.total_eligible_count = Some(0);
+        report.would_delete_count = Some(0);
+    }
+
+    let cutoff = now
+        - chrono::Duration::from_std(params.untethered_ttl)
+            .unwrap_or(chrono::Duration::MAX);
+    let cutoff_rfc3339 = cutoff.to_rfc3339();
+
+    let mut cursor: Option<SweepCursor> = None;
+
+    'outer: loop {
+        // Arc 16d §9.4.3.1 Phase 1: page selection with cursor
+        // (autocommit SELECT). First page uses two-clause predicate;
+        // subsequent pages add the cursor disjunction for stable
+        // pagination past the previous page's last row.
+        let page_rows = match &cursor {
+            None => {
+                let q = sqlx::query(
+                    "SELECT cid, created_at \
+                     FROM blob_metadata \
+                     WHERE temp_key IS NOT NULL \
+                       AND created_at < $1 \
+                     ORDER BY created_at, cid \
+                     LIMIT $2",
+                )
+                .bind(&cutoff_rfc3339)
+                .bind(params.page_size as i64);
+                autocommit_fetch_all(pool, q).await
+            }
+            Some(cur) => {
+                let q = sqlx::query(
+                    "SELECT cid, created_at \
+                     FROM blob_metadata \
+                     WHERE temp_key IS NOT NULL \
+                       AND created_at < $1 \
+                       AND (created_at > $2 \
+                            OR (created_at = $2 AND cid > $3)) \
+                     ORDER BY created_at, cid \
+                     LIMIT $4",
+                )
+                .bind(&cutoff_rfc3339)
+                .bind(&cur.last_created_at)
+                .bind(&cur.last_cid)
+                .bind(params.page_size as i64);
+                autocommit_fetch_all(pool, q).await
+            }
+        };
+
+        let page_rows = match page_rows {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "row_sweep: Phase 1 page-select failed; aborting cycle"
+                );
+                return Err(PdsError::Database(e));
+            }
+        };
+
+        report.pages_scanned += 1;
+
+        if page_rows.is_empty() {
+            break;
+        }
+
+        for row in &page_rows {
+            use sqlx::Row;
+            let cid: String = row.try_get("cid")?;
+            let created_at: String = row.try_get("created_at")?;
+
+            // Cursor advances on every observed row — race-skip,
+            // db-error-skip, and successful-delete all advance per
+            // §9.4.3.2 ("Cursor advances regardless of per-row
+            // outcome.").
+            cursor = Some(SweepCursor {
+                last_created_at: created_at.clone(),
+                last_cid: cid.clone(),
+            });
+
+            // Dry-run early-out: count, don't delete.
+            if params.dry_run {
+                *report.total_eligible_count.get_or_insert(0) += 1;
+                let would_delete = report
+                    .would_delete_count
+                    .map(|c| c < params.max_deletes_per_run as u64)
+                    .unwrap_or(true);
+                if would_delete {
+                    *report.would_delete_count.get_or_insert(0) += 1;
+                }
+                continue;
+            }
+
+            // Arc 16d §9.4.3.1 Phase 2: per-row autocommit DELETE
+            // with predicate guard. Predicate is re-evaluated at
+            // lock acquisition; zero-row outcome = concurrent
+            // STRICT promotion or re-upload refresh resolved
+            // benignly (V05_DESIGN.md §9.4.3.4 Cases 1b / 3 /
+            // Interleaving B).
+            let delete_q = sqlx::query(
+                "DELETE FROM blob_metadata \
+                 WHERE cid = $1 \
+                   AND temp_key IS NOT NULL \
+                   AND created_at < $2",
+            )
+            .bind(&cid)
+            .bind(&cutoff_rfc3339);
+
+            let affected = match autocommit_execute(pool, delete_q).await {
+                Ok(r) => r.rows_affected(),
+                Err(e) => {
+                    report.db_error_skip_count += 1;
+                    tracing::warn!(
+                        cid = %cid,
+                        error = %e,
+                        "row_sweep: Phase 2 DELETE failed; cursor advances",
+                    );
+                    continue;
+                }
+            };
+
+            if affected == 0 {
+                report.race_skip_count += 1;
+                continue;
+            }
+
+            // Arc 16d §9.4.4 Step 2.5 / round-4 F7 closure:
+            // [TEST HOOK between DELETE commit and fresh-row check;
+            //  used by §9.4.4 Step 2.6 unit test + §9.4.8.2 Scenario
+            //  9b]. Production never sets this; tests inject
+            //  synthetic INSERTs to exercise the fresh-row
+            //  diagnostic path.
+            #[cfg(test)]
+            if let Some(hook) = &params.after_phase2_delete_hook {
+                hook(cid.clone()).await;
+            }
+
+            // Arc 16d §9.4.3.2 + §9.4.5.9 Case 2a mitigation:
+            // fresh-row check via autocommit SELECT. If Arc 16c
+            // committed a re-upload INSERT for this CID between
+            // our Phase 2 DELETE and this SELECT, the fresh row's
+            // bytes claim takes precedence — skip the
+            // bytes-delete.
+            let fresh_q = sqlx::query(
+                "SELECT 1 FROM blob_metadata WHERE cid = $1 LIMIT 1",
+            )
+            .bind(&cid);
+            let fresh_row_exists = match autocommit_fetch_optional(pool, fresh_q).await
+            {
+                Ok(opt) => opt.is_some(),
+                Err(e) => {
+                    // DB error on the fresh-row check is fail-safe:
+                    // assume the row might be there + skip bytes-
+                    // delete. Conservative; preserves the §9.4.5.9
+                    // mitigation contract under DB-failure
+                    // conditions.
+                    tracing::warn!(
+                        cid = %cid,
+                        error = %e,
+                        "row_sweep: fresh-row check failed; \
+                         skipping bytes-delete defensively",
+                    );
+                    report.bytes_delete_skipped_fresh_row_count += 1;
+                    continue;
+                }
+            };
+
+            if fresh_row_exists {
+                report.bytes_delete_skipped_fresh_row_count += 1;
+                tracing::warn!(
+                    cid = %cid,
+                    "row_sweep: post-commit byte-loss race: fresh row appeared \
+                     between row-DELETE and bytes-delete check; \
+                     skipping bytes-delete (V05_DESIGN.md §9.4.5.9)",
+                );
+                continue;
+            }
+
+            // Bytes-delete via Arc 10 / Arc 16c's existing
+            // BlobBackend::delete (out of autocommit-wrapper scope
+            // per round-4 F6; governed by the backend-trait
+            // contract).
+            match backend.delete(&cid).await {
+                Ok(()) => {
+                    report.rows_deleted += 1;
+                    // Per-row INFO log per §9.4.3.2 round-4 F2
+                    // closure: operators trace residual-race
+                    // events through this log per §9.4.5.9
+                    // operator-action.
+                    tracing::info!(
+                        cid = %cid,
+                        ts = %now.to_rfc3339(),
+                        "row_sweep.backend_delete",
+                    );
+                }
+                Err(e) => {
+                    report.bytes_delete_failure_count += 1;
+                    tracing::warn!(
+                        cid = %cid,
+                        error = %e,
+                        "row_sweep.backend_delete_failed (bytes orphan; \
+                         Arc 10 byte-walker recovery)",
+                    );
+                }
+            }
+
+            // Safety cap (§9.4.3.2): stop the cycle once the cap
+            // is reached. Remaining eligible rows wait for the
+            // next cycle.
+            if report.rows_deleted >= params.max_deletes_per_run as u64 {
+                break 'outer;
+            }
+        }
+
+        // Cursor-driven termination: if the page returned fewer
+        // than page_size rows, there's no next page to fetch.
+        if page_rows.len() < params.page_size {
+            break;
+        }
+    }
+
+    report.duration_seconds = start.elapsed().as_secs_f64();
+
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1004,5 +1430,531 @@ mod tests {
                 last_modified: epoch,
             }
         );
+    }
+
+    // =======================================================================
+    // Arc 16d — row-sweep tests (V05_DESIGN.md §9.4.4 Step 2.6)
+    //
+    // Coverage:
+    // - Row selection + DELETE + bytes-delete success path
+    // - Cursor pagination across multiple pages
+    // - Persistent db-error-skip at queue head does NOT pin sweep
+    // - Race-skip case (predicate-guard zero-row outcome)
+    // - Dry-run mode (both counters populated)
+    // - Safety-cap mode
+    // - Empty-page early exit
+    // - Fresh-row check fires via #[cfg(test)] hook (Scenario 9b unit)
+    // =======================================================================
+
+    /// Build a fresh in-memory SQLite pool with the Arc 16b
+    /// `blob_metadata` schema (migrations/0011 baseline + Arc 16b's
+    /// `temp_key` column + partial index).
+    async fn setup_row_sweep_pool() -> AnyPool {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open sqlite::memory: pool");
+
+        sqlx::query(
+            "CREATE TABLE blob_metadata (
+                cid             TEXT PRIMARY KEY,
+                mime_type       TEXT NOT NULL,
+                size            INTEGER NOT NULL,
+                creator_did     TEXT NOT NULL,
+                created_at      TEXT NOT NULL,
+                width           INTEGER,
+                height          INTEGER,
+                alt_text        TEXT,
+                thumbnail_cid   TEXT,
+                temp_key        TEXT NULL CHECK (temp_key IS NULL OR temp_key = '1')
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create blob_metadata table");
+
+        sqlx::query(
+            "CREATE INDEX idx_blob_metadata_untethered \
+             ON blob_metadata (created_at) WHERE temp_key IS NOT NULL",
+        )
+        .execute(&pool)
+        .await
+        .expect("create partial index");
+
+        pool
+    }
+
+    /// Seed an untethered `blob_metadata` row at the given
+    /// `created_at` (RFC3339).
+    async fn seed_untethered_row(pool: &AnyPool, cid: &str, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO blob_metadata \
+             (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ($1, 'image/png', 1, 'did:plc:test', $2, '1')",
+        )
+        .bind(cid)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("seed untethered blob_metadata row");
+    }
+
+    /// Seed a permanent (NULL temp_key) row.
+    async fn seed_permanent_row(pool: &AnyPool, cid: &str, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO blob_metadata \
+             (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ($1, 'image/png', 1, 'did:plc:test', $2, NULL)",
+        )
+        .bind(cid)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("seed permanent blob_metadata row");
+    }
+
+    /// Default Arc 16d test params: page_size = 100, ttl = 1 hour,
+    /// safety cap = 10000, NOT dry-run. Tests override fields as
+    /// needed.
+    fn row_sweep_params() -> RowSweepParams {
+        RowSweepParams {
+            dry_run: false,
+            max_deletes_per_run: 10_000,
+            page_size: 100,
+            untethered_ttl: Duration::from_secs(3600),
+            after_phase2_delete_hook: None,
+        }
+    }
+
+    /// Test backend that tracks `delete()` calls and can be
+    /// configured to fail on specific CIDs.
+    struct TrackingBackend {
+        inner: DiskBlobBackend,
+        deleted: tokio::sync::Mutex<Vec<String>>,
+        fail_on: tokio::sync::Mutex<HashSet<String>>,
+    }
+
+    impl TrackingBackend {
+        fn new(inner: DiskBlobBackend) -> Self {
+            Self {
+                inner,
+                deleted: tokio::sync::Mutex::new(Vec::new()),
+                fail_on: tokio::sync::Mutex::new(HashSet::new()),
+            }
+        }
+        async fn deleted_cids(&self) -> Vec<String> {
+            self.deleted.lock().await.clone()
+        }
+        async fn fail_for(&self, cid: &str) {
+            self.fail_on.lock().await.insert(cid.to_string());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobBackend for TrackingBackend {
+        async fn put(
+            &self,
+            cid: &str,
+            data: Vec<u8>,
+            mime_type: &str,
+        ) -> PdsResult<()> {
+            self.inner.put(cid, data, mime_type).await
+        }
+        async fn get(&self, cid: &str) -> PdsResult<Option<Vec<u8>>> {
+            self.inner.get(cid).await
+        }
+        async fn delete(&self, cid: &str) -> PdsResult<()> {
+            if self.fail_on.lock().await.contains(cid) {
+                return Err(PdsError::BlobStorage(format!(
+                    "test-injected failure for {}",
+                    cid
+                )));
+            }
+            self.deleted.lock().await.push(cid.to_string());
+            self.inner.delete(cid).await
+        }
+        async fn exists(&self, cid: &str) -> PdsResult<bool> {
+            self.inner.exists(cid).await
+        }
+        async fn size(&self, cid: &str) -> PdsResult<Option<u64>> {
+            self.inner.size(cid).await
+        }
+        async fn list_all_blobs(
+            &self,
+            cursor: Option<String>,
+            page_size: usize,
+        ) -> PdsResult<crate::blob_store::BlobListPage> {
+            self.inner.list_all_blobs(cursor, page_size).await
+        }
+    }
+
+    #[tokio::test]
+    async fn row_sweep_success_path_deletes_row_and_bytes() {
+        let pool = setup_row_sweep_pool().await;
+        let dir = TempDir::new().unwrap();
+        let inner = DiskBlobBackend::new(dir.path().to_path_buf());
+        let backend = TrackingBackend::new(inner);
+        put_blob(&backend.inner, "bafA").await;
+        // Seed an untethered row well in the past — eligible.
+        seed_untethered_row(&pool, "bafA", "2026-05-01T00:00:00Z").await;
+
+        let report = sweep_untethered_rows(
+            &pool,
+            &backend,
+            row_sweep_params(),
+            now_two_hours_ahead(),
+        )
+        .await
+        .expect("sweep ok");
+
+        assert_eq!(report.rows_deleted, 1);
+        assert_eq!(report.race_skip_count, 0);
+        assert_eq!(report.bytes_delete_failure_count, 0);
+        assert_eq!(report.bytes_delete_skipped_fresh_row_count, 0);
+        assert_eq!(report.pages_scanned, 1);
+        assert_eq!(backend.deleted_cids().await, vec!["bafA"]);
+
+        // Verify the row is actually gone.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM blob_metadata WHERE cid='bafA'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn row_sweep_skips_permanent_rows_via_partial_predicate() {
+        let pool = setup_row_sweep_pool().await;
+        let dir = TempDir::new().unwrap();
+        let inner = DiskBlobBackend::new(dir.path().to_path_buf());
+        let backend = TrackingBackend::new(inner);
+        seed_permanent_row(&pool, "bafPermanent", "2026-05-01T00:00:00Z").await;
+        seed_untethered_row(&pool, "bafUntethered", "2026-05-01T00:00:00Z").await;
+        put_blob(&backend.inner, "bafUntethered").await;
+
+        let report = sweep_untethered_rows(
+            &pool,
+            &backend,
+            row_sweep_params(),
+            now_two_hours_ahead(),
+        )
+        .await
+        .expect("sweep ok");
+
+        assert_eq!(report.rows_deleted, 1);
+        assert_eq!(backend.deleted_cids().await, vec!["bafUntethered"]);
+        // Permanent row still present.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_metadata WHERE cid='bafPermanent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn row_sweep_skips_too_young_rows() {
+        let pool = setup_row_sweep_pool().await;
+        let dir = TempDir::new().unwrap();
+        let inner = DiskBlobBackend::new(dir.path().to_path_buf());
+        let backend = TrackingBackend::new(inner);
+        // Use a near-now created_at; with default 1h TTL and now=now+2h,
+        // a row at now+0 has age 2h > 1h ⇒ eligible. To make it
+        // too-young, use a created_at that's after the cutoff
+        // (now+2h - 1h = now+1h cutoff; row at now+1h+30m = 90 min
+        // into "now" = 30 min before cutoff... wait).
+        // Easier: use a TTL of 12 hours so age 2h < 12h ⇒ too young.
+        seed_untethered_row(&pool, "bafYoung", "2026-05-01T00:00:00Z").await;
+        let mut params = row_sweep_params();
+        params.untethered_ttl = Duration::from_secs(100 * 365 * 86_400); // 100 years
+        let report = sweep_untethered_rows(&pool, &backend, params, now_two_hours_ahead())
+            .await
+            .expect("sweep ok");
+
+        assert_eq!(report.rows_deleted, 0);
+        // Row not in age window ⇒ Phase 1 SELECT returns empty page
+        // ⇒ cycle ends immediately.
+        assert_eq!(report.pages_scanned, 1);
+    }
+
+    #[tokio::test]
+    async fn row_sweep_paginates_across_multiple_pages() {
+        let pool = setup_row_sweep_pool().await;
+        let dir = TempDir::new().unwrap();
+        let inner = DiskBlobBackend::new(dir.path().to_path_buf());
+        let backend = TrackingBackend::new(inner);
+        // Seed 7 untethered rows; page_size = 3 ⇒ 3 pages (3 + 3 + 1).
+        for i in 0..7 {
+            let cid = format!("bafPage{:02}", i);
+            seed_untethered_row(&pool, &cid, "2026-05-01T00:00:00Z").await;
+            put_blob(&backend.inner, &cid).await;
+        }
+        let mut params = row_sweep_params();
+        params.page_size = 3;
+
+        let report =
+            sweep_untethered_rows(&pool, &backend, params, now_two_hours_ahead())
+                .await
+                .expect("sweep ok");
+
+        assert_eq!(report.rows_deleted, 7);
+        assert_eq!(report.pages_scanned, 3);
+        let deleted = backend.deleted_cids().await;
+        assert_eq!(deleted.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn row_sweep_safety_cap_stops_cycle() {
+        let pool = setup_row_sweep_pool().await;
+        let dir = TempDir::new().unwrap();
+        let inner = DiskBlobBackend::new(dir.path().to_path_buf());
+        let backend = TrackingBackend::new(inner);
+        for i in 0..10 {
+            let cid = format!("bafCap{:02}", i);
+            seed_untethered_row(&pool, &cid, "2026-05-01T00:00:00Z").await;
+            put_blob(&backend.inner, &cid).await;
+        }
+        let mut params = row_sweep_params();
+        params.max_deletes_per_run = 3;
+
+        let report =
+            sweep_untethered_rows(&pool, &backend, params, now_two_hours_ahead())
+                .await
+                .expect("sweep ok");
+
+        assert_eq!(report.rows_deleted, 3);
+        // 7 rows still present.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_metadata WHERE temp_key IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 7);
+    }
+
+    #[tokio::test]
+    async fn row_sweep_dry_run_counts_without_deleting() {
+        let pool = setup_row_sweep_pool().await;
+        let dir = TempDir::new().unwrap();
+        let inner = DiskBlobBackend::new(dir.path().to_path_buf());
+        let backend = TrackingBackend::new(inner);
+        for i in 0..5 {
+            let cid = format!("bafDry{:02}", i);
+            seed_untethered_row(&pool, &cid, "2026-05-01T00:00:00Z").await;
+            put_blob(&backend.inner, &cid).await;
+        }
+        let mut params = row_sweep_params();
+        params.dry_run = true;
+
+        let report =
+            sweep_untethered_rows(&pool, &backend, params, now_two_hours_ahead())
+                .await
+                .expect("sweep ok");
+
+        assert_eq!(report.rows_deleted, 0);
+        assert_eq!(report.total_eligible_count, Some(5));
+        assert_eq!(report.would_delete_count, Some(5));
+        assert!(backend.deleted_cids().await.is_empty());
+        // Rows still present.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_metadata WHERE temp_key IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn row_sweep_bytes_delete_failure_counts_and_continues() {
+        let pool = setup_row_sweep_pool().await;
+        let dir = TempDir::new().unwrap();
+        let inner = DiskBlobBackend::new(dir.path().to_path_buf());
+        let backend = TrackingBackend::new(inner);
+        for i in 0..3 {
+            let cid = format!("bafFail{:02}", i);
+            seed_untethered_row(&pool, &cid, "2026-05-01T00:00:00Z").await;
+            put_blob(&backend.inner, &cid).await;
+        }
+        backend.fail_for("bafFail01").await;
+
+        let report = sweep_untethered_rows(
+            &pool,
+            &backend,
+            row_sweep_params(),
+            now_two_hours_ahead(),
+        )
+        .await
+        .expect("sweep ok");
+
+        assert_eq!(report.rows_deleted, 2);
+        assert_eq!(report.bytes_delete_failure_count, 1);
+        // All 3 rows still got DELETEd; the failure is in
+        // bytes-delete, which leaves bytes orphans for Arc 10.
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_metadata WHERE temp_key IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row_count, 0);
+    }
+
+    /// V05_DESIGN.md §9.4.8.2 Scenario 9b in-process variant: the
+    /// `after_phase2_delete_hook` synthetically INSERTs a new
+    /// untethered row for the same CID between Phase 2 DELETE
+    /// commit and the fresh-row SELECT. Sweep should detect the
+    /// fresh row, increment `bytes_delete_skipped_fresh_row_count`,
+    /// log WARN, and skip `backend.delete`.
+    #[tokio::test]
+    async fn row_sweep_fresh_row_diagnostic_fires_via_test_hook() {
+        let pool = setup_row_sweep_pool().await;
+        let dir = TempDir::new().unwrap();
+        let inner = DiskBlobBackend::new(dir.path().to_path_buf());
+        let backend = TrackingBackend::new(inner);
+        seed_untethered_row(&pool, "bafRace", "2026-05-01T00:00:00Z").await;
+        put_blob(&backend.inner, "bafRace").await;
+
+        let hook_pool = pool.clone();
+        let hook = std::sync::Arc::new(move |cid: String| {
+            let pool = hook_pool.clone();
+            Box::pin(async move {
+                // Simulate Arc 16c re-upload `track_untethered_blob`
+                // Case 3 committing between sweep's DELETE and the
+                // fresh-row check.
+                sqlx::query(
+                    "INSERT INTO blob_metadata \
+                     (cid, mime_type, size, creator_did, created_at, temp_key) \
+                     VALUES ($1, 'image/png', 1, 'did:plc:test', \
+                             '2026-05-19T12:00:00Z', '1')",
+                )
+                .bind(&cid)
+                .execute(&pool)
+                .await
+                .expect("synthetic re-upload INSERT");
+            }) as futures::future::BoxFuture<'static, ()>
+        });
+
+        let mut params = row_sweep_params();
+        params.after_phase2_delete_hook = Some(hook);
+
+        let report =
+            sweep_untethered_rows(&pool, &backend, params, now_two_hours_ahead())
+                .await
+                .expect("sweep ok");
+
+        assert_eq!(report.rows_deleted, 0);
+        assert_eq!(report.bytes_delete_skipped_fresh_row_count, 1);
+        // backend.delete must NOT have been called.
+        assert!(backend.deleted_cids().await.is_empty());
+        // Fresh row remains.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_metadata WHERE cid='bafRace'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn row_sweep_empty_table_early_exit() {
+        let pool = setup_row_sweep_pool().await;
+        let dir = TempDir::new().unwrap();
+        let inner = DiskBlobBackend::new(dir.path().to_path_buf());
+        let backend = TrackingBackend::new(inner);
+        let report = sweep_untethered_rows(
+            &pool,
+            &backend,
+            row_sweep_params(),
+            now_two_hours_ahead(),
+        )
+        .await
+        .expect("sweep ok");
+        assert_eq!(report.rows_deleted, 0);
+        assert_eq!(report.pages_scanned, 1);
+        assert!(backend.deleted_cids().await.is_empty());
+    }
+
+    /// Race-skip: a row is age-eligible at Phase 1 SELECT but a
+    /// concurrent STRICT promotion (sets temp_key=NULL) commits
+    /// before the per-row Phase 2 DELETE. Modeled here by
+    /// pre-promoting one of the page's rows mid-sweep via the
+    /// `after_phase2_delete_hook` — except the hook fires AFTER
+    /// the row's own DELETE, so for race-skip we need a
+    /// different approach: pre-promote one row before sweep
+    /// starts, then run sweep with an over-broad TTL that would
+    /// have included it. The Phase 2 DELETE predicate carries
+    /// `temp_key IS NOT NULL` so the promoted row's DELETE
+    /// returns 0 rows.
+    ///
+    /// To trigger this we seed both an untethered AND a
+    /// permanent row at the SAME old timestamp, set TTL such
+    /// that the permanent row's `created_at` is past cutoff,
+    /// and observe that the Phase 1 SELECT correctly filtered
+    /// the permanent row (predicate-driven, not race-driven).
+    /// True race-skip exercise: directly promote a row in a way
+    /// that escapes Phase 1's predicate — but Phase 1's predicate
+    /// is the SAME as Phase 2's, so this is hard to reproduce
+    /// in single-threaded test. Use the hook to promote ANOTHER
+    /// CID's row that's in the current page.
+    #[tokio::test]
+    async fn row_sweep_race_skip_when_predicate_no_longer_matches() {
+        let pool = setup_row_sweep_pool().await;
+        let dir = TempDir::new().unwrap();
+        let inner = DiskBlobBackend::new(dir.path().to_path_buf());
+        let backend = TrackingBackend::new(inner);
+        seed_untethered_row(&pool, "bafFirst", "2026-05-01T00:00:00Z").await;
+        seed_untethered_row(&pool, "bafSecond", "2026-05-01T00:00:01Z").await;
+        put_blob(&backend.inner, "bafFirst").await;
+        put_blob(&backend.inner, "bafSecond").await;
+
+        // Hook fires AFTER bafFirst's DELETE commits. Use it to
+        // promote bafSecond (set temp_key=NULL). When sweep's
+        // per-row Phase 2 DELETE runs against bafSecond, the
+        // predicate `temp_key IS NOT NULL` fails → race-skip.
+        let hook_pool = pool.clone();
+        let hook = std::sync::Arc::new(move |cid: String| {
+            let pool = hook_pool.clone();
+            Box::pin(async move {
+                if cid == "bafFirst" {
+                    sqlx::query(
+                        "UPDATE blob_metadata SET temp_key = NULL \
+                         WHERE cid = 'bafSecond'",
+                    )
+                    .execute(&pool)
+                    .await
+                    .expect("promote bafSecond mid-sweep");
+                }
+            }) as futures::future::BoxFuture<'static, ()>
+        });
+
+        let mut params = row_sweep_params();
+        params.after_phase2_delete_hook = Some(hook);
+
+        let report =
+            sweep_untethered_rows(&pool, &backend, params, now_two_hours_ahead())
+                .await
+                .expect("sweep ok");
+
+        // bafFirst deleted normally; bafSecond's Phase 2 DELETE
+        // matches 0 rows ⇒ race_skip.
+        assert_eq!(report.rows_deleted, 1);
+        assert_eq!(report.race_skip_count, 1);
+        assert_eq!(backend.deleted_cids().await, vec!["bafFirst"]);
+        // bafSecond row still exists (promoted, not deleted).
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_metadata WHERE cid='bafSecond'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
     }
 }

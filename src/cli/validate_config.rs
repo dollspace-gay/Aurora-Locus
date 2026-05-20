@@ -652,6 +652,54 @@ fn validate_gc_sweep_config(config: &ServerConfig, issues: &mut Vec<ValidationIs
             ),
         ));
     }
+
+    // Arc 16d §9.4.3.6 TTL-vs-interval warning: rows are eligible
+    // for sweep when `created_at < now - untethered_ttl_seconds`. If
+    // the TTL is <= the cadence between sweep runs, a row may live
+    // past TTL but never be observed by a sweep cycle (the previous
+    // cycle didn't see it, the next cycle's snapshot may also miss
+    // it if a refresh fires).
+    if config.gc_sweep.untethered_ttl_seconds <= config.gc_sweep.interval_secs {
+        issues.push(ValidationIssue::warning(
+            "GcSweep",
+            format!(
+                "untethered_ttl_seconds ({}) <= interval_secs ({}) - the \
+                 row-walker may observe untethered rows past TTL only in \
+                 the next sweep cycle, effectively doubling the reclamation \
+                 floor. Recommend untethered_ttl_seconds > interval_secs.",
+                config.gc_sweep.untethered_ttl_seconds,
+                config.gc_sweep.interval_secs,
+            ),
+        ));
+    }
+
+    // Arc 16d §9.4.3.6 / Step 1.6 + §9.4.4 round-4 F9 closure:
+    // case-insensitive Postgres-conditional warning. SQLite-only
+    // deployments don't trip the warning. Comparison is against
+    // "read committed" — any other value (READ COMMITTED variants
+    // included) is accepted as the operator's choice but warned on,
+    // since §9.4.3.4's race analysis is keyed to READ COMMITTED.
+    if config.database.backend == crate::config::DatabaseBackend::Postgres
+        && config.database.pg_transaction_isolation.to_ascii_lowercase()
+            != "read committed"
+    {
+        issues.push(ValidationIssue::warning(
+            "GcSweep",
+            format!(
+                "database.pg_transaction_isolation is {:?} - Arc 16d's \
+                 sweep-vs-STRICT predicate-disjointness race analysis \
+                 (V05_DESIGN.md §9.4.3.4) is keyed to Postgres READ \
+                 COMMITTED. Higher isolation (REPEATABLE READ / \
+                 SERIALIZABLE) produces 40001 serialization-failure errors \
+                 on the per-row autocommit DELETE that v0.5's sweep does \
+                 NOT retry-classify (deferred to v0.6+ per §9.4.1.2). \
+                 Either set pg_transaction_isolation back to \"read \
+                 committed\" or accept elevated db_error_skip_count from \
+                 the sweep job.",
+                config.database.pg_transaction_isolation
+            ),
+        ));
+    }
 }
 
 /// Check production readiness
