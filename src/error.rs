@@ -225,6 +225,13 @@ pub struct XrpcErrorResponse {
 /// Convert PdsError to HTTP response
 impl IntoResponse for PdsError {
     fn into_response(self) -> Response {
+        // chainlink #104 Fix 2a: capture the underlying error Display
+        // BEFORE the match consumes self, so 5xx responses can log it
+        // server-side. The HTTP body intentionally strips this detail
+        // (line below) to avoid leaking internals to clients; the log
+        // is the only place operators see the root cause.
+        let error_display = self.to_string();
+
         let (status, error_code, message) = match self {
             PdsError::Authentication(_) => (
                 StatusCode::UNAUTHORIZED,
@@ -301,6 +308,21 @@ impl IntoResponse for PdsError {
                 self.to_string(),
             ),
         };
+
+        // chainlink #104 Fix 2a: centrally log the underlying error
+        // for any 5xx mapping. Without this, the client sees the
+        // generic "Internal server error" body and tower_http logs
+        // only "response failed, Status code: 500" — leaving operators
+        // with nothing to diagnose. Handlers can add per-call domain
+        // context (cid, auth_did, etc.) on top of this central log.
+        if status.is_server_error() {
+            tracing::warn!(
+                status = status.as_u16(),
+                error_code = error_code,
+                error = %error_display,
+                "PdsError mapped to 5xx response",
+            );
+        }
 
         let body = Json(XrpcErrorResponse {
             error: error_code.to_string(),

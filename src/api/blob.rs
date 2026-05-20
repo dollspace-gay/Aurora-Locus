@@ -49,12 +49,35 @@ async fn upload_blob(
 
     // Convert Bytes to Vec<u8>
     let data = body.to_vec();
+    let data_len = data.len();
+
+    // chainlink #104 Fix 2b: timer + domain-context logging on failure.
+    // Phase B Scenario 5 showed 14x 500s under SQLite-WAL contention with
+    // no actionable signal in logs (tower_http logs only "Status code: 500,
+    // latency: …"; error.rs centrally logs the underlying cause via
+    // IntoResponse — chainlink #104 Fix 2a — but cid + auth_did + elapsed_ms
+    // need the in-handler context to be useful).
+    let start = std::time::Instant::now();
 
     // Phase 1: stage bytes to temp path + temp_blob_metadata row.
-    let temp_blob = ctx
+    let temp_blob = match ctx
         .blob_store
         .stage_blob(data, mime_type.as_deref(), auth_did)
-        .await?;
+        .await
+    {
+        Ok(tb) => tb,
+        Err(e) => {
+            tracing::warn!(
+                phase = "stage_blob",
+                auth_did = auth_did,
+                size_bytes = data_len,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                error = %e,
+                "uploadBlob failed during stage_blob (no CID computed yet)",
+            );
+            return Err(e);
+        }
+    };
 
     // Arc 16c §9.3.3.2 / §9.3.3.6 (chainlink #92): Phase 2 — promote
     // bytes to CID-derived final position + establish durability +
@@ -65,7 +88,19 @@ async fn upload_blob(
     // returning HTTP 200 only after commit_blob commits, the same
     // client's subsequent record-write referencing this CID will see
     // the committed row when STRICT runs in its own later transaction.
-    ctx.blob_store.commit_blob(&temp_blob.cid).await?;
+    if let Err(e) = ctx.blob_store.commit_blob(&temp_blob.cid).await {
+        tracing::warn!(
+            phase = "commit_blob",
+            cid = %temp_blob.cid,
+            auth_did = auth_did,
+            size_bytes = data_len,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            error = %e,
+            "uploadBlob failed during commit_blob (bytes may be at final position without row; \
+             cleanup deferred to Arc 10 byte-walker)",
+        );
+        return Err(e);
+    }
 
     // Return blob reference. Per §9.3.3.5 the blob_metadata row now
     // exists with temp_key='1' (untethered) and getBlob will serve it
