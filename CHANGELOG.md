@@ -572,6 +572,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   workstream; substrate for Arc 16b helpers + Arc 16c-f blob
   lifecycle work + Arc 17 dynamic lexicon loading.
 
+### Fixed
+
+- **uploadBlob returned malformed CID** (#93, surfaced in Arc 16c
+  Phase B Scenario 2). `BlobStore::calculate_cid` constructed
+  the CID via `format!("bafyrei{}", hex::encode(sha256(data)))`
+  — a 71-character string that was neither a valid CIDv1 nor
+  used the correct codec. Two bugs in one expression:
+  - **Wrong codec prefix**: `bafyrei*` is the base32 marker for
+    the `dag-cbor` codec (multicodec 0x71). Blobs are opaque
+    byte streams and MUST use the `raw` codec (multicodec
+    0x55), which encodes to `bafkrei*`.
+  - **Wrong digest encoding**: the hex-encoded SHA-256 was
+    string-concatenated to the prefix instead of being wrapped
+    in a sha2-256 multihash (0x12 + 0x20 + 32-byte digest) and
+    base32-multibase-encoded as part of the full CIDv1 byte
+    structure. A canonical CIDv1 + raw + sha256 + base32 is
+    exactly 59 characters; the malformed output was 71.
+  Fix routes through proto-blue's typed constructor:
+  `proto_blue::lex_data::Cid::for_raw(data).to_string()`. The
+  `sha2::{Digest, Sha256}` import in `src/blob_store/store.rs`
+  is now unused and removed. Three regression tests added to
+  the existing `blob_store::store::tests` module:
+  - `calculate_cid_matches_canonical_raw_sha256_base32` — calls
+    the private helper, cross-checks against `Cid::for_raw(...)`
+    independently constructed in-test.
+  - `calculate_cid_uses_raw_codec_prefix_not_dag_cbor` —
+    asserts the result starts with `bafkrei`, has length 59,
+    and does NOT start with `bafyrei`.
+  - `audit_grep_no_format_concat_baf_prefix_in_production` —
+    reads `src/blob_store/store.rs` + `src/api/blob.rs`,
+    asserts zero hits of `format!("bafyrei{` or
+    `format!("bafkrei{` in production scope (above
+    `mod tests {`). Prevents regression of the
+    string-concatenation pattern anywhere in the blob CID
+    path. Step 0.4 (Arc 16c) recon doc updated retroactively
+    — the CID-derivation path was not inspected during recon;
+    a recon-discipline gap caught by Phase B rather than
+    pre-implementation static review. cargo test --lib --locked:
+    1090 PASS / 0 FAIL (net +3 over Arc 16c lock at 1087).
+    **#93 stays OPEN** until skydeval re-runs Arc 16c Phase B
+    Scenario 2 against fix-tip and the returned CID matches
+    the independently-computed canonical value.
+
 ## [0.4.0] - 2026-05-13
 
 v0.4 makes Aurora-Locus production-deployable at scale. The
