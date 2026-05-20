@@ -4093,6 +4093,7 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            blob_metadata: Default::default(),
             entryway: None,
         };
         AppContext::new(
@@ -7100,6 +7101,7 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            blob_metadata: Default::default(),
             entryway: None,
         };
         AppContext::new(

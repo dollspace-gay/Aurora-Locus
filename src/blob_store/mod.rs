@@ -102,6 +102,23 @@ pub trait BlobBackend: Send + Sync {
         cursor: Option<String>,
         page_size: usize,
     ) -> PdsResult<BlobListPage>;
+
+    /// Arc 16c §9.3.3.2 step 3 — establish bytes-durability at the
+    /// CID-derived final position. Called by `BlobStore::commit_blob`
+    /// AFTER `put()` succeeds, BEFORE the metadata transaction opens.
+    ///
+    /// - **Disk backend**: open file at CID path, `sync_all()` (file
+    ///   data + metadata); open containing directory, `sync_all()`.
+    ///   "Both absent" disposition per Arc 16c Step 0.2 recon — disk
+    ///   backend had no fsync today; Arc 16c adds both in canonical
+    ///   order (file then directory).
+    /// - **S3 backend**: no-op (durability was confirmed by the 2xx
+    ///   PUT response inside `put()`; no further sync needed).
+    ///
+    /// Default impl: no-op. Backends that need fsync override.
+    async fn fsync(&self, _cid: &str) -> PdsResult<()> {
+        Ok(())
+    }
 }
 
 /// Configuration for blob storage

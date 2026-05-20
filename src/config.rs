@@ -46,6 +46,16 @@ pub struct ServerConfig {
     /// ([`crate::blob_store::gc::run_sweep`]) is the consumer.
     #[serde(default)]
     pub gc_sweep: GcSweepConfig,
+    /// Arc 16c §9.3.4 Step 1 — blob lifecycle config.
+    /// `stage_ttl_seconds` controls the temp_blob_metadata reaper's
+    /// TTL window (product knob: how long a client has to commit
+    /// an upload to a record). Separate from
+    /// `gc_sweep.freshness_threshold_secs` (substrate-safety bound,
+    /// in-flight-upload detection) per recon Step 0.5 precedent.
+    /// Default 86400 = 24h, matching bsky-PDS tempKey TTL parity.
+    /// Env override: `PDS_BLOB_STAGE_TTL_SECONDS`.
+    #[serde(default)]
+    pub blob_metadata: BlobMetadataConfig,
     /// Entryway-mode configuration per Arc 12 §5.3.9 + §5.4 Step 1.1.
     /// `None` = standalone mode. `Some` = forwarded handlers proxy
     /// to the entryway and OAuth metadata advertises the entryway
@@ -323,6 +333,37 @@ impl GcSweepConfig {
             freshness_threshold: std::time::Duration::from_secs(self.freshness_threshold_secs),
             page_size: self.page_size,
         }
+    }
+}
+
+/// Arc 16c §9.3.4 Step 1 — blob lifecycle config.
+///
+/// `stage_ttl_seconds` controls how long a `temp_blob_metadata` row
+/// persists before the (Arc 16d-shipped) reaper reclaims it. Default
+/// 86400 (24h), matching bsky-PDS tempKey TTL parity. Per Step 0.5
+/// recon, separate from `GcSweepConfig.freshness_threshold_secs`
+/// (substrate-safety bound used by Arc 10's in-flight classifier).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlobMetadataConfig {
+    pub stage_ttl_seconds: u64,
+}
+
+impl Default for BlobMetadataConfig {
+    fn default() -> Self {
+        Self { stage_ttl_seconds: 86400 }
+    }
+}
+
+impl BlobMetadataConfig {
+    /// Build from optional env-var override; falls back to default.
+    pub fn from_env_values(stage_ttl_seconds: Option<String>) -> PdsResult<Self> {
+        let defaults = Self::default();
+        let stage_ttl_seconds = parse_u64_env(
+            "PDS_BLOB_STAGE_TTL_SECONDS",
+            stage_ttl_seconds,
+            defaults.stage_ttl_seconds,
+        )?;
+        Ok(Self { stage_ttl_seconds })
     }
 }
 
@@ -1394,6 +1435,13 @@ impl ServerConfig {
             env::var("PDS_GC_SWEEP_PAGE_SIZE").ok(),
         )?;
 
+        // Arc 16c §9.3.4 Step 1 / chainlink #92: blob lifecycle
+        // config (stage_ttl_seconds product knob, separate from
+        // gc_sweep.freshness_threshold_secs).
+        let blob_metadata = BlobMetadataConfig::from_env_values(
+            env::var("PDS_BLOB_STAGE_TTL_SECONDS").ok(),
+        )?;
+
         // Arc 12 §5.3.2 Gap 1: public_url override via env var.
         // Renamed locally to avoid shadowing federation's
         // existing `public_url` binding (different env var,
@@ -1473,6 +1521,7 @@ impl ServerConfig {
             distributed_state_mode,
             maintenance_pool,
             gc_sweep,
+            blob_metadata,
             entryway,
         })
     }

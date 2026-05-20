@@ -50,13 +50,26 @@ async fn upload_blob(
     // Convert Bytes to Vec<u8>
     let data = body.to_vec();
 
-    // Stage blob in temporary storage (Phase 1)
+    // Phase 1: stage bytes to temp path + temp_blob_metadata row.
     let temp_blob = ctx
         .blob_store
         .stage_blob(data, mime_type.as_deref(), auth_did)
         .await?;
 
-    // Return blob reference
+    // Arc 16c §9.3.3.2 / §9.3.3.6 (chainlink #92): Phase 2 — promote
+    // bytes to CID-derived final position + establish durability +
+    // open transaction + call Arc 16b's track_untethered_blob. Returns
+    // only after the blob_metadata row's wrapping transaction commits.
+    //
+    // Single-client-single-CID sequencing guarantee per §9.3.3.6: by
+    // returning HTTP 200 only after commit_blob commits, the same
+    // client's subsequent record-write referencing this CID will see
+    // the committed row when STRICT runs in its own later transaction.
+    ctx.blob_store.commit_blob(&temp_blob.cid).await?;
+
+    // Return blob reference. Per §9.3.3.5 the blob_metadata row now
+    // exists with temp_key='1' (untethered) and getBlob will serve it
+    // (Case D per Step 0.3 recon — no blob-level auth gate).
     let blob_ref =
         crate::blob_store::BlobRef::new(temp_blob.cid, temp_blob.mime_type, temp_blob.size);
 

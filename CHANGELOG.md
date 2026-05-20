@@ -8,6 +8,99 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Arc 16c — uploadBlob two-phase wiring (v5 LOCKED)** (#92).
+  First arc to consume Arc 16b's `track_untethered_blob` as a
+  production caller. uploadBlob now persists `blob_metadata` rows
+  (with `temp_key='1'`); pre-Arc-16c, `commit_blob` was dead-code
+  and uploadBlob staged bytes only.
+  - **Two-phase upload** (§9.3.3.1): client streams bytes via
+    `stage_blob` → uploadBlob handler invokes refactored
+    `commit_blob` → bytes promoted to CID-derived final position
+    → fsync (disk backend) → DB transaction opens → SELECT
+    temp_blob_metadata (plain SELECT, no FOR UPDATE per §9.3.3.4)
+    → `track_untethered_blob(tx, …)` → commit → HTTP 200.
+  - **Ordering invariant** (§9.3.3.2, load-bearing): bytes
+    durability at final position strictly PRECEDES the
+    `blob_metadata` transaction commit. Consequence: "row exists
+    ⇒ bytes durable" — getBlob can rely on this; no
+    row-without-bytes window in production.
+  - **fsync — "Both absent" disposition** (Step 0.2 recon /
+    Step 3.2 rule): disk-backend `put()` had no fsync today;
+    Arc 16c adds both `file-fsync` (via `File::sync_all`) and
+    `dir-fsync` (open + sync_all on parent dir) in canonical
+    order via a new `BlobBackend::fsync(cid)` trait method
+    (default no-op for S3 — durability already established by
+    PUT-2xx per §9.3.3.2 step 3 S3 clause).
+  - **`stage_ttl_seconds` config** (§9.3.4 Step 1): new
+    `BlobMetadataConfig { stage_ttl_seconds: u64 }` peer to
+    `GcSweepConfig`. Default 86400 (24h, matching bsky-PDS
+    tempKey TTL parity). Env override: `PDS_BLOB_STAGE_TTL_SECONDS`.
+    Separate from `freshness_threshold_secs` per Step 0.5 recon
+    precedent (substrate-safety bound vs product knob).
+  - **Reaper TTL switch** (§9.3.4 Step 2): doc breadcrumb only —
+    Arc 10's classifier doesn't reap `temp_blob_metadata` (only
+    reads for in-flight classification); no production reaper
+    exists to switch. `list_orphaned_temp_blobs` documented as
+    Arc 16d's future invocation point with `stage_ttl_seconds /
+    3600` as `ttl_hours`. Arc 10's classifier continues to use
+    `freshness_threshold` (audit item 3 verified).
+  - **Reaper-vs-commit race analysis** (§9.3.3.4): plain SELECT
+    in step 5 catches **Case 3a** (Postgres READ COMMITTED
+    dominant) cleanly via stale-stage NotFound. **Cases 3b/3c**
+    benign by table-disjointness (helper writes to
+    `blob_metadata`; reaper deletes from `temp_blob_metadata`)
+    — load-bearing argument survives both SQLite WAL snapshot
+    isolation (Case 3c dominant) and Postgres READ COMMITTED
+    (Case 3a dominant) per Step 0.4 recon.
+  - **getBlob auth → Case D** (Step 0.3 recon): Q2 = "no auth"
+    deterministic mapping to Case D. Arc 14 §7.3.9 auth-removal
+    (chainlink #75) left getBlob without a blob-level auth gate;
+    Arc 16c accepts the inherited Case D semantics — getBlob
+    serves any `blob_metadata` row by CID (public CID-guess-
+    exposure bounded by 32-byte content-hash unpredictability).
+    **No skydeval sign-off required** (Case D is not on the
+    sign-off-gated list per §9.3.4 routing mechanism).
+  - **Byte-walker classifier → Case 1b accept-with-latency**
+    (Step 0.6 recon): Arc 10's `classify_blob` checks `blob` +
+    `temp_blob_metadata` but NOT `blob_metadata`. Untethered
+    rows are invisible to the classifier; bytes at the
+    CID-derived final position with a `blob_metadata` row but
+    no record reference would be misclassified as orphans
+    after `freshness_threshold` if record-write doesn't link
+    within 1h. Arc 16c does NOT extend the classifier (scope
+    expansion would need sign-off); Arc 16d's row-driven sweep
+    is the v0.5 byte-side recovery path. v0.5 acceptance per
+    §9.3.5.1: orphan-bytes storage cost bounded by
+    `stage_ttl_seconds × steady-state upload volume`, manageable
+    for dev-only single-actor scope.
+  - **Test harness → split mode** (Step 0.7): commit_blob is
+    monolithic today; Step 3.2 refactor exposes a natural seam
+    between bytes-promotion and DB-transaction-open. Scenario
+    3b-A in-process portion stays in §9.3.8; full
+    crash-survives-restart property displaced to §9.3.5.3 item 2.
+    Same disposition for Scenario 5b-A.
+
+  cargo test --lib --locked: **1087 PASS / 0 FAIL** (net +5
+  Arc 16c tests: commit_blob success + stale-stage Case 3a +
+  duplicate-CID-permanent + duplicate-CID-untethered +
+  getBlob-Case-D-no-auth-gate, on top of the 32 cumulative
+  blob_store helper tests). Arc 12+13 integration regression:
+  19/19 PASS. Arc-close audit 10/10 cargo-level items clean
+  (item 11 backend matrix is operator-facing Phase B coverage):
+  recon doc present with Step 0.1-0.7 results; `stage_ttl_seconds`
+  added with documented default; reaper governed by
+  `stage_ttl_seconds` (call-site doc only; reaper itself is Arc
+  16d); commit_blob no longer dead-code; production caller from
+  uploadBlob handler present; track_untethered_blob production
+  count = 0 + 1 = 1; apply_writes / gc.rs / Arc 16b helpers
+  untouched; no SQL anti-patterns added; decoupling-discipline
+  grep clean; V05_DESIGN.md §9 includes Arc 16f in in-cycle list +
+  §1.2 doesn't list #45 in "remain" status.
+
+  **Federation sub-feature #46 stays OPEN** — closes only when
+  Arc 16b + 16c + 16d all lock (Arc 16d row-driven sweep ships
+  next).
+
 - **Arc 16b — Blob lifecycle helpers (v6 LOCKED)** (#91). DB-level
   helpers-only arc — establishes the contract layer for
   federation sub-feature #46 (jointly with Arc 16c + Arc 16d).

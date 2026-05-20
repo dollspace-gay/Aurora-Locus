@@ -62,6 +62,39 @@ impl BlobBackend for DiskBlobBackend {
         Ok(())
     }
 
+    /// Arc 16c §9.3.3.2 step 3 — durability establishment via
+    /// `sync_all()` on the file then on the containing directory.
+    /// Canonical order per Step 3.2 "Both absent" rule from Step 0.2
+    /// recon (disk backend had neither fsync today; Arc 16c adds
+    /// both).
+    async fn fsync(&self, cid: &str) -> PdsResult<()> {
+        let blob_path = self.get_blob_path(cid);
+
+        // file-fsync first.
+        let file = fs::File::open(&blob_path).await.map_err(|e| {
+            PdsError::BlobStorage(format!("fsync open file {}: {}", cid, e))
+        })?;
+        file.sync_all().await.map_err(|e| {
+            PdsError::BlobStorage(format!("fsync file {}: {}", cid, e))
+        })?;
+        drop(file);
+
+        // dir-fsync second.
+        let Some(parent) = blob_path.parent() else {
+            return Err(PdsError::BlobStorage(format!(
+                "fsync: blob path has no parent ({:?})",
+                blob_path
+            )));
+        };
+        let dir = fs::File::open(parent).await.map_err(|e| {
+            PdsError::BlobStorage(format!("fsync open dir {:?}: {}", parent, e))
+        })?;
+        dir.sync_all().await.map_err(|e| {
+            PdsError::BlobStorage(format!("fsync dir {:?}: {}", parent, e))
+        })?;
+        Ok(())
+    }
+
     async fn get(&self, cid: &str) -> PdsResult<Option<Vec<u8>>> {
         let blob_path = self.get_blob_path(cid);
 

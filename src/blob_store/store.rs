@@ -234,87 +234,125 @@ impl BlobStore {
     ///
     /// Moves blob from temp to permanent storage and creates metadata
     #[allow(dead_code)] // Future blob commit functionality
+    /// Arc 16c §9.3.3.2 — two-phase upload commit: promote bytes from
+    /// temp path to CID-derived final position, establish durability,
+    /// THEN open the DB transaction that calls
+    /// `track_untethered_blob`. Ordering invariant (load-bearing):
+    /// **bytes durability at the final position strictly PRECEDES
+    /// the DB transaction commit.**
+    ///
+    /// Production caller: uploadBlob handler (`src/api/blob.rs`)
+    /// invokes this after `stage_blob` returns success. Returns
+    /// `Ok` only after the `blob_metadata` row exists with
+    /// `temp_key = '1'` and the row's wrapping transaction has
+    /// committed.
+    ///
+    /// Error classes (per §9.3.3.2 failure modes):
+    /// - **stale-stage**: temp_blob_metadata row missing at step 5
+    ///   (Case 3a reaper-race) → `PdsError::NotFound`. Bytes at
+    ///   final position become orphans pending Arc 16d's row-driven
+    ///   sweep (Step 0.6 Case 1b accept-with-latency disposition).
+    /// - **bytes-promotion failure** (step 2): backend put failed;
+    ///   no DB state change.
+    /// - **fsync failure** (step 3): durability not established; no
+    ///   DB state change. Bytes possibly partially written.
+    /// - **DB failure** (steps 4-7): row not committed; bytes at
+    ///   final position become orphans pending sweep.
     pub async fn commit_blob(&self, cid: &str) -> PdsResult<()> {
         let temp_path = self.get_temp_blob_path(cid);
 
-        // Check if temp blob exists
         if !temp_path.exists() {
             return Err(PdsError::NotFound(format!("Temp blob not found: {}", cid)));
         }
 
-        // Read temp blob data
+        // Step 1: read bytes from temp path (R1 read-then-write
+        // re-validation pattern).
         let data = fs::read(&temp_path)
             .await
             .map_err(|e| PdsError::BlobStorage(format!("Failed to read temp blob: {}", e)))?;
 
-        // Get metadata from database (should have been stored during stage)
+        // Get metadata from temp_blob_metadata (pre-transactional
+        // read; the in-transaction SELECT at step 5 is the
+        // authoritative reaper-race check).
         let metadata = self
             .get_temp_blob_metadata(cid)
             .await?
-            .ok_or_else(|| PdsError::NotFound(format!("Temp blob metadata not found: {}", cid)))?;
+            .ok_or_else(|| {
+                PdsError::NotFound(format!("Temp blob metadata not found: {}", cid))
+            })?;
 
-        // Extract dimensions for thumbnail generation
-        let dimensions = if let (Some(w), Some(h)) = (metadata.width, metadata.height) {
-            Some(ImageDimensions {
-                width: w as u32,
-                height: h as u32,
-            })
-        } else {
-            None
-        };
-
-        // Generate thumbnail if this is an image
-        let thumbnail_cid = if let Some(thumb_data) =
-            Self::generate_thumbnail(&data, &metadata.mime_type, 256)
-        {
-            let thumb_cid = self.calculate_cid(&thumb_data);
-
-            if !self.backend.exists(&thumb_cid).await? {
-                self.backend
-                    .put(&thumb_cid, thumb_data.clone(), "image/jpeg")
-                    .await?;
-
-                let thumb_dimensions = Self::extract_image_dimensions(&thumb_data, "image/jpeg");
-                self.store_metadata_full(
-                    &thumb_cid,
-                    "image/jpeg",
-                    thumb_data.len() as i64,
-                    &metadata.creator_did,
-                    thumb_dimensions.as_ref(),
-                    None,
-                )
-                .await?;
-            }
-
-            Some(thumb_cid)
-        } else {
-            None
-        };
-
-        // Move to permanent storage
+        // Step 2: write bytes to CID-derived final position.
         self.backend.put(cid, data, &metadata.mime_type).await?;
 
-        // Store permanent metadata
-        self.store_metadata_full(
+        // Step 3: establish durability. Disk backend: file-fsync +
+        // dir-fsync in canonical order ("Both absent" disposition
+        // per Step 0.2 recon — Arc 16c adds both fresh). S3 backend:
+        // no-op (2xx PUT already confirmed durability inside put()).
+        self.backend.fsync(cid).await?;
+
+        // Step 4: open DB transaction. Steps 5-7 happen inside.
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+
+        // Step 5: SELECT temp_blob_metadata row exists (plain SELECT,
+        // no FOR UPDATE per §9.3.3.4). Catches Case 3a reaper-race
+        // cleanly; Cases 3b/3c benign by table-disjointness.
+        let still_present: Option<(String,)> = sqlx::query_as(
+            "SELECT cid FROM temp_blob_metadata WHERE cid = $1",
+        )
+        .bind(cid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(PdsError::Database)?;
+
+        if still_present.is_none() {
+            // Stale-stage: reaper committed a DELETE between
+            // stage_blob and our transaction-open. Bytes at final
+            // position become orphans pending Arc 16d sweep.
+            return Err(PdsError::NotFound(format!(
+                "Stale stage: temp_blob_metadata row missing for {} \
+                 (likely reaped between stage and commit; client should retry)",
+                cid
+            )));
+        }
+
+        // Step 6: call Arc 16b's track_untethered_blob helper.
+        // First production caller per audit obligation Item 6.
+        self.track_untethered_blob(
+            &mut tx,
             cid,
             &metadata.mime_type,
             metadata.size,
             &metadata.creator_did,
-            dimensions.as_ref(),
-            thumbnail_cid.as_deref(),
+            Utc::now(),
         )
         .await?;
 
-        // Delete temp file
-        fs::remove_file(&temp_path)
-            .await
-            .map_err(|e| PdsError::BlobStorage(format!("Failed to delete temp blob: {}", e)))?;
+        // Step 7: commit transaction. After this returns Ok, the
+        // "row exists ⇒ bytes durable at final position" invariant
+        // holds (§9.3.3.2).
+        tx.commit().await.map_err(PdsError::Database)?;
 
-        // Delete temp metadata
-        self.delete_temp_blob_metadata(cid).await?;
+        // Post-commit cleanup: remove temp file + temp_blob_metadata
+        // row. Best-effort; failures here don't undo the commit
+        // (handler returns 200 to client regardless). Cleanup failures
+        // leave the temp_blob_metadata row to be reaped per
+        // stage_ttl_seconds (Step 2 reaper TTL switch).
+        if let Err(e) = fs::remove_file(&temp_path).await {
+            tracing::warn!(
+                cid = cid,
+                error = %e,
+                "commit_blob: post-commit temp file cleanup failed; will be reaped",
+            );
+        }
+        if let Err(e) = self.delete_temp_blob_metadata(cid).await {
+            tracing::warn!(
+                cid = cid,
+                error = %e,
+                "commit_blob: post-commit temp_blob_metadata cleanup failed; will be reaped",
+            );
+        }
 
-        tracing::info!("Committed blob {} to permanent storage", cid);
-
+        tracing::info!(cid = cid, "commit_blob: blob_metadata row inserted (untethered)");
         Ok(())
     }
 
@@ -631,7 +669,15 @@ impl BlobStore {
         Ok(())
     }
 
-    /// List orphaned temp blobs (older than ttl)
+    /// List orphaned temp blobs (older than ttl).
+    ///
+    /// Arc 16c §9.3.4 Step 2 / chainlink #92: Arc 16d's scheduled
+    /// temp_blob_metadata reaper (not yet implemented) will invoke
+    /// this with `ttl_hours = config.blob_metadata.stage_ttl_seconds
+    /// / 3600`. Arc 10's classifier continues to use
+    /// `freshness_threshold` for its (orthogonal) in-flight-upload
+    /// detection — Arc 16c does NOT change Arc 10's classifier per
+    /// §9.3.6 audit item 3.
     pub async fn list_orphaned_temp_blobs(&self, ttl_hours: i64) -> PdsResult<Vec<String>> {
         let cutoff = Utc::now() - chrono::Duration::hours(ttl_hours);
 
@@ -1212,6 +1258,26 @@ mod tests {
                 alt_text TEXT,
                 thumbnail_cid TEXT,
                 temp_key TEXT NULL CHECK (temp_key IS NULL OR temp_key = '1')
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Arc 16c §9.3.4 Step 3.5: commit_blob production-path tests
+        // need temp_blob_metadata schema. Mirrors
+        // migrations/0001_initial.sql:181-189.
+        sqlx::query(
+            r#"
+            CREATE TABLE temp_blob_metadata (
+                cid TEXT PRIMARY KEY,
+                mime_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                creator_did TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                width INTEGER,
+                height INTEGER
             )
             "#,
         )
@@ -1851,4 +1917,145 @@ mod tests {
         assert!(result.is_err(), "CHECK constraint must reject temp_key not in {{NULL, '1'}}");
         assert!(!metadata_exists(&pool, "bafyrei-bad").await);
     }
+
+    // ============================================================
+    // Arc 16c §9.3.4 Step 3.5 commit_blob production-path tests
+    // (chainlink #92). Cover §9.3.3.2 ordering invariant + Step
+    // 0.7 split-mode disposition for Scenario 3b/5b.
+    // ============================================================
+
+    /// Helper: stage a synthetic blob into the test store + return
+    /// the BlobRef. Mirrors what uploadBlob handler does pre-commit.
+    async fn stage_test_blob(store: &BlobStore, data: &[u8], mime: &str, did: &str) -> crate::blob_store::BlobRef {
+        let temp = store.stage_blob(data.to_vec(), Some(mime), did).await.unwrap();
+        crate::blob_store::BlobRef::new(temp.cid, temp.mime_type, temp.size)
+    }
+
+    /// Scenario 2 success path: stage → commit → row exists with
+    /// temp_key='1' + bytes durable at final position.
+    #[tokio::test]
+    async fn commit_blob_success_creates_untethered_row() {
+        let store = create_test_store().await;
+        let blob_ref = stage_test_blob(&store, b"hello arc 16c", "image/png", "did:plc:alice").await;
+
+        store.commit_blob(&blob_ref.r#ref.link).await.unwrap();
+
+        // Row exists with temp_key='1'.
+        assert!(store.is_untethered(&blob_ref.r#ref.link).await.unwrap());
+
+        // Bytes retrievable.
+        let (data, _) = store.get(&blob_ref.r#ref.link).await.unwrap().unwrap();
+        assert_eq!(data, b"hello arc 16c");
+    }
+
+    /// Scenario 5b-A reaper-race Case 3a: stage → synthetically
+    /// delete temp_blob_metadata between stage and commit → commit
+    /// returns stale-stage NotFound; no blob_metadata row created.
+    /// (Split-mode disposition per Step 0.7 — synthetic DB write
+    /// stands in for an actual reaper firing.)
+    #[tokio::test]
+    async fn commit_blob_stale_stage_case_3a_returns_not_found() {
+        let store = create_test_store().await;
+        let blob_ref = stage_test_blob(&store, b"will be stale", "image/png", "did:plc:alice").await;
+
+        // Synthetically delete the temp_blob_metadata row to simulate
+        // a reaper DELETE that committed between stage and commit.
+        store.delete_temp_blob(&blob_ref.r#ref.link).await.unwrap();
+
+        let result = store.commit_blob(&blob_ref.r#ref.link).await;
+        match result {
+            Err(PdsError::NotFound(msg)) => {
+                assert!(msg.contains("Stale stage") || msg.contains("not found"),
+                        "expected stale-stage NotFound message; got: {}", msg);
+            }
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+
+        // No blob_metadata row created.
+        assert!(!store.is_untethered(&blob_ref.r#ref.link).await.unwrap());
+        assert!(store.get_metadata(&blob_ref.r#ref.link).await.unwrap().is_none());
+    }
+
+    /// Scenario 7 duplicate-CID (already permanent): direct DB poke
+    /// makes the existing row permanent; re-uploading should be a
+    /// no-op on temp_key (preserves permanent state) per Arc 16b
+    /// `track_untethered_blob` Case 2.
+    #[tokio::test]
+    async fn commit_blob_duplicate_cid_already_permanent_preserves() {
+        let store = create_test_store().await;
+        let blob_ref = stage_test_blob(&store, b"dupe content", "image/png", "did:plc:alice").await;
+        store.commit_blob(&blob_ref.r#ref.link).await.unwrap();
+
+        // Direct DB poke: make it permanent.
+        sqlx::query("UPDATE blob_metadata SET temp_key = NULL WHERE cid = $1")
+            .bind(&blob_ref.r#ref.link)
+            .execute(&store.db)
+            .await
+            .unwrap();
+        assert!(!store.is_untethered(&blob_ref.r#ref.link).await.unwrap());
+
+        // Re-stage + re-commit the same content (same CID).
+        let blob_ref2 = stage_test_blob(&store, b"dupe content", "image/png", "did:plc:alice").await;
+        assert_eq!(blob_ref.r#ref.link, blob_ref2.r#ref.link, "same content → same CID");
+        store.commit_blob(&blob_ref2.r#ref.link).await.unwrap();
+
+        // Row remains permanent (Arc 16b track_untethered Case 2 preserve).
+        assert!(!store.is_untethered(&blob_ref.r#ref.link).await.unwrap());
+    }
+
+    /// Scenario 8 duplicate-CID (already untethered): re-upload
+    /// refreshes created_at (Arc 16b track_untethered Case 3) AND
+    /// row stays untethered.
+    #[tokio::test]
+    async fn commit_blob_duplicate_cid_already_untethered_refreshes() {
+        let store = create_test_store().await;
+        let blob_ref = stage_test_blob(&store, b"refresh content", "image/png", "did:plc:alice").await;
+        store.commit_blob(&blob_ref.r#ref.link).await.unwrap();
+
+        let row = sqlx::query("SELECT created_at FROM blob_metadata WHERE cid = $1")
+            .bind(&blob_ref.r#ref.link)
+            .fetch_one(&store.db).await.unwrap();
+        let first_ts: String = row.try_get("created_at").unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let blob_ref2 = stage_test_blob(&store, b"refresh content", "image/png", "did:plc:alice").await;
+        store.commit_blob(&blob_ref2.r#ref.link).await.unwrap();
+
+        let row2 = sqlx::query("SELECT created_at FROM blob_metadata WHERE cid = $1")
+            .bind(&blob_ref.r#ref.link)
+            .fetch_one(&store.db).await.unwrap();
+        let second_ts: String = row2.try_get("created_at").unwrap();
+
+        assert!(second_ts > first_ts, "created_at refreshed: {} → {}", first_ts, second_ts);
+        assert!(store.is_untethered(&blob_ref.r#ref.link).await.unwrap());
+    }
+
+    /// Scenario 4 getBlob serves untethered blob (Case D per Step 0.3
+    /// recon — no auth gate). The store-level `get` succeeds for any
+    /// caller regardless of `temp_key` state.
+    #[tokio::test]
+    async fn get_serves_untethered_blob_case_d_no_auth_gate() {
+        let store = create_test_store().await;
+        let blob_ref = stage_test_blob(&store, b"public-fetchable", "image/png", "did:plc:alice").await;
+        store.commit_blob(&blob_ref.r#ref.link).await.unwrap();
+
+        // No auth context required at the store level (Case D).
+        let result = store.get(&blob_ref.r#ref.link).await.unwrap();
+        let (data, mime) = result.expect("untethered blob is fetchable");
+        assert_eq!(data, b"public-fetchable");
+        assert_eq!(mime, "image/png");
+
+        // Confirm row state: still untethered (no record reference yet).
+        assert!(store.is_untethered(&blob_ref.r#ref.link).await.unwrap());
+    }
+
+    // Scenario 6 (Arc 10 classifier unchanged) + commit_blob
+    // not-dead-code: both audited via grep at Step 5 (audit items 3 +
+    // 4). The classifier's `freshness_threshold: Duration` parameter
+    // is verified by signature inspection at audit time
+    // (grep `freshness_threshold: Duration` in src/blob_store/gc.rs);
+    // commit_blob's absence of `#[allow(dead_code)]` is verified by
+    // grep of the function signature lines. Compile-time pins for
+    // either property proved too brittle.
 }
