@@ -2189,3 +2189,60 @@ mod relay_urls_parse_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod env_example_lint_tests {
+    //! chainlink #94: keep `.env.example` from re-introducing the
+    //! data_directory shadowing trap. Path env vars that auto-derive
+    //! from `PDS_DATA_DIRECTORY` (in `from_env_values` for blob paths
+    //! and in `ServerConfig::from_env` for the per-component DB paths)
+    //! must NOT be committed as active (uncommented) `KEY=value` lines
+    //! in `.env.example`. Operators routinely export only
+    //! `PDS_DATA_DIRECTORY` for per-instance overlays (e.g., Phase B
+    //! pds-a / pds-b); committed `.env.example` entries are copied into
+    //! the operator's local `.env`, dotenv populates them at process
+    //! start (since the operator's shell didn't export them), and the
+    //! derivation-from-data-directory path is silently bypassed —
+    //! stranding components at the .env-set path instead of following
+    //! the operator's directory move. The Arc 16c Phase B Scenario 2
+    //! report (#94) caught blob bytes landing at `./data/blobs/` while
+    //! `PDS_DATA_DIRECTORY=./phase-b/pds-a` was exported.
+
+    const SHADOWING_KEYS: &[&str] = &[
+        "PDS_ACCOUNT_DB_LOCATION",
+        "PDS_SEQUENCER_DB_LOCATION",
+        "PDS_DID_CACHE_DB_LOCATION",
+        "PDS_ACTOR_STORE_DIRECTORY",
+        "PDS_BLOBSTORE_DISK_LOCATION",
+        "PDS_BLOBSTORE_DISK_TMP_LOCATION",
+    ];
+
+    #[test]
+    fn env_example_does_not_shadow_data_directory_derived_defaults() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env.example");
+        let example = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+
+        for key in SHADOWING_KEYS {
+            let prefix = format!("{}=", key);
+            let active_line = example.lines().find(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with('#') && trimmed.starts_with(&prefix)
+            });
+            assert!(
+                active_line.is_none(),
+                ".env.example must not have an active `{}=...` line \
+                 (found: {:?}). These paths auto-derive from \
+                 PDS_DATA_DIRECTORY; committing them as active values \
+                 creates a precedence trap where operator-shell-exported \
+                 PDS_DATA_DIRECTORY no longer moves the component (the \
+                 dotenv-loaded .env value wins because the operator's \
+                 shell didn't export this specific key). Comment the \
+                 entry out — operators who genuinely want a non-default \
+                 component path can uncomment. See chainlink #94.",
+                key,
+                active_line,
+            );
+        }
+    }
+}

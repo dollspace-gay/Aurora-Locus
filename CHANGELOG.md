@@ -574,6 +574,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **`.env.example` shadowed `PDS_DATA_DIRECTORY`-derived defaults**
+  (#94, surfaced in Arc 16c Phase B Scenario 2). Operator exported
+  `PDS_DATA_DIRECTORY=./phase-b/pds-a` for per-instance overlay;
+  account DB landed at the operator-overridden path but blob bytes
+  landed at `./data/blobs/ba/<cid>` — the .env's literal value.
+  Root cause was config precedence, not code: `.env.example`
+  committed explicit `KEY=value` lines for six path env vars that
+  auto-derive from `PDS_DATA_DIRECTORY` when unset
+  (`PDS_ACCOUNT_DB_LOCATION`, `PDS_SEQUENCER_DB_LOCATION`,
+  `PDS_DID_CACHE_DB_LOCATION`, `PDS_ACTOR_STORE_DIRECTORY`,
+  `PDS_BLOBSTORE_DISK_LOCATION`, `PDS_BLOBSTORE_DISK_TMP_LOCATION`).
+  `dotenv::dotenv()` does NOT override shell-exported vars (so
+  operator's `PDS_DATA_DIRECTORY` wins), but DOES set vars the
+  operator didn't export (so `.env`'s `PDS_BLOBSTORE_DISK_LOCATION`
+  wins). `BlobstoreConfig::from_env_values` then sees
+  `Some("./data/blobs")` and skips the
+  `data_directory.join("blobs")` fallback. Result: a partial
+  precedence trap where moving `PDS_DATA_DIRECTORY` strands blob
+  storage at the old path. Fix is purely operator-config-side:
+  `.env.example` now commits only `PDS_DATA_DIRECTORY=./data` as
+  active; the six derivable paths are commented out with an
+  explanatory header pointing to chainlink #94 so operators who
+  genuinely want per-component path overrides can uncomment. New
+  regression test
+  `config::env_example_lint_tests::env_example_does_not_shadow_data_directory_derived_defaults`
+  reads `.env.example` from `CARGO_MANIFEST_DIR` and asserts none
+  of the six SHADOWING_KEYS appear as active (uncommented) lines.
+  Prevents the trap from re-entering via a future "set sensible
+  defaults" cleanup PR. cargo test --lib --locked: 1091 PASS / 0
+  FAIL (net +1 over #93 fix-tip at 1090). **Operator action
+  required for in-flight Phase B**: either re-`cp .env.example
+  .env` (acceptable because the operator's `.env` differs from
+  the example only in secrets + paths — secrets must be
+  recopied) or remove the six shadowing lines from the local
+  `.env`. **#94 stays OPEN** until skydeval re-runs Arc 16c
+  Phase B Scenario 2 with the .env adjustment and confirms blob
+  bytes land under `$PDS_DATA_DIRECTORY/blobs`.
+
 - **uploadBlob returned malformed CID** (#93, surfaced in Arc 16c
   Phase B Scenario 2). `BlobStore::calculate_cid` constructed
   the CID via `format!("bafyrei{}", hex::encode(sha256(data)))`
