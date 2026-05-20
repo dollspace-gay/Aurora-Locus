@@ -78,13 +78,38 @@ pub enum PdsError {
     /// Arc 16b §9.2 — `blob_metadata` row not found for the supplied
     /// CID. Emitted by `verify_blob_and_make_permanent` (STRICT) when
     /// a record-write references a CID with no upload. Mapped to HTTP
-    /// 404 + `BlobNotFound` envelope. `#[allow(dead_code)]` while
-    /// Arc 16b ships with zero production callers (§9.2.5.1); Arc
-    /// 16c removes the annotation when STRICT is wired into the
-    /// uploadBlob + record-write paths.
-    #[error("Blob not found: CID {0}")]
+    /// 400 + `BlobNotFound` envelope per Arc 16e §9.5.3.5 R0c.A
+    /// (matches bsky-PDS verbatim at
+    /// `packages/pds/src/actor-store/blob/transactor.ts:259-260`).
+    /// `#[allow(dead_code)]` while no production caller exists; Arc 16e
+    /// Step 2 wires STRICT into the apply_writes Phase B path and
+    /// removes the annotation.
+    ///
+    /// **Context**: this is the "record body references a CID with no
+    /// uploaded blob" case (HTTP 400 = bad request from client input).
+    /// Distinct from the admin-context "queried blob doesn't exist in
+    /// storage" case (HTTP 404 = resource not found) which routes
+    /// through `src/api/admin.rs::xrpc_blob_not_found_error` directly,
+    /// bypassing this variant.
+    #[error("Could not find blob: {0}")]
     #[allow(dead_code)]
     BlobNotFound(String),
+
+    /// Arc 16e §9.5.3.5 — record body contains a CID that is malformed
+    /// (unparseable multibase / multihash) OR non-DASL-compliant (not
+    /// `CIDv1`, or not raw/DAG-CBOR codec, or not SHA-256 hash).
+    /// Emitted by the validate-phase walker `extract_blob_cids` at
+    /// `src/repository/blob_refs.rs` before any state mutation occurs.
+    /// Mapped to HTTP 400 + typed `InvalidCid` envelope — deliberate
+    /// stricter-typed-than-bsky-PDS posture per §9.5.5.10. bsky-PDS
+    /// emits the `InvalidRequest` umbrella for the same condition;
+    /// Aurora-Locus elects a typed wire code consistent with the
+    /// Arc 14-era pattern (`RepoTakendown`, `RepoSuspended`, etc.).
+    /// Stricter REJECTION codes cannot break federation interop —
+    /// returned to the malformed-input client, never emitted to the
+    /// firehose.
+    #[error("Invalid CID in record body: {0}")]
+    InvalidCid(String),
 
     /// JWT errors
     #[error("JWT error: {0}")]
@@ -283,11 +308,21 @@ impl IntoResponse for PdsError {
                 "RepoDesynchronized",
                 self.to_string(),
             ),
-            // Arc 16b §9.2 / Step 0.3 / Step 3.6: typed error for
-            // STRICT helper's "blob not present" path. Spec-compliant
-            // envelope per Arc 14 v3.2 §7.6.5 pattern.
+            // Arc 16e §9.5.3.5 R0c.A — STRICT's "record references missing
+            // blob" path. HTTP 400 + wire shape matches bsky-PDS verbatim at
+            // packages/pds/src/actor-store/blob/transactor.ts:259-260.
+            // (Pre-Arc-16e this was HTTP 404; flipped at chainlink #107
+            // cross-arc PR. Admin storage-lookup miss stays 404 via the
+            // separate xrpc_blob_not_found_error helper in api/admin.rs.)
             PdsError::BlobNotFound(_) => {
-                (StatusCode::NOT_FOUND, "BlobNotFound", self.to_string())
+                (StatusCode::BAD_REQUEST, "BlobNotFound", self.to_string())
+            }
+            // Arc 16e §9.5.3.5 / §9.5.5.10 — validate-phase walker rejection.
+            // Typed wire code (deliberate stricter-than-bsky-PDS posture per
+            // §9.5.5.10); bsky-PDS uses InvalidRequest umbrella for the same
+            // condition. See chainlink #106 for the wire-vocabulary decision.
+            PdsError::InvalidCid(_) => {
+                (StatusCode::BAD_REQUEST, "InvalidCid", self.to_string())
             }
             PdsError::NotLeader(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -341,5 +376,51 @@ pub type PdsResult<T> = Result<T, PdsError>;
 impl From<proto_blue::lex_cbor::CborError> for PdsError {
     fn from(e: proto_blue::lex_cbor::CborError) -> Self {
         PdsError::CborEncoding(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    /// Arc 16e §9.5.3.5 R0c.A — `PdsError::BlobNotFound` maps to HTTP
+    /// 400 with wire shape `{"error": "BlobNotFound", "message":
+    /// "Could not find blob: <cid>"}` matching bsky-PDS verbatim at
+    /// `packages/pds/src/actor-store/blob/transactor.ts:259-260`.
+    /// Pre-#107 this was HTTP 404; the flip is the load-bearing
+    /// behavior change in the cross-arc PR.
+    #[tokio::test]
+    async fn blob_not_found_maps_to_http_400_with_bsky_pds_wire_shape() {
+        let err = PdsError::BlobNotFound("bafkreigh2akiscaildc".to_string());
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: XrpcErrorResponse = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body.error, "BlobNotFound");
+        assert_eq!(body.message, "Could not find blob: bafkreigh2akiscaildc");
+    }
+
+    /// Arc 16e §9.5.3.5 + §9.5.5.10 — `PdsError::InvalidCid` maps to
+    /// HTTP 400 with typed wire shape `{"error": "InvalidCid",
+    /// "message": "Invalid CID in record body: <cid>"}`. Deliberate
+    /// stricter-than-bsky-PDS posture per chainlink #106 (bsky-PDS
+    /// uses the `InvalidRequest` umbrella).
+    #[tokio::test]
+    async fn invalid_cid_maps_to_http_400_with_typed_wire_code() {
+        let err = PdsError::InvalidCid("bafyrei-malformed-input".to_string());
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: XrpcErrorResponse = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body.error, "InvalidCid");
+        assert_eq!(
+            body.message,
+            "Invalid CID in record body: bafyrei-malformed-input"
+        );
     }
 }
