@@ -574,6 +574,84 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Postgres-incompatible `datetime('now')` in 5 production queries**
+  (#95, surfaced in Arc 16c Phase B Postgres pass). Bug pre-dates
+  Arc 16c — leaked through Arc 13 Postgres Phase 5's 233-site
+  cross-backend sweep. Postgres-backed Aurora-Locus startup errored
+  with `function datetime(unknown) does not exist`; the
+  `metrics_collection` job failed after 3 retries. PDS was
+  otherwise functional (38 tables landed, XRPC surface up) but the
+  metrics surface was dark.
+  - **Affected callsites** (all `SELECT ... FROM session WHERE
+    expires_at > datetime('now')` variants):
+    `src/jobs/tasks.rs:333` (metrics_collection),
+    `src/api/admin.rs:832` + `:4782` (admin dashboards),
+    `src/cli/migrate_oauth.rs:80` + `:134` (per-DID +
+    DISTINCT-DID OAuth migration helpers).
+  - **Fix is NOT `CURRENT_TIMESTAMP`** (the first-instinct
+    SQL-standard substitute). Postgres `CURRENT_TIMESTAMP` returns
+    `timestamp with time zone`, but `expires_at` is `TEXT NOT
+    NULL` — per the explicit type-translation comment at
+    `migrations/postgres/0001_initial.sql:19-34`, sqlx::Any can't
+    bind chrono types so the codebase uses TEXT + lexicographic
+    RFC3339 comparison uniformly. `TEXT > timestamptz` has no
+    operator in Postgres and errors with `operator does not
+    exist: text > timestamp with time zone`.
+  - **Canonical fix** matches the pattern already in
+    `AccountManager::cleanup_expired_sessions`
+    (`src/account/manager.rs:1072`): bind
+    `chrono::Utc::now().to_rfc3339()` from application code,
+    compare TEXT > TEXT lexicographically. Works on both backends
+    because session writes already use `expires_at.to_rfc3339()`
+    so the storage and query formats match.
+  - **Latent SQLite bug also closed**: the original `datetime('now')`
+    returns `'YYYY-MM-DD HH:MM:SS'` (space-separated, no timezone)
+    but `expires_at` is stored as `to_rfc3339()` (`'YYYY-MM-DDTHH:MM:SS+TZ'`).
+    Lexicographic comparison of the two formats is unsound for
+    same-day expirations (space `0x20` < `T` `0x54` means
+    `datetime('now')` always sorts before any RFC3339 timestamp
+    with the same date, so an already-expired same-day session
+    incorrectly counted as active). The bind-RFC3339 fix
+    closes this latent bug as a side-effect.
+  - **Two regression layers**:
+    (1) `tests/postgres_smoke_test.rs`'s new
+    `session_expiry_query_runs_on_postgres` spins up a real
+    Postgres via testcontainers, seeds one expired + one valid
+    session, and runs each of the three query shapes verbatim —
+    asserts they parse + return the correct counts. Group 6
+    extension to the existing Arc 13 Phase 5 smoke matrix.
+    (2) `src/db/mod.rs`'s new `cross_backend_sql_lint_tests`
+    module walks the production `src/` tree (exempting
+    `src/actor_store/` which is always SQLite by design, and four
+    files that contain `datetime` only in Rust identifiers /
+    comments) and fails the build if any forbidden SQLite-only
+    SQL token (`datetime(`, `julianday(`, `strftime(`) appears
+    in a production line. Stops the next Phase B Postgres pass
+    from re-surfacing the same recon-coverage gap.
+  - **Recon-discipline meta-note** (filed under phase-b-gap label):
+    Arc 13 Phase 5's 233-site sweep produced a one-shot snapshot;
+    new SQL written in subsequent arcs (Arc 14/15/16) wasn't
+    re-swept. Going forward, the cross-backend audit grep
+    (`grep -rn "datetime(\|julianday(\|strftime(" src/`) should
+    be part of EVERY arc's Step 0 recon when the arc touches
+    database queries, not just arcs that explicitly target
+    Postgres support. The new
+    `cross_backend_sql_lint_tests::no_sqlite_only_time_functions_in_production_sql`
+    enforces this via the test suite so the recon checklist
+    doesn't have to remember.
+  - cargo test --lib --locked: **1092 PASS / 0 FAIL** (net +1
+    over #94 fix-tip at 1091).
+  - Real-Postgres regression: `session_expiry_query_runs_on_postgres`
+    PASS against `postgres:16-alpine` testcontainer.
+  - **#95 stays OPEN** until skydeval restarts the Postgres-backed
+    PDS at fix-tip and confirms the `metrics_collection` job
+    runs without the `datetime(unknown) does not exist` error.
+
+  *Out-of-scope deferral* (noted from same Phase B): `/xrpc/_health`
+  returns 404 — either the health endpoint lives at a different
+  path or doesn't exist. Deferred to v0.6 cleanup (minor, not a
+  blocker; no chainlink opened).
+
 - **`.env.example` shadowed `PDS_DATA_DIRECTORY`-derived defaults**
   (#94, surfaced in Arc 16c Phase B Scenario 2). Operator exported
   `PDS_DATA_DIRECTORY=./phase-b/pds-a` for per-instance overlay;

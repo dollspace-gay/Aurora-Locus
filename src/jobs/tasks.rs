@@ -328,9 +328,18 @@ pub async fn collect_aggregate_metrics(ctx: &AppContext) -> PdsResult<()> {
 
     crate::metrics::ACCOUNTS_TOTAL.set(account_count);
 
-    // 2. Count active sessions (not expired)
+    // 2. Count active sessions (not expired). chainlink #95: bind an
+    // RFC-3339 timestamp from application code rather than use SQL
+    // `datetime('now')` (SQLite-only) or `CURRENT_TIMESTAMP` (Postgres
+    // type-mismatch against the `TEXT` `expires_at` column). The
+    // bind-RFC-3339 pattern matches the storage format (sessions are
+    // inserted with `expires_at.to_rfc3339()` per
+    // `AccountManager::create_session`) and works on both backends
+    // via lexicographic TEXT comparison.
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
     let session_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')")
+        sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE expires_at > $1")
+            .bind(&now_rfc3339)
             .fetch_one(&ctx.account_db)
             .await
             .map_err(PdsError::Database)?;

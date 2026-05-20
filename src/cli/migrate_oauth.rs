@@ -76,10 +76,16 @@ pub async fn migrate_user(
 
 /// Count active sessions for a user
 async fn count_user_sessions(ctx: &AppContext, did: &str) -> PdsResult<usize> {
+    // chainlink #95: bind RFC-3339 from app code (see jobs/tasks.rs for
+    // rationale). Use $1/$2 placeholders for cross-backend portability
+    // — the SQLite `?` form works on both, but $N is the documented
+    // sqlx::Any preference and matches the rest of the file's queries.
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session WHERE did = ? AND expires_at > datetime('now')",
+        "SELECT COUNT(*) FROM session WHERE did = $1 AND expires_at > $2",
     )
     .bind(did)
+    .bind(&now_rfc3339)
     .fetch_one(&ctx.account_db)
     .await
     .map_err(PdsError::Database)?;
@@ -129,9 +135,12 @@ pub async fn bulk_migrate_users(
 ) -> PdsResult<Vec<MigrationResult>> {
     info!("Starting bulk OAuth migration");
 
-    // Get all DIDs with active sessions
+    // Get all DIDs with active sessions. chainlink #95: bind RFC-3339
+    // from app code (see jobs/tasks.rs for rationale).
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
     let dids: Vec<String> =
-        sqlx::query_scalar("SELECT DISTINCT did FROM session WHERE expires_at > datetime('now')")
+        sqlx::query_scalar("SELECT DISTINCT did FROM session WHERE expires_at > $1")
+            .bind(&now_rfc3339)
             .fetch_all(&ctx.account_db)
             .await
             .map_err(PdsError::Database)?;

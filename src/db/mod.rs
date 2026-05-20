@@ -432,3 +432,152 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod cross_backend_sql_lint_tests {
+    //! chainlink #95: prevent SQLite-only SQL functions from regressing
+    //! into production query strings. Arc 13 Phase 5's 233-site sweep
+    //! caught most, but five `datetime('now')` callsites survived in
+    //! `src/jobs/tasks.rs`, `src/api/admin.rs`, and
+    //! `src/cli/migrate_oauth.rs` — surfaced only at Postgres-backed
+    //! startup when the metrics_collection job errored with `function
+    //! datetime(unknown) does not exist`. This lint scans production
+    //! `src/` files for SQL strings that call SQLite-only time
+    //! functions; the per-actor `actor_store` is exempted because it
+    //! is always SQLite by design (per .env.example DB-backend doc).
+    //!
+    //! When this lint trips, the fix is the canonical TEXT + RFC3339
+    //! bind pattern documented at
+    //! `migrations/postgres/0001_initial.sql:19-34` and used by
+    //! `AccountManager::cleanup_expired_sessions`
+    //! (src/account/manager.rs:1072): `WHERE col > $1` with
+    //! `.bind(Utc::now().to_rfc3339())`. NOT `CURRENT_TIMESTAMP` —
+    //! Postgres's `CURRENT_TIMESTAMP` is `timestamptz`, which has no
+    //! `>` operator against the `TEXT` storage columns.
+
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    /// SQLite-only SQL function names that must not appear in production
+    /// query strings. Each entry is the function name as it appears in
+    /// a query (e.g., `datetime(` — the trailing `(` disambiguates from
+    /// identifiers like `datetime_field` or Rust function names like
+    /// `system_time_to_datetime`).
+    const FORBIDDEN_SQLITE_ONLY_TOKENS: &[&str] = &[
+        "datetime(",
+        "julianday(",
+        "strftime(",
+    ];
+
+    /// Files exempted from the lint. Either (a) per-actor stores that
+    /// are always SQLite by design, or (b) files containing only the
+    /// listed token in comments/test fixtures/Rust-side helpers (not
+    /// in SQL strings).
+    fn is_exempt(path: &Path) -> bool {
+        let rel = path
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap_or(path);
+
+        // Per-actor ActorStore is always SQLite (see .env.example
+        // database section); SQLite-only DDL/DML in this subtree is
+        // intentional.
+        if rel.starts_with("src/actor_store") {
+            return true;
+        }
+
+        // src/validation/mod.rs uses `datetime` in Rust function names
+        // (validate_datetime) and test names (test_validate_*_datetime);
+        // not SQL.
+        if rel == Path::new("src/validation/mod.rs") {
+            return true;
+        }
+
+        // src/admin/roles.rs comments reference `datetime('now')` in a
+        // doc comment explaining the format-mismatch lesson; no SQL.
+        if rel == Path::new("src/admin/roles.rs") {
+            return true;
+        }
+
+        // src/blob_store/disk.rs has a Rust helper named
+        // `system_time_to_datetime`; not SQL.
+        if rel == Path::new("src/blob_store/disk.rs") {
+            return true;
+        }
+
+        false
+    }
+
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+            panic!("read_dir {}: {}", dir.display(), e)
+        });
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension() == Some(OsStr::new("rs")) {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn no_sqlite_only_time_functions_in_production_sql() {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_dir, &mut files);
+
+        let mut violations: Vec<String> = Vec::new();
+        for file in &files {
+            if is_exempt(file) {
+                continue;
+            }
+            let content = match std::fs::read_to_string(file) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // Skip the test module portion of any file — production
+            // call-site discipline only. The convention is `#[cfg(test)]
+            // mod tests {`; everything after the first such marker is
+            // test code (unit tests embedded alongside production code).
+            let production = match content.find("#[cfg(test)]") {
+                Some(idx) => &content[..idx],
+                None => &content[..],
+            };
+            for (line_no, line) in production.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // Skip Rust-side comments (`//`) and doc comments
+                // (`///`, `//!`). SQL string literals are not comments.
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for token in FORBIDDEN_SQLITE_ONLY_TOKENS {
+                    if line.contains(token) {
+                        violations.push(format!(
+                            "{}:{}: contains forbidden SQLite-only token `{}`: {}",
+                            file.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                                .unwrap_or(file)
+                                .display(),
+                            line_no + 1,
+                            token,
+                            trimmed,
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "SQLite-only SQL functions found in production code \
+             (chainlink #95). Replace with the canonical TEXT + \
+             RFC3339-bind pattern: `WHERE col > $1` + \
+             `.bind(Utc::now().to_rfc3339())`. NOT `CURRENT_TIMESTAMP` \
+             — that errors on Postgres because `expires_at`-style \
+             columns are TEXT not TIMESTAMPTZ (see \
+             migrations/postgres/0001_initial.sql:19-34). \
+             Violations:\n  {}",
+            violations.join("\n  "),
+        );
+    }
+}

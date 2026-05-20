@@ -828,8 +828,11 @@ async fn get_stats(
     // Set to 0 for now, can be improved later
     let total_posts: i64 = 0;
 
+    // chainlink #95: bind RFC-3339 from app code (see jobs/tasks.rs for rationale).
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
     let active_sessions: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')")
+        sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE expires_at > $1")
+            .bind(&now_rfc3339)
             .fetch_one(&ctx.account_db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4778,9 +4781,12 @@ async fn get_database_status(
         .map(|(count,)| count)
         .unwrap_or(0);
 
+    // chainlink #95: bind RFC-3339 from app code (see jobs/tasks.rs for rationale).
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
     let session_count = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')",
+        "SELECT COUNT(*) FROM session WHERE expires_at > $1",
     )
+    .bind(&now_rfc3339)
     .fetch_one(&ctx.account_db)
     .await
     .map(|(count,)| count)
