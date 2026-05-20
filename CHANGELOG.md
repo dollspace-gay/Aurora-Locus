@@ -52,16 +52,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     with `#[allow(dead_code)]` (no production callers in Arc
     16b); HTTP 404 + `{error: "BlobNotFound", message}` envelope
     per Arc 14 v3.2 §7.6.5 typed-error pattern.
-  - **Recon-driven design adjustment**: Step 0.2 Item 9's initial
-    "tolerates-silently" outcome for `SELECT … FOR UPDATE` on
-    SQLite was empirically falsified during Step 3 testing —
-    sqlx 0.8 passes the clause through to SQLite which rejects
-    it as syntax error. Corrected outcome: `query-builder`
-    conditional emission via `BlobStore::for_update_clause()`
-    (runtime backend detection via `pg_backend_pid()` probe at
-    `BlobStore::new()`). Side effect: helpers became `&self`
-    methods rather than `BlobStore::helper(...)` free functions.
-    Recon doc updated; Step 5 audit item 10 verifies match.
+  - **Recon-driven design adjustment** — V05_DESIGN.md §3.5
+    behavioral-failure protocol callout: Step 0.2 Item 9's
+    initial "tolerates-silently" outcome for `SELECT … FOR
+    UPDATE` on SQLite was empirically falsified during Step 3
+    testing — sqlx 0.8 passes the clause through to SQLite
+    which rejects it as syntax error. Design said "verify in
+    Step 0," implementation tests caught the wrong outcome, recon
+    doc updated with empirical evidence + correction. Corrected
+    outcome: `query-builder` conditional emission via
+    `BlobStore::for_update_clause()` (runtime backend detection
+    via `pg_backend_pid()` probe at `BlobStore::new()`). Side
+    effect: helpers became `&self` methods rather than
+    `BlobStore::helper(...)` free functions. Recon doc updated
+    with the empirical trace + corrected outcome; Step 5 audit
+    item 10 verifies implementation matches the recorded outcome.
+    This is the cycle's standout recon-discipline win — the
+    "Step 0 outcome may be wrong; verify and correct rather than
+    blindly implement" protocol working as intended.
   - **Recon finding (no FK)**: per Step 0.2 Item 10, no FK
     currently exists between `record_blob` and `blob_metadata`.
     The design's caller-obligations table assumes "expected FK +
@@ -78,6 +86,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   / repository.rs untouched; UPSERT counts 3+3 post-diff; FOR
   UPDATE outcome matches recorded `query-builder` via
   `for_update_clause`).
+
+  **Phase B sign-off (2026-05-19):** helpers-only arc verification
+  — migration 0011 applies cleanly; `temp_key` column present
+  (TEXT, nullable, index 9); partial index
+  `idx_blob_metadata_untethered` landed with the design's TTL-
+  paging shape; lib 1082/1082 PASS at fix-tip; production
+  callers grep returns 0 per §9.2.5.1.
 
   **Federation sub-feature #46 stays OPEN** — closes only when
   Arc 16b + 16c + 16d all lock.
