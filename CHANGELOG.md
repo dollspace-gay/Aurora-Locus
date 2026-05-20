@@ -572,6 +572,80 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   workstream; substrate for Arc 16b helpers + Arc 16c-f blob
   lifecycle work + Arc 17 dynamic lexicon loading.
 
+### Documentation
+
+- **Arc 16c Phase B Scenario 3 source-trace + spec scoping**
+  (#92 / sibling investigation to #95; opens #96 as v0.6
+  hardening). Phase B Scenario 3 observed HTTP 5xx + no
+  `blob_metadata` row + NO orphan bytes at
+  `${PDS_DATA_DIRECTORY}/blobs/<shard>/` under a read-only-DB
+  injection — apparently contradicting §9.3.3.2's
+  bytes-before-commit ordering invariant (which predicts orphan
+  bytes on a commit-phase tx failure). Source-trace of
+  `stage_blob` (src/blob_store/store.rs:170-230) resolved the
+  apparent contradiction without modifying any code:
+  - **`stage_blob` writes bytes at line 210 (`fs::write` to
+    `temp_dir/<cid>`) BEFORE INSERT-ing `temp_blob_metadata`
+    at line 225.** A read-only DB rejects the INSERT at
+    `stage_blob`-phase — `commit_blob` is never invoked. The
+    bytes DO land on disk, but at `${PDS_DATA_DIRECTORY}/temp/`
+    (the staging dir), not at the FINAL `blobs/<shard>/` path
+    Scenario 3 was inspecting. Mechanism (b) per the
+    investigation framing: bytes streamed to a separate
+    staging location.
+  - **§9.3.3.2 ordering invariant is correctly stated and
+    NOT violated.** The invariant scopes to `commit_blob`'s
+    commit-phase (bytes-at-final-position before DB-commit);
+    it is silent on `stage_blob`'s stage-phase ordering
+    (bytes-at-temp before metadata-INSERT). New stage-phase
+    ordering note appended to §9.3.3.2 with rationale
+    (bytes-then-row at stage-phase prevents row-without-bytes
+    on crash between the two writes; row-then-bytes would
+    create a worse invariant violation).
+  - **Latent v0.6 gap surfaced**: the orphan temp file from
+    a stage_blob metadata-INSERT failure is invisible to every
+    existing v0.5 reaper. `list_orphaned_temp_blobs`
+    (src/blob_store/store.rs:689) queries the
+    `temp_blob_metadata` table — no row, no detection. Arc
+    10's classifier scans the FINAL-position storage, not
+    `temp_dir`. `commit_blob`'s post-commit cleanup at line
+    339 only runs after a successful DB commit. No standalone
+    filesystem-side sweep of `temp_dir` exists. Chainlink #96
+    opens with proposed defensive-cleanup fix (5-line wrap of
+    `store_temp_blob_metadata` failure that `fs::remove_file`
+    the orphan before propagating the error). Deferred to
+    v0.6 per V05_DESIGN.md §3.3 dev-only scope acceptance —
+    orphan size bounded by `max_blob_size = 5 MiB` per failed
+    stage, stage_blob failures should be rare. **Not a v0.5
+    blocker; Arc 16c (#92) close not blocked by #96.**
+  - **§4.6 (recon discipline) extended** with a new
+    "Source-trace discipline for Phase B observations"
+    subsection that encodes the lesson: when a Phase B
+    observation surfaces an *unexpected absence* (bytes/rows
+    /signals expected but not found), source-trace the actual
+    ordering of the implicated functions BEFORE filing the
+    observation as spec-shape limitation or v0.5-scope-accepted
+    friction. The Scenario 3 instance demonstrates all three
+    payoffs: (1) the "absence" may not be absent, just
+    elsewhere; (2) the trace may surface a latent gap (#96);
+    (3) the spec may need scoping refinement (§9.3.3.2
+    stage-phase note). 15-30 minutes of source-reading per
+    Phase B anomaly is cheap relative to spec-vs-reality
+    drift in subsequent arcs.
+  - **`docs/internal/arc16c-phase-b-commands.md` Scenario 3
+    rewritten** to inspect BOTH the FINAL path (should be
+    EMPTY under read-only-DB injection — `commit_blob` never
+    runs) AND the STAGING path (should contain orphan —
+    stage_blob's `fs::write` succeeded before the INSERT
+    failed). New 2b/3b steps + clarified pass criteria +
+    manual orphan-cleanup in the reset-to-known-state
+    procedure (pending #96).
+
+  No source code changes. cargo test --lib --locked: 1092
+  PASS / 0 FAIL (unchanged from #95 fix-tip). #92 + #93 + #94
+  + #95 disposition unchanged — still pending skydeval Phase
+  B re-run.
+
 ### Fixed
 
 - **Postgres-incompatible `datetime('now')` in 5 production queries**
