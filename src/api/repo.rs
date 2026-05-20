@@ -5,6 +5,7 @@ use crate::{
     context::AppContext,
     error::{PdsError, PdsResult},
     oauth::AtProtoScope,
+    repository::blob_refs::extract_blob_cids,
 };
 use axum::{
     extract::{Query, State},
@@ -13,46 +14,6 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-
-/// Extract blob CIDs from a record value
-///
-/// Recursively scans a JSON value for blob references in ATProto format.
-/// Blobs are represented as `{ "$type": "blob", "ref": { "$link": "CID" } }`.
-fn extract_blob_cids(value: &serde_json::Value) -> Vec<String> {
-    let mut cids = Vec::new();
-    extract_blob_cids_recursive(value, &mut cids);
-    cids
-}
-
-fn extract_blob_cids_recursive(value: &serde_json::Value, cids: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(obj) => {
-            // Check if this is a blob reference
-            if let Some(type_val) = obj.get("$type") {
-                if type_val.as_str() == Some("blob") {
-                    // Extract the CID from ref.$link
-                    if let Some(ref_obj) = obj.get("ref") {
-                        if let Some(link) = ref_obj.get("$link") {
-                            if let Some(cid) = link.as_str() {
-                                cids.push(cid.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            // Recurse into object values
-            for (_, v) in obj {
-                extract_blob_cids_recursive(v, cids);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                extract_blob_cids_recursive(v, cids);
-            }
-        }
-        _ => {}
-    }
-}
 
 /// Build repository routes
 pub fn routes() -> Router<AppContext> {
