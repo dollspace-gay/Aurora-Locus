@@ -284,6 +284,26 @@ pub enum PdsError {
     #[error("Concurrent mutation in progress for this repo")]
     #[allow(dead_code)]
     ConcurrentMutation,
+
+    /// Arc 16f §9.6.3.1 step 3 + Aurora error vocabulary — the
+    /// uploaded CAR body fails Aurora's structural acceptance gates
+    /// before Phase A can begin. Concrete causes that map to this
+    /// variant for v0.5 Step 3:
+    /// - Streaming size cap exceeded (HTTP 413 semantic, surfaced
+    ///   as 400 here — see [skydeval]: a v0.6+ refinement could
+    ///   split this into a dedicated `ImportTooLarge { size, limit }`
+    ///   variant if operators need wire-distinguishable 413 vs 400;
+    ///   v0.5 ships unified for variant-count economy).
+    /// - CAR root commit's `did` field does not match the
+    ///   authenticated importing DID.
+    /// - `verify_diff_car` returned a structural / encoding error
+    ///   (malformed CAR header, unparseable blocks, MST load
+    ///   failure).
+    ///
+    /// Mapped to HTTP 400 `InvalidCar`.
+    #[error("Invalid CAR: {0}")]
+    #[allow(dead_code)]
+    InvalidCar(String),
 }
 
 /// Manual PartialEq implementation for PdsError
@@ -346,6 +366,7 @@ impl PartialEq for PdsError {
                 PdsError::BlobTooLarge { cid: bc, size: bsz },
             ) => ac == bc && asz == bsz,
             (PdsError::ConcurrentMutation, PdsError::ConcurrentMutation) => true,
+            (PdsError::InvalidCar(a), PdsError::InvalidCar(b)) => a == b,
             // Database and Io errors cannot be compared, so we use error message comparison
             (PdsError::Database(a), PdsError::Database(b)) => a.to_string() == b.to_string(),
             (PdsError::Io(a), PdsError::Io(b)) => a.to_string() == b.to_string(),
@@ -505,6 +526,13 @@ impl IntoResponse for PdsError {
             PdsError::ConcurrentMutation => (
                 StatusCode::CONFLICT,
                 "ConcurrentMutation",
+                self.to_string(),
+            ),
+            // Arc 16f §9.6.3.1 step 3 — CAR body failed structural
+            // acceptance gates (DID mismatch, oversize, decode error).
+            PdsError::InvalidCar(_) => (
+                StatusCode::BAD_REQUEST,
+                "InvalidCar",
                 self.to_string(),
             ),
             // Arc 16f §9.6.3.5 — internal control-flow signal that

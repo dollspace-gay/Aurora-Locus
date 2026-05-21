@@ -21,6 +21,7 @@ pub mod oauth_admin;
 pub mod oauth_server;
 pub mod registry;
 pub mod repo;
+pub mod repo_import;
 pub mod server;
 pub mod sync;
 pub mod sync_helpers;
@@ -50,6 +51,7 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
         .merge(well_known::routes())
         .merge(server::routes())
         .merge(repo::routes())
+        .merge(repo_import::routes())
         .merge(blob::routes())
         .merge(identity::routes())
         .merge(admin_router)
