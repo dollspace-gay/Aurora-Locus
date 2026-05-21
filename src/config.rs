@@ -705,6 +705,22 @@ pub struct ServiceConfig {
     /// `PDS_SERVICE_BLOB_FETCH_MAX_RETRIES`.
     #[serde(default = "default_blob_fetch_max_retries")]
     pub blob_fetch_max_retries: u32,
+    /// Arc 16f §9.6.1.1 — kill-switch for the importRepo handler.
+    /// When `false`, the handler short-circuits with HTTP 503 inside
+    /// the single-flight lock so operators can drain in-flight
+    /// imports before halting new ones. Default `true` (importRepo
+    /// available). Env var: `PDS_SERVICE_ACCEPTING_IMPORTS`.
+    #[serde(default = "default_accepting_imports")]
+    pub accepting_imports: bool,
+    /// Arc 16f §9.6.1.1 + round-1 F21 — streaming size cap for
+    /// importRepo CAR bodies. Enforced during decode (decode loop
+    /// aborts at the first chunk that would push the accumulated
+    /// byte count past the cap, returning HTTP 413). `None` disables
+    /// the cap — discouraged for production, useful for self-import
+    /// dev workflows. No default; set explicitly. Env var:
+    /// `PDS_SERVICE_MAX_IMPORT_SIZE` (numeric).
+    #[serde(default)]
+    pub max_import_size: Option<u64>,
 }
 
 fn default_max_blob_fetch_size() -> u64 {
@@ -717,6 +733,10 @@ fn default_blob_fetch_timeout_seconds() -> u64 {
 
 fn default_blob_fetch_max_retries() -> u32 {
     3
+}
+
+fn default_accepting_imports() -> bool {
+    true
 }
 
 impl ServiceConfig {
@@ -1598,6 +1618,17 @@ impl ServerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(default_blob_fetch_max_retries);
 
+        // Arc 16f §9.6.1.1 — importRepo gate knobs. `accepting_imports`
+        // is the operator drain switch (default true); `max_import_size`
+        // is the streaming-cap (None = unbounded, only sensible in dev).
+        let accepting_imports = env::var("PDS_SERVICE_ACCEPTING_IMPORTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_accepting_imports);
+        let max_import_size = env::var("PDS_SERVICE_MAX_IMPORT_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
         // Arc 12 §5.4 Step 1.1 + 1.2: EntrywayConfig from
         // `PDS_ENTRYWAY_*` env vars, all-or-nothing.
         let entryway = EntrywayConfig::from_env_values(
@@ -1618,6 +1649,8 @@ impl ServerConfig {
                 max_blob_fetch_size,
                 blob_fetch_timeout_seconds,
                 blob_fetch_max_retries,
+                accepting_imports,
+                max_import_size,
             },
             storage: StorageConfig {
                 data_directory,

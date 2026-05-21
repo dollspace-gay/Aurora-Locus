@@ -1455,6 +1455,8 @@ mod admin_auth_third_path_tests {
                 max_blob_fetch_size: 50_000_000,
                 blob_fetch_timeout_seconds: 30,
                 blob_fetch_max_retries: 3,
+                accepting_imports: true,
+                max_import_size: None,
             },
             storage: StorageConfig {
                 data_directory: dir.clone(),
