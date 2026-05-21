@@ -7,6 +7,7 @@ pub mod disk;
 pub mod gc;
 pub mod mime;
 pub mod models;
+pub mod promoter;
 pub mod quarantine;
 pub mod s3;
 pub mod store;
@@ -16,6 +17,8 @@ pub use models::*;
 // then the re-export is unused at bin-scope. The allow lifts in Phase 2.
 #[allow(unused_imports)]
 pub use s3::{S3BlobBackend, S3Config};
+#[allow(unused_imports)]
+pub use promoter::{BlobPromoter, PromoteOutcome, StrictPromoter, TolerantPromoter};
 pub use store::{BlobStore, BlobStoreConfig, UnreferenceOutcome};
 
 use crate::error::PdsResult;
