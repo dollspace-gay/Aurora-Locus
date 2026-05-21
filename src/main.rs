@@ -28,6 +28,7 @@ mod metrics;
 mod oauth;
 mod rate_limit;
 mod read_after_write;
+mod repository;
 mod sequencer;
 mod server;
 mod service_auth;
