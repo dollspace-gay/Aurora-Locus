@@ -7,6 +7,7 @@
 //! - Relay support for event distribution
 
 pub mod authentication;
+pub mod blob_fetch;
 pub mod discovery;
 pub mod dpop;
 pub mod entryway;
