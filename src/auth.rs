@@ -1452,6 +1452,9 @@ mod admin_auth_third_path_tests {
                 version: "0.1.0-test".to_string(),
                 blob_upload_limit: 5_242_880,
                 public_url: None,
+                max_blob_fetch_size: 50_000_000,
+                blob_fetch_timeout_seconds: 30,
+                blob_fetch_max_retries: 3,
             },
             storage: StorageConfig {
                 data_directory: dir.clone(),

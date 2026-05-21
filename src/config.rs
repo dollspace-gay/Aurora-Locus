@@ -682,6 +682,41 @@ pub struct ServiceConfig {
     /// / 0.0.0.0.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// Per-blob memory cap for the Arc 16f origin-fetch primitive
+    /// (`src/federation/blob_fetch.rs`). Closes round-1 F10: defends
+    /// against `max_import_size`-respecting CARs that reference
+    /// oversized individual blobs. Enforced via HEAD `Content-Length`
+    /// pre-check; falls back to streaming-bound enforcement when the
+    /// origin omits Content-Length on HEAD. Default `50_000_000`
+    /// matches bsky-PDS `PDS_BLOB_UPLOAD_LIMIT` order. Env var:
+    /// `PDS_SERVICE_MAX_BLOB_FETCH_SIZE`.
+    #[serde(default = "default_max_blob_fetch_size")]
+    pub max_blob_fetch_size: u64,
+    /// Per-attempt timeout for origin-blob fetches in seconds. Applies
+    /// to one HTTP GET attempt; the primitive's inner retry budget
+    /// (`blob_fetch_max_retries`) may issue multiple attempts. Default
+    /// `30` seconds. Env var: `PDS_SERVICE_BLOB_FETCH_TIMEOUT_SECONDS`.
+    #[serde(default = "default_blob_fetch_timeout_seconds")]
+    pub blob_fetch_timeout_seconds: u64,
+    /// Per-CID retry budget for the origin-blob fetch primitive.
+    /// Counts retries *after* the first attempt — so total attempts ≤
+    /// `1 + blob_fetch_max_retries`. Only 5xx / network / timeout
+    /// errors retry; 4xx are durable. Default `3`. Env var:
+    /// `PDS_SERVICE_BLOB_FETCH_MAX_RETRIES`.
+    #[serde(default = "default_blob_fetch_max_retries")]
+    pub blob_fetch_max_retries: u32,
+}
+
+fn default_max_blob_fetch_size() -> u64 {
+    50_000_000
+}
+
+fn default_blob_fetch_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_blob_fetch_max_retries() -> u32 {
+    3
 }
 
 impl ServiceConfig {
@@ -1547,6 +1582,22 @@ impl ServerConfig {
         // different field, same name).
         let service_public_url = env::var("PDS_SERVICE_PUBLIC_URL").ok();
 
+        // Arc 16f §9.6.1.1 — origin-blob-fetch primitive knobs. Each
+        // falls back to the same default the serde-default helpers
+        // use, so YAML deserialisation and env-var construction agree.
+        let max_blob_fetch_size = env::var("PDS_SERVICE_MAX_BLOB_FETCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_max_blob_fetch_size);
+        let blob_fetch_timeout_seconds = env::var("PDS_SERVICE_BLOB_FETCH_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_blob_fetch_timeout_seconds);
+        let blob_fetch_max_retries = env::var("PDS_SERVICE_BLOB_FETCH_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_blob_fetch_max_retries);
+
         // Arc 12 §5.4 Step 1.1 + 1.2: EntrywayConfig from
         // `PDS_ENTRYWAY_*` env vars, all-or-nothing.
         let entryway = EntrywayConfig::from_env_values(
@@ -1564,6 +1615,9 @@ impl ServerConfig {
                 version,
                 blob_upload_limit,
                 public_url: service_public_url,
+                max_blob_fetch_size,
+                blob_fetch_timeout_seconds,
+                blob_fetch_max_retries,
             },
             storage: StorageConfig {
                 data_directory,
