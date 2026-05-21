@@ -5,7 +5,6 @@ use crate::{
     context::AppContext,
     error::{PdsError, PdsResult},
     oauth::AtProtoScope,
-    repository::blob_refs::extract_blob_cids,
 };
 use axum::{
     extract::{Query, State},
@@ -265,15 +264,16 @@ async fn create_record(
         (*ctx.actor_store).clone(),
         ctx.sequencer.clone(),
         ctx.config.validation_mode,
-    );
+    )
+    .with_blob_store(ctx.blob_store.clone());
 
     // Create signer from repo key
     let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
 
-    // Extract blob references from the record before creation
-    let blob_cids = extract_blob_cids(&req.record);
-
-    // Create the record
+    // Create the record. Arc 16e §9.5.4 Step 2: blob refs are tracked
+    // inside `apply_writes` Phase B via the wired `blob_store` field
+    // rather than by this handler — see the `.with_blob_store(...)`
+    // builder call above.
     tracing::debug!("create_record: Calling repo_mgr.create_record");
     let (uri, cid, _rev) = repo_mgr
         .create_record(
@@ -288,18 +288,6 @@ async fn create_record(
             tracing::error!("create_record: Failed to create record: {}", e);
             e
         })?;
-
-    // Track blob references for this record
-    for blob_cid in &blob_cids {
-        if let Err(e) = ctx.blob_store.track_blob_reference(blob_cid, &uri).await {
-            tracing::warn!(
-                "create_record: Failed to track blob reference {}: {}",
-                blob_cid,
-                e
-            );
-            // Don't fail the request for tracking errors
-        }
-    }
 
     // Invalidate read-after-write cache for this user
     ctx.cache_invalidator.invalidate_did(auth_did).await;
@@ -345,34 +333,20 @@ async fn put_record(
         (*ctx.actor_store).clone(),
         ctx.sequencer.clone(),
         ctx.config.validation_mode,
-    );
+    )
+    .with_blob_store(ctx.blob_store.clone());
 
     // Create signer from repo key
     let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
 
-    // Extract blob references from the new record
-    let blob_cids = extract_blob_cids(&req.record);
-
-    // Update the record
+    // Update the record. Arc 16e §9.5.4 Step 2: blob-ref add/drop is
+    // computed in Phase B via `read_existing_refs` + set differences;
+    // see the `.with_blob_store(...)` builder call above.
     let (cid, _rev) = repo_mgr
         .update_record(&req.collection, &req.rkey, req.record, req.validate, signer)
         .await?;
 
     let uri = format!("at://{}/{}/{}", auth_did, req.collection, req.rkey);
-
-    // Remove old blob references and add new ones
-    if let Err(e) = ctx.blob_store.remove_record_blob_references(&uri).await {
-        tracing::warn!("put_record: Failed to remove old blob references: {}", e);
-    }
-    for blob_cid in &blob_cids {
-        if let Err(e) = ctx.blob_store.track_blob_reference(blob_cid, &uri).await {
-            tracing::warn!(
-                "put_record: Failed to track blob reference {}: {}",
-                blob_cid,
-                e
-            );
-        }
-    }
 
     // Invalidate read-after-write cache for this user
     ctx.cache_invalidator.invalidate_did(auth_did).await;
@@ -412,23 +386,18 @@ async fn delete_record(
         (*ctx.actor_store).clone(),
         ctx.sequencer.clone(),
         ctx.config.validation_mode,
-    );
+    )
+    .with_blob_store(ctx.blob_store.clone());
 
     // Create signer from repo key
     let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
 
-    // Build record URI for blob reference cleanup
-    let uri = format!("at://{}/{}/{}", auth_did, req.collection, req.rkey);
-
-    // Delete the record
+    // Delete the record. Arc 16e §9.5.4 Step 2: blob refs for the
+    // record are unreferenced in Phase B via the wired `blob_store`;
+    // see the `.with_blob_store(...)` builder call above.
     repo_mgr
         .delete_record(&req.collection, &req.rkey, signer)
         .await?;
-
-    // Remove blob references for this record
-    if let Err(e) = ctx.blob_store.remove_record_blob_references(&uri).await {
-        tracing::warn!("delete_record: Failed to remove blob references: {}", e);
-    }
 
     // Invalidate read-after-write cache for this user
     ctx.cache_invalidator.invalidate_did(auth_did).await;
@@ -651,7 +620,8 @@ async fn apply_writes(
         (*ctx.actor_store).clone(),
         ctx.sequencer.clone(),
         ctx.config.validation_mode,
-    );
+    )
+    .with_blob_store(ctx.blob_store.clone());
 
     // Prepare writes (converts to PreparedWrite format)
     let prepared = repo_mgr.prepare_writes(req.writes)?;

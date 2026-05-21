@@ -93,6 +93,14 @@ impl BlobStore {
         })
     }
 
+    /// Arc 16e §9.5.3.2.2 — expose the shared pool so callers needing
+    /// Phase B transactions (`RepositoryManager::apply_writes`) can
+    /// `tx = pool.begin()` against the same DB that owns
+    /// `blob_metadata` + `record_blob`.
+    pub fn pool(&self) -> &sqlx::AnyPool {
+        &self.db
+    }
+
     /// Arc 16b §9.2.3.2: emit the SQL row-lock clause appropriate
     /// for the backend. Postgres: `" FOR UPDATE"`; SQLite: empty
     /// (WAL writer-lock provides equivalent serialization per

@@ -1725,7 +1725,8 @@ async fn update_account_signing_key(
         req.did.clone(),
         (*ctx.actor_store).clone(),
         ctx.sequencer.clone(),
-    );
+    )
+    .with_blob_store(ctx.blob_store.clone());
     let repo_signer_pb: std::sync::Arc<dyn proto_blue::crypto::Signer> = {
         let key_bytes = hex::decode(&ctx.config.authentication.repo_signing_key).map_err(|e| {
             plain_err(
