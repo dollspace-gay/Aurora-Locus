@@ -4,8 +4,11 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use proto_blue::lex_data::Cid;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::blob_store::store::QuarantinePublicReason;
 
 /// Main error type for the PDS
 #[derive(Error, Debug)]
@@ -194,6 +197,93 @@ pub enum PdsError {
     /// to HTTP 400.
     #[error("Orphaned appeal: appeal {appeal_id} has no FK to moderation/report/quarantine")]
     OrphanedAppeal { appeal_id: i64 },
+
+    // ============================================================
+    // Arc 16f §9.6.3.6 + §9.6.1.1 — CAR-import error vocabulary
+    // (Aurora-owned tools.aurora.repo.importRepo namespace per
+    // Option B). All variants below are emitted by the importRepo
+    // handler + supporting primitives; the handler + fetch path
+    // land in Steps 2-3 of the Arc 16f impl plan.
+    // ============================================================
+
+    /// Internal control-flow signal: TOLERANT's `verify_blob_tolerant_or_signal`
+    /// returned `NeedsFetch` for one or more CIDs in a batch — the
+    /// caller-driven fetch-and-retry loop at §9.6.3.5 consumes this
+    /// and dispatches `fetch_blob_from_origin` for each CID before
+    /// re-attempting `apply_writes`. NEVER reaches the wire under
+    /// normal operation; if it does, surface as HTTP 500 defensively.
+    #[error("Phase B needs origin-fetch for {} blob(s)", cids.len())]
+    #[allow(dead_code)]
+    NeedsBlobFetch { cids: Vec<Cid> },
+
+    /// Arc 16f §9.6.3.6 — record body references a CID whose blob is
+    /// quarantined. Validate-phase at §9.6.3.1 step 5 catches the
+    /// common case before Phase A; this variant also fires from
+    /// TOLERANT's defense-in-depth Phase B check when quarantine
+    /// lands between validate-phase and Phase B. Mapped to HTTP 400.
+    /// Wire payload exposes coarse `public_reason` only; operator-
+    /// internal `blob_quarantine.reason` is NOT exposed (round-1 F20).
+    #[error("Imported record references quarantined blob: {cid}")]
+    #[allow(dead_code)]
+    QuarantinedBlobReferenced {
+        cid: Cid,
+        public_reason: QuarantinePublicReason,
+    },
+
+    /// Arc 16f §9.6.3.3 / §9.6.3.5 — origin PDS returned a durable
+    /// client-side failure for a blob fetch (4xx — typically 404 Not
+    /// Found or 403 Forbidden). No retry per §9.6.3.3 step 6 (durable
+    /// failures stay durable). Mapped to HTTP 502 Bad Gateway —
+    /// origin's response was the cause; Aurora-Locus is the
+    /// intermediary.
+    #[error("Origin PDS rejected blob fetch for {cid}: {status_or_reason}")]
+    #[allow(dead_code)]
+    OriginFetchClientError {
+        cid: Cid,
+        status_or_reason: String,
+    },
+
+    /// Arc 16f §9.6.3.5 — fetch-and-retry loop exhausted its retry
+    /// budget OR aggregated multiple per-CID failures within a single
+    /// retry round. `per_cid_failures` carries the full operator-
+    /// visible context per round-1 F18 closure. Mapped to HTTP 502
+    /// Bad Gateway — origin-side failure was the root cause.
+    #[error("Failed to fetch {} blob(s) from origin PDS", per_cid_failures.len())]
+    #[allow(dead_code)]
+    OriginFetchExhausted {
+        per_cid_failures: Vec<(Cid, String)>,
+    },
+
+    /// Arc 16f §9.6.3.1 step 4 — CAR commit-chain signature verification
+    /// failed against the importing DID's PLC-resolved signing key
+    /// history. Mapped to HTTP 400 — bad client input.
+    #[error("CAR commit-chain signature verification failed")]
+    #[allow(dead_code)]
+    InvalidCommitSignature,
+
+    /// Arc 16f §9.6.3.1 step 1 — importRepo handler invoked for a
+    /// DID that has no local actor (no prior createAccount).
+    /// Precursor account-setup required. Mapped to HTTP 400.
+    #[error("Actor not initialized; createAccount required before importRepo")]
+    #[allow(dead_code)]
+    ActorNotInitialized,
+
+    /// Arc 16f §9.6.3.3 step 4 — pre-fetch HEAD response indicates
+    /// the blob exceeds `service.max_blob_fetch_size`. Per round-1
+    /// F10 closure, reject before downloading the body to keep
+    /// per-blob memory bounded. Mapped to HTTP 413 Payload Too
+    /// Large.
+    #[error("Blob {cid} exceeds max_blob_fetch_size: {size} bytes")]
+    #[allow(dead_code)]
+    BlobTooLarge { cid: Cid, size: u64 },
+
+    /// Arc 16f §9.6.3.1 step 1 — importRepo single-flight handler
+    /// lock was contended (concurrent importRepo on the same
+    /// importing DID). Round-1 F6 closure: try-acquire + fail-fast
+    /// posture per §9.6.5.8. Mapped to HTTP 409 Conflict.
+    #[error("Concurrent mutation in progress for this repo")]
+    #[allow(dead_code)]
+    ConcurrentMutation,
 }
 
 /// Manual PartialEq implementation for PdsError
@@ -232,6 +322,30 @@ impl PartialEq for PdsError {
                 PdsError::OrphanedAppeal { appeal_id: a },
                 PdsError::OrphanedAppeal { appeal_id: b },
             ) => a == b,
+            // Arc 16f §9.6.3.6 + §9.6.1.1 — import error variants.
+            (
+                PdsError::NeedsBlobFetch { cids: a },
+                PdsError::NeedsBlobFetch { cids: b },
+            ) => a == b,
+            (
+                PdsError::QuarantinedBlobReferenced { cid: ac, public_reason: ap },
+                PdsError::QuarantinedBlobReferenced { cid: bc, public_reason: bp },
+            ) => ac == bc && ap == bp,
+            (
+                PdsError::OriginFetchClientError { cid: ac, status_or_reason: ar },
+                PdsError::OriginFetchClientError { cid: bc, status_or_reason: br },
+            ) => ac == bc && ar == br,
+            (
+                PdsError::OriginFetchExhausted { per_cid_failures: a },
+                PdsError::OriginFetchExhausted { per_cid_failures: b },
+            ) => a == b,
+            (PdsError::InvalidCommitSignature, PdsError::InvalidCommitSignature) => true,
+            (PdsError::ActorNotInitialized, PdsError::ActorNotInitialized) => true,
+            (
+                PdsError::BlobTooLarge { cid: ac, size: asz },
+                PdsError::BlobTooLarge { cid: bc, size: bsz },
+            ) => ac == bc && asz == bsz,
+            (PdsError::ConcurrentMutation, PdsError::ConcurrentMutation) => true,
             // Database and Io errors cannot be compared, so we use error message comparison
             (PdsError::Database(a), PdsError::Database(b)) => a.to_string() == b.to_string(),
             (PdsError::Io(a), PdsError::Io(b)) => a.to_string() == b.to_string(),
@@ -336,6 +450,72 @@ impl IntoResponse for PdsError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalServerError",
                 "Internal server error".to_string(), // Don't leak details
+            ),
+            // Arc 16f §9.6.3.6 — record body references quarantined blob.
+            // Wire shape per round-1 F20: `public_reason` exposes coarse
+            // class only; operator-internal detail (blob_quarantine.reason
+            // text) is NOT leaked.
+            PdsError::QuarantinedBlobReferenced { .. } => (
+                StatusCode::BAD_REQUEST,
+                "QuarantinedBlobReferenced",
+                self.to_string(),
+            ),
+            // Arc 16f §9.6.3.5 — fetch-and-retry loop exhausted retries
+            // OR aggregated multiple per-CID failures. Wire shape's full
+            // per_cid_failures payload lands when the Step 3 importRepo
+            // handler ships; for now the standard XrpcErrorResponse
+            // envelope carries the summary message.
+            PdsError::OriginFetchExhausted { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "OriginFetchExhausted",
+                self.to_string(),
+            ),
+            // Arc 16f §9.6.3.3 — origin PDS returned a durable client
+            // failure (typically 4xx) for a blob fetch. Aurora-Locus is
+            // the intermediary; the origin was the proximate cause.
+            PdsError::OriginFetchClientError { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "OriginFetchClientError",
+                self.to_string(),
+            ),
+            // Arc 16f §9.6.3.1 step 4 — commit-chain signature
+            // verification failed against importing DID's PLC-resolved
+            // signing key.
+            PdsError::InvalidCommitSignature => (
+                StatusCode::BAD_REQUEST,
+                "InvalidCommitSignature",
+                self.to_string(),
+            ),
+            // Arc 16f §9.6.3.1 step 1 — importRepo against a DID with
+            // no local actor; precursor createAccount required.
+            PdsError::ActorNotInitialized => (
+                StatusCode::BAD_REQUEST,
+                "ActorNotInitialized",
+                self.to_string(),
+            ),
+            // Arc 16f §9.6.3.3 step 4 — pre-fetch HEAD indicates blob
+            // exceeds max_blob_fetch_size; rejected without download.
+            PdsError::BlobTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "BlobTooLarge",
+                self.to_string(),
+            ),
+            // Arc 16f §9.6.3.1 step 1 — single-flight handler lock
+            // contended; try-acquire + fail-fast posture per §9.6.5.8.
+            PdsError::ConcurrentMutation => (
+                StatusCode::CONFLICT,
+                "ConcurrentMutation",
+                self.to_string(),
+            ),
+            // Arc 16f §9.6.3.5 — internal control-flow signal that
+            // SHOULD be consumed by the fetch-and-retry loop and never
+            // reach the wire. If it does, surface as 500 defensively so
+            // operators see the bug (likely a missing loop iteration in
+            // the caller).
+            PdsError::NeedsBlobFetch { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "Internal server error".to_string(),
             ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
