@@ -1743,7 +1743,11 @@ async fn update_account_signing_key(
         std::sync::Arc::new(s)
     };
     let (commit_cid, rev) = repo_mgr
-        .apply_writes(vec![], repo_signer_pb)
+        .apply_writes(
+            vec![],
+            repo_signer_pb,
+            std::sync::Arc::new(crate::blob_store::StrictPromoter),
+        )
         .await
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tracing::info!(

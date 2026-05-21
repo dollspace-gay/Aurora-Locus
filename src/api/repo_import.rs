@@ -332,15 +332,12 @@ async fn import_repo(
     let ctx_for_stage = ctx.clone();
     let outcome = import_with_fetch_retry(
         ctx.config.service.blob_fetch_max_retries,
-        // do_writes: today this returns whatever apply_writes returns
-        // (which under STRICT semantics never yields NeedsBlobFetch).
-        // Step 4's signature extension
-        // (`apply_writes(writes, signer, Arc<dyn BlobPromoter>)`) drops
-        // in here without changing the surrounding loop: replace the
-        // `apply_writes(writes, signer)` call below with
-        //     apply_writes(writes, signer, Arc::new(TolerantPromoter))
-        // and the loop's NeedsBlobFetch branch starts firing
-        // organically. See [skydeval]'s Step 3 sequencing note.
+        // do_writes: Arc 16f Step 4 flipped this from the v5
+        // `apply_writes(writes, signer)` call to the v5.1
+        // `apply_writes(writes, signer, Arc::new(TolerantPromoter))`
+        // form. TolerantPromoter signals NeedsBlobFetch on row-absent
+        // CIDs, which `import_with_fetch_retry` consumes via the
+        // already-tested NeedsBlobFetch branch.
         || {
             let writes = writes_for_loop.clone();
             let signer = signer_for_loop.clone();
@@ -351,7 +348,14 @@ async fn import_repo(
                 validation_mode_for_loop,
             )
             .with_blob_store(blob_store_for_loop.clone());
-            async move { mgr.apply_writes(writes, signer).await }
+            async move {
+                mgr.apply_writes(
+                    writes,
+                    signer,
+                    Arc::new(crate::blob_store::TolerantPromoter),
+                )
+                .await
+            }
         },
         // stage_one: fetch + stage + commit per-CID. Captures the
         // pooled client + blob store + DID; the trait shim

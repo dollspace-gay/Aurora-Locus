@@ -371,10 +371,20 @@ impl RepositoryManager {
     /// The `signer` produces ECDSA signatures over the unsigned commit
     /// payload — pass a `RepoSigner` wrapping the actor's repo-signing
     /// key.
+    ///
+    /// Arc 16e v5.1 (Arc 16f Step 4 §9.6.3.4): the `promoter`
+    /// parameter selects the Phase B per-CID promotion discipline.
+    /// Every Arc 16e caller (createRecord / putRecord / deleteRecord
+    /// / applyWrites / admin key rotation / CLI key rotation) passes
+    /// [`StrictPromoter`], preserving Arc 16e v5 behavior verbatim.
+    /// The Arc 16f importRepo handler passes [`TolerantPromoter`],
+    /// which signals `NeedsFetch` on row-absent CIDs for the
+    /// caller-driven fetch-and-retry loop per §9.6.3.5.
     pub async fn apply_writes(
         &self,
         writes: Vec<WriteOp>,
         signer: Arc<dyn Signer>,
+        promoter: Arc<dyn crate::blob_store::BlobPromoter>,
     ) -> PdsResult<(String, String)> {
         // ATProto spec: max 200 writes per commit.
         if writes.len() > 200 {
@@ -591,7 +601,7 @@ impl RepositoryManager {
         // `.with_blob_store(...)` to opt in; tests that don't exercise
         // blob refs leave `blob_store` as `None` and skip Phase B.
         if let Some(blob_store) = &self.blob_store {
-            self.run_phase_b(&prepared, blob_store).await?;
+            self.run_phase_b(&prepared, blob_store, promoter.as_ref()).await?;
         }
 
         // Build the firehose CAR (commit block + new MST nodes + new record blocks).
@@ -639,10 +649,18 @@ impl RepositoryManager {
     /// every `unreference_blob` call so a single batch's TTL anchors
     /// are coherent). On error, emit the forensic ERROR log + flush
     /// stdout before returning so journald has a recovery anchor.
+    ///
+    /// Arc 16e v5.1 (Arc 16f Step 4 §9.6.3.4): the STRICT inner call
+    /// goes through the `promoter` indirection so the import path
+    /// (TolerantPromoter) can signal `NeedsFetch` for the caller's
+    /// fetch-and-retry loop. StrictPromoter delegates to the same
+    /// `verify_blob_and_make_permanent` call this loop used in v5,
+    /// preserving Arc 16e regression coverage.
     async fn run_phase_b(
         &self,
         prepared: &[PreparedRecord],
         blob_store: &Arc<BlobStore>,
+        promoter: &dyn crate::blob_store::BlobPromoter,
     ) -> PdsResult<()> {
         use std::io::Write as _;
 
@@ -738,17 +756,66 @@ impl RepositoryManager {
         // the same CID (§9.5.3.2.4). `touch_set` is a `BTreeSet`, so
         // iteration order is the proto-blue `Cid` `Ord` derivation
         // (byte-lex on the binary form) — deterministic.
+        //
+        // Arc 16e v5.1 (Arc 16f Step 4 §9.6.3.4 — round-1 F8 closure):
+        // promoter.promote() may signal `NeedsFetch` (TolerantPromoter
+        // only). Collect all such CIDs across the batch into a
+        // BTreeSet (natural dedupe) and surface as `NeedsBlobFetch`
+        // AFTER draining — do not short-circuit on the first
+        // NeedsFetch. The tx is implicitly rolled back when dropped
+        // unrcommitted via the early return.
+        let mut needs_fetch_cids: BTreeSet<Cid> = BTreeSet::new();
         for cid in &touch_set {
             let cid_str = cid.to_string();
-            // STRICT first: drain every record's strict set for this CID.
+            // STRICT/TOLERANT promote phase: drain every record's
+            // strict set for this CID.
             for plan in &per_record_plan {
                 if plan.strict.contains(cid) {
-                    if let Err(e) = blob_store
-                        .verify_blob_and_make_permanent(&mut tx, &cid_str, &plan.uri, now)
+                    match promoter
+                        .promote(blob_store, &mut tx, cid, &plan.uri, now)
                         .await
                     {
-                        Self::log_phase_b_failed(&self.did, &cid_str, &plan.uri, "STRICT", &e);
-                        return Err(e);
+                        Ok(crate::blob_store::PromoteOutcome::Done) => {}
+                        Ok(crate::blob_store::PromoteOutcome::NeedsFetch { cid: needed }) => {
+                            // Accumulate; keep draining the rest of
+                            // the batch so every NeedsFetch CID
+                            // surfaces in one round (round-1 F8).
+                            needs_fetch_cids.insert(needed);
+                        }
+                        Ok(crate::blob_store::PromoteOutcome::Quarantined {
+                            cid: q_cid,
+                            public_reason,
+                        }) => {
+                            // Defense-in-depth: validate-phase
+                            // quarantine check at §9.6.3.1 step 5
+                            // catches the common case before Phase A.
+                            // This fires only if quarantine landed
+                            // between validate and Phase B. Fast-fail
+                            // (no collect-all); roll tx back via the
+                            // early return.
+                            let err = PdsError::QuarantinedBlobReferenced {
+                                cid: q_cid,
+                                public_reason,
+                            };
+                            Self::log_phase_b_failed(
+                                &self.did,
+                                &cid_str,
+                                &plan.uri,
+                                "STRICT",
+                                &err,
+                            );
+                            return Err(err);
+                        }
+                        Err(e) => {
+                            Self::log_phase_b_failed(
+                                &self.did,
+                                &cid_str,
+                                &plan.uri,
+                                "STRICT",
+                                &e,
+                            );
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -780,6 +847,17 @@ impl RepositoryManager {
                     }
                 }
             }
+        }
+
+        // Round-1 F8 closure: if TolerantPromoter signalled any
+        // NeedsFetch CIDs during the inner loop, roll back tx and
+        // surface the full set so the caller's fetch-and-retry loop
+        // (§9.6.3.5) can drain them in one round. The early return
+        // here drops `tx` without `commit()` — sqlx rolls back on
+        // Drop.
+        if !needs_fetch_cids.is_empty() {
+            let cids: Vec<Cid> = needs_fetch_cids.into_iter().collect();
+            return Err(PdsError::NeedsBlobFetch { cids });
         }
 
         tx.commit().await.map_err(PdsError::Database)?;
@@ -894,7 +972,9 @@ impl RepositoryManager {
             swap_cid: None,
         }];
 
-        let (commit_cid, rev) = self.apply_writes(writes, signer).await?;
+        let (commit_cid, rev) = self
+            .apply_writes(writes, signer, Arc::new(crate::blob_store::StrictPromoter))
+            .await?;
         let uri = format!("at://{}/{}/{}", self.did, collection, rkey);
         Ok((uri, commit_cid, rev))
     }
@@ -917,7 +997,7 @@ impl RepositoryManager {
             swap_cid: None,
         }];
 
-        self.apply_writes(writes, signer).await
+        self.apply_writes(writes, signer, Arc::new(crate::blob_store::StrictPromoter)).await
     }
 
     /// Delete a record
@@ -936,7 +1016,7 @@ impl RepositoryManager {
             swap_cid: None,
         }];
 
-        self.apply_writes(writes, signer).await
+        self.apply_writes(writes, signer, Arc::new(crate::blob_store::StrictPromoter)).await
     }
 
     /// Get a record by AT-URI
@@ -1230,7 +1310,7 @@ impl RepositoryManager {
             })
             .collect();
 
-        self.apply_writes(ops, signer).await
+        self.apply_writes(ops, signer, Arc::new(crate::blob_store::StrictPromoter)).await
     }
 }
 
@@ -1336,7 +1416,7 @@ mod tests {
             },
         ];
 
-        let result = repo_mgr.apply_writes(writes, test_signer()).await;
+        let result = repo_mgr.apply_writes(writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter)).await;
         assert!(result.is_ok(), "apply_writes failed: {:?}", result.err());
     }
 
@@ -1386,6 +1466,30 @@ mod tests {
                 record_uri TEXT NOT NULL,
                 indexed_at TEXT NOT NULL,
                 PRIMARY KEY (blob_cid, record_uri)
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Arc 16f §9.6.3.2 — TOLERANT helper does a quarantine-first
+        // check (`SELECT reason FROM blob_quarantine WHERE cid = $1
+        // AND restored_at IS NULL`). The TolerantPromoter tests
+        // below (and any production Phase B that uses TOLERANT) need
+        // this table to exist even if it's empty. Schema mirrors
+        // `src/blob_store/store.rs::arc16f_store_with_quarantine`
+        // and the production migration.
+        sqlx::query(
+            r#"CREATE TABLE blob_quarantine (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cid TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                details TEXT,
+                quarantined_by TEXT NOT NULL,
+                quarantined_at TEXT NOT NULL,
+                restored_at TEXT,
+                restored_by TEXT,
+                legal_reference TEXT
             )"#,
         )
         .execute(&pool)
@@ -1508,7 +1612,7 @@ mod tests {
             swap_cid: None,
         }];
         repo_mgr
-            .apply_writes(writes, test_signer())
+            .apply_writes(writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
             .await
             .expect("apply_writes with blob_store wired");
 
@@ -1561,7 +1665,7 @@ mod tests {
             swap_cid: None,
         }];
         unwired_mgr
-            .apply_writes(writes, test_signer())
+            .apply_writes(writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
             .await
             .expect("apply_writes succeeds even without blob_store wired");
 
@@ -1606,7 +1710,7 @@ mod tests {
             swap_cid: None,
         }];
         let err = repo_mgr
-            .apply_writes(writes, test_signer())
+            .apply_writes(writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
             .await
             .expect_err("malformed CID must reject");
         assert!(
@@ -1699,7 +1803,7 @@ mod tests {
             },
         ];
         repo_mgr
-            .apply_writes(seed_writes, test_signer())
+            .apply_writes(seed_writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
             .await
             .expect("seed batch");
 
@@ -1755,7 +1859,7 @@ mod tests {
             },
         ];
         repo_mgr
-            .apply_writes(test_writes, test_signer())
+            .apply_writes(test_writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
             .await
             .expect("4-record test batch");
 
@@ -1785,5 +1889,140 @@ mod tests {
             Some("1".to_string()),
             "Y re-untethered after LastRefDropped"
         );
+    }
+
+    // ── Arc 16e v5.1 (Arc 16f Step 4 §9.6.3.4) — promoter swap ──
+
+    /// Arc 16f Step 4 §9.6.3.4 — the load-bearing TolerantPromoter
+    /// path through REAL `apply_writes` (Step 3's loop tests cover
+    /// the loop machinery with mock closures; this test covers the
+    /// promoter wiring through actual Phase B).
+    ///
+    /// A record body references an absent blob CID. With
+    /// `TolerantPromoter`, `apply_writes` MUST return
+    /// `Err(PdsError::NeedsBlobFetch { cids })` so the importRepo
+    /// fetch-and-retry loop can drain it. Verifies the round-1 F8
+    /// closure: collect-all-NeedsFetch + roll-back-tx-on-exit
+    /// behavior in `run_phase_b`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_writes_with_tolerant_promoter_signals_needs_blob_fetch_on_absent_row() {
+        let (repo_mgr, _bs, pool, _tmp, did) = test_repo_mgr_with_blob_store().await;
+        // Absent CID — no blob_metadata row staged.
+        let absent_cid = Cid::for_raw(b"step4-tolerant-absent-blob");
+        let absent_cid_str = absent_cid.to_string_base32();
+
+        // Sanity check: row truly absent.
+        let pre = sqlx::query("SELECT COUNT(*) AS c FROM blob_metadata WHERE cid = $1")
+            .bind(&absent_cid_str)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        use sqlx::Row;
+        assert_eq!(pre.try_get::<i64, _>("c").unwrap(), 0, "absent blob row");
+
+        let writes = vec![WriteOp {
+            action: WriteOpAction::Create,
+            collection: "app.bsky.actor.profile".to_string(),
+            rkey: "self".to_string(),
+            value: Some(serde_json::json!({
+                "$type": "app.bsky.actor.profile",
+                "avatar": blob_value(&absent_cid),
+            })),
+            validate: None,
+            swap_cid: None,
+        }];
+        let result = repo_mgr
+            .apply_writes(
+                writes,
+                test_signer(),
+                std::sync::Arc::new(crate::blob_store::TolerantPromoter),
+            )
+            .await;
+        match result {
+            Err(PdsError::NeedsBlobFetch { cids }) => {
+                assert_eq!(cids.len(), 1, "exactly one absent CID");
+                assert_eq!(
+                    cids[0].to_string_base32(),
+                    absent_cid_str,
+                    "the absent CID is the one Phase B signalled"
+                );
+            }
+            other => panic!(
+                "expected NeedsBlobFetch with one CID, got {:?}",
+                other
+            ),
+        }
+
+        // Round-1 F8 rollback: blob_metadata row STILL absent and
+        // record_blob STILL empty — the tx rolled back when the
+        // function returned NeedsBlobFetch.
+        let post = sqlx::query("SELECT COUNT(*) AS c FROM blob_metadata WHERE cid = $1")
+            .bind(&absent_cid_str)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(post.try_get::<i64, _>("c").unwrap(), 0, "row stays absent");
+        assert_eq!(
+            read_record_blob_count_for_cid(&pool, &absent_cid_str).await,
+            0,
+            "no record_blob row written"
+        );
+    }
+
+    /// Arc 16f Step 4 §9.6.3.4 — promoter asymmetry invariant.
+    ///
+    /// `StrictPromoter` never returns `NeedsFetch` or `Quarantined`;
+    /// it errors via `PdsError::BlobNotFound` on the same absent-row
+    /// state where `TolerantPromoter` would signal `NeedsFetch`.
+    /// This proves the discipline split: import-path callers get
+    /// the fetch signal; record-write-path callers get the
+    /// client-input-bug error. Same input → different outcome class.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_writes_with_strict_promoter_errors_blob_not_found_on_absent_row() {
+        let (repo_mgr, _bs, _pool, _tmp, did) = test_repo_mgr_with_blob_store().await;
+        let _ = did;
+        let absent_cid = Cid::for_raw(b"step4-strict-absent-blob");
+
+        let writes = vec![WriteOp {
+            action: WriteOpAction::Create,
+            collection: "app.bsky.actor.profile".to_string(),
+            rkey: "self".to_string(),
+            value: Some(serde_json::json!({
+                "$type": "app.bsky.actor.profile",
+                "avatar": blob_value(&absent_cid),
+            })),
+            validate: None,
+            swap_cid: None,
+        }];
+        let result = repo_mgr
+            .apply_writes(
+                writes,
+                test_signer(),
+                std::sync::Arc::new(crate::blob_store::StrictPromoter),
+            )
+            .await;
+        match result {
+            Err(PdsError::BlobNotFound(msg)) => {
+                assert!(
+                    msg.contains(&absent_cid.to_string_base32()) || msg.contains(&absent_cid.to_string()),
+                    "BlobNotFound should mention the absent CID: {}",
+                    msg
+                );
+            }
+            Err(PdsError::NeedsBlobFetch { .. }) => {
+                panic!(
+                    "StrictPromoter must NOT return NeedsBlobFetch — discipline asymmetry invariant violated"
+                );
+            }
+            Err(PdsError::QuarantinedBlobReferenced { .. }) => {
+                panic!(
+                    "StrictPromoter must NOT return QuarantinedBlobReferenced via PromoteOutcome — invariant violated"
+                );
+            }
+            other => panic!(
+                "expected BlobNotFound, got {:?} (StrictPromoter discipline asymmetry)",
+                other
+            ),
+        }
     }
 }
