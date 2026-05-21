@@ -207,7 +207,38 @@ fn create_repo_signer(
     Ok(std::sync::Arc::new(signer))
 }
 
-/// Create a new record
+/// Create a new record (`com.atproto.repo.createRecord`).
+///
+/// Writes a record to the actor's repo and reconciles blob references
+/// in Phase B. Aurora-Locus's lexicons-as-Rust-types convention means
+/// the wire contract for this endpoint is this handler's signature
+/// (request / response shapes from [`CreateRecordRequest`] /
+/// [`CreateRecordResponse`]) plus the error set below.
+///
+/// # Errors
+///
+/// Returns `PdsError` mapped to one of the following wire-error codes
+/// (see [`crate::error::PdsError`]'s `IntoResponse` for the full
+/// HTTP-status mapping):
+///
+/// - `AuthRequired` (401) — caller is unauthenticated.
+/// - `InsufficientScope` / `Forbidden` (403) — OAuth scope check
+///   against `AtProtoScope::RepoCreate` failed, or the request's
+///   `repo` field disagrees with the authenticated DID.
+/// - `RateLimitExceeded` (429) — cross-PDS rate limiter rejected the
+///   request.
+/// - `InvalidCid` (400) — Arc 16e §9.5.3.5: validate-phase walker
+///   ([`extract_blob_cids`](crate::repository::blob_refs::extract_blob_cids))
+///   found a malformed or non-DASL CID in a blob ref in the record
+///   body. No state mutation occurs (rejection is before Phase A).
+/// - `BlobNotFound` (400) — Arc 16e §9.5.3.5: Phase B STRICT could
+///   not find a referenced blob's `blob_metadata` row. Per R0c.A
+///   spec pin, the wire shape matches bsky-PDS at
+///   `packages/pds/src/actor-store/blob/transactor.ts:259-260`.
+/// - `Validation` (400) — record-body size limit, lexicon validation,
+///   or swap-CID mismatch.
+/// - `Database` / `Internal` (500) — sqlx or proto-blue commit
+///   failures.
 async fn create_record(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -301,7 +332,33 @@ async fn create_record(
     Ok(Json(CreateRecordResponse { uri, cid }))
 }
 
-/// Update an existing record (or create if doesn't exist)
+/// Update an existing record, or create if it doesn't exist
+/// (`com.atproto.repo.putRecord`).
+///
+/// Per-record Phase B computes the existing-refs / new-refs
+/// difference: added CIDs go through STRICT; dropped CIDs go through
+/// `unreference_blob`. Wire contract = this handler's signature
+/// (request / response shapes from [`PutRecordRequest`] /
+/// [`PutRecordResponse`]) plus the error set below.
+///
+/// # Errors
+///
+/// - `AuthRequired` (401) — caller is unauthenticated.
+/// - `InsufficientScope` / `Forbidden` (403) — OAuth scope check
+///   against `AtProtoScope::RepoUpdate` failed, or `repo` disagrees
+///   with the authenticated DID.
+/// - `RateLimitExceeded` (429) — cross-PDS rate limiter rejected.
+/// - `InvalidCid` (400) — Arc 16e §9.5.3.5: validate-phase walker
+///   found a malformed or non-DASL CID in a blob ref in the new
+///   record body. No state mutation (rejection is before Phase A).
+/// - `BlobNotFound` (400) — Arc 16e §9.5.3.5: Phase B STRICT could
+///   not find a newly-referenced blob's `blob_metadata` row.
+/// - `Validation` (400) — record-body size, lexicon validation, or
+///   swap-CID mismatch.
+/// - `NotFound` (404) — swap-CID supplied for a record that does
+///   not exist.
+/// - `Database` / `Internal` (500) — sqlx or proto-blue commit
+///   failures.
 async fn put_record(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -354,7 +411,30 @@ async fn put_record(
     Ok(Json(PutRecordResponse { uri, cid }))
 }
 
-/// Delete a record
+/// Delete a record (`com.atproto.repo.deleteRecord`).
+///
+/// Per-record Phase B reads the existing refs and runs
+/// `unreference_blob` for each. Delete records carry no new CIDs, so
+/// neither `InvalidCid` nor `BlobNotFound` surface from the
+/// Arc 16e wiring on this path (`unreference_blob`'s six-variant
+/// `UnreferenceOutcome` is log-and-continue, never an error
+/// propagation). Wire contract = this handler's signature
+/// (request shape from [`DeleteRecordRequest`]) plus the error set
+/// below.
+///
+/// # Errors
+///
+/// - `AuthRequired` (401) — caller is unauthenticated.
+/// - `InsufficientScope` / `Forbidden` (403) — OAuth scope check
+///   against `AtProtoScope::RepoDelete` failed, or `repo` disagrees
+///   with the authenticated DID.
+/// - `RateLimitExceeded` (429) — cross-PDS rate limiter rejected.
+/// - `Validation` (400) — swap-CID mismatch.
+/// - `NotFound` (404) — swap-CID supplied for a record that does
+///   not exist, or delete of a non-existent record (depending on
+///   the underlying store's contract).
+/// - `Database` / `Internal` (500) — sqlx or proto-blue commit
+///   failures.
 async fn delete_record(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -581,13 +661,40 @@ async fn describe_repo(
     }))
 }
 
-/// Apply writes (batch operations with validation)
+/// Apply a batch of writes (`com.atproto.repo.applyWrites`).
 ///
-/// Performs atomic batch operations with:
-/// - Full validation of all operations before execution
-/// - Duplicate detection
-/// - Size limit enforcement
-/// - All-or-nothing atomicity
+/// Performs atomic batch operations with full validation of all
+/// operations before execution, duplicate detection, size limit
+/// enforcement, and all-or-nothing atomicity. Arc 16e §9.5.3.2.0
+/// gives this endpoint the same validate-phase walker as the single-
+/// record write handlers: a malformed CID anywhere in the batch
+/// rejects the WHOLE batch before Phase A opens, so partial state
+/// mutation is structurally impossible.
+///
+/// Wire contract = this handler's signature (request shape from
+/// [`ApplyWritesRequest`]) plus the error set below.
+///
+/// # Errors
+///
+/// - `AuthRequired` (401) — caller is unauthenticated.
+/// - `InsufficientScope` / `Forbidden` (403) — OAuth scope check
+///   against `AtProtoScope::RepoAll` failed, or `repo` disagrees
+///   with the authenticated DID.
+/// - `RateLimitExceeded` (429) — cross-PDS rate limiter rejected.
+/// - `InvalidCid` (400) — Arc 16e §9.5.3.5: validate-phase walker
+///   found a malformed or non-DASL CID in a blob ref in any
+///   Create/Update record body in the batch. Aborts the whole
+///   batch with zero state mutation.
+/// - `BlobNotFound` (400) — Arc 16e §9.5.3.5: Phase B STRICT could
+///   not find a referenced blob's `blob_metadata` row for any
+///   Create/Update in the batch.
+/// - `Validation` (400) — batch size limit (>200 ops), duplicate
+///   operations, record size, lexicon validation, swap-CID
+///   mismatch, or per-op shape errors.
+/// - `NotFound` (404) — swap-CID supplied for a record that does
+///   not exist.
+/// - `Database` / `Internal` (500) — sqlx or proto-blue commit
+///   failures.
 async fn apply_writes(
     State(ctx): State<AppContext>,
     headers: HeaderMap,

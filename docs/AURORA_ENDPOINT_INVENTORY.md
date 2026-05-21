@@ -185,6 +185,36 @@ endpoints (listAccounts with broader filters, getInstanceMetrics).
 
 ---
 
+## com.atproto.repo.* (record-write surface — error contracts)
+
+Scope: the four record-write endpoints whose wire-error contracts
+were updated by Arc 16e §9.5.4 Step 3.8. Per the lexicons-as-Rust-
+types convention noted at the top of this file, the full request /
+response shapes live in the handler signatures at
+[src/api/repo.rs](../src/api/repo.rs); the table below enumerates
+the wire-error codes each handler can emit so the contract is
+discoverable from the endpoint surface without grep-tracing
+[`PdsError`](../src/error.rs)'s `IntoResponse` mapping.
+
+The Arc 16e additions on the write paths are `InvalidCid` (400 —
+validate-phase walker rejection) and `BlobNotFound` (400 — Phase B
+STRICT-missing-row); both are wire-pinned per V05_DESIGN.md
+§9.5.3.5 R0c.A to match bsky-PDS verbatim.
+
+Other `com.atproto.repo.*` endpoints (`getRecord`, `listRecords`,
+`describeRepo`, `listMissingBlobs`) are read-side and not in
+Arc 16e's scope; they can be added incrementally to this section
+as their error contracts get audited.
+
+| NSID | Type | Auth scope | Wire-error codes (HTTP status) |
+|---|---|---|---|
+| com.atproto.repo.createRecord | procedure | `RepoCreate` | `AuthRequired` (401), `InsufficientScope` / `Forbidden` (403), `RateLimitExceeded` (429), `InvalidCid` (400), `BlobNotFound` (400), `Validation` (400), `Database` / `Internal` (500) |
+| com.atproto.repo.putRecord | procedure | `RepoUpdate` | createRecord's set + `NotFound` (404, swap-CID against missing record) |
+| com.atproto.repo.deleteRecord | procedure | `RepoDelete` | `AuthRequired` (401), `InsufficientScope` / `Forbidden` (403), `RateLimitExceeded` (429), `Validation` (400, swap-CID mismatch), `NotFound` (404), `Database` / `Internal` (500). Phase B's `unreference_blob` six-variant `UnreferenceOutcome` is log-and-continue, so no Arc 16e-introduced error surfaces on this path. |
+| com.atproto.repo.applyWrites | procedure | `RepoAll` | putRecord's set + `Validation` (400) covers batch size limit (>200 ops) and duplicate-op detection. A malformed CID anywhere in the batch aborts the whole batch before Phase A opens — partial state mutation is structurally impossible. |
+
+---
+
 ## Discrepancies
 
 1. **com.atproto.admin.* count higher than the upstream baseline**

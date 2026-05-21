@@ -314,6 +314,12 @@ docker run -d \
 
 ### Systemd Service
 
+For v0.5 the forensic-recovery procedure (Option A failures from
+`apply_writes` Phase B) assumes a local-journald deployment. See
+[`docs/operator/deployment-posture.md`](docs/operator/deployment-posture.md)
+for the operator forensic procedure and the v0.6+ scope for
+container deployments.
+
 ```ini
 [Unit]
 Description=Aurora Locus PDS
