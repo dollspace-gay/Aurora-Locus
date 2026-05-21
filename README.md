@@ -314,11 +314,14 @@ docker run -d \
 
 ### Systemd Service
 
-For v0.5 the forensic-recovery procedure (Option A failures from
-`apply_writes` Phase B) assumes a local-journald deployment. See
+Docker / k8s / systemd are all supported runtimes for v0.5. The one
+configuration v0.5 ships a *verified* forensic-recovery runbook for
+(Option A failures from `apply_writes` Phase B) is systemd + local
+journald — other sinks can host the same recovery procedure but
+v0.5 doesn't verify those adaptations. See
 [`docs/operator/deployment-posture.md`](docs/operator/deployment-posture.md)
-for the operator forensic procedure and the v0.6+ scope for
-container deployments.
+for the verified runbook and the v0.6+ scope for non-journald
+recovery procedures.
 
 ```ini
 [Unit]
