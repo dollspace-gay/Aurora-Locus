@@ -36,3 +36,5 @@ __pycache__/
 # Working design docs (per-cycle, local-only artifacts)
 docs/*_DESIGN.md
 docs/internal
+phase-b/data-*/
+phase-b/*.sh
