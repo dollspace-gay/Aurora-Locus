@@ -18,6 +18,7 @@ fn parse_timestamp(s: &str) -> PdsResult<DateTime<Utc>> {
         .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))
 }
 use image::ImageFormat;
+use proto_blue::lex_data::Cid;
 use sqlx::{AnyPool, Row};
 use std::sync::Arc;
 use tokio::fs;
@@ -1204,6 +1205,110 @@ impl BlobStore {
             .and_then(|r| r.try_get::<Option<String>, _>("temp_key").ok().flatten())
             .is_some())
     }
+
+    /// Arc 16f §9.6.3.2 — TOLERANT promotion sibling to Arc 16b's STRICT
+    /// `verify_blob_and_make_permanent`. Used by the CAR-import flow
+    /// (Path B per V05_DESIGN.md §9.6 header): blob_metadata row may
+    /// be absent because the importing repo's blobs haven't been
+    /// re-fetched from origin yet, so a missing row signals
+    /// `NeedsFetch` to the caller rather than erroring like STRICT.
+    ///
+    /// Quarantine-first ordering (closes round-1 F3): the
+    /// `blob_quarantine` check fires BEFORE the `blob_metadata` lookup
+    /// so a quarantined CID rejects atomically even if a stray row
+    /// exists. Validate-phase at §9.6.3.1 step 5 catches the common
+    /// case before Phase A opens; this variant is defense-in-depth
+    /// for quarantine landing between validate-phase and Phase B
+    /// (window bounded by Arc 16b row-lock discipline per §9.6.5.5).
+    ///
+    /// Present-row branches DELEGATE to Arc 16b's
+    /// `verify_blob_and_make_permanent` (closes round-1 F15 — no
+    /// duplication of the present-row state machine). Arc 16b's four
+    /// locked helpers stay byte-identical.
+    ///
+    /// `cid: &Cid` uses the proto-blue typed form per §9.6.3.2
+    /// signature spec; conversion to `&str` for the SQL binding +
+    /// STRICT delegation happens internally.
+    pub async fn verify_blob_tolerant_or_signal<'tx>(
+        &self,
+        tx: &mut sqlx::Transaction<'tx, sqlx::Any>,
+        cid: &Cid,
+        record_uri: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> PdsResult<TolerantOutcome> {
+        let cid_str = cid.to_string();
+
+        // 1. Quarantine check (no FOR UPDATE — quarantine writes are
+        //    serialized by Arc 16b's own row-lock discipline, so this
+        //    read can be lock-free per §9.6.3.2 step 1).
+        //    `restored_at IS NULL` matches the active-quarantine
+        //    semantic from src/blob_store/quarantine.rs::is_quarantined.
+        let q_row = sqlx::query(
+            "SELECT reason FROM blob_quarantine \
+             WHERE cid = $1 AND restored_at IS NULL \
+             LIMIT 1",
+        )
+        .bind(&cid_str)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(PdsError::Database)?;
+        if let Some(row) = q_row {
+            let reason_str: String =
+                row.try_get("reason").map_err(PdsError::Database)?;
+            return Ok(TolerantOutcome::Quarantined {
+                cid: cid.clone(),
+                public_reason: QuarantinePublicReason::from_internal_reason_str(&reason_str),
+            });
+        }
+
+        // 2. `SELECT temp_key FROM blob_metadata WHERE cid = $1 FOR UPDATE`
+        //    (FOR UPDATE conditional on backend via Arc 16b's shared
+        //    `for_update_clause` — Postgres locks the row, SQLite WAL
+        //    relies on writer serialization per §9.2.3.2).
+        let sql = format!(
+            "SELECT temp_key FROM blob_metadata WHERE cid = $1{}",
+            self.for_update_clause()
+        );
+        let row = sqlx::query(&sql)
+            .bind(&cid_str)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(PdsError::Database)?;
+
+        // 3. Row absent → caller must fetch + retry. NO state mutation.
+        let row = match row {
+            Some(r) => r,
+            None => return Ok(TolerantOutcome::NeedsFetch { cid: cid.clone() }),
+        };
+
+        // 4. Row present (any temp_key state) → DELEGATE to Arc 16b's
+        //    STRICT. Map the outcome based on the pre-delegation
+        //    temp_key state we already read above.
+        let temp_key_state: Option<String> =
+            row.try_get("temp_key").map_err(PdsError::Database)?;
+        match self
+            .verify_blob_and_make_permanent(tx, &cid_str, record_uri, now)
+            .await
+        {
+            Ok(()) => Ok(match temp_key_state {
+                Some(_) => TolerantOutcome::Promoted,
+                None => TolerantOutcome::AlreadyPermanent,
+            }),
+            Err(PdsError::BlobNotFound(_)) => {
+                // We just confirmed the row was present (step 2). If
+                // STRICT's own row-lookup reports BlobNotFound, the row
+                // was concurrently deleted in the window between our
+                // SELECT and STRICT's. Narrow enough to be a real bug if
+                // it fires — surface as Internal so an operator sees it.
+                Err(PdsError::Internal(format!(
+                    "verify_blob_tolerant_or_signal: blob_metadata row {} \
+                     disappeared between TOLERANT SELECT and STRICT delegation",
+                    cid_str
+                )))
+            }
+            Err(other) => Err(other),
+        }
+    }
 }
 
 /// Arc 16b §9.2.3.2 — outcome of `unreference_blob`. Six variants
@@ -1243,6 +1348,119 @@ pub enum UnreferenceOutcome {
     /// today (Arc 16c integration discipline + v0.6+ FK hardening
     /// would close those gaps). Caller SHOULD log at ERROR.
     OrphanedRef,
+}
+
+/// Arc 16f §9.6.3.2 — outcome of [`BlobStore::verify_blob_tolerant_or_signal`].
+/// TOLERANT extends Arc 16b's STRICT vocabulary with `NeedsFetch`
+/// (caller-driven origin re-fetch per Path B) and `Quarantined`
+/// (defense-in-depth for quarantine landing between validate-phase
+/// and Phase B).
+///
+/// `Promoted` vs `AlreadyPermanent` carry no payload because the
+/// caller already has the `(cid, record_uri)` pair; the distinction
+/// is for logging + diagnosis only.
+#[derive(Debug, Clone)]
+pub enum TolerantOutcome {
+    /// `blob_metadata` row absent → caller must fetch the blob bytes
+    /// from origin PDS and retry. NO state mutation. Path B's
+    /// fetch-and-retry loop at §9.6.3.5 consumes this signal.
+    NeedsFetch { cid: Cid },
+
+    /// `blob_metadata` row was present with `temp_key NOT NULL` →
+    /// STRICT delegation flipped temp_key to NULL and inserted the
+    /// `record_blob` row. Normal-path import promotion.
+    Promoted,
+
+    /// `blob_metadata` row was already permanent (`temp_key NULL`)
+    /// → STRICT delegation no-op'd the UPDATE and inserted the
+    /// `record_blob` row idempotently. Common for re-import of
+    /// previously-imported repos.
+    AlreadyPermanent,
+
+    /// `blob_quarantine` entry exists for the CID at TOLERANT call
+    /// time. NO state mutation. Defense-in-depth — §9.6.3.1 step 5
+    /// catches the common case before Phase A opens; this variant
+    /// fires only if quarantine landed between validate-phase and
+    /// Phase B (window bounded by Arc 16b row-lock discipline per
+    /// §9.6.5.5).
+    Quarantined {
+        cid: Cid,
+        public_reason: QuarantinePublicReason,
+    },
+}
+
+/// Arc 16f §9.6.3.6 — coarse public class for quarantine reasons,
+/// exposed on the wire as the `public_reason` field. Closes round-1
+/// F20: operator-internal detail (e.g. `"matched signature
+/// SHA256:..."`) MUST NOT leak to clients; clients see only the
+/// coarse class.
+///
+/// Distinct from [`crate::blob_store::quarantine::QuarantineReason`]
+/// (the operator-internal enum stored as text in
+/// `blob_quarantine.reason`). Mapping from internal-reason-string to
+/// coarse public class lives in [`Self::from_internal_reason_str`];
+/// operator-configurable mapping is a v0.6+ candidate per §9.6.7.
+///
+/// Note on naming divergence from V05_DESIGN.md §9.6.3.6 pseudocode
+/// (skydeval review for Step 2/3 prompts): the design spec named this
+/// enum `QuarantineReason`, but that name is already taken by the
+/// operator-internal enum at `src/blob_store/quarantine.rs:18`. This
+/// type is named `QuarantinePublicReason` to coexist without collision;
+/// the wire field stays `public_reason` per spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuarantinePublicReason {
+    /// Operator policy decision (e.g. terms-of-service violation).
+    Policy,
+    /// Content abuse class (CSAM, harassment, etc.).
+    Abuse,
+    /// Detected harmful payload (malware, phishing).
+    Malware,
+    /// Legal request or takedown (DMCA, court order).
+    Legal,
+    /// No specific public reason; the operator-internal reason did
+    /// not map to one of the above classes. Default for unrecognized
+    /// internal reason strings.
+    Unspecified,
+}
+
+impl QuarantinePublicReason {
+    /// Map an operator-internal `blob_quarantine.reason` string to
+    /// the coarse public class. Matching is case-insensitive.
+    ///
+    /// Default v0.5 mapping aligns with
+    /// [`crate::blob_store::quarantine::QuarantineReason`] variants:
+    ///
+    /// | Internal     | Public class |
+    /// |--------------|--------------|
+    /// | `dmca`       | [`Legal`]    |
+    /// | `legal`      | [`Legal`]    |
+    /// | `csam`       | [`Abuse`]    |
+    /// | `tos`        | [`Policy`]   |
+    /// | `malware`    | [`Malware`]  |
+    /// | `other`      | [`Unspecified`] |
+    /// | (unknown)    | [`Unspecified`] |
+    ///
+    /// Operators wanting different mapping should wait for the v0.6+
+    /// config-driven mapping table per §9.6.7. Unrecognized internal
+    /// reason strings (operator-custom values not in the table above)
+    /// default to `Unspecified` so a misconfigured internal reason
+    /// can never leak detail to the wire.
+    ///
+    /// [`Legal`]: Self::Legal
+    /// [`Abuse`]: Self::Abuse
+    /// [`Policy`]: Self::Policy
+    /// [`Malware`]: Self::Malware
+    /// [`Unspecified`]: Self::Unspecified
+    pub fn from_internal_reason_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "dmca" | "legal" => Self::Legal,
+            "csam" => Self::Abuse,
+            "tos" => Self::Policy,
+            "malware" => Self::Malware,
+            _ => Self::Unspecified,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2178,5 +2396,278 @@ mod tests {
                 path
             );
         }
+    }
+
+    // ============================================================
+    // Arc 16f §9.6.3.2 TOLERANT helper tests.
+    // Extends Arc 16b's arc16b_store fixture with the
+    // `blob_quarantine` table so quarantine-first ordering can be
+    // exercised via direct SQL fixtures (mirrors the schema in
+    // src/blob_store/quarantine.rs:395).
+    // ============================================================
+
+    async fn arc16f_store_with_quarantine() -> (BlobStore, sqlx::AnyPool) {
+        let (store, pool) = arc16b_store().await;
+        sqlx::query(
+            r#"CREATE TABLE blob_quarantine (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cid TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                details TEXT,
+                quarantined_by TEXT NOT NULL,
+                quarantined_at TEXT NOT NULL,
+                restored_at TEXT,
+                restored_by TEXT,
+                legal_reference TEXT
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        (store, pool)
+    }
+
+    async fn insert_quarantine(pool: &sqlx::AnyPool, cid: &str, reason: &str) {
+        sqlx::query(
+            "INSERT INTO blob_quarantine (cid, reason, quarantined_by, quarantined_at) \
+             VALUES ($1, $2, 'did:plc:admin', '2026-01-01T00:00:00Z')",
+        )
+        .bind(cid)
+        .bind(reason)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tolerant_quarantine_hit_no_metadata_returns_quarantined() {
+        let (store, pool) = arc16f_store_with_quarantine().await;
+        let cid = Cid::for_raw(b"arc16f-tolerant-q1");
+        let cid_str = cid.to_string();
+        insert_quarantine(&pool, &cid_str, "csam").await;
+        // No blob_metadata row.
+
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store
+            .verify_blob_tolerant_or_signal(
+                &mut tx,
+                &cid,
+                "at://did:plc:alice/app.bsky.feed.post/abc",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        match outcome {
+            TolerantOutcome::Quarantined { cid: c, public_reason } => {
+                assert_eq!(c, cid);
+                assert_eq!(public_reason, QuarantinePublicReason::Abuse);
+            }
+            other => panic!("expected Quarantined, got {:?}", other),
+        }
+        // No state mutation.
+        assert!(!metadata_exists(&pool, &cid_str).await);
+        assert_eq!(record_blob_count(&pool, &cid_str).await, 0);
+    }
+
+    #[tokio::test]
+    async fn tolerant_quarantine_takes_precedence_over_present_row() {
+        let (store, pool) = arc16f_store_with_quarantine().await;
+        let cid = Cid::for_raw(b"arc16f-tolerant-q2");
+        let cid_str = cid.to_string();
+        insert_quarantine(&pool, &cid_str, "dmca").await;
+        // Seed an untethered blob_metadata row — quarantine MUST still
+        // take precedence per §9.6.3.2 step 1 (quarantine-first ordering).
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ($1, 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', '1')",
+        )
+        .bind(&cid_str)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store
+            .verify_blob_tolerant_or_signal(
+                &mut tx,
+                &cid,
+                "at://x/y/z",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        match outcome {
+            TolerantOutcome::Quarantined { cid: c, public_reason } => {
+                assert_eq!(c, cid);
+                assert_eq!(public_reason, QuarantinePublicReason::Legal);
+            }
+            other => panic!("expected Quarantined, got {:?}", other),
+        }
+        // Row was NOT promoted (temp_key still '1') and NO record_blob row.
+        assert_eq!(
+            read_temp_key(&pool, &cid_str).await,
+            Some("1".to_string())
+        );
+        assert_eq!(record_blob_count(&pool, &cid_str).await, 0);
+    }
+
+    #[tokio::test]
+    async fn tolerant_row_absent_no_quarantine_returns_needs_fetch() {
+        let (store, pool) = arc16f_store_with_quarantine().await;
+        let cid = Cid::for_raw(b"arc16f-tolerant-nf");
+        let cid_str = cid.to_string();
+
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store
+            .verify_blob_tolerant_or_signal(
+                &mut tx,
+                &cid,
+                "at://x/y/z",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        match outcome {
+            TolerantOutcome::NeedsFetch { cid: c } => assert_eq!(c, cid),
+            other => panic!("expected NeedsFetch, got {:?}", other),
+        }
+        // No state mutation.
+        assert!(!metadata_exists(&pool, &cid_str).await);
+        assert_eq!(record_blob_count(&pool, &cid_str).await, 0);
+    }
+
+    #[tokio::test]
+    async fn tolerant_row_present_temp_key_set_delegates_to_strict_promotes() {
+        let (store, pool) = arc16f_store_with_quarantine().await;
+        let cid = Cid::for_raw(b"arc16f-tolerant-p1");
+        let cid_str = cid.to_string();
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ($1, 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', '1')",
+        )
+        .bind(&cid_str)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store
+            .verify_blob_tolerant_or_signal(
+                &mut tx,
+                &cid,
+                "at://did:plc:alice/coll/rkey",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert!(
+            matches!(outcome, TolerantOutcome::Promoted),
+            "expected Promoted, got {:?}",
+            outcome
+        );
+        // STRICT delegation effects: temp_key NULL + record_blob row.
+        assert!(read_temp_key(&pool, &cid_str).await.is_none());
+        assert_eq!(record_blob_count(&pool, &cid_str).await, 1);
+    }
+
+    #[tokio::test]
+    async fn tolerant_row_present_temp_key_null_delegates_to_strict_already_permanent() {
+        let (store, pool) = arc16f_store_with_quarantine().await;
+        let cid = Cid::for_raw(b"arc16f-tolerant-ap1");
+        let cid_str = cid.to_string();
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ($1, 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', NULL)",
+        )
+        .bind(&cid_str)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store
+            .verify_blob_tolerant_or_signal(
+                &mut tx,
+                &cid,
+                "at://did:plc:alice/coll/rkey",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert!(
+            matches!(outcome, TolerantOutcome::AlreadyPermanent),
+            "expected AlreadyPermanent, got {:?}",
+            outcome
+        );
+        assert!(read_temp_key(&pool, &cid_str).await.is_none());
+        assert_eq!(record_blob_count(&pool, &cid_str).await, 1);
+    }
+
+    #[tokio::test]
+    async fn tolerant_runs_on_sqlite_without_for_update_syntax_error() {
+        // FOR UPDATE lock regression — mirrors Arc 16b §9.2.3.2's lock
+        // test shape. sqlx 0.8 does NOT silently tolerate FOR UPDATE on
+        // SQLite (it surfaces as syntax error); the helper passing on
+        // SQLite proves that the shared `for_update_clause()` mechanism
+        // correctly suppresses FOR UPDATE for the SQLite backend (same
+        // mechanism Arc 16b's STRICT uses).
+        let (store, pool) = arc16f_store_with_quarantine().await;
+        let cid = Cid::for_raw(b"arc16f-tolerant-lock");
+        let cid_str = cid.to_string();
+        sqlx::query(
+            "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
+             VALUES ($1, 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', '1')",
+        )
+        .bind(&cid_str)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let outcome = store
+            .verify_blob_tolerant_or_signal(
+                &mut tx,
+                &cid,
+                "at://x/y/z",
+                chrono::Utc::now(),
+            )
+            .await;
+        tx.commit().await.unwrap();
+        assert!(
+            outcome.is_ok(),
+            "TOLERANT must run on SQLite without FOR UPDATE syntax error: {:?}",
+            outcome
+        );
+    }
+
+    #[test]
+    fn quarantine_public_reason_mapping_covers_internal_classes() {
+        use QuarantinePublicReason as Q;
+        assert_eq!(Q::from_internal_reason_str("dmca"), Q::Legal);
+        assert_eq!(Q::from_internal_reason_str("legal"), Q::Legal);
+        assert_eq!(Q::from_internal_reason_str("csam"), Q::Abuse);
+        assert_eq!(Q::from_internal_reason_str("tos"), Q::Policy);
+        assert_eq!(Q::from_internal_reason_str("malware"), Q::Malware);
+        assert_eq!(Q::from_internal_reason_str("other"), Q::Unspecified);
+        // Case-insensitive.
+        assert_eq!(Q::from_internal_reason_str("DMCA"), Q::Legal);
+        assert_eq!(Q::from_internal_reason_str("Csam"), Q::Abuse);
+        // Unknown defaults to Unspecified — operator-internal detail
+        // (e.g. matched-signature SHA) MUST NOT leak to wire.
+        assert_eq!(
+            Q::from_internal_reason_str("matched-signature-sha256:abc"),
+            Q::Unspecified
+        );
+        assert_eq!(Q::from_internal_reason_str(""), Q::Unspecified);
     }
 }
