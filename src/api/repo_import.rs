@@ -151,18 +151,38 @@ async fn import_repo(
     middleware::enforce_scope(&auth, &AtProtoScope::RepoAll)?;
     let importing_did = auth.did().to_string();
 
-    info!(
-        event = "import_repo_starting",
-        did = %importing_did,
-        "importRepo handler entry"
-    );
+    // §9.6.3.9 unified forensic-rejection emit. Inner body returns
+    // `PdsResult<Response>`; every `?`-propagation surfaces here as a
+    // single `emit_rejected` call. Pre-refactor, 6 inner Err paths
+    // skipped the forensic emit (Phase B Scenario 11 discovery), which
+    // left Scenarios 6/14/10 unable to assert `import_repo_rejected`
+    // even when the wire response was correct. Outer-level emit
+    // restores the canonical-trail invariant: every Err path produces
+    // exactly one rejected event. The `accepting_imports=false` drain
+    // path is the one inline-emit exception inside `import_repo_inner`
+    // because it returns `Ok(503)` (the wire-shape design choice
+    // documented at §9.6.3.1 step 2), so the outer Err arm doesn't
+    // see it.
+    match import_repo_inner(&ctx, body, &importing_did).await {
+        Ok(resp) => Ok(resp),
+        Err(err) => {
+            let kind = error_kind_label(&err);
+            emit_rejected(&importing_did, kind, 0, &[]);
+            Err(err)
+        }
+    }
+}
 
+async fn import_repo_inner(
+    ctx: &AppContext,
+    body: Body,
+    importing_did: &str,
+) -> PdsResult<axum::response::Response> {
     // CF3 — signer resolution gate (account_emit.rs:59 template).
-    // Existence-check + per-account key resolution in one. Resolve
-    // BEFORE acquiring the lock so a missing actor fails fast
+    // Resolve BEFORE acquiring the lock so a missing actor fails fast
     // without holding it.
     let signer: Arc<dyn Signer> =
-        match ctx.account_manager.get_atproto_signing_key_bytes(&importing_did).await {
+        match ctx.account_manager.get_atproto_signing_key_bytes(importing_did).await {
             Ok(key_bytes) => Arc::new(
                 RepoSigner::from_bytes(&key_bytes).map_err(|e| {
                     PdsError::Internal(format!(
@@ -171,32 +191,27 @@ async fn import_repo(
                     ))
                 })?,
             ),
-            Err(PdsError::NotFound(_)) => {
-                emit_rejected(&importing_did, "ActorNotInitialized", 0, &[]);
-                return Err(PdsError::ActorNotInitialized);
-            }
+            Err(PdsError::NotFound(_)) => return Err(PdsError::ActorNotInitialized),
             Err(other) => return Err(other),
         };
 
-    // Single-flight lock keyed on importing_did. Acquired AFTER
-    // signer resolution so missing accounts fail fast.
-    let _lock_guard = match import_lock_registry().try_acquire(&importing_did) {
+    // Single-flight lock keyed on importing_did. Acquired AFTER signer
+    // resolution so missing accounts fail fast.
+    let _lock_guard = match import_lock_registry().try_acquire(importing_did) {
         Some(g) => g,
         None => {
-            warn!(
-                        did = %importing_did,
-                "importRepo concurrent mutation rejected"
-            );
-            emit_rejected(&importing_did, "ConcurrentMutation", 0, &[]);
+            warn!(did = %importing_did, "importRepo concurrent mutation rejected");
             return Err(PdsError::ConcurrentMutation);
         }
     };
 
-    // accepting_imports drain switch — checked INSIDE the lock
-    // so operators can flip the switch and let in-flight imports
+    // accepting_imports drain switch — special: returns Ok(503), not
+    // Err, so this is the one path that inline-emits rejected because
+    // the outer handler's Err arm won't see it. Checked INSIDE the
+    // lock so operators can flip the switch and let in-flight imports
     // finish without serving new ones.
     if !ctx.config.service.accepting_imports {
-        emit_rejected(&importing_did, "ServiceUnavailable", 0, &[]);
+        emit_rejected(importing_did, "ServiceUnavailable", 0, &[]);
         let status = axum::http::StatusCode::SERVICE_UNAVAILABLE;
         let payload = serde_json::json!({
             "error": "ServiceUnavailable",
@@ -206,24 +221,18 @@ async fn import_repo(
     }
 
     // Arc 16f Step 3 v5.2 (chainlink #123) — ensure the per-actor
-    // SQLite store exists for the importing DID. Idempotent: ActorStore::
-    // create uses CREATE TABLE IF NOT EXISTS + create_dir_all, so this
-    // is a no-op for already-initialised stores and materialises the
-    // store on first import for a seeded-but-uninitialised DID
-    // (the v0.5 federation-into-fresh-instance case). Mirrors the
-    // production createAccount path's seed-shared-DB-then-init-actor-store
-    // flow at src/api/server.rs:230. Without this, apply_writes →
-    // proto-blue Repo → SqliteRepoStorage::put_block → ActorStore::
-    // open_db fails NotFound for any DID whose actor store wasn't
-    // initialised through createAccount.
-    if let Err(e) = ctx.actor_store.create(&importing_did).await {
-        emit_rejected(&importing_did, "Internal", 0, &[]);
-        return Err(e);
-    }
+    // SQLite store exists. Idempotent: `CREATE TABLE IF NOT EXISTS` +
+    // `create_dir_all`. Materialises the store on first import for a
+    // seeded-but-uninitialised DID (the v0.5 federation-into-fresh-
+    // instance case). Without it, apply_writes → proto-blue Repo →
+    // SqliteRepoStorage::put_block → ActorStore::open_db fails
+    // NotFound for any DID whose actor store wasn't initialised
+    // through createAccount.
+    ctx.actor_store.create(importing_did).await?;
 
-    // CAR body read with streaming size-bound enforcement
-    // (round-1 F21). Chunks accumulate; first chunk that pushes
-    // the total past `max_import_size` aborts the read.
+    // CAR body read with streaming size-bound enforcement (round-1
+    // F21). Chunks accumulate; first chunk that pushes the total
+    // past `max_import_size` aborts the read.
     let car_bytes = read_body_with_cap(body, ctx.config.service.max_import_size).await?;
     let car_size = car_bytes.len();
     debug!(
@@ -248,8 +257,7 @@ async fn import_repo(
     // local actor — currently unsupported by the entry-gate
     // self-only constraint), this should switch to the importing
     // DID's PLC-resolved did:key history.
-    let signing_did_key =
-        public_did_key_for(&ctx, &importing_did).await?;
+    let signing_did_key = public_did_key_for(ctx, importing_did).await?;
 
     let verified_diff = match verify_diff_car(
         &car_bytes,
@@ -257,41 +265,34 @@ async fn import_repo(
               // applies imported commits as additive diffs against
               // an empty MST. v0.6+ may pass the current repo's
               // VerifiedRepo here to support incremental import.
-        Some(&importing_did),
+        Some(importing_did),
         Some(&signing_did_key),
     ) {
         Ok(d) => d,
         Err(e) => {
+            // proto-blue's RepoError covers structural failures (CAR
+            // decode, MST load) AND signature failures. Disambiguate
+            // via the error message — proto-blue signature failures
+            // carry "signature" in the displayed string per its
+            // error vocabulary. (Chainlink #120 tracks the v0.6+
+            // upstream-discriminated-variant cleanup.)
             let msg = e.to_string();
-            // proto-blue's RepoError covers structural failures
-            // (CAR decode, MST load) AND signature failures.
-            // Disambiguate via the error message — proto-blue
-            // signature failures carry "signature" in the
-            // displayed string per its error vocabulary. Cheap
-            // string match is sufficient for the wire-error
-            // routing; production tooling discriminates via the
-            // error name in the JSON envelope, not by
-            // string-matching the message.
             let lower = msg.to_lowercase();
-            let err = if lower.contains("signature") || lower.contains("signing") {
-                emit_rejected(&importing_did, "InvalidCommitSignature", car_size, &[]);
+            return Err(if lower.contains("signature") || lower.contains("signing") {
                 PdsError::InvalidCommitSignature
             } else {
-                emit_rejected(&importing_did, "InvalidCar", car_size, &[]);
                 PdsError::InvalidCar(format!("CAR decode failed: {}", msg))
-            };
-            return Err(err);
+            });
         }
     };
 
     // DID match: CAR root commit's DID MUST equal the authenticated
     // importing_did. The verify_diff_car call above already passes
-    // `expected_did = Some(&importing_did)`, which proto-blue
+    // `expected_did = Some(importing_did)`, which proto-blue
     // enforces — so a mismatch here would surface as a decode
     // error above. This second check is defensive (catches future
     // proto-blue changes that might relax the check).
     if verified_diff.repo.commit.did != importing_did {
-        emit_rejected(&importing_did, "InvalidCar", car_size, &[]);
         return Err(PdsError::InvalidCar(format!(
             "CAR root commit DID {} does not match importing DID {}",
             verified_diff.repo.commit.did, importing_did
@@ -299,18 +300,33 @@ async fn import_repo(
     }
 
     // Diff → WriteOp + blob_cid extraction.
-    let (writes, blob_cids) = diff_to_writes(&verified_diff, &importing_did)?;
+    let (writes, blob_cids) = diff_to_writes(&verified_diff, importing_did)?;
     let prepared_write_count = writes.len();
     let validate_phase_cid_count = blob_cids.len();
-    debug!(
+
+    // Validate-phase quarantine + DASL gate (round-1 F1). Returns
+    // `Err(QuarantinedBlobReferenced)` on hit; outer handler emits
+    // rejected.
+    validate_phase_blob_check(ctx, importing_did, &blob_cids).await?;
+
+    // §9.6.3.9 import_repo_starting — fires HERE, after all gates +
+    // validate-phase have passed. All four design-spec fields are now
+    // in scope (importing_did + car_size_bytes + prepared_write_count
+    // + validate_phase_cid_count). Crossing this emit means the
+    // import body is actually entering the apply_writes loop;
+    // rejections before this point produce `rejected`-only forensic
+    // trails (no `starting`). Discovered during Phase B Scenario 11
+    // (chainlink #121, 2026-05-21) — the prior at-handler-entry
+    // placement violated the design's "starting = crossed-validation-
+    // threshold" invariant.
+    info!(
+        event = "import_repo_starting",
         did = %importing_did,
+        car_size_bytes = car_size,
         prepared_write_count,
         validate_phase_cid_count,
-        "importRepo diff prepared"
+        "importRepo entering apply_writes loop"
     );
-
-    // Validate-phase quarantine + DASL gate (round-1 F1).
-    validate_phase_blob_check(&ctx, &importing_did, &blob_cids).await?;
 
     // Pooled reqwest::Client (round-1 F11) — single instance per
     // handler invocation, threaded to all fetch calls.
@@ -329,7 +345,7 @@ async fn import_repo(
     // the FnMut bound without needing Arc<Manager> indirection.
     let writes_for_loop = writes.clone();
     let signer_for_loop = signer.clone();
-    let did_for_loop = importing_did.clone();
+    let did_for_loop = importing_did.to_string();
     let actor_store_for_loop = (*ctx.actor_store).clone();
     let sequencer_for_loop = ctx.sequencer.clone();
     let validation_mode_for_loop = ctx.config.validation_mode;
@@ -339,7 +355,7 @@ async fn import_repo(
     // HttpOriginBlobFetcher is zero-sized; construct fresh per
     // stage call inside the closure rather than capturing by-move.
     let blob_store_for_stage = ctx.blob_store.clone();
-    let did_for_stage = importing_did.clone();
+    let did_for_stage = importing_did.to_string();
     let client_for_stage = client.clone();
     let ctx_for_stage = ctx.clone();
     let outcome = import_with_fetch_retry(
@@ -389,39 +405,33 @@ async fn import_repo(
 
     let total_duration_ms = started.elapsed().as_millis() as u64;
 
-    match outcome {
-        Ok((commit_cid, rev)) => {
-            info!(
-                        event = "import_repo_complete",
-                did = %importing_did,
-                car_size,
-                prepared_write_count,
-                fetched_blob_count = 0u32, // TOLERANT path lands in Step 4 — STRICT today
-                fetch_round_count = 0u32,
-                total_duration_ms,
-                %commit_cid,
-                %rev,
-                "importRepo handler complete"
-            );
-            Ok(Json(serde_json::json!({
-                "commit": { "cid": commit_cid, "rev": rev }
-            }))
-            .into_response())
-        }
-        Err(err) => {
-            let kind = error_kind_label(&err);
-            emit_rejected(&importing_did, kind, car_size, &[]);
-            warn!(
-                        event = "import_repo_rejected",
-                did = %importing_did,
-                car_size,
-                error = %err,
-                total_duration_ms,
-                "importRepo handler rejected"
-            );
-            Err(err)
-        }
-    }
+    let (commit_cid, rev) = outcome?;
+
+    // §9.6.3.9 import_repo_complete — fires on success path only.
+    // Apply-time Err propagates to the outer `import_repo` handler
+    // which emits `import_repo_rejected` via the unified outer arm.
+    //
+    // fetched_blob_count / fetch_round_count are hardcoded 0u32 per
+    // chainlink #122 (Step 3 never threaded the loop accounting out
+    // of import_with_fetch_retry); the per-fetch "origin blob fetch
+    // ok" log lines from Step 2's primitive are the authoritative
+    // count for now.
+    info!(
+        event = "import_repo_complete",
+        did = %importing_did,
+        car_size_bytes = car_size,
+        prepared_write_count,
+        fetched_blob_count = 0u32,
+        fetch_round_count = 0u32,
+        total_duration_ms,
+        %commit_cid,
+        %rev,
+        "importRepo handler complete"
+    );
+    Ok(Json(serde_json::json!({
+        "commit": { "cid": commit_cid, "rev": rev }
+    }))
+    .into_response())
 }
 
 // ============================================================
@@ -934,6 +944,85 @@ mod tests {
              `aurora_locus::*`-prefixed target.\n\nViolations:\n{}",
             violations.join("\n")
         );
+    }
+
+    // ------------------------------------------------------------
+    // §9.6.3.9 import_repo_starting placement + payload invariants
+    // ------------------------------------------------------------
+
+    /// Asserts V05_DESIGN.md §9.6.3.9's `import_repo_starting` design:
+    ///
+    /// **Placement**: the emit fires AFTER `validate_phase_blob_check`
+    /// returns (and therefore after every other gate too). Crossing
+    /// `starting` means the import body has passed all validation
+    /// gates and is entering the apply_writes loop. Refused imports
+    /// (signer NotFound, lock contention, accepting_imports=false,
+    /// decode failure, signature failure, quarantine, etc.) produce
+    /// a `rejected`-only forensic trail with NO `starting` line.
+    ///
+    /// **Payload**: the emit carries all four design-spec fields —
+    /// `importing_did`, `car_size_bytes`, `prepared_write_count`,
+    /// `validate_phase_cid_count` (§9.6.3.9 verbatim). Pre-fix the
+    /// emit at handler entry only carried `did`, violating the spec.
+    ///
+    /// Discovered by Phase B Scenario 11 (chainlink #121, 2026-05-21):
+    /// a refused-at-`accepting_imports=false` import emitted
+    /// `starting + rejected` instead of `rejected` only, because the
+    /// pre-fix code emitted at handler entry before any gate ran.
+    #[test]
+    fn import_repo_starting_design_invariants() {
+        let src = include_str!("repo_import.rs");
+        let lines: Vec<&str> = src.lines().collect();
+
+        // Skip comment lines (including this doc-comment, which
+        // legitimately contains the literals as documentation).
+        let code_line_match = |needle: &str| -> Option<usize> {
+            lines.iter().enumerate().find_map(|(i, line)| {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    return None;
+                }
+                if line.contains(needle) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+        };
+
+        let starting_idx = code_line_match("event = \"import_repo_starting\"")
+            .expect("import_repo_starting emit not found in repo_import.rs");
+        let validate_idx = code_line_match("validate_phase_blob_check(")
+            .expect("validate_phase_blob_check invocation not found");
+
+        assert!(
+            starting_idx > validate_idx,
+            "§9.6.3.9 invariant violated: import_repo_starting (line {}) must fire \
+             AFTER validate_phase_blob_check (line {}). Pre-validate-phase \
+             placement emits `starting` for refused-at-validate imports, breaking \
+             the design's `starting = crossed-validation-threshold` semantic. \
+             Phase B Scenario 11 (chainlink #121) discovery.",
+            starting_idx + 1,
+            validate_idx + 1
+        );
+
+        // The info! block follows event= for ~5-10 lines.
+        let block: String = lines[starting_idx..]
+            .iter()
+            .take(10)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        for field in &["car_size_bytes", "prepared_write_count", "validate_phase_cid_count"] {
+            assert!(
+                block.contains(field),
+                "§9.6.3.9 invariant violated: import_repo_starting must carry \
+                 design-spec field `{}`. Pre-fix emit at handler entry only \
+                 carried `did`, dropping the other 3 fields. Source block:\n{}",
+                field,
+                block
+            );
+        }
     }
 
     // ------------------------------------------------------------
