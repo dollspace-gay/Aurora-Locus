@@ -360,17 +360,46 @@ async fn import_repo_inner(
     // blob's metadata row vanishes between pre-fetch and Phase B
     // (concurrent admin action — vanishingly rare); a post-pre-fetch
     // NeedsBlobFetch surfaces as Internal (signals a real bug).
+    // Arc 16f Step 3 v5.4 (chainlink #127) — COLLECT-ALL-FAILURES.
+    // Pre-v5.4 the pre-fetch loop used `?`-propagation, short-
+    // circuiting on the first per-CID failure — silently superseding
+    // §9.6.3.5's drain-all-CIDs-then-aggregate invariant. Restored
+    // here so federation operators see the full failure scope (X, Y,
+    // Z all missing from origin) in one envelope rather than
+    // retrying to rediscover one CID at a time.
+    //
+    // Mechanics: iterate every absent blob_cid, collect Ok/Err per
+    // CID into pre_fetch_results, then aggregate via
+    // aggregate_per_cid_failures. Successful pre-fetches stage to
+    // blob_metadata + disk normally; if the round ends with non-empty
+    // failures, the import returns `OriginFetchExhausted`. Successful
+    // fetches in a failed round persist as untethered blob_metadata
+    // rows (will be reused on retry via the get_metadata-found-present
+    // skip, or cleaned by Arc 16d row-sweep if abandoned). Same Option
+    // A dual-DB posture already accepted everywhere else in v0.5.
+    //
+    // The `?` on `get_metadata` is preserved — those are Database/Io
+    // errors, not per-CID origin failures, and should fail-fast.
     let fetcher = crate::federation::blob_fetch::HttpOriginBlobFetcher;
-    let mut fetched_blob_count: u32 = 0;
+    let mut pre_fetch_results: Vec<(Cid, PdsResult<()>)> = Vec::new();
     for cid in &blob_cids {
         let cid_str = cid.to_string();
         let already_present = ctx.blob_store.get_metadata(&cid_str).await?.is_some();
-        if !already_present {
-            fetch_and_stage_one(ctx, &client, &ctx.blob_store, importing_did, cid, &fetcher)
-                .await?;
-            fetched_blob_count += 1;
+        if already_present {
+            continue;
         }
+        let result = fetch_and_stage_one(
+            ctx,
+            &client,
+            &ctx.blob_store,
+            importing_did,
+            cid,
+            &fetcher,
+        )
+        .await;
+        pre_fetch_results.push((cid.clone(), result));
     }
+    let fetched_blob_count = aggregate_per_cid_failures(pre_fetch_results)?;
 
     // apply_writes runs ONCE with all blobs staged. TolerantPromoter
     // returns Done for each present blob; no NeedsBlobFetch on the
@@ -740,6 +769,38 @@ where
     }
 }
 
+/// Arc 16f Step 3 v5.4 (chainlink #127) — drain a vec of per-CID
+/// fetch results and either return the success count or surface
+/// `OriginFetchExhausted` with the structured `per_cid_failures`
+/// payload per §9.6.3.5.
+///
+/// Pulled out as a helper so the collect-all-failures aggregation
+/// logic is unit-testable in isolation from the production
+/// pre-fetch loop's async I/O. Inputs are content-free
+/// `(Cid, PdsResult<()>)` tuples; outputs are either an
+/// `Ok(success_count)` for the all-clean case or
+/// `Err(PdsError::OriginFetchExhausted { per_cid_failures })` with
+/// ONLY the failed CIDs listed (not short-circuit-first-failure).
+/// Successful fetches in a failed round are still counted in the
+/// production code path; this helper just answers "should we
+/// surface OriginFetchExhausted with the per-CID context?"
+fn aggregate_per_cid_failures(
+    results: Vec<(Cid, PdsResult<()>)>,
+) -> PdsResult<u32> {
+    let mut success_count: u32 = 0;
+    let mut per_cid_failures: Vec<(Cid, String)> = Vec::new();
+    for (cid, result) in results {
+        match result {
+            Ok(()) => success_count += 1,
+            Err(e) => per_cid_failures.push((cid, e.to_string())),
+        }
+    }
+    if !per_cid_failures.is_empty() {
+        return Err(PdsError::OriginFetchExhausted { per_cid_failures });
+    }
+    Ok(success_count)
+}
+
 /// One-CID fetch + stage + commit per §9.6.3.5 pseudocode. Reuses
 /// Arc 16c's `stage_blob` + `commit_blob` pipeline so the fetched
 /// bytes land in the same final-position-then-metadata ordering as
@@ -889,6 +950,144 @@ mod tests {
         use std::str::FromStr;
         Cid::from_str("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
             .expect("valid CIDv1 raw multibase")
+    }
+
+    // ------------------------------------------------------------
+    // v5.4 pre-fetch aggregate-per-cid-failures (chainlink #127)
+    // ------------------------------------------------------------
+
+    /// Phase B Scenario 5b scope-trace (2026-05-22) found that v5.3's
+    /// pre-fetch loop short-circuited on the first per-CID failure
+    /// via `?`-propagation — silently superseding §9.6.3.5's
+    /// drain-all-CIDs-then-aggregate invariant. v5.4 restores
+    /// collect-all-failures via the `aggregate_per_cid_failures`
+    /// helper. These tests pin three invariants:
+    ///   1. All Ok results → returns success count.
+    ///   2. All Err results → returns `OriginFetchExhausted` listing
+    ///      ALL CIDs (no truncation).
+    ///   3. Mixed Ok/Err → returns `OriginFetchExhausted` with
+    ///      ONLY the failed CIDs (success count is preserved as
+    ///      production-side state; the failure surface lists what
+    ///      went wrong, not what worked).
+    ///
+    /// Aggregation property is content-free — no async, no AppContext,
+    /// no live fetch — so this is unit-testable in isolation.
+    #[test]
+    fn aggregate_per_cid_failures_all_ok_returns_success_count() {
+        let cid_a = Cid::for_raw(b"agg-test-a");
+        let cid_b = Cid::for_raw(b"agg-test-b");
+        let cid_c = Cid::for_raw(b"agg-test-c");
+        let results = vec![
+            (cid_a, Ok(())),
+            (cid_b, Ok(())),
+            (cid_c, Ok(())),
+        ];
+        let count = aggregate_per_cid_failures(results).expect("all-ok must succeed");
+        assert_eq!(count, 3, "all 3 CIDs counted as successful fetches");
+    }
+
+    #[test]
+    fn aggregate_per_cid_failures_all_err_surfaces_origin_fetch_exhausted_with_all_cids() {
+        let cid_a = Cid::for_raw(b"agg-fail-a");
+        let cid_b = Cid::for_raw(b"agg-fail-b");
+        let cid_c = Cid::for_raw(b"agg-fail-c");
+        let results = vec![
+            (
+                cid_a.clone(),
+                Err(PdsError::OriginFetchClientError {
+                    cid: cid_a.clone(),
+                    status_or_reason: "origin returned 503".to_string(),
+                }),
+            ),
+            (
+                cid_b.clone(),
+                Err(PdsError::OriginFetchClientError {
+                    cid: cid_b.clone(),
+                    status_or_reason: "exhausted after 4 attempts: connection refused".to_string(),
+                }),
+            ),
+            (
+                cid_c.clone(),
+                Err(PdsError::OriginFetchClientError {
+                    cid: cid_c.clone(),
+                    status_or_reason: "origin returned 404".to_string(),
+                }),
+            ),
+        ];
+        let err = aggregate_per_cid_failures(results).expect_err("all-err must surface");
+        match err {
+            PdsError::OriginFetchExhausted { per_cid_failures } => {
+                assert_eq!(
+                    per_cid_failures.len(),
+                    3,
+                    "ALL 3 failed CIDs must land in per_cid_failures \
+                     (collect-all-failures invariant — chainlink #127). \
+                     Short-circuit-first-failure would return only 1."
+                );
+                // Each reason carries through verbatim (no truncation,
+                // no canonicalisation). Operator dashboards key on the
+                // raw reason string.
+                let reasons: Vec<&str> =
+                    per_cid_failures.iter().map(|(_, r)| r.as_str()).collect();
+                assert!(reasons.iter().any(|r| r.contains("503")));
+                assert!(reasons.iter().any(|r| r.contains("exhausted")));
+                assert!(reasons.iter().any(|r| r.contains("404")));
+            }
+            other => panic!("expected OriginFetchExhausted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn aggregate_per_cid_failures_mixed_lists_only_failed_cids() {
+        // The §9.6.3.5 invariant Scenario 5b was designed to test:
+        // some CIDs succeed in the round, some fail; the wire surface
+        // lists ONLY the failures, NOT the successes.
+        let cid_failed_a = Cid::for_raw(b"agg-mixed-a-fail");
+        let cid_succeeded_b = Cid::for_raw(b"agg-mixed-b-succ");
+        let cid_failed_c = Cid::for_raw(b"agg-mixed-c-fail");
+        let results = vec![
+            (
+                cid_failed_a.clone(),
+                Err(PdsError::OriginFetchClientError {
+                    cid: cid_failed_a.clone(),
+                    status_or_reason: "origin returned 503".to_string(),
+                }),
+            ),
+            (cid_succeeded_b.clone(), Ok(())),
+            (
+                cid_failed_c.clone(),
+                Err(PdsError::OriginFetchClientError {
+                    cid: cid_failed_c.clone(),
+                    status_or_reason: "origin returned 503".to_string(),
+                }),
+            ),
+        ];
+        let err = aggregate_per_cid_failures(results).expect_err("mixed must surface");
+        match err {
+            PdsError::OriginFetchExhausted { per_cid_failures } => {
+                assert_eq!(
+                    per_cid_failures.len(),
+                    2,
+                    "ONLY the 2 failed CIDs land in per_cid_failures \
+                     (success cid_b is preserved as production state, \
+                     not in the wire failure surface)"
+                );
+                // No-success-leakage check: the successful CID must
+                // not appear in any failure-tuple position.
+                for (failed_cid, reason) in &per_cid_failures {
+                    assert_ne!(
+                        failed_cid, &cid_succeeded_b,
+                        "successful CID must not appear in per_cid_failures"
+                    );
+                    assert!(
+                        reason.contains("503"),
+                        "failure reason must be the actual failure, not synthesised: {}",
+                        reason
+                    );
+                }
+            }
+            other => panic!("expected OriginFetchExhausted, got {:?}", other),
+        }
     }
 
     // ------------------------------------------------------------
