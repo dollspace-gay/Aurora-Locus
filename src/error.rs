@@ -375,11 +375,49 @@ impl PartialEq for PdsError {
     }
 }
 
-/// XRPC error response format
+/// XRPC error response format.
+///
+/// Base shape is `{error, message}` — the bsky-PDS-compatible
+/// envelope. Aurora-specific structured-error wire shapes (Arc 16f
+/// §9.6.3.5 OriginFetchExhausted's `per_cid_failures`, §9.6.3.6
+/// QuarantinedBlobReferenced's `cid` + `public_reason`) extend the
+/// envelope via additive optional fields. `serde(skip_serializing_if
+/// = "Option::is_none")` keeps existing wire shapes unchanged for
+/// variants that don't populate the extensions — backward-compatible
+/// for clients keying on `{error, message}` only.
+///
+/// Round-1 F20 invariant for QuarantinedBlobReferenced: the
+/// operator-internal `blob_quarantine.reason` text (e.g. "csam",
+/// "matched signature SHA256:...") must NEVER appear in any field
+/// of this envelope. The `public_reason` field carries only the
+/// coarse [`QuarantinePublicReason`] class, populated via
+/// `from_internal_reason_str` at the validate-phase reject site.
+/// See the `quarantined_blob_referenced_wire_shape_*` tests in
+/// the integration suite for the invariant proof.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct XrpcErrorResponse {
     pub error: String,
     pub message: String,
+    /// Arc 16f §9.6.3.6 — QuarantinedBlobReferenced wire field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+    /// Arc 16f §9.6.3.6 — QuarantinedBlobReferenced wire field.
+    /// Carries the coarse `QuarantinePublicReason` class
+    /// (e.g. "abuse"); never the operator-internal reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_reason: Option<String>,
+    /// Arc 16f §9.6.3.5 — OriginFetchExhausted wire field.
+    /// Per-CID failure context aggregated by the fetch-and-retry loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_cid_failures: Option<Vec<PerCidFailure>>,
+}
+
+/// Arc 16f §9.6.3.5 — per-CID failure entry inside
+/// [`XrpcErrorResponse::per_cid_failures`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PerCidFailure {
+    pub cid: String,
+    pub reason: String,
 }
 
 /// Convert PdsError to HTTP response
@@ -391,6 +429,36 @@ impl IntoResponse for PdsError {
         // (line below) to avoid leaking internals to clients; the log
         // is the only place operators see the root cause.
         let error_display = self.to_string();
+
+        // Arc 16f §9.6.3.5 / §9.6.3.6 (chainlink #126) — extract
+        // structured fields for the variants that need them on the
+        // wire BEFORE the match consumes self. Round-1 F20 invariant:
+        // QuarantinedBlobReferenced extracts ONLY the coarse public
+        // class (via QuarantinePublicReason's serde-rename-lowercase),
+        // never the operator-internal blob_quarantine.reason text.
+        let (cid_field, public_reason_field, per_cid_failures_field) = match &self {
+            PdsError::QuarantinedBlobReferenced { cid, public_reason } => (
+                Some(cid.to_string()),
+                serde_json::to_value(public_reason)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from)),
+                None,
+            ),
+            PdsError::OriginFetchExhausted { per_cid_failures } => (
+                None,
+                None,
+                Some(
+                    per_cid_failures
+                        .iter()
+                        .map(|(c, r)| PerCidFailure {
+                            cid: c.to_string(),
+                            reason: r.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+            _ => (None, None, None),
+        };
 
         let (status, error_code, message) = match self {
             PdsError::Authentication(_) => (
@@ -570,6 +638,9 @@ impl IntoResponse for PdsError {
         let body = Json(XrpcErrorResponse {
             error: error_code.to_string(),
             message,
+            cid: cid_field,
+            public_reason: public_reason_field,
+            per_cid_failures: per_cid_failures_field,
         });
 
         (status, body).into_response()
@@ -629,6 +700,160 @@ mod tests {
         assert_eq!(
             body.message,
             "Invalid CID in record body: bafyrei-malformed-input"
+        );
+    }
+
+    fn quarantine_test_cid() -> Cid {
+        use std::str::FromStr;
+        Cid::from_str("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
+            .expect("valid CIDv1 raw multibase")
+    }
+
+    /// Arc 16f §9.6.3.6 — QuarantinedBlobReferenced wire shape carries
+    /// `cid` and `public_reason` as separate JSON fields per design,
+    /// not embedded in the message. Phase B Scenario 6 (chainlink
+    /// #121, 2026-05-22) surfaced the gap: pre-#126, the IntoResponse
+    /// impl discarded both fields via `..` and emitted only `{error,
+    /// message}`. Post-#126, the wire shape matches §9.6.3.6 verbatim.
+    #[tokio::test]
+    async fn quarantined_blob_referenced_wire_shape_carries_cid_and_public_reason() {
+        let cid = quarantine_test_cid();
+        let err = PdsError::QuarantinedBlobReferenced {
+            cid: cid.clone(),
+            public_reason: QuarantinePublicReason::Abuse,
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: XrpcErrorResponse = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body.error, "QuarantinedBlobReferenced");
+        assert_eq!(
+            body.cid.as_deref(),
+            Some(cid.to_string().as_str()),
+            "wire payload must carry the cid as a separate field, \
+             not just embedded in message text"
+        );
+        assert_eq!(
+            body.public_reason.as_deref(),
+            Some("abuse"),
+            "wire payload must carry the coarse QuarantinePublicReason \
+             class (Abuse → \"abuse\" via serde rename_all=lowercase)"
+        );
+    }
+
+    /// Arc 16f §9.6.3.6 round-1 F20 invariant: the wire payload exposes
+    /// ONLY the coarse [`QuarantinePublicReason`] class. The operator-
+    /// internal `blob_quarantine.reason` text (e.g. "csam", "matched
+    /// signature SHA256:abc...") MUST NEVER appear in any wire field.
+    ///
+    /// The variant payload by construction only carries
+    /// [`QuarantinePublicReason`] (an enum), so a wire leak would
+    /// require either a future contributor adding the internal-reason
+    /// text into the variant OR the variant's Display impl picking up
+    /// the internal text somehow. This test sets the public class to
+    /// Abuse — which maps from internal reason "csam" via
+    /// `from_internal_reason_str` — and asserts the raw JSON bytes
+    /// contain neither "csam" nor any other internal-reason marker.
+    #[tokio::test]
+    async fn quarantined_blob_referenced_does_not_leak_internal_reason() {
+        let cid = quarantine_test_cid();
+        // Construct via the production code path: `from_internal_reason_str("csam")`
+        // returns Abuse — the SAME path validate_phase_blob_check uses.
+        let public_reason = QuarantinePublicReason::from_internal_reason_str("csam");
+        assert_eq!(public_reason, QuarantinePublicReason::Abuse);
+
+        let err = PdsError::QuarantinedBlobReferenced { cid, public_reason };
+        let resp = err.into_response();
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let raw = std::str::from_utf8(&bytes).expect("UTF-8 body");
+
+        // Round-1 F20: no operator-internal reason words anywhere.
+        // The check looks at the raw JSON bytes (not just deserialized
+        // fields) so a leak in any new field gets caught — including
+        // a future contributor accidentally adding the internal reason
+        // to a debug-style additional field.
+        for forbidden in ["csam", "dmca", "tos", "matched signature"] {
+            assert!(
+                !raw.to_lowercase().contains(forbidden),
+                "wire payload leaked operator-internal reason word `{}`. \
+                 Raw body: {}",
+                forbidden,
+                raw
+            );
+        }
+
+        // Positive check: the coarse class IS present.
+        assert!(
+            raw.contains("\"public_reason\":\"abuse\""),
+            "wire payload must carry the coarse public class. Raw body: {}",
+            raw
+        );
+    }
+
+    /// Arc 16f §9.6.3.5 — OriginFetchExhausted wire shape carries
+    /// `per_cid_failures` as a structured array per design. Phase B
+    /// Scenario 6 (chainlink #121) surfaced the parallel gap: pre-#126
+    /// the IntoResponse impl discarded the per_cid_failures vec via
+    /// `..` and emitted only `{error, message}` (explicit "lands when
+    /// Step 3 ships" placeholder in the code). Post-#126 the wire
+    /// shape matches §9.6.3.5 verbatim.
+    #[tokio::test]
+    async fn origin_fetch_exhausted_wire_shape_carries_per_cid_failures() {
+        let cid_a = quarantine_test_cid();
+        let cid_b = quarantine_test_cid();
+        let err = PdsError::OriginFetchExhausted {
+            per_cid_failures: vec![
+                (cid_a.clone(), "404 Not Found".to_string()),
+                (cid_b.clone(), "5xx after 3 retries".to_string()),
+            ],
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: XrpcErrorResponse = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body.error, "OriginFetchExhausted");
+        let per_cid = body
+            .per_cid_failures
+            .expect("per_cid_failures must be serialized on the wire");
+        assert_eq!(per_cid.len(), 2, "all failure entries land on wire");
+        assert_eq!(per_cid[0].cid, cid_a.to_string());
+        assert_eq!(per_cid[0].reason, "404 Not Found");
+        assert_eq!(per_cid[1].cid, cid_b.to_string());
+        assert_eq!(per_cid[1].reason, "5xx after 3 retries");
+    }
+
+    /// Backward-compat sanity: variants that don't populate the
+    /// optional extension fields must NOT serialize them (no `null`
+    /// pollution, no empty `cid: ""` etc.). `serde(skip_serializing_if
+    /// = "Option::is_none")` carries this — confirm against the wire
+    /// for one representative non-Arc-16f variant.
+    #[tokio::test]
+    async fn non_extended_variant_omits_optional_fields() {
+        let err = PdsError::BlobNotFound("bafkrei...".to_string());
+        let resp = err.into_response();
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let raw = std::str::from_utf8(&bytes).expect("UTF-8 body");
+        assert!(
+            !raw.contains("\"cid\""),
+            "BlobNotFound must NOT emit a `cid` field; only Arc 16f \
+             structured-error variants do. Raw body: {}",
+            raw
+        );
+        assert!(
+            !raw.contains("\"public_reason\""),
+            "BlobNotFound must NOT emit a `public_reason` field. \
+             Raw body: {}",
+            raw
+        );
+        assert!(
+            !raw.contains("\"per_cid_failures\""),
+            "BlobNotFound must NOT emit a `per_cid_failures` field. \
+             Raw body: {}",
+            raw
         );
     }
 }
