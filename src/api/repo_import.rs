@@ -167,7 +167,20 @@ async fn import_repo(
         Ok(resp) => Ok(resp),
         Err(err) => {
             let kind = error_kind_label(&err);
-            emit_rejected(&importing_did, kind, 0, &[]);
+            // §9.6.3.5 / #129 — surface aggregated per-CID failures into
+            // the forensic log when the inner path collected them. Without
+            // this extract, the wire response correctly ships
+            // `per_cid_failures` (e.g. 3 entries) while the structured log
+            // event reports `per_cid_failure_count: 0`, leaving operators
+            // grepping logs blind to the failure shape that the client
+            // already saw.
+            let failures_for_log: &[(Cid, String)] = match &err {
+                PdsError::OriginFetchExhausted { per_cid_failures } => {
+                    per_cid_failures.as_slice()
+                }
+                _ => &[],
+            };
+            emit_rejected(&importing_did, kind, 0, failures_for_log);
             Err(err)
         }
     }
