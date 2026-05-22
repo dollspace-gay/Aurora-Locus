@@ -192,18 +192,50 @@ struct ApplyWritesRequest {
 /// Build the proto-blue Signer that the repository manager uses to sign
 /// commits.
 ///
-/// Wraps the configured hex-encoded secp256k1 repo signing key in a
-/// `RepoSigner` and hands it back as `Arc<dyn Signer>`. Failure here
-/// means the configured key is malformed — surface it as a 500-class
-/// internal error so operators see it in logs rather than getting a
-/// generic auth failure.
-fn create_repo_signer(
-    repo_key_hex: &str,
+/// Arc 18 (chainlink #117 / CF3 recon §G): resolve the per-account
+/// signing key for `did` and wrap it as `Arc<dyn Signer>`.
+///
+/// Pre-Arc-18, the four record-write handlers below all signed with
+/// the server-wide `ctx.config.authentication.repo_signing_key` (a
+/// single key shared across every actor on the instance). This left a
+/// signature-chain discontinuity at commit 2 of every repo — genesis
+/// was signed by the per-actor key from `plc_keys.atproto_signing_key`
+/// ([src/api/account_emit.rs:59-63]) but every subsequent record-write
+/// commit was signed by the global key. Latent for Aurora's own paths
+/// (which don't verify commit signatures), but federation-visible:
+/// any external verifier rotating through the importing DID's
+/// published `#atproto` verification method would fail to verify
+/// post-genesis commits.
+///
+/// Caught by Arc 16f Step 5 Phase B Scenario 2 (chainlink #121) on
+/// 2026-05-21: importing alice's CAR from instance A into instance B
+/// failed `InvalidCommitSignature` despite the signature being
+/// genuinely valid for the global key — the published per-account
+/// verification method correctly rejected it.
+///
+/// Mirrors the per-account-signer template inlined at the importRepo
+/// handler's CF3 gate ([src/api/repo_import.rs] `account_emit.rs:59`
+/// template). Surfaces `Internal` (500) on NotFound — record-write
+/// handlers have already passed createSession, so a missing
+/// `plc_keys` row is a server-side inconsistency, not an
+/// `ActorNotInitialized` (400) condition reserved for importRepo's
+/// pre-account-init gate.
+pub(crate) async fn create_actor_signer(
+    account_manager: &crate::account::AccountManager,
+    did: &str,
 ) -> PdsResult<std::sync::Arc<dyn proto_blue::crypto::Signer>> {
-    let key_bytes = hex::decode(repo_key_hex)
-        .map_err(|e| PdsError::Internal(format!("Invalid hex in repo_signing_key: {}", e)))?;
+    let key_bytes = account_manager
+        .get_atproto_signing_key_bytes(did)
+        .await
+        .map_err(|e| PdsError::Internal(format!(
+            "could not resolve per-account signing key for {}: {}",
+            did, e
+        )))?;
     let signer = crate::crypto::proto_blue_signer::RepoSigner::from_bytes(&key_bytes)
-        .map_err(|e| PdsError::Internal(format!("Failed to create repo signer: {}", e)))?;
+        .map_err(|e| PdsError::Internal(format!(
+            "Failed to construct per-account repo signer for {}: {}",
+            did, e
+        )))?;
     Ok(std::sync::Arc::new(signer))
 }
 
@@ -299,7 +331,7 @@ async fn create_record(
     .with_blob_store(ctx.blob_store.clone());
 
     // Create signer from repo key
-    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
+    let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
 
     // Create the record. Arc 16e §9.5.4 Step 2: blob refs are tracked
     // inside `apply_writes` Phase B via the wired `blob_store` field
@@ -394,7 +426,7 @@ async fn put_record(
     .with_blob_store(ctx.blob_store.clone());
 
     // Create signer from repo key
-    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
+    let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
 
     // Update the record. Arc 16e §9.5.4 Step 2: blob-ref add/drop is
     // computed in Phase B via `read_existing_refs` + set differences;
@@ -470,7 +502,7 @@ async fn delete_record(
     .with_blob_store(ctx.blob_store.clone());
 
     // Create signer from repo key
-    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
+    let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
 
     // Delete the record. Arc 16e §9.5.4 Step 2: blob refs for the
     // record are unreferenced in Phase B via the wired `blob_store`;
@@ -740,7 +772,7 @@ async fn apply_writes(
     );
 
     // Create signer from repo key
-    let signer = create_repo_signer(&ctx.config.authentication.repo_signing_key)?;
+    let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
 
     // Apply batch atomically (includes validation)
     let (commit_cid, rev) = repo_mgr.apply_batch_writes(prepared, signer).await?;

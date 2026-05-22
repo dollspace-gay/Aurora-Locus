@@ -4032,6 +4032,89 @@ mod tests {
         );
     }
 
+    /// Arc 18 (chainlink #117 / CF3 recon §G) — `create_actor_signer`
+    /// resolves the PER-ACCOUNT signing key from
+    /// `plc_keys.atproto_signing_key`, NOT the server-wide
+    /// `ctx.config.authentication.repo_signing_key`. Two-account
+    /// roundtrip proves the property:
+    ///
+    /// - Sign the same message with each actor's signer.
+    /// - Signatures MUST differ — if they're equal, the helper fell
+    ///   back to a single global key (Arc 18 regression).
+    ///
+    /// Together with the existing
+    /// `test_create_account_populates_distinct_atproto_signing_key`
+    /// (which proves the column write), this locks in the post-Arc-18
+    /// per-account signing invariant. Phase B Scenario 2 carries the
+    /// integration-level commit-chain-replay validation; this test is
+    /// the focused unit-level check.
+    #[tokio::test]
+    async fn create_actor_signer_resolves_per_account_key_not_global() {
+        use proto_blue::crypto::Signer as _;
+
+        let manager = setup_test_db().await;
+
+        let alice = manager
+            .create_account(
+                "arc18alice".to_string(),
+                Some("alice@arc18.example".to_string()),
+                "alice-password-12345".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create alice");
+        let bob = manager
+            .create_account(
+                "arc18bob".to_string(),
+                Some("bob@arc18.example".to_string()),
+                "bob-password-12345".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create bob");
+
+        let signer_alice = crate::api::repo::create_actor_signer(&manager, &alice.did)
+            .await
+            .expect("alice signer");
+        let signer_bob = crate::api::repo::create_actor_signer(&manager, &bob.did)
+            .await
+            .expect("bob signer");
+
+        let msg = b"arc18-roundtrip-check";
+        let sig_alice = signer_alice.sign(msg).expect("alice sign");
+        let sig_bob = signer_bob.sign(msg).expect("bob sign");
+
+        assert_ne!(
+            sig_alice, sig_bob,
+            "Arc 18 invariant violated: create_actor_signer returned the \
+             same key for two distinct DIDs. Either the helper is reading \
+             a global key (regression to pre-Arc-18 behaviour) or the \
+             per-account keys collided (vanishingly improbable)."
+        );
+
+        // Cross-check: the key resolved for alice's DID matches the column
+        // value populated by alice's create_account, NOT bob's. Proves the
+        // helper is DID-keyed, not e.g. last-account-keyed.
+        let alice_key_bytes = manager
+            .get_atproto_signing_key_bytes(&alice.did)
+            .await
+            .expect("alice key bytes");
+        let alice_kp_from_column =
+            proto_blue::crypto::K256Keypair::from_private_key(&alice_key_bytes)
+                .expect("alice kp from column");
+        let sig_from_column = alice_kp_from_column
+            .sign(msg)
+            .expect("sign with column-derived keypair");
+        assert_eq!(
+            sig_alice, sig_from_column,
+            "create_actor_signer(alice) must produce the same signature as \
+             K256Keypair::from_private_key(plc_keys.atproto_signing_key for alice). \
+             A mismatch means the helper is not reading the published per-account key."
+        );
+    }
+
     // ============================================================
     // Arc 13 §6.3.6 / Step 3 / chainlink #71 — end-to-end
     // validate → consume → re-consume sequence for the
