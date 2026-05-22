@@ -152,7 +152,6 @@ async fn import_repo(
     let importing_did = auth.did().to_string();
 
     info!(
-        target: "import_repo",
         event = "import_repo_starting",
         did = %importing_did,
         "importRepo handler entry"
@@ -185,8 +184,7 @@ async fn import_repo(
         Some(g) => g,
         None => {
             warn!(
-                target: "import_repo",
-                did = %importing_did,
+                        did = %importing_did,
                 "importRepo concurrent mutation rejected"
             );
             emit_rejected(&importing_did, "ConcurrentMutation", 0, &[]);
@@ -229,7 +227,6 @@ async fn import_repo(
     let car_bytes = read_body_with_cap(body, ctx.config.service.max_import_size).await?;
     let car_size = car_bytes.len();
     debug!(
-        target: "import_repo",
         did = %importing_did,
         car_size,
         "importRepo CAR body buffered"
@@ -306,7 +303,6 @@ async fn import_repo(
     let prepared_write_count = writes.len();
     let validate_phase_cid_count = blob_cids.len();
     debug!(
-        target: "import_repo",
         did = %importing_did,
         prepared_write_count,
         validate_phase_cid_count,
@@ -396,8 +392,7 @@ async fn import_repo(
     match outcome {
         Ok((commit_cid, rev)) => {
             info!(
-                target: "import_repo",
-                event = "import_repo_complete",
+                        event = "import_repo_complete",
                 did = %importing_did,
                 car_size,
                 prepared_write_count,
@@ -417,8 +412,7 @@ async fn import_repo(
             let kind = error_kind_label(&err);
             emit_rejected(&importing_did, kind, car_size, &[]);
             warn!(
-                target: "import_repo",
-                event = "import_repo_rejected",
+                        event = "import_repo_rejected",
                 did = %importing_did,
                 car_size,
                 error = %err,
@@ -620,8 +614,7 @@ async fn validate_phase_blob_check(
         match quarantine.get_quarantine(&cid_str).await {
             Ok(Some(rec)) => {
                 warn!(
-                    target: "import_repo",
-                    did = %importing_did,
+                                did = %importing_did,
                     cid = %cid_str,
                     reason_class = ?rec.reason,
                     "importRepo validate-phase: CID quarantined"
@@ -836,7 +829,6 @@ fn emit_rejected(
         per_cid_failures,
     };
     info!(
-        target: "import_repo",
         event = evt.event,
         did = %evt.did,
         rejection_reason = %evt.rejection_reason,
@@ -881,6 +873,67 @@ mod tests {
         use std::str::FromStr;
         Cid::from_str("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
             .expect("valid CIDv1 raw multibase")
+    }
+
+    // ------------------------------------------------------------
+    // Forensic tracing target convention (post-bare-target regression)
+    // ------------------------------------------------------------
+
+    /// Regression test for the Phase B Scenario 2 forensic-logging
+    /// bypass discovered 2026-05-21: `tracing::info!` / `warn!` /
+    /// `debug!` invocations in this module previously used
+    /// `target: "import_repo"` — a bare-string target that doesn't
+    /// match the standard `aurora_locus=info` `EnvFilter` and is
+    /// silently dropped. The fix: remove the `target:` override
+    /// entirely, so emits use the default module-path target
+    /// (`aurora_locus::api::repo_import`) which matches the
+    /// `aurora_locus=info` prefix rule.
+    ///
+    /// This test reads this file's source at compile time and asserts
+    /// no `target: "..."` override exists with a target that does
+    /// not start with `aurora_locus` (the prefix the standard
+    /// RUST_LOG filter matches). A future contributor who
+    /// re-introduces `target: "import_repo"` (or any other
+    /// non-aurora_locus target) gets a loud test failure rather
+    /// than silently broken production observability.
+    #[test]
+    fn no_tracing_target_overrides_outside_aurora_locus_namespace() {
+        let src = include_str!("repo_import.rs");
+        let mut violations: Vec<String> = Vec::new();
+        for (lineno_zero, line) in src.lines().enumerate() {
+            // Skip comment lines (including the doc-comment ON THIS
+            // TEST, which legitimately contains the bad literal as
+            // documentation). Aurora-Locus's formatted style puts
+            // tracing-macro args at uniform indentation; the line's
+            // first non-whitespace char distinguishes code from
+            // comment.
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // Match a `target: "..."` macro-arg form on a CODE line.
+            if let Some(after) = line.split("target: \"").nth(1) {
+                if let Some(value) = after.split('"').next() {
+                    if !value.starts_with("aurora_locus") {
+                        violations.push(format!(
+                            "line {}: target=\"{}\"",
+                            lineno_zero + 1,
+                            value
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "repo_import.rs has tracing target overrides outside the \
+             aurora_locus::* namespace. These bypass the standard \
+             `aurora_locus=info` EnvFilter and would silently drop \
+             forensic events. Remove the `target:` override (default \
+             module-path target matches the filter) or use an \
+             `aurora_locus::*`-prefixed target.\n\nViolations:\n{}",
+            violations.join("\n")
+        );
     }
 
     // ------------------------------------------------------------

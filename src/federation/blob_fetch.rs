@@ -194,7 +194,6 @@ pub(crate) async fn fetch_blob_inner(
         match do_get_attempt(client, &url, cid, max_size).await {
             Ok(bytes) => {
                 debug!(
-                    target: "blob_fetch",
                     cid = %cid,
                     bytes = bytes.len(),
                     "origin blob fetch ok"
@@ -213,8 +212,7 @@ pub(crate) async fn fetch_blob_inner(
                 let reason = transient.to_string();
                 if attempt >= max_retries {
                     warn!(
-                        target: "blob_fetch",
-                        cid = %cid,
+                            cid = %cid,
                         attempts = attempt + 1,
                         last = %reason,
                         "origin blob fetch exhausted retries"
@@ -230,7 +228,6 @@ pub(crate) async fn fetch_blob_inner(
                 }
                 let sleep = backoff_base * (1u32 << attempt);
                 debug!(
-                    target: "blob_fetch",
                     cid = %cid,
                     attempt = attempt + 1,
                     sleep_ms = sleep.as_millis() as u64,
@@ -259,7 +256,6 @@ async fn head_size_check(
         Ok(r) => r,
         Err(e) => {
             debug!(
-                target: "blob_fetch",
                 cid = %cid,
                 err = %e,
                 "HEAD request failed; deferring size check to body-cap path"
@@ -271,7 +267,6 @@ async fn head_size_check(
     let status = resp.status();
     if !status.is_success() {
         debug!(
-            target: "blob_fetch",
             cid = %cid,
             %status,
             "HEAD returned non-success; deferring size check to body-cap path"
