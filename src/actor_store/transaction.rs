@@ -591,4 +591,46 @@ mod tests {
         assert!(store.get_block(&did, "cid1").await.unwrap().is_some());
         assert!(store.get_block(&did, "cid2").await.unwrap().is_some());
     }
+
+    /// Arc 16f Step 3 v5.2 (chainlink #123) — `ActorStore::create` is
+    /// idempotent for already-initialised DIDs: a second call returns
+    /// `Ok(())` with no data loss. This is the load-bearing property
+    /// behind the import_repo handler's CF3-gate auto-init call —
+    /// importRepo runs `create()` unconditionally on every invocation,
+    /// safe because already-init'd stores are no-ops.
+    #[tokio::test]
+    async fn actor_store_create_is_idempotent_for_already_initialised_did() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = ActorStoreConfig {
+            base_directory: temp_dir.path().to_path_buf(),
+            cache_size: 10,
+        };
+        let store = ActorStore::new(config);
+        let did = "did:plc:idempotency-test";
+
+        // First call: fresh init.
+        store.create(did).await.expect("first create ok");
+        assert!(store.exists(did).await, "store exists after first create");
+
+        // Write a sentinel row so we can prove the second create() didn't
+        // wipe state. update_repo_root upserts; if the second create()
+        // somehow dropped/recreated the table, the sentinel would be lost.
+        store
+            .update_repo_root(did, "bafy_idempotency_sentinel_cid", "3jzfcijpj2z2a")
+            .await
+            .expect("upsert sentinel ok");
+        let pre = store.get_repo_root(did).await.expect("read sentinel ok");
+        assert_eq!(pre.cid, "bafy_idempotency_sentinel_cid");
+
+        // Second call: must succeed without disturbing state.
+        store.create(did).await.expect("second create ok — idempotent");
+        assert!(store.exists(did).await, "store still exists after second create");
+
+        let post = store.get_repo_root(did).await.expect("read sentinel again");
+        assert_eq!(
+            post.cid, "bafy_idempotency_sentinel_cid",
+            "second create() must NOT have wiped the repo_root row"
+        );
+        assert_eq!(post.rev, "3jzfcijpj2z2a");
+    }
 }

@@ -207,6 +207,22 @@ async fn import_repo(
         return Ok((status, Json(payload)).into_response());
     }
 
+    // Arc 16f Step 3 v5.2 (chainlink #123) — ensure the per-actor
+    // SQLite store exists for the importing DID. Idempotent: ActorStore::
+    // create uses CREATE TABLE IF NOT EXISTS + create_dir_all, so this
+    // is a no-op for already-initialised stores and materialises the
+    // store on first import for a seeded-but-uninitialised DID
+    // (the v0.5 federation-into-fresh-instance case). Mirrors the
+    // production createAccount path's seed-shared-DB-then-init-actor-store
+    // flow at src/api/server.rs:230. Without this, apply_writes →
+    // proto-blue Repo → SqliteRepoStorage::put_block → ActorStore::
+    // open_db fails NotFound for any DID whose actor store wasn't
+    // initialised through createAccount.
+    if let Err(e) = ctx.actor_store.create(&importing_did).await {
+        emit_rejected(&importing_did, "Internal", 0, &[]);
+        return Err(e);
+    }
+
     // CAR body read with streaming size-bound enforcement
     // (round-1 F21). Chunks accumulate; first chunk that pushes
     // the total past `max_import_size` aborts the read.
