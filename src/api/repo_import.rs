@@ -892,6 +892,98 @@ mod tests {
     }
 
     // ------------------------------------------------------------
+    // CF1 signature-verification routing (chainlink #120 brittleness)
+    // ------------------------------------------------------------
+
+    /// Phase B Scenario 7 discovered (2026-05-22) that the `dd`-corrupt
+    /// weak form CANNOT reach `verify_diff_car`'s signature-verification
+    /// path — proto-blue rejects the byte-flipped CAR at the CID-hash
+    /// integrity check first (`RepoError::CidMismatch`), well before
+    /// signature verification runs. "Structurally valid + wrong
+    /// signature" is unreachable via byte corruption alone.
+    ///
+    /// To exercise the SIGNATURE path proper, this unit test
+    /// constructs a structurally-valid CAR signed by key_A then asks
+    /// `verify_diff_car` to verify it against key_B's `did:key` (a
+    /// different, valid key). proto-blue should reject with
+    /// `RepoError::InvalidSignature`, whose `Display` impl is
+    /// `"Invalid signature on commit"`. Aurora's routing at
+    /// [`import_repo_inner`]'s `verify_diff_car` Err arm string-matches
+    /// the `Display` text for `signature`/`signing` → routes to
+    /// `PdsError::InvalidCommitSignature`. If proto-blue's `Display`
+    /// wording changes in a future bump (chainlink #120), the routing
+    /// silently degrades to `InvalidCar` and federation verification
+    /// loses its wire-distinguishable signal — this test fails loud.
+    ///
+    /// Covers what the weak-form Phase B couldn't: the end-to-end
+    /// SDK→wire-code routing for the wrong-signer case.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_diff_car_wrong_key_displays_signature_keyword_for_aurora_routing() {
+        use proto_blue::crypto::{K256Keypair, Keypair};
+        use proto_blue::lex_cbor::cid_for_lex;
+        use proto_blue::lex_data::LexValue;
+        use proto_blue::repo::{
+            blocks_to_car, sign_commit, BlockMap, MstNode, UnsignedCommit,
+        };
+
+        // Build a CAR signed by key_A with key_A's DID embedded.
+        let kp_a = K256Keypair::generate();
+        let mut mst = MstNode::empty();
+        let mut blocks = BlockMap::new();
+        let record_key = "app.bsky.feed.post/3jzfcijpj2z2a";
+        let record_value = LexValue::String("payload".into());
+        let record_cid = cid_for_lex(&record_value).unwrap();
+        blocks.add_value(&record_value).unwrap();
+        mst = mst.add(record_key, record_cid).unwrap();
+        let (mst_root, mst_blocks) = mst.get_all_blocks().unwrap();
+        blocks.add_map(&mst_blocks);
+        let unsigned =
+            UnsignedCommit::new(kp_a.did(), mst_root, "3jzfcijpj2z2a".to_string(), None);
+        let signed = sign_commit(&unsigned, &kp_a).unwrap();
+        let commit_cid = signed.cid().unwrap();
+        blocks.set(commit_cid.clone(), signed.to_cbor().unwrap());
+        let car = blocks_to_car(Some(&commit_cid), &blocks).unwrap();
+
+        // Verify against a DIFFERENT key's did:key. proto-blue must
+        // reject because the embedded signature was made with key_A
+        // but verification expects key_B.
+        let kp_b = K256Keypair::generate();
+        let wrong_did_key = kp_b.did();
+        assert_ne!(kp_a.did(), wrong_did_key, "two distinct keys");
+
+        let result = verify_diff_car(
+            &car,
+            None,
+            Some(&kp_a.did()),
+            Some(&wrong_did_key),
+        );
+        let err = result.expect_err("wrong-key CAR must be rejected");
+        let display = err.to_string();
+        let lower = display.to_lowercase();
+
+        // The load-bearing routing assertion: Aurora at
+        // import_repo_inner's verify_diff_car Err arm matches on
+        // `lower.contains("signature") || lower.contains("signing")`
+        // to route to PdsError::InvalidCommitSignature. proto-blue's
+        // RepoError::InvalidSignature Display ("Invalid signature on
+        // commit") satisfies this — but if a future proto-blue bump
+        // changes the wording (e.g. "signed payload rejected"),
+        // Aurora silently routes wrong-key failures to InvalidCar,
+        // producing wire-indistinguishable confusion at the federation
+        // surface. This test fails loud on that change.
+        assert!(
+            lower.contains("signature") || lower.contains("signing"),
+            "proto-blue's wrong-key error Display must contain `signature` \
+             or `signing` for Aurora's `verify_diff_car` Err routing to \
+             map it to InvalidCommitSignature. Got: {}\n\nIf proto-blue's \
+             Display wording changed, update import_repo_inner's string-\
+             match heuristic (chainlink #120) — or take the upstream-\
+             discriminated-variant fix.",
+            display
+        );
+    }
+
+    // ------------------------------------------------------------
     // Forensic tracing target convention (post-bare-target regression)
     // ------------------------------------------------------------
 
