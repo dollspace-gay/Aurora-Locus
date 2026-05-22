@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- Arc 18: record-write signer correctness gap (per-account key) (#117)
 - Arc 16e — apply_writes Phase B wiring: STRICT/unreference production callers via validate-phase CID walker + BlobNotFound 404→400 + InvalidCid variant (#107) + walker relocation to repository/blob_refs (#105)
 - Fix Scenario 5 findings: byte-walker ENOENT tolerance + central 5xx-cause logging (#104)
 - Arc 16d — Row-driven GC sweep (v5 LOCKED): sweep_untethered_rows primitive + autocommit-wrapper module + row_sweep_job + GcSweepConfig extensions + Postgres READ COMMITTED pool-pin + cross-backend Phase B (#101)
