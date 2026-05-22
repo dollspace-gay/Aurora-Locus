@@ -329,7 +329,7 @@ async fn import_repo_inner(
     );
 
     // Pooled reqwest::Client (round-1 F11) — single instance per
-    // handler invocation, threaded to all fetch calls.
+    // handler invocation, used for the pre-fetch loop below.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(
             ctx.config.service.blob_fetch_timeout_seconds,
@@ -339,90 +339,96 @@ async fn import_repo_inner(
             PdsError::Internal(format!("reqwest client construction failed: {}", e))
         })?;
 
-    // RepositoryManager is not Clone (holds a sync RecordValidator);
-    // rebuild it on each loop iteration. Construction is cheap —
-    // just struct field setup, no I/O — and lets the closure satisfy
-    // the FnMut bound without needing Arc<Manager> indirection.
-    let writes_for_loop = writes.clone();
-    let signer_for_loop = signer.clone();
-    let did_for_loop = importing_did.to_string();
-    let actor_store_for_loop = (*ctx.actor_store).clone();
-    let sequencer_for_loop = ctx.sequencer.clone();
-    let validation_mode_for_loop = ctx.config.validation_mode;
-    let blob_store_for_loop = ctx.blob_store.clone();
     let started = std::time::Instant::now();
 
-    // HttpOriginBlobFetcher is zero-sized; construct fresh per
-    // stage call inside the closure rather than capturing by-move.
-    let blob_store_for_stage = ctx.blob_store.clone();
-    let did_for_stage = importing_did.to_string();
-    let client_for_stage = client.clone();
-    let ctx_for_stage = ctx.clone();
-    let outcome = import_with_fetch_retry(
-        ctx.config.service.blob_fetch_max_retries,
-        // do_writes: Arc 16f Step 4 flipped this from the v5
-        // `apply_writes(writes, signer)` call to the v5.1
-        // `apply_writes(writes, signer, Arc::new(TolerantPromoter))`
-        // form. TolerantPromoter signals NeedsBlobFetch on row-absent
-        // CIDs, which `import_with_fetch_retry` consumes via the
-        // already-tested NeedsBlobFetch branch.
-        || {
-            let writes = writes_for_loop.clone();
-            let signer = signer_for_loop.clone();
-            let mgr = RepositoryManager::with_sequencer_and_validation(
-                did_for_loop.clone(),
-                actor_store_for_loop.clone(),
-                sequencer_for_loop.clone(),
-                validation_mode_for_loop,
-            )
-            .with_blob_store(blob_store_for_loop.clone());
-            async move {
-                mgr.apply_writes(
-                    writes,
-                    signer,
-                    Arc::new(crate::blob_store::TolerantPromoter),
-                )
-                .await
-            }
-        },
-        // stage_one: fetch + stage + commit per-CID. Captures the
-        // pooled client + blob store + DID; the trait shim
-        // (`OriginBlobFetcher`) lets Phase B and Step 4 tests swap in
-        // mock fetchers without touching this seam.
-        |cid: Cid| {
-            let client = client_for_stage.clone();
-            let blob_store = blob_store_for_stage.clone();
-            let did = did_for_stage.clone();
-            let ctx_inner = ctx_for_stage.clone();
-            async move {
-                let fetcher = crate::federation::blob_fetch::HttpOriginBlobFetcher;
-                fetch_and_stage_one(&ctx_inner, &client, &blob_store, &did, &cid, &fetcher)
-                    .await
-            }
-        },
+    // Step 3 v5.3 (chainlink #124) — PRE-FETCH missing blobs BEFORE
+    // apply_writes. Closes the multi-blob retry-into-Phase-A-collision
+    // surfaced by Phase B Scenario 13: §9.6.3.5's "Phase A re-commit
+    // on retry is idempotent" claim applies to Aurora's `put_record`
+    // SQL but NOT to proto-blue's `Repo::apply_writes` MST commit
+    // (which rejects Create-on-existing-key). After the first
+    // apply_writes attempt's Phase A committed records to per-actor
+    // SQLite, a NeedsBlobFetch retry would re-run Phase A against a
+    // repo that ALREADY contains those keys, failing
+    // `Key already exists: <collection>/<rkey>`.
+    //
+    // By staging all missing blobs BEFORE apply_writes, the
+    // TolerantPromoter Phase B inner loop sees every CID present and
+    // returns `Done` for each — no NeedsBlobFetch fires on the happy
+    // path, no retry, no Phase A collision. TolerantPromoter stays
+    // wired as defense-in-depth for the narrow race window where a
+    // blob's metadata row vanishes between pre-fetch and Phase B
+    // (concurrent admin action — vanishingly rare); a post-pre-fetch
+    // NeedsBlobFetch surfaces as Internal (signals a real bug).
+    let fetcher = crate::federation::blob_fetch::HttpOriginBlobFetcher;
+    let mut fetched_blob_count: u32 = 0;
+    for cid in &blob_cids {
+        let cid_str = cid.to_string();
+        let already_present = ctx.blob_store.get_metadata(&cid_str).await?.is_some();
+        if !already_present {
+            fetch_and_stage_one(ctx, &client, &ctx.blob_store, importing_did, cid, &fetcher)
+                .await?;
+            fetched_blob_count += 1;
+        }
+    }
+
+    // apply_writes runs ONCE with all blobs staged. TolerantPromoter
+    // returns Done for each present blob; no NeedsBlobFetch on the
+    // happy path.
+    let mgr = RepositoryManager::with_sequencer_and_validation(
+        importing_did.to_string(),
+        (*ctx.actor_store).clone(),
+        ctx.sequencer.clone(),
+        ctx.config.validation_mode,
     )
-    .await;
+    .with_blob_store(ctx.blob_store.clone());
+
+    let outcome = mgr
+        .apply_writes(writes, signer, Arc::new(crate::blob_store::TolerantPromoter))
+        .await;
 
     let total_duration_ms = started.elapsed().as_millis() as u64;
 
-    let (commit_cid, rev) = outcome?;
+    let (commit_cid, rev) = match outcome {
+        Ok(success) => success,
+        Err(PdsError::NeedsBlobFetch { cids }) => {
+            // Defense-in-depth: pre-fetch staged all required blobs,
+            // so a post-pre-fetch NeedsBlobFetch indicates concurrent
+            // blob_metadata mutation (e.g. admin quarantine racing the
+            // import) OR a pre-fetch logic bug. Surface as Internal
+            // rather than retrying — a second apply_writes would hit
+            // the Phase A retry-collision this v5.3 fix exists to
+            // prevent.
+            return Err(PdsError::Internal(format!(
+                "apply_writes returned NeedsBlobFetch after pre-fetch staged {} blob(s); \
+                 likely concurrent blob_metadata mutation. unstaged cids: {:?}",
+                fetched_blob_count, cids
+            )));
+        }
+        Err(other) => return Err(other),
+    };
 
     // §9.6.3.9 import_repo_complete — fires on success path only.
     // Apply-time Err propagates to the outer `import_repo` handler
     // which emits `import_repo_rejected` via the unified outer arm.
     //
-    // fetched_blob_count / fetch_round_count are hardcoded 0u32 per
-    // chainlink #122 (Step 3 never threaded the loop accounting out
-    // of import_with_fetch_retry); the per-fetch "origin blob fetch
-    // ok" log lines from Step 2's primitive are the authoritative
-    // count for now.
+    // fetched_blob_count: number of blobs the pre-fetch loop pulled
+    // from origin (excludes already-locally-present blobs that
+    // skipped the fetch). Post-v5.3 (chainlink #124) this is
+    // accurate-by-construction; closes chainlink #122 (the prior
+    // hardcoded placeholder).
+    //
+    // fetch_round_count: 1 if the pre-fetch ran (legacy field name
+    // preserved for operator-dashboard compat; the retry-loop
+    // accounting it tracked pre-v5.3 is no longer meaningful since
+    // the import is a single pass now).
     info!(
         event = "import_repo_complete",
         did = %importing_did,
         car_size_bytes = car_size,
         prepared_write_count,
-        fetched_blob_count = 0u32,
-        fetch_round_count = 0u32,
+        fetched_blob_count,
+        fetch_round_count = 1u32,
         total_duration_ms,
         %commit_cid,
         %rev,
@@ -943,6 +949,55 @@ mod tests {
              module-path target matches the filter) or use an \
              `aurora_locus::*`-prefixed target.\n\nViolations:\n{}",
             violations.join("\n")
+        );
+    }
+
+    // ------------------------------------------------------------
+    // §9.6.3 v5.3 — pre-fetch eliminates retry-into-Phase-A-collision
+    // ------------------------------------------------------------
+
+    /// Regression test for the Phase B Scenario 13 discovery
+    /// (chainlink #124, 2026-05-22): multi-blob imports produced
+    /// "Key already exists" on proto-blue's MST.add because the
+    /// `import_with_fetch_retry` loop re-ran `apply_writes`'s Phase A
+    /// after the first attempt's MST commit had persisted. The v5.3
+    /// fix moves blob staging out of the retry loop and BEFORE
+    /// `apply_writes`, so the handler calls apply_writes exactly once
+    /// per import with all blobs already locally staged.
+    ///
+    /// This test asserts the structural property: `import_repo_inner`
+    /// does NOT invoke `import_with_fetch_retry`. The retry-loop
+    /// function still exists for the existing in-isolation unit
+    /// tests (it's defensible code that just isn't used in
+    /// production anymore), but if it ever reappears in the
+    /// production handler body, the retry-into-Phase-A-collision
+    /// bug-class returns.
+    #[test]
+    fn import_repo_inner_does_not_invoke_retry_loop() {
+        let src = include_str!("repo_import.rs");
+        let inner_marker = "async fn import_repo_inner(";
+        let inner_start = src
+            .find(inner_marker)
+            .expect("import_repo_inner not found in repo_import.rs");
+        // Find the next top-level `async fn` declaration as the
+        // function boundary (sufficient because all helpers below
+        // import_repo_inner are `fn` or `async fn` at module scope).
+        let after_inner = &src[inner_start + inner_marker.len()..];
+        let inner_end = after_inner
+            .find("\nasync fn ")
+            .or_else(|| after_inner.find("\nfn "))
+            .unwrap_or(after_inner.len());
+        let inner_body = &after_inner[..inner_end];
+
+        assert!(
+            !inner_body.contains("import_with_fetch_retry("),
+            "Step 3 v5.3 (chainlink #124): import_repo_inner must NOT invoke \
+             import_with_fetch_retry. Pre-fetch architecture moves blob \
+             staging in front of apply_writes so the handler calls apply_writes \
+             exactly once per import; re-introducing the retry loop reopens \
+             the Phase A retry-collision on multi-blob imports (proto-blue's \
+             MST.add rejects Create-on-existing-key after Phase A of attempt \
+             1 has already persisted to per-actor SQLite)."
         );
     }
 
