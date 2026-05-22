@@ -324,15 +324,31 @@ async fn create_session(
             .check_identifier_ip(&req.identifier, &client_ip)?;
     }
 
-    // Try regular password authentication first
+    // Try regular password authentication first. If that returns a
+    // routine auth failure (NotFound / Authentication), fall through
+    // silently to the app-password path — that's the intended dual-login
+    // shape (single endpoint serves regular + app passwords). Anything
+    // else (database errors, decode failures, internal errors) must NOT
+    // be silently swallowed; #130 caught a PG-only TIMESTAMPTZ decode
+    // failure masked here for weeks, surfacing as a generic NotFound
+    // with zero log signal. Emit at warn for non-auth errors so the
+    // next decode/database failure is grep-visible.
     let (account, session) = match ctx
         .account_manager
         .login(&req.identifier, &req.password)
         .await
     {
         Ok(result) => result,
-        Err(_) => {
-            // If regular password fails, try app password authentication
+        Err(err) => {
+            if !matches!(
+                err,
+                PdsError::NotFound(_) | PdsError::Authentication(_)
+            ) {
+                tracing::warn!(
+                    error = %err,
+                    "primary login path errored unexpectedly; falling back to app-password"
+                );
+            }
             ctx.account_manager
                 .login_with_app_password(&req.identifier, &req.password)
                 .await
