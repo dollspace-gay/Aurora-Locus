@@ -6535,6 +6535,7 @@ mod tests {
             gc_sweep: Default::default(),
             blob_metadata: Default::default(),
             entryway: None,
+            lexicon: crate::config::LexiconConfig::default(),
         };
 
         // The admin module hosts `describe_capabilities`, which
