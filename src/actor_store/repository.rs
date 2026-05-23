@@ -36,7 +36,10 @@ use crate::{
         events::{CommitEvent, CommitOp, OpAction},
         Sequencer,
     },
-    validation::{validation_errors_to_pds_error, RecordValidator, ValidationMode},
+    validation::{
+        should_validate_per_lexicon_imports, validation_errors_to_pds_error, RecordValidator,
+        ValidationMode,
+    },
 };
 use proto_blue::common::next_tid;
 use proto_blue::crypto::Signer;
@@ -129,6 +132,14 @@ pub struct RepositoryManager {
     /// handler in production MUST chain `.with_blob_store(...)` to
     /// avoid silently dropping reference tracking.
     blob_store: Option<Arc<BlobStore>>,
+    /// Arc 17 §17.3.4 — lexicon config snapshot. Used at validate-
+    /// phase entry to evaluate the `validate_imports` override (the
+    /// per-write `validate = Some(false)` bypass is skipped when
+    /// `enabled && validate_imports` are both true). `None` =
+    /// pre-Arc-17 behavior preserved (the bypass always applies).
+    /// Paired with the validator's own `with_lexicon` wiring —
+    /// production handlers chain both onto the constructor.
+    lexicon_config: Option<crate::config::LexiconConfig>,
 }
 
 impl RepositoryManager {
@@ -145,6 +156,7 @@ impl RepositoryManager {
             validator: RecordValidator::with_mode(mode),
             sequencer: None,
             blob_store: None,
+            lexicon_config: None,
         }
     }
 
@@ -166,6 +178,7 @@ impl RepositoryManager {
             validator: RecordValidator::with_mode(mode),
             sequencer: Some(sequencer),
             blob_store: None,
+            lexicon_config: None,
         }
     }
 
@@ -177,6 +190,28 @@ impl RepositoryManager {
     #[must_use]
     pub fn with_blob_store(mut self, blob_store: Arc<BlobStore>) -> Self {
         self.blob_store = Some(blob_store);
+        self
+    }
+
+    /// Arc 17 §17.3.4 wiring: attach the lexicon resolver + config
+    /// snapshot so unknown-collection writes route through the
+    /// §17.3.1 flow AND the `validate_imports` override fires at
+    /// validate-phase entry. Production handlers chain this onto the
+    /// constructor; tests that don't exercise the Arc 17 path omit
+    /// it (pre-Arc-17 behavior is preserved).
+    #[must_use]
+    pub fn with_lexicon(
+        mut self,
+        resolver: Arc<crate::federation::lexicon_resolver::LexResolver>,
+        config: crate::config::LexiconConfig,
+    ) -> Self {
+        // Move-out / move-back is the cleanest way to thread the
+        // resolver into RecordValidator's builder without restructuring
+        // the constructor (which would ripple through every test
+        // fixture in src/).
+        let validator = std::mem::replace(&mut self.validator, RecordValidator::new());
+        self.validator = validator.with_lexicon(resolver, config.clone());
+        self.lexicon_config = Some(config);
         self
     }
 
@@ -329,15 +364,33 @@ impl RepositoryManager {
 
     /// Validate a single write — runs the codec validator under the
     /// configured mode and tracks failures on the actor store.
+    ///
+    /// Arc 17 §17.3.4 / round-1 F4 closure: when `lexicon.enabled` and
+    /// `lexicon.validate_imports = true` (default), the per-write
+    /// `validate = Some(false)` bypass is OVERRIDDEN — validate fires
+    /// regardless. This closes the v1 gap where CAR-imported records
+    /// (which the Arc 16f handler sets to `validate = Some(false)`)
+    /// received zero validation by default. The override applies to
+    /// BOTH known NSIDs (hand-coded path) and unknown NSIDs (lexicon
+    /// fall-through) — see V05_DESIGN_arc17.md §17.3.4 matrix.
     async fn validate_write(&self, write: &WriteOp) -> PdsResult<()> {
         let value = match &write.value {
             Some(v) => v,
             None => return Ok(()), // delete or no-op
         };
-        if !write.validate.unwrap_or(true) {
+
+        // §17.3.4 per-write bypass evaluation. Delegated to
+        // `should_validate_per_lexicon_imports` so the matrix is
+        // unit-tested in isolation; see that function's doc-comment
+        // table for the full rule set. Quick mental model: the
+        // override only fires when both `lexicon.enabled` and
+        // `validate_imports` are true; otherwise pre-Arc-17 semantics
+        // (the `validate = Some(false)` bypass) are preserved.
+        if !should_validate_per_lexicon_imports(write.validate, self.lexicon_config.as_ref()) {
             return Ok(());
         }
-        if let Err(errors) = self.validator.validate(&write.collection, value) {
+
+        if let Err(errors) = self.validator.validate(&write.collection, value).await {
             let uri = format!("at://{}/{}/{}", self.did, write.collection, write.rkey);
 
             if self.validator.mode() == ValidationMode::Optimistic {
