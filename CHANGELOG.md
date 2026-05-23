@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- Arc 16f Step 5: Phase B command script (#121)
+- v0.6+: import_repo_complete fetch-accounting not threaded (#122)
 - Arc 18: record-write signer correctness gap (per-account key) (#117)
 - Arc 16e — apply_writes Phase B wiring: STRICT/unreference production callers via validate-phase CID walker + BlobNotFound 404→400 + InvalidCid variant (#107) + walker relocation to repository/blob_refs (#105)
 - Fix Scenario 5 findings: byte-walker ENOENT tolerance + central 5xx-cause logging (#104)
@@ -472,6 +474,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   intermittently fail under full suite).
 
 ### Fixed
+- PG migration 0010 TIMESTAMPTZ vs Rust read-as-Option<String> divergence breaks login on Postgres (#130)
+- import_repo_rejected log emits per_cid_failure_count: 0 despite aggregated failures in wire response (#129)
 
 - **deleteAccount HTTP 500 → HTTP 200** (#86, closes #74). Phase B
   Scenario 3 surfaced `deleteAccount` failing with a generic
