@@ -304,6 +304,95 @@ pub enum PdsError {
     #[error("Invalid CAR: {0}")]
     #[allow(dead_code)]
     InvalidCar(String),
+
+    /// Arc 17 §17.3.6 — lexicon fetch (DNS / DID-resolve / HTTP)
+    /// exhausted retries OR surfaced a terminal failure. The
+    /// `failure_class` field carries the round-1 F14 forensic-log
+    /// taxonomy: `"dns_fail"`, `"did_fail"`, `"pds_unreachable"`,
+    /// `"http_5xx"`, `"http_4xx"`, `"timeout"`,
+    /// `"authority_tombstoned"`, `"authority_ambiguous"`,
+    /// `"invalid_schema"`. Mapped to HTTP 502 per §17.3.6 wire-format
+    /// alignment with Arc 16f's `OriginFetchExhausted`.
+    #[error("Lexicon fetch failed for {nsid} ({failure_class}): {source_detail}")]
+    #[allow(dead_code)]
+    LexiconFetchFailed {
+        nsid: String,
+        failure_class: &'static str,
+        source_detail: String,
+    },
+
+    /// Arc 17 §17.3.6 — fetched lexicon document failed schema
+    /// validation in `proto_blue::lexicon::Lexicons::add` (the doc is
+    /// structurally invalid as an ATProto lexicon). Mapped to HTTP
+    /// 500 per §17.3.6 (server-side state corruption, not a client
+    /// error).
+    #[error("Lexicon document {nsid} failed schema validation: {detail}")]
+    #[allow(dead_code)]
+    LexiconInvalidSchema { nsid: String, detail: String },
+
+    /// Arc 17 §17.3.6 — DNS TXT-resolved authority DID does not match
+    /// the DID actually hosting the lexicon record. Mapped to HTTP
+    /// 502 per §17.3.6.
+    #[error("Lexicon authority mismatch for {nsid}: expected {expected}, found {found}")]
+    #[allow(dead_code)]
+    LexiconAuthorityMismatch {
+        nsid: String,
+        expected: String,
+        found: String,
+    },
+
+    /// Arc 17 §17.3.6 (round-1 F5 closure) — DNS `_lexicon.<host>`
+    /// TXT lookup returned multiple TXT records OR a single record
+    /// with multiple `did=` entries. Aurora hard-fails per §17.3.1
+    /// step 3c; matches bsky-PDS strict posture at the reference
+    /// SHA (Step 0.0a ratification). Mapped to HTTP 502.
+    #[error("Lexicon authority ambiguous for {nsid}: {} candidate(s)", candidates.len())]
+    #[allow(dead_code)]
+    LexiconAuthorityAmbiguous {
+        nsid: String,
+        candidates: Vec<String>,
+    },
+
+    /// Arc 17 §17.3.6 (round-1 F13 closure) — authority DID is
+    /// tombstoned in PLC. Distinct from a generic `did_fail` so
+    /// operators can grep `failure_class = "authority_tombstoned"`
+    /// directly. Mapped to HTTP 502.
+    #[error("Lexicon authority {did} for {nsid} is tombstoned")]
+    #[allow(dead_code)]
+    LexiconAuthorityTombstoned { nsid: String, did: String },
+
+    /// Arc 17 §17.3.6 (round-1 F9 closure) — NSID fails ATProto spec
+    /// segment validation (each segment must match
+    /// `[a-z][a-z0-9-]*[a-z0-9]`, total ≥ 3 segments). Mapped to
+    /// HTTP 400 (client supplied a malformed NSID).
+    #[error("Invalid NSID: {nsid}")]
+    #[allow(dead_code)]
+    LexiconInvalidNsid { nsid: String },
+
+    /// Arc 17 §17.3.6 (round-1 F7 closure) — record failed
+    /// lexicon-driven schema validation against the fetched lexicon
+    /// doc. Structured `field_path` is extracted from proto-blue's
+    /// `ValidationError::InvalidValue { path, message }`;
+    /// `expected_type` and `actual_summary` are heuristic-derived
+    /// from the message text for v0.5 (proto-blue's structured-field
+    /// shape may evolve in v0.6+). Mapped to HTTP 400.
+    #[error("Schema violation in {collection} at {field_path}: {detail}")]
+    #[allow(dead_code)]
+    SchemaViolation {
+        collection: String,
+        field_path: String,
+        expected: Option<String>,
+        actual_summary: Option<String>,
+        detail: String,
+    },
+
+    /// Arc 17 §17.3.6 (round-1 F2 closure) — record NSID matches the
+    /// configured denylist; record is rejected outright with no
+    /// lexicon fetch attempted. Distinct from `LexiconFetchFailed`
+    /// (which is a fetch-attempt outcome). Mapped to HTTP 400.
+    #[error("Namespace denied: {nsid}")]
+    #[allow(dead_code)]
+    NamespaceDenied { nsid: String },
 }
 
 /// Manual PartialEq implementation for PdsError
@@ -367,6 +456,39 @@ impl PartialEq for PdsError {
             ) => ac == bc && asz == bsz,
             (PdsError::ConcurrentMutation, PdsError::ConcurrentMutation) => true,
             (PdsError::InvalidCar(a), PdsError::InvalidCar(b)) => a == b,
+            // Arc 17 §17.3.6 — lexicon variants.
+            (
+                PdsError::LexiconFetchFailed { nsid: an, failure_class: af, source_detail: as_ },
+                PdsError::LexiconFetchFailed { nsid: bn, failure_class: bf, source_detail: bs },
+            ) => an == bn && af == bf && as_ == bs,
+            (
+                PdsError::LexiconInvalidSchema { nsid: an, detail: ad },
+                PdsError::LexiconInvalidSchema { nsid: bn, detail: bd },
+            ) => an == bn && ad == bd,
+            (
+                PdsError::LexiconAuthorityMismatch { nsid: an, expected: ae, found: af },
+                PdsError::LexiconAuthorityMismatch { nsid: bn, expected: be, found: bf },
+            ) => an == bn && ae == be && af == bf,
+            (
+                PdsError::LexiconAuthorityAmbiguous { nsid: an, candidates: ac },
+                PdsError::LexiconAuthorityAmbiguous { nsid: bn, candidates: bc },
+            ) => an == bn && ac == bc,
+            (
+                PdsError::LexiconAuthorityTombstoned { nsid: an, did: ad },
+                PdsError::LexiconAuthorityTombstoned { nsid: bn, did: bd },
+            ) => an == bn && ad == bd,
+            (
+                PdsError::LexiconInvalidNsid { nsid: an },
+                PdsError::LexiconInvalidNsid { nsid: bn },
+            ) => an == bn,
+            (
+                PdsError::SchemaViolation { collection: ac, field_path: ap, expected: ae, actual_summary: aas, detail: ad },
+                PdsError::SchemaViolation { collection: bc, field_path: bp, expected: be, actual_summary: bas, detail: bd },
+            ) => ac == bc && ap == bp && ae == be && aas == bas && ad == bd,
+            (
+                PdsError::NamespaceDenied { nsid: an },
+                PdsError::NamespaceDenied { nsid: bn },
+            ) => an == bn,
             // Database and Io errors cannot be compared, so we use error message comparison
             (PdsError::Database(a), PdsError::Database(b)) => a.to_string() == b.to_string(),
             (PdsError::Io(a), PdsError::Io(b)) => a.to_string() == b.to_string(),
@@ -612,6 +734,49 @@ impl IntoResponse for PdsError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalServerError",
                 "Internal server error".to_string(),
+            ),
+            // Arc 17 §17.3.6 wire-format mapping (aligned with Arc 16f
+            // §9.6.3.5 OriginFetchExhausted at HTTP 502 per round-1
+            // F15 closure).
+            PdsError::LexiconFetchFailed { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "LexiconFetchFailed",
+                self.to_string(),
+            ),
+            PdsError::LexiconAuthorityMismatch { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "LexiconAuthorityMismatch",
+                self.to_string(),
+            ),
+            PdsError::LexiconAuthorityAmbiguous { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "LexiconAuthorityAmbiguous",
+                self.to_string(),
+            ),
+            PdsError::LexiconAuthorityTombstoned { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "LexiconAuthorityTombstoned",
+                self.to_string(),
+            ),
+            PdsError::LexiconInvalidSchema { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "LexiconInvalidSchema",
+                self.to_string(),
+            ),
+            PdsError::LexiconInvalidNsid { .. } => (
+                StatusCode::BAD_REQUEST,
+                "LexiconInvalidNsid",
+                self.to_string(),
+            ),
+            PdsError::SchemaViolation { .. } => (
+                StatusCode::BAD_REQUEST,
+                "SchemaViolation",
+                self.to_string(),
+            ),
+            PdsError::NamespaceDenied { .. } => (
+                StatusCode::BAD_REQUEST,
+                "NamespaceDenied",
+                self.to_string(),
             ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
