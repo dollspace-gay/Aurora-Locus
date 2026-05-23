@@ -178,6 +178,70 @@ impl LexiconCache {
         guard.insert(entry.nsid.clone(), entry);
     }
 
+    /// Arc 17 §17.3.7 admin surface — snapshot the in-memory cache
+    /// as a Vec, sorted by NSID for deterministic pagination. Cheap
+    /// because `CachedLexicon::clone` is `Arc`-pointer cloning, not
+    /// deep copying of the lexicon doc.
+    ///
+    /// Returns `(entries, total_count)`. `cursor` is the last NSID
+    /// from the previous page (None for the first page); `limit`
+    /// caps the response size. Backwards-compatible with future
+    /// pagination on top of the same shape.
+    pub async fn snapshot(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        nsid_filter: Option<&str>,
+    ) -> (Vec<CachedLexicon>, usize) {
+        let guard = self.entries.read().await;
+
+        if let Some(nsid) = nsid_filter {
+            let total = guard.contains_key(nsid) as usize;
+            let entries = guard.get(nsid).cloned().into_iter().collect();
+            return (entries, total);
+        }
+
+        let mut all: Vec<&CachedLexicon> = guard.values().collect();
+        all.sort_by(|a, b| a.nsid.cmp(&b.nsid));
+        let total = all.len();
+
+        let start_idx = match cursor {
+            Some(c) => all
+                .iter()
+                .position(|e| e.nsid.as_str() > c)
+                .unwrap_or(all.len()),
+            None => 0,
+        };
+        let end_idx = (start_idx + limit).min(all.len());
+        let page = all[start_idx..end_idx]
+            .iter()
+            .map(|e| (*e).clone())
+            .collect();
+        (page, total)
+    }
+
+    /// Arc 17 §17.3.7 admin surface — evict a single NSID from the
+    /// in-memory cache. Returns `true` if the entry was present.
+    /// Does NOT touch the on-disk row; the next restart will pick
+    /// up the on-disk value and re-warm. Operators wanting both
+    /// layers cleared should follow with the on-disk DELETE
+    /// directly (or just rely on TTL).
+    pub async fn evict(&self, nsid: &str) -> bool {
+        let mut guard = self.entries.write().await;
+        guard.remove(nsid).is_some()
+    }
+
+    /// Arc 17 §17.3.7 admin surface — evict every in-memory entry.
+    /// Returns the count of entries removed. Same on-disk caveat
+    /// as `evict`: the on-disk rows survive and will rehydrate on
+    /// next fetch.
+    pub async fn evict_all(&self) -> usize {
+        let mut guard = self.entries.write().await;
+        let count = guard.len();
+        guard.clear();
+        count
+    }
+
     /// On-disk INSERT/UPDATE for a fresh entry. The resolver spawns this
     /// onto its own task so the validate-phase return isn't blocked
     /// (§17.5.8 async-write-failure-consistency).

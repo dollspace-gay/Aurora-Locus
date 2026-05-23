@@ -146,6 +146,40 @@ impl ResolverErrorRepr {
             }
         }
     }
+
+    /// Map to the round-1 F14 forensic-log `failure_class` taxonomy.
+    /// §17.3.1 step 9 enumerates: dns_fail, did_fail, pds_unreachable,
+    /// http_5xx, http_4xx, timeout, invalid_schema,
+    /// authority_tombstoned, authority_ambiguous. `InvalidNsid` is
+    /// client-input rejection (pre-I/O) so it slots as `invalid_nsid`
+    /// even though §17.3.1 step 9 doesn't list it — operators grepping
+    /// failure_class values benefit from the distinct class. Adding it
+    /// to the metric label set is harmless (Prometheus accepts new
+    /// label values without redeclaration).
+    fn failure_class(&self) -> &'static str {
+        match self {
+            Self::InvalidNsid(_) => "invalid_nsid",
+            Self::Ambiguous { .. } => "authority_ambiguous",
+            Self::Tombstoned { .. } => "authority_tombstoned",
+            Self::FetchFailed { failure_class, .. } => failure_class,
+            Self::InvalidSchema { .. } => "invalid_schema",
+        }
+    }
+
+    /// Short detail string for the forensic log. Avoids dumping the
+    /// full candidate list / JSON detail into the log line; the wire
+    /// response already carries that.
+    fn short_detail(&self) -> String {
+        match self {
+            Self::InvalidNsid(nsid) => format!("invalid nsid: {nsid}"),
+            Self::Ambiguous { candidates, .. } => {
+                format!("{} candidates", candidates.len())
+            }
+            Self::Tombstoned { did, .. } => format!("tombstoned: {did}"),
+            Self::FetchFailed { detail, .. } => detail.clone(),
+            Self::InvalidSchema { detail, .. } => detail.clone(),
+        }
+    }
 }
 
 /// The resolver. Holds the cache, the DNS+fetcher traits, and the
@@ -160,6 +194,15 @@ pub struct LexResolver {
 }
 
 impl LexResolver {
+    /// Arc 17 §17.3.7 admin surface — borrow the underlying cache so
+    /// the `tools.aurora.lexicon.*` handlers can call `snapshot()` /
+    /// `evict()` / `evict_all()` directly. Returning `&Arc` avoids
+    /// cloning at the call site; the handler clones if it needs an
+    /// owned `Arc` for spawning.
+    pub fn cache(&self) -> &Arc<LexiconCache> {
+        &self.cache
+    }
+
     /// Build a resolver. Caller wires production impls
     /// ([`crate::federation::dns_resolver::HickoryDnsTxtResolver`] +
     /// the Step-2 production fetcher) or test mocks. The cache must
@@ -192,15 +235,27 @@ impl LexResolver {
         // stale is a v0.6+ feature per §17.5.4; v0.5 serves the
         // stale value without spawning a refresh.)
         if let Some(entry) = self.cache.get(nsid, now).await {
+            crate::metrics::AURORA_LEXICON_CACHE_HITS_TOTAL.inc();
             return Ok(entry);
         }
+        // Cache miss — every fall-through to the fetch path counts
+        // once. Phase B Scenario 15 asserts that concurrent calls for
+        // the same cold NSID increment `fetch_attempts_total` exactly
+        // once via the single-flight gate below, not once per
+        // concurrent caller; the miss-count behavior is unchanged
+        // (each caller increments misses before the gate).
+        crate::metrics::AURORA_LEXICON_CACHE_MISSES_TOTAL.inc();
 
-        // 2. Single-flight gate.
+        // 2. Single-flight gate. `fetch_attempts_total` increments
+        // ONLY in the "register a new in-flight" branch — concurrent
+        // callers for the same cold NSID share the future and don't
+        // each bump the counter (Phase B Scenario 15 / round-1 F6).
         let shared: InFlight = {
             let mut guard = self.in_flight.lock().await;
             if let Some(existing) = guard.get(nsid) {
                 existing.clone()
             } else {
+                crate::metrics::AURORA_LEXICON_FETCH_ATTEMPTS_TOTAL.inc();
                 let nsid_owned = nsid.to_string();
                 let self_clone = self.clone_inner_for_fetch();
                 let fut: BoxFuture<'static, Result<CachedLexicon, ResolverErrorRepr>> =
@@ -249,6 +304,58 @@ struct ResolverFetchHandle {
 
 impl ResolverFetchHandle {
     async fn fetch_uncached(self, nsid: &str) -> Result<CachedLexicon, ResolverErrorRepr> {
+        // Wrap the inner body so duration histogram + failure-metric +
+        // forensic logs all fire from a single accounting point regardless
+        // of which step failed. §17.3.1 step 9 names the events:
+        // lexicon_fetch_complete on success; lexicon_fetch_failed on
+        // failure carrying the failure_class field (round-1 F14 taxonomy).
+        let start = std::time::Instant::now();
+        let result = self.fetch_uncached_inner(nsid).await;
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        crate::metrics::AURORA_LEXICON_FETCH_DURATION_SECONDS.observe(elapsed_secs);
+
+        match &result {
+            Ok(entry) => {
+                info!(
+                    event = "lexicon_fetch_complete",
+                    nsid = %nsid,
+                    authority_did = %entry.authority_did,
+                    duration_secs = elapsed_secs,
+                    "lexicon fetch + parse + cache write succeeded"
+                );
+            }
+            Err(err) => {
+                let failure_class = err.failure_class();
+                crate::metrics::AURORA_LEXICON_FETCH_FAILURES_TOTAL
+                    .with_label_values(&[failure_class])
+                    .inc();
+                info!(
+                    event = "lexicon_fetch_failed",
+                    nsid = %nsid,
+                    failure_class = %failure_class,
+                    duration_secs = elapsed_secs,
+                    detail = %err.short_detail(),
+                    "lexicon fetch failed"
+                );
+            }
+        }
+
+        // Arc 16e §9.5.3.1.3 — flush stdout so structured emissions
+        // land immediately even if the process aborts shortly after
+        // (Arc 16f §9.6.3.9 convention for forensic-discipline events).
+        use std::io::Write as _;
+        let _ = std::io::stdout().lock().flush();
+
+        result
+    }
+
+    /// §17.3.1 steps 3-8: the actual fetch flow. Extracted from
+    /// `fetch_uncached` so the duration histogram + failure-metric +
+    /// forensic-log accounting sits in one wrapping place.
+    async fn fetch_uncached_inner(
+        &self,
+        nsid: &str,
+    ) -> Result<CachedLexicon, ResolverErrorRepr> {
         // Validate NSID first — cheap, deterministic, no I/O.
         if !is_valid_nsid(nsid) {
             return Err(ResolverErrorRepr::InvalidNsid(nsid.to_string()));
@@ -314,12 +421,6 @@ impl ResolverFetchHandle {
             }
         });
 
-        info!(
-            event = "lexicon_fetch_complete",
-            nsid = %nsid,
-            authority_did = %authority_did,
-            "lexicon fetch + parse + cache write succeeded"
-        );
         Ok(entry)
     }
 
