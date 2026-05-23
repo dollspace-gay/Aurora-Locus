@@ -322,13 +322,14 @@ async fn create_record(
 
     // Create repository manager with sequencer
     tracing::debug!("create_record: Creating repository manager with sequencer");
-    let repo_mgr = RepositoryManager::with_sequencer_and_validation(
-        auth_did.to_string(),
-        (*ctx.actor_store).clone(),
-        ctx.sequencer.clone(),
-        ctx.config.validation_mode,
-    )
-    .with_blob_store(ctx.blob_store.clone());
+    // §17.4 Step 4 + #136 — go through `for_writer` so the Arc 17
+    // lexicon resolver + config snapshot get plumbed when
+    // `lexicon_resolver` is `Some`. Centralization is load-bearing:
+    // pre-#136, this site chained `.with_blob_store` but not
+    // `.with_lexicon`, leaving the dispatch ladder's PRIORITY 2 gate
+    // empty and forcing every unknown-NSID write through Optimistic
+    // fall-through.
+    let repo_mgr = RepositoryManager::for_writer(&ctx, auth_did.to_string());
 
     // Create signer from repo key
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
@@ -416,14 +417,9 @@ async fn put_record(
         ));
     }
 
-    // Create repository manager
-    let repo_mgr = RepositoryManager::with_sequencer_and_validation(
-        auth_did.to_string(),
-        (*ctx.actor_store).clone(),
-        ctx.sequencer.clone(),
-        ctx.config.validation_mode,
-    )
-    .with_blob_store(ctx.blob_store.clone());
+    // Create repository manager via §17.4-Step-4 / #136 helper —
+    // plumbs the lexicon resolver + config when enabled.
+    let repo_mgr = RepositoryManager::for_writer(&ctx, auth_did.to_string());
 
     // Create signer from repo key
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
@@ -492,14 +488,11 @@ async fn delete_record(
         ));
     }
 
-    // Create repository manager
-    let repo_mgr = RepositoryManager::with_sequencer_and_validation(
-        auth_did.to_string(),
-        (*ctx.actor_store).clone(),
-        ctx.sequencer.clone(),
-        ctx.config.validation_mode,
-    )
-    .with_blob_store(ctx.blob_store.clone());
+    // §17.4-Step-4 / #136 — delete writes don't reach the lexicon
+    // path (`validate_write` early-returns on `write.value = None`),
+    // but route through `for_writer` anyway so the audit grep
+    // (#136-guard-2) has a uniform rule.
+    let repo_mgr = RepositoryManager::for_writer(&ctx, auth_did.to_string());
 
     // Create signer from repo key
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
@@ -753,14 +746,11 @@ async fn apply_writes(
         ));
     }
 
-    // Create repository manager
-    let repo_mgr = RepositoryManager::with_sequencer_and_validation(
-        auth_did.to_string(),
-        (*ctx.actor_store).clone(),
-        ctx.sequencer.clone(),
-        ctx.config.validation_mode,
-    )
-    .with_blob_store(ctx.blob_store.clone());
+    // §17.4-Step-4 / #136 — batch writes route the same way: each
+    // per-write validate dispatch goes through the lexicon resolver
+    // when plumbed, and the §17.3.4 `validate_imports` override
+    // fires at validate-phase entry for each write in the batch.
+    let repo_mgr = RepositoryManager::for_writer(&ctx, auth_did.to_string());
 
     // Prepare writes (converts to PreparedWrite format)
     let prepared = repo_mgr.prepare_writes(req.writes)?;

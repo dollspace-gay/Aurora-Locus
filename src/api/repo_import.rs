@@ -417,13 +417,16 @@ async fn import_repo_inner(
     // apply_writes runs ONCE with all blobs staged. TolerantPromoter
     // returns Done for each present blob; no NeedsBlobFetch on the
     // happy path.
-    let mgr = RepositoryManager::with_sequencer_and_validation(
-        importing_did.to_string(),
-        (*ctx.actor_store).clone(),
-        ctx.sequencer.clone(),
-        ctx.config.validation_mode,
-    )
-    .with_blob_store(ctx.blob_store.clone());
+    //
+    // §17.4-Step-4 / #136 — importRepo is THE site where §17.3.4's
+    // `validate_imports` override fires. Without `for_writer` (which
+    // plumbs the lexicon resolver + config snapshot), the
+    // `lexicon_config = None` branch at validate-phase entry leaves
+    // the override unreachable from the import path — every CAR-
+    // imported record bypasses validation regardless of what
+    // `PDS_LEXICON_VALIDATE_IMPORTS` is set to. Phase B Scenario 16
+    // depends on this.
+    let mgr = RepositoryManager::for_writer(ctx, importing_did.to_string());
 
     let outcome = mgr
         .apply_writes(writes, signer, Arc::new(crate::blob_store::TolerantPromoter))
