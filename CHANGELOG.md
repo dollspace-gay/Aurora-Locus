@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- Arc 17 Phase B bug #2: lexicon fetch-class HardFail bypasses ValidationMode::Optimistic at validate_write — §17.3.3 precedence gate via `is_fetch_class_lexicon_variant` + `should_propagate_validation_errors` (#137)
 - Arc 16f Step 5: Phase B command script (#121)
 - v0.6+: import_repo_complete fetch-accounting not threaded (#122)
 - Arc 18: record-write signer correctness gap (per-account key) (#117)

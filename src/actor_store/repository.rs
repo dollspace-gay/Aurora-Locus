@@ -37,8 +37,8 @@ use crate::{
         Sequencer,
     },
     validation::{
-        should_validate_per_lexicon_imports, validation_errors_to_pds_error, RecordValidator,
-        ValidationMode,
+        should_propagate_validation_errors, should_validate_per_lexicon_imports,
+        validation_errors_to_pds_error, RecordValidator, ValidationMode,
     },
 };
 use proto_blue::common::next_tid;
@@ -439,7 +439,23 @@ impl RepositoryManager {
         if let Err(errors) = self.validator.validate(&write.collection, value).await {
             let uri = format!("at://{}/{}/{}", self.did, write.collection, write.rkey);
 
-            if self.validator.mode() == ValidationMode::Optimistic {
+            // Arc 17 §17.3.3 Phase B bug #2 — lexicon fetch-class
+            // failures (HardFail, authority-trust, deny, invalid-NSID)
+            // bypass `ValidationMode::Optimistic` per the §17.3.3
+            // precedence ("HardFail propagates; record validation
+            // fails" is strictly stronger than Optimistic's accept-
+            // on-failure). `SchemaViolation` and hand-coded validator
+            // errors remain absorbable under Optimistic — the matrix
+            // lives in `should_propagate_validation_errors` so the
+            // precedence is unit-tested in isolation. Warn-mode lexicon
+            // failures never reach this branch as fetch-class variants
+            // (handle_fetch_error short-circuits to handle_unknown
+            // before re-emitting an error), so the gate doesn't
+            // interfere with the warn_fallback path.
+            let propagate = should_propagate_validation_errors(&errors, self.validator.mode());
+
+            if !propagate {
+                // Optimistic absorb — track and accept.
                 if let Err(e) = self
                     .store
                     .track_validation_failure(&self.did, &write.collection, &uri, &errors)
@@ -455,7 +471,10 @@ impl RepositoryManager {
                 return Ok(());
             }
 
-            // Required mode — track and reject.
+            // Required mode OR fetch-class lexicon variant under
+            // Optimistic — track and reject. `validation_errors_to_pds_error`
+            // routes `@lexicon/LexiconFetchFailed` to `PdsError::LexiconFetchFailed`
+            // → HTTP 502 per §17.3.6 wire alignment.
             let _ = self
                 .store
                 .track_validation_failure(&self.did, &write.collection, &uri, &errors)
@@ -2286,6 +2305,156 @@ mod tests {
                     "{path} contains {direct_call_count} direct `RepositoryManager::with_sequencer_and_validation(` call(s) — write handlers MUST go through `RepositoryManager::for_writer` so the §17.4 Step 4 lexicon plumbing can't be silently skipped (Phase B Scenario 12 / chainlink #136 regression preventer)",
                 );
             }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Arc 17 #137 — Phase B bug #2 regression preventers
+    //
+    // Phase B Scenario 6a caught it: with `PDS_LEXICON_ENABLED=true`,
+    // `fetch_failure_behavior=HardFail`, the validator emitted
+    // `ValidationError::LexiconFetchFailed` correctly, but
+    // `validate_write`'s `ValidationMode::Optimistic` catch blanket-
+    // accepted ALL errors regardless of variant. Observed wire shape
+    // was HTTP 200 with a warn log; §17.3.3 says HardFail propagates
+    // (HTTP 502 expected).
+    //
+    // The fix added `is_fetch_class_lexicon_variant` +
+    // `should_propagate_validation_errors` (both unit-tested in
+    // `validation::tests::arc17_matrix`). These integration tests
+    // assert the end-to-end behavior at the repo layer:
+    //
+    // - HardFail + Optimistic + unknown NSID + erroring fetcher
+    //   → validate_write returns `Err(LexiconFetchFailed)`.
+    // - Warn   + Optimistic + same wiring
+    //   → validate_write returns `Ok(())` (warn_fallback ordering
+    //     preserved — fetch-class error is never re-emitted because
+    //     handle_fetch_error short-circuits to handle_unknown).
+    // ──────────────────────────────────────────────────────────────
+
+    mod bug_2_hardfail_optimistic_137 {
+        use super::*;
+        use crate::config::FetchFailureBehavior;
+        use crate::federation::dns_resolver::{DnsTxtResolver, MockDnsTxtResolver};
+        use crate::federation::lexicon_cache::LexiconCache;
+        use crate::federation::lexicon_resolver::{
+            LexResolver, LexiconFetcherError, LexiconRecordFetcher,
+        };
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        /// Fetcher that always returns Http5xx — drives the resolver
+        /// through `Err(PdsError::LexiconFetchFailed)` so
+        /// `handle_fetch_error` produces a `@lexicon/LexiconFetchFailed`
+        /// ValidationError.
+        struct ErroringFetcher;
+
+        #[async_trait]
+        impl LexiconRecordFetcher for ErroringFetcher {
+            async fn fetch(
+                &self,
+                _authority_did: &str,
+                _nsid: &str,
+            ) -> Result<String, LexiconFetcherError> {
+                Err(LexiconFetcherError::Http5xx("503".to_string()))
+            }
+        }
+
+        /// Build a `RepositoryManager` wired to a lexicon resolver
+        /// whose fetcher errors, ValidationMode=Optimistic, and the
+        /// caller-chosen `fetch_failure_behavior`. The DNS resolver
+        /// is mocked to answer the §17.3.5 authority lookup so the
+        /// path gets all the way to the fetcher.
+        async fn build_mgr(
+            behavior: FetchFailureBehavior,
+        ) -> (RepositoryManager, tempfile::TempDir, String) {
+            let (store, temp) = test_store();
+            let did = unique_did();
+
+            let mut cfg = crate::config::LexiconConfig::default();
+            cfg.enabled = true;
+            cfg.fetch_failure_behavior = behavior;
+
+            // §17.3.5 authority for NSID `com.example.thing.foo` is
+            // `thing.example.com` (all-segments-minus-last reverse).
+            let dns: Arc<dyn DnsTxtResolver> = Arc::new(
+                MockDnsTxtResolver::new().with_txt(
+                    "_lexicon.thing.example.com",
+                    vec!["did=did:plc:authority".to_string()],
+                ),
+            );
+            let cache = Arc::new(LexiconCache::in_memory(60));
+            let fetcher: Arc<dyn LexiconRecordFetcher> = Arc::new(ErroringFetcher);
+            let resolver = Arc::new(LexResolver::new(cache, dns, fetcher, cfg.clone()));
+
+            let mgr = RepositoryManager::with_validation_mode(
+                did.clone(),
+                store,
+                ValidationMode::Optimistic,
+            )
+            .with_lexicon(resolver, cfg);
+
+            // Initialize the actor store so track_validation_failure's
+            // DB writes don't spew warns (the outcome of validate_write
+            // is unaffected by track success, but a clean test run is
+            // worth two lines of setup).
+            mgr.initialize().await.expect("initialize actor store");
+
+            (mgr, temp, did)
+        }
+
+        fn unknown_collection_write() -> WriteOp {
+            WriteOp {
+                action: WriteOpAction::Create,
+                collection: "com.example.thing.foo".to_string(),
+                rkey: "abc".to_string(),
+                value: Some(serde_json::json!({
+                    "$type": "com.example.thing.foo",
+                    "text": "hi"
+                })),
+                validate: None,
+                swap_cid: None,
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn hardfail_fetch_failure_propagates_under_optimistic_mode() {
+            // THIS is the bug. Pre-fix: returned Ok with a warn log.
+            // Post-fix: returns Err(LexiconFetchFailed) which the
+            // HTTP layer maps to 502.
+            let (mgr, _temp, _did) = build_mgr(FetchFailureBehavior::HardFail).await;
+            let write = unknown_collection_write();
+            let result = mgr.validate_write(&write).await;
+            match result {
+                Err(PdsError::LexiconFetchFailed { nsid, failure_class, .. }) => {
+                    assert_eq!(nsid, "com.example.thing.foo");
+                    assert_eq!(
+                        failure_class, "http_5xx",
+                        "failure_class must survive the @lexicon/ sentinel round-trip"
+                    );
+                }
+                Ok(()) => panic!(
+                    "validate_write returned Ok under HardFail+Optimistic — bug #2 regressed; §17.3.3 says HardFail propagates"
+                ),
+                Err(other) => panic!(
+                    "validate_write returned the wrong PdsError variant: {other:?} — expected LexiconFetchFailed"
+                ),
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn warn_fetch_failure_falls_through_to_optimistic() {
+            // Warn ordering preservation: handle_fetch_error short-
+            // circuits to handle_unknown (which under Optimistic
+            // calls validate_basic), so a fetch-class ValidationError
+            // is never re-emitted. The new gate must not interfere.
+            let (mgr, _temp, _did) = build_mgr(FetchFailureBehavior::Warn).await;
+            let write = unknown_collection_write();
+            let result = mgr.validate_write(&write).await;
+            assert!(
+                result.is_ok(),
+                "validate_write must return Ok under Warn+Optimistic (warn_fallback ordering): {result:?}"
+            );
         }
     }
 }

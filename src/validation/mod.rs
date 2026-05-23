@@ -95,6 +95,34 @@ pub fn should_validate_per_lexicon_imports(
     }
 }
 
+/// Arc 17 §17.3.3 Phase B bug #2 — given a non-empty error list and
+/// the active [`ValidationMode`], should `validate_write` propagate
+/// the errors (reject the write), or can Optimistic mode absorb them?
+///
+/// Returns `true` to propagate, `false` to absorb. The matrix:
+///
+/// | mode       | fetch-class variant present | propagate? |
+/// |------------|-----------------------------|------------|
+/// | Required   | any                         | yes        |
+/// | None       | any                         | yes (defensive — None short-circuits before Err in practice) |
+/// | Optimistic | yes                         | yes (§17.3.3 HardFail/authority/deny/InvalidNsid bypass) |
+/// | Optimistic | no                          | no (absorb — v1 SchemaViolation / hand-coded Optimistic contract) |
+///
+/// "fetch-class variant" is anything for which
+/// [`ValidationError::is_fetch_class_lexicon_variant`] returns true.
+/// The fetch-class set deliberately excludes `SchemaViolation` so the
+/// v1 unknown-NSID-extended-to-mismatched-record absorption contract
+/// is preserved.
+pub fn should_propagate_validation_errors(
+    errors: &[ValidationError],
+    mode: ValidationMode,
+) -> bool {
+    if mode != ValidationMode::Optimistic {
+        return true;
+    }
+    errors.iter().any(|e| e.is_fetch_class_lexicon_variant())
+}
+
 impl ValidationError {
     /// Arc 17 §17.3.6 — NSID matches the configured denylist; record
     /// rejected outright. Maps to [`PdsError::NamespaceDenied`].
@@ -207,6 +235,54 @@ impl ValidationError {
     /// (i.e. [`ValidationError::path`] starts with `@lexicon/`).
     pub fn is_lexicon_variant(&self) -> bool {
         self.path.starts_with(LEXICON_VARIANT_PREFIX)
+    }
+
+    /// Arc 17 §17.3.3 Phase B bug #2 — does this error encode a
+    /// FETCH/AUTHORITY/INPUT-class lexicon hard-failure variant?
+    /// These reject the write even under [`ValidationMode::Optimistic`]
+    /// because the §17.3.3 contract ("HardFail propagates; record
+    /// validation fails") and the operator-configured deny / pre-I/O
+    /// hard errors are strictly stronger than Optimistic's accept-on-
+    /// failure precedent.
+    ///
+    /// In the bypass set (these REJECT even in Optimistic mode):
+    /// - `LexiconFetchFailed` — `fetch_failure_behavior = HardFail`
+    ///   contract per §17.3.3.
+    /// - `LexiconAuthorityTombstoned` / `LexiconAuthorityAmbiguous` —
+    ///   authority cannot be trusted; absorbing would silently accept
+    ///   records under an unverifiable schema source.
+    /// - `NamespaceDenied` — operator-configured deny rule (§17.3.3
+    ///   PRIORITY 3); a deliberate rejection Optimistic must not
+    ///   soft-circumvent.
+    /// - `LexiconInvalidNsid` — pre-I/O hard error (NSID failed
+    ///   ATProto spec segment validation); an invalid identifier is
+    ///   not absorbable.
+    ///
+    /// NOT in the bypass set (Optimistic still absorbs):
+    /// - `SchemaViolation` — lexicon fetched fine, record just doesn't
+    ///   match. This is the v1 unknown-NSID precedent extended; the
+    ///   Optimistic contract is preserved.
+    ///
+    /// `LexiconAuthorityMismatch` and `LexiconInvalidSchema` are
+    /// presently NOT in the bypass set (neither Phase B Scenario 6a
+    /// nor the bug #2 spec named them). The predicate's tag list is
+    /// the single change-point if a future scenario reclassifies them.
+    pub fn is_fetch_class_lexicon_variant(&self) -> bool {
+        // The path-sentinel format is `@lexicon/<Variant>`; match on
+        // the tag rather than the full path so the predicate doesn't
+        // accidentally accept a hand-coded validator path that happens
+        // to contain a variant name as a substring.
+        const FETCH_CLASS_TAGS: &[&str] = &[
+            "LexiconFetchFailed",
+            "LexiconAuthorityTombstoned",
+            "LexiconAuthorityAmbiguous",
+            "NamespaceDenied",
+            "LexiconInvalidNsid",
+        ];
+        self.path
+            .strip_prefix(LEXICON_VARIANT_PREFIX)
+            .map(|tag| FETCH_CLASS_TAGS.contains(&tag))
+            .unwrap_or(false)
     }
 }
 
@@ -3588,6 +3664,227 @@ mod tests {
             };
             let pe = validation_errors_to_pds_error(vec![ve]);
             assert!(matches!(pe, PdsError::Validation(_)));
+        }
+
+        // ─── §17.3.3 Phase B bug #2 — fetch-class predicate + propagate matrix ───
+        //
+        // The bug: a HardFail lexicon fetch failure was being absorbed
+        // by `ValidationMode::Optimistic` at `repository.rs::validate_write`.
+        // The fix introduces `is_fetch_class_lexicon_variant` + the
+        // `should_propagate_validation_errors` matrix. These tests pin
+        // both halves so future variants (e.g. an Arc-17.x reclassifying
+        // `LexiconAuthorityMismatch` into the bypass set) flip the
+        // predicate, not the surrounding plumbing.
+
+        #[test]
+        fn fetch_class_predicate_lexicon_fetch_failed_in_set() {
+            let ve =
+                ValidationError::lexicon_fetch_failed("com.example.foo", "pds_unreachable", "x");
+            assert!(ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_authority_tombstoned_in_set() {
+            let ve =
+                ValidationError::lexicon_authority_tombstoned("com.example.foo", "did:plc:gone");
+            assert!(ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_authority_ambiguous_in_set() {
+            let ve = ValidationError::lexicon_authority_ambiguous(
+                "com.example.foo",
+                &["did:plc:a".to_string(), "did:plc:b".to_string()],
+            );
+            assert!(ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_namespace_denied_in_set() {
+            let ve = ValidationError::namespace_denied("com.evil.thing");
+            assert!(ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_lexicon_invalid_nsid_in_set() {
+            let ve = ValidationError::lexicon_invalid_nsid("not-a-real-nsid");
+            assert!(ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_schema_violation_not_in_set() {
+            // SchemaViolation = lexicon fetched fine, record doesn't
+            // match. Optimistic absorption preserved.
+            let ve = ValidationError::schema_violation(
+                "com.example.foo",
+                "/text",
+                Some("string"),
+                Some("number"),
+                "text must be a string",
+            );
+            assert!(!ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_authority_mismatch_not_in_set_currently() {
+            // Documented in the predicate doc-comment: NOT in the
+            // bypass set at v0.5; this test pins current behavior so
+            // a future reclassification is intentional, not accidental.
+            let ve = ValidationError::lexicon_authority_mismatch(
+                "com.example.foo",
+                "did:plc:expected",
+                "did:plc:found",
+            );
+            assert!(!ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_lexicon_invalid_schema_not_in_set_currently() {
+            // Documented in the predicate doc-comment: NOT in the
+            // bypass set at v0.5; future reclassification is the
+            // single change-point in the predicate's tag list.
+            let ve = ValidationError::lexicon_invalid_schema("com.example.foo", "broken doc");
+            assert!(!ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_hand_coded_validator_path_not_in_set() {
+            // Plain JSON-pointer paths (the 152 hand-coded validators)
+            // must never trip the predicate.
+            let ve = ValidationError {
+                path: "$.text".to_string(),
+                message: "Required field missing".to_string(),
+            };
+            assert!(!ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_path_with_variant_name_substring_not_in_set() {
+            // Defense against accidental substring match. A
+            // hand-coded path that happens to contain a variant name
+            // must NOT trip the predicate (the prefix gate keeps
+            // us honest).
+            let ve = ValidationError {
+                path: "$.LexiconFetchFailed".to_string(),
+                message: "field path coincidence".to_string(),
+            };
+            assert!(!ve.is_fetch_class_lexicon_variant());
+        }
+
+        // ── propagate-matrix tests ──
+
+        fn one_lex_fetch_failed() -> Vec<ValidationError> {
+            vec![ValidationError::lexicon_fetch_failed(
+                "com.example.foo",
+                "pds_unreachable",
+                "connection refused",
+            )]
+        }
+
+        fn one_schema_violation() -> Vec<ValidationError> {
+            vec![ValidationError::schema_violation(
+                "com.example.foo",
+                "/text",
+                Some("string"),
+                None,
+                "missing text",
+            )]
+        }
+
+        fn one_hand_coded_error() -> Vec<ValidationError> {
+            vec![ValidationError {
+                path: "$.text".to_string(),
+                message: "Required field missing".to_string(),
+            }]
+        }
+
+        #[test]
+        fn propagate_matrix_required_always_propagates_fetch_class() {
+            assert!(should_propagate_validation_errors(
+                &one_lex_fetch_failed(),
+                ValidationMode::Required
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_required_always_propagates_schema_violation() {
+            assert!(should_propagate_validation_errors(
+                &one_schema_violation(),
+                ValidationMode::Required
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_required_always_propagates_hand_coded() {
+            assert!(should_propagate_validation_errors(
+                &one_hand_coded_error(),
+                ValidationMode::Required
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_none_propagates_defensive() {
+            // In practice None mode short-circuits before the Err
+            // branch — but if it ever reaches here, propagate is the
+            // defensive choice.
+            assert!(should_propagate_validation_errors(
+                &one_lex_fetch_failed(),
+                ValidationMode::None
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_optimistic_propagates_fetch_class() {
+            // THIS is bug #2's core assertion: HardFail + Optimistic
+            // must propagate (not absorb).
+            assert!(should_propagate_validation_errors(
+                &one_lex_fetch_failed(),
+                ValidationMode::Optimistic
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_optimistic_absorbs_schema_violation() {
+            // v1 contract: SchemaViolation under Optimistic = warn-
+            // and-accept. Bug #2's fix must NOT regress this.
+            assert!(!should_propagate_validation_errors(
+                &one_schema_violation(),
+                ValidationMode::Optimistic
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_optimistic_absorbs_hand_coded() {
+            // The 152 hand-coded validator errors retain their pre-
+            // Arc-17 Optimistic absorption.
+            assert!(!should_propagate_validation_errors(
+                &one_hand_coded_error(),
+                ValidationMode::Optimistic
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_optimistic_mixed_propagates_if_any_fetch_class() {
+            // A single fetch-class variant in a multi-error vec
+            // forces propagation — even if other errors would be
+            // absorbable on their own.
+            let mut errs = one_schema_violation();
+            errs.extend(one_lex_fetch_failed());
+            assert!(should_propagate_validation_errors(
+                &errs,
+                ValidationMode::Optimistic
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_optimistic_empty_absorbs() {
+            // Defensive: the Err branch shouldn't see an empty vec
+            // (validators always emit ≥1 error), but if it does,
+            // Optimistic absorption is the consistent choice.
+            assert!(!should_propagate_validation_errors(
+                &[],
+                ValidationMode::Optimistic
+            ));
         }
     }
 }
