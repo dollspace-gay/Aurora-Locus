@@ -802,6 +802,61 @@ impl AppContext {
             None => (None, None),
         };
 
+        // Arc 17 §17.4 Step 4 — production LexiconRecordFetcher wiring.
+        // When `config.lexicon.enabled` is true, build the full resolver
+        // stack (DnsTxtResolver + LexiconCache + ProductionLexiconFetcher)
+        // and stash it; otherwise leave `None` so admin endpoints respond
+        // HTTP 503 `LexiconDisabled` and the validate-phase fall-through
+        // stays inert (Step 3 disabled-config behavior preserved).
+        let lexicon_resolver = if config.lexicon.enabled {
+            use crate::federation::dns_resolver::HickoryDnsTxtResolver;
+            use crate::federation::lexicon_cache::LexiconCache;
+            use crate::federation::lexicon_fetcher_prod::ProductionLexiconFetcher;
+            use crate::federation::lexicon_resolver::LexResolver;
+
+            let dns = Arc::new(HickoryDnsTxtResolver::from_system().map_err(|e| {
+                PdsError::Internal(format!(
+                    "Arc 17 §17.4 Step 1.5: hickory DNS resolver init failed: {e:?}"
+                ))
+            })?);
+
+            let http_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(
+                    config.lexicon.fetch_timeout_secs,
+                ))
+                .build()
+                .map_err(|e| {
+                    PdsError::Internal(format!(
+                        "Arc 17 production fetcher: reqwest client init failed: {e}"
+                    ))
+                })?;
+
+            let fetcher = Arc::new(ProductionLexiconFetcher::new(
+                identity_resolver.clone(),
+                http_client,
+            ));
+
+            let cache = Arc::new(LexiconCache::with_pool(
+                account_db.clone(),
+                config.lexicon.last_used_persist_threshold_secs,
+            ));
+
+            tracing::info!(
+                fetch_timeout_secs = config.lexicon.fetch_timeout_secs,
+                cache_ttl_secs = config.lexicon.cache_ttl_secs,
+                "Arc 17 §17.3 lexicon resolver wired (enabled=true)"
+            );
+
+            Some(Arc::new(LexResolver::new(
+                cache,
+                dns as Arc<dyn crate::federation::dns_resolver::DnsTxtResolver>,
+                fetcher as Arc<dyn crate::federation::lexicon_resolver::LexiconRecordFetcher>,
+                config.lexicon.clone(),
+            )))
+        } else {
+            None
+        };
+
         Ok(Self {
             config: Arc::new(config),
             account_db,
@@ -836,14 +891,11 @@ impl AppContext {
             trusted_iss,
             entryway_client,
             entryway_admin_client,
-            // Arc 17 §17.3.7 — production LexiconRecordFetcher impl
-            // (PLC + reqwest wiring) is the remaining mock-only seam
-            // going into Step 4 Phase B; until it lands, AppContext::new
-            // ships with lexicon_resolver: None and admin endpoints
-            // respond with HTTP 503 LexiconDisabled. Operators wanting
-            // to exercise the lexicon path in v0.5 do so via the test
-            // fixture seam (mock DNS + mock fetcher) the unit tests use.
-            lexicon_resolver: None,
+            // Arc 17 §17.4 Step 4 — lexicon resolver constructed above
+            // (Some when config.lexicon.enabled, None otherwise).
+            // Admin endpoints under tools.aurora.lexicon.* and the
+            // validate-phase fall-through gate on this field.
+            lexicon_resolver,
         })
     }
 
