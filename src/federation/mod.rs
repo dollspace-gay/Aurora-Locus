@@ -14,6 +14,7 @@ pub mod dpop;
 pub mod entryway;
 pub mod entryway_headers;
 pub mod lexicon_cache;
+pub mod lexicon_fetcher_prod;
 pub mod lexicon_resolver;
 pub mod nonce_store;
 pub mod relay;

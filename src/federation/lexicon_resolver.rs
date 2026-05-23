@@ -94,6 +94,17 @@ pub enum LexiconFetcherError {
     /// `failure_class = "timeout"`.
     #[error("HTTP timeout fetching lexicon")]
     Timeout,
+
+    /// The HTTP fetch SUCCEEDED (200 + body received) but the response
+    /// body didn't match the expected shape — malformed CAR, MST that
+    /// fails to load, or a valid CAR that doesn't contain a record at
+    /// the requested `(collection, rkey)`. Maps to
+    /// `failure_class = "invalid_schema"` per the round-1 F14 taxonomy
+    /// (the closest of the 9 values that doesn't misrepresent the
+    /// transport: classifying this as `http_4xx` would make a log
+    /// reader think the origin returned 4xx when it returned 200).
+    #[error("invalid response structure: {0}")]
+    InvalidResponseStructure(String),
 }
 
 impl LexiconFetcherError {
@@ -106,6 +117,7 @@ impl LexiconFetcherError {
             Self::Http4xx(_) => "http_4xx",
             Self::Http5xx(_) => "http_5xx",
             Self::Timeout => "timeout",
+            Self::InvalidResponseStructure(_) => "invalid_schema",
         }
     }
 }
