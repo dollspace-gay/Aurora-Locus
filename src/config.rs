@@ -66,6 +66,11 @@ pub struct ServerConfig {
     /// env-var loading is the sole construction path.
     #[serde(skip)]
     pub entryway: Option<EntrywayConfig>,
+    /// Arc 17 §17.3 dynamic-lexicon-loading config. Off-by-default
+    /// (`enabled: false`) per §17.5 friction-risk posture — operators
+    /// opt in via `PDS_LEXICON_ENABLED=true`. See [`LexiconConfig`].
+    #[serde(default)]
+    pub lexicon: LexiconConfig,
 }
 
 /// Distributed-state substrate selector (Arc 7, V04_DESIGN.md
@@ -1126,6 +1131,233 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+/// Arc 17 §17.3 — dynamic-lexicon-loading configuration. Off-by-default
+/// for v0.5 (`enabled: false`); when enabled, unknown-NSID records are
+/// validated against lexicon documents fetched lazily from each NSID's
+/// authority DID (resolved via `_lexicon.<host>` DNS TXT then PLC then
+/// HTTP GET against the hosting PDS).
+///
+/// Env-var loading lives in [`LexiconConfig::from_env_values`]. All
+/// knobs are optional; defaults mirror the v2 design at §17.3.2 /
+/// §17.5.4.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LexiconConfig {
+    /// Master switch. When `false`, the validator skips the lexicon
+    /// fall-through entirely and unknown NSIDs route to Aurora's
+    /// existing Optimistic mode. Default `false`.
+    pub enabled: bool,
+
+    /// Optional override for authority resolution. When `Some`, the
+    /// LexResolver bypasses DNS TXT + PLC and uses this DID as the
+    /// authority for every NSID. Useful for testing and for
+    /// homogeneous-federation deployments where a single PDS hosts
+    /// every Aurora-specific lexicon. Default `None`.
+    pub did_authority: Option<String>,
+
+    /// Behavior when a lexicon fetch fails (DNS / PLC / HTTP).
+    /// `HardFail` propagates `PdsError::LexiconFetchFailed` to the
+    /// caller (record validation fails); `Warn` emits a WARN log and
+    /// falls back to Optimistic acceptance. Default `Warn` for v0.5
+    /// (operators opt into the strict posture explicitly). The v1
+    /// `Quarantine` variant is DROPPED for v0.5 per §17.5.7 /
+    /// round-1 F1.
+    pub fetch_failure_behavior: FetchFailureBehavior,
+
+    /// Number of HTTP retries on the lexicon-record fetch step
+    /// (§17.3.1 step 6 only — DNS retries inherit `hickory-resolver`
+    /// defaults; PLC retries inherit Arc 13 defaults; round-1 F18
+    /// closure). Default 3.
+    pub fetch_max_retries: u32,
+
+    /// Per-attempt timeout for the HTTP lexicon-record fetch (§17.3.1
+    /// step 6). Default 30s; `Warn` mode's worst-case latency floor
+    /// per §17.5.4.
+    pub fetch_timeout_secs: u64,
+
+    /// In-memory cache TTL; expired entries trigger background
+    /// re-fetch while serving cached value (§17.3.1 step 1). Default
+    /// 86400s (24h).
+    pub cache_ttl_secs: u64,
+
+    /// Throttle floor for on-disk `last_used_at` writes (round-1 F11
+    /// closure / §17.3.2). In-memory `last_used_at` updates
+    /// immediately; on-disk update fires only when the in-memory
+    /// value advances by ≥ this many seconds. Default 60s. Keeps
+    /// hot-NSID cache reads from hammering the `lexicon_cache` table.
+    pub last_used_persist_threshold_secs: u64,
+
+    /// NSID prefix denylist (round-1 F2 closure / §17.3.3). When a
+    /// record's collection NSID starts with any prefix in this list,
+    /// the validator rejects with `PdsError::NamespaceDenied`. Intent
+    /// B per §17.3.3. Default empty.
+    pub namespace_denylist: Option<Vec<String>>,
+
+    /// NSID prefix allowlist (round-1 F2 closure / §17.3.3). When
+    /// `Some` and non-empty, only collections matching one of these
+    /// prefixes route to the lexicon-fetch path; non-matching
+    /// collections fall through to Optimistic (Intent A per §17.3.3
+    /// — exclusion is NOT rejection). Default `None` (no allowlist
+    /// gate; every unknown NSID is fetchable).
+    pub namespace_allowlist: Option<Vec<String>>,
+
+    /// Whether CAR-import write records are subject to lexicon
+    /// validation. Default `true` per §17.3.4 — heterogeneous-
+    /// federation default. Operators running homogeneous federation
+    /// (multiple Aurora-Locus instances with identical lexicon
+    /// configs) can set `false` to skip redundant work on import.
+    /// When `true`, the validator overrides Arc 16e's per-write
+    /// bypass for known NSIDs too (round-1 F4 closure).
+    pub validate_imports: bool,
+}
+
+/// Arc 17 §17.3.6 / round-1 F1 — what to do when a lexicon fetch fails
+/// at validate-phase. `Quarantine` (v1) was DROPPED for v0.5 per §17.5.7
+/// because Arc 16b's `blob_quarantine` is blob-CID-keyed while lexicon
+/// fetch failures are NSID-scoped — structural mismatch. v0.6+ candidate
+/// gates on a separate `record_quarantine` surface design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchFailureBehavior {
+    /// Propagate `PdsError::LexiconFetchFailed` to the caller. Record
+    /// validation fails; client sees HTTP 502.
+    HardFail,
+    /// Emit a WARN log and fall back to Aurora's existing Optimistic
+    /// acceptance (record is written; failure is recorded via
+    /// `track_validation_failure`). Default.
+    #[default]
+    Warn,
+}
+
+impl FetchFailureBehavior {
+    /// Parse from env-var value with the same case-insensitive
+    /// pattern other config enums use.
+    pub fn from_env_value(s: &str) -> PdsResult<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "hard_fail" | "hardfail" | "strict" => Ok(Self::HardFail),
+            "warn" | "optimistic" => Ok(Self::Warn),
+            other => Err(PdsError::Validation(format!(
+                "PDS_LEXICON_FETCH_FAILURE_BEHAVIOR must be one of \
+                 'hard_fail', 'warn' (got: {:?})",
+                other
+            ))),
+        }
+    }
+}
+
+impl Default for LexiconConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            did_authority: None,
+            fetch_failure_behavior: FetchFailureBehavior::default(),
+            fetch_max_retries: 3,
+            fetch_timeout_secs: 30,
+            cache_ttl_secs: 86_400,
+            last_used_persist_threshold_secs: 60,
+            namespace_denylist: None,
+            namespace_allowlist: None,
+            validate_imports: true,
+        }
+    }
+}
+
+impl LexiconConfig {
+    /// Construct from explicit option-typed env-var values. Pure
+    /// function so unit tests can exercise without touching
+    /// process-global env. Empty / unset → default value.
+    pub fn from_env_values(
+        enabled: Option<String>,
+        did_authority: Option<String>,
+        fetch_failure_behavior: Option<String>,
+        fetch_max_retries: Option<String>,
+        fetch_timeout_secs: Option<String>,
+        cache_ttl_secs: Option<String>,
+        last_used_persist_threshold_secs: Option<String>,
+        namespace_denylist: Option<String>,
+        namespace_allowlist: Option<String>,
+        validate_imports: Option<String>,
+    ) -> PdsResult<Self> {
+        let mut cfg = Self::default();
+
+        if let Some(v) = enabled {
+            cfg.enabled = matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on");
+        }
+        if let Some(v) = did_authority {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                cfg.did_authority = Some(trimmed.to_string());
+            }
+        }
+        if let Some(v) = fetch_failure_behavior {
+            cfg.fetch_failure_behavior = FetchFailureBehavior::from_env_value(&v)?;
+        }
+        if let Some(v) = fetch_max_retries {
+            cfg.fetch_max_retries = v.parse().map_err(|_| {
+                PdsError::Validation(format!(
+                    "PDS_LEXICON_FETCH_MAX_RETRIES must be a non-negative integer (got {:?})",
+                    v
+                ))
+            })?;
+        }
+        if let Some(v) = fetch_timeout_secs {
+            cfg.fetch_timeout_secs = v.parse().map_err(|_| {
+                PdsError::Validation(format!(
+                    "PDS_LEXICON_FETCH_TIMEOUT_SECS must be a positive integer (got {:?})",
+                    v
+                ))
+            })?;
+            if cfg.fetch_timeout_secs == 0 {
+                return Err(PdsError::Validation(
+                    "PDS_LEXICON_FETCH_TIMEOUT_SECS must be greater than 0".to_string(),
+                ));
+            }
+        }
+        if let Some(v) = cache_ttl_secs {
+            cfg.cache_ttl_secs = v.parse().map_err(|_| {
+                PdsError::Validation(format!(
+                    "PDS_LEXICON_CACHE_TTL_SECS must be a positive integer (got {:?})",
+                    v
+                ))
+            })?;
+            if cfg.cache_ttl_secs == 0 {
+                return Err(PdsError::Validation(
+                    "PDS_LEXICON_CACHE_TTL_SECS must be greater than 0".to_string(),
+                ));
+            }
+        }
+        if let Some(v) = last_used_persist_threshold_secs {
+            cfg.last_used_persist_threshold_secs = v.parse().map_err(|_| {
+                PdsError::Validation(format!(
+                    "PDS_LEXICON_LAST_USED_PERSIST_THRESHOLD_SECS must be a non-negative integer (got {:?})",
+                    v
+                ))
+            })?;
+        }
+        cfg.namespace_denylist = parse_csv_prefix_list(namespace_denylist);
+        cfg.namespace_allowlist = parse_csv_prefix_list(namespace_allowlist);
+        if let Some(v) = validate_imports {
+            cfg.validate_imports =
+                matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on");
+        }
+        Ok(cfg)
+    }
+}
+
+fn parse_csv_prefix_list(raw: Option<String>) -> Option<Vec<String>> {
+    raw.and_then(|v| {
+        let items: Vec<String> = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if items.is_empty() {
+            None
+        } else {
+            Some(items)
+        }
+    })
+}
+
 /// Federation configuration for Bluesky network integration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationConfig {
@@ -1596,6 +1828,22 @@ impl ServerConfig {
             env::var("PDS_BLOB_STAGE_TTL_SECONDS").ok(),
         )?;
 
+        // Arc 17 §17.3 — dynamic lexicon loading. Off-by-default;
+        // operators opt in via PDS_LEXICON_ENABLED=true. See
+        // [`LexiconConfig`] for every knob.
+        let lexicon = LexiconConfig::from_env_values(
+            env::var("PDS_LEXICON_ENABLED").ok(),
+            env::var("PDS_LEXICON_DID_AUTHORITY").ok(),
+            env::var("PDS_LEXICON_FETCH_FAILURE_BEHAVIOR").ok(),
+            env::var("PDS_LEXICON_FETCH_MAX_RETRIES").ok(),
+            env::var("PDS_LEXICON_FETCH_TIMEOUT_SECS").ok(),
+            env::var("PDS_LEXICON_CACHE_TTL_SECS").ok(),
+            env::var("PDS_LEXICON_LAST_USED_PERSIST_THRESHOLD_SECS").ok(),
+            env::var("PDS_LEXICON_NAMESPACE_DENYLIST").ok(),
+            env::var("PDS_LEXICON_NAMESPACE_ALLOWLIST").ok(),
+            env::var("PDS_LEXICON_VALIDATE_IMPORTS").ok(),
+        )?;
+
         // Arc 12 §5.3.2 Gap 1: public_url override via env var.
         // Renamed locally to avoid shadowing federation's
         // existing `public_url` binding (different env var,
@@ -1709,6 +1957,7 @@ impl ServerConfig {
             gc_sweep,
             blob_metadata,
             entryway,
+            lexicon,
         })
     }
 
