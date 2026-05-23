@@ -498,6 +498,35 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(crate::api::aurora_admin::trigger_password_reset),
             CapsBuilder::new(Family::Admin, 1).extensions(["trigger-password-reset-v1"]),
         )
+        // ---- tools.aurora.lexicon.* (Arc 17 §17.3.7 / #133 pin) ----
+        //
+        // Three admin endpoints for the dynamic-lexicon resolver
+        // cache. Auth: AdminAuthContext extractor + Admin+ role
+        // (mirrors the AdminAll scope per Step 0.0h pin). When the
+        // resolver is not wired on AppContext (PDS_LEXICON_ENABLED=
+        // false, the v0.5 default) every handler responds with
+        // HTTP 503 LexiconDisabled.
+        //
+        // Registered as plain (non-registry) routes: registering
+        // under Family::Admin would advertise them as
+        // tools.aurora.admin.<name> in describeCapabilities (wrong
+        // namespace), and Family::Lexicon doesn't exist yet. The
+        // §17.1.1 promised wire path is honored by the URL itself;
+        // describeCapabilities will surface them once a future
+        // cycle adds Family::Lexicon (snapshot tests at admin.rs:
+        // 7726 will need refreshing then).
+        .route(
+            "/xrpc/tools.aurora.lexicon.getCacheState",
+            get(crate::api::aurora_lexicon::get_cache_state),
+        )
+        .route(
+            "/xrpc/tools.aurora.lexicon.evictCache",
+            post(crate::api::aurora_lexicon::evict_cache),
+        )
+        .route(
+            "/xrpc/tools.aurora.lexicon.fetchNow",
+            post(crate::api::aurora_lexicon::fetch_now),
+        )
         // Phase 3.7 (chainlink #104) — moderation aggregations.
         // Auth: AdminModeration scope, Moderator+ role enforced at
         // handler level. Powers Dashboard Moderator flavor + bell
