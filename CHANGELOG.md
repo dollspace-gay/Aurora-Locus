@@ -474,6 +474,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   intermittently fail under full suite).
 
 ### Fixed
+- Arc 17 Step 0.0e v2-trigger: §17.3.5 NSID authority hostname derivation algorithm diverges from bsky-PDS — wholesale rewrite (#131)
 - PG migration 0010 TIMESTAMPTZ vs Rust read-as-Option<String> divergence breaks login on Postgres (#130)
 - import_repo_rejected log emits per_cid_failure_count: 0 despite aggregated failures in wire response (#129)
 
