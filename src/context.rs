@@ -144,6 +144,18 @@ pub struct AppContext {
     /// `config.entryway.admin_token`. `Some`/`None` symmetrically
     /// with `entryway_client`.
     pub entryway_admin_client: Option<Arc<crate::federation::EntrywayAdminClient>>,
+    /// Arc 17 §17.3.2 + §17.3.7 — dynamic lexicon resolver shared by
+    /// (a) the validate-phase fall-through dispatched from
+    /// [`crate::actor_store::repository::RepositoryManager`] when its
+    /// own `.with_lexicon` builder is chained, and (b) the three
+    /// `tools.aurora.lexicon.*` admin endpoints in
+    /// [`crate::api::aurora_lexicon`]. `Some` when
+    /// `config.lexicon.enabled` is true; `None` when the lexicon
+    /// subsystem is off (the v0.5 default). Admin endpoints
+    /// short-circuit to HTTP 503 `LexiconDisabled` when this is
+    /// `None`; validate-phase callers skip the Arc 17 fall-through
+    /// entirely.
+    pub lexicon_resolver: Option<Arc<crate::federation::lexicon_resolver::LexResolver>>,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -824,6 +836,14 @@ impl AppContext {
             trusted_iss,
             entryway_client,
             entryway_admin_client,
+            // Arc 17 §17.3.7 — production LexiconRecordFetcher impl
+            // (PLC + reqwest wiring) is the remaining mock-only seam
+            // going into Step 4 Phase B; until it lands, AppContext::new
+            // ships with lexicon_resolver: None and admin endpoints
+            // respond with HTTP 503 LexiconDisabled. Operators wanting
+            // to exercise the lexicon path in v0.5 do so via the test
+            // fixture seam (mock DNS + mock fetcher) the unit tests use.
+            lexicon_resolver: None,
         })
     }
 

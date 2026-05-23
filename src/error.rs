@@ -393,6 +393,17 @@ pub enum PdsError {
     #[error("Namespace denied: {nsid}")]
     #[allow(dead_code)]
     NamespaceDenied { nsid: String },
+
+    /// Arc 17 §17.3.7 — admin endpoint called against an instance
+    /// where lexicon is disabled (`PDS_LEXICON_ENABLED=false`, the
+    /// v0.5 default). The endpoint cannot fulfill the request because
+    /// there is no resolver to delegate to. Mapped to HTTP 503 —
+    /// "the lexicon subsystem is not available; enable it and
+    /// retry." Distinct from `LexiconFetchFailed` (which is a runtime
+    /// fetch outcome, not a configuration state).
+    #[error("Lexicon subsystem is disabled (PDS_LEXICON_ENABLED=false)")]
+    #[allow(dead_code)]
+    LexiconDisabled,
 }
 
 /// Manual PartialEq implementation for PdsError
@@ -489,6 +500,7 @@ impl PartialEq for PdsError {
                 PdsError::NamespaceDenied { nsid: an },
                 PdsError::NamespaceDenied { nsid: bn },
             ) => an == bn,
+            (PdsError::LexiconDisabled, PdsError::LexiconDisabled) => true,
             // Database and Io errors cannot be compared, so we use error message comparison
             (PdsError::Database(a), PdsError::Database(b)) => a.to_string() == b.to_string(),
             (PdsError::Io(a), PdsError::Io(b)) => a.to_string() == b.to_string(),
@@ -776,6 +788,11 @@ impl IntoResponse for PdsError {
             PdsError::NamespaceDenied { .. } => (
                 StatusCode::BAD_REQUEST,
                 "NamespaceDenied",
+                self.to_string(),
+            ),
+            PdsError::LexiconDisabled => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "LexiconDisabled",
                 self.to_string(),
             ),
             _ => (
