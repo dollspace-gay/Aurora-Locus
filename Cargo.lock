@@ -247,6 +247,7 @@ dependencies = [
  "futures-util",
  "governor",
  "hex",
+ "hickory-resolver",
  "hmac",
  "image",
  "jsonwebtoken",

@@ -9,9 +9,12 @@
 pub mod authentication;
 pub mod blob_fetch;
 pub mod discovery;
+pub mod dns_resolver;
 pub mod dpop;
 pub mod entryway;
 pub mod entryway_headers;
+pub mod lexicon_cache;
+pub mod lexicon_resolver;
 pub mod nonce_store;
 pub mod relay;
 pub mod search;
