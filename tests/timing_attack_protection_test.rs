@@ -106,6 +106,7 @@ async fn create_test_manager() -> AccountManager {
         gc_sweep: Default::default(),
         blob_metadata: Default::default(),
         entryway: None,
+        lexicon: aurora_locus::config::LexiconConfig::default(),
     });
 
     AccountManager::new(db, config)

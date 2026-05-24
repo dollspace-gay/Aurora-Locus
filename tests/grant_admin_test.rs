@@ -13,14 +13,12 @@
 
 mod common;
 
-use aurora_locus::admin::roles::Role;
 use aurora_locus::cli::admin::grant_admin;
 use aurora_locus::config::*;
 use aurora_locus::context::AppContext;
 use aurora_locus::error::PdsError;
 use aurora_locus::validation::ValidationMode;
 use sqlx::Row;
-use std::path::PathBuf;
 use tempfile::TempDir;
 
 /// Build a real on-disk SQLite-backed AppContext rooted at a fresh
@@ -107,6 +105,7 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
         gc_sweep: Default::default(),
         blob_metadata: Default::default(),
         entryway: None,
+        lexicon: aurora_locus::config::LexiconConfig::default(),
     };
     let ctx = AppContext::new(
         config,
