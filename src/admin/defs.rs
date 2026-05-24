@@ -372,8 +372,13 @@ impl From<AuroraAdminError> for (axum::http::StatusCode, axum::Json<serde_json::
 // Linux (the `mod tests/` segment doesn't physically exist).
 // Top-level `#[path]` resolves relative to the directory holding
 // this .rs file (`src/admin/`), which is real on disk.
+// Twin inline include of `tests/common/canonical_json.rs` lives in
+// `src/api/admin.rs` for its sibling tests; both need the helper but
+// the file isn't a lib module so each #[cfg(test)] site includes it
+// directly. Lifting to a shared lib module is a v0.6 cleanup.
 #[cfg(test)]
 #[path = "../../tests/common/canonical_json.rs"]
+#[allow(clippy::duplicate_mod)]
 mod canonical_json_helper;
 
 #[cfg(test)]

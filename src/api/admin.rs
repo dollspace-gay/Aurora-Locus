@@ -6440,8 +6440,10 @@ async fn cleanup_nonce_stores(
 // Arc 2 Step 1 (§6.4.1) — canonical-JSON helper for snapshot
 // tests. See the matching declaration in `src/admin/defs.rs` for
 // the rationale on top-level placement vs nested-mod placement.
+// Twin inline include — see `src/admin/defs.rs` for the v0.6 cleanup note.
 #[cfg(test)]
 #[path = "../../tests/common/canonical_json.rs"]
+#[allow(clippy::duplicate_mod)]
 mod canonical_json_helper;
 
 #[cfg(test)]
@@ -7937,7 +7939,7 @@ mod tests {
             role: "moderator".to_string(),
             rationale: Some("on-call rotation".to_string()),
         };
-        grant_role(State(ctx.clone()), superadmin_test_auth(), Json(req))
+        let _ = grant_role(State(ctx.clone()), superadmin_test_auth(), Json(req))
             .await
             .expect("SuperAdmin grant succeeds");
         let count: i64 = sqlx::query_scalar(
@@ -8300,7 +8302,7 @@ mod tests {
             reason: "spam-ring".to_string(),
             notes: None,
         };
-        takedown_account(State(ctx.clone()), admin_test_auth(), Json(req))
+        let _ = takedown_account(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
             .expect("takedown succeeds");
         assert_eq!(
@@ -8440,7 +8442,7 @@ mod tests {
             val: "spam".to_string(),
             expires_days: None,
         };
-        apply_label(State(ctx.clone()), admin_test_auth(), Json(req))
+        let _ = apply_label(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
             .expect("apply_label succeeds");
         let count: i64 = sqlx::query_scalar(
@@ -8464,7 +8466,7 @@ mod tests {
             note: None,
             for_account: None,
         };
-        create_invite_code(State(ctx.clone()), admin_test_auth(), Json(req))
+        let _ = create_invite_code(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
             .expect("invite create succeeds");
         assert_eq!(count_chain_rows(&ctx, "invite.create", None).await, 1);
@@ -8475,7 +8477,7 @@ mod tests {
         // Category F: server-level no-subject. action "sequencer.pause"
         // with None subject — chain row's subject_did/uri/cid are all NULL.
         let ctx = create_test_context().await;
-        pause_sequencer(State(ctx.clone()), admin_test_auth())
+        let _ = pause_sequencer(State(ctx.clone()), admin_test_auth())
             .await
             .expect("pause sequencer succeeds");
         assert_eq!(count_chain_rows(&ctx, "sequencer.pause", None).await, 1);
@@ -8590,7 +8592,7 @@ mod tests {
             }),
             legacy_record_uri_used: false,
         };
-        update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
+        let _ = update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect("update_subject_status succeeds");
 

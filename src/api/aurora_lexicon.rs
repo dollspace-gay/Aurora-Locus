@@ -215,7 +215,7 @@ mod tests {
     use super::*;
     use crate::config::LexiconConfig;
     use crate::federation::dns_resolver::{DnsTxtResolver, MockDnsTxtResolver};
-    use crate::federation::lexicon_cache::{CachedLexicon, LexiconCache};
+    use crate::federation::lexicon_cache::LexiconCache;
     use crate::federation::lexicon_resolver::{
         LexResolver, LexiconFetcherError, LexiconRecordFetcher,
     };
@@ -456,7 +456,8 @@ mod tests {
     async fn failure_class_classification_covers_round1_f14_taxonomy() {
         // Spot-check several failure_class values map correctly
         // via the LexiconFetchFailed PdsError variant.
-        let cases: &[(fn() -> LexiconFetcherError, &str)] = &[
+        type FailureCase = (fn() -> LexiconFetcherError, &'static str);
+        let cases: &[FailureCase] = &[
             (|| LexiconFetcherError::Http5xx("x".to_string()), "http_5xx"),
             (|| LexiconFetcherError::Http4xx("x".to_string()), "http_4xx"),
             (|| LexiconFetcherError::Timeout, "timeout"),

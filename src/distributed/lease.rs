@@ -60,6 +60,9 @@ impl Lease {
     /// `now_epoch_ms`. The strict-less comparison matches the
     /// reaper sweep predicate (`WHERE exp_at_epoch_ms < $now`),
     /// so reader semantics line up with sweep semantics.
+    /// Forward-substrate for the distributed-store consumers that
+    /// haven't all landed yet (Arc 7 Step 5+).
+    #[allow(dead_code)]
     pub fn is_expired_at(&self, now_epoch_ms: i64) -> bool {
         self.expires_at_epoch_ms < now_epoch_ms
     }

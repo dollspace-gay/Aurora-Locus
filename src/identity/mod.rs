@@ -11,7 +11,6 @@ pub mod reserved_handles;
 pub mod resolver;
 
 pub use cache::DidCache;
-pub use clock::{Clock, SystemClock};
 pub use handle_validation::validate_handle;
 pub use resolver::{IdentityResolver, IdentityResolverApi, IdentityResolverConfig};
 

@@ -3283,6 +3283,12 @@ mod tests {
     // path is Phase B (Step 4) territory.
     // ──────────────────────────────────────────────────────────────
 
+    // Test-mod-local allow: the `let mut cfg = LexiconConfig::default();
+    // cfg.<flag> = true;` per-field-mutation pattern is repeated across
+    // many small test setups. Struct-literal init would force every test
+    // to enumerate the full LexiconConfig surface; the mutate-after-default
+    // shape keeps each test focused on the one or two flags under test.
+    #[allow(clippy::field_reassign_with_default)]
     mod arc17_matrix {
         use super::*;
         use crate::config::{FetchFailureBehavior, LexiconConfig};

@@ -1298,7 +1298,7 @@ mod tests {
         // detection condition is `client_cursor < oldest - 1` exactly.
         let client_cursor = 2i64;
         assert!(
-            !(client_cursor < oldest.unwrap() - 1),
+            (client_cursor >= oldest.unwrap() - 1),
             "cursor 2 == oldest-1 is the boundary; not outdated"
         );
     }

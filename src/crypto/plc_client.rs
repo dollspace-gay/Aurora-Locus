@@ -102,9 +102,7 @@ impl PlcClient {
             .map_err(|e| PdsError::IdentityResolution(format!("Invalid PLC audit log JSON: {}", e)))?;
 
         let last_accepted = entries
-            .iter()
-            .filter(|e| !e.get("nullified").and_then(|n| n.as_bool()).unwrap_or(false))
-            .next_back()
+            .iter().rfind(|e| !e.get("nullified").and_then(|n| n.as_bool()).unwrap_or(false))
             .ok_or_else(|| {
                 PdsError::IdentityResolution(format!(
                     "PLC audit log for {} has no accepted (non-nullified) entries",

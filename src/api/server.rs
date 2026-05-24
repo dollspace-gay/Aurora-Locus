@@ -380,14 +380,11 @@ async fn get_session(
     // Arc 12 §5.3.8 mint-pattern forward. Entryway is the canonical
     // source of session info in entryway mode (it owns the account
     // identity).
-    if ctx.entryway_client.is_some() {
+    if let Some(entryway) = ctx.entryway_client.as_ref() {
         let fwd_headers = ctx
             .entryway_auth_headers(&did, "com.atproto.server.getSession")
             .await?;
-        let resp: SessionInfo = ctx
-            .entryway_client
-            .as_ref()
-            .expect("checked above")
+        let resp: SessionInfo = entryway
             .xrpc_get_json("com.atproto.server.getSession", fwd_headers, &[])
             .await?;
         return Ok(Json(resp));

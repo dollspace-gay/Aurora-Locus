@@ -114,6 +114,13 @@ pub struct MockDnsTxtResolver {
 }
 
 #[cfg(test)]
+impl Default for MockDnsTxtResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
 impl MockDnsTxtResolver {
     pub fn new() -> Self {
         Self {

@@ -174,6 +174,10 @@ where
 /// Admin-tier entryway client per §5.3.9. Basic-auth header is
 /// pre-bound from `EntrywayConfig.admin_token` at construction so
 /// admin callers don't have to thread the secret through.
+// Pairs with the AppContext.entryway_admin_client field — Arc 12 §5.3.9
+// forward-substrate; admin-handler methods that consume these fields
+// land with Arc 12 Step 3 (#60).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct EntrywayAdminClient {
     /// Base URL of the entryway.
@@ -181,7 +185,8 @@ pub struct EntrywayAdminClient {
     /// Pre-built default headers including the Basic-auth header
     /// derived from the admin token.
     pub default_headers: HeaderMap,
-    /// Shared HTTP client.
+    /// Shared HTTP client. Populated by `new()`; consumer methods
+    /// land with Arc 12 admin-handler dispatch (#60).
     pub http: Client,
 }
 

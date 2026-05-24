@@ -127,12 +127,18 @@ impl CachedLexicon {
 pub struct LexiconCache {
     entries: Arc<RwLock<HashMap<String, CachedLexicon>>>,
     pool: Option<AnyPool>,
+    /// Throttle window for on-disk `last_used_at` persists (round-1 F11).
+    /// Consumed by `persist_last_used_if_due` below; that path itself is
+    /// tests-only today, so the field reads as dead under `--lib`.
+    #[allow(dead_code)]
     last_used_persist_threshold_secs: u64,
 }
 
 impl LexiconCache {
     /// Construct an in-memory-only cache (no on-disk persist). Useful
     /// for tests; production should use [`Self::with_pool`].
+    /// Tests-only consumer today; `--lib` doesn't see tests/.
+    #[allow(dead_code)]
     pub fn in_memory(last_used_persist_threshold_secs: u64) -> Self {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
@@ -291,6 +297,11 @@ impl LexiconCache {
     /// exceeds the existing on-disk value by ≥
     /// `last_used_persist_threshold_secs`. Returns `Ok(true)` when an
     /// update fired, `Ok(false)` when throttled (no DB write).
+    ///
+    /// Forward-substrate — consumer is the resolver's read path,
+    /// which short-circuits this in v0.5 to avoid per-fetch DB writes.
+    /// Wires up with v0.6 cache-warming work.
+    #[allow(dead_code)]
     pub async fn persist_last_used_if_due(
         &self,
         nsid: &str,

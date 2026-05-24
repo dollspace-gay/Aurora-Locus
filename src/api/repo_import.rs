@@ -870,7 +870,7 @@ impl SingleFlightImportLock {
     /// guard's `Drop` impl releases the slot. Returns `None` if
     /// another importRepo for the same DID is in flight — caller
     /// should return `PdsError::ConcurrentMutation`.
-    pub(crate) fn try_acquire(self: &'static Self, did: &str) -> Option<ImportLockGuard> {
+    pub(crate) fn try_acquire(&'static self, did: &str) -> Option<ImportLockGuard> {
         let mut set = self.in_flight.lock().expect("lock poisoned");
         if set.contains(did) {
             return None;
@@ -959,7 +959,7 @@ fn error_kind_label(err: &PdsError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
+    
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn test_cid() -> Cid {

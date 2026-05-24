@@ -378,10 +378,10 @@ impl JobScheduler {
     }
 
     /// Arc 16d §9.4.4 Step 3.2 — row-walker orchestrator parallel
-    /// to [`Self::gc_sweep_job`]. Single-tasked per §9.4.3.7
-    /// (no self-overlap mutex needed — `tokio::spawn` of one task
-    /// + `MissedTickBehavior::Skip` together give the topology
-    /// the design assumes).
+    /// to [`Self::gc_sweep_job`]. Single-tasked per §9.4.3.7 (no
+    /// self-overlap mutex needed — `tokio::spawn` of one task plus
+    /// `MissedTickBehavior::Skip` together give the topology the
+    /// design assumes).
     ///
     /// Cadence shared with the byte-walker via
     /// `gc_sweep.interval_secs`. Cycle-completion summary log

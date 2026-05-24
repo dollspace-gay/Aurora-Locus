@@ -680,8 +680,7 @@ fn validate_gc_sweep_config(config: &ServerConfig, issues: &mut Vec<ValidationIs
     // included) is accepted as the operator's choice but warned on,
     // since §9.4.3.4's race analysis is keyed to READ COMMITTED.
     if config.database.backend == crate::config::DatabaseBackend::Postgres
-        && config.database.pg_transaction_isolation.to_ascii_lowercase()
-            != "read committed"
+        && !config.database.pg_transaction_isolation.eq_ignore_ascii_case("read committed")
     {
         issues.push(ValidationIssue::warning(
             "GcSweep",

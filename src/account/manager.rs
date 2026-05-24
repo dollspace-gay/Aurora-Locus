@@ -1015,8 +1015,10 @@ impl AccountManager {
         // §5.3.3 tuple table; the kid here makes the routing
         // explicit + tracks issuance for future revocation
         // surfaces (§5.5.2).
-        let mut header = Header::default();
-        header.kid = Some("aurora-local-v1".to_string());
+        let header = Header {
+            kid: Some("aurora-local-v1".to_string()),
+            ..Header::default()
+        };
 
         let token = encode(
             &header,
@@ -1763,20 +1765,6 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Update account password (admin operation)
-    ///
-    /// Updates the password for an account. This is an admin operation that
-    /// bypasses the normal password reset flow. All sessions are invalidated
-    /// as a security measure.
-    pub async fn update_password(&self, did: &str, new_password: &str) -> PdsResult<()> {
-        let password_hash = crate::auth::PasswordHasher::hash(new_password)
-            .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
-        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
-        Self::update_password_hash_in_tx(&mut tx, did, &password_hash).await?;
-        tx.commit().await.map_err(PdsError::Database)?;
-        Ok(())
-    }
-
     /// Update password inside an existing transaction. LB-1 / chainlink #129
     /// atomic-with-chain entry point. Performs the hash before opening
     /// the tx so the (slow) Argon2 work doesn't extend the transaction's
@@ -1974,19 +1962,12 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Takedown an account (remove from public view)
-    ///
-    /// Sets the takedown_ref field and revokes all active sessions and refresh tokens
-    /// in a single transaction for consistency. This ensures that a taken-down account
-    /// cannot continue to use the service.
-    ///
-    /// # Arguments
-    /// * `did` - The DID of the account to take down
-    /// * `takedown_ref` - A reference string identifying the takedown action (moderation ID, reason code, etc.)
-    ///
-    /// # Returns
-    /// * `Ok(())` if the takedown was successful
-    /// * `Err(PdsError)` if the account doesn't exist or database operation fails
+    /// Takedown an account (remove from public view). Begins its own
+    /// transaction; production handlers should prefer
+    /// `takedown_account_in_tx` so the chain-entry write rides the
+    /// caller's transaction. Consumed by `#[cfg(test)]` sites in
+    /// `src/api/admin.rs` for handler-level coverage.
+    #[allow(dead_code)]
     pub async fn takedown_account(&self, did: &str, takedown_ref: &str) -> PdsResult<()> {
         let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
         Self::takedown_account_in_tx(&mut tx, did, takedown_ref).await?;
@@ -2036,24 +2017,6 @@ impl AccountManager {
             takedown_ref
         );
 
-        Ok(())
-    }
-
-    /// Activate an account (restore from takedown)
-    ///
-    /// Clears the takedown_ref field, making the account accessible again.
-    /// Note: This does NOT restore sessions - the user will need to log in again.
-    ///
-    /// # Arguments
-    /// * `did` - The DID of the account to activate
-    ///
-    /// # Returns
-    /// * `Ok(())` if the activation was successful
-    /// * `Err(PdsError)` if the account doesn't exist or database operation fails
-    pub async fn activate_account(&self, did: &str) -> PdsResult<()> {
-        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
-        Self::activate_account_in_tx(&mut tx, did).await?;
-        tx.commit().await.map_err(PdsError::Database)?;
         Ok(())
     }
 
@@ -2576,20 +2539,6 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Allocate invite codes to an account (periodic allocation)
-    ///
-    /// This can be called periodically (e.g., weekly) to give users new invite codes
-    /// based on the configuration.
-    /// Enable invite code creation for an account
-    ///
-    /// Allows the account to create and use invite codes.
-    pub async fn enable_account_invites(&self, did: &str) -> PdsResult<()> {
-        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
-        Self::enable_account_invites_in_tx(&mut tx, did).await?;
-        tx.commit().await.map_err(PdsError::Database)?;
-        Ok(())
-    }
-
     /// Enable invite code creation for an account inside an existing
     /// transaction. LB-1 / chainlink #122 atomic-with-chain entry point.
     pub async fn enable_account_invites_in_tx<'c>(
@@ -2610,9 +2559,12 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Disable invite code creation for an account
-    ///
-    /// Prevents the account from creating new invite codes.
+    /// Disable invite code creation for an account. Begins its own
+    /// transaction; production handlers should prefer
+    /// `disable_account_invites_in_tx` so the chain-entry write rides
+    /// the caller's transaction. Consumed by `#[cfg(test)]` sites in
+    /// `src/api/admin.rs` for handler-level coverage.
+    #[allow(dead_code)]
     pub async fn disable_account_invites(&self, did: &str) -> PdsResult<()> {
         let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
         Self::disable_account_invites_in_tx(&mut tx, did).await?;

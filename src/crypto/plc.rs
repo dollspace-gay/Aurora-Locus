@@ -376,6 +376,12 @@ impl PlcSigner {
     /// raw 64-byte r||s form. Callers (the pre-Arc-13 utility)
     /// own all encoding/canonicalization decisions on either
     /// side of this call.
+    ///
+    /// Sole consumer is the pre-Arc-13 test scaffold at
+    /// `tests/support/pre_arc13_signing.rs`; production uses
+    /// `sign_operation` / `sign_tombstone`. The `--lib` build
+    /// doesn't see integration tests, so the lint fires.
+    #[allow(dead_code)]
     pub fn sign_raw(&self, msg: &[u8]) -> Signature {
         self.keypair.signing_key().sign(msg)
     }

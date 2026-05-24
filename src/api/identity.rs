@@ -2,7 +2,6 @@
 /// Implements com.atproto.identity.* endpoints for handle and DID resolution
 use crate::{
     auth::AuthContext,
-    crypto::plc::{PlcOperationBuilder, PlcSigner},
     error::{PdsError, PdsResult},
     AppContext,
 };
@@ -62,16 +61,13 @@ pub async fn update_handle(
     let did = auth.did;
 
     // Arc 12 §5.3.8 mint-pattern forward.
-    if ctx.entryway_client.is_some() {
+    if let Some(entryway) = ctx.entryway_client.as_ref() {
         let headers = ctx
             .entryway_auth_headers(&did, "com.atproto.identity.updateHandle")
             .await?;
         // updateHandle's upstream response is empty (`{}`); decode as
         // serde_json::Value and discard.
-        let _: serde_json::Value = ctx
-            .entryway_client
-            .as_ref()
-            .expect("checked above")
+        let _: serde_json::Value = entryway
             .xrpc_post_json("com.atproto.identity.updateHandle", headers, &req)
             .await?;
         return Ok(Json(()));
@@ -265,7 +261,7 @@ pub async fn get_recommended_did_credentials(
             ))
         })?;
     let atproto_signer = PlcSigner::from_hex(&atproto_signing_key_hex)?;
-    let atproto_did_key = atproto_signer.public_key_did_key();
+    let _atproto_did_key = atproto_signer.public_key_did_key();
 
     // §6.3.3 priority order. Per-account recovery_key isn't
     // surfaced here (server-side doesn't know it).
@@ -362,14 +358,11 @@ pub async fn sign_plc_operation(
     // configured, mint a service-auth JWT scoped to this NSID via
     // `entryway_auth_headers` and proxy the request body upstream;
     // the entryway is the canonical signer in that deployment shape.
-    if ctx.entryway_client.is_some() {
+    if let Some(entryway) = ctx.entryway_client.as_ref() {
         let headers = ctx
             .entryway_auth_headers(&did, "com.atproto.identity.signPlcOperation")
             .await?;
-        let resp: SignPlcOperationResponse = ctx
-            .entryway_client
-            .as_ref()
-            .expect("checked above")
+        let resp: SignPlcOperationResponse = entryway
             .xrpc_post_json("com.atproto.identity.signPlcOperation", headers, &req)
             .await?;
         return Ok(Json(resp));

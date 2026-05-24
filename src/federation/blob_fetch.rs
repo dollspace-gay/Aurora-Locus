@@ -378,7 +378,7 @@ mod tests {
         body::Body,
         extract::{Query, State},
         http::{HeaderMap, Method, StatusCode},
-        response::{IntoResponse, Response},
+        response::Response,
         routing::any,
         Router,
     };

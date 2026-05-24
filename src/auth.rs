@@ -900,7 +900,7 @@ pub async fn validate_external_access_token(
             "external access token iat is in the future".to_string(),
         ));
     }
-    if !expected_audiences.iter().any(|a| *a == aud.as_str()) {
+    if !expected_audiences.contains(&aud.as_str()) {
         return Err(PdsError::Authentication(format!(
             "external access token aud {:?} not in expected audiences {:?}",
             aud, expected_audiences

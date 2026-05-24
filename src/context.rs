@@ -143,6 +143,10 @@ pub struct AppContext {
     /// `Basic` auth header pre-bound from
     /// `config.entryway.admin_token`. `Some`/`None` symmetrically
     /// with `entryway_client`.
+    ///
+    /// Arc 12 forward-substrate — admin-tier forwarded handlers
+    /// deferred (#60).
+    #[allow(dead_code)]
     pub entryway_admin_client: Option<Arc<crate::federation::EntrywayAdminClient>>,
     /// Arc 17 §17.3.2 + §17.3.7 — dynamic lexicon resolver shared by
     /// (a) the validate-phase fall-through dispatched from

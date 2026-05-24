@@ -387,6 +387,7 @@ async fn canonical_form_matches_for_genesis_entry() {
 // hashes it, they should get the same value asserted here.
 // ====================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn fixed_row(
     sequence: i64,
     actor_did: &str,

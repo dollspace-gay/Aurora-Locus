@@ -544,7 +544,7 @@ fn parse_did_from_txt(records: &[String]) -> Result<String, Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::dns_resolver::{DnsResolverError, MockDnsTxtResolver};
+    use crate::federation::dns_resolver::MockDnsTxtResolver;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Test fetcher counting `fetch` invocations + returning canned
@@ -627,10 +627,11 @@ mod tests {
     }
 
     fn config_with(did_authority: Option<&str>) -> LexiconConfig {
-        let mut cfg = LexiconConfig::default();
-        cfg.enabled = true;
-        cfg.did_authority = did_authority.map(|s| s.to_string());
-        cfg
+        LexiconConfig {
+            enabled: true,
+            did_authority: did_authority.map(|s| s.to_string()),
+            ..LexiconConfig::default()
+        }
     }
 
     // ──────────────────────────────────────────────────────────────

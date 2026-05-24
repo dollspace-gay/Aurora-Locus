@@ -45,10 +45,14 @@ pub fn read_bool(row: &sqlx::any::AnyRow, col: &str) -> Result<bool, sqlx::Error
     }
 }
 
-/// Database connection options
+/// Database connection options. Legacy `SqlitePool` factory pair —
+/// only the AnyPool path has production callers; both this struct
+/// and `create_pool` below survive only to wire the intra-module
+/// `open_*_pool` helpers below pending the Phase 3 (#76) AnyPool
+/// migration cutover that retires them.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DatabaseOptions {
-    #[allow(dead_code)] // Future connection pool configuration
     pub max_connections: u32,
     pub enable_wal: bool,
 }
@@ -62,7 +66,9 @@ impl Default for DatabaseOptions {
     }
 }
 
-/// Create a SQLite connection pool
+/// Create a SQLite connection pool. Legacy factory paired with
+/// `DatabaseOptions` above — pending the #76 AnyPool cutover.
+#[allow(dead_code)]
 pub async fn create_pool(path: &Path, options: DatabaseOptions) -> PdsResult<SqlitePool> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
@@ -85,27 +91,6 @@ pub async fn create_pool(path: &Path, options: DatabaseOptions) -> PdsResult<Sql
     .map_err(PdsError::Database)?;
 
     Ok(pool)
-}
-
-/// Run migrations for a database
-/// Migrations are embedded at compile time from ./migrations directory
-pub async fn run_migrations(pool: &SqlitePool) -> PdsResult<()> {
-    sqlx::migrate!("./migrations")
-        .run(pool)
-        .await
-        .map_err(|e| PdsError::Internal(format!("Migration failed: {}", e)))?;
-
-    Ok(())
-}
-
-/// Test database connection
-pub async fn test_connection(pool: &SqlitePool) -> PdsResult<()> {
-    sqlx::query("SELECT 1")
-        .execute(pool)
-        .await
-        .map_err(PdsError::Database)?;
-
-    Ok(())
 }
 
 // ============================================================================

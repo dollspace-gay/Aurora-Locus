@@ -919,40 +919,6 @@ impl BlobStore {
         Ok(results)
     }
 
-    /// Track a blob reference from a record
-    ///
-    /// Called when a record is created/updated that contains blob references.
-    pub async fn track_blob_reference(&self, blob_cid: &str, record_uri: &str) -> PdsResult<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO record_blob (blob_cid, record_uri, indexed_at)
-            VALUES ($1, $2, $3)
-            ON CONFLICT(blob_cid, record_uri) DO NOTHING
-            "#,
-        )
-        .bind(blob_cid)
-        .bind(record_uri)
-        .bind(Utc::now().to_rfc3339())
-        .execute(&self.db)
-        .await
-        .map_err(PdsError::Database)?;
-
-        Ok(())
-    }
-
-    /// Remove blob references for a record
-    ///
-    /// Called when a record is deleted.
-    pub async fn remove_record_blob_references(&self, record_uri: &str) -> PdsResult<()> {
-        sqlx::query("DELETE FROM record_blob WHERE record_uri = $1")
-            .bind(record_uri)
-            .execute(&self.db)
-            .await
-            .map_err(PdsError::Database)?;
-
-        Ok(())
-    }
-
     /// List blob CIDs for sync protocol (com.atproto.sync.listBlobs)
     ///
     /// Returns just the CID strings for a DID with cursor-based pagination.
@@ -1195,6 +1161,10 @@ impl BlobStore {
     /// Observability caveat: observes committed state only — cannot
     /// reflect uncommitted writes in any in-flight transaction
     /// (including the caller's own). NOT a control primitive.
+    ///
+    /// Observational-only forward-substrate: consumed by tests +
+    /// future operator admin endpoint; no production caller today.
+    #[allow(dead_code)]
     pub async fn is_untethered(&self, cid: &str) -> PdsResult<bool> {
         let row = sqlx::query("SELECT temp_key FROM blob_metadata WHERE cid = $1")
             .bind(cid)
@@ -2147,7 +2117,7 @@ mod tests {
 
     #[tokio::test]
     async fn is_untethered_false_when_row_absent() {
-        let (store, pool) = arc16b_store().await;
+        let (store, _pool) = arc16b_store().await;
         assert!(!store.is_untethered("bafyrei-missing").await.unwrap());
     }
 
@@ -2157,7 +2127,7 @@ mod tests {
     /// Direct INSERT with disallowed value must error.
     #[tokio::test]
     async fn check_constraint_rejects_unexpected_temp_key_value() {
-        let (store, pool) = arc16b_store().await;
+        let (_store, pool) = arc16b_store().await;
         let result = sqlx::query(
             "INSERT INTO blob_metadata (cid, mime_type, size, creator_did, created_at, temp_key) \
              VALUES ('bafyrei-bad', 'image/png', 100, 'did:plc:alice', '2026-01-01T00:00:00Z', 'unexpected')",

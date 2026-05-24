@@ -255,7 +255,7 @@ impl RepositoryManager {
         // resolver into RecordValidator's builder without restructuring
         // the constructor (which would ripple through every test
         // fixture in src/).
-        let validator = std::mem::replace(&mut self.validator, RecordValidator::new());
+        let validator = std::mem::take(&mut self.validator);
         self.validator = validator.with_lexicon(resolver, config.clone());
         self.lexicon_config = Some(config);
         self
@@ -1754,7 +1754,7 @@ mod tests {
     /// state changes. Documents the None-default behavior.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_phase_b_skipped_when_blob_store_not_wired() {
-        let (repo_mgr, _bs, pool, _tmp, did) = test_repo_mgr_with_blob_store().await;
+        let (repo_mgr, _bs, pool, _tmp, _did) = test_repo_mgr_with_blob_store().await;
         let did_for_unwired = unique_did();
         let blob_x = Cid::for_raw(b"step2-unwired-blob");
         let blob_x_str = blob_x.to_string_base32();
@@ -2024,7 +2024,7 @@ mod tests {
     /// behavior in `run_phase_b`.
     #[tokio::test(flavor = "multi_thread")]
     async fn apply_writes_with_tolerant_promoter_signals_needs_blob_fetch_on_absent_row() {
-        let (repo_mgr, _bs, pool, _tmp, did) = test_repo_mgr_with_blob_store().await;
+        let (repo_mgr, _bs, pool, _tmp, _did) = test_repo_mgr_with_blob_store().await;
         // Absent CID — no blob_metadata row staged.
         let absent_cid = Cid::for_raw(b"step4-tolerant-absent-blob");
         let absent_cid_str = absent_cid.to_string_base32();
@@ -2165,6 +2165,11 @@ mod tests {
     //   handler can't accidentally skip the lexicon chain.
     // ──────────────────────────────────────────────────────────────
 
+    // Test-mod-local allow: same rationale as validation::tests::
+    // arc17_matrix — `let mut cfg = LexiconConfig::default(); cfg.<flag>
+    // = ...;` per-field setup avoids forcing each test to enumerate
+    // the full LexiconConfig surface.
+    #[allow(clippy::field_reassign_with_default)]
     mod dispatch_plumbing_136 {
         use super::*;
         use crate::federation::dns_resolver::{DnsTxtResolver, MockDnsTxtResolver};
@@ -2332,6 +2337,9 @@ mod tests {
     //     handle_fetch_error short-circuits to handle_unknown).
     // ──────────────────────────────────────────────────────────────
 
+    // Same per-field-mutation-after-default rationale as the sibling
+    // arc17_matrix and dispatch_plumbing_136 test mods.
+    #[allow(clippy::field_reassign_with_default)]
     mod bug_2_hardfail_optimistic_137 {
         use super::*;
         use crate::config::FetchFailureBehavior;

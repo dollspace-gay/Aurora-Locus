@@ -1265,6 +1265,11 @@ impl LexiconConfig {
     /// Construct from explicit option-typed env-var values. Pure
     /// function so unit tests can exercise without touching
     /// process-global env. Empty / unset → default value.
+    ///
+    /// Conditional per-field derivation from option-typed env-var
+    /// inputs is what justifies the mutable-default-then-assign
+    /// shape and the 10-arg surface.
+    #[allow(clippy::field_reassign_with_default, clippy::too_many_arguments)]
     pub fn from_env_values(
         enabled: Option<String>,
         did_authority: Option<String>,

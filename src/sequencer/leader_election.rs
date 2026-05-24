@@ -57,8 +57,6 @@ pub trait LockProvider: Send + Sync {
     /// releases via Postgres session semantics, so this is for graceful
     /// shutdown only.
     async fn release(&self);
-    /// Whether the lock is currently held by this provider.
-    async fn is_held(&self) -> bool;
 }
 
 /// Postgres-backed lock provider. Holds a dedicated connection (NOT
@@ -156,9 +154,6 @@ impl LockProvider for PostgresLockProvider {
         }
     }
 
-    async fn is_held(&self) -> bool {
-        self.held_connection.lock().await.is_some()
-    }
 }
 
 /// Configuration for the leader-election loop.
@@ -248,7 +243,10 @@ impl LeaderElection {
     }
 
     /// Signal the election task to stop and wait for it to drain.
-    /// Releases the advisory lock if held.
+    /// Releases the advisory lock if held. Operator-side graceful-
+    /// shutdown forward-substrate — no production caller today;
+    /// integration-test consumer in `tests/multi_instance_test.rs`.
+    #[allow(dead_code)]
     pub async fn shutdown(mut self) -> PdsResult<()> {
         self.shutdown_flag.store(true, Ordering::SeqCst);
         self.shutdown_notify.notify_waiters();
@@ -260,7 +258,9 @@ impl LeaderElection {
     }
 
     /// Current role from the shared flag. Useful for diagnostics; the
-    /// Sequencer reads the same flag directly.
+    /// Sequencer reads the same flag directly. Consumed by inline tests
+    /// (same module) for failover assertions.
+    #[allow(dead_code)]
     pub fn current_role(&self) -> LeaderRole {
         if self.role_flag.load(Ordering::SeqCst) {
             LeaderRole::Leader
@@ -320,10 +320,6 @@ mod tests {
             if *g == Some(self.id) {
                 *g = None;
             }
-        }
-
-        async fn is_held(&self) -> bool {
-            *self.shared.lock().unwrap() == Some(self.id)
         }
     }
 

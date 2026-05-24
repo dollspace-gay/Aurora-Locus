@@ -100,6 +100,9 @@ impl Sequencer {
     }
 
     /// Cheap atomic load — checked at the top of every write path.
+    /// Consumed by `tests/multi_instance_test.rs` for failover
+    /// assertions; the `--lib` build doesn't see integration tests.
+    #[allow(dead_code)]
     pub fn is_leader(&self) -> bool {
         self.is_leader.load(Ordering::SeqCst)
     }
