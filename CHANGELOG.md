@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **Arc 17 Phase B sign-off (sub-feature #47, Arc 17 umbrella #46)** — dynamic lexicon loading verified end-to-end against live two-instance binaries (SQLite primary + Postgres re-run for federation/cache-persist). Fetch → CAR parse → cache write → validate → reuse (cache hit, no refetch) → single-flight de-dup (10 concurrent = 1 fetch) → HardFail 502 + Warn 200 → authority_tombstoned 502 → validate_imports override fires on validate:false writes. PG lexicon_cache migration 0013 confirmed TEXT timestamp columns (#130 invariant holds); cache row physically persisted to PG lexicon_cache after a real cross-PDS fetch. Phase B caught + fixed two production bugs (#136 dispatch plumbing, #137 HardFail vs Optimistic). Phase B doc-expectation corrections captured under #138. Closes #135, #136, #137, #46 (umbrella), #132 / #133 (pin chainlinks); defers #134 to v0.6.
+- Arc 17 Step 4: production LexiconRecordFetcher (sync.getRecord + CAR-parse standard door) (#135)
 - Arc 17 Phase B bug #2: lexicon fetch-class HardFail bypasses ValidationMode::Optimistic at validate_write — §17.3.3 precedence gate via `is_fetch_class_lexicon_variant` + `should_propagate_validation_errors` (#137)
 - Arc 16f Step 5: Phase B command script (#121)
 - v0.6+: import_repo_complete fetch-accounting not threaded (#122)
@@ -475,6 +477,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   intermittently fail under full suite).
 
 ### Fixed
+- Arc 17 #136: write handlers missed .with_lexicon — dispatch silently disabled in production (#136)
 - Arc 17 Step 0.0e v2-trigger: §17.3.5 NSID authority hostname derivation algorithm diverges from bsky-PDS — wholesale rewrite (#131)
 - PG migration 0010 TIMESTAMPTZ vs Rust read-as-Option<String> divergence breaks login on Postgres (#130)
 - import_repo_rejected log emits per_cid_failure_count: 0 despite aggregated failures in wire response (#129)
