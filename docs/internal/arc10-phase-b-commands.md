@@ -1,6 +1,6 @@
 # Arc 10 Phase B exercise script
 
-Localhost smoke-test script for Chrys's Phase B sweep of Arc 10
+Localhost smoke-test script for skydeval's Phase B sweep of Arc 10
 (`chainlink #57` — GC sweep for orphaned blob storage). Mirrors
 the Arc 7/8/9 convention at
 [`arc9-phase-b-commands.md`](arc9-phase-b-commands.md): curl
@@ -677,7 +677,7 @@ Stop the PDS before continuing.
 
 ## Section F — Operator doc readability
 
-Observational — Chrys's domain.
+Observational — skydeval's domain.
 
 ### F1. Confirm section header inventory
 

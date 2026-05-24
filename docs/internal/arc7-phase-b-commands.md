@@ -1,6 +1,6 @@
 # Arc 7 Phase B exercise script
 
-Localhost smoke-test script for Chrys's Phase B sweep of Arc 7
+Localhost smoke-test script for skydeval's Phase B sweep of Arc 7
 (`chainlink #53` — Multi-instance auth state + rate limiting).
 Mirrors the Arc 6 convention at
 [`arc6-phase-b-script.md`](arc6-phase-b-script.md): curl
@@ -11,7 +11,7 @@ framing.
 ## Prerequisites
 
 - Working directory: the Aurora-Locus checkout (WSL path on
-  Chrys's environment).
+  skydeval's environment).
 - Branch `skydeval/v0.4-cycle` at the Arc 7 Phase B tip or
   later.
 - A free port 2583 (default `PDS_PORT`).
@@ -91,12 +91,12 @@ curl -s -X POST http://localhost:2583/xrpc/com.atproto.server.createAccount \
 ```
 
 Expected: 200 with `did`, `handle`, `accessJwt`. Save the DID
-(format `did:plc:...`) for later if Chrys's existing local
+(format `did:plc:...`) for later if skydeval's existing local
 state doesn't already have one.
 
 ### Grant SuperAdmin
 
-(Skip if Chrys's local state already has a SuperAdmin from
+(Skip if skydeval's local state already has a SuperAdmin from
 prior Phase B sessions.)
 
 ```bash

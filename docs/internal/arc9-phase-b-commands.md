@@ -1,6 +1,6 @@
 # Arc 9 Phase B exercise script
 
-Localhost smoke-test script for Chrys's Phase B sweep of Arc 9
+Localhost smoke-test script for skydeval's Phase B sweep of Arc 9
 (`chainlink #55` — Hygiene pass). Mirrors the Arc 7/8 convention
 at [`arc7-phase-b-commands.md`](arc7-phase-b-commands.md) and
 [`arc8-phase-b-commands.md`](arc8-phase-b-commands.md): curl
@@ -452,7 +452,7 @@ dropped a redaction; investigate the diff against
 
 ## Section D — `AURORA_ADMIN_UI_DESIGN.md` readability
 
-Observational, not curl-driven — readability is Chrys's
+Observational, not curl-driven — readability is skydeval's
 domain per the existing Phase B convention. Read selected
 sections to confirm the historicized prose reads cleanly and
 that §8.15 + §15 were NOT modified.

@@ -1,6 +1,6 @@
 # Arc 6 Phase B exercise script
 
-Consolidated verification script for Chrys's Phase B sweep
+Consolidated verification script for skydeval's Phase B sweep
 against `pds.goddess.systems`. Aggregates the per-step
 verification sections from `/tmp/arc6_step1_report.md` through
 `/tmp/arc6_step7_report.md` into a single coherent run-through.
@@ -502,4 +502,4 @@ Once all sections clear:
 1. Document any new findings or regressions in a Phase B
    addendum (separate from this script).
 2. If clean, the v0.4 within-doll's-repo PR is ready to open.
-3. Tag and release after the PR merges (Chrys's call).
+3. Tag and release after the PR merges (skydeval's call).
