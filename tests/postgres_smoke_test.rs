@@ -330,6 +330,7 @@ async fn admin_managers_round_trip_on_postgres() {
 // ===========================================================================
 
 #[tokio::test]
+#[ignore = "requires a live PLC at the configured endpoint; see chainlink #109"]
 async fn account_manager_round_trip_on_postgres() {
     use aurora_locus::account::AccountManager;
     use aurora_locus::config::*;
