@@ -134,6 +134,14 @@ pb_env_emit_role() {
 export PDS_SERVICE_HOSTNAME=localhost
 export PDS_SERVICE_PORT=$port
 export PDS_HOSTNAME=localhost
+# PDS_PORT is the TCP bind port (src/config.rs:1608, default 2583).
+# Distinct from PDS_SERVICE_PORT / PDS_PUBLIC_URL / PDS_SERVICE_DID
+# which feed the public-URL + service-DID derivation. Without this
+# explicit per-role bind-port, every instance binds 2583 regardless
+# of A_PORT / B_PORT — role=a happens to work (A_PORT default is
+# 2583) but role=b collides with role=a on 2583 and never listens
+# on B_PORT, which is what the dual-backend scenarios assume.
+export PDS_PORT=$port
 export PDS_PUBLIC_URL=http://localhost:$port
 export PDS_SERVICE_DID=did:web:localhost%3A$port
 export PDS_SERVICE_HANDLE_DOMAINS=.localhost
