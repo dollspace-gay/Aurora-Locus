@@ -331,7 +331,12 @@ class MockHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
 
-        if path in ("/", ""):
+        # `/_health` is the readiness probe path used by both the
+        # operator harness (phase-b/lib/mock-plc.sh) and the CI gate
+        # (.github/workflows/ci.yml — postgres smoke test). Returning
+        # the same status JSON as `/` keeps the contract minimal: any
+        # 2xx is liveness; the body shape is incidental.
+        if path in ("/", "", "/_health"):
             self._send_json(
                 200,
                 {
