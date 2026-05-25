@@ -103,7 +103,17 @@ pb_create_account() {
         export "${upper}_ADMIN_JWT=$admin_jwt"
     fi
 
-    echo "[pb-creds] role=$role  did=$did  jwt_len=$jwt_len  admin_jwt_set=$( [ -n "${!upper}_ADMIN_JWT:-" ] && echo yes || echo no )"
+    # Indirect-expand the per-role admin-JWT var name. Bash's
+    # `${!var}_suffix` syntax expands `${!var}` first and appends
+    # `_suffix` literally — so `${!upper}_ADMIN_JWT:-` evaluated
+    # `${!upper}` first (the value of $A / $B, which is unset under
+    # `set -u`) and fired "!upper: unbound variable". The dangling `:-`
+    # outside the braces was also a no-op. Compound indirect expansion
+    # needs an intermediate variable holding the constructed name.
+    local admin_var="${upper}_ADMIN_JWT"
+    local admin_set_label
+    if [ -n "${!admin_var:-}" ]; then admin_set_label=yes; else admin_set_label=no; fi
+    echo "[pb-creds] role=$role  did=$did  jwt_len=$jwt_len  admin_jwt_set=$admin_set_label"
 }
 
 # -----------------------------------------------------------------------------
