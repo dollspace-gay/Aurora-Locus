@@ -32,7 +32,7 @@ use proto_blue::lexicon::{LexiconDoc, Lexicons};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Trait the resolver uses to perform the lexicon-record HTTP fetch
 /// against the authority DID's hosting PDS. Lives behind a trait so
@@ -375,9 +375,35 @@ impl ResolverFetchHandle {
 
         // Resolve authority DID. The `did_authority` config override
         // (if set) bypasses DNS TXT entirely.
+        //
+        // chainlink #142 — distinguishing debug emission on each arm so
+        // Phase B Scenario 13 can tell "live resolver actually fired and
+        // rejected" from "PDS_LEXICON_DID_AUTHORITY override silently
+        // consulted." The side-effect check keys on presence of
+        // `lexicon_dns_lookup` AND absence of
+        // `lexicon_authority_override_used` (both halves load-bearing;
+        // without both, the scenario can't prove the live path fired).
+        // debug! level so production noise stays at info+; Phase B uses
+        // debug builds with the lexicon-resolver target at debug, so the
+        // emission lands in the operator's log without flag flipping.
         let authority_did = match &self.config.did_authority {
-            Some(did) => did.clone(),
-            None => self.resolve_authority_did(nsid).await?,
+            Some(did) => {
+                debug!(
+                    event = "lexicon_authority_override_used",
+                    nsid = %nsid,
+                    did_authority = %did,
+                    "config did_authority override consulted; DNS skipped"
+                );
+                did.clone()
+            }
+            None => {
+                debug!(
+                    event = "lexicon_dns_lookup",
+                    nsid = %nsid,
+                    "no did_authority override; resolving via DNS TXT lookup"
+                );
+                self.resolve_authority_did(nsid).await?
+            }
         };
 
         // Fetch the lexicon record JSON.
