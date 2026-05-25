@@ -78,9 +78,12 @@ terminal restarts.
 
 ## Conventions (locked; do not change inside scenarios)
 
-- **Redirect, NEVER tee.** `cargo run > /tmp/pds-<role>-<backend>.log 2>&1 &` —
+- **Redirect, NEVER tee.** `cargo run --bin aurora-locus > /tmp/pds-<role>-<backend>.log 2>&1 &` —
   tee'd ANSI from `fmt::Layer.pretty()` breaks quoted greps. The
-  `pb_launch_instance` helper bakes this in.
+  `pb_launch_instance` helper bakes this in. The `--bin aurora-locus`
+  selector is also load-bearing once a second `[[bin]]` lives in
+  `Cargo.toml` (Cluster 1 added `phase-b-dns-responder`); bare
+  `cargo run` errors out as ambiguous.
 - **NEVER `--release`.** Phase B exercises debug-built behavior
   including `debug!` emission.
 - **Ready probe = `describeServer`, NOT `/xrpc/_health`.** The PDS

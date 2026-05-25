@@ -3,7 +3,7 @@
 # Source this file. Provides:
 #
 #   pb_kill_prior              # pkill any lingering aurora-locus instance
-#   pb_launch_instance <role>  # cargo run > /tmp/pds-<role>-<backend>.log 2>&1 &
+#   pb_launch_instance <role>  # cargo run --bin aurora-locus > /tmp/pds-<role>-<backend>.log 2>&1 &
 #   pb_wait_for_ready <role>   # poll describeServer until 200 (bounded retry)
 #   pb_grep_banner   <role>    # confirm right port + right data dir in startup log
 #
@@ -67,7 +67,10 @@ pb_launch_instance() {
         source "$env_path"
         set +a
         # Redirect, NOT tee. NOT --release.
-        cargo run >"$log_path" 2>&1 &
+        # `--bin aurora-locus` is load-bearing: M1.2(b) (commit 6bfa24a)
+        # added phase-b-dns-responder as a second [[bin]] in Cargo.toml,
+        # so bare `cargo run` is now ambiguous and fails to launch.
+        cargo run --bin aurora-locus >"$log_path" 2>&1 &
         echo $! > "/tmp/pds-${role}-${backend}.pid"
     )
     local pid
