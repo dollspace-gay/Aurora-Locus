@@ -49,11 +49,17 @@ pb_env_init() {
 
     case "$BACKEND" in
     sqlite)
-        # Per-instance isolation comes from PDS_DATA_DIRECTORY (the
-        # `?mode=rwc` URL is per-data-dir). Matches the convention
-        # arc16f-phase-b-commands.md settled on.
-        export A_DB_URL="sqlite:///$A_DATA/account.sqlite?mode=rwc"
-        export B_DB_URL="sqlite:///$B_DATA/account.sqlite?mode=rwc"
+        # Per-instance isolation comes from PDS_DATA_DIRECTORY. For SQLite
+        # the PDS treats PDS_DB_URL as a *bare filesystem path*; the
+        # production AnyPool layer (src/db/mod.rs::any_url_for) wraps it
+        # internally as `sqlite://<path>?mode=rwc`. Emitting the URL form
+        # here (as the v0.5 arc16f/arc17 markdown convention did) yields
+        # `sqlite://sqlite:///<path>?mode=rwc?mode=rwc` after wrapping and
+        # SQLx then rejects `mode=rwc?mode=rwc`. Bare path is the form the
+        # config layer expects. Postgres branch still emits the full URL
+        # because the PDS hands postgres URLs to sqlx untransformed.
+        export A_DB_URL="$A_DATA/account.sqlite"
+        export B_DB_URL="$B_DATA/account.sqlite"
         export PB_DB_BACKEND_VAL="sqlite"
         ;;
     postgres|pg)
