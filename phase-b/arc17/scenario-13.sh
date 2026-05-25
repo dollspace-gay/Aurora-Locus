@@ -18,12 +18,31 @@
 #   Live resolver returns Vec<String> length 2 -> strict-parse rejects
 #   ambiguity -> validate-phase rejects with HTTP 502
 #   LexiconAuthorityAmbiguous.
-# - 13b — ONE TXT with TWO `did=` entries (two character-strings in one
-#   record). Joined-chunks parse yields "did=did:plc:xyz1 did=did:plc:xyz2"
-#   which contains two `did=` substrings -> strict-parse rejects.
+# - 13b — TWO TXT records for one _lexicon name, EACH with TWO
+#   character-strings. The resolver's chunks-join('') step joins each
+#   record's chunks into one prefix-matching `did=...` value (Vec<String>
+#   length 2, two distinct candidates) -> strict-parse rejects ambiguity
+#   -> HTTP 502 LexiconAuthorityAmbiguous. Distinct from 13a along the
+#   chunk-joining axis: this exercises that joining happens BEFORE
+#   ambiguity detection (single-record multi-chunk would join into one
+#   prefix-match, NOT two; a prior iteration of this scenario tested
+#   that shape and surfaced as `did_fail` because the joined blob became
+#   a single candidate downstream — fixture-vs-parser-contract mismatch.
+#   Two records, each multi-chunk, is the wire shape that actually
+#   triggers ambiguity per src/federation/dns_resolver.rs::resolve_txt
+#   joining and src/federation/lexicon_resolver.rs::parse_did_from_txt
+#   prefix-only matching).
 # - 13c — ONE TXT, malformed (uppercase `DID=`, leading/trailing
-#   whitespace). Strict-parse rejects (no `did=` prefix in the
-#   case-sensitive match).
+#   whitespace). parse_did_from_txt's case-sensitive whitespace-
+#   intolerant strip_prefix("did=") yields zero candidates -> resolver
+#   surfaces as LexiconFetchFailed `failure_class: dns_fail` with detail
+#   "no did= entries in TXT records for _lexicon.test13c.example.com".
+#   NOT LexiconAuthorityAmbiguous — uppercase/whitespace is a strict-
+#   parse rejection that classifies as "no valid entries" (same bucket
+#   as truly-absent), distinguished from absent only by the detail
+#   message. The parser's design choice to share the dns_fail bucket
+#   here is defensible (same user-facing outcome: DID couldn't be
+#   extracted) and is the correct expectation, not a parser gap.
 #
 # Cache-defeat: per-sub-case unique NSIDs (Layer 3, load-bearing) +
 # responder TTL=0 (Layer 1) + cache_size=0 on the Phase-B-only resolver
@@ -82,6 +101,12 @@ DID_A1="did:plc:test13a000000000000001"
 DID_A2="did:plc:test13a000000000000002"
 DID_B1="did:plc:test13b000000000000001"
 DID_B2="did:plc:test13b000000000000002"
+# 13b splits each DID across two TXT character-strings to exercise
+# the resolver's chunk-join('') step alongside multi-record ambiguity.
+# Joined per record yields `did=$DID_B1` and `did=$DID_B2`; two
+# records -> two prefix-matching candidates -> ambiguity rejection.
+DID_B1_SUFFIX="${DID_B1#did:plc:}"
+DID_B2_SUFFIX="${DID_B2#did:plc:}"
 DID_C1="did:plc:test13c000000000000001"
 
 # ============================================================
@@ -113,7 +138,8 @@ cat > "$MOCK_DNS_CONFIG" <<JSON
     {
       "name": "_lexicon.test13b.example.com",
       "txt_records": [
-        ["did=${DID_B1}", "did=${DID_B2}"]
+        ["did=did:plc:", "${DID_B1_SUFFIX}"],
+        ["did=did:plc:", "${DID_B2_SUFFIX}"]
       ]
     },
     {
@@ -174,10 +200,10 @@ echo
 echo "expected: HTTP 502, body { error: 'LexiconAuthorityAmbiguous', ... }"
 
 # ============================================================
-# Block 3 — Scenario-call 13b (one TXT, two did= entries)
+# Block 3 — Scenario-call 13b (two TXT records, each multi-chunk)
 # ============================================================
 echo
-echo "[scenario-13] Block 3: 13b — one TXT with two did= entries"
+echo "[scenario-13] Block 3: 13b — two TXT records, each split across two chunks"
 echo "============================================================"
 
 RESP_PATH_13B=/tmp/scenario-13b-body.json
@@ -191,6 +217,9 @@ echo "13b write status: $WRITE_STATUS_13B"
 cat "$RESP_PATH_13B" | jq . 2>/dev/null || cat "$RESP_PATH_13B"
 echo
 echo "expected: HTTP 502, body { error: 'LexiconAuthorityAmbiguous', ... }"
+echo "         (the resolver's chunks-join('') joins each record's two"
+echo "          character-strings into one 'did=did:plc:...' prefix-matching"
+echo "          value; two records -> two candidates -> ambiguity)"
 
 # ============================================================
 # Block 4 — Scenario-call 13c (malformed TXT — uppercase DID=, whitespace)
@@ -209,13 +238,19 @@ WRITE_STATUS_13C=$(curl -sX POST "http://localhost:${B_PORT}/xrpc/com.atproto.re
 echo "13c write status: $WRITE_STATUS_13C"
 cat "$RESP_PATH_13C" | jq . 2>/dev/null || cat "$RESP_PATH_13C"
 echo
-echo "expected: HTTP 502, body { error: 'LexiconAuthorityAmbiguous' or similar"
-echo "          strict-parse rejection — depending on parse_did_from_txt's"
-echo "          taxonomy mapping for uppercase/whitespace, the error variant"
-echo "          may surface as the generic AmbiguousAuthority or a more"
-echo "          specific InvalidResponseStructure-equivalent. Operator"
-echo "          confirms the rejection happened (status >= 400) and that"
-echo "          NO record was committed."
+echo "expected: HTTP 502, body { error: 'LexiconFetchFailed', message:"
+echo "          '...no did= entries in TXT records for"
+echo "          _lexicon.test13c.example.com', failure_class: dns_fail }"
+echo "          parse_did_from_txt is case-sensitive (strip_prefix(\"did=\"))"
+echo "          AND whitespace-intolerant, so uppercase DID= and leading/"
+echo "          trailing whitespace BOTH fail the prefix match -> zero"
+echo "          candidates -> resolver classifies as dns_fail (same bucket"
+echo "          as truly-absent records, distinguished by detail message)."
+echo "          NOT LexiconAuthorityAmbiguous — strict-parse rejection of"
+echo "          a single malformed entry is 'no valid entries', not"
+echo "          'multiple entries.' The dns_fail bucket-sharing is the"
+echo "          parser's intended design (same user-facing outcome: a DID"
+echo "          could not be extracted from the published TXT records)."
 
 # ============================================================
 # Block 5 — Side-effect-check: distinguishing-log proof (chainlink #142)
@@ -278,10 +313,22 @@ MOCK_DNS_BIND="$DNS_NAMESERVER" pb_mock_dns_stop
 echo
 echo "[scenario-13] decision-point:"
 echo "  per sub-case, operator confirms:"
-echo "    - HTTP status 502 (or rejected-class 4xx/5xx for 13c)"
-echo "    - body shape: { error: 'LexiconAuthorityAmbiguous', ... } (13a/b)"
-echo "                  (13c's exact error variant TBD by parse_did_from_txt's"
-echo "                   taxonomy — operator records what surfaces)"
+echo "    13a: HTTP 502, body { error: 'LexiconAuthorityAmbiguous',"
+echo "         message contains '2 candidates', ... }; log:"
+echo "         lexicon_fetch_failed with failure_class=authority_ambiguous"
+echo "    13b: HTTP 502, body { error: 'LexiconAuthorityAmbiguous',"
+echo "         message contains '2 candidates', ... }; log:"
+echo "         lexicon_fetch_failed with failure_class=authority_ambiguous"
+echo "         (proves the resolver's chunks-join('') is applied per-record"
+echo "          BEFORE ambiguity detection, vs across-records)"
+echo "    13c: HTTP 502, body { error: 'LexiconFetchFailed', message"
+echo "         contains 'no did= entries in TXT records for'"
+echo "         _lexicon.test13c.example.com }; log:"
+echo "         lexicon_fetch_failed with failure_class=dns_fail"
+echo "         (proves strict-parse rejection of uppercase/whitespace —"
+echo "          the case-sensitive whitespace-intolerant prefix match is"
+echo "          working as intended)"
+echo "  all three sub-cases:"
 echo "    - log: lexicon_dns_lookup PRESENT (DNS arm fired)"
 echo "    - log: lexicon_authority_override_used ABSENT (override didn't fire)"
 echo "    - cache: zero rows for each of $NSID_13A, $NSID_13B, $NSID_13C"
