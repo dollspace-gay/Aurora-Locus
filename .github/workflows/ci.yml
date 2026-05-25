@@ -82,8 +82,45 @@ jobs:
       # backup_restore_roundtrip_on_postgres test (chainlink #95 /
       # Phase 5.2). The test skips silently if these aren't on PATH,
       # so installing them upgrades the test from skip to actually-run.
-      - name: Install postgres-client (for pg_dump / psql)
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      #
+      # python3-cryptography provides the cryptography package
+      # mock-plc.py imports for ECDSA signature verification
+      # (cryptography.hazmat.primitives.asymmetric.ec / utils). The
+      # v0.5-era doc claim that mock-plc.py was stdlib-only was
+      # incorrect; this install closes that gap so the Launch step
+      # below doesn't fail at first import.
+      - name: Install postgres-client + python3-cryptography
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client python3-cryptography
+      # Launch the mock PLC directory for the postgres_smoke_test
+      # account_manager_round_trip case (chainlink #109 Option A).
+      # The test calls create_account → posts plc_operation → reads
+      # back the DID doc; without a live PLC this short-circuits
+      # via the #[cfg(test)] sentinel in account/manager.rs (which
+      # only fires for cfg(test), NOT integration tests), so the
+      # integration test was #[ignore]'d in v0.5 (Option B). v0.6
+      # ships Option A: stand up mock-plc.py in CI and retarget the
+      # test config at it (see tests/postgres_smoke_test.rs
+      # did_plc_url change in the same chainlink).
+      #
+      # The liveness loop is load-bearing: without it the smoke
+      # test races and intermittently 400s on a not-yet-ready PLC.
+      #
+      # /_health here is mock-plc.py's OWN /_health and works — a
+      # different service from the PDS /_health that 404s (chainlink
+      # #97). Different ports too (mock-PLC on 2582; PDS on the
+      # test's configured port).
+      - name: Launch mock PLC for postgres smoke tests
+        run: |
+          python3 phase-b/mock-plc.py --port 2582 > /tmp/mock-plc.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:2582/_health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:2582/_health || {
+            echo "Mock PLC did not start"
+            cat /tmp/mock-plc.log
+            exit 1
+          }
       # `--test-threads=1` because each test spins up its own Postgres
       # container; running them in parallel races on port allocation
       # under some Docker configs. Tests are short individually

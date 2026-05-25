@@ -367,14 +367,21 @@ class MockHandler(BaseHTTPRequestHandler):
         op = last["operation"]
         op_type = op.get("type")
         if op_type == "plc_tombstone":
-            self._send_json(
-                200,
-                {
-                    "did": did,
-                    "tombstoned": True,
-                    "prev": op.get("prev"),
-                },
-            )
+            # PLC spec is HTTP 410 Gone for tombstoned DIDs. The v0.5
+            # mock returned 200 with {tombstoned: True} for backward
+            # compat; v0.6 makes the 410 permanent so Arc 13 v4.2's
+            # fetch_plc_document branch (which matches on status 410)
+            # fires correctly without an inline-and-revert patch. This
+            # is the M1.4 / chainlink #109 owner-side edit; consumed
+            # by Cluster 2's live DidTombstoned -> 400 verification on
+            # the federation handlers. Does NOT affect Member 1.4's
+            # smoke test outcome (the smoke posts plc_operation via
+            # create_account, never a plc_tombstone — the tombstone
+            # response shape doesn't touch the smoke's path).
+            self.send_response(410)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Gone (tombstoned)")
             return
 
         # Build a minimal DID-doc shape from the latest plc_operation.
