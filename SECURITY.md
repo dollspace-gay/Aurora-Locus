@@ -256,6 +256,69 @@ RATE_LIMIT_AUTHENTICATED_RPS=100 # Default: 100 req/s
 | DID Document Tampering | LOW | Blockchain/PLC directory provides integrity |
 | Clock Skew Attacks | LOW | 2-minute window for `iat` validation |
 
+### Accepted Advisory: RUSTSEC-2026-0118 (hickory-proto NSEC3 unbounded-loop)
+
+**Severity:** High (per RUSTSEC). **Status in Aurora Locus:** **accepted —
+exposure proven unreachable in this build.**
+
+**Background.** `hickory-proto` (transitively via `hickory-resolver`) carries
+the NSEC3 unbounded-loop vulnerability advised at
+[RUSTSEC-2026-0118](https://rustsec.org/advisories/RUSTSEC-2026-0118).
+Upstream has not published a fix as of the v0.6 cycle; the bump to
+`hickory-resolver 0.26.1` (M1.3, chainlink #152) patches the sibling
+RUSTSEC-2026-0119 (Moderate) but cannot address the High because no
+patched release exists.
+
+**Why we accept rather than mitigate.** The vulnerable function
+`verify_nsec3` lives in
+`hickory-proto::dnssec::dnssec_dns_handle::nsec3_validation`. It has exactly
+one call site, in `DnssecDnsHandle::verify_nsec_proof`. The `DnssecDnsHandle`
+is only constructed by `ResolverBuilder::build()` when BOTH of the following
+hold:
+
+1. The `__dnssec` cargo feature is active on `hickory-resolver`.
+2. `ResolverOpts.validate` is `true`.
+
+Aurora Locus's [`Cargo.toml`](Cargo.toml) declares
+`hickory-resolver = "0.26.1"` with default features only (`default =
+["system-config", "tokio"]`); `__dnssec` is NOT in defaults and we activate
+no `dnssec-ring` / `dnssec-aws-lc-rs` feature. `ResolverOpts::Default`
+sets `validate: false`, and `parse_resolv_conf` in
+`hickory-resolver/src/system_conf/unix.rs` never writes that field. Under
+`TokioResolver::builder_tokio().build()` (the call shape we use at
+[`src/federation/dns_resolver.rs`](src/federation/dns_resolver.rs)
+`HickoryDnsTxtResolver::from_system`) the constructed handle is
+unconditionally `LookupEither::Retry`, never
+`LookupEither::Secure(DnssecDnsHandle)`. The NSEC3 validation path is
+unreachable.
+
+**Transitive scope note.** `Cargo.lock` resolves a SECOND copy of
+`hickory-resolver 0.25.2` via `proto-blue-identity v0.3.2` (transitive
+through `proto-blue`). Our direct usage in `src/federation/dns_resolver.rs`
+is on the 0.26.1 binary and the reachability proof above governs it. The
+proto-blue-identity transitive copy is outside the v0.6 M1.3 bump scope; if
+that copy's DNS calls also flow through the unreachable-path shape (default
+features + no DNSSEC validation) the same reasoning applies, but the
+verification is upstream's responsibility and we have not audited it. A
+future cycle where proto-blue ships a release pinning hickory `>= 0.26.1`
+will collapse the duplicate.
+
+**Reassessment triggers.** This disposition must reopen if ANY of:
+
+- The `hickory-resolver` pin in `Cargo.toml` gains a `dnssec-ring` or
+  `dnssec-aws-lc-rs` feature (enables `__dnssec`).
+- Any code path constructs a `ResolverBuilder` and sets
+  `options.validate = true` (no such site exists today; future Phase-B-only
+  constructor paths must NOT touch `validate`).
+- Upstream `hickory-proto` publishes a fix for RUSTSEC-2026-0118 — at that
+  point bump and remove this acceptance entry.
+
+**Verification surface.** Live exercise of the lexicon DNS path
+(Scenario 13, Cluster 1 Member 1.2) confirms the resolver still produces the
+expected behaviour post-bump. The unreachability of NSEC3 itself is a
+static-source proof (above); there is no positive test (you cannot test
+that unreachable code didn't run).
+
 ### Recently Resolved Risks
 
 | Risk | Resolution Date | Notes |

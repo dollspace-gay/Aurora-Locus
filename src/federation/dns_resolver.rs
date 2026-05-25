@@ -15,6 +15,7 @@
 //! transport-level seam, not the policy layer.
 
 use async_trait::async_trait;
+use hickory_resolver::proto::rr::{RData, RecordType};
 use hickory_resolver::TokioResolver;
 use std::sync::Arc;
 
@@ -58,13 +59,46 @@ impl HickoryDnsTxtResolver {
     /// Build a resolver from the system DNS configuration (`/etc/resolv.conf`
     /// on Unix, registry on Windows — `hickory-resolver`'s `system-config`
     /// feature handles both, on by default).
+    ///
+    /// ## RUSTSEC-2026-0118 (NSEC3 unbounded-loop) — accept-disposition
+    ///
+    /// The advisory's vulnerable code path is `verify_nsec3` in
+    /// `hickory-proto::dnssec::dnssec_dns_handle::nsec3_validation`. That
+    /// function is only callable through `DnssecDnsHandle`, which the
+    /// resolver builder wires in only when BOTH of the following hold:
+    ///
+    /// 1. The `__dnssec` feature is active on `hickory-resolver` — we do
+    ///    NOT enable it (`Cargo.toml` declares `hickory-resolver = "0.26.1"`
+    ///    with default features only; no `dnssec-ring` / `dnssec-aws-lc-rs`
+    ///    activation).
+    /// 2. `ResolverOpts.validate` is `true` — the `Default` impl sets it to
+    ///    `false`, and `read_system_conf`'s `parse_resolv_conf` never
+    ///    writes the field.
+    ///
+    /// Under `builder_tokio().build()` the resulting handle is
+    /// unconditionally `LookupEither::Retry`, never `Secure(DnssecDnsHandle)`.
+    /// NSEC3 validation is unreachable; the High advisory is therefore an
+    /// accepted exposure rather than an active risk in this build. See
+    /// `SECURITY.md` for the full reasoning + upstream-tracking note.
+    ///
+    /// **Reassessment trigger:** any future change that enables DNSSEC
+    /// validation (adds the `dnssec-ring` feature on the hickory pin, or
+    /// flips `options.validate = true` on this builder) re-exposes the
+    /// vulnerable path and must reopen this disposition.
     pub fn from_system() -> Result<Self, DnsResolverError> {
-        let resolver = TokioResolver::builder_tokio()
-            .map_err(|e| DnsResolverError::Transport {
+        let builder = TokioResolver::builder_tokio().map_err(|e| {
+            DnsResolverError::Transport {
                 name: "<system-config>".to_string(),
                 source_detail: format!("hickory builder: {e}"),
-            })?
-            .build();
+            }
+        })?;
+        // hickory-resolver 0.26: `.build()` returns `Result<Resolver<P>, NetError>`
+        // (was infallible in 0.25). Map the NetError into our Transport variant
+        // so callers don't have to know about hickory's internal error type.
+        let resolver = builder.build().map_err(|e| DnsResolverError::Transport {
+            name: "<system-config>".to_string(),
+            source_detail: format!("hickory build: {e}"),
+        })?;
         Ok(Self {
             inner: Arc::new(resolver),
         })
@@ -89,14 +123,32 @@ impl DnsTxtResolver for HickoryDnsTxtResolver {
         // each TXT record's character-data chunks into one string. Multiple
         // TXT records remain as separate Vec entries — the caller decides
         // policy (strict-fail-on-multiple vs accept-first-etc).
+        //
+        // hickory-resolver 0.26 changed the iteration model: `txt_lookup`
+        // returns the generic `Lookup` (was the specialized `TxtLookup`),
+        // which exposes `.answers() -> &[Record]` instead of an
+        // `iter()`-yielding-`&TXT` shape. The semantic is preserved:
+        // (a) filter answers to RecordType::TXT (the message can carry
+        //     auxiliary records — CNAME for the alias, signatures, etc.,
+        //     even though our `txt_lookup` is type-narrow);
+        // (b) match `record.data()` on `RData::TXT` to access the chunk
+        //     vector (`TXT::txt_data: Box<[Box<[u8]>]>`);
+        // (c) join the chunks with empty separator, lossy-utf8 per chunk
+        //     (`from_utf8_lossy`), matching the 0.25 behaviour exactly.
         let mut out = Vec::new();
-        for record in lookup.iter() {
-            let joined: String = record
-                .iter()
-                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                .collect::<Vec<_>>()
-                .join("");
-            out.push(joined);
+        for record in lookup.answers() {
+            if record.record_type() != RecordType::TXT {
+                continue;
+            }
+            if let RData::TXT(txt) = &record.data {
+                let joined: String = txt
+                    .txt_data
+                    .iter()
+                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("");
+                out.push(joined);
+            }
         }
 
         if out.is_empty() {
