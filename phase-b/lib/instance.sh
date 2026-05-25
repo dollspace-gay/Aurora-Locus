@@ -38,10 +38,76 @@ pb_kill_prior() {
 }
 
 # -----------------------------------------------------------------------------
+# pb_pg_preflight <role>
+# Probe the operator-managed Postgres container for $role and fail fast
+# with a clear "start the container first" message if absent. Without
+# this, a missing container causes the PDS to spin on sqlx's connect
+# retry loop until PoolTimedOut (~60s) with a generic error that hides
+# the real cause. The probe prefers `pg_isready` when available; falls
+# back to bash's `/dev/tcp` TCP-handshake check so a fresh operator
+# environment without `postgresql-client` still gets a clean signal.
+# Reads the role's port from the URL env.sh emitted (A_DB_URL / B_DB_URL)
+# so the preflight stays in lockstep with whatever URL the launched PDS
+# would actually try to connect to.
+# -----------------------------------------------------------------------------
+
+pb_pg_preflight() {
+    local role="$1"
+    local upper
+    upper=$(echo "$role" | tr '[:lower:]' '[:upper:]')
+    local url_var="${upper}_DB_URL"
+    local url="${!url_var:-}"
+
+    if [ -z "$url" ]; then
+        echo "[pb-instance] pg preflight: $url_var unset — pb_env_init must run before pb_launch_instance under BACKEND=postgres" >&2
+        return 1
+    fi
+
+    # Extract host + port from `postgres://user:pass@host:port/db`.
+    # Strip the scheme + auth, leave `host:port/db`, then split.
+    local hostport="${url#*@}"
+    hostport="${hostport%%/*}"
+    local host="${hostport%%:*}"
+    local port="${hostport##*:}"
+
+    local container="aurora-phase-b-pg-${role}"
+
+    # Prefer pg_isready (recognizes server liveness, not just TCP).
+    # Fall back to bash's /dev/tcp probe so the operator doesn't need
+    # postgresql-client installed just to get a fail-fast signal.
+    local probe_ok=1
+    if command -v pg_isready >/dev/null 2>&1; then
+        if pg_isready -h "$host" -p "$port" -q >/dev/null 2>&1; then
+            probe_ok=0
+        fi
+    else
+        # /dev/tcp is bash-native; the script is bash-only so this is
+        # always available. Wrapping in `timeout 2` keeps a stale port
+        # from hanging on SYN_SENT.
+        if timeout 2 bash -c "exec 9<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+            probe_ok=0
+        fi
+    fi
+
+    if [ "$probe_ok" -ne 0 ]; then
+        echo "[pb-instance] postgres container ${container} not reachable on ${host}:${port}" >&2
+        echo "[pb-instance] start it first (see phase-b/README.md \"Postgres prerequisite\"):" >&2
+        echo "  docker run -d --name ${container} -p ${port}:5432 \\" >&2
+        echo "    -e POSTGRES_USER=aurora -e POSTGRES_PASSWORD=aurora \\" >&2
+        echo "    -e POSTGRES_DB=aurora postgres:16" >&2
+        return 1
+    fi
+
+    echo "[pb-instance] pg preflight ok role=$role  container=${container}  ${host}:${port}"
+}
+
+# -----------------------------------------------------------------------------
 # pb_launch_instance <role>
 # Expects role-env already emitted (A_ENV/B_ENV path set + file readable)
 # and the per-role data dir pre-created (call lib/data.sh helpers first).
 # Logs to /tmp/pds-<role>-<backend>.log (redirect, NOT tee).
+# Under BACKEND=postgres, pb_pg_preflight gates the launch so a missing
+# operator-managed container surfaces fast instead of as PoolTimedOut.
 # -----------------------------------------------------------------------------
 
 pb_launch_instance() {
@@ -56,6 +122,16 @@ pb_launch_instance() {
     if [ -z "$env_path" ] || [ ! -r "$env_path" ]; then
         echo "[pb-instance] env file missing for role=$role ($env_var='$env_path')" >&2
         return 1
+    fi
+
+    # Postgres preflight: fail fast with the docker incantation if the
+    # operator-managed container isn't reachable, rather than letting
+    # sqlx burn 60s to PoolTimedOut. See phase-b/README.md "Postgres
+    # prerequisite". Previously this preflight lived only in scenario-11
+    # (the matrix wrapper); promoted to instance.sh so every scenario
+    # picks it up.
+    if [ "$backend" = "postgres" ]; then
+        pb_pg_preflight "$role" || return 1
     fi
 
     # Subshell so the source doesn't leak the per-role env into the

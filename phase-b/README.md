@@ -120,10 +120,36 @@ BACKEND=postgres ./phase-b/arc17/scenario-2.sh
 ```
 
 Default is `sqlite` when unset. `lib/env.sh` resolves per-backend DB
-URLs and container handles. Postgres requires two containers on 5432
-(A) and 5433 (B) per the v0.5 Phase B convention; the script preflight
-in `scenario-11.sh` errors with the docker run incantation if they're
-not reachable.
+URLs and container handles. SQLite is self-contained (each scenario
+spins its own per-role data dir). Postgres requires two long-lived
+operator-managed containers (see prerequisite below); `lib/instance.sh`
+runs a `pg_isready` (or `/dev/tcp` fallback) preflight before launching
+each PDS so a missing container fails fast with the docker incantation
+rather than letting the PDS spin to `PoolTimedOut`.
+
+### Postgres prerequisite
+
+Before running any scenario with `BACKEND=postgres`, stand up the two
+operator containers the harness expects. The names + ports + creds
+are prescriptive — `lib/env.sh` emits PDS_DB_URL pointing at exactly
+these, and `lib/instance.sh`'s preflight probes exactly these:
+
+```
+docker run -d --name aurora-phase-b-pg-a -p 5432:5432 \
+  -e POSTGRES_USER=aurora -e POSTGRES_PASSWORD=aurora \
+  -e POSTGRES_DB=aurora postgres:16
+
+docker run -d --name aurora-phase-b-pg-b -p 5433:5432 \
+  -e POSTGRES_USER=aurora -e POSTGRES_PASSWORD=aurora \
+  -e POSTGRES_DB=aurora postgres:16
+```
+
+Single-instance scenarios (e.g. scenario-13, which only seeds role B)
+only need `aurora-phase-b-pg-b`; multi-instance scenarios need both.
+Per-instance container ≈ the fresh-data-dir discipline for SQLite —
+tear down + re-create between scenarios that assert side-effect
+isolation (or `docker exec ... psql -c 'TRUNCATE ...'` for in-place
+resets — operator's call by scenario shape).
 
 ## CI vs operator harness
 
