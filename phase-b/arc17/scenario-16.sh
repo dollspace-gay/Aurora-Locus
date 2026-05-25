@@ -32,27 +32,39 @@ pb_env_echo_confirm
 B_LOG="/tmp/pds-b-${BACKEND}.log"
 TARGET_NSID="com.example.lexicon.target"
 
-# Helper: inspect record-table count via the active backend.
+# Helper: print the inspect command for B's record-table count.
+#
+# The `record` table is BACKEND-INDEPENDENT: it lives only in the
+# per-actor SQLite store at ${B_DATA}/actors/<shard>/<safe_did>/store.sqlite
+# (created inline by src/actor_store/store.rs::ActorStore::create), NOT in
+# account.sqlite (SQLite-backend) or the `aurora` Postgres database. Even
+# under BACKEND=postgres the actor stores stay SQLite — there is no
+# Postgres branch in actor_store/. The earlier shape of this helper
+# (sqlite3 ${B_DATA}/account.sqlite "SELECT count(*) FROM record WHERE
+# did='${B_DID}'") would error with `no such table: record` if an operator
+# copy-pasted it; the Postgres branch would error the same way. The
+# `WHERE did=` filter was also bogus — the per-actor `record` table has
+# columns (uri, cid, collection, rkey, repo_rev, indexed_at, takedown_ref)
+# with no `did` column (each store.sqlite belongs to exactly one DID).
+#
+# The shard directory is hash-derived (Rust's DefaultHasher % 256, not
+# reproducible in bash across Rust versions), so we discover the actor's
+# store.sqlite by walking ${B_DATA}/actors/. The primary side-effect
+# proof for Scenario 16 is the warn log; this helper is a secondary
+# operator-inspect hint.
 pb_record_count() {
-    local query="SELECT count(*) FROM record WHERE did='${B_DID}'"
-    case "$BACKEND" in
-    sqlite)
-        # Per-actor SQLite at ${B_DATA}/actors/<did-shard>/<did>/store.sqlite —
-        # operators run their own DB inspect commands; here we just probe
-        # an account-level count via the account_db (records replicate in
-        # the per-account record table at account_db only for some
-        # surfaces; the side-effect proof we WANT is the warn log).
-        # Print a placeholder and hand the inspect command to the operator.
-        echo "(BACKEND=sqlite — operator runs:"
-        echo "   sqlite3 \"${B_DATA}/account.sqlite\" \"${query}\""
-        echo " for the record-table count assertion.)"
-        ;;
-    postgres)
-        echo "(BACKEND=postgres — operator runs:"
-        echo "   docker exec aurora-phase-b-pg-b psql -U aurora -d aurora -At -c \"${query}\""
-        echo " for the record-table count assertion.)"
-        ;;
-    esac
+    local safe_did="${B_DID//:/_}"
+    local actor_db
+    actor_db=$(find "${B_DATA}/actors" -type f -name 'store.sqlite' \
+        -path "*/${safe_did}/*" -print -quit 2>/dev/null)
+    if [ -z "$actor_db" ]; then
+        echo "(per-actor store.sqlite not found under ${B_DATA}/actors/*/${safe_did}/ —"
+        echo "  has B been seeded yet? Scenario 12 creates the account.)"
+        return
+    fi
+    echo "(operator runs against B's per-actor SQLite — backend-independent:"
+    echo "   sqlite3 \"${actor_db}\" \"SELECT count(*) FROM record\""
+    echo " for the record-table count assertion.)"
 }
 
 # ============================================================
