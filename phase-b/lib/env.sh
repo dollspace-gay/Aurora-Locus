@@ -64,9 +64,16 @@ pb_env_init() {
         ;;
     postgres|pg)
         # Two containers on distinct ports per the v0.5 Postgres re-run
-        # convention. Container provisioning is operator-side (the
-        # harness assumes containers already running on 5432 + 5433);
-        # see the scenario's setup block.
+        # convention. Container provisioning is HARNESS-MANAGED — see
+        # lib/instance.sh::pb_pg_provision (auto-start on launch, restart
+        # if stopped, fast no-op if running) and lib/data.sh::
+        # pb_fresh_data_dir (extended to wipe the role's pg schema under
+        # BACKEND=postgres so scenarios that call it get a backend-
+        # symmetric clean slate). The v0.5 "operator-side provisioning"
+        # assumption was inherited from the markdown scripts; making it
+        # harness-managed closes the SQLite/Postgres ergonomics asymmetry
+        # that quietly biased operators toward sqlite-only runs (recorded
+        # intentional revision; see phase-b/README.md "Postgres backend").
         export A_DB_URL="postgres://aurora:aurora@localhost:5432/aurora"
         export B_DB_URL="postgres://aurora:aurora@localhost:5433/aurora"
         export PB_DB_BACKEND_VAL="postgres"

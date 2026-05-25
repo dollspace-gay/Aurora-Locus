@@ -6,42 +6,39 @@
 #
 # Source-of-record: docs/internal/arc17-phase-b-commands.md Scenario 11.
 #
-# THIS SCRIPT IS A WRAPPER. It assumes the operator has already stood up
-# the two Postgres containers (per the markdown) on 5432 + 5433. It
-# flips BACKEND=postgres and re-invokes the relevant scenarios in
-# sequence. Each invoked scenario re-sources lib/env.sh, which picks up
-# BACKEND=postgres and emits the postgres-flavored DB URLs.
+# THIS SCRIPT IS A WRAPPER. It flips BACKEND=postgres, auto-provisions
+# the two Postgres containers (via lib/instance.sh::pb_pg_provision),
+# and re-invokes the relevant scenarios in sequence. Each invoked
+# scenario re-sources lib/env.sh, which picks up BACKEND=postgres and
+# emits the postgres-flavored DB URLs. The matrix DELIBERATELY does
+# NOT call pb_fresh_data_dir between child scenarios — chained
+# scenarios share state across launches (the bootstrap from one is
+# the precondition for the next), matching the SQLite matrix behavior.
 
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 # shellcheck source=../lib/env.sh
 source phase-b/lib/env.sh
+# shellcheck source=../lib/instance.sh
+source phase-b/lib/instance.sh
 
 # ============================================================
-# Block 1 — Preflight: confirm two postgres containers responding
+# Block 1 — Auto-provision both Postgres containers up-front
 # ============================================================
 echo
-echo "[scenario-11] Block 1: preflight Postgres container reachability"
+echo "[scenario-11] Block 1: auto-provision Postgres containers"
 echo "============================================================"
 
-if ! command -v psql >/dev/null 2>&1; then
-    echo "[scenario-11] psql not on PATH; install postgresql-client to validate" >&2
-    echo "  apt: sudo apt-get install -y postgresql-client" >&2
-fi
-
-# Probe both containers (5432 = A; 5433 = B).
-for port in 5432 5433; do
-    if pg_isready -h localhost -p "$port" >/dev/null 2>&1; then
-        echo "Postgres reachable on :$port"
-    else
-        echo "[scenario-11] Postgres NOT reachable on :$port — stand up the container first" >&2
-        echo "  docker run -d --name aurora-phase-b-pg-<role> -p $port:5432 \\" >&2
-        echo "    -e POSTGRES_USER=aurora -e POSTGRES_PASSWORD=aurora \\" >&2
-        echo "    -e POSTGRES_DB=aurora postgres:16" >&2
-        exit 1
-    fi
-done
+# The matrix re-runs multi-instance scenarios (2 needs both A and B),
+# so provision both roles up-front. pb_pg_provision is idempotent —
+# fast no-op if a container is already up. Doing it here lets the
+# matrix fail fast at the top if docker is unavailable rather than
+# part-way through scenario-2's launch.
+export BACKEND=postgres
+pb_env_init >/dev/null
+pb_pg_provision a
+pb_pg_provision b
 
 # ============================================================
 # Block 2 — Flip BACKEND; reset role env vars so re-emission picks up

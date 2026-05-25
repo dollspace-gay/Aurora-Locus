@@ -120,36 +120,48 @@ BACKEND=postgres ./phase-b/arc17/scenario-2.sh
 ```
 
 Default is `sqlite` when unset. `lib/env.sh` resolves per-backend DB
-URLs and container handles. SQLite is self-contained (each scenario
-spins its own per-role data dir). Postgres requires two long-lived
-operator-managed containers (see prerequisite below); `lib/instance.sh`
-runs a `pg_isready` (or `/dev/tcp` fallback) preflight before launching
-each PDS so a missing container fails fast with the docker incantation
-rather than letting the PDS spin to `PoolTimedOut`.
+URLs and container handles. Both backends auto-provision their state
+substrate so a Postgres run is as frictionless as a SQLite run — no
+manual `docker run` step before `BACKEND=postgres`.
 
-### Postgres prerequisite
+### Postgres backend (auto-provisioned)
 
-Before running any scenario with `BACKEND=postgres`, stand up the two
-operator containers the harness expects. The names + ports + creds
-are prescriptive — `lib/env.sh` emits PDS_DB_URL pointing at exactly
-these, and `lib/instance.sh`'s preflight probes exactly these:
+Under `BACKEND=postgres`, `lib/instance.sh::pb_pg_provision` ensures
+the role's container (`aurora-phase-b-pg-a` on port 5432, or
+`aurora-phase-b-pg-b` on port 5433) is up and reachable before
+launching the PDS. The function is idempotent:
 
-```
-docker run -d --name aurora-phase-b-pg-a -p 5432:5432 \
-  -e POSTGRES_USER=aurora -e POSTGRES_PASSWORD=aurora \
-  -e POSTGRES_DB=aurora postgres:16
+- If the container is already up + reachable: fast probe-only no-op.
+- If it exists but is stopped: `docker start`, then wait for ready.
+- If it doesn't exist: `docker run -d --name ... -p ...:5432 -e ...
+  postgres:16`, then wait for ready (bounded 30s).
+- If docker is genuinely unavailable: fails fast with the exact
+  docker incantation the operator can run by hand, rather than letting
+  the PDS spin to `PoolTimedOut` after 60s.
 
-docker run -d --name aurora-phase-b-pg-b -p 5433:5432 \
-  -e POSTGRES_USER=aurora -e POSTGRES_PASSWORD=aurora \
-  -e POSTGRES_DB=aurora postgres:16
-```
+Clean-state isolation is orthogonal and follows the SQLite pattern.
+`lib/data.sh::pb_fresh_data_dir <role>` is the scenario-driven "clean
+slate for role X" primitive; under Postgres it wipes the role's
+schema via `DROP SCHEMA public CASCADE; CREATE SCHEMA public
+AUTHORIZATION aurora;` (audited safe — pg migrations are pure
+tables/indexes; the next PDS launch re-runs all migrations via
+`src/db/mod.rs::run_any_migrations`). Scenarios that want a clean
+slate call `pb_fresh_data_dir <role>` regardless of backend and get
+backend-symmetric isolation. Matrix scenarios that intentionally
+share state across launches (e.g. `scenario-11.sh` chaining 2 → 3 →
+12 → 6a → 6b → 16) skip the call, same as under SQLite.
 
-Single-instance scenarios (e.g. scenario-13, which only seeds role B)
-only need `aurora-phase-b-pg-b`; multi-instance scenarios need both.
-Per-instance container ≈ the fresh-data-dir discipline for SQLite —
-tear down + re-create between scenarios that assert side-effect
-isolation (or `docker exec ... psql -c 'TRUNCATE ...'` for in-place
-resets — operator's call by scenario shape).
+Containers persist between runs by default (cheap to wipe in place —
+matters when iterating). The operator can `docker rm -f
+aurora-phase-b-pg-{a,b}` to force a full recreate; the next harness
+invocation re-runs the docker incantation transparently.
+
+The harness-managed lifecycle is a deliberate revision of the v0.5
+"operator-side provisioning" convention. The old assumption was
+inherited from the markdown scripts without recorded rationale and
+left SQLite ergonomically favorable, quietly biasing operators toward
+sqlite-only runs and undermining the "always run twice, no backend
+carve-out" discipline (V06_DESIGN.md Settled Decision 3).
 
 ## CI vs operator harness
 

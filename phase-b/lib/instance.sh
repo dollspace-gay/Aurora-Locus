@@ -38,20 +38,31 @@ pb_kill_prior() {
 }
 
 # -----------------------------------------------------------------------------
-# pb_pg_preflight <role>
-# Probe the operator-managed Postgres container for $role and fail fast
-# with a clear "start the container first" message if absent. Without
-# this, a missing container causes the PDS to spin on sqlx's connect
-# retry loop until PoolTimedOut (~60s) with a generic error that hides
-# the real cause. The probe prefers `pg_isready` when available; falls
-# back to bash's `/dev/tcp` TCP-handshake check so a fresh operator
-# environment without `postgresql-client` still gets a clean signal.
-# Reads the role's port from the URL env.sh emitted (A_DB_URL / B_DB_URL)
-# so the preflight stays in lockstep with whatever URL the launched PDS
-# would actually try to connect to.
+# pb_pg_provision <role>
+# Ensure the role's Postgres container is running + reachable on the
+# host:port env.sh emitted for the role. Auto-starts the container if
+# absent (docker run with the conventional name/port/creds) or restarts
+# it if stopped (docker start). Idempotent: a no-op fast probe when the
+# container is already up.
+#
+# Lifecycle is harness-managed under BACKEND=postgres, mirroring the
+# SQLite path's data-dir auto-provisioning. Schema isolation is
+# orthogonal: pb_fresh_data_dir (in lib/data.sh) wipes both the data
+# dir AND the role's PG schema when BACKEND=postgres, so scenarios that
+# want clean state get it regardless of backend.
+#
+# Degraded fail-fast: if docker isn't available (or the daemon refuses
+# the start) we fall back to a clear error message + the exact docker
+# incantation, the same shape the d511291 preflight printed. The
+# operator sees a bounded actionable error instead of a 60s
+# PoolTimedOut spin.
+#
+# Reads the role's host+port from ${ROLE}_DB_URL (set by pb_env_init's
+# postgres branch) so the probe stays in lockstep with whatever URL the
+# launched PDS will actually try to connect to.
 # -----------------------------------------------------------------------------
 
-pb_pg_preflight() {
+pb_pg_provision() {
     local role="$1"
     local upper
     upper=$(echo "$role" | tr '[:lower:]' '[:upper:]')
@@ -59,12 +70,11 @@ pb_pg_preflight() {
     local url="${!url_var:-}"
 
     if [ -z "$url" ]; then
-        echo "[pb-instance] pg preflight: $url_var unset — pb_env_init must run before pb_launch_instance under BACKEND=postgres" >&2
+        echo "[pb-instance] pg provision: $url_var unset — pb_env_init must run before pb_pg_provision under BACKEND=postgres" >&2
         return 1
     fi
 
     # Extract host + port from `postgres://user:pass@host:port/db`.
-    # Strip the scheme + auth, leave `host:port/db`, then split.
     local hostport="${url#*@}"
     hostport="${hostport%%/*}"
     local host="${hostport%%:*}"
@@ -72,42 +82,124 @@ pb_pg_preflight() {
 
     local container="aurora-phase-b-pg-${role}"
 
-    # Prefer pg_isready (recognizes server liveness, not just TCP).
-    # Fall back to bash's /dev/tcp probe so the operator doesn't need
-    # postgresql-client installed just to get a fail-fast signal.
-    local probe_ok=1
-    if command -v pg_isready >/dev/null 2>&1; then
-        if pg_isready -h "$host" -p "$port" -q >/dev/null 2>&1; then
-            probe_ok=0
-        fi
-    else
-        # /dev/tcp is bash-native; the script is bash-only so this is
-        # always available. Wrapping in `timeout 2` keeps a stale port
-        # from hanging on SYN_SENT.
-        if timeout 2 bash -c "exec 9<>/dev/tcp/${host}/${port}" 2>/dev/null; then
-            probe_ok=0
-        fi
+    # ----- Phase 1: probe. -----
+    # Already reachable -> done, no-op.
+    if _pb_pg_probe "$host" "$port"; then
+        echo "[pb-instance] pg provision ok role=$role  container=$container  $host:$port  (already up)"
+        return 0
     fi
 
-    if [ "$probe_ok" -ne 0 ]; then
-        echo "[pb-instance] postgres container ${container} not reachable on ${host}:${port}" >&2
-        echo "[pb-instance] start it first (see phase-b/README.md \"Postgres prerequisite\"):" >&2
-        echo "  docker run -d --name ${container} -p ${port}:5432 \\" >&2
-        echo "    -e POSTGRES_USER=aurora -e POSTGRES_PASSWORD=aurora \\" >&2
-        echo "    -e POSTGRES_DB=aurora postgres:16" >&2
+    # ----- Phase 2: try to bring the container up via docker. -----
+    if ! command -v docker >/dev/null 2>&1; then
+        _pb_pg_fail_fast "$container" "$host" "$port" "docker not on PATH"
         return 1
     fi
 
-    echo "[pb-instance] pg preflight ok role=$role  container=${container}  ${host}:${port}"
+    # docker inspect tells us whether the container exists + its state.
+    # `2>/dev/null` swallows the "no such object" error so we can branch
+    # on the empty result.
+    local existing_state
+    existing_state=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)
+
+    case "$existing_state" in
+    true)
+        # Container says it's running but the probe just failed —
+        # likely starting up or stuck. Fall through to the wait loop.
+        echo "[pb-instance] pg provision: $container reports running but probe failed, waiting"
+        ;;
+    false)
+        echo "[pb-instance] pg provision: starting existing stopped container $container"
+        if ! docker start "$container" >/dev/null 2>&1; then
+            _pb_pg_fail_fast "$container" "$host" "$port" "docker start failed"
+            return 1
+        fi
+        ;;
+    "")
+        echo "[pb-instance] pg provision: creating $container on $host:$port"
+        if ! docker run -d --name "$container" \
+            -p "${port}:5432" \
+            -e POSTGRES_USER=aurora -e POSTGRES_PASSWORD=aurora \
+            -e POSTGRES_DB=aurora \
+            postgres:16 >/dev/null 2>&1; then
+            _pb_pg_fail_fast "$container" "$host" "$port" "docker run failed"
+            return 1
+        fi
+        ;;
+    *)
+        echo "[pb-instance] pg provision: docker inspect returned unexpected state '$existing_state' for $container" >&2
+        return 1
+        ;;
+    esac
+
+    # ----- Phase 3: bounded wait for ready. -----
+    # postgres:16 cold-start to accepting connections is typically
+    # 2-5s; bound generously at 30s to absorb slow disks.
+    local i
+    for i in $(seq 1 30); do
+        if _pb_pg_probe "$host" "$port"; then
+            echo "[pb-instance] pg provision ok role=$role  container=$container  $host:$port  (ready in ${i}s)"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "[pb-instance] pg provision: $container started but not reachable on $host:$port within 30s" >&2
+    echo "[pb-instance] container logs (last 30 lines):" >&2
+    docker logs --tail 30 "$container" >&2 2>&1 || true
+    return 1
+}
+
+# -----------------------------------------------------------------------------
+# _pb_pg_probe <host> <port>
+# Internal: returns 0 if the postgres TCP endpoint is responding.
+# Prefers pg_isready when on PATH (recognizes server liveness, not just
+# TCP); falls back to bash's /dev/tcp probe so a fresh operator without
+# postgresql-client still gets a clean signal.
+# -----------------------------------------------------------------------------
+
+_pb_pg_probe() {
+    local host="$1"
+    local port="$2"
+    if command -v pg_isready >/dev/null 2>&1; then
+        pg_isready -h "$host" -p "$port" -q >/dev/null 2>&1
+    else
+        # `timeout 2` prevents a stale half-open port from hanging on
+        # SYN_SENT.
+        timeout 2 bash -c "exec 9<>/dev/tcp/${host}/${port}" 2>/dev/null
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# _pb_pg_fail_fast <container> <host> <port> <reason>
+# Internal: print the degraded-mode fail-fast message + the docker
+# incantation the operator can run by hand. Preserved from the d511291
+# preflight so docker-absent / can't-start environments still get a
+# bounded actionable error instead of PoolTimedOut.
+# -----------------------------------------------------------------------------
+
+_pb_pg_fail_fast() {
+    local container="$1"
+    local host="$2"
+    local port="$3"
+    local reason="$4"
+    echo "[pb-instance] postgres container $container not reachable on $host:$port ($reason)" >&2
+    echo "[pb-instance] auto-provision is unavailable; start it manually:" >&2
+    echo "  docker run -d --name $container -p ${port}:5432 \\" >&2
+    echo "    -e POSTGRES_USER=aurora -e POSTGRES_PASSWORD=aurora \\" >&2
+    echo "    -e POSTGRES_DB=aurora postgres:16" >&2
 }
 
 # -----------------------------------------------------------------------------
 # pb_launch_instance <role>
 # Expects role-env already emitted (A_ENV/B_ENV path set + file readable)
 # and the per-role data dir pre-created (call lib/data.sh helpers first).
-# Logs to /tmp/pds-<role>-<backend>.log (redirect, NOT tee).
-# Under BACKEND=postgres, pb_pg_preflight gates the launch so a missing
-# operator-managed container surfaces fast instead of as PoolTimedOut.
+# Logs to /tmp/pds-<role>-<backend>.log (redirect, NOT tee); log file is
+# truncated at launch so failed-launch tails can't show a prior run's
+# banner.
+# Under BACKEND=postgres, pb_pg_provision ensures the role's container is
+# up (auto-start if absent, restart if stopped) before launching the PDS.
+# Schema isolation is orthogonal — pb_fresh_data_dir (lib/data.sh) is the
+# scenario-driven wipe that mirrors SQLite's fresh-data-dir.
 # -----------------------------------------------------------------------------
 
 pb_launch_instance() {
@@ -124,15 +216,21 @@ pb_launch_instance() {
         return 1
     fi
 
-    # Postgres preflight: fail fast with the docker incantation if the
-    # operator-managed container isn't reachable, rather than letting
-    # sqlx burn 60s to PoolTimedOut. See phase-b/README.md "Postgres
-    # prerequisite". Previously this preflight lived only in scenario-11
-    # (the matrix wrapper); promoted to instance.sh so every scenario
-    # picks it up.
+    # Postgres auto-provision: ensure the role's container is up
+    # (start if absent, restart if stopped, no-op if up) and reachable.
+    # Without this, a missing container caused the PDS to spin to
+    # PoolTimedOut after 60s with a generic error. SQLite path skips
+    # this branch entirely — it self-provisions its data dir via
+    # pb_fresh_data_dir.
     if [ "$backend" = "postgres" ]; then
-        pb_pg_preflight "$role" || return 1
+        pb_pg_provision "$role" || return 1
     fi
+
+    # Truncate the log so a failed launch can't surface a previous
+    # run's banner as if it were this run's. Without this, a void
+    # launch's "dump last 50 lines" tail prints a stale-but-plausible
+    # PDS-up log from the prior run and looks like a successful start.
+    : > "$log_path"
 
     # Subshell so the source doesn't leak the per-role env into the
     # parent shell (parent keeps its own state; the launched process
