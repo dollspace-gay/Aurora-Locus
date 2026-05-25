@@ -5,6 +5,11 @@
 
 pub mod account;
 pub mod advisory_locks;
+/// Arc 16d §9.4.4 Step 2.1 typed-wrapper substrate for autocommit
+/// SQL statements (`sweep_untethered_rows` issues every SQL site
+/// through these wrappers; audit-grep at Step 5 item 8 enforces
+/// the discipline scoped to `src/blob_store/gc.rs`).
+pub mod autocommit;
 pub mod liveness_lock;
 pub mod postgres;
 
@@ -40,10 +45,14 @@ pub fn read_bool(row: &sqlx::any::AnyRow, col: &str) -> Result<bool, sqlx::Error
     }
 }
 
-/// Database connection options
+/// Database connection options. Legacy `SqlitePool` factory pair —
+/// only the AnyPool path has production callers; both this struct
+/// and `create_pool` below survive only to wire the intra-module
+/// `open_*_pool` helpers below pending the Phase 3 (#76) AnyPool
+/// migration cutover that retires them.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DatabaseOptions {
-    #[allow(dead_code)] // Future connection pool configuration
     pub max_connections: u32,
     pub enable_wal: bool,
 }
@@ -57,7 +66,9 @@ impl Default for DatabaseOptions {
     }
 }
 
-/// Create a SQLite connection pool
+/// Create a SQLite connection pool. Legacy factory paired with
+/// `DatabaseOptions` above — pending the #76 AnyPool cutover.
+#[allow(dead_code)]
 pub async fn create_pool(path: &Path, options: DatabaseOptions) -> PdsResult<SqlitePool> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
@@ -82,27 +93,6 @@ pub async fn create_pool(path: &Path, options: DatabaseOptions) -> PdsResult<Sql
     Ok(pool)
 }
 
-/// Run migrations for a database
-/// Migrations are embedded at compile time from ./migrations directory
-pub async fn run_migrations(pool: &SqlitePool) -> PdsResult<()> {
-    sqlx::migrate!("./migrations")
-        .run(pool)
-        .await
-        .map_err(|e| PdsError::Internal(format!("Migration failed: {}", e)))?;
-
-    Ok(())
-}
-
-/// Test database connection
-pub async fn test_connection(pool: &SqlitePool) -> PdsResult<()> {
-    sqlx::query("SELECT 1")
-        .execute(pool)
-        .await
-        .map_err(PdsError::Database)?;
-
-    Ok(())
-}
-
 // ============================================================================
 // Backend-dispatching pool / migration entry points (Phase 2 / chainlink #75).
 //
@@ -112,6 +102,22 @@ pub async fn test_connection(pool: &SqlitePool) -> PdsResult<()> {
 // alongside the legacy SQLite-only paths above; AppContext continues to
 // construct the legacy `SqlitePool` for now.
 // ============================================================================
+
+/// Arc 16d §9.4.4 Step 1.7: normalize the operator-provided isolation
+/// string to a Postgres-recognized SQL fragment. Comparison is
+/// case-insensitive; the canonical SQL form is emitted in uppercase.
+/// Unrecognized values fall through verbatim so Postgres will reject
+/// the SET statement at connect time — surfaces operator typos
+/// immediately rather than silently coercing.
+fn normalize_pg_isolation(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "read uncommitted" => "READ UNCOMMITTED".to_string(),
+        "read committed" => "READ COMMITTED".to_string(),
+        "repeatable read" => "REPEATABLE READ".to_string(),
+        "serializable" => "SERIALIZABLE".to_string(),
+        _ => raw.trim().to_string(),
+    }
+}
 
 /// Resolve the connection URL for an `AnyPool` from a `DatabaseConfig`.
 /// SQLite gets a `sqlite://` prefix and `?mode=rwc` so the file is
@@ -163,6 +169,27 @@ pub async fn create_any_pool(
     }
     if let Some(t) = config.max_lifetime_secs {
         opts = opts.max_lifetime(Some(Duration::from_secs(t)));
+    }
+
+    // Arc 16d §9.4.3.6 / §9.4.4 Step 1.7: Postgres connection-level
+    // transaction isolation pin. Set via `after_connect` so the value
+    // travels with every new pool connection (overriding cluster-level
+    // `postgresql.conf`). Default `"read committed"` per
+    // `default_pg_transaction_isolation`. SQLite connections skip this
+    // hook entirely (SQLite has no per-connection isolation knob; WAL
+    // snapshot isolation is fixed at file-level).
+    if config.backend == DatabaseBackend::Postgres {
+        let isolation = normalize_pg_isolation(&config.pg_transaction_isolation);
+        opts = opts.after_connect(move |conn, _meta| {
+            let stmt = format!(
+                "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {}",
+                isolation
+            );
+            Box::pin(async move {
+                sqlx::query(&stmt).execute(conn).await?;
+                Ok(())
+            })
+        });
     }
 
     let url = any_url_for(config, fallback_sqlite_path);
@@ -430,5 +457,154 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod cross_backend_sql_lint_tests {
+    //! chainlink #95: prevent SQLite-only SQL functions from regressing
+    //! into production query strings. Arc 13 Phase 5's 233-site sweep
+    //! caught most, but five `datetime('now')` callsites survived in
+    //! `src/jobs/tasks.rs`, `src/api/admin.rs`, and
+    //! `src/cli/migrate_oauth.rs` — surfaced only at Postgres-backed
+    //! startup when the metrics_collection job errored with `function
+    //! datetime(unknown) does not exist`. This lint scans production
+    //! `src/` files for SQL strings that call SQLite-only time
+    //! functions; the per-actor `actor_store` is exempted because it
+    //! is always SQLite by design (per .env.example DB-backend doc).
+    //!
+    //! When this lint trips, the fix is the canonical TEXT + RFC3339
+    //! bind pattern documented at
+    //! `migrations/postgres/0001_initial.sql:19-34` and used by
+    //! `AccountManager::cleanup_expired_sessions`
+    //! (src/account/manager.rs:1072): `WHERE col > $1` with
+    //! `.bind(Utc::now().to_rfc3339())`. NOT `CURRENT_TIMESTAMP` —
+    //! Postgres's `CURRENT_TIMESTAMP` is `timestamptz`, which has no
+    //! `>` operator against the `TEXT` storage columns.
+
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    /// SQLite-only SQL function names that must not appear in production
+    /// query strings. Each entry is the function name as it appears in
+    /// a query (e.g., `datetime(` — the trailing `(` disambiguates from
+    /// identifiers like `datetime_field` or Rust function names like
+    /// `system_time_to_datetime`).
+    const FORBIDDEN_SQLITE_ONLY_TOKENS: &[&str] = &[
+        "datetime(",
+        "julianday(",
+        "strftime(",
+    ];
+
+    /// Files exempted from the lint. Either (a) per-actor stores that
+    /// are always SQLite by design, or (b) files containing only the
+    /// listed token in comments/test fixtures/Rust-side helpers (not
+    /// in SQL strings).
+    fn is_exempt(path: &Path) -> bool {
+        let rel = path
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap_or(path);
+
+        // Per-actor ActorStore is always SQLite (see .env.example
+        // database section); SQLite-only DDL/DML in this subtree is
+        // intentional.
+        if rel.starts_with("src/actor_store") {
+            return true;
+        }
+
+        // src/validation/mod.rs uses `datetime` in Rust function names
+        // (validate_datetime) and test names (test_validate_*_datetime);
+        // not SQL.
+        if rel == Path::new("src/validation/mod.rs") {
+            return true;
+        }
+
+        // src/admin/roles.rs comments reference `datetime('now')` in a
+        // doc comment explaining the format-mismatch lesson; no SQL.
+        if rel == Path::new("src/admin/roles.rs") {
+            return true;
+        }
+
+        // src/blob_store/disk.rs has a Rust helper named
+        // `system_time_to_datetime`; not SQL.
+        if rel == Path::new("src/blob_store/disk.rs") {
+            return true;
+        }
+
+        false
+    }
+
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+            panic!("read_dir {}: {}", dir.display(), e)
+        });
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension() == Some(OsStr::new("rs")) {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn no_sqlite_only_time_functions_in_production_sql() {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_dir, &mut files);
+
+        let mut violations: Vec<String> = Vec::new();
+        for file in &files {
+            if is_exempt(file) {
+                continue;
+            }
+            let content = match std::fs::read_to_string(file) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // Skip the test module portion of any file — production
+            // call-site discipline only. The convention is `#[cfg(test)]
+            // mod tests {`; everything after the first such marker is
+            // test code (unit tests embedded alongside production code).
+            let production = match content.find("#[cfg(test)]") {
+                Some(idx) => &content[..idx],
+                None => &content[..],
+            };
+            for (line_no, line) in production.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // Skip Rust-side comments (`//`) and doc comments
+                // (`///`, `//!`). SQL string literals are not comments.
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for token in FORBIDDEN_SQLITE_ONLY_TOKENS {
+                    if line.contains(token) {
+                        violations.push(format!(
+                            "{}:{}: contains forbidden SQLite-only token `{}`: {}",
+                            file.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                                .unwrap_or(file)
+                                .display(),
+                            line_no + 1,
+                            token,
+                            trimmed,
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "SQLite-only SQL functions found in production code \
+             (chainlink #95). Replace with the canonical TEXT + \
+             RFC3339-bind pattern: `WHERE col > $1` + \
+             `.bind(Utc::now().to_rfc3339())`. NOT `CURRENT_TIMESTAMP` \
+             — that errors on Postgres because `expires_at`-style \
+             columns are TEXT not TIMESTAMPTZ (see \
+             migrations/postgres/0001_initial.sql:19-34). \
+             Violations:\n  {}",
+            violations.join("\n  "),
+        );
     }
 }

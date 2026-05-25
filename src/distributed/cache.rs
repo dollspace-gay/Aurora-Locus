@@ -26,6 +26,11 @@
 //! wrapped in a [`CacheEntry`] carrying the absolute expiry.
 //! `dashmap` is already a Cargo dep (used elsewhere in the
 //! rate-limit middleware); no new dependency is introduced.
+//!
+//! `TtlCache` + `CacheEntry` exist as forward-substrate for the
+//! DPoP-claims short-circuit; the consumer-side wiring is part of
+//! Arc 7 Step 5 follow-ups (no production caller today).
+#![allow(dead_code)]
 
 use std::hash::Hash;
 use std::sync::Arc;

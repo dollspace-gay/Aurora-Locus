@@ -850,7 +850,7 @@ mod verify_service_jwt_tests {
             .expect("HMAC accepts arbitrary key length");
         mac.update(signing_input.as_bytes());
         let sig = mac.finalize().into_bytes();
-        let sig_b64 = URL_SAFE_NO_PAD.encode(&sig);
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig);
         let token = format!("{}.{}.{}", header_b64, claims_b64, sig_b64);
 
         // Script the resolver with the matching DID document so that

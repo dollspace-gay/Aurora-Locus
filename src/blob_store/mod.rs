@@ -7,6 +7,7 @@ pub mod disk;
 pub mod gc;
 pub mod mime;
 pub mod models;
+pub mod promoter;
 pub mod quarantine;
 pub mod s3;
 pub mod store;
@@ -16,7 +17,9 @@ pub use models::*;
 // then the re-export is unused at bin-scope. The allow lifts in Phase 2.
 #[allow(unused_imports)]
 pub use s3::{S3BlobBackend, S3Config};
-pub use store::{BlobStore, BlobStoreConfig};
+#[allow(unused_imports)]
+pub use promoter::{BlobPromoter, PromoteOutcome, StrictPromoter, TolerantPromoter};
+pub use store::{BlobStore, BlobStoreConfig, UnreferenceOutcome};
 
 use crate::error::PdsResult;
 use async_trait::async_trait;
@@ -102,6 +105,23 @@ pub trait BlobBackend: Send + Sync {
         cursor: Option<String>,
         page_size: usize,
     ) -> PdsResult<BlobListPage>;
+
+    /// Arc 16c §9.3.3.2 step 3 — establish bytes-durability at the
+    /// CID-derived final position. Called by `BlobStore::commit_blob`
+    /// AFTER `put()` succeeds, BEFORE the metadata transaction opens.
+    ///
+    /// - **Disk backend**: open file at CID path, `sync_all()` (file
+    ///   data + metadata); open containing directory, `sync_all()`.
+    ///   "Both absent" disposition per Arc 16c Step 0.2 recon — disk
+    ///   backend had no fsync today; Arc 16c adds both in canonical
+    ///   order (file then directory).
+    /// - **S3 backend**: no-op (durability was confirmed by the 2xx
+    ///   PUT response inside `put()`; no further sync needed).
+    ///
+    /// Default impl: no-op. Backends that need fsync override.
+    async fn fsync(&self, _cid: &str) -> PdsResult<()> {
+        Ok(())
+    }
 }
 
 /// Configuration for blob storage

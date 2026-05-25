@@ -121,6 +121,45 @@ pub struct AppContext {
     /// every consumer but only `describe_capabilities` reads
     /// it once Step 3 lands. See [`crate::api::registry`].
     pub route_registry: Arc<crate::api::registry::RouteRegistry>,
+    /// Arc 12 §5.3.3.1 trusted-iss allowlist for the
+    /// service-auth fallback path. Constructed at
+    /// `AppContext::new` from `[ctx.service_did(),
+    /// ctx.entryway_did()?, config.federation.peer_pds[*].did,
+    /// local_service_dids]` and **immutable for the process
+    /// lifetime** per §5.5.7 restart-requirement. Constant-
+    /// time membership lookup via `AppContext::is_trusted_iss`.
+    /// Iss values failing the membership check reject at
+    /// routing without PLC fetch per §5.3.3.1 boundary-case
+    /// rejection (also rejects empty / non-DID / missing iss).
+    pub trusted_iss: Arc<std::collections::HashSet<String>>,
+    /// Arc 12 §5.3.9 + §5.4 Step 1.4 — forwarded-handler entryway
+    /// HTTP client. `Some` when `config.entryway` is set; `None`
+    /// in standalone mode. Used by §5.3.8 forwarded handlers
+    /// (`signPlcOperation`, `updateHandle`, `getSession`,
+    /// `requestPasswordReset`) to forward XRPC calls to the
+    /// entryway.
+    pub entryway_client: Option<Arc<crate::federation::EntrywayClient>>,
+    /// Arc 12 §5.3.9 — admin-tier entryway client with the
+    /// `Basic` auth header pre-bound from
+    /// `config.entryway.admin_token`. `Some`/`None` symmetrically
+    /// with `entryway_client`.
+    ///
+    /// Arc 12 forward-substrate — admin-tier forwarded handlers
+    /// deferred (#60).
+    #[allow(dead_code)]
+    pub entryway_admin_client: Option<Arc<crate::federation::EntrywayAdminClient>>,
+    /// Arc 17 §17.3.2 + §17.3.7 — dynamic lexicon resolver shared by
+    /// (a) the validate-phase fall-through dispatched from
+    /// [`crate::actor_store::repository::RepositoryManager`] when its
+    /// own `.with_lexicon` builder is chained, and (b) the three
+    /// `tools.aurora.lexicon.*` admin endpoints in
+    /// [`crate::api::aurora_lexicon`]. `Some` when
+    /// `config.lexicon.enabled` is true; `None` when the lexicon
+    /// subsystem is off (the v0.5 default). Admin endpoints
+    /// short-circuit to HTTP 503 `LexiconDisabled` when this is
+    /// `None`; validate-phase callers skip the Arc 17 fall-through
+    /// entirely.
+    pub lexicon_resolver: Option<Arc<crate::federation::lexicon_resolver::LexResolver>>,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -276,6 +315,11 @@ impl AppContext {
                     idle_timeout_secs: config.database.idle_timeout_secs,
                     max_lifetime_secs: config.database.max_lifetime_secs,
                     leader_retry_interval_ms: config.database.leader_retry_interval_ms,
+                    // Arc 16d §9.4.3.6: maintenance pool inherits the same
+                    // Postgres isolation pin as the primary pool — sweep
+                    // operations against the substrate's rate-limit + DPoP
+                    // tables share the same race-analysis assumptions.
+                    pg_transaction_isolation: config.database.pg_transaction_isolation.clone(),
                 };
                 let pool = Arc::new(
                     db::create_any_pool(&maintenance_db_config, &config.storage.account_db)
@@ -449,6 +493,31 @@ impl AppContext {
             // PDS discovery for finding other instances
             let discovery = Arc::new(PdsDiscovery::new(config.federation.relay_urls.clone()));
 
+            // Arc 12 §5.3.2 Gap 3: at-startup bootstrap of
+            // peer-PDS map from `config.federation.peer_pds`.
+            // The map is populated once here; runtime mutation
+            // surfaces (`refresh_instances`, ops endpoints)
+            // continue to layer on top. Per §5.5.1, two-instance
+            // Phase B doesn't require runtime cross-instance
+            // routing — config-bootstrap suffices for v0.5.
+            for peer in &config.federation.peer_pds {
+                let instance = crate::federation::discovery::PdsInstance {
+                    did: peer.did.clone(),
+                    url: peer.url.clone(),
+                    name: None,
+                    open_registrations: false,
+                    user_count: None,
+                    last_seen: None,
+                    features: Vec::new(),
+                };
+                discovery.add_instance(instance).await;
+                tracing::info!(
+                    did = %peer.did,
+                    url = %peer.url,
+                    "Arc 12 §5.3.2 Gap 3: registered peer-PDS at startup"
+                );
+            }
+
             (Some(auth), Some(discovery))
         } else {
             (None, None)
@@ -517,10 +586,22 @@ impl AppContext {
             Arc::new(DPopVerifier::new(store_for_verifier))
         };
 
-        // Initialize sequencer with relay client (using account_db for now, could be separate database)
+        // Initialize sequencer with relay client (using account_db for now, could be separate database).
+        // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
+        // window. Matches bsky-PDS's `PDS_REPO_BACKFILL_LIMIT_MS`
+        // env-var convention (Sub-step 0.C verified default 86_400_000
+        // ms = 1 day).
+        let mut sequencer_config = SequencerConfig::default();
+        if let Ok(raw) = std::env::var("PDS_REPO_BACKFILL_LIMIT_MS") {
+            if let Ok(ms) = raw.parse::<i64>() {
+                if ms > 0 {
+                    sequencer_config.backfill_limit_secs = ms / 1000;
+                }
+            }
+        }
         let mut seq = Sequencer::with_relay(
             account_db.clone(),
-            SequencerConfig::default(),
+            sequencer_config,
             relay_client.clone(),
         );
 
@@ -667,6 +748,119 @@ impl AppContext {
         // fixtures' empty-registry paths also flow through this
         // arg.
 
+        // Arc 12 §5.3.3.1 trusted-iss allowlist — built once at
+        // construction time and frozen for the process lifetime
+        // (§5.5.7 restart-requirement). Pre-Step-1, the entryway
+        // DID slot is absent; Step 1.1 lands EntrywayConfig and
+        // a follow-up amendment extends this construction.
+        // local_service_dids is a forward-compatibility slot for
+        // admin-tier service identities from src/service_auth.rs
+        // flows — currently empty; future cycles may populate.
+        let mut trusted_iss_set = std::collections::HashSet::new();
+        trusted_iss_set.insert(config.service.service_did.clone());
+        for peer in &config.federation.peer_pds {
+            trusted_iss_set.insert(peer.did.clone());
+        }
+        // Arc 12 §5.4 Step 1.1: seed the entryway DID once
+        // EntrywayConfig is set. The set remains immutable for the
+        // process lifetime per §5.5.7 — toggling entryway mode
+        // requires a restart.
+        if let Some(entryway) = &config.entryway {
+            trusted_iss_set.insert(entryway.did.clone());
+        }
+        let trusted_iss = Arc::new(trusted_iss_set);
+
+        // Arc 12 §5.4 Step 1.4: entryway HTTP clients. Constructed
+        // once at startup when entryway mode is configured;
+        // `None`/`None` in standalone mode. The clients are
+        // dispatch-only wrappers in Step 1; method surfaces for
+        // mint-pattern forwarding (`entryway_auth_headers`) and
+        // passthru forwarding (`entryway_passthru_headers`) land in
+        // Step 2, and per-handler dispatch lands in Step 3.
+        let (entryway_client, entryway_admin_client) = match &config.entryway {
+            Some(entryway_cfg) => {
+                let client = crate::federation::EntrywayClient::new(entryway_cfg.url.clone())
+                    .map_err(|e| {
+                        PdsError::Internal(format!(
+                            "Failed to build entryway forwarded-handler HTTP client: {}",
+                            e
+                        ))
+                    })?;
+                let admin_client = crate::federation::EntrywayAdminClient::new(
+                    entryway_cfg.url.clone(),
+                    &entryway_cfg.admin_token,
+                )
+                .map_err(|e| {
+                    PdsError::Internal(format!(
+                        "Failed to build entryway admin HTTP client: {}",
+                        e
+                    ))
+                })?;
+                tracing::info!(
+                    entryway_url = %entryway_cfg.url,
+                    entryway_did = %entryway_cfg.did,
+                    "Arc 12 §5.3.9: constructed entryway clients (forwarded + admin)"
+                );
+                (Some(Arc::new(client)), Some(Arc::new(admin_client)))
+            }
+            None => (None, None),
+        };
+
+        // Arc 17 §17.4 Step 4 — production LexiconRecordFetcher wiring.
+        // When `config.lexicon.enabled` is true, build the full resolver
+        // stack (DnsTxtResolver + LexiconCache + ProductionLexiconFetcher)
+        // and stash it; otherwise leave `None` so admin endpoints respond
+        // HTTP 503 `LexiconDisabled` and the validate-phase fall-through
+        // stays inert (Step 3 disabled-config behavior preserved).
+        let lexicon_resolver = if config.lexicon.enabled {
+            use crate::federation::dns_resolver::HickoryDnsTxtResolver;
+            use crate::federation::lexicon_cache::LexiconCache;
+            use crate::federation::lexicon_fetcher_prod::ProductionLexiconFetcher;
+            use crate::federation::lexicon_resolver::LexResolver;
+
+            let dns = Arc::new(HickoryDnsTxtResolver::from_system().map_err(|e| {
+                PdsError::Internal(format!(
+                    "Arc 17 §17.4 Step 1.5: hickory DNS resolver init failed: {e:?}"
+                ))
+            })?);
+
+            let http_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(
+                    config.lexicon.fetch_timeout_secs,
+                ))
+                .build()
+                .map_err(|e| {
+                    PdsError::Internal(format!(
+                        "Arc 17 production fetcher: reqwest client init failed: {e}"
+                    ))
+                })?;
+
+            let fetcher = Arc::new(ProductionLexiconFetcher::new(
+                identity_resolver.clone(),
+                http_client,
+            ));
+
+            let cache = Arc::new(LexiconCache::with_pool(
+                account_db.clone(),
+                config.lexicon.last_used_persist_threshold_secs,
+            ));
+
+            tracing::info!(
+                fetch_timeout_secs = config.lexicon.fetch_timeout_secs,
+                cache_ttl_secs = config.lexicon.cache_ttl_secs,
+                "Arc 17 §17.3 lexicon resolver wired (enabled=true)"
+            );
+
+            Some(Arc::new(LexResolver::new(
+                cache,
+                dns as Arc<dyn crate::federation::dns_resolver::DnsTxtResolver>,
+                fetcher as Arc<dyn crate::federation::lexicon_resolver::LexiconRecordFetcher>,
+                config.lexicon.clone(),
+            )))
+        } else {
+            None
+        };
+
         Ok(Self {
             config: Arc::new(config),
             account_db,
@@ -698,7 +892,27 @@ impl AppContext {
             maintenance_pool,
             distributed_store,
             route_registry,
+            trusted_iss,
+            entryway_client,
+            entryway_admin_client,
+            // Arc 17 §17.4 Step 4 — lexicon resolver constructed above
+            // (Some when config.lexicon.enabled, None otherwise).
+            // Admin endpoints under tools.aurora.lexicon.* and the
+            // validate-phase fall-through gate on this field.
+            lexicon_resolver,
         })
+    }
+
+    /// Arc 12 §5.3.3.1: constant-time membership check for the
+    /// trusted-iss allowlist. Empty / non-DID / missing iss
+    /// uniformly rejects (the HashSet stores fully-qualified
+    /// DIDs; shape-invalid values can't be members). Caller
+    /// MUST reject without PLC fetch when this returns `false`.
+    pub fn is_trusted_iss(&self, iss: &str) -> bool {
+        if iss.is_empty() || !iss.starts_with("did:") {
+            return false;
+        }
+        self.trusted_iss.contains(iss)
     }
 
     /// Ensure required directories exist
@@ -729,17 +943,77 @@ impl AppContext {
         Ok(())
     }
 
-    /// Get service URL
+    /// Get service URL.
+    ///
+    /// Arc 12 §5.3.2 Gap 1 closure: delegates to
+    /// `ServiceConfig::effective_public_url()` which reads
+    /// `service.public_url` when set (via
+    /// `PDS_SERVICE_PUBLIC_URL`), otherwise derives
+    /// `{scheme}://{hostname}[:{port}]` with localhost-aware
+    /// scheme selection. Preserves v0.4 behavior when
+    /// `public_url` is unset on a localhost deployment.
     pub fn service_url(&self) -> String {
-        format!(
-            "http://{}:{}",
-            self.config.service.hostname, self.config.service.port
-        )
+        self.config.service.effective_public_url()
     }
 
     /// Get service DID
     pub fn service_did(&self) -> &str {
         &self.config.service.service_did
+    }
+
+    /// Arc 12 §5.3.4 / §5.3.9: configured entryway DID, `None` in
+    /// standalone mode. Used by `require_auth_forwarded` to build
+    /// the multi-audience allowlist and by `AppContext::new` to
+    /// seed the trusted-iss set with the entryway DID.
+    pub fn entryway_did(&self) -> Option<&str> {
+        self.config.entryway.as_ref().map(|c| c.did.as_str())
+    }
+
+    /// Arc 12 §5.3.4.1 shared verification helper. Routes a bearer
+    /// token through the §5.3.3 tuple table, honoring the caller-
+    /// supplied audience allowlist for the destination routes that
+    /// check audience. The two middleware variants
+    /// (`require_auth_unified` / `require_auth_forwarded`) are thin
+    /// wrappers around this method that differ only in their
+    /// allowlist.
+    ///
+    /// Returns a `UnifiedAuthContext` whose variant identifies the
+    /// validated path: `Local` for the DB-lookup local-verify path,
+    /// `OAuth` for the opaque-token DB-lookup OAuth path, and
+    /// `CrossPDS` for both the entryway external-verify and the
+    /// trusted-iss service-auth fallback (both produce a verified
+    /// did-bearing claim from a remote-trust path).
+    pub async fn verify_jwt_with_allowlist(
+        &self,
+        token: &str,
+        audience_allowlist: &[&str],
+    ) -> PdsResult<crate::api::middleware::UnifiedAuthContext> {
+        crate::auth::verify_jwt_with_allowlist_impl(self, token, audience_allowlist).await
+    }
+
+    /// Arc 12 §5.4 Step 2.1 — build the `Authorization: Bearer <jwt>`
+    /// header set required when forwarding `lxm` to the entryway on
+    /// behalf of `user_did`. Thin wrapper around
+    /// `crate::federation::entryway_auth_headers` that also resolves
+    /// the configured entryway DID. Returns
+    /// `PdsError::Internal("...without EntrywayConfig")` when called
+    /// in standalone mode — callers (the §5.3.8 forwarded handlers)
+    /// gate on `ctx.entryway_client.is_some()` before invoking, so
+    /// reaching this error path is a programming bug.
+    pub async fn entryway_auth_headers(
+        &self,
+        user_did: &str,
+        lxm: &str,
+    ) -> PdsResult<axum::http::HeaderMap> {
+        let entryway_did = self.entryway_did().ok_or_else(|| {
+            PdsError::Internal(
+                "entryway_auth_headers called without EntrywayConfig — \
+                 forwarded handlers must gate on entryway_client.is_some()"
+                    .to_string(),
+            )
+        })?;
+        crate::federation::entryway_auth_headers(&self.account_db, user_did, entryway_did, lxm)
+            .await
     }
 }
 

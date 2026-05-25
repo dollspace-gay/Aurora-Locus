@@ -59,6 +59,12 @@ pub struct ActorAccount {
     pub takedown_ref: Option<String>,
     pub deactivated_at: Option<DateTime<Utc>>,
     pub delete_after: Option<DateTime<Utc>>,
+    /// Arc 14 §7.3.6 (migration 0010): suspended-state timestamp.
+    /// v0.5: populated only by test-affordance direct DB writes.
+    pub suspended_at: Option<DateTime<Utc>>,
+    /// Arc 14 §7.3.6 (migration 0010): desync-detected timestamp.
+    /// v0.5: populated only by test-affordance direct DB writes.
+    pub desynchronized_at: Option<DateTime<Utc>>,
 
     // Account fields (optional - may be None for federated actors)
     pub email: Option<String>,
@@ -67,19 +73,23 @@ pub struct ActorAccount {
     pub invites_disabled: Option<bool>,
 }
 
-/// PLC (Public Ledger of Credentials) key storage
+/// PLC key storage per Arc 13 §6.3.2 key separation.
 ///
-/// Stores the rotation keys for DID:PLC management.
-/// Separate from Actor/Account to keep cryptographic material isolated.
+/// The PDS-wide rotation key (which signs PLC ops) lives in
+/// `config.authentication.plc_rotation_key`, NOT in per-account
+/// rows. What `plc_keys` carries per account is only the per-actor
+/// atproto signing key (consumed by repo commit signing + Arc 12
+/// `entryway_auth_headers`).
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct PlcKeys {
-    /// DID this key belongs to
+    /// DID this key belongs to.
     pub did: String,
-    /// PLC rotation key (private key, hex-encoded, 32 bytes)
-    pub rotation_key: String,
-    /// PLC rotation key public (compressed public key, hex-encoded, 33 bytes)
-    pub rotation_key_public: String,
-    /// Last PLC operation CID
+    /// Per-actor atproto signing key (private key, hex-encoded,
+    /// 32 bytes). Added by Arc 12 Step 1.5; sole crypto column
+    /// per Arc 13 Step 0.7.1.
+    pub atproto_signing_key: String,
+    /// Last PLC operation CID (the `prev` value for the next
+    /// update op).
     pub last_operation_cid: Option<String>,
 }
 

@@ -182,12 +182,15 @@ async fn create_account(
         tracing::debug!("create_account: Invite code validated successfully");
     }
 
-    // Create account (pass None for invite_code since we already validated it)
+    // Create account (pass None for invite_code since we already validated it).
+    // Arc 13 §6.3.3 / Step 2.2: pass through the optional
+    // `recovery_key` input so it ends up first in the genesis op's
+    // rotation_keys per §6.3.3 priority order.
     tracing::debug!("create_account: Creating account in database");
     let email = req.email.clone();
     let account = ctx
         .account_manager
-        .create_account(req.handle.clone(), req.email, req.password, None)
+        .create_account(req.handle.clone(), req.email, req.password, None, req.recovery_key)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -229,6 +232,26 @@ async fn create_account(
         e
     })?;
     tracing::info!("create_account: Repository initialized successfully");
+
+    // Arc 15 §8.3.8: four-emit sequence (identity → account Active
+    // → commit genesis → sync). Best-effort: emission failures are
+    // logged but do NOT fail account creation (the account exists;
+    // consumers will resync on next connection).
+    if let Some(ref handle) = account.handle {
+        if let Err(e) = crate::api::account_emit::create_account_emit_sequence(
+            &ctx,
+            &account.did,
+            handle,
+        )
+        .await
+        {
+            tracing::warn!(
+                did = %account.did,
+                error = %e,
+                "create_account: four-emit sequence failed (account created OK)"
+            );
+        }
+    }
 
     // Generate and send email verification token if email was provided
     if let Some(email_val) = &email {
@@ -301,15 +324,31 @@ async fn create_session(
             .check_identifier_ip(&req.identifier, &client_ip)?;
     }
 
-    // Try regular password authentication first
+    // Try regular password authentication first. If that returns a
+    // routine auth failure (NotFound / Authentication), fall through
+    // silently to the app-password path — that's the intended dual-login
+    // shape (single endpoint serves regular + app passwords). Anything
+    // else (database errors, decode failures, internal errors) must NOT
+    // be silently swallowed; #130 caught a PG-only TIMESTAMPTZ decode
+    // failure masked here for weeks, surfacing as a generic NotFound
+    // with zero log signal. Emit at warn for non-auth errors so the
+    // next decode/database failure is grep-visible.
     let (account, session) = match ctx
         .account_manager
         .login(&req.identifier, &req.password)
         .await
     {
         Ok(result) => result,
-        Err(_) => {
-            // If regular password fails, try app password authentication
+        Err(err) => {
+            if !matches!(
+                err,
+                PdsError::NotFound(_) | PdsError::Authentication(_)
+            ) {
+                tracing::warn!(
+                    error = %err,
+                    "primary login path errored unexpectedly; falling back to app-password"
+                );
+            }
             ctx.account_manager
                 .login_with_app_password(&req.identifier, &req.password)
                 .await
@@ -332,11 +371,27 @@ async fn get_session(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<Json<SessionInfo>> {
-    // Require authentication
-    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+    // Arc 12 §5.3.4: forwarded-routes auth path (single-aud in
+    // standalone mode; multi-aud accepting entryway-issued tokens in
+    // entryway mode).
+    let unified = middleware::require_auth_forwarded(State(ctx.clone()), headers.clone()).await?;
+    let did = unified.did().to_string();
 
-    // Get account info
-    let account = ctx.account_manager.get_account(&validated.did).await?;
+    // Arc 12 §5.3.8 mint-pattern forward. Entryway is the canonical
+    // source of session info in entryway mode (it owns the account
+    // identity).
+    if let Some(entryway) = ctx.entryway_client.as_ref() {
+        let fwd_headers = ctx
+            .entryway_auth_headers(&did, "com.atproto.server.getSession")
+            .await?;
+        let resp: SessionInfo = entryway
+            .xrpc_get_json("com.atproto.server.getSession", fwd_headers, &[])
+            .await?;
+        return Ok(Json(resp));
+    }
+
+    // Standalone path (unchanged).
+    let account = ctx.account_manager.get_account(&did).await?;
 
     Ok(Json(SessionInfo {
         did: account.did,
@@ -457,7 +512,7 @@ async fn confirm_email(
 /// Request password reset endpoint
 ///
 /// Generates a reset token and sends it via email (public endpoint, no auth required)
-#[derive(serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct RequestPasswordResetRequest {
     identifier: String, // Email or handle
 }
@@ -467,6 +522,25 @@ async fn request_password_reset(
     headers: HeaderMap,
     Json(req): Json<RequestPasswordResetRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
+    // Arc 12 §5.3.8 passthru-pattern forward. requestPasswordReset
+    // is token-free: filter incoming headers per §5.3.6 via
+    // `entryway_passthru_headers` and forward the body as-is. The
+    // entryway is the canonical source of password-reset state in
+    // entryway mode.
+    if let Some(entryway_client) = ctx.entryway_client.as_ref() {
+        let fwd_headers =
+            crate::federation::entryway_passthru_headers(&headers, None)?;
+        let resp: serde_json::Value = entryway_client
+            .xrpc_post_json(
+                "com.atproto.server.requestPasswordReset",
+                fwd_headers,
+                &req,
+            )
+            .await?;
+        return Ok(Json(resp));
+    }
+
+    // Standalone path (unchanged).
     // IP-based rate limiting for password reset (50 per 5 minutes per IP)
     // Prevents email spam and denial of service
     if let Some(client_ip) =
@@ -719,64 +793,162 @@ async fn delete_account(
     headers: HeaderMap,
     Json(req): Json<DeleteAccountRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
+    // Per-? tracing pattern from Arc 13 #71 closure (chainlink #86):
+    // every error-propagation point logs at tracing::error! with an
+    // `at_step` field so operators get a one-line cause on any
+    // future failure path.
+
     // IP-based rate limiting for account deletion (50 per 5 minutes)
     if let Some(client_ip) =
         crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
     {
-        ctx.rate_limiter.check_ip(&client_ip)?;
+        ctx.rate_limiter.check_ip(&client_ip).map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:rate_limit",
+                did = %req.did,
+                client_ip = %client_ip,
+                error = %e,
+                "deleteAccount: per-IP rate limit rejected"
+            );
+            e
+        })?;
     }
 
     // Get account (include deactivated and taken down accounts)
-    let account = ctx.account_manager.get_account(&req.did).await?;
+    let account = ctx.account_manager.get_account(&req.did).await.map_err(|e| {
+        tracing::error!(
+            at_step = "delete_account:get_account",
+            did = %req.did,
+            error = %e,
+            "deleteAccount: account lookup failed"
+        );
+        e
+    })?;
 
     // Verify password - must have local account credentials
     let password_hash = account.password_hash.ok_or_else(|| {
+        tracing::error!(
+            at_step = "delete_account:no_password_hash",
+            did = %req.did,
+            "deleteAccount: account has no local password_hash (federated actor?)"
+        );
         crate::error::PdsError::Authorization("No local account credentials".to_string())
     })?;
 
     let valid =
         crate::auth::PasswordHasher::verify(&req.password, &password_hash).map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:password_verify",
+                did = %req.did,
+                error = %e,
+                "deleteAccount: password verification call failed"
+            );
             crate::error::PdsError::Internal(format!("Password verification failed: {}", e))
         })?;
 
     if !valid {
+        tracing::error!(
+            at_step = "delete_account:password_invalid",
+            did = %req.did,
+            "deleteAccount: invalid password"
+        );
         return Err(crate::error::PdsError::Authentication(
             "Invalid did or password".to_string(),
         ));
     }
 
-    // Validate deletion token
+    // Validate deletion token (chainlink #86 root cause was here:
+    // sqlx::Any bool/BIGINT mismatch on the `used` column read).
     ctx.account_manager
         .validate_account_delete_token(&req.did, &req.token)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:validate_token",
+                did = %req.did,
+                error_kind = ?std::mem::discriminant(&e),
+                error = %e,
+                "deleteAccount: token validation failed"
+            );
+            e
+        })?;
 
     // Mark token as used
     ctx.account_manager
         .mark_delete_token_used(&req.token)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:mark_token_used",
+                did = %req.did,
+                error = %e,
+                "deleteAccount: failed to mark token used"
+            );
+            e
+        })?;
 
     // Delete actor store data (repository, blobs, etc.)
-    // This should be done before deleting account records
+    // This should be done before deleting account records.
     if let Err(e) = ctx.actor_store.destroy(&req.did).await {
         tracing::warn!(
+            at_step = "delete_account:actor_store_destroy",
             did = %req.did,
             error = %e,
-            "Failed to destroy actor store during account deletion"
+            "deleteAccount: actor store cleanup failed; continuing with account row delete"
         );
-        // Continue with account deletion even if actor store cleanup fails
+        // Continue with account deletion even if actor store cleanup fails.
     }
 
     // Permanently delete account from database
     ctx.account_manager
         .delete_account_permanent(&req.did)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:delete_permanent",
+                did = %req.did,
+                error = %e,
+                "deleteAccount: permanent delete failed (actor store may be already destroyed)"
+            );
+            e
+        })?;
 
-    // TODO: Sequence account deletion event for federation
-    // let account_seq = ctx.sequencer.sequence_account_evt(&req.did, AccountStatus::Deleted).await?;
-    // ctx.sequencer.delete_all_for_user(&req.did, vec![account_seq]).await?;
+    // Arc 15 §8.3.3: emit Deleted #account event + wipe prior history.
+    // Two-await non-atomic per §8.5.5 (matches bsky-PDS pattern;
+    // consumers duplicate-suppress on did).
+    let deletion_seq = ctx
+        .sequencer
+        .sequence_account(crate::sequencer::events::AccountEvent::from_status(
+            req.did.clone(),
+            crate::sequencer::events::AccountStatus::Deleted,
+        ))
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:sequence_deletion_event",
+                did = %req.did,
+                error = %e,
+                "deleteAccount: failed to emit #account Deleted"
+            );
+            e
+        })?;
+    ctx.sequencer
+        .delete_all_for_user(&req.did, &[deletion_seq])
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                at_step = "delete_account:wipe_prior_events",
+                did = %req.did,
+                deletion_seq,
+                error = %e,
+                "deleteAccount: retention wipe failed (deletion event emitted OK)"
+            );
+            e
+        })?;
 
     tracing::info!(
         did = %req.did,
+        deletion_seq,
         "account_deleted_permanently"
     );
 
@@ -1255,68 +1427,213 @@ async fn create_invite_codes(
     Ok(Json(CreateInviteCodesResponse { codes }))
 }
 
-/// Activate account endpoint
+/// Body for activate_account. All fields optional — empty body
+/// triggers the spec-compliant JWT-only path; populated
+/// {handle, password} triggers the Aurora recovery path
+/// (chainlink #82: deactivation invalidates JWTs, so the
+/// post-deactivation reactivation can't authenticate via JWT
+/// and needs an unauth path with credentials).
+#[derive(Debug, Default, serde::Deserialize)]
+struct ActivateAccountRequest {
+    #[serde(default)]
+    handle: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// Activate (reactivate) account endpoint.
 ///
-/// Reactivates a deactivated account.
+/// Two auth paths (chainlink #82 — documented Aurora divergence from
+/// atproto spec):
+///
+/// 1. **JWT path (spec)**: bearer token in `authorization` header.
+///    Used when the caller still holds a valid pre-deactivation
+///    session (rare — `deactivate_account` invalidates sessions).
+///    Body may be empty or `{}`.
+///
+/// 2. **Credentials path (Aurora recovery)**: empty/missing
+///    `authorization` header + body `{handle, password}`. Required
+///    because `AccountManager::deactivate_account` deletes every
+///    session+refresh_token row for the DID, and `login`
+///    short-circuits on `deactivated_at != NULL`. Without this
+///    path, deactivation would be a one-way trapdoor.
 async fn activate_account(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
+    body: Option<Json<ActivateAccountRequest>>,
 ) -> PdsResult<Json<serde_json::Value>> {
-    // Require authentication
-    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Reactivate temporarily deactivated account
-    // If account is pending deletion (has delete_after set), use cancel_account_deletion instead
-    let account = ctx.account_manager.get_account(&validated.did).await?;
+    // Resolve the DID: try JWT first; fall back to {handle, password}.
+    let did =
+        match middleware::require_auth(State(ctx.clone()), headers).await {
+            Ok(validated) => validated.did,
+            Err(jwt_err) => {
+                let handle = body.handle.as_deref().ok_or_else(|| {
+                    PdsError::Authentication(format!(
+                        "JWT auth failed ({}) and no {{handle, password}} body \
+                         supplied for recovery path",
+                        jwt_err
+                    ))
+                })?;
+                let password = body.password.as_deref().ok_or_else(|| {
+                    PdsError::Validation(
+                        "password required when activating via {handle, password} \
+                         recovery path"
+                            .to_string(),
+                    )
+                })?;
+                let account = ctx
+                    .account_manager
+                    .get_account_by_identifier(handle)
+                    .await?;
+                let hash = account.password_hash.clone().ok_or_else(|| {
+                    PdsError::Authorization(
+                        "No local credentials for this handle".to_string(),
+                    )
+                })?;
+                let valid = crate::auth::PasswordHasher::verify(password, &hash)
+                    .map_err(|e| {
+                        PdsError::Internal(format!(
+                            "Password verification failed: {}",
+                            e
+                        ))
+                    })?;
+                if !valid {
+                    return Err(PdsError::Authentication(
+                        "Invalid handle or password".to_string(),
+                    ));
+                }
+                account.did
+            }
+        };
 
-    if account.delete_after.is_some() {
-        // Account is pending deletion, cancel it completely
-        ctx.account_manager
-            .cancel_account_deletion(&validated.did)
-            .await?;
-        Ok(Json(serde_json::json!({
-            "message": "Account deletion cancelled and account reactivated"
-        })))
+    // Reactivate temporarily deactivated account.
+    // If account is pending deletion (has delete_after set), use cancel_account_deletion instead.
+    let account = ctx.account_manager.get_account(&did).await?;
+
+    let message = if account.delete_after.is_some() {
+        ctx.account_manager.cancel_account_deletion(&did).await?;
+        "Account deletion cancelled and account reactivated"
     } else {
-        // Account is just temporarily deactivated, reactivate it
-        ctx.account_manager
-            .reactivate_account(&validated.did)
-            .await?;
-        Ok(Json(serde_json::json!({
-            "message": "Account reactivated successfully"
-        })))
+        ctx.account_manager.reactivate_account(&did).await?;
+        "Account reactivated successfully"
+    };
+
+    // Arc 15 §8.3.5: three-emit reactivation — account → identity →
+    // sync. Concurrent-write interleaving tolerated (round-1 F9
+    // closure); `#sync` acts as resync surface.
+    //
+    // 1. Account (Pattern B — status from freshly-read row).
+    let acc_post = ctx.account_manager.get_account(&did).await?;
+    let (active, status) =
+        crate::api::sync_helpers::get_account_status(&acc_post);
+    ctx.sequencer
+        .sequence_account(crate::sequencer::events::AccountEvent {
+            did: did.clone(),
+            active,
+            status,
+        })
+        .await?;
+
+    // 2. Identity — handle present (handle-change semantics is the
+    // None-case per §8.3.7; reactivation always carries the handle).
+    ctx.sequencer
+        .sequence_identity(crate::sequencer::events::IdentityEvent {
+            did: did.clone(),
+            handle: acc_post.handle.clone(),
+        })
+        .await?;
+
+    // 3. Sync — project current commit state via Sub-step 0.3(a)
+    // helper. Best-effort: if the actor has no commit yet (edge
+    // case), skip the sync emit rather than fail the reactivation.
+    let repo_mgr = crate::actor_store::RepositoryManager::with_sequencer(
+        did.clone(),
+        ctx.actor_store.as_ref().clone(),
+        ctx.sequencer.clone(),
+    );
+    match repo_mgr.current_sync_event_data().await {
+        Ok(sync_data) => {
+            let sync_evt = crate::sequencer::events::SyncEvent::from_sync_data(
+                did.clone(),
+                sync_data,
+            )?;
+            ctx.sequencer.sequence_sync(sync_evt).await?;
+        }
+        Err(e) => {
+            tracing::warn!(
+                did = %did,
+                error = %e,
+                "reactivate: no current sync data — skipping #sync emit",
+            );
+        }
     }
+
+    Ok(Json(serde_json::json!({ "message": message })))
 }
 
-/// Deactivate account endpoint
+/// Body for deactivate_account per atproto lexicon
+/// `com.atproto.server.deactivateAccount`: only optional
+/// `deleteAfter` (datetime). JWT auth supplies the DID; no
+/// password, no token in body (chainlink #83 spec-divergence fix).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeactivateAccountRequest {
+    #[serde(default)]
+    delete_after: Option<String>,
+}
+
+/// Deactivate account endpoint per `com.atproto.server.deactivateAccount`.
 ///
-/// Temporarily deactivates an account without initiating deletion.
-/// User can reactivate anytime via com.atproto.server.activateAccount or by logging in.
-/// This is DIFFERENT from deleteAccount which permanently deletes after grace period.
+/// JWT-auth + optional `deleteAfter` body field (chainlink #83 — the
+/// pre-fix `{did, password, token}` body was off-spec). DID comes
+/// from JWT; password isn't re-verified (JWT possession is the
+/// identity proof). Reactivation path via `activateAccount` per
+/// chainlink #82.
 async fn deactivate_account(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
-    Json(req): Json<DeleteAccountRequest>,
+    body: Option<Json<DeactivateAccountRequest>>,
 ) -> PdsResult<Json<serde_json::Value>> {
-    // Require authentication
+    // Require authentication.
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Verify password before deactivation
-    let account = ctx.account_manager.get_account(&validated.did).await?;
-    let password_hash = account
-        .password_hash
-        .ok_or_else(|| PdsError::Authorization("No local account credentials".to_string()))?;
-
-    let valid = crate::auth::PasswordHasher::verify(&req.password, &password_hash)
-        .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
-
-    if !valid {
-        return Err(PdsError::Authorization("Invalid password".to_string()));
+    // `deleteAfter` is the lexicon-spec optional field. Aurora-Locus
+    // doesn't schedule deferred deletion in v0.5 (the field exists in
+    // the schema as `actor.delete_after` and is set via
+    // `requestAccountDelete` / `delete_account` flows). If present
+    // here, log + ignore — v0.6+ work to honor it from deactivate.
+    if let Some(delete_after) = req.delete_after.as_deref() {
+        tracing::info!(
+            did = %validated.did,
+            delete_after,
+            "deactivate_account: deleteAfter requested but not yet honored in v0.5 \
+             (deactivation only; use requestAccountDelete for scheduled deletion)"
+        );
     }
 
-    // Temporarily deactivate account (NO deletion scheduled)
+    // Temporarily deactivate account (NO deletion scheduled).
     ctx.account_manager
         .deactivate_account(&validated.did)
+        .await?;
+
+    // Arc 15 §8.3.4: emit Deactivated #account event (Pattern B —
+    // status derived from freshly-read post-mutation row).
+    let acc_post = ctx.account_manager.get_account(&validated.did).await?;
+    let (active, status) =
+        crate::api::sync_helpers::get_account_status(&acc_post);
+    debug_assert_eq!(
+        status,
+        Some(crate::sequencer::events::AccountStatus::Deactivated)
+    );
+    ctx.sequencer
+        .sequence_account(crate::sequencer::events::AccountEvent {
+            did: validated.did.clone(),
+            active,
+            status,
+        })
         .await?;
 
     Ok(Json(serde_json::json!({

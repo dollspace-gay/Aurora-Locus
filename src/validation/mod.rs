@@ -42,10 +42,248 @@ impl FromStr for ValidationMode {
 }
 
 /// Validation error detail
+///
+/// The wire shape is `{path, message}` to preserve the 152 hand-coded
+/// validator bodies (Arc 17 §17.4 Step 5 byte-identical audit baseline).
+/// Arc 17's structured variants per §17.3.6 — `NamespaceDenied`,
+/// `LexiconFetchFailed`, `SchemaViolation`, etc. — encode into the same
+/// struct shape via path-sentinel routing: the `path` field carries an
+/// `@lexicon/<variant>` tag that [`validation_errors_to_pds_error`]
+/// matches on to surface the right [`PdsError`] variant for HTTP wire
+/// mapping. Hand-coded validators keep their plain JSON-pointer paths
+/// (`$.text`, `$.embed.images[0].image`, etc.) and remain
+/// indistinguishable from the v1 shape.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ValidationError {
     pub path: String,
     pub message: String,
+}
+
+/// Sentinel prefix used by Arc 17 §17.3.6 variants in
+/// [`ValidationError::path`]. Anything not starting with this prefix
+/// is a hand-coded-validator error (preserved-as-is on the wire);
+/// anything starting with it is parsed by
+/// [`validation_errors_to_pds_error`].
+pub(crate) const LEXICON_VARIANT_PREFIX: &str = "@lexicon/";
+
+/// Arc 17 §17.3.4 / round-1 F4 closure — should validation fire for
+/// this write? The full matrix:
+///
+/// | `write.validate`     | lexicon.enabled | validate_imports | fires? |
+/// |----------------------|-----------------|------------------|--------|
+/// | `None`               | any             | any              | yes    |
+/// | `Some(true)`         | any             | any              | yes    |
+/// | `Some(false)` (CAR)  | true            | true             | yes (override) |
+/// | `Some(false)` (CAR)  | true            | false            | no     |
+/// | `Some(false)` (CAR)  | false           | any              | no     |
+/// | `Some(false)` (CAR)  | (no lex config) | n/a              | no     |
+///
+/// The override only fires when BOTH `lexicon.enabled` and
+/// `validate_imports` are true. Disabling the lexicon globally
+/// (`enabled = false`) restores pre-Arc-17 semantics regardless of
+/// the import-validation flag.
+pub fn should_validate_per_lexicon_imports(
+    write_validate: Option<bool>,
+    lexicon_config: Option<&crate::config::LexiconConfig>,
+) -> bool {
+    let override_fires = lexicon_config
+        .map(|cfg| cfg.enabled && cfg.validate_imports)
+        .unwrap_or(false);
+    match write_validate {
+        Some(false) => override_fires,
+        _ => true,
+    }
+}
+
+/// Arc 17 §17.3.3 Phase B bug #2 — given a non-empty error list and
+/// the active [`ValidationMode`], should `validate_write` propagate
+/// the errors (reject the write), or can Optimistic mode absorb them?
+///
+/// Returns `true` to propagate, `false` to absorb. The matrix:
+///
+/// | mode       | fetch-class variant present | propagate? |
+/// |------------|-----------------------------|------------|
+/// | Required   | any                         | yes        |
+/// | None       | any                         | yes (defensive — None short-circuits before Err in practice) |
+/// | Optimistic | yes                         | yes (§17.3.3 HardFail/authority/deny/InvalidNsid bypass) |
+/// | Optimistic | no                          | no (absorb — v1 SchemaViolation / hand-coded Optimistic contract) |
+///
+/// "fetch-class variant" is anything for which
+/// [`ValidationError::is_fetch_class_lexicon_variant`] returns true.
+/// The fetch-class set deliberately excludes `SchemaViolation` so the
+/// v1 unknown-NSID-extended-to-mismatched-record absorption contract
+/// is preserved.
+pub fn should_propagate_validation_errors(
+    errors: &[ValidationError],
+    mode: ValidationMode,
+) -> bool {
+    if mode != ValidationMode::Optimistic {
+        return true;
+    }
+    errors.iter().any(|e| e.is_fetch_class_lexicon_variant())
+}
+
+impl ValidationError {
+    /// Arc 17 §17.3.6 — NSID matches the configured denylist; record
+    /// rejected outright. Maps to [`PdsError::NamespaceDenied`].
+    pub fn namespace_denied(nsid: &str) -> Self {
+        Self {
+            path: format!("{LEXICON_VARIANT_PREFIX}NamespaceDenied"),
+            message: serde_json::json!({ "nsid": nsid }).to_string(),
+        }
+    }
+
+    /// Arc 17 §17.3.6 — lexicon fetch (DNS / DID-resolve / HTTP)
+    /// exhausted retries or surfaced a terminal failure. Maps to
+    /// [`PdsError::LexiconFetchFailed`].
+    pub fn lexicon_fetch_failed(nsid: &str, failure_class: &'static str, source_detail: &str) -> Self {
+        Self {
+            path: format!("{LEXICON_VARIANT_PREFIX}LexiconFetchFailed"),
+            message: serde_json::json!({
+                "nsid": nsid,
+                "failure_class": failure_class,
+                "source_detail": source_detail,
+            })
+            .to_string(),
+        }
+    }
+
+    /// Arc 17 §17.3.6 — fetched lexicon document failed schema
+    /// validation inside `proto_blue::lexicon::Lexicons::add`. Maps to
+    /// [`PdsError::LexiconInvalidSchema`].
+    pub fn lexicon_invalid_schema(nsid: &str, detail: &str) -> Self {
+        Self {
+            path: format!("{LEXICON_VARIANT_PREFIX}LexiconInvalidSchema"),
+            message: serde_json::json!({ "nsid": nsid, "detail": detail }).to_string(),
+        }
+    }
+
+    /// Arc 17 §17.3.6 — DNS TXT returned a DID different from the
+    /// lexicon record's hosting DID. Maps to
+    /// [`PdsError::LexiconAuthorityMismatch`].
+    pub fn lexicon_authority_mismatch(nsid: &str, expected: &str, found: &str) -> Self {
+        Self {
+            path: format!("{LEXICON_VARIANT_PREFIX}LexiconAuthorityMismatch"),
+            message: serde_json::json!({
+                "nsid": nsid,
+                "expected": expected,
+                "found": found,
+            })
+            .to_string(),
+        }
+    }
+
+    /// Arc 17 §17.3.6 — multiple TXT records or multiple `did=` entries.
+    /// Maps to [`PdsError::LexiconAuthorityAmbiguous`].
+    pub fn lexicon_authority_ambiguous(nsid: &str, candidates: &[String]) -> Self {
+        Self {
+            path: format!("{LEXICON_VARIANT_PREFIX}LexiconAuthorityAmbiguous"),
+            message: serde_json::json!({
+                "nsid": nsid,
+                "candidates": candidates,
+            })
+            .to_string(),
+        }
+    }
+
+    /// Arc 17 §17.3.6 — authority DID is tombstoned in PLC. Maps to
+    /// [`PdsError::LexiconAuthorityTombstoned`].
+    pub fn lexicon_authority_tombstoned(nsid: &str, did: &str) -> Self {
+        Self {
+            path: format!("{LEXICON_VARIANT_PREFIX}LexiconAuthorityTombstoned"),
+            message: serde_json::json!({ "nsid": nsid, "did": did }).to_string(),
+        }
+    }
+
+    /// Arc 17 §17.3.6 — NSID fails ATProto spec segment validation
+    /// (`[a-z][a-z0-9-]*[a-z0-9]`, ≥ 3 segments). Maps to
+    /// [`PdsError::LexiconInvalidNsid`].
+    pub fn lexicon_invalid_nsid(nsid: &str) -> Self {
+        Self {
+            path: format!("{LEXICON_VARIANT_PREFIX}LexiconInvalidNsid"),
+            message: serde_json::json!({ "nsid": nsid }).to_string(),
+        }
+    }
+
+    /// Arc 17 §17.3.6 — record failed lexicon-driven schema validation.
+    /// `field_path` is structured (JSON-pointer-style, from proto-blue's
+    /// `ValidationError::InvalidValue.path`); `expected` is heuristic-
+    /// on-message for v0.5 per Step 0.0b finding (proto-blue's
+    /// structured-field shape may enrich in v0.6+). Maps to
+    /// [`PdsError::SchemaViolation`].
+    pub fn schema_violation(
+        collection: &str,
+        field_path: &str,
+        expected: Option<&str>,
+        actual_summary: Option<&str>,
+        detail: &str,
+    ) -> Self {
+        Self {
+            path: format!("{LEXICON_VARIANT_PREFIX}SchemaViolation"),
+            message: serde_json::json!({
+                "collection": collection,
+                "field_path": field_path,
+                "expected": expected,
+                "actual_summary": actual_summary,
+                "detail": detail,
+            })
+            .to_string(),
+        }
+    }
+
+    /// Returns true if this error encodes an Arc 17 §17.3.6 variant
+    /// (i.e. [`ValidationError::path`] starts with `@lexicon/`).
+    pub fn is_lexicon_variant(&self) -> bool {
+        self.path.starts_with(LEXICON_VARIANT_PREFIX)
+    }
+
+    /// Arc 17 §17.3.3 Phase B bug #2 — does this error encode a
+    /// FETCH/AUTHORITY/INPUT-class lexicon hard-failure variant?
+    /// These reject the write even under [`ValidationMode::Optimistic`]
+    /// because the §17.3.3 contract ("HardFail propagates; record
+    /// validation fails") and the operator-configured deny / pre-I/O
+    /// hard errors are strictly stronger than Optimistic's accept-on-
+    /// failure precedent.
+    ///
+    /// In the bypass set (these REJECT even in Optimistic mode):
+    /// - `LexiconFetchFailed` — `fetch_failure_behavior = HardFail`
+    ///   contract per §17.3.3.
+    /// - `LexiconAuthorityTombstoned` / `LexiconAuthorityAmbiguous` —
+    ///   authority cannot be trusted; absorbing would silently accept
+    ///   records under an unverifiable schema source.
+    /// - `NamespaceDenied` — operator-configured deny rule (§17.3.3
+    ///   PRIORITY 3); a deliberate rejection Optimistic must not
+    ///   soft-circumvent.
+    /// - `LexiconInvalidNsid` — pre-I/O hard error (NSID failed
+    ///   ATProto spec segment validation); an invalid identifier is
+    ///   not absorbable.
+    ///
+    /// NOT in the bypass set (Optimistic still absorbs):
+    /// - `SchemaViolation` — lexicon fetched fine, record just doesn't
+    ///   match. This is the v1 unknown-NSID precedent extended; the
+    ///   Optimistic contract is preserved.
+    ///
+    /// `LexiconAuthorityMismatch` and `LexiconInvalidSchema` are
+    /// presently NOT in the bypass set (neither Phase B Scenario 6a
+    /// nor the bug #2 spec named them). The predicate's tag list is
+    /// the single change-point if a future scenario reclassifies them.
+    pub fn is_fetch_class_lexicon_variant(&self) -> bool {
+        // The path-sentinel format is `@lexicon/<Variant>`; match on
+        // the tag rather than the full path so the predicate doesn't
+        // accidentally accept a hand-coded validator path that happens
+        // to contain a variant name as a substring.
+        const FETCH_CLASS_TAGS: &[&str] = &[
+            "LexiconFetchFailed",
+            "LexiconAuthorityTombstoned",
+            "LexiconAuthorityAmbiguous",
+            "NamespaceDenied",
+            "LexiconInvalidNsid",
+        ];
+        self.path
+            .strip_prefix(LEXICON_VARIANT_PREFIX)
+            .map(|tag| FETCH_CLASS_TAGS.contains(&tag))
+            .unwrap_or(false)
+    }
 }
 
 /// Validation result with detailed errors
@@ -109,6 +347,17 @@ pub struct RecordValidator {
     mode: ValidationMode,
     /// Collection-specific validators
     validators: HashMap<String, ValidatorFn>,
+    /// Arc 17 §17.3.3 — optional lexicon fall-through. `None` = legacy
+    /// behavior (Optimistic/Required modes only, no lexicon fetch).
+    /// `Some` = unknown-collection writes route through the §17.3.1
+    /// flow (denylist → allowlist → resolve_and_fetch →
+    /// validate_against_lexicon). Constructed via
+    /// [`RecordValidator::with_lexicon`].
+    lexicon_config: Option<crate::config::LexiconConfig>,
+    /// Arc 17 §17.3.2 — shared lexicon resolver. Paired with
+    /// `lexicon_config`; both must be Some for the lexicon path to
+    /// fire.
+    lexicon_resolver: Option<std::sync::Arc<crate::federation::lexicon_resolver::LexResolver>>,
 }
 
 impl RecordValidator {
@@ -122,6 +371,8 @@ impl RecordValidator {
         let mut validator = Self {
             mode,
             validators: HashMap::new(),
+            lexicon_config: None,
+            lexicon_resolver: None,
         };
 
         // Register built-in validators
@@ -146,8 +397,29 @@ impl RecordValidator {
         self.mode
     }
 
-    /// Validate a record against its collection schema
-    pub fn validate(&self, collection: &str, record: &Value) -> ValidationResult {
+    /// Arc 17 §17.4 Step 1.5 wiring: attach the lexicon resolver +
+    /// config so unknown-collection writes route through the
+    /// §17.3.1 flow. Without this call the validator behaves
+    /// identically to v1 (Optimistic / Required modes only).
+    #[must_use]
+    pub fn with_lexicon(
+        mut self,
+        resolver: std::sync::Arc<crate::federation::lexicon_resolver::LexResolver>,
+        config: crate::config::LexiconConfig,
+    ) -> Self {
+        self.lexicon_config = Some(config);
+        self.lexicon_resolver = Some(resolver);
+        self
+    }
+
+    /// Arc 17 §17.3.3 Pattern B — validate a record against its
+    /// collection schema. The outer dispatcher is `async` so the
+    /// lexicon fall-through can `.await`; the inner hand-coded
+    /// validator closures stay sync (called directly inside this
+    /// async fn). The 152 `register_*_validator` closure signatures
+    /// (`Fn(&Value) -> ValidationResult`) are UNCHANGED — Arc 17
+    /// §17.4 Step 5 audit baseline.
+    pub async fn validate(&self, collection: &str, record: &Value) -> ValidationResult {
         // Start timing for metrics
         let start = std::time::Instant::now();
 
@@ -156,33 +428,7 @@ impl RecordValidator {
             return Ok(());
         }
 
-        // Perform validation
-        let result = if let Some(validator_fn) = self.validators.get(collection) {
-            // Check if we have a specific validator for this collection
-            validator_fn(record)
-        } else {
-            // No specific validator for this collection
-            match self.mode {
-                ValidationMode::Required => {
-                    // In Required mode, reject unknown collections
-                    Err(vec![ValidationError {
-                        path: "$".to_string(),
-                        message: format!(
-                            "Unknown collection '{}' - validation required but no validator found",
-                            collection
-                        ),
-                    }])
-                }
-                ValidationMode::Optimistic => {
-                    // In Optimistic mode, fall back to basic validation
-                    self.validate_basic(record)
-                }
-                ValidationMode::None => {
-                    // Already handled above, but for completeness
-                    Ok(())
-                }
-            }
-        };
+        let result = self.dispatch(collection, record).await;
 
         // Record metrics
         let duration = start.elapsed().as_secs_f64();
@@ -192,16 +438,209 @@ impl RecordValidator {
             }
             Err(errors) => {
                 crate::metrics::record_validation(collection, false, duration);
-                // Record each error type
                 for error in errors {
-                    // Extract error type from message (first word or "unknown")
-                    let error_type = error.message.split_whitespace().next().unwrap_or("unknown");
+                    let error_type = if error.is_lexicon_variant() {
+                        // Arc 17 §17.3.6 path-sentinel encoding: the
+                        // tag after `@lexicon/` IS the error type;
+                        // avoids parsing the JSON message just for
+                        // metrics granularity.
+                        error.path.trim_start_matches(LEXICON_VARIANT_PREFIX)
+                    } else {
+                        error.message.split_whitespace().next().unwrap_or("unknown")
+                    };
                     crate::metrics::record_validation_failure(collection, error_type);
                 }
             }
         }
 
         result
+    }
+
+    /// Inner dispatch — separates the §17.3.3 priority ladder from
+    /// the metrics bookkeeping so the logic stays readable.
+    async fn dispatch(&self, collection: &str, record: &Value) -> ValidationResult {
+        // PRIORITY 1 (§17.3.3): hand-coded validator (sync, preserved).
+        if let Some(validator_fn) = self.validators.get(collection) {
+            return validator_fn(record);
+        }
+
+        // PRIORITY 2: lexicon fall-through gate. If lexicon is not
+        // configured OR disabled in config, defer to the legacy
+        // unknown-collection behavior (Optimistic / Required).
+        let (lex_config, lex_resolver) = match (&self.lexicon_config, &self.lexicon_resolver) {
+            (Some(cfg), Some(resolver)) if cfg.enabled => (cfg, resolver),
+            _ => return self.handle_unknown(collection, record),
+        };
+
+        // PRIORITY 3 (§17.3.3 / round-1 F2 closure): denylist check
+        // BEFORE allowlist. Denylist hit → reject; matches first per
+        // §4.9 trust-boundary semantics (Intent B). Both-match → deny
+        // wins because deny is checked first.
+        if let Some(deny) = lex_config.namespace_denylist.as_ref() {
+            if deny.iter().any(|p| collection.starts_with(p)) {
+                return Err(vec![ValidationError::namespace_denied(collection)]);
+            }
+        }
+
+        // PRIORITY 4 (§17.3.3 / round-1 F2 closure): allowlist
+        // exclusion → fall through to Optimistic (Intent A —
+        // fetch-restriction, NOT rejection). Empty allowlist (None)
+        // means "no restriction; every unknown NSID is fetchable".
+        if let Some(allow) = lex_config.namespace_allowlist.as_ref() {
+            if !allow.iter().any(|p| collection.starts_with(p)) {
+                return self.handle_unknown(collection, record);
+            }
+        }
+
+        // PRIORITY 5: resolve_and_fetch via the lexicon resolver.
+        // Caller's task only awaits while the single-flight gate is
+        // contended OR while DNS / HTTP fires on a miss.
+        let fetched = lex_resolver.resolve_and_fetch(collection).await;
+
+        match fetched {
+            Ok(cached) => self.validate_against_lexicon(collection, record, &cached),
+            Err(err) => self.handle_fetch_error(collection, record, err, lex_config),
+        }
+    }
+
+    /// §17.3.3 — branch on fetch_failure_behavior. HardFail surfaces
+    /// the PdsError-shaped LexiconFetchFailed; Warn emits a WARN log
+    /// and delegates to Optimistic fall-through (existing precedent).
+    /// No Quarantine path per §17.5.7 / round-1 F1 closure.
+    fn handle_fetch_error(
+        &self,
+        collection: &str,
+        record: &Value,
+        err: crate::error::PdsError,
+        lex_config: &crate::config::LexiconConfig,
+    ) -> ValidationResult {
+        use crate::config::FetchFailureBehavior;
+        use crate::error::PdsError;
+
+        // Classify into the round-1 F14 forensic-log taxonomy. The
+        // resolver already routes specific variants; we surface
+        // them verbatim as Arc 17 ValidationError structs.
+        let ve = match &err {
+            PdsError::LexiconAuthorityAmbiguous { nsid, candidates } => {
+                ValidationError::lexicon_authority_ambiguous(nsid, candidates)
+            }
+            PdsError::LexiconAuthorityTombstoned { nsid, did } => {
+                ValidationError::lexicon_authority_tombstoned(nsid, did)
+            }
+            PdsError::LexiconAuthorityMismatch { nsid, expected, found } => {
+                ValidationError::lexicon_authority_mismatch(nsid, expected, found)
+            }
+            PdsError::LexiconInvalidNsid { nsid } => ValidationError::lexicon_invalid_nsid(nsid),
+            PdsError::LexiconInvalidSchema { nsid, detail } => {
+                ValidationError::lexicon_invalid_schema(nsid, detail)
+            }
+            PdsError::LexiconFetchFailed { nsid, failure_class, source_detail } => {
+                ValidationError::lexicon_fetch_failed(nsid, failure_class, source_detail)
+            }
+            other => ValidationError::lexicon_fetch_failed(
+                collection,
+                "unknown",
+                &other.to_string(),
+            ),
+        };
+
+        match lex_config.fetch_failure_behavior {
+            FetchFailureBehavior::HardFail => Err(vec![ve]),
+            FetchFailureBehavior::Warn => {
+                tracing::warn!(
+                    event = "lexicon_fetch_failed_warn_fallback",
+                    collection = %collection,
+                    error = ?ve,
+                    "lexicon fetch failed; falling back to Optimistic per fetch_failure_behavior=Warn"
+                );
+                self.handle_unknown(collection, record)
+            }
+        }
+    }
+
+    /// §17.3.3 — bind the fetched lexicon doc to proto-blue's
+    /// `validate_record` and convert any failure into Arc 17's
+    /// structured `SchemaViolation`. Step 0.0b finding: proto-blue's
+    /// `ValidationError::InvalidValue { path, message }` gives
+    /// structured `path` (→ field_path) and a descriptive `message`
+    /// (→ actual_summary). `expected_type` is heuristic-on-message
+    /// for v0.5 (acceptable; v0.6+ candidate to enrich if proto-blue
+    /// adds structured-field accessors).
+    fn validate_against_lexicon(
+        &self,
+        collection: &str,
+        record: &Value,
+        cached: &crate::federation::lexicon_cache::CachedLexicon,
+    ) -> ValidationResult {
+        use proto_blue::lex_json::json_to_lex;
+        use proto_blue::lexicon::{validate_record, LexUserType};
+
+        // Locate the `main` def. Arc 17 only validates record
+        // collections; a non-record `main` (query/procedure/etc.) is
+        // a misconfigured fetch and surfaces as InvalidSchema.
+        let main_def = cached.doc.defs.get("main").ok_or_else(|| {
+            vec![ValidationError::lexicon_invalid_schema(
+                collection,
+                "lexicon doc has no `main` definition",
+            )]
+        })?;
+        let record_def = match main_def {
+            LexUserType::Record(r) => r,
+            _ => {
+                return Err(vec![ValidationError::lexicon_invalid_schema(
+                    collection,
+                    "lexicon `main` def is not a record",
+                )]);
+            }
+        };
+
+        // Bridge serde_json::Value → LexValue. proto-blue's validate_record
+        // operates on the lex-typed value (which distinguishes blob refs,
+        // CIDs, etc. that lossily round-trip through plain JSON).
+        let lex_value = json_to_lex(record);
+
+        match validate_record(&cached.lexicons, record_def, &lex_value) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                use proto_blue::lexicon::ValidationError as PbErr;
+                let ve = match e {
+                    PbErr::InvalidValue { path, message } => ValidationError::schema_violation(
+                        collection,
+                        &path,
+                        None,
+                        Some(&message),
+                        &message,
+                    ),
+                    other => ValidationError::schema_violation(
+                        collection,
+                        "$",
+                        None,
+                        None,
+                        &other.to_string(),
+                    ),
+                };
+                Err(vec![ve])
+            }
+        }
+    }
+
+    /// Legacy unknown-collection handler. Wires into the Required /
+    /// Optimistic / None mode matrix that pre-Arc-17 v1 used. The
+    /// Arc 17 fall-through reaches this when (a) lexicon is
+    /// disabled, (b) the NSID is excluded by allowlist, or (c)
+    /// `fetch_failure_behavior = Warn` triggered a fall-back.
+    fn handle_unknown(&self, collection: &str, record: &Value) -> ValidationResult {
+        match self.mode {
+            ValidationMode::Required => Err(vec![ValidationError {
+                path: "$".to_string(),
+                message: format!(
+                    "Unknown collection '{}' - validation required but no validator found",
+                    collection
+                ),
+            }]),
+            ValidationMode::Optimistic => self.validate_basic(record),
+            ValidationMode::None => Ok(()),
+        }
     }
 
     /// Basic validation for all records
@@ -1488,8 +1927,35 @@ impl Default for RecordValidator {
     }
 }
 
-/// Convert validation errors to PdsError
+/// Convert validation errors to [`PdsError`].
+///
+/// Arc 17 §17.3.6 routing: if the first error's `path` starts with
+/// `@lexicon/`, the variant tag identifies the specific PdsError
+/// variant to surface (HTTP 502 for fetch-class failures, HTTP 400
+/// for client-input failures, HTTP 500 for invalid-schema). The
+/// JSON-encoded `message` carries the structured fields. Hand-coded
+/// validator errors (which don't use the `@lexicon/` prefix) fall
+/// through to the legacy `PdsError::Validation` aggregation that
+/// surfaces as HTTP 400 with a multi-line error list.
+///
+/// Only the *first* error is routed to a typed variant — single-
+/// origin errors (which the resolver always produces) carry one
+/// entry; multi-error lists from hand-coded validators all share
+/// the same Validation umbrella anyway.
 pub fn validation_errors_to_pds_error(errors: Vec<ValidationError>) -> PdsError {
+    if let Some(first) = errors.first() {
+        if first.is_lexicon_variant() {
+            if let Some(err) = parse_lexicon_variant(first) {
+                return err;
+            }
+            // Path looked like @lexicon/X but JSON decode failed —
+            // fall through to the umbrella Validation rather than
+            // dropping the error. Worst case is an opaque 400; the
+            // structured wire shape regresses but the rejection
+            // itself doesn't disappear.
+        }
+    }
+
     let messages: Vec<String> = errors
         .iter()
         .map(|e| format!("{}: {}", e.path, e.message))
@@ -1501,13 +1967,90 @@ pub fn validation_errors_to_pds_error(errors: Vec<ValidationError>) -> PdsError 
     ))
 }
 
+/// Arc 17 §17.3.6 — parse a `@lexicon/<variant>` sentinel into the
+/// concrete [`PdsError`] variant. Returns `None` if the message JSON
+/// fails to decode or the variant tag is unknown (caller falls back
+/// to the umbrella `PdsError::Validation`).
+fn parse_lexicon_variant(err: &ValidationError) -> Option<PdsError> {
+    let tag = err.path.strip_prefix(LEXICON_VARIANT_PREFIX)?;
+    let payload: serde_json::Value = serde_json::from_str(&err.message).ok()?;
+    let s = |k: &str| -> Option<String> {
+        payload.get(k).and_then(|v| v.as_str()).map(str::to_string)
+    };
+
+    match tag {
+        "NamespaceDenied" => Some(PdsError::NamespaceDenied { nsid: s("nsid")? }),
+        "LexiconInvalidNsid" => Some(PdsError::LexiconInvalidNsid { nsid: s("nsid")? }),
+        "LexiconInvalidSchema" => Some(PdsError::LexiconInvalidSchema {
+            nsid: s("nsid")?,
+            detail: s("detail")?,
+        }),
+        "LexiconAuthorityTombstoned" => Some(PdsError::LexiconAuthorityTombstoned {
+            nsid: s("nsid")?,
+            did: s("did")?,
+        }),
+        "LexiconAuthorityMismatch" => Some(PdsError::LexiconAuthorityMismatch {
+            nsid: s("nsid")?,
+            expected: s("expected")?,
+            found: s("found")?,
+        }),
+        "LexiconAuthorityAmbiguous" => {
+            let nsid = s("nsid")?;
+            let candidates: Vec<String> = payload
+                .get("candidates")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(PdsError::LexiconAuthorityAmbiguous { nsid, candidates })
+        }
+        "LexiconFetchFailed" => {
+            let nsid = s("nsid")?;
+            // failure_class must be a 'static str at the PdsError
+            // level; map the parsed string back to the closed set of
+            // round-1 F14 taxonomy values, defaulting to "unknown"
+            // for shapes that escape the canonical list.
+            let class_str = payload.get("failure_class").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let failure_class: &'static str = match class_str {
+                "dns_fail" => "dns_fail",
+                "did_fail" => "did_fail",
+                "pds_unreachable" => "pds_unreachable",
+                "http_5xx" => "http_5xx",
+                "http_4xx" => "http_4xx",
+                "timeout" => "timeout",
+                "authority_tombstoned" => "authority_tombstoned",
+                "authority_ambiguous" => "authority_ambiguous",
+                "invalid_schema" => "invalid_schema",
+                _ => "unknown",
+            };
+            let source_detail = s("source_detail").unwrap_or_default();
+            Some(PdsError::LexiconFetchFailed {
+                nsid,
+                failure_class,
+                source_detail,
+            })
+        }
+        "SchemaViolation" => Some(PdsError::SchemaViolation {
+            collection: s("collection")?,
+            field_path: s("field_path")?,
+            expected: s("expected"),
+            actual_summary: s("actual_summary"),
+            detail: s("detail")?,
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn test_validate_post_valid() {
+    #[tokio::test]
+    async fn test_validate_post_valid() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1516,12 +2059,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_post_missing_text() {
+    #[tokio::test]
+    async fn test_validate_post_missing_text() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1529,7 +2072,7 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
 
         if let Err(errors) = result {
@@ -1538,8 +2081,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_post_text_too_long() {
+    #[tokio::test]
+    async fn test_validate_post_text_too_long() {
         let validator = RecordValidator::new();
 
         let long_text = "a".repeat(3001);
@@ -1549,7 +2092,7 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
 
         if let Err(errors) = result {
@@ -1558,8 +2101,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_post_too_many_tags() {
+    #[tokio::test]
+    async fn test_validate_post_too_many_tags() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1569,12 +2112,12 @@ mod tests {
             "tags": ["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7", "tag8", "tag9"]
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_follow_valid() {
+    #[tokio::test]
+    async fn test_validate_follow_valid() {
         let validator = RecordValidator::new();
 
         let follow = json!({
@@ -1583,12 +2126,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.follow", &follow);
+        let result = validator.validate("app.bsky.graph.follow", &follow).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_follow_invalid_did() {
+    #[tokio::test]
+    async fn test_validate_follow_invalid_did() {
         let validator = RecordValidator::new();
 
         let follow = json!({
@@ -1597,12 +2140,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.follow", &follow);
+        let result = validator.validate("app.bsky.graph.follow", &follow).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_datetime_valid_formats() {
+    #[tokio::test]
+    async fn test_validate_datetime_valid_formats() {
         // RFC3339 with Z timezone
         assert!(validate_datetime("2025-01-10T12:00:00Z"));
 
@@ -1622,8 +2165,8 @@ mod tests {
         assert!(validate_datetime("2025-01-10T12:00:00+09:30"));
     }
 
-    #[test]
-    fn test_validate_datetime_invalid_formats() {
+    #[tokio::test]
+    async fn test_validate_datetime_invalid_formats() {
         // Missing timezone
         assert!(!validate_datetime("2025-01-10T12:00:00"));
 
@@ -1643,8 +2186,8 @@ mod tests {
         assert!(!validate_datetime(""));
     }
 
-    #[test]
-    fn test_validate_post_invalid_datetime() {
+    #[tokio::test]
+    async fn test_validate_post_invalid_datetime() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1653,7 +2196,7 @@ mod tests {
             "createdAt": "2025-01-10 12:00:00"  // Missing timezone, invalid format
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
 
         if let Err(errors) = result {
@@ -1663,8 +2206,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_post_valid_datetime_formats() {
+    #[tokio::test]
+    async fn test_validate_post_valid_datetime_formats() {
         let validator = RecordValidator::new();
 
         // Test various valid datetime formats
@@ -1682,15 +2225,15 @@ mod tests {
                 "createdAt": datetime
             });
 
-            let result = validator.validate("app.bsky.feed.post", &post);
+            let result = validator.validate("app.bsky.feed.post", &post).await;
             assert!(result.is_ok(), "Failed for datetime: {}", datetime);
         }
     }
 
     // Embed validation tests
 
-    #[test]
-    fn test_validate_post_with_images_embed_valid() {
+    #[tokio::test]
+    async fn test_validate_post_with_images_embed_valid() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1709,12 +2252,12 @@ mod tests {
             }
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_post_with_images_embed_missing_alt() {
+    #[tokio::test]
+    async fn test_validate_post_with_images_embed_missing_alt() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1732,12 +2275,12 @@ mod tests {
             }
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_post_with_images_embed_too_many() {
+    #[tokio::test]
+    async fn test_validate_post_with_images_embed_too_many() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1756,12 +2299,12 @@ mod tests {
             }
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_post_with_external_embed_valid() {
+    #[tokio::test]
+    async fn test_validate_post_with_external_embed_valid() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1779,12 +2322,12 @@ mod tests {
             }
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_post_with_external_embed_invalid_uri() {
+    #[tokio::test]
+    async fn test_validate_post_with_external_embed_invalid_uri() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1801,12 +2344,12 @@ mod tests {
             }
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_post_with_record_embed_valid() {
+    #[tokio::test]
+    async fn test_validate_post_with_record_embed_valid() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1822,12 +2365,12 @@ mod tests {
             }
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_post_with_record_embed_invalid_uri() {
+    #[tokio::test]
+    async fn test_validate_post_with_record_embed_invalid_uri() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1843,12 +2386,12 @@ mod tests {
             }
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_post_with_record_with_media_embed_valid() {
+    #[tokio::test]
+    async fn test_validate_post_with_record_with_media_embed_valid() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1873,12 +2416,12 @@ mod tests {
             }
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_post_with_record_with_media_embed_missing_media() {
+    #[tokio::test]
+    async fn test_validate_post_with_record_with_media_embed_missing_media() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1895,12 +2438,12 @@ mod tests {
             }
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_post_with_unknown_embed_type() {
+    #[tokio::test]
+    async fn test_validate_post_with_unknown_embed_type() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -1913,12 +2456,12 @@ mod tests {
             }
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_like_invalid_datetime() {
+    #[tokio::test]
+    async fn test_validate_like_invalid_datetime() {
         let validator = RecordValidator::new();
 
         let like = json!({
@@ -1927,12 +2470,12 @@ mod tests {
             "createdAt": "invalid-datetime"
         });
 
-        let result = validator.validate("app.bsky.feed.like", &like);
+        let result = validator.validate("app.bsky.feed.like", &like).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_follow_invalid_datetime() {
+    #[tokio::test]
+    async fn test_validate_follow_invalid_datetime() {
         let validator = RecordValidator::new();
 
         let follow = json!({
@@ -1941,12 +2484,12 @@ mod tests {
             "createdAt": "2025-01-10"  // Date only, missing time and timezone
         });
 
-        let result = validator.validate("app.bsky.graph.follow", &follow);
+        let result = validator.validate("app.bsky.graph.follow", &follow).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_repost_invalid_datetime() {
+    #[tokio::test]
+    async fn test_validate_repost_invalid_datetime() {
         let validator = RecordValidator::new();
 
         let repost = json!({
@@ -1955,14 +2498,14 @@ mod tests {
             "createdAt": 1234567890  // Number instead of string
         });
 
-        let result = validator.validate("app.bsky.feed.repost", &repost);
+        let result = validator.validate("app.bsky.feed.repost", &repost).await;
         assert!(result.is_err());
     }
 
     // Validation mode tests
 
-    #[test]
-    fn test_validation_mode_none_skips_all_validation() {
+    #[tokio::test]
+    async fn test_validation_mode_none_skips_all_validation() {
         let validator = RecordValidator::with_mode(ValidationMode::None);
 
         // Even completely invalid records should pass
@@ -1971,15 +2514,15 @@ mod tests {
             // Missing required fields: text, createdAt
         });
 
-        let result = validator.validate("app.bsky.feed.post", &invalid_post);
+        let result = validator.validate("app.bsky.feed.post", &invalid_post).await;
         assert!(
             result.is_ok(),
             "ValidationMode::None should skip all validation"
         );
     }
 
-    #[test]
-    fn test_validation_mode_optimistic_validates_known_collections() {
+    #[tokio::test]
+    async fn test_validation_mode_optimistic_validates_known_collections() {
         let validator = RecordValidator::with_mode(ValidationMode::Optimistic);
 
         // Known collection with invalid data should fail
@@ -1989,15 +2532,15 @@ mod tests {
             // Missing required field: text
         });
 
-        let result = validator.validate("app.bsky.feed.post", &invalid_post);
+        let result = validator.validate("app.bsky.feed.post", &invalid_post).await;
         assert!(
             result.is_err(),
             "Optimistic mode should validate known collections"
         );
     }
 
-    #[test]
-    fn test_validation_mode_optimistic_accepts_unknown_collections() {
+    #[tokio::test]
+    async fn test_validation_mode_optimistic_accepts_unknown_collections() {
         let validator = RecordValidator::with_mode(ValidationMode::Optimistic);
 
         // Unknown collection with basic valid structure should pass
@@ -2006,29 +2549,29 @@ mod tests {
             "data": "some data"
         });
 
-        let result = validator.validate("com.example.custom.record", &unknown_record);
+        let result = validator.validate("com.example.custom.record", &unknown_record).await;
         assert!(
             result.is_ok(),
             "Optimistic mode should accept unknown collections with basic validation"
         );
     }
 
-    #[test]
-    fn test_validation_mode_optimistic_rejects_malformed_unknown() {
+    #[tokio::test]
+    async fn test_validation_mode_optimistic_rejects_malformed_unknown() {
         let validator = RecordValidator::with_mode(ValidationMode::Optimistic);
 
         // Unknown collection but not even an object
         let invalid_record = json!("not an object");
 
-        let result = validator.validate("com.example.custom.record", &invalid_record);
+        let result = validator.validate("com.example.custom.record", &invalid_record).await;
         assert!(
             result.is_err(),
             "Optimistic mode should reject malformed unknown collections"
         );
     }
 
-    #[test]
-    fn test_validation_mode_required_validates_known_collections() {
+    #[tokio::test]
+    async fn test_validation_mode_required_validates_known_collections() {
         let validator = RecordValidator::with_mode(ValidationMode::Required);
 
         // Known collection with invalid data should fail
@@ -2038,15 +2581,15 @@ mod tests {
             // Missing required field: text
         });
 
-        let result = validator.validate("app.bsky.feed.post", &invalid_post);
+        let result = validator.validate("app.bsky.feed.post", &invalid_post).await;
         assert!(
             result.is_err(),
             "Required mode should validate known collections"
         );
     }
 
-    #[test]
-    fn test_validation_mode_required_rejects_unknown_collections() {
+    #[tokio::test]
+    async fn test_validation_mode_required_rejects_unknown_collections() {
         let validator = RecordValidator::with_mode(ValidationMode::Required);
 
         // Unknown collection should be rejected even if well-formed
@@ -2055,7 +2598,7 @@ mod tests {
             "data": "some data"
         });
 
-        let result = validator.validate("com.example.custom.record", &unknown_record);
+        let result = validator.validate("com.example.custom.record", &unknown_record).await;
         assert!(
             result.is_err(),
             "Required mode should reject unknown collections"
@@ -2067,8 +2610,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validation_mode_from_str() {
+    #[tokio::test]
+    async fn test_validation_mode_from_str() {
         assert_eq!(
             ValidationMode::from_str("required"),
             Ok(ValidationMode::Required)
@@ -2098,8 +2641,8 @@ mod tests {
         assert!(ValidationMode::from_str("").is_err());
     }
 
-    #[test]
-    fn test_validation_mode_default() {
+    #[tokio::test]
+    async fn test_validation_mode_default() {
         let mode = ValidationMode::default();
         assert_eq!(
             mode,
@@ -2108,8 +2651,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_validator_mode_getter() {
+    #[tokio::test]
+    async fn test_validator_mode_getter() {
         let validator_default = RecordValidator::new();
         assert_eq!(validator_default.mode(), ValidationMode::Optimistic);
 
@@ -2122,8 +2665,8 @@ mod tests {
 
     // Tests for new collection validators
 
-    #[test]
-    fn test_validate_block_valid() {
+    #[tokio::test]
+    async fn test_validate_block_valid() {
         let validator = RecordValidator::new();
 
         let block = json!({
@@ -2132,12 +2675,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.block", &block);
+        let result = validator.validate("app.bsky.graph.block", &block).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_block_missing_subject() {
+    #[tokio::test]
+    async fn test_validate_block_missing_subject() {
         let validator = RecordValidator::new();
 
         let block = json!({
@@ -2145,12 +2688,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.block", &block);
+        let result = validator.validate("app.bsky.graph.block", &block).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_block_invalid_did() {
+    #[tokio::test]
+    async fn test_validate_block_invalid_did() {
         let validator = RecordValidator::new();
 
         let block = json!({
@@ -2159,12 +2702,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.block", &block);
+        let result = validator.validate("app.bsky.graph.block", &block).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_listitem_valid() {
+    #[tokio::test]
+    async fn test_validate_listitem_valid() {
         let validator = RecordValidator::new();
 
         let listitem = json!({
@@ -2174,12 +2717,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.listitem", &listitem);
+        let result = validator.validate("app.bsky.graph.listitem", &listitem).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_listitem_missing_list() {
+    #[tokio::test]
+    async fn test_validate_listitem_missing_list() {
         let validator = RecordValidator::new();
 
         let listitem = json!({
@@ -2188,12 +2731,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.listitem", &listitem);
+        let result = validator.validate("app.bsky.graph.listitem", &listitem).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_listitem_invalid_at_uri() {
+    #[tokio::test]
+    async fn test_validate_listitem_invalid_at_uri() {
         let validator = RecordValidator::new();
 
         let listitem = json!({
@@ -2203,12 +2746,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.listitem", &listitem);
+        let result = validator.validate("app.bsky.graph.listitem", &listitem).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_list_valid() {
+    #[tokio::test]
+    async fn test_validate_list_valid() {
         let validator = RecordValidator::new();
 
         let list = json!({
@@ -2219,12 +2762,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.list", &list);
+        let result = validator.validate("app.bsky.graph.list", &list).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_list_missing_name() {
+    #[tokio::test]
+    async fn test_validate_list_missing_name() {
         let validator = RecordValidator::new();
 
         let list = json!({
@@ -2233,12 +2776,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.list", &list);
+        let result = validator.validate("app.bsky.graph.list", &list).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_list_invalid_purpose() {
+    #[tokio::test]
+    async fn test_validate_list_invalid_purpose() {
         let validator = RecordValidator::new();
 
         let list = json!({
@@ -2248,12 +2791,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.list", &list);
+        let result = validator.validate("app.bsky.graph.list", &list).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_list_name_too_long() {
+    #[tokio::test]
+    async fn test_validate_list_name_too_long() {
         let validator = RecordValidator::new();
 
         let long_name = "a".repeat(641);
@@ -2264,12 +2807,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.graph.list", &list);
+        let result = validator.validate("app.bsky.graph.list", &list).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_threadgate_valid() {
+    #[tokio::test]
+    async fn test_validate_threadgate_valid() {
         let validator = RecordValidator::new();
 
         let threadgate = json!({
@@ -2279,12 +2822,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.threadgate", &threadgate);
+        let result = validator.validate("app.bsky.feed.threadgate", &threadgate).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_threadgate_missing_post() {
+    #[tokio::test]
+    async fn test_validate_threadgate_missing_post() {
         let validator = RecordValidator::new();
 
         let threadgate = json!({
@@ -2292,12 +2835,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.threadgate", &threadgate);
+        let result = validator.validate("app.bsky.feed.threadgate", &threadgate).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_threadgate_too_many_rules() {
+    #[tokio::test]
+    async fn test_validate_threadgate_too_many_rules() {
         let validator = RecordValidator::new();
 
         let threadgate = json!({
@@ -2314,12 +2857,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.threadgate", &threadgate);
+        let result = validator.validate("app.bsky.feed.threadgate", &threadgate).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_postgate_valid() {
+    #[tokio::test]
+    async fn test_validate_postgate_valid() {
         let validator = RecordValidator::new();
 
         let postgate = json!({
@@ -2329,12 +2872,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.postgate", &postgate);
+        let result = validator.validate("app.bsky.feed.postgate", &postgate).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_postgate_missing_post() {
+    #[tokio::test]
+    async fn test_validate_postgate_missing_post() {
         let validator = RecordValidator::new();
 
         let postgate = json!({
@@ -2342,12 +2885,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.postgate", &postgate);
+        let result = validator.validate("app.bsky.feed.postgate", &postgate).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_postgate_too_many_detached_uris() {
+    #[tokio::test]
+    async fn test_validate_postgate_too_many_detached_uris() {
         let validator = RecordValidator::new();
 
         let mut uris = Vec::new();
@@ -2362,12 +2905,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.postgate", &postgate);
+        let result = validator.validate("app.bsky.feed.postgate", &postgate).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_generator_valid() {
+    #[tokio::test]
+    async fn test_validate_generator_valid() {
         let validator = RecordValidator::new();
 
         let generator = json!({
@@ -2378,12 +2921,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.generator", &generator);
+        let result = validator.validate("app.bsky.feed.generator", &generator).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_generator_missing_did() {
+    #[tokio::test]
+    async fn test_validate_generator_missing_did() {
         let validator = RecordValidator::new();
 
         let generator = json!({
@@ -2392,12 +2935,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.generator", &generator);
+        let result = validator.validate("app.bsky.feed.generator", &generator).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_generator_display_name_too_long() {
+    #[tokio::test]
+    async fn test_validate_generator_display_name_too_long() {
         let validator = RecordValidator::new();
 
         let long_name = "a".repeat(241);
@@ -2408,12 +2951,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.generator", &generator);
+        let result = validator.validate("app.bsky.feed.generator", &generator).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_labeler_valid() {
+    #[tokio::test]
+    async fn test_validate_labeler_valid() {
         let validator = RecordValidator::new();
 
         let labeler = json!({
@@ -2425,12 +2968,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.labeler.service", &labeler);
+        let result = validator.validate("app.bsky.labeler.service", &labeler).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_labeler_missing_policies() {
+    #[tokio::test]
+    async fn test_validate_labeler_missing_policies() {
         let validator = RecordValidator::new();
 
         let labeler = json!({
@@ -2438,12 +2981,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.labeler.service", &labeler);
+        let result = validator.validate("app.bsky.labeler.service", &labeler).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_labeler_invalid_labels() {
+    #[tokio::test]
+    async fn test_validate_labeler_invalid_labels() {
         let validator = RecordValidator::new();
 
         let labeler = json!({
@@ -2455,14 +2998,14 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.labeler.service", &labeler);
+        let result = validator.validate("app.bsky.labeler.service", &labeler).await;
         assert!(result.is_err());
     }
 
     // Grapheme counting tests
 
-    #[test]
-    fn test_validate_text_length_ascii() {
+    #[tokio::test]
+    async fn test_validate_text_length_ascii() {
         // Simple ASCII text: 1 byte = 1 grapheme
         let result = validate_text_length("hello", 10, 10);
         assert!(result.is_ok());
@@ -2475,8 +3018,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_text_length_emoji() {
+    #[tokio::test]
+    async fn test_validate_text_length_emoji() {
         // Single emoji: multiple bytes, 1 grapheme
         let emoji = "👍";
         let result = validate_text_length(emoji, 100, 1);
@@ -2490,8 +3033,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_text_length_family_emoji() {
+    #[tokio::test]
+    async fn test_validate_text_length_family_emoji() {
         // Family emoji with ZWJ (Zero Width Joiner): 25 bytes, 1 grapheme
         let family = "👨‍👩‍👧‍👦";
         let result = validate_text_length(family, 100, 1);
@@ -2506,8 +3049,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_text_length_combining_characters() {
+    #[tokio::test]
+    async fn test_validate_text_length_combining_characters() {
         // "é" can be represented as e + combining acute accent
         let combined = "e\u{0301}"; // e + combining acute accent = é
         let result = validate_text_length(combined, 10, 1);
@@ -2521,8 +3064,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_text_length_flag_emoji() {
+    #[tokio::test]
+    async fn test_validate_text_length_flag_emoji() {
         // Flag emojis are regional indicator symbols
         let flag = "🇺🇸"; // US flag
         let result = validate_text_length(flag, 100, 1);
@@ -2536,8 +3079,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_post_with_emoji_text() {
+    #[tokio::test]
+    async fn test_validate_post_with_emoji_text() {
         let validator = RecordValidator::new();
 
         // A post with emoji should count graphemes correctly
@@ -2548,12 +3091,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_post_with_too_many_graphemes() {
+    #[tokio::test]
+    async fn test_validate_post_with_too_many_graphemes() {
         let validator = RecordValidator::new();
 
         // Create a string with exactly 301 simple emojis (each is 1 grapheme)
@@ -2564,7 +3107,7 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
 
         if let Err(errors) = result {
@@ -2574,8 +3117,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_post_text_exactly_300_graphemes() {
+    #[tokio::test]
+    async fn test_validate_post_text_exactly_300_graphemes() {
         let validator = RecordValidator::new();
 
         // Create a string with exactly 300 emojis
@@ -2586,12 +3129,12 @@ mod tests {
             "createdAt": "2025-01-10T12:00:00Z"
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_profile_displayname_with_emoji() {
+    #[tokio::test]
+    async fn test_validate_profile_displayname_with_emoji() {
         let validator = RecordValidator::new();
 
         // Display name with emoji
@@ -2600,12 +3143,12 @@ mod tests {
             "displayName": "Alice 🎨 Smith",
         });
 
-        let result = validator.validate("app.bsky.actor.profile", &profile);
+        let result = validator.validate("app.bsky.actor.profile", &profile).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_profile_displayname_too_many_graphemes() {
+    #[tokio::test]
+    async fn test_validate_profile_displayname_too_many_graphemes() {
         let validator = RecordValidator::new();
 
         // Create a displayName with 65 emojis (exceeds 64 grapheme limit)
@@ -2615,7 +3158,7 @@ mod tests {
             "displayName": long_name,
         });
 
-        let result = validator.validate("app.bsky.actor.profile", &profile);
+        let result = validator.validate("app.bsky.actor.profile", &profile).await;
         assert!(result.is_err());
 
         if let Err(errors) = result {
@@ -2625,8 +3168,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_profile_description_with_unicode() {
+    #[tokio::test]
+    async fn test_validate_profile_description_with_unicode() {
         let validator = RecordValidator::new();
 
         // Description with various Unicode characters
@@ -2635,12 +3178,12 @@ mod tests {
             "description": "I love coding! 💻 こんにちは 🌸 Café ☕",
         });
 
-        let result = validator.validate("app.bsky.actor.profile", &profile);
+        let result = validator.validate("app.bsky.actor.profile", &profile).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_profile_description_too_many_graphemes() {
+    #[tokio::test]
+    async fn test_validate_profile_description_too_many_graphemes() {
         let validator = RecordValidator::new();
 
         // Create a description with 257 emojis (exceeds 256 grapheme limit)
@@ -2650,7 +3193,7 @@ mod tests {
             "description": long_desc,
         });
 
-        let result = validator.validate("app.bsky.actor.profile", &profile);
+        let result = validator.validate("app.bsky.actor.profile", &profile).await;
         assert!(result.is_err());
 
         if let Err(errors) = result {
@@ -2660,8 +3203,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_tag_with_emoji() {
+    #[tokio::test]
+    async fn test_validate_tag_with_emoji() {
         let validator = RecordValidator::new();
 
         let post = json!({
@@ -2671,12 +3214,12 @@ mod tests {
             "tags": ["coding", "rust🦀", "emoji😀"]
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_tag_too_many_graphemes() {
+    #[tokio::test]
+    async fn test_validate_tag_too_many_graphemes() {
         let validator = RecordValidator::new();
 
         // Create a tag with 65 emojis (exceeds 64 grapheme limit)
@@ -2688,7 +3231,7 @@ mod tests {
             "tags": [long_tag]
         });
 
-        let result = validator.validate("app.bsky.feed.post", &post);
+        let result = validator.validate("app.bsky.feed.post", &post).await;
         assert!(result.is_err());
 
         if let Err(errors) = result {
@@ -2698,8 +3241,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_text_length_mixed_unicode() {
+    #[tokio::test]
+    async fn test_validate_text_length_mixed_unicode() {
         // Mix of ASCII, Latin extended, emoji, and CJK. The string is
         // 21 graphemes (originally pegged at 20 by an off-by-one),
         // so the generous limit needs to accommodate it.
@@ -2711,8 +3254,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_text_length_skin_tone_emoji() {
+    #[tokio::test]
+    async fn test_validate_text_length_skin_tone_emoji() {
         // Emoji with skin tone modifier: 1 grapheme but multiple code points
         let emoji_with_tone = "👋🏽"; // Waving hand with medium skin tone
         let result = validate_text_length(emoji_with_tone, 100, 1);
@@ -2723,6 +3266,631 @@ mod tests {
         if let Err((byte_len, grapheme_count)) = result {
             assert!(byte_len > 4); // Base emoji + modifier
             assert_eq!(grapheme_count, 1); // But displayed as 1 emoji
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Arc 17 §17.3 — dynamic-lexicon dispatch matrix
+    //
+    // Covers the §17.3.4 validate_imports matrix (via the pure helper
+    // `should_validate_per_lexicon_imports`), the §17.3.3 allowlist/
+    // denylist split, the fetch_failure_behavior branch, and the
+    // path-sentinel round-trip from ValidationError → PdsError.
+    //
+    // The lexicon-fetch path is mocked through the same
+    // LexiconRecordFetcher + MockDnsTxtResolver seam unit-tested in
+    // src/federation/lexicon_resolver.rs; the real DNS / PLC / HTTP
+    // path is Phase B (Step 4) territory.
+    // ──────────────────────────────────────────────────────────────
+
+    // Test-mod-local allow: the `let mut cfg = LexiconConfig::default();
+    // cfg.<flag> = true;` per-field-mutation pattern is repeated across
+    // many small test setups. Struct-literal init would force every test
+    // to enumerate the full LexiconConfig surface; the mutate-after-default
+    // shape keeps each test focused on the one or two flags under test.
+    #[allow(clippy::field_reassign_with_default)]
+    mod arc17_matrix {
+        use super::*;
+        use crate::config::{FetchFailureBehavior, LexiconConfig};
+        use crate::federation::dns_resolver::{DnsTxtResolver, MockDnsTxtResolver};
+        use crate::federation::lexicon_cache::LexiconCache;
+        use crate::federation::lexicon_resolver::{
+            LexResolver, LexiconFetcherError, LexiconRecordFetcher,
+        };
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        struct MockFetcher {
+            response: Option<String>,
+            error: Option<fn() -> LexiconFetcherError>,
+        }
+
+        impl MockFetcher {
+            fn with_doc(json: &str) -> Self {
+                Self {
+                    response: Some(json.to_string()),
+                    error: None,
+                }
+            }
+            fn with_error(err_fn: fn() -> LexiconFetcherError) -> Self {
+                Self {
+                    response: None,
+                    error: Some(err_fn),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl LexiconRecordFetcher for MockFetcher {
+            async fn fetch(
+                &self,
+                _authority_did: &str,
+                _nsid: &str,
+            ) -> Result<String, LexiconFetcherError> {
+                if let Some(err_fn) = self.error {
+                    return Err(err_fn());
+                }
+                self.response.clone().ok_or(LexiconFetcherError::Http4xx("404".to_string()))
+            }
+        }
+
+        fn sample_doc(nsid: &str) -> String {
+            format!(
+                r#"{{
+                    "lexicon": 1,
+                    "id": "{nsid}",
+                    "defs": {{
+                        "main": {{
+                            "type": "record",
+                            "key": "tid",
+                            "record": {{
+                                "type": "object",
+                                "required": ["text"],
+                                "properties": {{
+                                    "text": {{ "type": "string" }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}"#
+            )
+        }
+
+        fn build_validator(
+            config: LexiconConfig,
+            fetcher: MockFetcher,
+            dns_txt_for_nsid: Option<(&str, &str)>,
+        ) -> RecordValidator {
+            let dns = if let Some((auth, did)) = dns_txt_for_nsid {
+                MockDnsTxtResolver::new()
+                    .with_txt(&format!("_lexicon.{auth}"), vec![format!("did={did}")])
+            } else {
+                MockDnsTxtResolver::new()
+            };
+            let cache = Arc::new(LexiconCache::in_memory(60));
+            let dns: Arc<dyn DnsTxtResolver> = Arc::new(dns);
+            let fetcher: Arc<dyn LexiconRecordFetcher> = Arc::new(fetcher);
+            let resolver = Arc::new(LexResolver::new(cache, dns, fetcher, config.clone()));
+            RecordValidator::with_mode(ValidationMode::Optimistic).with_lexicon(resolver, config)
+        }
+
+        // ─── §17.3.4 validate_imports override matrix (pure helper) ───
+
+        #[test]
+        fn override_local_write_none_always_validates() {
+            assert!(should_validate_per_lexicon_imports(None, None));
+            assert!(should_validate_per_lexicon_imports(
+                None,
+                Some(&LexiconConfig::default())
+            ));
+        }
+
+        #[test]
+        fn override_local_write_explicit_true_always_validates() {
+            assert!(should_validate_per_lexicon_imports(Some(true), None));
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            cfg.validate_imports = false;
+            assert!(should_validate_per_lexicon_imports(Some(true), Some(&cfg)));
+        }
+
+        #[test]
+        fn override_car_import_no_lexicon_config_honors_bypass() {
+            // write.validate = Some(false), no lexicon config → bypass.
+            assert!(!should_validate_per_lexicon_imports(Some(false), None));
+        }
+
+        #[test]
+        fn override_car_import_lexicon_disabled_honors_bypass() {
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = false;
+            cfg.validate_imports = true; // would fire if enabled
+            assert!(!should_validate_per_lexicon_imports(Some(false), Some(&cfg)));
+        }
+
+        #[test]
+        fn override_car_import_validate_imports_false_honors_bypass() {
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            cfg.validate_imports = false;
+            assert!(!should_validate_per_lexicon_imports(Some(false), Some(&cfg)));
+        }
+
+        #[test]
+        fn override_car_import_enabled_and_validate_imports_fires() {
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            cfg.validate_imports = true;
+            assert!(should_validate_per_lexicon_imports(Some(false), Some(&cfg)));
+        }
+
+        // ─── §17.3.3 known-NSID short-circuit ───
+
+        #[tokio::test]
+        async fn known_nsid_uses_hand_coded_validator_not_lexicon_path() {
+            // Build a validator with a lexicon resolver wired in but
+            // also the default hand-coded validators (post-validator
+            // is registered for app.bsky.feed.post). The hand-coded
+            // path MUST win; lexicon fetch must not fire.
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            // Configure a fetcher that PANICS if called — the
+            // hand-coded path must short-circuit before fetcher invoke.
+            let fetcher = MockFetcher::with_error(|| {
+                panic!("fetcher must not fire for known NSID");
+            });
+            let validator = build_validator(cfg, fetcher, None);
+            let post = json!({
+                "$type": "app.bsky.feed.post",
+                "text": "hello",
+                "createdAt": "2025-01-10T12:00:00Z"
+            });
+            // Hand-coded validator should accept the post.
+            assert!(validator.validate("app.bsky.feed.post", &post).await.is_ok());
+        }
+
+        // ─── §17.3.3 allowlist/denylist split ───
+
+        #[tokio::test]
+        async fn denylist_hit_rejects_with_namespace_denied_sentinel() {
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            cfg.namespace_denylist = Some(vec!["com.evil.".to_string()]);
+            let fetcher = MockFetcher::with_doc(&sample_doc("com.evil.thing"));
+            let validator = build_validator(cfg, fetcher, Some(("evil.com", "did:plc:x")));
+            let record = json!({"text": "hi"});
+            let errors = validator
+                .validate("com.evil.thing", &record)
+                .await
+                .unwrap_err();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].path, "@lexicon/NamespaceDenied");
+            assert!(errors[0].message.contains("com.evil.thing"));
+        }
+
+        #[tokio::test]
+        async fn allowlist_exclusion_falls_through_to_optimistic() {
+            // allowlist non-empty, NSID not in it → Optimistic path
+            // (Intent A — fetch-restriction, NOT rejection). The
+            // record passes validate_basic (it's an object with $type).
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            cfg.namespace_allowlist = Some(vec!["com.allowed.".to_string()]);
+            let fetcher = MockFetcher::with_error(|| {
+                panic!("fetcher must not fire for allowlist-excluded NSID")
+            });
+            let validator = build_validator(cfg, fetcher, None);
+            let record = json!({
+                "$type": "com.example.other.thing",
+                "data": "x"
+            });
+            assert!(validator
+                .validate("com.example.other.thing", &record)
+                .await
+                .is_ok());
+        }
+
+        #[tokio::test]
+        async fn deny_and_allow_both_match_deny_wins() {
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            cfg.namespace_denylist = Some(vec!["com.evil.".to_string()]);
+            cfg.namespace_allowlist = Some(vec!["com.evil.".to_string()]);
+            let fetcher = MockFetcher::with_doc(&sample_doc("com.evil.thing"));
+            let validator = build_validator(cfg, fetcher, Some(("evil.com", "did:plc:x")));
+            let record = json!({"text": "hi"});
+            let errors = validator
+                .validate("com.evil.thing", &record)
+                .await
+                .unwrap_err();
+            assert_eq!(errors[0].path, "@lexicon/NamespaceDenied");
+        }
+
+        // ─── §17.3.3 fetch-failure branch ───
+
+        #[tokio::test]
+        async fn hardfail_fetch_failure_surfaces_lexicon_fetch_failed_sentinel() {
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            cfg.fetch_failure_behavior = FetchFailureBehavior::HardFail;
+            let fetcher = MockFetcher::with_error(|| {
+                LexiconFetcherError::Http5xx("503".to_string())
+            });
+            let validator =
+                build_validator(cfg, fetcher, Some(("thing.example.com", "did:plc:x")));
+            let record = json!({"text": "hi"});
+            let errors = validator
+                .validate("com.example.thing.foo", &record)
+                .await
+                .unwrap_err();
+            assert_eq!(errors[0].path, "@lexicon/LexiconFetchFailed");
+            assert!(errors[0].message.contains("http_5xx"));
+        }
+
+        #[tokio::test]
+        async fn warn_fetch_failure_falls_through_to_optimistic() {
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            cfg.fetch_failure_behavior = FetchFailureBehavior::Warn;
+            let fetcher = MockFetcher::with_error(|| {
+                LexiconFetcherError::Http5xx("503".to_string())
+            });
+            let validator =
+                build_validator(cfg, fetcher, Some(("thing.example.com", "did:plc:x")));
+            let record = json!({
+                "$type": "com.example.thing.foo",
+                "data": "x"
+            });
+            // Warn mode + Optimistic fallback accepts the record.
+            assert!(validator
+                .validate("com.example.thing.foo", &record)
+                .await
+                .is_ok());
+        }
+
+        // ─── §17.3.3 happy-path lexicon validation + SchemaViolation ───
+
+        #[tokio::test]
+        async fn lexicon_validation_happy_path_accepts_well_formed_record() {
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            let fetcher = MockFetcher::with_doc(&sample_doc("com.example.thing.foo"));
+            let validator =
+                build_validator(cfg, fetcher, Some(("thing.example.com", "did:plc:x")));
+            let record = json!({
+                "$type": "com.example.thing.foo",
+                "text": "hello"
+            });
+            assert!(validator
+                .validate("com.example.thing.foo", &record)
+                .await
+                .is_ok());
+        }
+
+        #[tokio::test]
+        async fn lexicon_validation_missing_required_field_surfaces_schema_violation() {
+            let mut cfg = LexiconConfig::default();
+            cfg.enabled = true;
+            let fetcher = MockFetcher::with_doc(&sample_doc("com.example.thing.foo"));
+            let validator =
+                build_validator(cfg, fetcher, Some(("thing.example.com", "did:plc:x")));
+            let record = json!({
+                "$type": "com.example.thing.foo"
+                // text missing — schema requires it
+            });
+            let errors = validator
+                .validate("com.example.thing.foo", &record)
+                .await
+                .unwrap_err();
+            assert_eq!(errors[0].path, "@lexicon/SchemaViolation");
+        }
+
+        // ─── PdsError round-trip via validation_errors_to_pds_error ───
+
+        #[test]
+        fn pds_error_roundtrip_namespace_denied() {
+            let ve = ValidationError::namespace_denied("com.evil.thing");
+            let pe = validation_errors_to_pds_error(vec![ve]);
+            match pe {
+                PdsError::NamespaceDenied { nsid } => assert_eq!(nsid, "com.evil.thing"),
+                other => panic!("expected NamespaceDenied, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn pds_error_roundtrip_lexicon_fetch_failed_preserves_failure_class() {
+            let ve = ValidationError::lexicon_fetch_failed(
+                "app.bsky.feed.post",
+                "http_5xx",
+                "503 Service Unavailable",
+            );
+            let pe = validation_errors_to_pds_error(vec![ve]);
+            match pe {
+                PdsError::LexiconFetchFailed {
+                    nsid,
+                    failure_class,
+                    source_detail,
+                } => {
+                    assert_eq!(nsid, "app.bsky.feed.post");
+                    assert_eq!(failure_class, "http_5xx");
+                    assert!(source_detail.contains("503"));
+                }
+                other => panic!("expected LexiconFetchFailed, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn pds_error_roundtrip_schema_violation_preserves_field_path() {
+            let ve = ValidationError::schema_violation(
+                "app.bsky.feed.post",
+                "/text",
+                Some("string"),
+                Some("missing required field"),
+                "Required field missing: text",
+            );
+            let pe = validation_errors_to_pds_error(vec![ve]);
+            match pe {
+                PdsError::SchemaViolation {
+                    collection,
+                    field_path,
+                    expected,
+                    actual_summary,
+                    detail,
+                } => {
+                    assert_eq!(collection, "app.bsky.feed.post");
+                    assert_eq!(field_path, "/text");
+                    assert_eq!(expected.as_deref(), Some("string"));
+                    assert!(actual_summary.is_some());
+                    assert!(detail.contains("text"));
+                }
+                other => panic!("expected SchemaViolation, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn pds_error_roundtrip_authority_ambiguous_carries_candidates() {
+            let candidates = vec!["did:plc:one".to_string(), "did:plc:two".to_string()];
+            let ve = ValidationError::lexicon_authority_ambiguous("app.bsky.feed.post", &candidates);
+            let pe = validation_errors_to_pds_error(vec![ve]);
+            match pe {
+                PdsError::LexiconAuthorityAmbiguous { nsid, candidates: c } => {
+                    assert_eq!(nsid, "app.bsky.feed.post");
+                    assert_eq!(c.len(), 2);
+                }
+                other => panic!("expected LexiconAuthorityAmbiguous, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn pds_error_legacy_validation_error_uses_umbrella_validation_variant() {
+            // Hand-coded validator path (no @lexicon/ prefix) → umbrella.
+            let ve = ValidationError {
+                path: "$.text".to_string(),
+                message: "Required field missing".to_string(),
+            };
+            let pe = validation_errors_to_pds_error(vec![ve]);
+            assert!(matches!(pe, PdsError::Validation(_)));
+        }
+
+        // ─── §17.3.3 Phase B bug #2 — fetch-class predicate + propagate matrix ───
+        //
+        // The bug: a HardFail lexicon fetch failure was being absorbed
+        // by `ValidationMode::Optimistic` at `repository.rs::validate_write`.
+        // The fix introduces `is_fetch_class_lexicon_variant` + the
+        // `should_propagate_validation_errors` matrix. These tests pin
+        // both halves so future variants (e.g. an Arc-17.x reclassifying
+        // `LexiconAuthorityMismatch` into the bypass set) flip the
+        // predicate, not the surrounding plumbing.
+
+        #[test]
+        fn fetch_class_predicate_lexicon_fetch_failed_in_set() {
+            let ve =
+                ValidationError::lexicon_fetch_failed("com.example.foo", "pds_unreachable", "x");
+            assert!(ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_authority_tombstoned_in_set() {
+            let ve =
+                ValidationError::lexicon_authority_tombstoned("com.example.foo", "did:plc:gone");
+            assert!(ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_authority_ambiguous_in_set() {
+            let ve = ValidationError::lexicon_authority_ambiguous(
+                "com.example.foo",
+                &["did:plc:a".to_string(), "did:plc:b".to_string()],
+            );
+            assert!(ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_namespace_denied_in_set() {
+            let ve = ValidationError::namespace_denied("com.evil.thing");
+            assert!(ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_lexicon_invalid_nsid_in_set() {
+            let ve = ValidationError::lexicon_invalid_nsid("not-a-real-nsid");
+            assert!(ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_schema_violation_not_in_set() {
+            // SchemaViolation = lexicon fetched fine, record doesn't
+            // match. Optimistic absorption preserved.
+            let ve = ValidationError::schema_violation(
+                "com.example.foo",
+                "/text",
+                Some("string"),
+                Some("number"),
+                "text must be a string",
+            );
+            assert!(!ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_authority_mismatch_not_in_set_currently() {
+            // Documented in the predicate doc-comment: NOT in the
+            // bypass set at v0.5; this test pins current behavior so
+            // a future reclassification is intentional, not accidental.
+            let ve = ValidationError::lexicon_authority_mismatch(
+                "com.example.foo",
+                "did:plc:expected",
+                "did:plc:found",
+            );
+            assert!(!ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_lexicon_invalid_schema_not_in_set_currently() {
+            // Documented in the predicate doc-comment: NOT in the
+            // bypass set at v0.5; future reclassification is the
+            // single change-point in the predicate's tag list.
+            let ve = ValidationError::lexicon_invalid_schema("com.example.foo", "broken doc");
+            assert!(!ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_hand_coded_validator_path_not_in_set() {
+            // Plain JSON-pointer paths (the 152 hand-coded validators)
+            // must never trip the predicate.
+            let ve = ValidationError {
+                path: "$.text".to_string(),
+                message: "Required field missing".to_string(),
+            };
+            assert!(!ve.is_fetch_class_lexicon_variant());
+        }
+
+        #[test]
+        fn fetch_class_predicate_path_with_variant_name_substring_not_in_set() {
+            // Defense against accidental substring match. A
+            // hand-coded path that happens to contain a variant name
+            // must NOT trip the predicate (the prefix gate keeps
+            // us honest).
+            let ve = ValidationError {
+                path: "$.LexiconFetchFailed".to_string(),
+                message: "field path coincidence".to_string(),
+            };
+            assert!(!ve.is_fetch_class_lexicon_variant());
+        }
+
+        // ── propagate-matrix tests ──
+
+        fn one_lex_fetch_failed() -> Vec<ValidationError> {
+            vec![ValidationError::lexicon_fetch_failed(
+                "com.example.foo",
+                "pds_unreachable",
+                "connection refused",
+            )]
+        }
+
+        fn one_schema_violation() -> Vec<ValidationError> {
+            vec![ValidationError::schema_violation(
+                "com.example.foo",
+                "/text",
+                Some("string"),
+                None,
+                "missing text",
+            )]
+        }
+
+        fn one_hand_coded_error() -> Vec<ValidationError> {
+            vec![ValidationError {
+                path: "$.text".to_string(),
+                message: "Required field missing".to_string(),
+            }]
+        }
+
+        #[test]
+        fn propagate_matrix_required_always_propagates_fetch_class() {
+            assert!(should_propagate_validation_errors(
+                &one_lex_fetch_failed(),
+                ValidationMode::Required
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_required_always_propagates_schema_violation() {
+            assert!(should_propagate_validation_errors(
+                &one_schema_violation(),
+                ValidationMode::Required
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_required_always_propagates_hand_coded() {
+            assert!(should_propagate_validation_errors(
+                &one_hand_coded_error(),
+                ValidationMode::Required
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_none_propagates_defensive() {
+            // In practice None mode short-circuits before the Err
+            // branch — but if it ever reaches here, propagate is the
+            // defensive choice.
+            assert!(should_propagate_validation_errors(
+                &one_lex_fetch_failed(),
+                ValidationMode::None
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_optimistic_propagates_fetch_class() {
+            // THIS is bug #2's core assertion: HardFail + Optimistic
+            // must propagate (not absorb).
+            assert!(should_propagate_validation_errors(
+                &one_lex_fetch_failed(),
+                ValidationMode::Optimistic
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_optimistic_absorbs_schema_violation() {
+            // v1 contract: SchemaViolation under Optimistic = warn-
+            // and-accept. Bug #2's fix must NOT regress this.
+            assert!(!should_propagate_validation_errors(
+                &one_schema_violation(),
+                ValidationMode::Optimistic
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_optimistic_absorbs_hand_coded() {
+            // The 152 hand-coded validator errors retain their pre-
+            // Arc-17 Optimistic absorption.
+            assert!(!should_propagate_validation_errors(
+                &one_hand_coded_error(),
+                ValidationMode::Optimistic
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_optimistic_mixed_propagates_if_any_fetch_class() {
+            // A single fetch-class variant in a multi-error vec
+            // forces propagation — even if other errors would be
+            // absorbable on their own.
+            let mut errs = one_schema_violation();
+            errs.extend(one_lex_fetch_failed());
+            assert!(should_propagate_validation_errors(
+                &errs,
+                ValidationMode::Optimistic
+            ));
+        }
+
+        #[test]
+        fn propagate_matrix_optimistic_empty_absorbs() {
+            // Defensive: the Err branch shouldn't see an empty vec
+            // (validators always emit ≥1 error), but if it does,
+            // Optimistic absorption is the consistent choice.
+            assert!(!should_propagate_validation_errors(
+                &[],
+                ValidationMode::Optimistic
+            ));
         }
     }
 }

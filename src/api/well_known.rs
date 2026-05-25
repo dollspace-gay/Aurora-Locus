@@ -15,6 +15,50 @@ pub fn routes() -> Router<AppContext> {
     Router::new()
         .route("/.well-known/atproto-did", get(atproto_did))
         .route("/.well-known/did.json", get(did_document))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_protected_resource),
+        )
+}
+
+/// Arc 12 §5.3.10 OAuth protected-resource metadata.
+///
+/// Registered unconditionally. The only mode-dependent field is
+/// `authorization_servers`: `[entryway_url]` when `EntrywayConfig`
+/// is set, `[service_url]` otherwise. CORS preflight succeeds and
+/// the response advertises permissive cross-origin headers per the
+/// spec's "publicly fetchable" semantics.
+pub async fn oauth_protected_resource(
+    State(ctx): State<AppContext>,
+) -> PdsResult<Response> {
+    let resource = ctx.service_url();
+    let authorization_server = match ctx.config.entryway.as_ref() {
+        Some(entryway) => entryway.url.clone(),
+        None => resource.clone(),
+    };
+    let body = serde_json::json!({
+        "resource": resource,
+        "authorization_servers": [authorization_server],
+        "scopes_supported": ["atproto", "transition:generic"],
+    });
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+        crate::error::PdsError::Internal(format!(
+            "Failed to serialise oauth-protected-resource body: {}",
+            e
+        ))
+    })?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(body_bytes.into())
+        .map_err(|e| {
+            crate::error::PdsError::Internal(format!(
+                "Failed to build oauth-protected-resource response: {}",
+                e
+            ))
+        })
 }
 
 /// /.well-known/atproto-did
@@ -141,6 +185,12 @@ mod tests {
                 service_did: "did:web:localhost".to_string(),
                 version: "0.1.0".to_string(),
                 blob_upload_limit: 5242880,
+                public_url: None,
+                max_blob_fetch_size: 50_000_000,
+                blob_fetch_timeout_seconds: 30,
+                blob_fetch_max_retries: 3,
+                accepting_imports: true,
+                max_import_size: None,
             },
             storage: StorageConfig {
                 data_directory: PathBuf::from("./data"),
@@ -172,6 +222,7 @@ mod tests {
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {
@@ -195,11 +246,15 @@ mod tests {
                 crawl_enabled: false,
                 public_url: None,
                 auto_stream_events: false,
+                peer_pds: vec![],
             },
             validation_mode: crate::validation::ValidationMode::Optimistic,
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            blob_metadata: Default::default(),
+            entryway: None,
+            lexicon: crate::config::LexiconConfig::default(),
         }
     }
 
@@ -291,5 +346,81 @@ mod tests {
         assert!(json.contains("did:web:localhost"));
         assert!(json.contains("AtprotoPersonalDataServer"));
         assert!(json.contains("Multikey"));
+    }
+
+    // ---------- Arc 12 §5.3.10 oauth-protected-resource ----------
+
+    /// Shape verifier — read the response body bytes and assert the
+    /// JSON skeleton + the mode-dependent `authorization_servers`
+    /// list value. Each call gets its own tempdir so DB / actor-store
+    /// state doesn't leak across cases.
+    async fn run_oauth_protected_resource(
+        mut config: ServerConfig,
+        expected_auth_server: &str,
+    ) {
+        let dir = tempfile::tempdir().unwrap().keep();
+        config.storage.data_directory = dir.clone();
+        config.storage.account_db = dir.join("account.sqlite");
+        config.storage.sequencer_db = dir.join("sequencer.sqlite");
+        config.storage.did_cache_db = dir.join("did_cache.sqlite");
+        config.storage.actor_store_directory = dir.join("actors");
+        config.storage.blobstore = BlobstoreConfig::Disk {
+            location: dir.join("blobs"),
+            tmp_location: dir.join("temp"),
+        };
+
+        let ctx = AppContext::new(
+            config,
+            std::sync::Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .expect("AppContext::new");
+
+        let response = oauth_protected_resource(axum::extract::State(ctx)).await.expect("ok");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["resource"].is_string());
+        assert_eq!(json["authorization_servers"][0], expected_auth_server);
+        assert_eq!(json["scopes_supported"][0], "atproto");
+        assert_eq!(json["scopes_supported"][1], "transition:generic");
+    }
+
+    #[tokio::test]
+    async fn oauth_protected_resource_standalone_mode_advertises_self() {
+        let config = create_test_config();
+        // In standalone mode, authorization_servers = [service_url].
+        let expected = "http://localhost:2583";
+        run_oauth_protected_resource(config, expected).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_protected_resource_entryway_mode_advertises_entryway_url() {
+        let mut config = create_test_config();
+        // Manually wire an EntrywayConfig to assert the multi-mode
+        // switch. The k256 pubkey is a deterministic SEC1-compressed
+        // 33-byte stub derived from a fixed private key so the test
+        // is self-contained.
+        let signing_key = k256::ecdsa::SigningKey::from_slice(&[0x42u8; 32])
+            .expect("k256 from_slice");
+        let verifying_key = *signing_key.verifying_key();
+        config.entryway = Some(EntrywayConfig {
+            url: "https://entryway.test".to_string(),
+            admin_token: "test-admin-token".to_string(),
+            jwt_public_key: verifying_key,
+            did: "did:web:entryway.test".to_string(),
+        });
+        run_oauth_protected_resource(config, "https://entryway.test").await;
     }
 }

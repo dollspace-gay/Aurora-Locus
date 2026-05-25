@@ -338,6 +338,21 @@ impl IdentityResolver {
                     }
 
                     let status = response.status();
+
+                    // Arc 13 v4.2 — PLC returns 410 Gone for tombstoned DIDs.
+                    // Route into the pre-existing `DidTombstoned` variant
+                    // (originally added in §6.3.4 / §6.3.6 for PlcClient's
+                    // audit-log path) so callers reason about tombstone
+                    // state structurally instead of substring-matching
+                    // "410" in an opaque message. Non-retryable: a
+                    // tombstoned DID is a permanent state and doesn't
+                    // benefit from backoff. All other non-2xx statuses
+                    // keep their current `IdentityResolution` mapping
+                    // unchanged.
+                    if status == reqwest::StatusCode::GONE {
+                        return Err(PdsError::DidTombstoned(did.to_string()));
+                    }
+
                     if Self::is_retryable_status(status) && attempt < max_retries {
                         tracing::warn!(
                             did = %did,
@@ -401,11 +416,15 @@ impl IdentityResolver {
             .first()
             .ok_or_else(|| PdsError::IdentityResolution("Missing domain in did:web".to_string()))?;
 
+        // Arc 12 §5.3.2 Gap 1: localhost-aware scheme for
+        // did:web resolution so a peer at localhost:NNNN resolves
+        // via http://.
+        let scheme = crate::config::derive_url_scheme(domain);
         let url = if parts.len() == 1 {
-            format!("https://{}/.well-known/did.json", domain)
+            format!("{}://{}/.well-known/did.json", scheme, domain)
         } else {
             let path = parts[1..].join("/");
-            format!("https://{}/{}/did.json", domain, path)
+            format!("{}://{}/{}/did.json", scheme, domain, path)
         };
 
         let max_retries = self.config.max_retries;
@@ -800,7 +819,11 @@ impl IdentityResolverApi for IdentityResolver {
     }
 }
 
-#[cfg(test)]
+// Exposed to integration tests in `tests/` (e.g.
+// `tests/arc12_routing_matrix.rs`). The mock has no production
+// callers; gating it behind `#[cfg(test)]` would hide it from
+// integration tests because Cargo only sets `cfg(test)` for the
+// crate currently being compiled in test mode.
 pub mod test_doubles {
     //! Test doubles for the identity-resolution surface.
     //!
@@ -1224,6 +1247,155 @@ mod tests {
             resolver.config.plc_directory_url,
             "https://test.plc.directory/"
         );
+    }
+
+    // =====================================================
+    // Arc 13 v4.2 — 410-on-PLC → DidTombstoned routing
+    //
+    // Tests use a tiny axum server bound to 127.0.0.1:0 (same
+    // pattern as src/federation/blob_fetch.rs's TestOrigin)
+    // returning the configured status. No new dep introduced.
+    // =====================================================
+
+    async fn open_test_pool_for_plc() -> sqlx::AnyPool {
+        let pool = open_test_pool().await;
+        sqlx::query(
+            r#"
+            CREATE TABLE did_doc (
+                did TEXT PRIMARY KEY,
+                doc TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cached_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE did_handle (
+                handle TEXT PRIMARY KEY,
+                did TEXT NOT NULL,
+                declared_at TEXT,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    /// Spawn a one-shot stub PLC at `127.0.0.1:0` returning `status`
+    /// for any GET. Returns `(base_url, shutdown_tx)`. Drop the
+    /// shutdown_tx to terminate the server.
+    async fn spawn_stub_plc(status: u16) -> (String, tokio::sync::oneshot::Sender<()>) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::any;
+        use axum::Router;
+
+        let app = Router::new().route(
+            "/*path",
+            any(move || async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    "stubbed",
+                )
+                    .into_response()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .ok();
+        });
+        (format!("http://{}", addr), tx)
+    }
+
+    fn config_pointing_at(url: &str) -> IdentityResolverConfig {
+        IdentityResolverConfig {
+            user_agent: "Aurora-v4.2-test/1.0".to_string(),
+            use_doh: false,
+            plc_directory_url: url.to_string(),
+            // Keep retries low so failure-path tests don't spin
+            // wall-clock seconds on backoff.
+            max_retries: 0,
+            retry_base_delay_ms: 10,
+            retry_max_delay_ms: 50,
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_plc_document_maps_410_to_did_tombstoned() {
+        let (url, _shutdown) = spawn_stub_plc(410).await;
+        let cache = DidCache::new(open_test_pool_for_plc().await);
+        let resolver = IdentityResolver::new(cache, config_pointing_at(&url)).unwrap();
+
+        let target_did = "did:plc:tombstoned123";
+        let err = resolver.fetch_plc_document(target_did).await.unwrap_err();
+        match err {
+            PdsError::DidTombstoned(d) => assert_eq!(d, target_did),
+            other => panic!(
+                "expected PdsError::DidTombstoned, got: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_plc_document_maps_non_410_5xx_to_identity_resolution_unchanged() {
+        // 500 is the canonical "other non-2xx" case — preserves
+        // the existing IdentityResolution mapping. (500 IS in the
+        // retryable set per is_retryable_status; with max_retries=0
+        // we only attempt once and surface the terminal error.)
+        let (url, _shutdown) = spawn_stub_plc(500).await;
+        let cache = DidCache::new(open_test_pool_for_plc().await);
+        let resolver = IdentityResolver::new(cache, config_pointing_at(&url)).unwrap();
+
+        let err = resolver.fetch_plc_document("did:plc:transient").await.unwrap_err();
+        match err {
+            PdsError::IdentityResolution(msg) => {
+                assert!(
+                    msg.contains("500"),
+                    "expected 500 in error message, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected PdsError::IdentityResolution, got: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_plc_document_maps_non_410_4xx_to_identity_resolution_unchanged() {
+        // 404 is the "DID does not exist at PLC" case — current
+        // behavior keeps it as IdentityResolution. v4.2 carves out
+        // ONLY 410; everything else stays put.
+        let (url, _shutdown) = spawn_stub_plc(404).await;
+        let cache = DidCache::new(open_test_pool_for_plc().await);
+        let resolver = IdentityResolver::new(cache, config_pointing_at(&url)).unwrap();
+
+        let err = resolver.fetch_plc_document("did:plc:missing").await.unwrap_err();
+        match err {
+            PdsError::IdentityResolution(msg) => {
+                assert!(
+                    msg.contains("404"),
+                    "expected 404 in error message, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected PdsError::IdentityResolution, got: {other:?}"
+            ),
+        }
     }
 
     // =====================================================

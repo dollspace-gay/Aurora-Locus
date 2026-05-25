@@ -2,7 +2,15 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Blob metadata stored in database
+/// Blob metadata stored in database.
+///
+/// Arc 16b §9.2.3.1: `temp_key` discriminates the lifecycle state.
+/// `Some('1')` = untethered (no record references; subject to Arc
+/// 16d's TTL-based reclamation). `None` = permanent (at least one
+/// record references this blob). The CHECK constraint on the column
+/// restricts the value space to `NULL` or `'1'`; field type
+/// `Option<String>` is wider than the CHECK domain (v0.6+ candidate
+/// per §9.2.5.6 #3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobMetadata {
     pub cid: String,
@@ -14,6 +22,9 @@ pub struct BlobMetadata {
     pub height: Option<i64>,
     pub alt_text: Option<String>,
     pub thumbnail_cid: Option<String>,
+    /// Arc 16b §9.2.3.1: lifecycle discriminator.
+    #[serde(default)]
+    pub temp_key: Option<String>,
 }
 
 /// Image dimensions

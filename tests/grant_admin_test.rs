@@ -13,14 +13,12 @@
 
 mod common;
 
-use aurora_locus::admin::roles::Role;
 use aurora_locus::cli::admin::grant_admin;
 use aurora_locus::config::*;
 use aurora_locus::context::AppContext;
 use aurora_locus::error::PdsError;
 use aurora_locus::validation::ValidationMode;
 use sqlx::Row;
-use std::path::PathBuf;
 use tempfile::TempDir;
 
 /// Build a real on-disk SQLite-backed AppContext rooted at a fresh
@@ -37,6 +35,12 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
             service_did: "did:web:localhost".to_string(),
             version: "0.1.0-test".to_string(),
             blob_upload_limit: 5_242_880,
+                public_url: None,
+            max_blob_fetch_size: 50_000_000,
+            blob_fetch_timeout_seconds: 30,
+            blob_fetch_max_retries: 3,
+            accepting_imports: true,
+            max_import_size: None,
         },
         storage: StorageConfig {
             data_directory: dir_path.clone(),
@@ -69,6 +73,7 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
             service_handle_domains: vec![".localhost".to_string()],
             did_cache_stale_ttl: 3600,
             did_cache_max_ttl: 86400,
+            recovery_did_key: None,
         },
         email: None,
         invites: InviteConfig {
@@ -92,11 +97,15 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
             crawl_enabled: false,
             public_url: Some("http://localhost:2583".to_string()),
             auto_stream_events: false,
+                peer_pds: vec![],
         },
         validation_mode: ValidationMode::Optimistic,
         distributed_state_mode: Default::default(),
         maintenance_pool: Default::default(),
         gc_sweep: Default::default(),
+        blob_metadata: Default::default(),
+        entryway: None,
+        lexicon: aurora_locus::config::LexiconConfig::default(),
     };
     let ctx = AppContext::new(
         config,

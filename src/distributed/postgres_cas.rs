@@ -33,6 +33,11 @@
 //! decomposes the JSON into the fine-grained columns the
 //! Step-0.6 schema chose. Per-table value schemas are documented
 //! on [`DpopJtiReplayValue`] and [`RateLimitBucketValue`] below.
+//!
+//! Some impl methods on the `DistributedStore` trait surface have
+//! no production consumer yet — file-level allow mirrors the trait-
+//! side allow in `src/distributed/mod.rs`.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 

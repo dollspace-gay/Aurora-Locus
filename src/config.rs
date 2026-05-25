@@ -46,6 +46,31 @@ pub struct ServerConfig {
     /// ([`crate::blob_store::gc::run_sweep`]) is the consumer.
     #[serde(default)]
     pub gc_sweep: GcSweepConfig,
+    /// Arc 16c §9.3.4 Step 1 — blob lifecycle config.
+    /// `stage_ttl_seconds` controls the temp_blob_metadata reaper's
+    /// TTL window (product knob: how long a client has to commit
+    /// an upload to a record). Separate from
+    /// `gc_sweep.freshness_threshold_secs` (substrate-safety bound,
+    /// in-flight-upload detection) per recon Step 0.5 precedent.
+    /// Default 86400 = 24h, matching bsky-PDS tempKey TTL parity.
+    /// Env override: `PDS_BLOB_STAGE_TTL_SECONDS`.
+    #[serde(default)]
+    pub blob_metadata: BlobMetadataConfig,
+    /// Entryway-mode configuration per Arc 12 §5.3.9 + §5.4 Step 1.1.
+    /// `None` = standalone mode. `Some` = forwarded handlers proxy
+    /// to the entryway and OAuth metadata advertises the entryway
+    /// as the authorization server. Populated from
+    /// `PDS_ENTRYWAY_*` env vars (all-or-nothing per §5.4 Step 1.2).
+    /// Marked `#[serde(skip)]` because the parsed `VerifyingKey`
+    /// is not round-trippable through standard serde derives —
+    /// env-var loading is the sole construction path.
+    #[serde(skip)]
+    pub entryway: Option<EntrywayConfig>,
+    /// Arc 17 §17.3 dynamic-lexicon-loading config. Off-by-default
+    /// (`enabled: false`) per §17.5 friction-risk posture — operators
+    /// opt in via `PDS_LEXICON_ENABLED=true`. See [`LexiconConfig`].
+    #[serde(default)]
+    pub lexicon: LexiconConfig,
 }
 
 /// Distributed-state substrate selector (Arc 7, V04_DESIGN.md
@@ -176,13 +201,24 @@ impl MaintenancePoolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcSweepConfig {
     /// If `true`, the scheduled background sweep runs at
-    /// `interval_secs` cadence. Default `false` — operators
-    /// opt in explicitly per the v0.4 design.
-    #[serde(default)]
+    /// `interval_secs` cadence. **Default `true` post-Arc-16d**
+    /// (V05_DESIGN.md §9.4.1.3 / §9.4.4 Step 1.3): Arc 16d ships
+    /// production-grade row-driven GC; both walkers are on by
+    /// default and operators opt OUT explicitly. Pre-Arc-16d
+    /// (Arc 10 only), this defaulted to `false`.
+    #[serde(default = "default_gc_sweep_enabled")]
     pub enabled: bool,
 
+    /// Arc 16d row-walker on/off (V05_DESIGN.md §9.4.2.1). When
+    /// `true` the `row_sweep_job` orchestrates
+    /// `sweep_untethered_rows`. Default `true`; cadence shared
+    /// with byte-walker via `interval_secs`.
+    #[serde(default = "default_gc_sweep_row_sweep_enabled")]
+    pub row_sweep_enabled: bool,
+
     /// Cadence between scheduled sweep runs, in seconds.
-    /// Default 86400 (24 hours).
+    /// Default 86400 (24 hours). **Shared between byte-walker
+    /// and row-walker** per V05_DESIGN.md §9.4.2.1.
     #[serde(default = "default_gc_sweep_interval_secs")]
     pub interval_secs: u64,
 
@@ -195,7 +231,8 @@ pub struct GcSweepConfig {
 
     /// Safety cap: max blobs to delete per sweep run.
     /// Default 10000. Confirmed orphans beyond the cap are
-    /// logged and deferred to the next run.
+    /// logged and deferred to the next run. **Shared between
+    /// byte-walker and row-walker** per V05_DESIGN.md §9.4.2.1.
     #[serde(default = "default_gc_sweep_max_deletes")]
     pub max_deletes_per_run: usize,
 
@@ -205,30 +242,54 @@ pub struct GcSweepConfig {
     /// (1 hour) per Step 0 Q9's analysis: the tracking surface
     /// is authoritative; this threshold catches the rare race
     /// where a `temp_blob_metadata` row hasn't committed yet.
+    /// **Arc 10 classifier knob, UNCHANGED by Arc 16d** (the
+    /// row-walker uses `untethered_ttl_seconds` instead).
     #[serde(default = "default_gc_sweep_threshold_secs")]
     pub freshness_threshold_secs: u64,
 
     /// Storage page size for the sweep's pagination. Default
     /// 500 — Step 1 benchmark validated this stays index-driven
     /// on SQLite at 100k seeded rows (6.98ms / well under the
-    /// 50ms threshold).
+    /// 50ms threshold). **Shared between byte-walker and
+    /// row-walker** per V05_DESIGN.md §9.4.2.1.
     #[serde(default = "default_gc_sweep_page_size")]
     pub page_size: usize,
+
+    /// Arc 16d row-sweep TTL anchor in seconds. Untethered
+    /// `blob_metadata` rows (`temp_key IS NOT NULL`) older than
+    /// `untethered_ttl_seconds` are eligible for sweep DELETE +
+    /// bytes-delete. Default 86400 (24h, matching the bsky-PDS
+    /// tempKey TTL parity that Arc 16c's `stage_ttl_seconds`
+    /// established for the adjacent staging surface). Per
+    /// V05_DESIGN.md §9.4.2.1 / §9.4.4 Step 1.1.
+    #[serde(default = "default_gc_sweep_untethered_ttl_secs")]
+    pub untethered_ttl_seconds: u64,
 }
 
 impl Default for GcSweepConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_gc_sweep_enabled(),
+            row_sweep_enabled: default_gc_sweep_row_sweep_enabled(),
             interval_secs: default_gc_sweep_interval_secs(),
             dry_run: default_gc_sweep_dry_run(),
             max_deletes_per_run: default_gc_sweep_max_deletes(),
             freshness_threshold_secs: default_gc_sweep_threshold_secs(),
             page_size: default_gc_sweep_page_size(),
+            untethered_ttl_seconds: default_gc_sweep_untethered_ttl_secs(),
         }
     }
 }
 
+/// Arc 16d §9.4.4 Step 1.3: default flipped `false → true`.
+/// Both walkers (byte + row) are on by default starting at v0.5.
+fn default_gc_sweep_enabled() -> bool {
+    true
+}
+/// Arc 16d §9.4.2.1: row-walker on/off; default `true`.
+fn default_gc_sweep_row_sweep_enabled() -> bool {
+    true
+}
 fn default_gc_sweep_interval_secs() -> u64 {
     86_400
 }
@@ -244,20 +305,36 @@ fn default_gc_sweep_threshold_secs() -> u64 {
 fn default_gc_sweep_page_size() -> usize {
     500
 }
+/// Arc 16d §9.4.2.1 / §9.4.4 Step 1.1: row-sweep TTL default 86400 (24h).
+fn default_gc_sweep_untethered_ttl_secs() -> u64 {
+    86_400
+}
 
 impl GcSweepConfig {
     /// Construct from explicit option-typed env-var values.
     /// Mirrors the pattern in `MaintenancePoolConfig::from_env_values`.
+    ///
+    /// Arc 16d §9.4.4 Step 1.5 adds two new env vars:
+    /// `PDS_GC_SWEEP_ROW_SWEEP_ENABLED` (boolean toggle) and
+    /// `PDS_GC_SWEEP_UNTETHERED_TTL_SECS` (TTL anchor seconds).
+    #[allow(clippy::too_many_arguments)]
     pub fn from_env_values(
         enabled: Option<String>,
+        row_sweep_enabled: Option<String>,
         interval_secs: Option<String>,
         dry_run: Option<String>,
         max_deletes_per_run: Option<String>,
         freshness_threshold_secs: Option<String>,
         page_size: Option<String>,
+        untethered_ttl_seconds: Option<String>,
     ) -> PdsResult<Self> {
         let defaults = Self::default();
         let enabled = parse_bool_env("PDS_GC_SWEEP_ENABLED", enabled, defaults.enabled)?;
+        let row_sweep_enabled = parse_bool_env(
+            "PDS_GC_SWEEP_ROW_SWEEP_ENABLED",
+            row_sweep_enabled,
+            defaults.row_sweep_enabled,
+        )?;
         let interval_secs = parse_u64_env(
             "PDS_GC_SWEEP_INTERVAL_SECS",
             interval_secs,
@@ -276,6 +353,11 @@ impl GcSweepConfig {
         )?;
         let page_size =
             parse_usize_env("PDS_GC_SWEEP_PAGE_SIZE", page_size, defaults.page_size)?;
+        let untethered_ttl_seconds = parse_u64_env(
+            "PDS_GC_SWEEP_UNTETHERED_TTL_SECS",
+            untethered_ttl_seconds,
+            defaults.untethered_ttl_seconds,
+        )?;
 
         if interval_secs == 0 {
             return Err(PdsError::Validation(
@@ -287,14 +369,21 @@ impl GcSweepConfig {
                 "PDS_GC_SWEEP_PAGE_SIZE must be greater than 0".to_string(),
             ));
         }
+        if untethered_ttl_seconds == 0 {
+            return Err(PdsError::Validation(
+                "PDS_GC_SWEEP_UNTETHERED_TTL_SECS must be greater than 0".to_string(),
+            ));
+        }
 
         Ok(Self {
             enabled,
+            row_sweep_enabled,
             interval_secs,
             dry_run,
             max_deletes_per_run,
             freshness_threshold_secs,
             page_size,
+            untethered_ttl_seconds,
         })
     }
 
@@ -313,6 +402,37 @@ impl GcSweepConfig {
             freshness_threshold: std::time::Duration::from_secs(self.freshness_threshold_secs),
             page_size: self.page_size,
         }
+    }
+}
+
+/// Arc 16c §9.3.4 Step 1 — blob lifecycle config.
+///
+/// `stage_ttl_seconds` controls how long a `temp_blob_metadata` row
+/// persists before the (Arc 16d-shipped) reaper reclaims it. Default
+/// 86400 (24h), matching bsky-PDS tempKey TTL parity. Per Step 0.5
+/// recon, separate from `GcSweepConfig.freshness_threshold_secs`
+/// (substrate-safety bound used by Arc 10's in-flight classifier).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlobMetadataConfig {
+    pub stage_ttl_seconds: u64,
+}
+
+impl Default for BlobMetadataConfig {
+    fn default() -> Self {
+        Self { stage_ttl_seconds: 86400 }
+    }
+}
+
+impl BlobMetadataConfig {
+    /// Build from optional env-var override; falls back to default.
+    pub fn from_env_values(stage_ttl_seconds: Option<String>) -> PdsResult<Self> {
+        let defaults = Self::default();
+        let stage_ttl_seconds = parse_u64_env(
+            "PDS_BLOB_STAGE_TTL_SECONDS",
+            stage_ttl_seconds,
+            defaults.stage_ttl_seconds,
+        )?;
+        Ok(Self { stage_ttl_seconds })
     }
 }
 
@@ -346,6 +466,21 @@ pub struct DatabaseConfig {
     /// skip leader election entirely. See
     /// docs/AURORA_DESIGN.md §5.4.1.
     pub leader_retry_interval_ms: u64,
+    /// Arc 16d §9.4.3.6 / §9.4.4 Step 1.4: Postgres connection-level
+    /// transaction isolation pin. Default `"read committed"` —
+    /// Aurora-Locus's sweep DELETE predicate-disjointness argument
+    /// (§9.4.3.4) relies on statement-scoped snapshot semantics.
+    /// Higher isolation levels (REPEATABLE READ / SERIALIZABLE)
+    /// produce serialization-failure (40001) errors on the sweep's
+    /// per-row autocommit DELETE that the v0.5 sweep doesn't
+    /// retry-classify (deferred to v0.6+ per §9.4.1.2). Pool builder
+    /// reads this; `validate_gc_sweep_config` warns case-insensitively
+    /// when Postgres is the active backend and the value differs
+    /// from "read committed". SQLite-only deployments don't trip
+    /// the warning. Overrides cluster-level `postgresql.conf`
+    /// per §9.4.3.6 operator-visible-precedent note.
+    #[serde(default = "default_pg_transaction_isolation")]
+    pub pg_transaction_isolation: String,
 }
 
 impl Default for DatabaseConfig {
@@ -360,8 +495,14 @@ impl Default for DatabaseConfig {
             idle_timeout_secs: None,
             max_lifetime_secs: None,
             leader_retry_interval_ms: 2000,
+            pg_transaction_isolation: default_pg_transaction_isolation(),
         }
     }
+}
+
+/// Arc 16d §9.4.4 Step 1.4: Postgres isolation pin default.
+fn default_pg_transaction_isolation() -> String {
+    "read committed".to_string()
 }
 
 impl DatabaseConfig {
@@ -379,6 +520,7 @@ impl DatabaseConfig {
         idle_timeout_secs: Option<String>,
         max_lifetime_secs: Option<String>,
         leader_retry_interval_ms: Option<String>,
+        pg_transaction_isolation: Option<String>,
     ) -> PdsResult<Self> {
         let backend = match backend.as_deref().map(str::to_ascii_lowercase) {
             None => DatabaseBackend::Sqlite,
@@ -444,6 +586,13 @@ impl DatabaseConfig {
             )));
         }
 
+        // Arc 16d §9.4.4 Step 1.5: pg_transaction_isolation env override.
+        // Default `"read committed"`. Stored verbatim as the operator typed
+        // it (case-preserving); validator + pool builder normalize via
+        // `to_ascii_lowercase` at comparison time.
+        let pg_transaction_isolation = pg_transaction_isolation
+            .unwrap_or_else(default_pg_transaction_isolation);
+
         Ok(Self {
             backend,
             url,
@@ -453,6 +602,7 @@ impl DatabaseConfig {
             idle_timeout_secs,
             max_lifetime_secs,
             leader_retry_interval_ms,
+            pg_transaction_isolation,
         })
     }
 }
@@ -526,6 +676,116 @@ pub struct ServiceConfig {
     pub service_did: String,
     pub version: String,
     pub blob_upload_limit: usize,
+    /// Externally-reachable public URL. Arc 12 §5.3.2 Gap 1
+    /// closure: when set (typically via `PDS_SERVICE_PUBLIC_URL`),
+    /// every site that needs the self-PDS public URL reads
+    /// this. When unset, the URL is derived from
+    /// `derive_url_scheme(hostname)` + hostname + port —
+    /// preserving v0.4 backward compatibility for deployments
+    /// that don't set the env var. `https` is the default for
+    /// non-localhost hostnames; `http` for localhost / 127.x.x.x
+    /// / 0.0.0.0.
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// Per-blob memory cap for the Arc 16f origin-fetch primitive
+    /// (`src/federation/blob_fetch.rs`). Closes round-1 F10: defends
+    /// against `max_import_size`-respecting CARs that reference
+    /// oversized individual blobs. Enforced via HEAD `Content-Length`
+    /// pre-check; falls back to streaming-bound enforcement when the
+    /// origin omits Content-Length on HEAD. Default `50_000_000`
+    /// matches bsky-PDS `PDS_BLOB_UPLOAD_LIMIT` order. Env var:
+    /// `PDS_SERVICE_MAX_BLOB_FETCH_SIZE`.
+    #[serde(default = "default_max_blob_fetch_size")]
+    pub max_blob_fetch_size: u64,
+    /// Per-attempt timeout for origin-blob fetches in seconds. Applies
+    /// to one HTTP GET attempt; the primitive's inner retry budget
+    /// (`blob_fetch_max_retries`) may issue multiple attempts. Default
+    /// `30` seconds. Env var: `PDS_SERVICE_BLOB_FETCH_TIMEOUT_SECONDS`.
+    #[serde(default = "default_blob_fetch_timeout_seconds")]
+    pub blob_fetch_timeout_seconds: u64,
+    /// Per-CID retry budget for the origin-blob fetch primitive.
+    /// Counts retries *after* the first attempt — so total attempts ≤
+    /// `1 + blob_fetch_max_retries`. Only 5xx / network / timeout
+    /// errors retry; 4xx are durable. Default `3`. Env var:
+    /// `PDS_SERVICE_BLOB_FETCH_MAX_RETRIES`.
+    #[serde(default = "default_blob_fetch_max_retries")]
+    pub blob_fetch_max_retries: u32,
+    /// Arc 16f §9.6.1.1 — kill-switch for the importRepo handler.
+    /// When `false`, the handler short-circuits with HTTP 503 inside
+    /// the single-flight lock so operators can drain in-flight
+    /// imports before halting new ones. Default `true` (importRepo
+    /// available). Env var: `PDS_SERVICE_ACCEPTING_IMPORTS`.
+    #[serde(default = "default_accepting_imports")]
+    pub accepting_imports: bool,
+    /// Arc 16f §9.6.1.1 + round-1 F21 — streaming size cap for
+    /// importRepo CAR bodies. Enforced during decode (decode loop
+    /// aborts at the first chunk that would push the accumulated
+    /// byte count past the cap, returning HTTP 413). `None` disables
+    /// the cap — discouraged for production, useful for self-import
+    /// dev workflows. No default; set explicitly. Env var:
+    /// `PDS_SERVICE_MAX_IMPORT_SIZE` (numeric).
+    #[serde(default)]
+    pub max_import_size: Option<u64>,
+}
+
+fn default_max_blob_fetch_size() -> u64 {
+    50_000_000
+}
+
+fn default_blob_fetch_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_blob_fetch_max_retries() -> u32 {
+    3
+}
+
+fn default_accepting_imports() -> bool {
+    true
+}
+
+impl ServiceConfig {
+    /// Effective public URL per Arc 12 §5.3.2 Gap 1.
+    ///
+    /// Returns `self.public_url` when set; otherwise derives
+    /// `{scheme}://{hostname}[:{port}]` with scheme picked by
+    /// `derive_url_scheme(hostname)`. Standard ports (80 for
+    /// http, 443 for https) are omitted from the derived form.
+    #[must_use]
+    pub fn effective_public_url(&self) -> String {
+        if let Some(url) = &self.public_url {
+            return url.clone();
+        }
+        let scheme = derive_url_scheme(&self.hostname);
+        let port_is_standard = (scheme == "http" && self.port == 80)
+            || (scheme == "https" && self.port == 443);
+        if port_is_standard {
+            format!("{}://{}", scheme, self.hostname)
+        } else {
+            format!("{}://{}:{}", scheme, self.hostname, self.port)
+        }
+    }
+}
+
+/// Pick `http` for localhost-shaped hosts; `https` otherwise.
+///
+/// Arc 12 §5.3.2 Gap 1 helper. Used by `ServiceConfig::effective_public_url`
+/// for self-URL derivation, and by remote-PDS-URL formatters
+/// (`src/federation/discovery.rs`, `src/identity/resolver.rs`)
+/// for peer-URL scheme selection.
+#[must_use]
+pub fn derive_url_scheme(host: &str) -> &'static str {
+    // `host` may be hostname-only or hostname:port; strip the port
+    // before classifying.
+    let host_only = host.split(':').next().unwrap_or(host);
+    if host_only == "localhost"
+        || host_only == "0.0.0.0"
+        || host_only.starts_with("127.")
+    {
+        "http"
+    } else {
+        "https"
+    }
 }
 
 /// Storage configuration
@@ -822,6 +1082,20 @@ pub struct IdentityConfig {
     pub service_handle_domains: Vec<String>,
     pub did_cache_stale_ttl: u64,
     pub did_cache_max_ttl: u64,
+    /// Arc 13 §6.3.3 PDS-wide recovery key (did:key format), env
+    /// `PDS_IDENTITY_RECOVERY_DID_KEY`. Optional — when set, every
+    /// new account's genesis op gets this did:key prepended to its
+    /// `rotation_keys` after any per-account `recovery_key` input
+    /// but before the PDS-wide rotation key.
+    ///
+    /// Per §6.5.7: the PDS-wide rotation key is in every account's
+    /// rotation_keys; single compromise rotates every account
+    /// (until the 72-hour timelock + recovery key intervene).
+    /// Operators are expected to configure this key + hold its
+    /// private material separately so a PDS compromise doesn't
+    /// also compromise account recovery.
+    #[serde(default)]
+    pub recovery_did_key: Option<String>,
 }
 
 /// Email configuration
@@ -857,6 +1131,238 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+/// Arc 17 §17.3 — dynamic-lexicon-loading configuration. Off-by-default
+/// for v0.5 (`enabled: false`); when enabled, unknown-NSID records are
+/// validated against lexicon documents fetched lazily from each NSID's
+/// authority DID (resolved via `_lexicon.<host>` DNS TXT then PLC then
+/// HTTP GET against the hosting PDS).
+///
+/// Env-var loading lives in [`LexiconConfig::from_env_values`]. All
+/// knobs are optional; defaults mirror the v2 design at §17.3.2 /
+/// §17.5.4.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LexiconConfig {
+    /// Master switch. When `false`, the validator skips the lexicon
+    /// fall-through entirely and unknown NSIDs route to Aurora's
+    /// existing Optimistic mode. Default `false`.
+    pub enabled: bool,
+
+    /// Optional override for authority resolution. When `Some`, the
+    /// LexResolver bypasses DNS TXT + PLC and uses this DID as the
+    /// authority for every NSID. Useful for testing and for
+    /// homogeneous-federation deployments where a single PDS hosts
+    /// every Aurora-specific lexicon. Default `None`.
+    pub did_authority: Option<String>,
+
+    /// Behavior when a lexicon fetch fails (DNS / PLC / HTTP).
+    /// `HardFail` propagates `PdsError::LexiconFetchFailed` to the
+    /// caller (record validation fails); `Warn` emits a WARN log and
+    /// falls back to Optimistic acceptance. Default `Warn` for v0.5
+    /// (operators opt into the strict posture explicitly). The v1
+    /// `Quarantine` variant is DROPPED for v0.5 per §17.5.7 /
+    /// round-1 F1.
+    pub fetch_failure_behavior: FetchFailureBehavior,
+
+    /// Number of HTTP retries on the lexicon-record fetch step
+    /// (§17.3.1 step 6 only — DNS retries inherit `hickory-resolver`
+    /// defaults; PLC retries inherit Arc 13 defaults; round-1 F18
+    /// closure). Default 3.
+    pub fetch_max_retries: u32,
+
+    /// Per-attempt timeout for the HTTP lexicon-record fetch (§17.3.1
+    /// step 6). Default 30s; `Warn` mode's worst-case latency floor
+    /// per §17.5.4.
+    pub fetch_timeout_secs: u64,
+
+    /// In-memory cache TTL; expired entries trigger background
+    /// re-fetch while serving cached value (§17.3.1 step 1). Default
+    /// 86400s (24h).
+    pub cache_ttl_secs: u64,
+
+    /// Throttle floor for on-disk `last_used_at` writes (round-1 F11
+    /// closure / §17.3.2). In-memory `last_used_at` updates
+    /// immediately; on-disk update fires only when the in-memory
+    /// value advances by ≥ this many seconds. Default 60s. Keeps
+    /// hot-NSID cache reads from hammering the `lexicon_cache` table.
+    pub last_used_persist_threshold_secs: u64,
+
+    /// NSID prefix denylist (round-1 F2 closure / §17.3.3). When a
+    /// record's collection NSID starts with any prefix in this list,
+    /// the validator rejects with `PdsError::NamespaceDenied`. Intent
+    /// B per §17.3.3. Default empty.
+    pub namespace_denylist: Option<Vec<String>>,
+
+    /// NSID prefix allowlist (round-1 F2 closure / §17.3.3). When
+    /// `Some` and non-empty, only collections matching one of these
+    /// prefixes route to the lexicon-fetch path; non-matching
+    /// collections fall through to Optimistic (Intent A per §17.3.3
+    /// — exclusion is NOT rejection). Default `None` (no allowlist
+    /// gate; every unknown NSID is fetchable).
+    pub namespace_allowlist: Option<Vec<String>>,
+
+    /// Whether CAR-import write records are subject to lexicon
+    /// validation. Default `true` per §17.3.4 — heterogeneous-
+    /// federation default. Operators running homogeneous federation
+    /// (multiple Aurora-Locus instances with identical lexicon
+    /// configs) can set `false` to skip redundant work on import.
+    /// When `true`, the validator overrides Arc 16e's per-write
+    /// bypass for known NSIDs too (round-1 F4 closure).
+    pub validate_imports: bool,
+}
+
+/// Arc 17 §17.3.6 / round-1 F1 — what to do when a lexicon fetch fails
+/// at validate-phase. `Quarantine` (v1) was DROPPED for v0.5 per §17.5.7
+/// because Arc 16b's `blob_quarantine` is blob-CID-keyed while lexicon
+/// fetch failures are NSID-scoped — structural mismatch. v0.6+ candidate
+/// gates on a separate `record_quarantine` surface design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchFailureBehavior {
+    /// Propagate `PdsError::LexiconFetchFailed` to the caller. Record
+    /// validation fails; client sees HTTP 502.
+    HardFail,
+    /// Emit a WARN log and fall back to Aurora's existing Optimistic
+    /// acceptance (record is written; failure is recorded via
+    /// `track_validation_failure`). Default.
+    #[default]
+    Warn,
+}
+
+impl FetchFailureBehavior {
+    /// Parse from env-var value with the same case-insensitive
+    /// pattern other config enums use.
+    pub fn from_env_value(s: &str) -> PdsResult<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "hard_fail" | "hardfail" | "strict" => Ok(Self::HardFail),
+            "warn" | "optimistic" => Ok(Self::Warn),
+            other => Err(PdsError::Validation(format!(
+                "PDS_LEXICON_FETCH_FAILURE_BEHAVIOR must be one of \
+                 'hard_fail', 'warn' (got: {:?})",
+                other
+            ))),
+        }
+    }
+}
+
+impl Default for LexiconConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            did_authority: None,
+            fetch_failure_behavior: FetchFailureBehavior::default(),
+            fetch_max_retries: 3,
+            fetch_timeout_secs: 30,
+            cache_ttl_secs: 86_400,
+            last_used_persist_threshold_secs: 60,
+            namespace_denylist: None,
+            namespace_allowlist: None,
+            validate_imports: true,
+        }
+    }
+}
+
+impl LexiconConfig {
+    /// Construct from explicit option-typed env-var values. Pure
+    /// function so unit tests can exercise without touching
+    /// process-global env. Empty / unset → default value.
+    ///
+    /// Conditional per-field derivation from option-typed env-var
+    /// inputs is what justifies the mutable-default-then-assign
+    /// shape and the 10-arg surface.
+    #[allow(clippy::field_reassign_with_default, clippy::too_many_arguments)]
+    pub fn from_env_values(
+        enabled: Option<String>,
+        did_authority: Option<String>,
+        fetch_failure_behavior: Option<String>,
+        fetch_max_retries: Option<String>,
+        fetch_timeout_secs: Option<String>,
+        cache_ttl_secs: Option<String>,
+        last_used_persist_threshold_secs: Option<String>,
+        namespace_denylist: Option<String>,
+        namespace_allowlist: Option<String>,
+        validate_imports: Option<String>,
+    ) -> PdsResult<Self> {
+        let mut cfg = Self::default();
+
+        if let Some(v) = enabled {
+            cfg.enabled = matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on");
+        }
+        if let Some(v) = did_authority {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                cfg.did_authority = Some(trimmed.to_string());
+            }
+        }
+        if let Some(v) = fetch_failure_behavior {
+            cfg.fetch_failure_behavior = FetchFailureBehavior::from_env_value(&v)?;
+        }
+        if let Some(v) = fetch_max_retries {
+            cfg.fetch_max_retries = v.parse().map_err(|_| {
+                PdsError::Validation(format!(
+                    "PDS_LEXICON_FETCH_MAX_RETRIES must be a non-negative integer (got {:?})",
+                    v
+                ))
+            })?;
+        }
+        if let Some(v) = fetch_timeout_secs {
+            cfg.fetch_timeout_secs = v.parse().map_err(|_| {
+                PdsError::Validation(format!(
+                    "PDS_LEXICON_FETCH_TIMEOUT_SECS must be a positive integer (got {:?})",
+                    v
+                ))
+            })?;
+            if cfg.fetch_timeout_secs == 0 {
+                return Err(PdsError::Validation(
+                    "PDS_LEXICON_FETCH_TIMEOUT_SECS must be greater than 0".to_string(),
+                ));
+            }
+        }
+        if let Some(v) = cache_ttl_secs {
+            cfg.cache_ttl_secs = v.parse().map_err(|_| {
+                PdsError::Validation(format!(
+                    "PDS_LEXICON_CACHE_TTL_SECS must be a positive integer (got {:?})",
+                    v
+                ))
+            })?;
+            if cfg.cache_ttl_secs == 0 {
+                return Err(PdsError::Validation(
+                    "PDS_LEXICON_CACHE_TTL_SECS must be greater than 0".to_string(),
+                ));
+            }
+        }
+        if let Some(v) = last_used_persist_threshold_secs {
+            cfg.last_used_persist_threshold_secs = v.parse().map_err(|_| {
+                PdsError::Validation(format!(
+                    "PDS_LEXICON_LAST_USED_PERSIST_THRESHOLD_SECS must be a non-negative integer (got {:?})",
+                    v
+                ))
+            })?;
+        }
+        cfg.namespace_denylist = parse_csv_prefix_list(namespace_denylist);
+        cfg.namespace_allowlist = parse_csv_prefix_list(namespace_allowlist);
+        if let Some(v) = validate_imports {
+            cfg.validate_imports =
+                matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on");
+        }
+        Ok(cfg)
+    }
+}
+
+fn parse_csv_prefix_list(raw: Option<String>) -> Option<Vec<String>> {
+    raw.and_then(|v| {
+        let items: Vec<String> = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if items.is_empty() {
+            None
+        } else {
+            Some(items)
+        }
+    })
+}
+
 /// Federation configuration for Bluesky network integration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationConfig {
@@ -874,6 +1380,223 @@ pub struct FederationConfig {
     pub public_url: Option<String>,
     /// Enable automatic event streaming to relay
     pub auto_stream_events: bool,
+    /// Trusted peer PDS list (Arc 12 §5.3.2 Gap 2 + §5.3.7
+    /// env-var parser). Populated from
+    /// `PDS_FEDERATION_PEER_PDS=did1@url1,did2@url2,...` at
+    /// startup; consumed by Arc 12 §5.3.3.1 trusted-iss
+    /// allowlist and Arc 12 §5.3.2 Gap 3 `PdsDiscovery`
+    /// bootstrap. Empty Vec when env var unset.
+    #[serde(default)]
+    pub peer_pds: Vec<PeerPdsConfig>,
+}
+
+/// Trusted peer-PDS entry parsed from
+/// `PDS_FEDERATION_PEER_PDS`. Format per Arc 12 §5.3.7:
+/// `did@url`. Malformed entries reject at startup per
+/// §5.4 Step 1.2 all-or-nothing discipline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerPdsConfig {
+    pub did: String,
+    pub url: String,
+}
+
+impl PeerPdsConfig {
+    /// Parse a single `did@url` entry. Returns `Err` with a
+    /// descriptive message naming the offending input on
+    /// any of: missing `@`, empty did, empty url, non-DID
+    /// `did` (no `did:` prefix), non-URL `url` (no `http://`
+    /// or `https://` prefix).
+    pub fn parse_entry(entry: &str) -> PdsResult<Self> {
+        let (did, url) = entry.split_once('@').ok_or_else(|| {
+            PdsError::Validation(format!(
+                "PDS_FEDERATION_PEER_PDS entry missing '@' separator: {:?}",
+                entry
+            ))
+        })?;
+        let did = did.trim();
+        let url = url.trim();
+        if did.is_empty() {
+            return Err(PdsError::Validation(format!(
+                "PDS_FEDERATION_PEER_PDS entry has empty did: {:?}",
+                entry
+            )));
+        }
+        if url.is_empty() {
+            return Err(PdsError::Validation(format!(
+                "PDS_FEDERATION_PEER_PDS entry has empty url: {:?}",
+                entry
+            )));
+        }
+        if !did.starts_with("did:") {
+            return Err(PdsError::Validation(format!(
+                "PDS_FEDERATION_PEER_PDS entry did missing 'did:' prefix: {:?}",
+                entry
+            )));
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(PdsError::Validation(format!(
+                "PDS_FEDERATION_PEER_PDS entry url must start with http:// or https://: {:?}",
+                entry
+            )));
+        }
+        Ok(PeerPdsConfig {
+            did: did.to_string(),
+            url: url.to_string(),
+        })
+    }
+
+    /// Parse a comma-separated list per Arc 12 §5.3.7
+    /// (`did1@url1,did2@url2,...`). Empty input → empty Vec.
+    /// Any malformed entry → Err with the offending entry
+    /// named.
+    pub fn parse_list(raw: &str) -> PdsResult<Vec<Self>> {
+        if raw.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Self::parse_entry)
+            .collect()
+    }
+}
+
+/// Entryway-mode configuration (Arc 12 §5.3.9 + §5.4 Step 1.1).
+///
+/// When `Some`, Aurora-Locus runs in entryway-attached mode:
+/// forwarded handlers proxy to the entryway, the OAuth
+/// protected-resource metadata advertises the entryway as the
+/// authorization server, and the §5.3.3 routing's "ES256K + known
+/// entryway kid" row is enabled. When `None`, Aurora-Locus runs
+/// in standalone mode (default).
+///
+/// All four `PDS_ENTRYWAY_*` env vars are required together
+/// (all-or-nothing per §5.4 Step 1.2). Partial config (any subset)
+/// is rejected at startup with a clear error naming the missing
+/// variable(s).
+///
+/// The `jwt_public_key` field holds the entryway's ES256K JWT-signing
+/// public key as a parsed `k256::ecdsa::VerifyingKey`, decoded once
+/// at env-load time from `PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX`. The
+/// hex form (33 bytes SEC1-compressed, 66 hex chars) is the wire
+/// format Aurora-Locus shares with the entryway operator.
+#[derive(Debug, Clone)]
+pub struct EntrywayConfig {
+    /// Base URL of the entryway (e.g., `https://entryway.example.com`).
+    /// Populated from `PDS_ENTRYWAY_URL`.
+    pub url: String,
+    /// Admin Basic-auth token, pre-bound on `entryway_admin_client`
+    /// per §5.3.9. Populated from `PDS_ENTRYWAY_ADMIN_TOKEN`.
+    pub admin_token: String,
+    /// Entryway's ES256K JWT-signing public key, parsed at startup
+    /// from `PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX`. Consumed by
+    /// `validate_external_access_token` (§5.3.3) when the routing
+    /// table's "ES256K + known entryway kid" row fires.
+    pub jwt_public_key: k256::ecdsa::VerifyingKey,
+    /// Entryway DID. Populated from `PDS_ENTRYWAY_DID`. Joins the
+    /// trusted-iss allowlist (§5.3.3.1) and becomes an accepted
+    /// audience for `require_auth_forwarded` (§5.3.4) routes.
+    pub did: String,
+}
+
+impl EntrywayConfig {
+    /// Parse from env-var values. Implements the all-or-nothing
+    /// rule per §5.4 Step 1.2:
+    ///
+    /// - All four `Some` → returns `Ok(Some(EntrywayConfig{..}))`
+    ///   if every value validates; rejection otherwise names the
+    ///   offending input.
+    /// - All four `None` → returns `Ok(None)` (standalone mode).
+    /// - Any other subset → returns `Err(PdsError::Validation(..))`
+    ///   identifying which variable(s) are missing.
+    ///
+    /// Each input is the env-var value (`env::var(..).ok()`).
+    pub fn from_env_values(
+        url: Option<String>,
+        admin_token: Option<String>,
+        jwt_public_key_hex: Option<String>,
+        did: Option<String>,
+    ) -> PdsResult<Option<Self>> {
+        let any_set = url.is_some()
+            || admin_token.is_some()
+            || jwt_public_key_hex.is_some()
+            || did.is_some();
+        if !any_set {
+            return Ok(None);
+        }
+
+        let mut missing: Vec<&'static str> = Vec::new();
+        if url.is_none() {
+            missing.push("PDS_ENTRYWAY_URL");
+        }
+        if admin_token.is_none() {
+            missing.push("PDS_ENTRYWAY_ADMIN_TOKEN");
+        }
+        if jwt_public_key_hex.is_none() {
+            missing.push("PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX");
+        }
+        if did.is_none() {
+            missing.push("PDS_ENTRYWAY_DID");
+        }
+        if !missing.is_empty() {
+            return Err(PdsError::Validation(format!(
+                "EntrywayConfig is partially specified \
+                 (PDS_ENTRYWAY_* are all-or-nothing per §5.4 Step 1.2); \
+                 missing: {}",
+                missing.join(", ")
+            )));
+        }
+
+        let url = url.expect("checked Some above");
+        let admin_token = admin_token.expect("checked Some above");
+        let jwt_public_key_hex = jwt_public_key_hex.expect("checked Some above");
+        let did = did.expect("checked Some above");
+
+        if url.is_empty() {
+            return Err(PdsError::Validation(
+                "PDS_ENTRYWAY_URL must not be empty".to_string(),
+            ));
+        }
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(PdsError::Validation(format!(
+                "PDS_ENTRYWAY_URL must start with http:// or https:// — got {:?}",
+                url
+            )));
+        }
+        if admin_token.is_empty() {
+            return Err(PdsError::Validation(
+                "PDS_ENTRYWAY_ADMIN_TOKEN must not be empty".to_string(),
+            ));
+        }
+        if !did.starts_with("did:") {
+            return Err(PdsError::Validation(format!(
+                "PDS_ENTRYWAY_DID must be a DID (start with 'did:') — got {:?}",
+                did
+            )));
+        }
+
+        let key_bytes = hex::decode(&jwt_public_key_hex).map_err(|e| {
+            PdsError::Validation(format!(
+                "PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX is not valid hex: {}",
+                e
+            ))
+        })?;
+        let jwt_public_key =
+            k256::ecdsa::VerifyingKey::from_sec1_bytes(&key_bytes).map_err(|e| {
+                PdsError::Validation(format!(
+                    "PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX is not a valid \
+                     SEC1-encoded k256 public key: {}",
+                    e
+                ))
+            })?;
+
+        Ok(Some(EntrywayConfig {
+            url,
+            admin_token,
+            jwt_public_key,
+            did,
+        }))
+    }
 }
 
 impl ServerConfig {
@@ -932,11 +1655,25 @@ impl ServerConfig {
         let plc_rotation_key = env::var("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX")
             .map_err(|_| PdsError::Validation("PLC rotation key required".to_string()))?;
 
-        // OAuth configuration for admin login
-        let oauth_client_id = env::var("PDS_OAUTH_CLIENT_ID")
-            .unwrap_or_else(|_| format!("https://{}/oauth/client-metadata.json", hostname));
-        let oauth_redirect_uri = env::var("PDS_OAUTH_REDIRECT_URI")
-            .unwrap_or_else(|_| format!("https://{}/admin-oauth/callback", hostname));
+        // OAuth configuration for admin login.
+        // Arc 12 §5.3.2 Gap 1: classified (C) in recon but promoted
+        // to (M) — these defaults baked hostname directly without
+        // routing through service_url(). Use derive_url_scheme()
+        // for localhost-aware scheme so localhost deployments
+        // don't default to https.
+        let oauth_default_scheme = derive_url_scheme(&hostname);
+        let oauth_client_id = env::var("PDS_OAUTH_CLIENT_ID").unwrap_or_else(|_| {
+            format!(
+                "{}://{}/oauth/client-metadata.json",
+                oauth_default_scheme, hostname
+            )
+        });
+        let oauth_redirect_uri = env::var("PDS_OAUTH_REDIRECT_URI").unwrap_or_else(|_| {
+            format!(
+                "{}://{}/admin-oauth/callback",
+                oauth_default_scheme, hostname
+            )
+        });
         let oauth_pds_url =
             env::var("PDS_OAUTH_PDS_URL").unwrap_or_else(|_| "https://bsky.social".to_string());
 
@@ -947,6 +1684,14 @@ impl ServerConfig {
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
+        // Arc 13 §6.3.3 / Step 2.1: PDS-wide recovery key env var.
+        // Optional — no default. Validated as non-empty when set
+        // (empty string would silently turn into a recovery slot
+        // for the empty did:key, which is nonsense).
+        let recovery_did_key = env::var("PDS_IDENTITY_RECOVERY_DID_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let did_cache_stale_ttl = env::var("PDS_DID_CACHE_STALE_TTL")
             .unwrap_or_else(|_| "3600".to_string())
             .parse()
@@ -1009,10 +1754,19 @@ impl ServerConfig {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false);
-        let relay_urls = env::var("PDS_FEDERATION_RELAY_URLS")
+        // Empty-entry filter is load-bearing: `AppContext::new` gates
+        // RelayClient construction (and JobScheduler's
+        // relay_firehose_subscription_job spawn) on
+        // `!relay_urls.is_empty()`. Setting `PDS_FEDERATION_RELAY_URLS=""`
+        // is the explicit "federation on for peer_pds + entryway forwarding,
+        // but no relay loop" override; without this filter, `""` would
+        // collect to `vec![""]` (length 1) and spawn a connect loop
+        // against an empty URL.
+        let relay_urls: Vec<String> = env::var("PDS_FEDERATION_RELAY_URLS")
             .unwrap_or_else(|_| "https://bsky.network".to_string())
             .split(',')
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .collect();
         let appview_url = env::var("PDS_APPVIEW_URL").ok();
         let firehose_enabled = env::var("PDS_FEDERATION_FIREHOSE_ENABLED")
@@ -1029,6 +1783,13 @@ impl ServerConfig {
             .parse()
             .unwrap_or(false);
 
+        // Arc 12 §5.3.2 Gap 2 + §5.3.7: peer-PDS env-var parser
+        // with all-or-nothing validation per §5.4 Step 1.2.
+        let peer_pds = match env::var("PDS_FEDERATION_PEER_PDS") {
+            Ok(raw) => PeerPdsConfig::parse_list(&raw)?,
+            Err(_) => Vec::new(),
+        };
+
         let database = DatabaseConfig::from_env_values(
             env::var("PDS_DB_BACKEND").ok(),
             env::var("PDS_DB_URL").ok(),
@@ -1038,6 +1799,8 @@ impl ServerConfig {
             env::var("PDS_DB_IDLE_TIMEOUT_SECS").ok(),
             env::var("PDS_DB_MAX_LIFETIME_SECS").ok(),
             env::var("PDS_SEQUENCER_LEADER_RETRY_MS").ok(),
+            // Arc 16d §9.4.4 Step 1.5: Postgres isolation pin env override.
+            env::var("PDS_DATABASE_PG_TRANSACTION_ISOLATION").ok(),
         )?;
 
         let distributed_state_mode = match env::var("PDS_DISTRIBUTED_STATE_MODE") {
@@ -1053,11 +1816,79 @@ impl ServerConfig {
 
         let gc_sweep = GcSweepConfig::from_env_values(
             env::var("PDS_GC_SWEEP_ENABLED").ok(),
+            // Arc 16d §9.4.4 Step 1.5: new row-walker env vars.
+            env::var("PDS_GC_SWEEP_ROW_SWEEP_ENABLED").ok(),
             env::var("PDS_GC_SWEEP_INTERVAL_SECS").ok(),
             env::var("PDS_GC_SWEEP_DRY_RUN").ok(),
             env::var("PDS_GC_SWEEP_MAX_DELETES_PER_RUN").ok(),
             env::var("PDS_GC_SWEEP_FRESHNESS_THRESHOLD_SECS").ok(),
             env::var("PDS_GC_SWEEP_PAGE_SIZE").ok(),
+            env::var("PDS_GC_SWEEP_UNTETHERED_TTL_SECS").ok(),
+        )?;
+
+        // Arc 16c §9.3.4 Step 1 / chainlink #92: blob lifecycle
+        // config (stage_ttl_seconds product knob, separate from
+        // gc_sweep.freshness_threshold_secs).
+        let blob_metadata = BlobMetadataConfig::from_env_values(
+            env::var("PDS_BLOB_STAGE_TTL_SECONDS").ok(),
+        )?;
+
+        // Arc 17 §17.3 — dynamic lexicon loading. Off-by-default;
+        // operators opt in via PDS_LEXICON_ENABLED=true. See
+        // [`LexiconConfig`] for every knob.
+        let lexicon = LexiconConfig::from_env_values(
+            env::var("PDS_LEXICON_ENABLED").ok(),
+            env::var("PDS_LEXICON_DID_AUTHORITY").ok(),
+            env::var("PDS_LEXICON_FETCH_FAILURE_BEHAVIOR").ok(),
+            env::var("PDS_LEXICON_FETCH_MAX_RETRIES").ok(),
+            env::var("PDS_LEXICON_FETCH_TIMEOUT_SECS").ok(),
+            env::var("PDS_LEXICON_CACHE_TTL_SECS").ok(),
+            env::var("PDS_LEXICON_LAST_USED_PERSIST_THRESHOLD_SECS").ok(),
+            env::var("PDS_LEXICON_NAMESPACE_DENYLIST").ok(),
+            env::var("PDS_LEXICON_NAMESPACE_ALLOWLIST").ok(),
+            env::var("PDS_LEXICON_VALIDATE_IMPORTS").ok(),
+        )?;
+
+        // Arc 12 §5.3.2 Gap 1: public_url override via env var.
+        // Renamed locally to avoid shadowing federation's
+        // existing `public_url` binding (different env var,
+        // different field, same name).
+        let service_public_url = env::var("PDS_SERVICE_PUBLIC_URL").ok();
+
+        // Arc 16f §9.6.1.1 — origin-blob-fetch primitive knobs. Each
+        // falls back to the same default the serde-default helpers
+        // use, so YAML deserialisation and env-var construction agree.
+        let max_blob_fetch_size = env::var("PDS_SERVICE_MAX_BLOB_FETCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_max_blob_fetch_size);
+        let blob_fetch_timeout_seconds = env::var("PDS_SERVICE_BLOB_FETCH_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_blob_fetch_timeout_seconds);
+        let blob_fetch_max_retries = env::var("PDS_SERVICE_BLOB_FETCH_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_blob_fetch_max_retries);
+
+        // Arc 16f §9.6.1.1 — importRepo gate knobs. `accepting_imports`
+        // is the operator drain switch (default true); `max_import_size`
+        // is the streaming-cap (None = unbounded, only sensible in dev).
+        let accepting_imports = env::var("PDS_SERVICE_ACCEPTING_IMPORTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_accepting_imports);
+        let max_import_size = env::var("PDS_SERVICE_MAX_IMPORT_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
+        // Arc 12 §5.4 Step 1.1 + 1.2: EntrywayConfig from
+        // `PDS_ENTRYWAY_*` env vars, all-or-nothing.
+        let entryway = EntrywayConfig::from_env_values(
+            env::var("PDS_ENTRYWAY_URL").ok(),
+            env::var("PDS_ENTRYWAY_ADMIN_TOKEN").ok(),
+            env::var("PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX").ok(),
+            env::var("PDS_ENTRYWAY_DID").ok(),
         )?;
 
         Ok(ServerConfig {
@@ -1067,6 +1898,12 @@ impl ServerConfig {
                 service_did,
                 version,
                 blob_upload_limit,
+                public_url: service_public_url,
+                max_blob_fetch_size,
+                blob_fetch_timeout_seconds,
+                blob_fetch_max_retries,
+                accepting_imports,
+                max_import_size,
             },
             storage: StorageConfig {
                 data_directory,
@@ -1095,6 +1932,7 @@ impl ServerConfig {
                 service_handle_domains,
                 did_cache_stale_ttl,
                 did_cache_max_ttl,
+                recovery_did_key,
             },
             email,
             invites: InviteConfig {
@@ -1116,11 +1954,15 @@ impl ServerConfig {
                 crawl_enabled,
                 public_url,
                 auto_stream_events,
+                peer_pds,
             },
             validation_mode,
             distributed_state_mode,
             maintenance_pool,
             gc_sweep,
+            blob_metadata,
+            entryway,
+            lexicon,
         })
     }
 
@@ -1191,10 +2033,10 @@ mod database_tests {
 
     #[test]
     fn from_env_values_defaults_to_sqlite() {
-        let cfg = DatabaseConfig::from_env_values(None, None, None, None, None, None, None,
-            None,
+        let cfg = DatabaseConfig::from_env_values(
+            None, None, None, None, None, None, None, None, None,
         )
-            .unwrap();
+        .unwrap();
         assert_eq!(cfg.backend, DatabaseBackend::Sqlite);
         assert!(cfg.url.is_none());
         assert_eq!(cfg.max_connections, 25);
@@ -1215,7 +2057,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .unwrap();
         assert_eq!(cfg.backend, DatabaseBackend::Postgres);
         assert_eq!(
@@ -1235,7 +2079,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .unwrap();
         assert_eq!(cfg.backend, DatabaseBackend::Postgres);
     }
@@ -1251,7 +2097,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("postgres without URL should be rejected");
         assert!(err.to_string().contains("PDS_DB_URL is required"));
     }
@@ -1267,7 +2115,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("non-postgres URL should be rejected");
         assert!(err.to_string().contains("postgres://"));
     }
@@ -1283,7 +2133,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("unknown backend should be rejected");
         let msg = err.to_string();
         assert!(msg.contains("sqlite"));
@@ -1301,7 +2153,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("min > max should be rejected");
         let msg = err.to_string();
         assert!(msg.contains("MIN_CONNECTIONS"));
@@ -1319,7 +2173,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("max=0 should be rejected");
         assert!(err.to_string().contains("greater than 0"));
     }
@@ -1335,7 +2191,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("acquire timeout=0 should be rejected");
         assert!(err.to_string().contains("ACQUIRE_TIMEOUT_SECS"));
     }
@@ -1351,7 +2209,9 @@ mod database_tests {
             None,
             None,
         
-            None,)
+            None,
+            None,
+        )
         .expect_err("non-integer timeout should be rejected");
         assert!(err.to_string().contains("non-negative integer"));
     }
@@ -1367,7 +2227,9 @@ mod database_tests {
             Some("60".to_string()),
             Some("3600".to_string()),
         
-            None,)
+            None,
+            None,
+        )
         .unwrap();
         assert_eq!(cfg.idle_timeout_secs, Some(60));
         assert_eq!(cfg.max_lifetime_secs, Some(3600));
@@ -1610,21 +2472,43 @@ mod blobstore_tests {
 mod gc_sweep_tests {
     use super::*;
 
+    /// Updated for Arc 16d §9.4.4 Step 1.3: `gc_sweep.enabled`
+    /// default flipped from `false → true`. v0.4's "off-by-default
+    /// safety stance" is superseded by v0.5's "row-walker + byte-
+    /// walker both default-on" — Arc 16d ships production-grade
+    /// row-driven GC and the design accepts both walkers running by
+    /// default. Operators who want pre-Arc-16d behavior set
+    /// `PDS_GC_SWEEP_ENABLED=false` explicitly.
     #[test]
-    fn default_matches_v04_design_safety_stance() {
+    fn default_matches_v05_arc16d_lock_stance() {
         let c = GcSweepConfig::default();
-        assert!(!c.enabled, "default must be disabled");
-        assert!(c.dry_run, "default must be dry_run=true");
+        assert!(c.enabled, "Arc 16d §9.4.4 Step 1.3: default flipped to enabled");
+        assert!(
+            c.row_sweep_enabled,
+            "Arc 16d §9.4.2.1: row-walker default enabled"
+        );
+        assert!(c.dry_run, "default must be dry_run=true (unchanged from v0.4)");
         assert_eq!(c.interval_secs, 86_400);
         assert_eq!(c.max_deletes_per_run, 10_000);
         assert_eq!(c.freshness_threshold_secs, 3_600);
         assert_eq!(c.page_size, 500);
+        assert_eq!(
+            c.untethered_ttl_seconds, 86_400,
+            "Arc 16d §9.4.4 Step 1.1: row-sweep TTL default 86400 (24h)"
+        );
     }
 
     #[test]
     fn from_env_values_all_none_yields_default() {
-        let c = GcSweepConfig::from_env_values(None, None, None, None, None, None).unwrap();
+        let c = GcSweepConfig::from_env_values(
+            None, None, None, None, None, None, None, None,
+        )
+        .unwrap();
+        // Arc 16d §9.4.4 Step 1.3: enabled default flipped false→true.
         assert_eq!(c.enabled, GcSweepConfig::default().enabled);
+        assert!(c.enabled);
+        // Arc 16d §9.4.2.1: row_sweep_enabled default true.
+        assert!(c.row_sweep_enabled);
         assert_eq!(c.dry_run, GcSweepConfig::default().dry_run);
         assert_eq!(c.interval_secs, GcSweepConfig::default().interval_secs);
         assert_eq!(c.max_deletes_per_run, GcSweepConfig::default().max_deletes_per_run);
@@ -1633,32 +2517,40 @@ mod gc_sweep_tests {
             GcSweepConfig::default().freshness_threshold_secs
         );
         assert_eq!(c.page_size, GcSweepConfig::default().page_size);
+        // Arc 16d §9.4.4 Step 1.1: untethered_ttl_seconds default 86400.
+        assert_eq!(c.untethered_ttl_seconds, 86_400);
     }
 
     #[test]
     fn from_env_values_parses_all_fields() {
         let c = GcSweepConfig::from_env_values(
             Some("true".to_string()),
+            Some("false".to_string()), // row_sweep_enabled
             Some("3600".to_string()),
             Some("false".to_string()),
             Some("500".to_string()),
             Some("1800".to_string()),
             Some("250".to_string()),
+            Some("172800".to_string()), // untethered_ttl_seconds (48h)
         )
         .unwrap();
         assert!(c.enabled);
+        assert!(!c.row_sweep_enabled);
         assert_eq!(c.interval_secs, 3_600);
         assert!(!c.dry_run);
         assert_eq!(c.max_deletes_per_run, 500);
         assert_eq!(c.freshness_threshold_secs, 1_800);
         assert_eq!(c.page_size, 250);
+        assert_eq!(c.untethered_ttl_seconds, 172_800);
     }
 
     #[test]
     fn from_env_values_zero_interval_rejected() {
         let err = GcSweepConfig::from_env_values(
             Some("true".to_string()),
+            None,
             Some("0".to_string()),
+            None,
             None,
             None,
             None,
@@ -1676,7 +2568,9 @@ mod gc_sweep_tests {
             None,
             None,
             None,
+            None,
             Some("0".to_string()),
+            None,
         )
         .expect_err("zero page size must be rejected");
         assert!(err.to_string().contains("PDS_GC_SWEEP_PAGE_SIZE"));
@@ -1691,20 +2585,41 @@ mod gc_sweep_tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect_err("'yes' is not a valid bool");
         assert!(err.to_string().contains("PDS_GC_SWEEP_ENABLED"));
+    }
+
+    /// Arc 16d §9.4.4 Step 1.5: zero `untethered_ttl_seconds` rejected.
+    #[test]
+    fn from_env_values_zero_untethered_ttl_rejected() {
+        let err = GcSweepConfig::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0".to_string()),
+        )
+        .expect_err("zero untethered_ttl_seconds must be rejected");
+        assert!(err.to_string().contains("PDS_GC_SWEEP_UNTETHERED_TTL_SECS"));
     }
 
     #[test]
     fn to_sweep_params_propagates_fields() {
         let cfg = GcSweepConfig {
             enabled: true,
+            row_sweep_enabled: true,
             interval_secs: 7200,
             dry_run: false,
             max_deletes_per_run: 250,
             freshness_threshold_secs: 600,
             page_size: 100,
+            untethered_ttl_seconds: 86_400,
         };
         let p = cfg.to_sweep_params(true);
         assert!(!p.dry_run);
@@ -1720,5 +2635,127 @@ mod gc_sweep_tests {
         let p = cfg.to_sweep_params(false);
         assert!(!p.report_only);
         assert!(p.dry_run, "config dry_run propagates to params");
+    }
+}
+
+#[cfg(test)]
+mod relay_urls_parse_tests {
+    //! Inline parser-shape tests for `PDS_FEDERATION_RELAY_URLS`.
+    //! The filter is load-bearing: `AppContext::new`
+    //! gates `RelayClient` construction (and its background
+    //! `JobScheduler::relay_firehose_subscription_job` spawn) on
+    //! `!relay_urls.is_empty()`. Setting the env var to `""` is the
+    //! explicit "federation on, no relay loop" override.
+
+    /// Mirror the exact parse pipeline used in `ServerConfig::from_env`
+    /// so this test verifies the contract by-shape rather than by
+    /// poking process-global env vars (which races with parallel
+    /// tests).
+    fn parse(raw: &str) -> Vec<String> {
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn empty_string_yields_empty_vec_so_relay_client_is_none() {
+        assert_eq!(parse(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn whitespace_only_yields_empty_vec() {
+        assert_eq!(parse("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn commas_with_no_entries_yield_empty_vec() {
+        assert_eq!(parse(",,, ,"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn single_url_default_shape() {
+        assert_eq!(parse("https://bsky.network"), vec!["https://bsky.network"]);
+    }
+
+    #[test]
+    fn multi_url_comma_split() {
+        assert_eq!(
+            parse("https://a.example,https://b.example"),
+            vec!["https://a.example", "https://b.example"]
+        );
+    }
+
+    #[test]
+    fn empty_entries_between_real_urls_are_dropped() {
+        assert_eq!(
+            parse("https://a,,https://b,"),
+            vec!["https://a", "https://b"]
+        );
+    }
+
+    #[test]
+    fn whitespace_around_entries_is_trimmed() {
+        assert_eq!(
+            parse("  https://a  ,  https://b  "),
+            vec!["https://a", "https://b"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod env_example_lint_tests {
+    //! chainlink #94: keep `.env.example` from re-introducing the
+    //! data_directory shadowing trap. Path env vars that auto-derive
+    //! from `PDS_DATA_DIRECTORY` (in `from_env_values` for blob paths
+    //! and in `ServerConfig::from_env` for the per-component DB paths)
+    //! must NOT be committed as active (uncommented) `KEY=value` lines
+    //! in `.env.example`. Operators routinely export only
+    //! `PDS_DATA_DIRECTORY` for per-instance overlays (e.g., Phase B
+    //! pds-a / pds-b); committed `.env.example` entries are copied into
+    //! the operator's local `.env`, dotenv populates them at process
+    //! start (since the operator's shell didn't export them), and the
+    //! derivation-from-data-directory path is silently bypassed —
+    //! stranding components at the .env-set path instead of following
+    //! the operator's directory move. The Arc 16c Phase B Scenario 2
+    //! report (#94) caught blob bytes landing at `./data/blobs/` while
+    //! `PDS_DATA_DIRECTORY=./phase-b/pds-a` was exported.
+
+    const SHADOWING_KEYS: &[&str] = &[
+        "PDS_ACCOUNT_DB_LOCATION",
+        "PDS_SEQUENCER_DB_LOCATION",
+        "PDS_DID_CACHE_DB_LOCATION",
+        "PDS_ACTOR_STORE_DIRECTORY",
+        "PDS_BLOBSTORE_DISK_LOCATION",
+        "PDS_BLOBSTORE_DISK_TMP_LOCATION",
+    ];
+
+    #[test]
+    fn env_example_does_not_shadow_data_directory_derived_defaults() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env.example");
+        let example = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+
+        for key in SHADOWING_KEYS {
+            let prefix = format!("{}=", key);
+            let active_line = example.lines().find(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with('#') && trimmed.starts_with(&prefix)
+            });
+            assert!(
+                active_line.is_none(),
+                ".env.example must not have an active `{}=...` line \
+                 (found: {:?}). These paths auto-derive from \
+                 PDS_DATA_DIRECTORY; committing them as active values \
+                 creates a precedence trap where operator-shell-exported \
+                 PDS_DATA_DIRECTORY no longer moves the component (the \
+                 dotenv-loaded .env value wins because the operator's \
+                 shell didn't export this specific key). Comment the \
+                 entry out — operators who genuinely want a non-default \
+                 component path can uncomment. See chainlink #94.",
+                key,
+                active_line,
+            );
+        }
     }
 }

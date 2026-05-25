@@ -4,9 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.5.0] - 2026-05-23
 
-_Future v0.5 cycle work lands here._
+The v0.5 cycle theme is **federation activation**. Aurora-Locus is now a participating federation peer rather than an isolated server: it emits the full account-lifecycle event stream other peers consume, accepts and validates external lexicons dynamically at write-time, and imports complete repositories with first-class blob continuity. Both backends (SQLite WAL + Postgres READ COMMITTED) are exercised end-to-end at every shipped surface.
+
+### Federation event stream
+
+The sequencer producer now emits on every account-lifecycle path that the reference PDS does: account creation, deactivation, reactivation, takedown, deletion, and PLC-operation submission. Both `#account` and `#sync` events fire where the spec requires them, including the four-frame createAccount sequence (identity → account → genesis-commit → sync) and the three-emit reactivation pattern (account → identity → sync). Pre-cycle, zero `#account` or `#sync` events were ever emitted on this server; post-cycle, downstream peers see takedowns, deactivations, and identity rotations as they happen. The canonical lex admin endpoint `com.atproto.admin.updateSubjectStatus` now also emits the matching `#account` event rather than mutating account state silently — downstream moderation tooling (Ozone or any spec-compliant peer) sees moderation actions applied via the canonical path.
+
+### Dynamic lexicon loading
+
+The PDS can now resolve, fetch, validate, and cache external lexicons from their authoring repositories at record-write time. The resolver implements two-layer caching (in-memory + on-disk `lexicon_cache` table with dual-backend migration), single-flight de-dup (N concurrent fetches for the same NSID coalesce to a single outbound), and explicit failure semantics (operator-configurable `HardFail` rejects writes; `Warn` accepts with logging). Authority resolution honors NSID-derived DNS lookup, PLC tombstones (HTTP 410 Gone), and operator deny/allow lists. Admin endpoints under `tools.aurora.lexicon.*` expose cache state, manual fetches, and evictions. The full path is verified end-to-end against live two-instance binaries on both SQLite and Postgres: fetch → CAR parse → cache write → validate → reuse → single-flight collapse → both failure modes → tombstone classification → validate-imports override on `validate:false` writes.
+
+### Repository import
+
+A new `importRepo` surface accepts a full CAR upload, validates structure, pre-fetches all referenced blobs from the origin PDS, and applies the imported records under the actor's signing key. Origin-fetch failures, schema rejections, and quarantine routing surface as structured wire errors; partial-failure rollback is atomic. Blob reference accounting uses the same shared-DB transaction shape the live record-write path uses, so STRICT-before-unreference ordering and `BlobNotFound` semantics carry through imports symmetrically.
+
+### Blob substrate
+
+Blob storage gained two-phase commit (bytes-durable-before-row, with fsync on the disk backend), TTL-bounded staged-orphan cleanup via a row-driven GC sweep, and STRICT-before-unreference accounting on every record-write path. The shared-DB transaction model now carries through `applyWrites`, `createRecord`, `putRecord`, `deleteRecord`, and `importRepo` symmetrically. A new `BlobNotFound` typed error variant surfaces 404 → 400 at the wire per spec.
+
+### Wire-protocol corrections
+
+Several pre-cycle wire-shape inconsistencies are now spec-aligned: PLC `410 Gone` routes to a typed `DidTombstoned` variant rather than a 500; `BlobNotFound` returns 404 with a structured envelope rather than an opaque 5xx; record-write signing uses the per-account repo key rather than a server-wide key; `importRepo` forensic events report per-CID failure counts accurately rather than always zero; Postgres login decode tolerates the cross-backend `TIMESTAMPTZ` vs Rust `Option<String>` divergence (silent-fail mask removed).
+
+### Operator surfaces
+
+Forensic events for cache, fetch, validation, and import emit structured `event=<name>` log entries with consistent `failure_class` taxonomies (DNS, DID, PDS-unreachable, HTTP 4xx/5xx, timeout, authority-tombstoned, authority-ambiguous, schema, invalid-NSID). Metrics expose lexicon fetch attempts, cache hit/miss rates, single-flight collapse counts, and per-collection validation outcomes.
+
+### Backend matrix
+
+Every shipped feature is verified on both backends. The Postgres path is a first-class peer of the SQLite path, with backend-conditional `FOR UPDATE` emission, READ COMMITTED isolation pinning, and TEXT-timestamp invariance preserved across the type-compatible read layer.
+
+### Deferred to v0.6
+
+- Lexicon authority routing for the four federation handlers (`verify_remote_token`, `fetch_remote_profile`, `is_trusted_pds`, `verify_service_jwt` via `get_signing_key`) — pre-existing signing-key-routing item carries through with the raw-`DidTombstoned`-wire-shift co-deferral.
+- Required-mode `validate_imports` hard-reject explicit live coverage (unit-covered today).
+- Lexicon fetch-quarantine behavior and a `record_quarantine` surface.
+- CAR + MST signature verification on imports (structure-validated today).
+- `importRepo` cross-process race coverage.
+- Upstream mock-PLC `tombstone` → HTTP 410 alignment patch.
 
 ## [0.4.0] - 2026-05-13
 

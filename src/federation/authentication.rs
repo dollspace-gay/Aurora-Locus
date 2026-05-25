@@ -67,22 +67,13 @@ impl FederationAuthenticator {
         self.verify_token_with_pds(&pds_endpoint, did, token).await
     }
 
-    /// Extract PDS endpoint from DID document
+    /// Extract PDS endpoint from DID document.
+    ///
+    /// Thin instance-method shim over [`extract_pds_endpoint`] so legacy
+    /// `self.extract_pds_endpoint(...)` call sites keep compiling. Arc 16f
+    /// Step 2 shares the helper with `src/federation/blob_fetch.rs`.
     fn extract_pds_endpoint(&self, did_doc: &DidDocument) -> Option<String> {
-        // Look for ATProto PDS service in DID document
-        // Format: https://atproto.com/specs/did#service-endpoints
-        // Convert to JSON for parsing
-        let json = serde_json::to_value(did_doc).ok()?;
-        let services = json.get("service")?.as_array()?;
-
-        for service in services {
-            let service_type = service.get("type")?.as_str()?;
-            if service_type == "AtprotoPersonalDataServer" {
-                return service.get("serviceEndpoint")?.as_str().map(String::from);
-            }
-        }
-
-        None
+        extract_pds_endpoint(did_doc)
     }
 
     /// Verify token with remote PDS
@@ -225,6 +216,32 @@ pub struct RemoteProfile {
     pub posts_count: Option<i64>,
 }
 
+/// Pull the ATProto PDS endpoint URL out of a resolved DID document.
+///
+/// Walks the document's `service` array and returns the first
+/// `serviceEndpoint` whose `type` is `AtprotoPersonalDataServer`.
+/// Returns `None` if no such service entry exists.
+///
+/// Extracted from `FederationAuthenticator::extract_pds_endpoint` in Arc 16f
+/// Step 2 so the origin-blob-fetch primitive
+/// (`crate::federation::blob_fetch`) shares one canonical implementation
+/// with the cross-PDS auth verifier rather than duplicating the DID-doc
+/// walking logic.
+pub(crate) fn extract_pds_endpoint(did_doc: &DidDocument) -> Option<String> {
+    // Format: https://atproto.com/specs/did#service-endpoints
+    let json = serde_json::to_value(did_doc).ok()?;
+    let services = json.get("service")?.as_array()?;
+
+    for service in services {
+        let service_type = service.get("type")?.as_str()?;
+        if service_type == "AtprotoPersonalDataServer" {
+            return service.get("serviceEndpoint")?.as_str().map(String::from);
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +278,43 @@ mod tests {
         // We can't easily test without creating a full authenticator,
         // but we can test the JSON structure
         assert!(did_doc.get("service").is_some());
+    }
+
+    fn did_doc_with_services(services: serde_json::Value) -> DidDocument {
+        let raw = serde_json::json!({
+            "id": "did:plc:test123",
+            "service": services,
+        });
+        serde_json::from_value(raw).expect("synthetic DID doc deserialises")
+    }
+
+    #[test]
+    fn extract_pds_endpoint_returns_atproto_pds_service_endpoint() {
+        let doc = did_doc_with_services(serde_json::json!([
+            {
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": "https://pds.example.com"
+            }
+        ]));
+
+        assert_eq!(
+            extract_pds_endpoint(&doc),
+            Some("https://pds.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_pds_endpoint_returns_none_for_missing_service() {
+        let doc = did_doc_with_services(serde_json::json!([]));
+        assert_eq!(extract_pds_endpoint(&doc), None);
+    }
+
+    #[test]
+    fn extract_pds_endpoint_skips_non_atproto_service_types() {
+        let doc = did_doc_with_services(serde_json::json!([
+            { "id": "#x", "type": "OtherService", "serviceEndpoint": "https://other.example.com" }
+        ]));
+        assert_eq!(extract_pds_endpoint(&doc), None);
     }
 }

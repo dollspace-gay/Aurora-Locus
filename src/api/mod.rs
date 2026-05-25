@@ -2,6 +2,7 @@
 pub mod admin;
 pub mod appview;
 pub mod aurora_admin;
+pub mod aurora_lexicon;
 pub mod extractors;
 pub mod aurora_moderator;
 pub mod aurora_subscribe;
@@ -9,7 +10,9 @@ pub mod blob;
 #[cfg(debug_assertions)]
 pub mod dev_routes;
 pub mod federation;
+pub mod account_emit;
 pub mod firehose;
+pub mod firehose_encoder;
 pub mod health;
 pub mod identity;
 pub mod labels;
@@ -19,6 +22,7 @@ pub mod oauth_admin;
 pub mod oauth_server;
 pub mod registry;
 pub mod repo;
+pub mod repo_import;
 pub mod server;
 pub mod sync;
 pub mod sync_helpers;
@@ -48,6 +52,7 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
         .merge(well_known::routes())
         .merge(server::routes())
         .merge(repo::routes())
+        .merge(repo_import::routes())
         .merge(blob::routes())
         .merge(identity::routes())
         .merge(admin_router)

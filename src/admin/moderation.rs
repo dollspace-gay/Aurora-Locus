@@ -395,6 +395,12 @@ mod tests {
                 service_did: "did:web:localhost".to_string(),
                 version: "0.1.0".to_string(),
                 blob_upload_limit: 5242880,
+                public_url: None,
+                max_blob_fetch_size: 50_000_000,
+                blob_fetch_timeout_seconds: 30,
+                blob_fetch_max_retries: 3,
+                accepting_imports: true,
+                max_import_size: None,
             },
             storage: StorageConfig {
                 data_directory: PathBuf::from("./data"),
@@ -411,7 +417,7 @@ mod tests {
             authentication: AuthConfig {
                 jwt_secret: "test-secret-key".to_string(),
                 repo_signing_key: "test-key".to_string(),
-                plc_rotation_key: "test-rotation-key".to_string(),
+                plc_rotation_key: "b".repeat(64),
                 oauth: OAuthConfig {
                     client_id: "test-client".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -426,6 +432,7 @@ mod tests {
                 service_handle_domains: vec!["localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {
@@ -449,11 +456,15 @@ mod tests {
                 crawl_enabled: false,
                 public_url: None,
                 auto_stream_events: false,
+                peer_pds: vec![],
             },
             validation_mode: crate::validation::ValidationMode::Optimistic,
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            blob_metadata: Default::default(),
+            entryway: None,
+            lexicon: crate::config::LexiconConfig::default(),
         }
     }
 

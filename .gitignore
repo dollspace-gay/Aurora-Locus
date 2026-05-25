@@ -22,6 +22,9 @@ Cargo.lock
 # Runtime data
 data/
 data.backup/
+data.bak/
+# Phase B local PDS runtime state (per-instance SQLite + actor stores)
+phase-b/pds-*/
 
 # Local tooling
 .claude/
@@ -32,3 +35,6 @@ __pycache__/
 
 # Working design docs (per-cycle, local-only artifacts)
 docs/*_DESIGN.md
+docs/internal
+phase-b/data-*/
+phase-b/*.sh

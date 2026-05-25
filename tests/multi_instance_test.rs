@@ -84,8 +84,8 @@ async fn open_pool(url: &str) -> AnyPool {
     pool
 }
 
-/// One simulated aurora-locus "instance": Sequencer + LeaderElection
-/// + CacheInvalidator + Listener wired exactly as `AppContext::new`
+/// One simulated aurora-locus "instance": Sequencer, LeaderElection,
+/// CacheInvalidator, and Listener wired exactly as `AppContext::new`
 /// wires them for Postgres deployments.
 struct Instance {
     sequencer: Arc<Sequencer>,

@@ -132,14 +132,10 @@ impl UnifiedAuthContext {
     }
 }
 
-/// Require authentication (local, OAuth, or cross-PDS) - Phase 6
-///
-/// This tries multiple authentication methods in order:
-/// 1. OAuth 2.1 tokens (most modern)
-/// 2. Local session tokens (legacy)
-/// 3. Service auth JWTs (cross-PDS)
-///
-/// Use this for endpoints that should accept all authentication types.
+/// Require authentication — Arc 12 §5.3.3 tuple-routed, §5.3.4
+/// non-forwarded variant. Thin wrapper around
+/// `AppContext::verify_jwt_with_allowlist` (§5.3.4.1 shared helper);
+/// audience allowlist is `[ctx.service_did()]`.
 pub async fn require_auth_unified(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -149,101 +145,34 @@ pub async fn require_auth_unified(
         metrics::record_error("AuthenticationFailed", "middleware");
         PdsError::Authentication("Missing authorization header".to_string())
     })?;
+    let service_did = ctx.service_did().to_string();
+    ctx.verify_jwt_with_allowlist(&token, &[service_did.as_str()])
+        .await
+}
 
-    // Try OAuth token validation first (most modern)
-    match crate::auth::validate_oauth_token(&ctx, &token).await {
-        Ok(token_info) => {
-            info!(
-                did = %token_info.did,
-                client_id = %token_info.client_id,
-                auth_type = "oauth",
-                "authentication_successful"
-            );
-            return Ok(UnifiedAuthContext::OAuth {
-                did: token_info.did,
-                scope: token_info.scope,
-            });
-        }
-        Err(_) => {
-            // OAuth failed, try local session auth
-        }
+/// Arc 12 §5.3.4 forwarded variant — thin wrapper around the same
+/// `verify_jwt_with_allowlist` helper with the multi-audience
+/// allowlist that forwarded routes need (`[service_did, entryway_did]`
+/// when entryway is configured; `[service_did]` only in standalone
+/// mode, in which case forwarded routes degrade to the same
+/// allowlist as the non-forwarded variant — see §5.3.8 standalone
+/// passthrough).
+pub async fn require_auth_forwarded(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+) -> PdsResult<UnifiedAuthContext> {
+    let token = extract_bearer_token(&headers).ok_or_else(|| {
+        warn!("authentication_failed: missing authorization header");
+        metrics::record_error("AuthenticationFailed", "middleware");
+        PdsError::Authentication("Missing authorization header".to_string())
+    })?;
+    let service_did = ctx.service_did().to_string();
+    let entryway_did = ctx.entryway_did().map(str::to_string);
+    let mut allowlist: Vec<&str> = vec![service_did.as_str()];
+    if let Some(eid) = entryway_did.as_deref() {
+        allowlist.push(eid);
     }
-
-    // Try local session auth
-    match ctx.account_manager.validate_access_token(&token).await {
-        Ok(session) => {
-            info!(
-                did = %session.did,
-                is_app_password = session.is_app_password,
-                auth_type = "local",
-                "authentication_successful"
-            );
-            return Ok(UnifiedAuthContext::Local(session));
-        }
-        Err(_) => {
-            // Local auth failed, try service auth (cross-PDS)
-        }
-    }
-
-    // Try service auth (cross-PDS)
-    if let Some(service_auth) = &ctx.federation_auth {
-        let service_did = ctx.service_did();
-
-        match service_auth
-            .authenticator
-            .verify_service_jwt(&token, service_did)
-            .await
-        {
-            Ok(claims) => {
-                // Verify and consume nonce
-                if let Some(nonce_store) = &ctx.nonce_store {
-                    match nonce_store.check_and_record(&claims.jti).await {
-                        Ok(true) => {
-                            info!(
-                                did = %claims.iss,
-                                auth_type = "cross_pDS",
-                                "authentication_successful"
-                            );
-                            return Ok(UnifiedAuthContext::CrossPDS { did: claims.iss });
-                        }
-                        Ok(false) => {
-                            warn!(
-                                jti = %claims.jti,
-                                "service_auth_failed: replay_attack"
-                            );
-                            metrics::record_error("ServiceAuthReplayAttack", "middleware");
-                            return Err(PdsError::Authentication(
-                                "Replay attack detected".to_string(),
-                            ));
-                        }
-                        Err(e) => {
-                            error!(
-                                error = %e,
-                                "service_auth_failed: nonce_check_error"
-                            );
-                        }
-                    }
-                }
-
-                // If nonce store is not available, allow but log warning
-                warn!("service_auth: nonce_store_not_available, replay_prevention_disabled");
-                return Ok(UnifiedAuthContext::CrossPDS { did: claims.iss });
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "service_auth_failed"
-                );
-            }
-        }
-    }
-
-    // All auth methods failed
-    warn!("authentication_failed: invalid_token");
-    metrics::record_error("AuthenticationFailed", "middleware");
-    Err(PdsError::Authentication(
-        "Invalid or expired token".to_string(),
-    ))
+    ctx.verify_jwt_with_allowlist(&token, &allowlist).await
 }
 
 /// Moderation enforcement middleware

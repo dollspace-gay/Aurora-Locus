@@ -1,0 +1,42 @@
+{
+  "lexicon": 1,
+  "id": "tools.aurora.lexicon.evictCache",
+  "description": "Arc 17 §17.3.7 — evict entries from the dynamic-lexicon resolver's in-memory cache. One of `nsid` or `all` must be supplied (mutually exclusive). On-disk rows are NOT touched; they rehydrate on next fetch or expire via TTL. Auth: AdminAll scope.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "nsid": {
+              "type": "string",
+              "description": "Evict a specific entry. No-op if not cached."
+            },
+            "all": {
+              "type": "boolean",
+              "description": "Evict every in-memory entry. Only `true` is meaningful; `false` is the absent state. Mutually exclusive with `nsid`."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["evicted"],
+          "properties": {
+            "evicted": {
+              "type": "integer",
+              "description": "Count of in-memory entries actually removed."
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "LexiconDisabled" }
+      ]
+    }
+  }
+}

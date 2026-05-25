@@ -99,6 +99,44 @@ impl FromRequestParts<AppContext> for AuthContext {
     }
 }
 
+/// Arc 12 §5.3.4 forwarded-routes auth extractor. Thin wrapper
+/// around `AppContext::verify_jwt_with_allowlist` with the
+/// `[service_did, entryway_did]` allowlist (degrades to
+/// `[service_did]` in standalone mode where `entryway_did()` is
+/// `None`). Used by the four §5.3.8 forwarded mint-pattern handlers
+/// (`signPlcOperation`, `updateHandle`, `getSession`).
+///
+/// Returns only the resolved DID — handlers don't need the inner
+/// session/oauth/cross-pds variant distinction for forwarding
+/// decisions (the variant is purely informational at this layer).
+#[derive(Debug, Clone)]
+pub struct AuthContextForwarded {
+    pub did: String,
+}
+
+#[async_trait]
+impl FromRequestParts<AppContext> for AuthContextForwarded {
+    type Rejection = PdsError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        ctx: &AppContext,
+    ) -> Result<Self, Self::Rejection> {
+        let token = extract_bearer_token(&parts.headers)
+            .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
+        let service_did = ctx.service_did().to_string();
+        let entryway_did_owned = ctx.entryway_did().map(str::to_string);
+        let mut allowlist: Vec<&str> = vec![service_did.as_str()];
+        if let Some(eid) = entryway_did_owned.as_deref() {
+            allowlist.push(eid);
+        }
+        let auth = ctx.verify_jwt_with_allowlist(&token, &allowlist).await?;
+        Ok(Self {
+            did: auth.did().to_string(),
+        })
+    }
+}
+
 /// Optional authenticated context - does not fail if no auth provided
 #[derive(Debug, Clone)]
 pub struct OptionalAuthContext {
@@ -685,6 +723,201 @@ impl FromRequestParts<AppContext> for OAuthAuthContext {
     }
 }
 
+/// Claims extracted from an entryway-issued external access token
+/// per Arc 12 §5.3.3.
+#[derive(Debug, Clone)]
+pub struct AccessTokenClaims {
+    /// Subject DID (the user the token authenticates).
+    pub did: String,
+    /// Issuer DID — the entryway DID per §5.3.3.1.
+    pub iss: String,
+    /// Audience — must match one of the caller-supplied
+    /// `expected_audiences`.
+    pub aud: String,
+    /// Issued-at unix timestamp.
+    pub iat: i64,
+    /// Expires-at unix timestamp.
+    pub exp: i64,
+    /// OAuth scope claim. Optional because some entryway-mint
+    /// shapes omit it for service-only tokens.
+    pub scope: Option<String>,
+    /// OAuth client_id claim. Optional for the same reason.
+    pub client_id: Option<String>,
+}
+
+/// Verify an external access token issued by the entryway per
+/// Arc 12 §5.3.3.
+///
+/// Performs:
+/// 1. JWT-shape pre-check (3 base64url segments).
+/// 2. Header decode + `alg == ES256K` verification. (The
+///    §5.3.3 algorithm-allowlist guard at the tuple-routing
+///    front-door also enforces this; the check here is
+///    defense-in-depth so the function is safe to call
+///    independently.)
+/// 3. Payload decode + claims extraction.
+/// 4. ES256K signature verification over `header.payload`
+///    against `entryway_jwt_public_key`.
+/// 5. Claim validation: `exp` not past, `iat` not future,
+///    `aud` ∈ `expected_audiences`. `iss` extracted but
+///    NOT trust-checked here (caller is responsible per
+///    §5.3.3 routing — this function trusts the public key
+///    is the entryway's).
+///
+/// Returns `PdsError::Authentication(...)` on any failure.
+/// On success: `AccessTokenClaims` with did/iss/aud/iat/exp +
+/// optional scope/client_id.
+///
+/// **Signature semantics.** k256 ECDSA over the SHA-256 of
+/// `header.payload` (ATProto / JWS ES256K convention).
+/// Signature bytes are DER-encoded per ATProto convention
+/// (same as `verify_service_jwt`'s signature handling).
+pub async fn validate_external_access_token(
+    token: &str,
+    entryway_jwt_public_key: &k256::ecdsa::VerifyingKey,
+    expected_audiences: &[&str],
+) -> Result<AccessTokenClaims, PdsError> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use k256::ecdsa::{signature::Verifier, Signature};
+
+    // 1. Shape pre-check.
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(PdsError::Authentication(
+            "external access token not JWT-shaped (expected 3 segments)".to_string(),
+        ));
+    }
+    let header_b64 = parts[0];
+    let claims_b64 = parts[1];
+    let signature_b64 = parts[2];
+
+    // 2. Header decode + alg check.
+    let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).map_err(|_| {
+        PdsError::Authentication("external access token header base64 decode failed".to_string())
+    })?;
+    let header_json: serde_json::Value = serde_json::from_slice(&header_bytes).map_err(|_| {
+        PdsError::Authentication("external access token header not parseable JSON".to_string())
+    })?;
+    let alg = header_json
+        .get("alg")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            PdsError::Authentication(
+                "external access token header missing/invalid alg".to_string(),
+            )
+        })?;
+    if alg != "ES256K" {
+        return Err(PdsError::Authentication(format!(
+            "external access token alg {:?} not ES256K",
+            alg
+        )));
+    }
+
+    // 3. Payload decode + claim extraction.
+    let claims_bytes = URL_SAFE_NO_PAD.decode(claims_b64).map_err(|_| {
+        PdsError::Authentication("external access token payload base64 decode failed".to_string())
+    })?;
+    let claims_json: serde_json::Value = serde_json::from_slice(&claims_bytes).map_err(|_| {
+        PdsError::Authentication("external access token payload not parseable JSON".to_string())
+    })?;
+
+    let sub = claims_json
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            PdsError::Authentication("external access token missing sub claim".to_string())
+        })?
+        .to_string();
+    let iss = claims_json
+        .get("iss")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            PdsError::Authentication("external access token missing iss claim".to_string())
+        })?
+        .to_string();
+    let aud = claims_json
+        .get("aud")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            PdsError::Authentication("external access token missing aud claim".to_string())
+        })?
+        .to_string();
+    let iat = claims_json
+        .get("iat")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| {
+            PdsError::Authentication(
+                "external access token missing/invalid iat claim".to_string(),
+            )
+        })?;
+    let exp = claims_json
+        .get("exp")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| {
+            PdsError::Authentication(
+                "external access token missing/invalid exp claim".to_string(),
+            )
+        })?;
+    let scope = claims_json
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let client_id = claims_json
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // 4. Signature verification (ES256K, DER-encoded per
+    // ATProto convention).
+    let signature_bytes = URL_SAFE_NO_PAD.decode(signature_b64).map_err(|_| {
+        PdsError::Authentication(
+            "external access token signature base64 decode failed".to_string(),
+        )
+    })?;
+    let signature = Signature::from_der(&signature_bytes).map_err(|_| {
+        PdsError::Authentication("external access token signature DER parse failed".to_string())
+    })?;
+    let signing_input = format!("{}.{}", header_b64, claims_b64);
+    entryway_jwt_public_key
+        .verify(signing_input.as_bytes(), &signature)
+        .map_err(|_| {
+            PdsError::Authentication(
+                "external access token signature verification failed".to_string(),
+            )
+        })?;
+
+    // 5. Claim validation.
+    let now = chrono::Utc::now().timestamp();
+    // Allow ±300s skew matching verify_jwt_token's leeway.
+    const SKEW_SECS: i64 = 300;
+    if exp + SKEW_SECS < now {
+        return Err(PdsError::Authentication(
+            "external access token expired".to_string(),
+        ));
+    }
+    if iat > now + SKEW_SECS {
+        return Err(PdsError::Authentication(
+            "external access token iat is in the future".to_string(),
+        ));
+    }
+    if !expected_audiences.contains(&aud.as_str()) {
+        return Err(PdsError::Authentication(format!(
+            "external access token aud {:?} not in expected audiences {:?}",
+            aud, expected_audiences
+        )));
+    }
+
+    Ok(AccessTokenClaims {
+        did: sub,
+        iss,
+        aud,
+        iat,
+        exp,
+        scope,
+        client_id,
+    })
+}
+
 /// Validate OAuth access token
 ///
 /// Looks up the token in the database and returns token information.
@@ -804,6 +1037,321 @@ impl PasswordHasher {
     }
 }
 
+// ============================================================
+// Arc 12 §5.3.4.1 — shared verify helper used by both middleware
+// variants (`require_auth_unified` + `require_auth_forwarded`).
+// Step 1.3 extracts the tuple-routing logic that landed in
+// `require_auth_unified` during Step 0.6.3 into this module so the
+// two middleware functions can call it as
+// `ctx.verify_jwt_with_allowlist(token, audience_allowlist)` and
+// differ only in their allowlist.
+// ============================================================
+
+/// §5.3.3 algorithm allowlist. Anything outside this set — including
+/// `alg=none` — is rejected before tuple lookup. Single source of
+/// truth shared with `validate_external_access_token`'s defensive
+/// alg check.
+fn alg_in_allowlist(alg: &str) -> bool {
+    matches!(alg, "HS256" | "ES256K" | "ES256")
+}
+
+/// Decode the JWT header's `alg` (required) and `kid` (optional).
+/// Returns the human-readable failure reason on the `Err` side so the
+/// caller can log it without echoing token bytes.
+fn decode_jwt_header_alg_kid(
+    header_b64: &str,
+) -> Result<(String, Option<String>), &'static str> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .map_err(|_| "header base64 decode failed")?;
+    let header_json: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|_| "header not parseable JSON")?;
+    let alg = header_json
+        .get("alg")
+        .and_then(|v| v.as_str())
+        .ok_or("header missing/invalid alg")?
+        .to_string();
+    let kid = header_json
+        .get("kid")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok((alg, kid))
+}
+
+/// Decode the JWT payload's `iss` claim. Missing / non-string iss
+/// → `Ok(None)`. Base64/JSON parse failure → `Err`.
+fn decode_jwt_iss_only(claims_b64: &str) -> Result<Option<String>, &'static str> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(claims_b64)
+        .map_err(|_| "claims base64 decode failed")?;
+    let claims_json: serde_json::Value =
+        serde_json::from_slice(&claims_bytes).map_err(|_| "claims not parseable JSON")?;
+    Ok(claims_json
+        .get("iss")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
+}
+
+/// "Known entryway kid" predicate per §5.3.3. The Aurora-Locus
+/// `EntrywayConfig` (§5.4 Step 1.1) does not enumerate kid values —
+/// per the design's "kid is a routing hint, not a trust gate"
+/// principle, any non-local kid is taken as an entryway-routing hint
+/// when entryway mode is configured. Signature verification against
+/// `EntrywayConfig.jwt_public_key` is the actual safety floor.
+fn is_known_entryway_kid(ctx: &AppContext, kid: &str) -> bool {
+    ctx.config.entryway.is_some() && kid != "aurora-local-v1"
+}
+
+/// §5.3.4.1 implementation. Called via
+/// `AppContext::verify_jwt_with_allowlist`. Routes a bearer token
+/// through the §5.3.3 tuple table; the destination routes that check
+/// audience (`route_external_verify`, `route_service_auth_fallback`)
+/// receive the caller-supplied `audience_allowlist`.
+pub async fn verify_jwt_with_allowlist_impl(
+    ctx: &AppContext,
+    token: &str,
+    audience_allowlist: &[&str],
+) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return route_opaque_oauth(ctx, token).await;
+    }
+
+    let (alg, kid) = match decode_jwt_header_alg_kid(parts[0]) {
+        Ok(pair) => pair,
+        Err(reason) => {
+            tracing::warn!(
+                reason = %reason,
+                "authentication_failed: jwt header decode"
+            );
+            crate::metrics::record_error("AuthenticationFailed", "middleware");
+            return Err(PdsError::Authentication("Invalid token".to_string()));
+        }
+    };
+
+    if !alg_in_allowlist(&alg) {
+        tracing::warn!(
+            alg = %alg,
+            "authentication_failed: alg not in allowlist"
+        );
+        crate::metrics::record_error("AuthenticationFailed", "middleware");
+        return Err(PdsError::Authentication("Invalid algorithm".to_string()));
+    }
+
+    let iss = decode_jwt_iss_only(parts[1]).unwrap_or(None);
+
+    match (alg.as_str(), kid.as_deref()) {
+        ("HS256", Some("aurora-local-v1") | None) => route_local_verify(ctx, token).await,
+        ("HS256", Some(unknown_kid)) => {
+            tracing::warn!(
+                kid = %unknown_kid,
+                "authentication_failed: HS256 with unrecognized kid"
+            );
+            crate::metrics::record_error("AuthenticationFailed", "middleware");
+            Err(PdsError::Authentication("Invalid token".to_string()))
+        }
+        ("ES256K", Some(k)) if is_known_entryway_kid(ctx, k) => {
+            route_external_verify(ctx, token, audience_allowlist).await
+        }
+        ("ES256K", _) | ("ES256", _) => {
+            route_service_auth_fallback(ctx, token, iss.as_deref(), audience_allowlist).await
+        }
+        _ => {
+            tracing::warn!(
+                alg = %alg,
+                kid = ?kid,
+                "authentication_failed: unhandled (alg, kid) combination"
+            );
+            crate::metrics::record_error("AuthenticationFailed", "middleware");
+            Err(PdsError::Authentication("Invalid token".to_string()))
+        }
+    }
+}
+
+/// Opaque-bearer dispatch: existing OAuth DB-lookup path. Per §5.3.3,
+/// this is the only route opaque-shaped tokens take.
+async fn route_opaque_oauth(
+    ctx: &AppContext,
+    token: &str,
+) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
+    match validate_oauth_token(ctx, token).await {
+        Ok(token_info) => {
+            tracing::info!(
+                did = %token_info.did,
+                client_id = %token_info.client_id,
+                auth_type = "oauth",
+                "authentication_successful"
+            );
+            Ok(crate::api::middleware::UnifiedAuthContext::OAuth {
+                did: token_info.did,
+                scope: token_info.scope,
+            })
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "authentication_failed: oauth token invalid"
+            );
+            crate::metrics::record_error("AuthenticationFailed", "middleware");
+            Err(PdsError::Authentication(
+                "Invalid or expired token".to_string(),
+            ))
+        }
+    }
+}
+
+/// Local-verify dispatch (HS256 + `aurora-local-v1` | absent kid).
+/// Aurora-Locus stores minted access tokens in the session table, so
+/// this validation is a DB lookup of the full JWT string — the
+/// equivalent of an HS256 signature check against the local secret
+/// (only this server could have stored that exact byte string).
+async fn route_local_verify(
+    ctx: &AppContext,
+    token: &str,
+) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
+    match ctx.account_manager.validate_access_token(token).await {
+        Ok(session) => {
+            tracing::info!(
+                did = %session.did,
+                is_app_password = session.is_app_password,
+                auth_type = "local",
+                "authentication_successful"
+            );
+            Ok(crate::api::middleware::UnifiedAuthContext::Local(session))
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "authentication_failed: local session invalid"
+            );
+            crate::metrics::record_error("AuthenticationFailed", "middleware");
+            Err(PdsError::Authentication(
+                "Invalid or expired token".to_string(),
+            ))
+        }
+    }
+}
+
+/// ES256K + entryway-kid dispatch. Verifies the JWT against the
+/// configured entryway pubkey via `validate_external_access_token`.
+/// `audience_allowlist` is honored by the inner function's aud
+/// check. When `EntrywayConfig` is `None` this branch is unreachable
+/// (`is_known_entryway_kid` returns `false`); the explicit guard
+/// here is defense-in-depth.
+async fn route_external_verify(
+    ctx: &AppContext,
+    token: &str,
+    audience_allowlist: &[&str],
+) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
+    let entryway = ctx.config.entryway.as_ref().ok_or_else(|| {
+        tracing::warn!("authentication_failed: external entryway-verify reached without EntrywayConfig");
+        crate::metrics::record_error("AuthenticationFailed", "middleware");
+        PdsError::Authentication("Entryway verification not configured".to_string())
+    })?;
+
+    let claims = validate_external_access_token(
+        token,
+        &entryway.jwt_public_key,
+        audience_allowlist,
+    )
+    .await?;
+
+    tracing::info!(
+        did = %claims.did,
+        iss = %claims.iss,
+        auth_type = "entryway_external",
+        "authentication_successful"
+    );
+    Ok(crate::api::middleware::UnifiedAuthContext::CrossPDS { did: claims.did })
+}
+
+/// Trusted service-auth fallback (§5.3.3.1).
+///
+/// Order is load-bearing: iss-trust check runs *before* any PLC fetch
+/// or signature verification, so unknown / non-DID / empty iss
+/// uniformly reject without any network call.
+///
+/// The `audience_allowlist` is iterated; verify_service_jwt is called
+/// once per audience and the first success is accepted. Per §5.3.4
+/// `require_auth_unified` passes a single audience (the PDS DID);
+/// `require_auth_forwarded` passes both (PDS DID + entryway DID).
+async fn route_service_auth_fallback(
+    ctx: &AppContext,
+    token: &str,
+    iss: Option<&str>,
+    audience_allowlist: &[&str],
+) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
+    let iss_str = iss.unwrap_or("");
+    if !ctx.is_trusted_iss(iss_str) {
+        tracing::warn!(
+            iss = %iss_str,
+            "authentication_failed: iss not in trusted-iss allowlist"
+        );
+        crate::metrics::record_error("AuthenticationFailed", "middleware");
+        return Err(PdsError::Authentication("Invalid token".to_string()));
+    }
+
+    let service_auth = ctx.federation_auth.as_ref().ok_or_else(|| {
+        tracing::warn!("authentication_failed: federation_auth not configured");
+        crate::metrics::record_error("AuthenticationFailed", "middleware");
+        PdsError::Authentication("Service auth not configured".to_string())
+    })?;
+
+    let mut last_err: Option<crate::error::PdsError> = None;
+    for &aud in audience_allowlist {
+        match service_auth.authenticator.verify_service_jwt(token, aud).await {
+            Ok(claims) => {
+                if let Some(nonce_store) = &ctx.nonce_store {
+                    match nonce_store.check_and_record(&claims.jti).await {
+                        Ok(true) => {
+                            tracing::info!(
+                                did = %claims.iss,
+                                aud = %aud,
+                                auth_type = "cross_pds",
+                                "authentication_successful"
+                            );
+                            return Ok(crate::api::middleware::UnifiedAuthContext::CrossPDS {
+                                did: claims.iss,
+                            });
+                        }
+                        Ok(false) => {
+                            tracing::warn!(jti = %claims.jti, "service_auth_failed: replay_attack");
+                            crate::metrics::record_error("ServiceAuthReplayAttack", "middleware");
+                            return Err(PdsError::Authentication(
+                                "Replay attack detected".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "service_auth_failed: nonce_check_error");
+                            return Err(PdsError::Authentication("Invalid token".to_string()));
+                        }
+                    }
+                } else {
+                    tracing::warn!("service_auth: nonce_store_not_available, replay_prevention_disabled");
+                    return Ok(crate::api::middleware::UnifiedAuthContext::CrossPDS {
+                        did: claims.iss,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::debug!(aud = %aud, error = %e, "service_auth: aud-allowlist iteration failed");
+                last_err = Some(e);
+                continue;
+            }
+        }
+    }
+
+    if let Some(e) = last_err {
+        tracing::warn!(error = %e, "service_auth_failed");
+    } else {
+        tracing::warn!("service_auth_failed: empty audience_allowlist");
+    }
+    crate::metrics::record_error("AuthenticationFailed", "middleware");
+    Err(PdsError::Authentication("Invalid token".to_string()))
+}
+
 #[cfg(test)]
 mod password_tests {
     use super::PasswordHasher;
@@ -903,6 +1451,12 @@ mod admin_auth_third_path_tests {
                 service_did: TEST_SERVICE_DID.to_string(),
                 version: "0.1.0-test".to_string(),
                 blob_upload_limit: 5_242_880,
+                public_url: None,
+                max_blob_fetch_size: 50_000_000,
+                blob_fetch_timeout_seconds: 30,
+                blob_fetch_max_retries: 3,
+                accepting_imports: true,
+                max_import_size: None,
             },
             storage: StorageConfig {
                 data_directory: dir.clone(),
@@ -935,6 +1489,7 @@ mod admin_auth_third_path_tests {
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {
@@ -958,6 +1513,7 @@ mod admin_auth_third_path_tests {
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
                 auto_stream_events: false,
+                peer_pds: vec![],
             },
             validation_mode: PathBuf::from("required")
                 .into_os_string()
@@ -967,6 +1523,9 @@ mod admin_auth_third_path_tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            blob_metadata: Default::default(),
+            entryway: None,
+            lexicon: crate::config::LexiconConfig::default(),
         };
         let mut ctx = AppContext::new(
             config,

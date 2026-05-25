@@ -1,0 +1,45 @@
+{
+  "lexicon": 1,
+  "id": "tools.aurora.lexicon.fetchNow",
+  "description": "Arc 17 §17.3.7 — force a synchronous fetch + parse + cache write for an NSID. Operators use this as the warm-up affordance §17.5.1 points at: run for each NSID in the post-restart warm-up script so the first user request doesn't pay the cold-fetch latency. Auth: AdminAll scope. On fetch failure, surfaces the typed Arc 17 §17.3.6 error (HTTP 502 / 400 / 500 per §17.3.6 wire-format mapping).",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["nsid"],
+          "properties": {
+            "nsid": {
+              "type": "string",
+              "description": "The NSID to fetch and cache. Must be a valid ATProto NSID (≥3 segments, each `[a-z][a-z0-9-]*[a-z0-9]`)."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["entry"],
+          "properties": {
+            "entry": {
+              "type": "ref",
+              "ref": "tools.aurora.lexicon.getCacheState#cacheEntry"
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "LexiconDisabled" },
+        { "name": "LexiconFetchFailed" },
+        { "name": "LexiconAuthorityAmbiguous" },
+        { "name": "LexiconAuthorityTombstoned" },
+        { "name": "LexiconAuthorityMismatch" },
+        { "name": "LexiconInvalidSchema" },
+        { "name": "LexiconInvalidNsid" }
+      ]
+    }
+  }
+}

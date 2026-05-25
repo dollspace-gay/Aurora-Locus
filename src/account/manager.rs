@@ -27,6 +27,28 @@ fn opt_parse_timestamp(s: Option<String>) -> PdsResult<Option<DateTime<Utc>>> {
 }
 
 
+/// Arc 13 §6.3.6 round-4 F2 closure — outcome of
+/// [`AccountManager::consume_plc_operation_token`]. Four variants
+/// for observability; handler dispatch is two-way (`Consumed` →
+/// proceed; everything else → reject as `TokenAlreadyConsumed`).
+#[derive(Debug)]
+pub enum ConsumeResult {
+    /// CAS UPDATE flipped `used: false → true`; the token row
+    /// transitioned because of this call.
+    Consumed,
+    /// CAS UPDATE found zero rows but a follow-up SELECT shows
+    /// the token exists and was already used.
+    AlreadyConsumed,
+    /// CAS UPDATE found zero rows and a follow-up SELECT shows
+    /// no matching token row. Effectively impossible if
+    /// `validate_plc_operation_token` succeeded immediately
+    /// before; logged at warn if seen.
+    NotFound,
+    /// Database-layer failure on either the UPDATE or the
+    /// follow-up SELECT.
+    Error(PdsError),
+}
+
 /// Account manager service
 pub struct AccountManager {
     db: AnyPool,
@@ -49,6 +71,7 @@ impl AccountManager {
         email: Option<String>,
         password: String,
         invite_code: Option<String>,
+        recovery_key: Option<String>,
     ) -> PdsResult<ActorAccount> {
         // Validate invite code if required
         if self.config.invites.required {
@@ -85,9 +108,14 @@ impl AccountManager {
         let password_hash = crate::auth::PasswordHasher::hash(&password)
             .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
 
-        // Generate DID with PLC registration
-        let (did, plc_key, plc_key_public, plc_operation_cid) =
-            self.generate_plc_did(&handle).await?;
+        // Generate DID with PLC registration. Arc 13 §6.3.2 +
+        // §6.3.3: returns the per-actor atproto signing key (NOT a
+        // per-account rotation key). The per-account recovery_key
+        // (when supplied) goes into rotation_keys[0] per §6.3.3
+        // priority order.
+        let (did, atproto_signing_key_hex, atproto_public_key_hex, plc_operation_cid) =
+            self.generate_plc_did(&handle, recovery_key.as_deref()).await?;
+        let _ = atproto_public_key_hex; // currently unused at insert site
 
         let now = Utc::now();
 
@@ -118,15 +146,19 @@ impl AccountManager {
         .await
         .map_err(PdsError::Database)?;
 
-        // Insert into plc_keys table (cryptographic material)
+        // Insert into plc_keys table (cryptographic material).
+        // Arc 13 §6.4 Step 0.7.1: `rotation_key` +
+        // `rotation_key_public` columns dropped — the PDS-wide
+        // rotation key lives in config, not per-account state.
+        // Only the per-actor atproto signing key returned from
+        // `generate_plc_did` is persisted here.
         sqlx::query(
-            "INSERT INTO plc_keys (did, rotation_key, rotation_key_public, last_operation_cid)
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO plc_keys (did, last_operation_cid, atproto_signing_key)
+             VALUES ($1, $2, $3)",
         )
         .bind(&did)
-        .bind(&plc_key)
-        .bind(&plc_key_public)
         .bind(&plc_operation_cid)
+        .bind(&atproto_signing_key_hex)
         .execute(&mut *tx)
         .await
         .map_err(PdsError::Database)?;
@@ -150,6 +182,8 @@ impl AccountManager {
             takedown_ref: None,
             deactivated_at: None,
             delete_after: None,
+            suspended_at: None,
+            desynchronized_at: None,
             // Account fields
             email,
             password_hash: Some(password_hash),
@@ -453,10 +487,31 @@ impl AccountManager {
     /// Get account by DID
     ///
     /// Joins actor and account tables to get complete actor information.
+    /// Arc 15 §8.3.8 / Step 6: load the actor's `atproto_signing_key`
+    /// (per Arc 13 §6.3.2 key separation) from `plc_keys`. Used by
+    /// `create_account_emit_sequence` to construct the genesis-commit
+    /// Signer. Returns the 32-byte private-key bytes (decoded from
+    /// hex). Errors if the row is missing or the hex is malformed.
+    pub async fn get_atproto_signing_key_bytes(&self, did: &str) -> PdsResult<Vec<u8>> {
+        let row = sqlx::query("SELECT atproto_signing_key FROM plc_keys WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(PdsError::Database)?
+            .ok_or_else(|| {
+                PdsError::NotFound(format!("plc_keys row missing for did={}", did))
+            })?;
+        let hex_key: String = row.try_get("atproto_signing_key").map_err(PdsError::Database)?;
+        hex::decode(&hex_key).map_err(|e| {
+            PdsError::Internal(format!("atproto_signing_key for {} is malformed hex: {}", did, e))
+        })
+    }
+
     pub async fn get_account(&self, did: &str) -> PdsResult<ActorAccount> {
         let row = sqlx::query(
             "SELECT
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                a.suspended_at, a.desynchronized_at,
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              LEFT JOIN account ac ON a.did = ac.did
@@ -476,6 +531,9 @@ impl AccountManager {
             takedown_ref: row.get("takedown_ref"),
             deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
             delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+            // Arc 14 §7.3.6: suspended/desynchronized timestamps.
+            suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+            desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
             // Account fields (may be None for federated actors)
             email: row.get("email"),
             password_hash: row.get("password_hash"),
@@ -522,6 +580,7 @@ impl AccountManager {
         let row = sqlx::query(
             "SELECT
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                a.suspended_at, a.desynchronized_at,
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              LEFT JOIN account ac ON a.did = ac.did
@@ -541,6 +600,8 @@ impl AccountManager {
             takedown_ref: row.get("takedown_ref"),
             deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
             delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+            suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+            desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
             // Account fields (may be None for federated actors)
             email: row.get("email"),
             password_hash: row.get("password_hash"),
@@ -556,6 +617,7 @@ impl AccountManager {
         let row = sqlx::query(
             "SELECT
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                a.suspended_at, a.desynchronized_at,
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              INNER JOIN account ac ON a.did = ac.did
@@ -575,6 +637,8 @@ impl AccountManager {
             takedown_ref: row.get("takedown_ref"),
             deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
             delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+            suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+            desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
             // Account fields
             email: row.get("email"),
             password_hash: row.get("password_hash"),
@@ -710,36 +774,98 @@ impl AccountManager {
     /// Generate a PLC DID and register it with the PLC Directory
     ///
     /// Returns: (did, rotation_key_hex, rotation_key_public_hex, operation_cid)
-    async fn generate_plc_did(&self, handle: &str) -> PdsResult<(String, String, String, String)> {
-        use crate::crypto::plc::{register_plc_did, PlcOperationBuilder, PlcSigner};
+    async fn generate_plc_did(
+        &self,
+        handle: &str,
+        recovery_key: Option<&str>,
+    ) -> PdsResult<(String, String, String, String)> {
+        use crate::crypto::plc::{
+            compute_op_cid, derive_did_suffix, register_plc_did, PlcOperationBuilder, PlcSigner,
+            ServiceEntry,
+        };
         use rand::RngCore;
-        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
 
-        // Generate a random 32-byte private key for PLC rotation
-        let mut private_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut private_key);
-        let private_key_hex = hex::encode(private_key);
+        // §6.3.7 + §6.6.6 — hard-fail on PLC registration failure.
+        // In #[cfg(test)] builds we short-circuit the actual PLC
+        // HTTP call so unit tests that need accounts (~22 tests
+        // pre-Step-5 relied on the silent did:web fallback) don't
+        // require a running mock PLC directory. The hard-fail
+        // behavior itself is verified by Phase B Scenario 6
+        // (§6.8.2) which is operator-driven.
+        #[cfg(test)]
+        let test_short_circuit_did_plc_url = {
+            // If the test fixture points at the prod PLC URL,
+            // synthesize a fake DID + signing key. Real PLC tests
+            // (Scenario 6) point at an unreachable URL and assert
+            // the hard-fail error explicitly via the production
+            // path (no #[cfg(test)] short-circuit applies).
+            //
+            // Treat https://plc.directory and 127.0.0.1:0 as
+            // "synthesize" markers; any other URL goes through
+            // the real path.
+            let url = self.config.identity.did_plc_url.as_str();
+            url == "https://plc.directory" || url.contains("127.0.0.1:0")
+        };
+        #[cfg(test)]
+        if test_short_circuit_did_plc_url {
+            let mut atproto_private_key = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut atproto_private_key);
+            let atproto_signing_key_hex = hex::encode(atproto_private_key);
+            let atproto_signer = PlcSigner::new(&atproto_private_key)?;
+            let atproto_public_key_hex = atproto_signer.public_key_hex();
+            // Synthesize a stable-shape DID for test fixtures.
+            let synthetic_suffix: String = atproto_public_key_hex
+                .chars()
+                .take(24)
+                .collect();
+            let did = format!("did:plc:{}", synthetic_suffix);
+            let _ = recovery_key;
+            let _ = handle;
+            return Ok((
+                did,
+                atproto_signing_key_hex,
+                atproto_public_key_hex,
+                String::new(),
+            ));
+        }
 
-        // Create PLC signer
-        let signer = PlcSigner::new(&private_key)?;
-        let public_key_hex = signer.public_key_hex();
+        // §6.3.2 key separation: the PDS-wide rotation key signs
+        // every account's genesis op (and every later update op).
+        // It comes from `config.authentication.plc_rotation_key`
+        // — one key per PDS deployment, loaded once at startup,
+        // shared across every account. Its `did:key` URI is what
+        // ends up in `rotation_keys[N-1]` so the signer's key
+        // satisfies the spec-required invariant from chainlink
+        // #61 §1.4.5.
+        let rotation_signer =
+            PlcSigner::from_hex(&self.config.authentication.plc_rotation_key)?;
+        let rotation_did_key = rotation_signer.public_key_did_key();
 
-        // Generate DID from hash of public key (PLC method)
-        // did:plc uses base32-encoded hash of the genesis operation
-        let mut hasher = Sha256::new();
-        hasher.update(&public_key_hex);
-        let hash = hasher.finalize();
+        // §6.3.2 key separation: the per-actor atproto signing key
+        // is a *separate* fresh ES256K key, generated here per
+        // account. Its `did:key` URI goes into
+        // `verification_methods["atproto"]` and it's stored in
+        // `plc_keys.atproto_signing_key` for later use by
+        // `entryway_auth_headers` (Arc 12 §5.3.5) + repo commit
+        // signing.
+        let mut atproto_private_key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut atproto_private_key);
+        let atproto_signing_key_hex = hex::encode(atproto_private_key);
+        let atproto_signer = PlcSigner::new(&atproto_private_key)?;
+        let atproto_public_key_hex = atproto_signer.public_key_hex();
+        let atproto_did_key = atproto_signer.public_key_did_key();
 
-        // Use full hash and encode as base32 lowercase (RFC4648, no padding), then truncate to 24 chars
-        // This follows the PLC spec: did:plc:${base32Encode(sha256(createOp)).slice(0,24)}
-        let base32_hash = base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, &hash);
-        let did_suffix = &base32_hash[..24]; // Truncate to 24 characters
-        let did = format!("did:plc:{}", did_suffix);
+        // Arc 12 §5.3.2 Gap 1 closure: read effective_public_url()
+        // so localhost / explicit PDS_SERVICE_PUBLIC_URL deployments
+        // produce the correct scheme + port rather than baking
+        // `https://hostname` (no port) into the immutable PLC
+        // genesis op CBOR.
+        let service_url = self.config.service.effective_public_url();
 
-        // Build PLC operation
-        let service_url = format!("https://{}", self.config.service.hostname);
-
-        // Check if handle already includes the domain
+        // Handle-to-full-handle. (#69 will fix the double-dot bug
+        // where service_handle_domains entries with leading-dot
+        // produce malformed `usera..localhost` shapes.)
         let full_handle = if handle.contains('.')
             && self
                 .config
@@ -748,73 +874,114 @@ impl AccountManager {
                 .iter()
                 .any(|d| handle.ends_with(d))
         {
-            // Handle is already full (e.g., "test.locus.dollsky.social")
             handle.to_string()
         } else {
-            // Handle needs domain appended (e.g., "test" -> "test.locus.dollsky.social")
             format!(
                 "{}.{}",
                 handle, self.config.identity.service_handle_domains[0]
             )
         };
 
-        let services = serde_json::json!([{
-            "id": "#atproto_pds",
-            "type": "AtprotoPersonalDataServer",
-            "serviceEndpoint": service_url
-        }]);
+        // Arc 13 §6.3.1 wire-shape: services as map keyed by
+        // service name (`atproto_pds`), verification_methods as
+        // map keyed by purpose name (`atproto`), rotation_keys
+        // as plain Vec.
+        let mut services = BTreeMap::new();
+        services.insert(
+            "atproto_pds".to_string(),
+            ServiceEntry {
+                type_: "AtprotoPersonalDataServer".to_string(),
+                endpoint: service_url,
+            },
+        );
 
-        // Get proper multibase encoding for public key
-        let public_key_multibase = signer.public_key_multibase();
-        let public_key_did_key = signer.public_key_did_key();
+        // §6.3.2 mapping: verification_methods["atproto"] points
+        // at the per-actor signing key (NOT the rotation key).
+        let mut verification_methods = BTreeMap::new();
+        verification_methods.insert("atproto".to_string(), atproto_did_key);
 
-        let verification_methods = serde_json::json!([{
-            "id": format!("{}#atproto", did),
-            "type": "Multikey",
-            "controller": did.clone(),
-            "publicKeyMultibase": public_key_multibase
-        }]);
+        // §6.3.3 Step 2.3 priority order: rotation_keys =
+        // [input.recovery_key?, config.recovery_did_key?,
+        //  config.plc_rotation_key.did_key()].
+        // Earlier entries in the list have higher rotation
+        // authority (operator/account-owned recovery keys can
+        // override the PDS server's signing).
+        let mut rotation_keys: Vec<String> = Vec::with_capacity(3);
+        if let Some(per_account) = recovery_key {
+            let trimmed = per_account.trim();
+            if !trimmed.is_empty() {
+                rotation_keys.push(trimmed.to_string());
+            }
+        }
+        if let Some(pds_recovery) = &self.config.identity.recovery_did_key {
+            if !pds_recovery.is_empty() {
+                rotation_keys.push(pds_recovery.clone());
+            }
+        }
+        rotation_keys.push(rotation_did_key);
 
-        let also_known_as = vec![format!("at://{}", full_handle)];
-
-        let operation = PlcOperationBuilder::new()
-            .did(did.clone())
-            .rotation_keys(vec![public_key_did_key])
-            .also_known_as(also_known_as)
-            .services(services)
+        let unsigned = PlcOperationBuilder::new()
+            .rotation_keys(rotation_keys)
             .verification_methods(verification_methods)
+            .also_known_as(vec![format!("at://{}", full_handle)])
+            .services(services)
             .build()?;
 
-        // Sign the operation
-        let signed_operation = signer.sign_operation(operation)?;
+        // §6.3.1 / Step 0.6.1: DID suffix is SHA-256 of canonical
+        // DAG-CBOR of unsigned op, base32-lower (no padding), first
+        // 24 chars.
+        let did_suffix = derive_did_suffix(&unsigned)?;
+        let did = format!("did:plc:{}", did_suffix);
 
-        // Get PLC directory URL from config or use default
+        // §6.3.2: the PDS-wide rotation key signs (its `did:key`
+        // is in `rotation_keys[0]`, satisfying chainlink #61 §1.4.5
+        // signer-in-rotation-keys invariant).
+        let signed_operation = rotation_signer.sign_operation(unsigned)?;
+
         let plc_url = self.config.identity.did_plc_url.as_str();
 
-        // Register with PLC directory
-        match register_plc_did(plc_url, signed_operation.clone()).await {
+        match register_plc_did(plc_url, &did, signed_operation.clone()).await {
             Ok(_) => {
                 tracing::info!("Successfully registered DID with PLC directory: {}", did);
 
-                // For operation CID, we'll use a simplified hash of the operation
-                // In production, this should be a proper CID
-                let operation_json = serde_json::to_string(&signed_operation).unwrap_or_default();
-                let mut cid_hasher = Sha256::new();
-                cid_hasher.update(operation_json.as_bytes());
-                let cid_hash = cid_hasher.finalize();
-                let operation_cid = format!("bafyrei{}", hex::encode(&cid_hash[..16]));
+                // §6.3.1 / Step 0.6.2: CID over canonical DAG-CBOR
+                // of signed op (the proper PLC-spec CID).
+                let operation_cid = compute_op_cid(&signed_operation)?;
 
-                Ok((did, private_key_hex, public_key_hex, operation_cid))
+                // Return shape: (did, atproto_signing_key_hex,
+                // atproto_public_key_hex, operation_cid). The
+                // rotation key isn't returned — it's the PDS-wide
+                // key, stored in config, not per-account state.
+                Ok((
+                    did,
+                    atproto_signing_key_hex,
+                    atproto_public_key_hex,
+                    operation_cid,
+                ))
             }
             Err(e) => {
-                tracing::warn!(
-                    "Failed to register DID with PLC directory: {}. Falling back to did:web",
-                    e
+                // §6.3.7 / §6.4 Step 5 — hard-fail. Silent
+                // did:web fallback removed. PLC directory
+                // unreachable → no account creation succeeds.
+                //
+                // Partial-state cleanup: generate_plc_did is
+                // called BEFORE create_account opens its
+                // transaction (line 88-89 of create_account),
+                // so no DB rows have been inserted at this
+                // point. The early return from create_account
+                // leaves no partial actor state to clean up.
+                // The PDS-wide rotation key is unaffected (it's
+                // config-resident, not allocated here). The
+                // per-actor atproto_signing_key generated above
+                // is in stack memory only; dropped when the
+                // function returns.
+                tracing::error!(
+                    did = %did,
+                    handle = %full_handle,
+                    error = %e,
+                    "PLC directory registration failed; hard-failing account creation per §6.3.7"
                 );
-                // Fallback to did:web if PLC registration fails
-                // full_handle is already constructed above (line 463)
-                let did_web = format!("did:web:{}", full_handle);
-                Ok((did_web, private_key_hex, public_key_hex, "".to_string()))
+                Err(e)
             }
         }
     }
@@ -840,8 +1007,21 @@ impl AccountManager {
             exp: now + 3600, // 1 hour
         };
 
+        // Arc 12 §5.4 Step 0.6.2: include kid="aurora-local-v1"
+        // in JWT header so tuple-routing per §5.3.3 can route
+        // local-mint tokens to the local-verify path
+        // unambiguously. Pre-Step-0.6 kid-less tokens still
+        // route to local-verify by HS256+kid-absent rule per
+        // §5.3.3 tuple table; the kid here makes the routing
+        // explicit + tracks issuance for future revocation
+        // surfaces (§5.5.2).
+        let header = Header {
+            kid: Some("aurora-local-v1".to_string()),
+            ..Header::default()
+        };
+
         let token = encode(
-            &Header::default(),
+            &header,
             &claims,
             &EncodingKey::from_secret(self.config.authentication.jwt_secret.as_bytes()),
         )
@@ -971,7 +1151,9 @@ impl AccountManager {
 
         let did: String = row.try_get("did")?;
         let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
-        let used: bool = row.try_get("used")?;
+        // chainlink #74 / #86: sqlx::Any bool/BIGINT mismatch fix —
+        // same pattern as #71 closure for validate_plc_operation_token.
+        let used: bool = crate::db::read_bool(&row, "used")?;
 
         // Check if already used
         if used {
@@ -1108,7 +1290,8 @@ impl AccountManager {
 
         let did: String = row.try_get("did")?;
         let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
-        let used: bool = row.try_get("used")?;
+        // chainlink #74 / #86: sqlx::Any bool/BIGINT mismatch fix.
+        let used: bool = crate::db::read_bool(&row, "used")?;
 
         // Check if already used
         if used {
@@ -1158,6 +1341,160 @@ impl AccountManager {
         tracing::info!("Password reset successful for DID: {}", did);
 
         Ok(())
+    }
+
+    // ============================================================
+    // Arc 13 §6.3.6 + Step 3.1 — `plc_operation` email-token surface.
+    // Three helpers paired with §6.3.6 two-phase flow: validate-only
+    // first (no consume), build + sign the op, then CAS-style
+    // consume. Pattern follows existing per-purpose email-token
+    // helpers (chainlink #62 Case B confirmation).
+    // ============================================================
+
+    /// Generate a `plc_operation` email token. TTL = 30 minutes per
+    /// §6.3.6 (matches bsky-PDS pattern). Single-use; cleaned up at
+    /// consume time via the CAS UPDATE in [`consume_plc_operation_token`].
+    pub async fn generate_plc_operation_token(&self, did: &str) -> PdsResult<String> {
+        let token = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let expires_at = now + Duration::minutes(30);
+
+        sqlx::query(
+            r#"
+            INSERT INTO email_token (token, did, purpose, created_at, expires_at, used)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(&token)
+        .bind(did)
+        .bind("plc_operation")
+        .bind(now.to_rfc3339())
+        .bind(expires_at.to_rfc3339())
+        .bind(false)
+        .execute(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        Ok(token)
+    }
+
+    /// §6.3.6 two-phase step 2: validate-only, **NO consume**. On
+    /// success the token row remains untouched so a transient
+    /// failure between validate and consume (e.g., transient PLC
+    /// directory outage at step 3) leaves the token intact for
+    /// retry.
+    ///
+    /// Fails with `PdsError::Authentication("InvalidToken: ...")` on
+    /// missing token, mismatched DID, already-used, or expired. The
+    /// `InvalidToken` prefix in the message lets the handler map
+    /// uniformly to HTTP 400 `InvalidToken` without dispatching on
+    /// the inner cause (cause is logged at debug for observability).
+    pub async fn validate_plc_operation_token(
+        &self,
+        did: &str,
+        token: &str,
+    ) -> PdsResult<()> {
+        let now = Utc::now();
+        let row = sqlx::query(
+            r#"
+            SELECT token, did, purpose, expires_at, used
+            FROM email_token
+            WHERE token = $1 AND purpose = 'plc_operation'
+            "#,
+        )
+        .bind(token)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?
+        .ok_or_else(|| {
+            PdsError::Authentication("InvalidToken: no matching plc_operation token".to_string())
+        })?;
+
+        let token_did: String = row.try_get("did")?;
+        let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
+        // chainlink #71 — must use crate::db::read_bool, NOT
+        // row.try_get::<bool, _>. SQLite stores BOOLEAN as
+        // BIGINT 0/1 and sqlx::Any's try_get<bool> errors with
+        // "mismatched types; Rust type 'bool' is not compatible
+        // with SQL type 'BIGINT'". read_bool dispatches on the
+        // backend. Pre-#71 this surfaced as a generic HTTP 500
+        // in sign_plc_operation since the handler propagated
+        // PdsError::Database without observable cause.
+        let used: bool = crate::db::read_bool(&row, "used")?;
+
+        if token_did != did {
+            return Err(PdsError::Authentication(
+                "InvalidToken: token DID does not match authenticated user".to_string(),
+            ));
+        }
+        if used {
+            return Err(PdsError::Authentication(
+                "InvalidToken: plc_operation token has already been used".to_string(),
+            ));
+        }
+        if now > expires_at {
+            return Err(PdsError::Authentication(
+                "InvalidToken: plc_operation token has expired".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// §6.3.6 two-phase step 7: CAS-style consume. Single atomic
+    /// UPDATE flips `used: false → true` and reports whether the
+    /// row was the one to make the transition. Two simultaneous
+    /// calls with the same token race: exactly one returns
+    /// `Consumed`; the other returns `AlreadyConsumed`. No double-
+    /// consume is possible.
+    ///
+    /// Per round-4 F2 closure (§6.3.6 enum semantics): CAS UPDATE
+    /// returns zero affected rows for BOTH `AlreadyConsumed` AND
+    /// `NotFound`. We do a follow-up SELECT for logging
+    /// distinguishability only — both map to `TokenAlreadyConsumed`
+    /// (HTTP 409) on the wire. In practice `NotFound` is impossible
+    /// if [`validate_plc_operation_token`] succeeded immediately
+    /// before, but distinguishing logs help debug if the assumption
+    /// is ever violated.
+    pub async fn consume_plc_operation_token(
+        &self,
+        did: &str,
+        token: &str,
+    ) -> ConsumeResult {
+        let result = sqlx::query(
+            r#"
+            UPDATE email_token
+            SET used = true
+            WHERE token = $1
+              AND did = $2
+              AND purpose = 'plc_operation'
+              AND used = false
+            "#,
+        )
+        .bind(token)
+        .bind(did)
+        .execute(&self.db)
+        .await;
+
+        let exec = match result {
+            Ok(e) => e,
+            Err(e) => return ConsumeResult::Error(PdsError::Database(e)),
+        };
+
+        if exec.rows_affected() >= 1 {
+            return ConsumeResult::Consumed;
+        }
+
+        // Disambiguate AlreadyConsumed vs NotFound for logging.
+        let probe = sqlx::query("SELECT used FROM email_token WHERE token = $1 AND purpose = 'plc_operation'")
+            .bind(token)
+            .fetch_optional(&self.db)
+            .await;
+        match probe {
+            Ok(Some(_)) => ConsumeResult::AlreadyConsumed,
+            Ok(None) => ConsumeResult::NotFound,
+            Err(e) => ConsumeResult::Error(PdsError::Database(e)),
+        }
     }
 
     /// Generate account deletion token
@@ -1210,9 +1547,41 @@ impl AccountManager {
         .map_err(PdsError::Database)?
         .ok_or_else(|| PdsError::Validation("Invalid deletion token".to_string()))?;
 
-        let token_did: String = row.try_get("did")?;
-        let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
-        let used: bool = row.try_get("used")?;
+        let token_did: String = row.try_get("did").map_err(|e| {
+            tracing::error!(
+                at_step = "validate_account_delete_token:read_did",
+                error = %e,
+                "deleteAccount validator: failed to read 'did' column"
+            );
+            PdsError::Database(e)
+        })?;
+        let expires_at_str: String = row.try_get("expires_at").map_err(|e| {
+            tracing::error!(
+                at_step = "validate_account_delete_token:read_expires_at",
+                error = %e,
+                "deleteAccount validator: failed to read 'expires_at' column"
+            );
+            PdsError::Database(e)
+        })?;
+        let expires_at: DateTime<Utc> = parse_timestamp(&expires_at_str).map_err(|e| {
+            tracing::error!(
+                at_step = "validate_account_delete_token:parse_expires_at",
+                error = %e,
+                "deleteAccount validator: failed to parse 'expires_at' timestamp"
+            );
+            e
+        })?;
+        // chainlink #86 / #74: sqlx::Any does not auto-coerce bool ↔
+        // SQLite BIGINT; route through crate::db::read_bool. Same fix
+        // pattern as #71 for validate_plc_operation_token.
+        let used: bool = crate::db::read_bool(&row, "used").map_err(|e| {
+            tracing::error!(
+                at_step = "validate_account_delete_token:read_used",
+                error = %e,
+                "deleteAccount validator: failed to read 'used' column"
+            );
+            e
+        })?;
 
         // Verify token is for the correct DID
         if token_did != did {
@@ -1301,7 +1670,8 @@ impl AccountManager {
 
         let token_did: String = row.try_get("did")?;
         let expires_at: DateTime<Utc> = parse_timestamp(&row.try_get::<String, _>("expires_at")?)?;
-        let used: bool = row.try_get("used")?;
+        // chainlink #74 / #86: sqlx::Any bool/BIGINT mismatch fix.
+        let used: bool = crate::db::read_bool(&row, "used")?;
 
         if token_did != did {
             return Err(PdsError::Validation(
@@ -1392,20 +1762,6 @@ impl AccountManager {
             "account_email_updated"
         );
 
-        Ok(())
-    }
-
-    /// Update account password (admin operation)
-    ///
-    /// Updates the password for an account. This is an admin operation that
-    /// bypasses the normal password reset flow. All sessions are invalidated
-    /// as a security measure.
-    pub async fn update_password(&self, did: &str, new_password: &str) -> PdsResult<()> {
-        let password_hash = crate::auth::PasswordHasher::hash(new_password)
-            .map_err(|e| PdsError::Internal(format!("Password hashing failed: {}", e)))?;
-        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
-        Self::update_password_hash_in_tx(&mut tx, did, &password_hash).await?;
-        tx.commit().await.map_err(PdsError::Database)?;
         Ok(())
     }
 
@@ -1606,19 +1962,12 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Takedown an account (remove from public view)
-    ///
-    /// Sets the takedown_ref field and revokes all active sessions and refresh tokens
-    /// in a single transaction for consistency. This ensures that a taken-down account
-    /// cannot continue to use the service.
-    ///
-    /// # Arguments
-    /// * `did` - The DID of the account to take down
-    /// * `takedown_ref` - A reference string identifying the takedown action (moderation ID, reason code, etc.)
-    ///
-    /// # Returns
-    /// * `Ok(())` if the takedown was successful
-    /// * `Err(PdsError)` if the account doesn't exist or database operation fails
+    /// Takedown an account (remove from public view). Begins its own
+    /// transaction; production handlers should prefer
+    /// `takedown_account_in_tx` so the chain-entry write rides the
+    /// caller's transaction. Consumed by `#[cfg(test)]` sites in
+    /// `src/api/admin.rs` for handler-level coverage.
+    #[allow(dead_code)]
     pub async fn takedown_account(&self, did: &str, takedown_ref: &str) -> PdsResult<()> {
         let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
         Self::takedown_account_in_tx(&mut tx, did, takedown_ref).await?;
@@ -1668,24 +2017,6 @@ impl AccountManager {
             takedown_ref
         );
 
-        Ok(())
-    }
-
-    /// Activate an account (restore from takedown)
-    ///
-    /// Clears the takedown_ref field, making the account accessible again.
-    /// Note: This does NOT restore sessions - the user will need to log in again.
-    ///
-    /// # Arguments
-    /// * `did` - The DID of the account to activate
-    ///
-    /// # Returns
-    /// * `Ok(())` if the activation was successful
-    /// * `Err(PdsError)` if the account doesn't exist or database operation fails
-    pub async fn activate_account(&self, did: &str) -> PdsResult<()> {
-        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
-        Self::activate_account_in_tx(&mut tx, did).await?;
-        tx.commit().await.map_err(PdsError::Database)?;
         Ok(())
     }
 
@@ -2208,20 +2539,6 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Allocate invite codes to an account (periodic allocation)
-    ///
-    /// This can be called periodically (e.g., weekly) to give users new invite codes
-    /// based on the configuration.
-    /// Enable invite code creation for an account
-    ///
-    /// Allows the account to create and use invite codes.
-    pub async fn enable_account_invites(&self, did: &str) -> PdsResult<()> {
-        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
-        Self::enable_account_invites_in_tx(&mut tx, did).await?;
-        tx.commit().await.map_err(PdsError::Database)?;
-        Ok(())
-    }
-
     /// Enable invite code creation for an account inside an existing
     /// transaction. LB-1 / chainlink #122 atomic-with-chain entry point.
     pub async fn enable_account_invites_in_tx<'c>(
@@ -2242,9 +2559,12 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Disable invite code creation for an account
-    ///
-    /// Prevents the account from creating new invite codes.
+    /// Disable invite code creation for an account. Begins its own
+    /// transaction; production handlers should prefer
+    /// `disable_account_invites_in_tx` so the chain-entry write rides
+    /// the caller's transaction. Consumed by `#[cfg(test)]` sites in
+    /// `src/api/admin.rs` for handler-level coverage.
+    #[allow(dead_code)]
     pub async fn disable_account_invites(&self, did: &str) -> PdsResult<()> {
         let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
         Self::disable_account_invites_in_tx(&mut tx, did).await?;
@@ -2321,6 +2641,7 @@ impl AccountManager {
         let mut sql = String::from(
             "SELECT
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                a.suspended_at, a.desynchronized_at,
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
              FROM actor a
              LEFT JOIN account ac ON a.did = ac.did
@@ -2354,6 +2675,8 @@ impl AccountManager {
                 takedown_ref: row.get("takedown_ref"),
                 deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
                 delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+                suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+                desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
                 email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
@@ -2373,6 +2696,7 @@ impl AccountManager {
             sqlx::query(
                 "SELECT
                     a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                    a.suspended_at, a.desynchronized_at,
                     ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
                  FROM actor a
                  LEFT JOIN account ac ON a.did = ac.did
@@ -2389,6 +2713,7 @@ impl AccountManager {
             sqlx::query(
                 "SELECT
                     a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
+                    a.suspended_at, a.desynchronized_at,
                     ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled
                  FROM actor a
                  LEFT JOIN account ac ON a.did = ac.did
@@ -2411,6 +2736,8 @@ impl AccountManager {
                 takedown_ref: row.get("takedown_ref"),
                 deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
                 delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+                suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+                desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
                 // Account fields (may be None for federated actors)
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
@@ -2456,6 +2783,7 @@ impl AccountManager {
         let mut sql = String::from(
             "SELECT \
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after, \
+                a.suspended_at, a.desynchronized_at, \
                 ac.email, ac.password_hash, ac.email_confirmed_at, ac.invites_disabled \
              FROM actor a \
              LEFT JOIN account ac ON a.did = ac.did",
@@ -2536,6 +2864,8 @@ impl AccountManager {
                 takedown_ref: row.get("takedown_ref"),
                 deactivated_at: opt_parse_timestamp(row.get::<Option<String>, _>("deactivated_at"))?,
                 delete_after: opt_parse_timestamp(row.get::<Option<String>, _>("delete_after"))?,
+                suspended_at: opt_parse_timestamp(row.get::<Option<String>, _>("suspended_at"))?,
+                desynchronized_at: opt_parse_timestamp(row.get::<Option<String>, _>("desynchronized_at"))?,
                 email: row.get("email"),
                 password_hash: row.get("password_hash"),
                 email_confirmed_at: opt_parse_timestamp(
@@ -2621,6 +2951,12 @@ mod tests {
                 service_did: "did:web:localhost".to_string(),
                 version: "0.1.0".to_string(),
                 blob_upload_limit: 5242880,
+                public_url: None,
+                max_blob_fetch_size: 50_000_000,
+                blob_fetch_timeout_seconds: 30,
+                blob_fetch_max_retries: 3,
+                accepting_imports: true,
+                max_import_size: None,
             },
             storage: StorageConfig {
                 data_directory: PathBuf::from("./data"),
@@ -2637,7 +2973,7 @@ mod tests {
             authentication: AuthConfig {
                 jwt_secret: "test-secret-key-for-testing-only".to_string(),
                 repo_signing_key: "test-key".to_string(),
-                plc_rotation_key: "test-rotation-key".to_string(),
+                plc_rotation_key: "b".repeat(64),
                 oauth: crate::config::OAuthConfig {
                     client_id: "test-client".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -2652,6 +2988,7 @@ mod tests {
                 service_handle_domains: vec!["localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {
@@ -2675,11 +3012,15 @@ mod tests {
                 crawl_enabled: false,
                 public_url: None,
                 auto_stream_events: false,
+                peer_pds: vec![],
             },
             validation_mode: crate::validation::ValidationMode::Optimistic,
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            blob_metadata: Default::default(),
+            entryway: None,
+            lexicon: crate::config::LexiconConfig::default(),
         });
 
         AccountManager::new(db, config)
@@ -2862,6 +3203,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -2902,6 +3244,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -2935,6 +3278,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -2986,6 +3330,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3013,6 +3358,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3072,6 +3418,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3098,6 +3445,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3125,6 +3473,7 @@ mod tests {
                 Some("test@example.com".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3167,7 +3516,7 @@ mod tests {
 
         // Create test account
         let account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3199,12 +3548,12 @@ mod tests {
 
         // Create two accounts
         let _account1 = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
         let account2 = manager
-            .create_account("bob".to_string(), None, "password456".to_string(), None)
+            .create_account("bob".to_string(), None, "password456".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3230,7 +3579,7 @@ mod tests {
 
         // Create test account
         let account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3250,7 +3599,7 @@ mod tests {
 
         // Create test account
         let account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3278,7 +3627,7 @@ mod tests {
     async fn takedown_account_in_tx_rolls_back_on_caller_rollback() {
         let manager = setup_test_db().await;
         let account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3317,7 +3666,7 @@ mod tests {
     async fn takedown_account_in_tx_commits_on_caller_commit() {
         let manager = setup_test_db().await;
         let account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
 
@@ -3345,6 +3694,7 @@ mod tests {
                 Some("alice@old.example".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3386,6 +3736,7 @@ mod tests {
                 Some("alice@example".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3395,6 +3746,7 @@ mod tests {
                 Some("bob@example".to_string()),
                 "password456".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3420,7 +3772,7 @@ mod tests {
     async fn update_handle_in_tx_rolls_back_on_caller_rollback() {
         let manager = setup_test_db().await;
         let _account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
         let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
@@ -3441,7 +3793,7 @@ mod tests {
     async fn update_password_in_tx_rolls_back_on_caller_rollback() {
         let manager = setup_test_db().await;
         let _account = manager
-            .create_account("alice".to_string(), None, "original-password".to_string(), None)
+            .create_account("alice".to_string(), None, "original-password".to_string(), None, None)
             .await
             .unwrap();
         let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
@@ -3476,7 +3828,7 @@ mod tests {
     async fn delete_account_permanent_in_tx_rolls_back_on_caller_rollback() {
         let manager = setup_test_db().await;
         let _account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
         let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
@@ -3498,7 +3850,7 @@ mod tests {
     async fn activate_deactivate_reactivate_in_tx_roll_back_on_caller_rollback() {
         let manager = setup_test_db().await;
         let _account = manager
-            .create_account("alice".to_string(), None, "password123".to_string(), None)
+            .create_account("alice".to_string(), None, "password123".to_string(), None, None)
             .await
             .unwrap();
         let did = manager.resolve_at_identifier_to_did("alice").await.unwrap();
@@ -3555,6 +3907,7 @@ mod tests {
                 Some("alice@example".to_string()),
                 "password123".to_string(),
                 None,
+                        None,
             )
             .await
             .unwrap();
@@ -3577,5 +3930,305 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(token_count, 0, "rolled-back tx must not leave a token row");
+    }
+
+    /// Arc 13 §6.4 Step 0.7 — key separation completion.
+    /// New accounts MUST populate `plc_keys.atproto_signing_key`
+    /// with a non-empty value that is byte-distinct from the
+    /// PDS-wide rotation key in config (§6.3.2). The rotation key
+    /// column was dropped in Step 0.7.1; what's stored per-account
+    /// is *only* the per-actor signing key.
+    #[tokio::test]
+    async fn test_create_account_populates_distinct_atproto_signing_key() {
+        let manager = setup_test_db().await;
+
+        let account = manager
+            .create_account(
+                "arc12testuser".to_string(),
+                Some("arc12@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                        None,
+            )
+            .await
+            .expect("create_account");
+
+        let row: (String,) = sqlx::query_as(
+            "SELECT atproto_signing_key FROM plc_keys WHERE did = $1",
+        )
+        .bind(&account.did)
+        .fetch_one(&manager.db)
+        .await
+        .expect("plc_keys row");
+
+        let (atproto_signing_key,) = row;
+        assert!(
+            !atproto_signing_key.is_empty(),
+            "atproto_signing_key must be populated for new accounts"
+        );
+        assert_eq!(
+            atproto_signing_key.len(),
+            64,
+            "atproto_signing_key must be 32-byte hex (64 chars)"
+        );
+        assert!(
+            atproto_signing_key
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "atproto_signing_key must be valid hex"
+        );
+        assert_ne!(
+            atproto_signing_key,
+            manager.config.authentication.plc_rotation_key,
+            "per-actor atproto_signing_key must be byte-distinct from \
+             the PDS-wide rotation key (§6.3.2 key separation)"
+        );
+    }
+
+    /// Arc 18 (chainlink #117 / CF3 recon §G) — `create_actor_signer`
+    /// resolves the PER-ACCOUNT signing key from
+    /// `plc_keys.atproto_signing_key`, NOT the server-wide
+    /// `ctx.config.authentication.repo_signing_key`. Two-account
+    /// roundtrip proves the property:
+    ///
+    /// - Sign the same message with each actor's signer.
+    /// - Signatures MUST differ — if they're equal, the helper fell
+    ///   back to a single global key (Arc 18 regression).
+    ///
+    /// Together with the existing
+    /// `test_create_account_populates_distinct_atproto_signing_key`
+    /// (which proves the column write), this locks in the post-Arc-18
+    /// per-account signing invariant. Phase B Scenario 2 carries the
+    /// integration-level commit-chain-replay validation; this test is
+    /// the focused unit-level check.
+    #[tokio::test]
+    async fn create_actor_signer_resolves_per_account_key_not_global() {
+        use proto_blue::crypto::Signer as _;
+
+        let manager = setup_test_db().await;
+
+        let alice = manager
+            .create_account(
+                "arc18alice".to_string(),
+                Some("alice@arc18.example".to_string()),
+                "alice-password-12345".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create alice");
+        let bob = manager
+            .create_account(
+                "arc18bob".to_string(),
+                Some("bob@arc18.example".to_string()),
+                "bob-password-12345".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create bob");
+
+        let signer_alice = crate::api::repo::create_actor_signer(&manager, &alice.did)
+            .await
+            .expect("alice signer");
+        let signer_bob = crate::api::repo::create_actor_signer(&manager, &bob.did)
+            .await
+            .expect("bob signer");
+
+        let msg = b"arc18-roundtrip-check";
+        let sig_alice = signer_alice.sign(msg).expect("alice sign");
+        let sig_bob = signer_bob.sign(msg).expect("bob sign");
+
+        assert_ne!(
+            sig_alice, sig_bob,
+            "Arc 18 invariant violated: create_actor_signer returned the \
+             same key for two distinct DIDs. Either the helper is reading \
+             a global key (regression to pre-Arc-18 behaviour) or the \
+             per-account keys collided (vanishingly improbable)."
+        );
+
+        // Cross-check: the key resolved for alice's DID matches the column
+        // value populated by alice's create_account, NOT bob's. Proves the
+        // helper is DID-keyed, not e.g. last-account-keyed.
+        let alice_key_bytes = manager
+            .get_atproto_signing_key_bytes(&alice.did)
+            .await
+            .expect("alice key bytes");
+        let alice_kp_from_column =
+            proto_blue::crypto::K256Keypair::from_private_key(&alice_key_bytes)
+                .expect("alice kp from column");
+        let sig_from_column = alice_kp_from_column
+            .sign(msg)
+            .expect("sign with column-derived keypair");
+        assert_eq!(
+            sig_alice, sig_from_column,
+            "create_actor_signer(alice) must produce the same signature as \
+             K256Keypair::from_private_key(plc_keys.atproto_signing_key for alice). \
+             A mismatch means the helper is not reading the published per-account key."
+        );
+    }
+
+    // ============================================================
+    // Arc 13 §6.3.6 / Step 3 / chainlink #71 — end-to-end
+    // validate → consume → re-consume sequence for the
+    // plc_operation email-token surface. Pre-#71 these
+    // helpers had no integration-test coverage; the only
+    // observation was Phase B Scenario 5 surfacing HTTP 500
+    // with no error class.
+    // ============================================================
+
+    #[tokio::test]
+    async fn plc_operation_token_validate_then_consume_returns_consumed() {
+        let manager = setup_test_db().await;
+        let account = manager
+            .create_account(
+                "alicetest".to_string(),
+                Some("alice@local".to_string()),
+                "TestPassword123!".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create_account");
+
+        let token = manager
+            .generate_plc_operation_token(&account.did)
+            .await
+            .expect("generate token");
+        assert!(!token.is_empty());
+
+        // Step 1: validate-only (NO consume).
+        manager
+            .validate_plc_operation_token(&account.did, &token)
+            .await
+            .expect("validate must succeed with fresh token");
+
+        // Step 2: validate AGAIN — should still succeed (token
+        // not consumed yet — two-phase property).
+        manager
+            .validate_plc_operation_token(&account.did, &token)
+            .await
+            .expect("validate-after-validate still succeeds (two-phase preserves token)");
+
+        // Step 3: consume.
+        let result = manager
+            .consume_plc_operation_token(&account.did, &token)
+            .await;
+        assert!(
+            matches!(result, ConsumeResult::Consumed),
+            "first consume must return Consumed; got {:?}",
+            result
+        );
+
+        // Step 4: validate post-consume — should fail (token
+        // marked used).
+        let err = manager
+            .validate_plc_operation_token(&account.did, &token)
+            .await
+            .expect_err("validate-after-consume must fail");
+        assert!(
+            err.to_string().contains("InvalidToken"),
+            "post-consume validate error must contain InvalidToken: {}",
+            err
+        );
+
+        // Step 5: re-consume — must return AlreadyConsumed (per
+        // §6.3.6 round-4 F2 ConsumeResult semantics + §71's
+        // re-call → HTTP 409 expectation).
+        let re_result = manager
+            .consume_plc_operation_token(&account.did, &token)
+            .await;
+        assert!(
+            matches!(re_result, ConsumeResult::AlreadyConsumed),
+            "re-consume must return AlreadyConsumed; got {:?}",
+            re_result
+        );
+    }
+
+    #[tokio::test]
+    async fn plc_operation_token_validate_rejects_unknown_token() {
+        let manager = setup_test_db().await;
+        let account = manager
+            .create_account(
+                "bobtest".to_string(),
+                Some("bob@local".to_string()),
+                "TestPassword123!".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create_account");
+
+        let err = manager
+            .validate_plc_operation_token(&account.did, "garbage-token")
+            .await
+            .expect_err("unknown token must reject");
+        assert!(err.to_string().contains("InvalidToken"));
+    }
+
+    #[tokio::test]
+    async fn plc_operation_token_consume_unknown_returns_not_found() {
+        let manager = setup_test_db().await;
+        let account = manager
+            .create_account(
+                "carolt".to_string(),
+                Some("carol@local".to_string()),
+                "TestPassword123!".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create_account");
+
+        let result = manager
+            .consume_plc_operation_token(&account.did, "never-issued")
+            .await;
+        assert!(
+            matches!(result, ConsumeResult::NotFound),
+            "consume of unknown token must return NotFound; got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn plc_operation_token_validate_rejects_wrong_did() {
+        let manager = setup_test_db().await;
+        let alice = manager
+            .create_account(
+                "alicewrong".to_string(),
+                Some("a@local".to_string()),
+                "TestPassword123!".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create alice");
+        let bob = manager
+            .create_account(
+                "bobwrong".to_string(),
+                Some("b@local".to_string()),
+                "TestPassword123!".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create bob");
+
+        // Token belongs to alice.
+        let token = manager
+            .generate_plc_operation_token(&alice.did)
+            .await
+            .expect("generate token");
+
+        // Bob tries to use it.
+        let err = manager
+            .validate_plc_operation_token(&bob.did, &token)
+            .await
+            .expect_err("wrong-did validation must reject");
+        assert!(
+            err.to_string().contains("InvalidToken"),
+            "wrong-did err: {}",
+            err
+        );
     }
 }

@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use tokio::time::{interval, sleep, Duration};
+use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
 use tracing::{error, info, warn};
 
 pub mod tasks;
@@ -153,6 +153,28 @@ impl JobScheduler {
             );
         } else {
             tracing::debug!("GC sweep job disabled (gc_sweep.enabled = false)");
+        }
+
+        // Arc 16d §9.4.4 Step 3.4: conditional spawn for row-walker.
+        // Independent enable flag (`row_sweep_enabled`) so operators
+        // can run byte-walker without row-walker (or vice versa).
+        // Both walkers safely concurrent per §9.4.3.9 — Arc 10's
+        // byte-walker doesn't touch `blob_metadata`, and Arc 16d's
+        // row-walker doesn't touch `blob`/`temp_blob_metadata`.
+        if self.context.config.gc_sweep.row_sweep_enabled {
+            tokio::spawn(Self::row_sweep_job(Arc::clone(&self)));
+            info!(
+                interval_secs = self.context.config.gc_sweep.interval_secs,
+                dry_run = self.context.config.gc_sweep.dry_run,
+                untethered_ttl_seconds =
+                    self.context.config.gc_sweep.untethered_ttl_seconds,
+                max_deletes_per_run = self.context.config.gc_sweep.max_deletes_per_run,
+                "row-sweep job scheduled (Arc 16d)"
+            );
+        } else {
+            tracing::debug!(
+                "row-sweep job disabled (gc_sweep.row_sweep_enabled = false)"
+            );
         }
 
         info!("Background jobs started");
@@ -306,6 +328,12 @@ impl JobScheduler {
     async fn gc_sweep_job(scheduler: Arc<Self>) {
         let interval_secs = scheduler.context.config.gc_sweep.interval_secs;
         let mut interval = interval(Duration::from_secs(interval_secs));
+        // Arc 16d §9.4.4 Step 3.3: MissedTickBehavior::Skip on both
+        // walkers. Without this, after a slow cycle (e.g., a large
+        // backlog page taking > interval_secs), tokio fires the
+        // backlog of missed ticks back-to-back which compounds load
+        // exactly when the system is already strained.
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             interval.tick().await;
@@ -345,6 +373,75 @@ impl JobScheduler {
                     );
                 }
                 Err(e) => error!("GC sweep failed: {}", e),
+            }
+        }
+    }
+
+    /// Arc 16d §9.4.4 Step 3.2 — row-walker orchestrator parallel
+    /// to [`Self::gc_sweep_job`]. Single-tasked per §9.4.3.7 (no
+    /// self-overlap mutex needed — `tokio::spawn` of one task plus
+    /// `MissedTickBehavior::Skip` together give the topology the
+    /// design assumes).
+    ///
+    /// Cadence shared with the byte-walker via
+    /// `gc_sweep.interval_secs`. Cycle-completion summary log
+    /// includes `RowSweepReport` counters per Step 3.5; per-row
+    /// INFO logging for every successful `backend.delete` is
+    /// emitted inside `sweep_untethered_rows` itself (round-4 F2
+    /// closure / §9.4.3.2 / §9.4.5.9 operator-action references
+    /// require the log emission for residual-race investigation).
+    async fn row_sweep_job(scheduler: Arc<Self>) {
+        let cfg = &scheduler.context.config.gc_sweep;
+        let interval_secs = cfg.interval_secs;
+        let mut interval = interval(Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+
+            // Snapshot config per-cycle so a hot-reload (if any
+            // ever lands) takes effect at cycle boundary.
+            let cfg = &scheduler.context.config.gc_sweep;
+            let params = crate::blob_store::gc::RowSweepParams {
+                dry_run: cfg.dry_run,
+                max_deletes_per_run: cfg.max_deletes_per_run,
+                page_size: cfg.page_size,
+                untethered_ttl: Duration::from_secs(cfg.untethered_ttl_seconds),
+                #[cfg(test)]
+                after_phase2_delete_hook: None,
+            };
+            let now = chrono::Utc::now();
+
+            info!(
+                dry_run = params.dry_run,
+                max_deletes_per_run = params.max_deletes_per_run,
+                page_size = params.page_size,
+                untethered_ttl_seconds = cfg.untethered_ttl_seconds,
+                "Running row-sweep job (Arc 16d)"
+            );
+
+            match scheduler
+                .context
+                .blob_store
+                .run_row_sweep(params, now)
+                .await
+            {
+                Ok(report) => {
+                    info!(
+                        rows_deleted = report.rows_deleted,
+                        race_skip_count = report.race_skip_count,
+                        bytes_delete_failure_count = report.bytes_delete_failure_count,
+                        db_error_skip_count = report.db_error_skip_count,
+                        bytes_delete_skipped_fresh_row_count =
+                            report.bytes_delete_skipped_fresh_row_count,
+                        total_eligible_count = ?report.total_eligible_count,
+                        would_delete_count = ?report.would_delete_count,
+                        pages_scanned = report.pages_scanned,
+                        duration_seconds = report.duration_seconds,
+                        "row-sweep cycle complete"
+                    );
+                }
+                Err(e) => error!("row-sweep failed: {}", e),
             }
         }
     }

@@ -632,6 +632,61 @@ lazy_static! {
         vec![1.0, 10.0, 50.0, 100.0, 250.0, 500.0]
     )
     .unwrap();
+
+    // ──────────────────────────────────────────────────────────────
+    // Arc 17 §17.3 dynamic lexicon loading — 5 metrics per the design.
+    // Names follow Prometheus convention: `aurora_lexicon_<surface>_<phase>`.
+    // ──────────────────────────────────────────────────────────────
+
+    /// Arc 17 — in-memory cache hits on the lexicon resolver. Incremented
+    /// when `resolve_and_fetch(nsid)` finds an entry in the in-memory map
+    /// (regardless of staleness — stale-served-while-revalidating is a
+    /// v0.6+ feature, but a hit is a hit for accounting purposes here).
+    pub static ref AURORA_LEXICON_CACHE_HITS_TOTAL: IntCounter = register_int_counter!(
+        "aurora_lexicon_cache_hits_total",
+        "Total in-memory cache hits in the Arc 17 lexicon resolver"
+    )
+    .unwrap();
+
+    /// Arc 17 — in-memory cache misses. Incremented when
+    /// `resolve_and_fetch(nsid)` falls through to the fetch path.
+    /// Always paired with an increment of `fetch_attempts_total` on
+    /// the same call.
+    pub static ref AURORA_LEXICON_CACHE_MISSES_TOTAL: IntCounter = register_int_counter!(
+        "aurora_lexicon_cache_misses_total",
+        "Total in-memory cache misses in the Arc 17 lexicon resolver"
+    )
+    .unwrap();
+
+    /// Arc 17 — fetch attempts initiated by the resolver. Incremented
+    /// once per `resolve_and_fetch` call that misses the cache,
+    /// regardless of single-flight de-duplication; Phase B Scenario 15
+    /// asserts N concurrent calls for the same cold NSID produce
+    /// exactly ONE increment here, not N (round-1 F6 closure).
+    pub static ref AURORA_LEXICON_FETCH_ATTEMPTS_TOTAL: IntCounter = register_int_counter!(
+        "aurora_lexicon_fetch_attempts_total",
+        "Total fetch attempts initiated by the Arc 17 lexicon resolver"
+    )
+    .unwrap();
+
+    /// Arc 17 — fetch failures, labeled by `failure_class` per round-1
+    /// F14 taxonomy: dns_fail / did_fail / pds_unreachable / http_5xx
+    /// / http_4xx / timeout / invalid_schema / authority_tombstoned /
+    /// authority_ambiguous.
+    pub static ref AURORA_LEXICON_FETCH_FAILURES_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "aurora_lexicon_fetch_failures_total",
+        "Total fetch failures by failure_class (round-1 F14 taxonomy)",
+        &["failure_class"]
+    )
+    .unwrap();
+
+    /// Arc 17 — aggregate fetch duration. Single histogram for v0.5;
+    /// per-step (DNS / PLC / HTTP) breakdown is v0.6+ per round-1 F19.
+    pub static ref AURORA_LEXICON_FETCH_DURATION_SECONDS: Histogram = register_histogram!(
+        "aurora_lexicon_fetch_duration_seconds",
+        "End-to-end fetch duration in the Arc 17 lexicon resolver"
+    )
+    .unwrap();
 }
 
 /// Render metrics in Prometheus text format

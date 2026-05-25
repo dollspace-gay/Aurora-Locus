@@ -38,6 +38,7 @@ pub async fn create_account(
             Some(email.to_string()),
             password.to_string(),
             invite_code.map(|s| s.to_string()),
+            None,
         )
         .await?;
 
@@ -65,7 +66,12 @@ pub async fn create_account(
             .generate_email_verification_token(&account.did)
             .await?;
 
-        let base_url = format!("https://{}", ctx.config.service.hostname);
+        // Arc 12 §5.3.2 Gap 1: classified (C) in recon but
+        // promoted to (M) — this CLI path doesn't route through
+        // AppContext::service_url() (uses ctx.config.service.hostname
+        // directly), so reads effective_public_url() to honor
+        // PDS_SERVICE_PUBLIC_URL.
+        let base_url = ctx.service_url();
 
         println!("📤 Sending verification email...");
         ctx.mailer

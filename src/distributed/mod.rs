@@ -29,6 +29,13 @@
 //! in that mode, no maintenance pool is constructed and consumers
 //! fall back to per-instance in-memory state (auth state is lost
 //! on restart — operator-accepted trade-off per §6.3.6).
+//!
+//! Trait methods + result types (`DistributedStore::cas`, `CasResult`)
+//! and the per-surface bucket helpers (`cas_rate_limit_bucket`) are
+//! the full substrate surface; some consumers landed in Arc 7,
+//! others land with v0.6 federation work. Module-level allow covers
+//! the incomplete-but-deliberately-scoped surface.
+#![allow(dead_code)]
 
 pub mod cache;
 pub mod lease;

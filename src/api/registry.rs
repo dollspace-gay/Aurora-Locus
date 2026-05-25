@@ -9,6 +9,16 @@
 //! reimplemented `describe_capabilities` against the registry
 //! and removed the hand-curated lists.
 //!
+//! Many query accessors / forward-compat shapes (`FamilyKind`,
+//! `RouteEntry::{methods, version, omitted, is_omitted,
+//! extension_strings, family}`, `RouteRegistryBuilder::{merge,
+//! entries, is_empty, len}`, `ADMIN_TIER_PATH_REGEX`,
+//! `admin_tier_regex`, `Family::kind`) exist for the post-v0.5
+//! consumers that haven't landed yet. File-level allow for the
+//! whole forward-substrate cluster — individual items get wired
+//! when a real consumer lands.
+#![allow(dead_code)]
+//!
 //! Per V04_DESIGN.md §7.3.2 + §7.3.3:
 //!
 //! - [`RouteEntry`] captures per-route capability metadata
@@ -220,6 +230,9 @@ pub enum FamilyKind {
     Admin,
     Moderator,
     SuperAdmin,
+    /// Forward-substrate per Step 0 Q6 — reserved for the day
+    /// public XRPC enters the registry. No constructor today.
+    #[allow(dead_code)]
     Public,
 }
 
@@ -233,6 +246,7 @@ pub struct RouteEntry {
     /// methods publicly, and the current `describe_capabilities`
     /// wire output doesn't include methods. Future cycles may
     /// populate this if a consumer needs it (v0.6 candidate).
+    #[allow(dead_code)]
     pub methods: Vec<Method>,
     /// The family this route belongs to. Family Display string
     /// becomes the namespace key in `describe_capabilities`.
@@ -240,6 +254,7 @@ pub struct RouteEntry {
     /// Capability version. Used by the `<kebab-family>-v<integer>`
     /// versioning convention (V04_DESIGN.md §7.3.2). v0.4 routes
     /// all use version 1; v2 ships when a breaking change lands.
+    #[allow(dead_code)]
     pub version: u32,
     /// True iff this route is intentionally not advertised
     /// (§8.15 omission policy). Routes marked omitted are
@@ -505,6 +520,7 @@ where
     /// registry tracking (Step 0 Q1 found all admin-tier
     /// registration in one site); this method exists for
     /// forward-compat.
+    #[allow(dead_code)]
     pub fn merge(mut self, other: Router<S>) -> Self {
         self.router = self.router.merge(other);
         self

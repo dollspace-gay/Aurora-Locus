@@ -1,6 +1,6 @@
 # Arc 8 Phase B exercise script
 
-Localhost smoke-test script for Chrys's Phase B sweep of Arc 8
+Localhost smoke-test script for skydeval's Phase B sweep of Arc 8
 (`chainlink #54` — Runtime route enumeration). Mirrors the
 Arc 7 convention at
 [`arc7-phase-b-commands.md`](arc7-phase-b-commands.md): curl
@@ -302,7 +302,7 @@ Expected: `948 passed; 0 failed; 0 ignored`.
 
 ## Section D — §8.15 documentation readability
 
-Observational, not curl-driven — §8.15 readability is Chrys's
+Observational, not curl-driven — §8.15 readability is skydeval's
 domain per the existing Phase B convention. Read the updated
 prose at `docs/AURORA_ADMIN_UI_DESIGN.md` §8.15 end-to-end. The
 three checks below are load-bearing for Arc 8.

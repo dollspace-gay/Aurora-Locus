@@ -289,10 +289,10 @@ fn matching_brace(source: &str, open_idx: usize) -> Option<usize> {
     None
 }
 
-/// Extract `<name>` from a return type that matches one of:
-/// - `Result<Json<<name>>, ...>`
-/// - `Result<(StatusCode, Json<<name>>), ...>`
-/// Returns `None` if the return type doesn't carry a `Json<*Output>`.
+/// Extract `<name>` from a return type matching either
+/// `Result<Json<<name>>, ...>` or
+/// `Result<(StatusCode, Json<<name>>), ...>`. Returns `None` if the
+/// return type doesn't carry a `Json<*Output>`.
 fn extract_output_type(return_type: &str) -> Option<String> {
     let json_marker = "Json<";
     let json_off = return_type.find(json_marker)?;
@@ -368,9 +368,8 @@ fn has_field_named(struct_body: &str, field: &str) -> bool {
             .strip_prefix("pub(crate) ")
             .or_else(|| trimmed.strip_prefix("pub "))
             .unwrap_or(trimmed);
-        if stripped.starts_with(field) {
+        if let Some(rest) = stripped.strip_prefix(field) {
             // Must be followed by `:` (with optional whitespace).
-            let rest = &stripped[field.len()..];
             if rest.trim_start().starts_with(':') {
                 return true;
             }

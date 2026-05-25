@@ -4030,6 +4030,12 @@ mod tests {
                 service_did: "did:web:localhost".to_string(),
                 version: "0.1.0-test".to_string(),
                 blob_upload_limit: 5_242_880,
+                public_url: None,
+                max_blob_fetch_size: 50_000_000,
+                blob_fetch_timeout_seconds: 30,
+                blob_fetch_max_retries: 3,
+                accepting_imports: true,
+                max_import_size: None,
             },
             storage: StorageConfig {
                 data_directory: dir.clone(),
@@ -4062,6 +4068,7 @@ mod tests {
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {
@@ -4085,11 +4092,15 @@ mod tests {
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
                 auto_stream_events: false,
+                peer_pds: vec![],
             },
             validation_mode: PathBuf::from("required").into_os_string().to_string_lossy().parse().unwrap_or(crate::validation::ValidationMode::Required),
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            blob_metadata: Default::default(),
+            entryway: None,
+            lexicon: crate::config::LexiconConfig::default(),
         };
         AppContext::new(
             config,
@@ -5147,7 +5158,7 @@ mod tests {
     async fn batch_remove_label_skips_subjects_without_label() {
         let ctx = create_test_context().await;
         // Apply label to one of two subjects upfront.
-        batch_apply_label(
+        let _ = batch_apply_label(
             State(ctx.clone()),
             moderator_auth(),
             Json(BatchLabelInput {
@@ -5677,7 +5688,7 @@ mod tests {
     async fn get_audit_trail_returns_entries_with_verified_true() {
         let ctx = create_test_context().await;
         seed_actor(&ctx, "did:plc:victim", "victim.test").await;
-        emit_event(
+        let _ = emit_event(
             State(ctx.clone()),
             moderator_auth(),
             crate::api::extractors::AuroraJson(EmitEventInput {
@@ -5877,7 +5888,7 @@ mod tests {
             crate::admin::audit_chain::append_entry(
                 &ctx.account_db,
                 crate::admin::audit_chain::AppendEntryParams {
-                    actor_did: *actor,
+                    actor_did: actor,
                     action: "TakedownAccount",
                     subject: Some(&Subject::Blob {
                         did: "did:plc:victim".to_string(),
@@ -6251,11 +6262,11 @@ mod tests {
         // entry-2, entry-3 (sequence 2, 3, 4) — newest-first by
         // created_at means entry-3 first.
         let rationales: Vec<&str> = resp.items.iter().map(|e| e.rationale.as_str()).collect();
-        assert!(rationales.iter().any(|r| *r == "entry-1"));
-        assert!(rationales.iter().any(|r| *r == "entry-2"));
-        assert!(rationales.iter().any(|r| *r == "entry-3"));
-        assert!(!rationales.iter().any(|r| *r == "entry-0"));
-        assert!(!rationales.iter().any(|r| *r == "entry-4"));
+        assert!(rationales.contains(&"entry-1"));
+        assert!(rationales.contains(&"entry-2"));
+        assert!(rationales.contains(&"entry-3"));
+        assert!(!rationales.contains(&"entry-0"));
+        assert!(!rationales.contains(&"entry-4"));
     }
 
     // ---- Gap 4: malformed cursor ----
@@ -7029,6 +7040,12 @@ mod tests {
                 service_did: "did:web:localhost".to_string(),
                 version: "0.1.0-test".to_string(),
                 blob_upload_limit: 5_242_880,
+                public_url: None,
+                max_blob_fetch_size: 50_000_000,
+                blob_fetch_timeout_seconds: 30,
+                blob_fetch_max_retries: 3,
+                accepting_imports: true,
+                max_import_size: None,
             },
             storage: StorageConfig {
                 data_directory: dir.clone(),
@@ -7061,6 +7078,7 @@ mod tests {
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {
@@ -7084,6 +7102,7 @@ mod tests {
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
                 auto_stream_events: false,
+                peer_pds: vec![],
             },
             validation_mode: PathBuf::from("required")
                 .into_os_string()
@@ -7093,6 +7112,9 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            blob_metadata: Default::default(),
+            entryway: None,
+            lexicon: crate::config::LexiconConfig::default(),
         };
         AppContext::new(
             config,
@@ -7143,7 +7165,7 @@ mod tests {
         .expect("file-tier yaml loads cleanly");
         // Land a runtime row for the same key — must win over
         // file-tier value.
-        set_runtime_setting(
+        let _ = set_runtime_setting(
             State(ctx.clone()),
             super_admin_auth(),
             Json(SetRuntimeSettingInput {
@@ -7712,7 +7734,7 @@ mod tests {
     #[tokio::test]
     async fn emit_event_multi_subject_takedown_record_round_trip() {
         let ctx = create_test_context().await;
-        emit_event(
+        let _ = emit_event(
             State(ctx.clone()),
             moderator_auth(),
             crate::api::extractors::AuroraJson(EmitEventInput {
@@ -7915,7 +7937,7 @@ mod tests {
         // cascade_subjects: [s].
         let ctx = create_test_context().await;
         seed_actor(&ctx, "did:plc:single", "single.test").await;
-        emit_event(
+        let _ = emit_event(
             State(ctx.clone()),
             moderator_auth(),
             crate::api::extractors::AuroraJson(EmitEventInput {
@@ -7953,7 +7975,7 @@ mod tests {
     async fn emit_event_chain_row_shape_single_subject_no_snapshot() {
         // §8.3.3: snapshot_capture=false → cascade_snapshot_ids: [].
         let ctx = create_test_context().await;
-        emit_event(
+        let _ = emit_event(
             State(ctx.clone()),
             moderator_auth(),
             crate::api::extractors::AuroraJson(EmitEventInput {
@@ -7996,7 +8018,7 @@ mod tests {
         for did in &["did:plc:m1", "did:plc:m2"] {
             seed_actor(&ctx, did, &did.replace("did:plc:", "")).await;
         }
-        emit_event(
+        let _ = emit_event(
             State(ctx.clone()),
             moderator_auth(),
             crate::api::extractors::AuroraJson(EmitEventInput {

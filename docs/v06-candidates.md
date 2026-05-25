@@ -122,6 +122,25 @@ full-suite parallelism. Pre-existing; flagged for the v04-
 candidates accumulator originally (item 12) and carried
 forward.
 
+## Carryovers from v0.5 cycle
+
+### Automated Phase B harness substrate
+
+Per Arc 16a Step 0 r0 finding 1 (May 2026). v0.5 ships with
+per-arc operator-driven markdown per V05_DESIGN.md §4.10. A
+unified harness — `make phase-b` target, scripted
+multi-backend execution, optional CI integration — is
+deferred to v0.6+. Shape proposals to be aggregated from
+arc-specific operational feedback during v0.5 implementation.
+
+### proto-blue 0.3.2 review
+
+Per Arc 16a Step 0.1 r0 finding (May 2026). proto-blue 0.3.2
+published 2026-05-14. Arc 16a pins 0.3.1 via
+`--precise 0.3.1`; future `cargo update` would accept 0.3.2
+per `^0.3.1` caret semantics. v0.6+ cycle reviews 0.3.2
+changelog for opt-in surface changes.
+
 ## Out of scope for v0.6 (cycle planning will decide)
 
 Items below would be candidates for v0.7+ if v0.6 doesn't pick

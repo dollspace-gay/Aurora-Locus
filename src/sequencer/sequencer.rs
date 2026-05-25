@@ -14,14 +14,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
-/// Sequencer configuration
+/// Sequencer configuration.
+///
+/// `backfill_limit_secs` is consumed by [`Sequencer::earliest_after_time`]
+/// via [`Sequencer::backfill_limit`] in the firehose handler's
+/// pre-stream cursor-window check (Arc 14 §7.3.3).
 #[derive(Debug, Clone)]
 pub struct SequencerConfig {
     /// Maximum number of events to return in a single query
     pub max_query_limit: i64,
 
-    /// Backfill time window in seconds (how far back cursors can resume)
-    #[allow(dead_code)] // Will be used for cursor expiration logic
+    /// Backfill time window in seconds (how far back cursors can resume).
+    /// Default 1 day per Arc 14 Step 0 sub-step 0.C (bsky-PDS verified
+    /// default: `repoBackfillLimitMs = DAY = 86_400_000 ms`).
+    /// Env-overridable via `PDS_REPO_BACKFILL_LIMIT_MS` (read at
+    /// AppContext construction).
     pub backfill_limit_secs: i64,
 }
 
@@ -29,7 +36,10 @@ impl Default for SequencerConfig {
     fn default() -> Self {
         Self {
             max_query_limit: 1000,
-            backfill_limit_secs: 14 * 24 * 60 * 60, // 14 days
+            // Arc 14 §7.3.3 default: 1 day. Verified against bsky-PDS
+            // (`packages/pds/src/config/config.ts:175` → `DAY` from
+            // `@atproto/common`). Recon Sub-step 0.C closure.
+            backfill_limit_secs: 24 * 60 * 60,
         }
     }
 }
@@ -90,6 +100,9 @@ impl Sequencer {
     }
 
     /// Cheap atomic load — checked at the top of every write path.
+    /// Consumed by `tests/multi_instance_test.rs` for failover
+    /// assertions; the `--lib` build doesn't see integration tests.
+    #[allow(dead_code)]
     pub fn is_leader(&self) -> bool {
         self.is_leader.load(Ordering::SeqCst)
     }
@@ -164,7 +177,6 @@ impl Sequencer {
     }
 
     /// Sequence an account event
-    #[allow(dead_code)] // Will be used when implementing account status changes
     pub async fn sequence_account(&self, evt: AccountEvent) -> PdsResult<i64> {
         self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)
@@ -178,6 +190,47 @@ impl Sequencer {
         self.publish_to_relay("account", &evt.did, seq, None).await;
 
         Ok(seq)
+    }
+
+    /// Arc 15 §8.3.3 — retention helper for the deletion path:
+    /// wipe every `repo_seq` row for `did` EXCEPT the seqs listed in
+    /// `excluding`. Used by `delete_account` to retain the deletion
+    /// `#account` event while clearing prior history.
+    ///
+    /// Two-await non-atomic semantics with the preceding
+    /// `sequence_account(Deleted)` call — matches bsky-PDS pattern;
+    /// race window documented in §8.5.5. Consumers
+    /// duplicate-suppress on `did`.
+    pub async fn delete_all_for_user(
+        &self,
+        did: &str,
+        excluding: &[i64],
+    ) -> PdsResult<u64> {
+        self.check_leader()?;
+        let result = if excluding.is_empty() {
+            sqlx::query("DELETE FROM repo_seq WHERE did = $1")
+                .bind(did)
+                .execute(&self.db)
+                .await
+                .map_err(PdsError::Database)?
+        } else {
+            // Build the NOT IN clause inline — `excluding` is
+            // operator-controlled (handler-supplied seqs only;
+            // not user input) so binding as integers is safe.
+            let placeholders: Vec<String> = (2..=excluding.len() + 1)
+                .map(|i| format!("${}", i))
+                .collect();
+            let sql = format!(
+                "DELETE FROM repo_seq WHERE did = $1 AND seq NOT IN ({})",
+                placeholders.join(",")
+            );
+            let mut q = sqlx::query(&sql).bind(did);
+            for seq in excluding {
+                q = q.bind(*seq);
+            }
+            q.execute(&self.db).await.map_err(PdsError::Database)?
+        };
+        Ok(result.rows_affected())
     }
 
     /// Insert event into database
@@ -211,6 +264,41 @@ impl Sequencer {
         *last = Some(seq);
 
         Ok(seq)
+    }
+
+    /// Arc 14 §7.3.3 / §7.4 Step 3: configured backfill window in
+    /// seconds. The firehose handler consumes this to compute the
+    /// cut-off time for the cursor-window OutdatedCursor check.
+    pub fn backfill_limit_secs(&self) -> i64 {
+        self.config.backfill_limit_secs
+    }
+
+    /// Arc 14 §7.3.3 / §7.4 Step 3: lowest emitted `seq` whose
+    /// `sequenced_at >= time`. Returns `None` if the table is empty
+    /// or every row predates `time`.
+    ///
+    /// Used by the firehose handler to advance an outdated cursor to
+    /// the start of the configured backfill window. Empty-window
+    /// fall-through to live-tail is the caller's responsibility
+    /// (round-1 F8 closure).
+    pub async fn earliest_after_time(
+        &self,
+        time: chrono::DateTime<Utc>,
+    ) -> PdsResult<Option<i64>> {
+        let time_str = time.to_rfc3339();
+        let row = sqlx::query(
+            r#"
+            SELECT MIN(seq) as min_seq
+            FROM repo_seq
+            WHERE NOT invalidated AND sequenced_at >= $1
+            "#,
+        )
+        .bind(time_str)
+        .fetch_one(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        let min_seq: Option<i64> = row.try_get("min_seq").map_err(PdsError::Database)?;
+        Ok(min_seq)
     }
 
     /// Get current maximum sequence number
@@ -517,6 +605,7 @@ mod tests {
             "bafyrei123".to_string(),
             "3".to_string(),
             None,
+            None,
             vec![],
             vec![],
         );
@@ -538,6 +627,7 @@ mod tests {
             "bafyrei123".to_string(),
             "3".to_string(),
             None,
+            None,
             vec![],
             vec![],
         );
@@ -557,6 +647,7 @@ mod tests {
                 format!("bafyrei{}", i),
                 "3".to_string(),
                 None,
+                None,
                 vec![],
                 vec![],
             );
@@ -569,5 +660,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(events.len(), 2); // seq 3 and 4
+    }
+
+    /// Arc 14 §7.3.3 / Sub-step 0.C: default backfill window is 1 day
+    /// (86_400 seconds), matching bsky-PDS's
+    /// `repoBackfillLimitMs = DAY` default.
+    #[test]
+    fn test_backfill_limit_default_one_day() {
+        let config = SequencerConfig::default();
+        assert_eq!(config.backfill_limit_secs, 24 * 60 * 60);
+    }
+
+    /// Arc 14 §7.4 Step 3: `earliest_after_time` returns `None` when
+    /// no events exist after the cutoff time (round-1 F8 closure
+    /// covered by the firehose handler's fall-through).
+    #[tokio::test]
+    async fn test_earliest_after_time_empty_returns_none() {
+        let sequencer = create_test_sequencer().await;
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let result = sequencer.earliest_after_time(future).await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    /// Arc 15 §8.3.3 / Step 1.4: `delete_all_for_user` with an empty
+    /// `excluding` list removes every event for the DID.
+    #[tokio::test]
+    async fn test_delete_all_for_user_wipes_when_excluding_empty() {
+        let sequencer = create_test_sequencer().await;
+        for i in 1..=3 {
+            sequencer
+                .sequence_commit(CommitEvent::new(
+                    "did:plc:alice".to_string(),
+                    format!("bafyrei{}", i),
+                    "3".to_string(),
+                    None,
+                    None,
+                    vec![],
+                    vec![],
+                ))
+                .await
+                .unwrap();
+        }
+        let removed = sequencer.delete_all_for_user("did:plc:alice", &[]).await.unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(sequencer.current_seq().await.unwrap(), None);
+    }
+
+    /// Arc 15 §8.3.3 / Step 1.4: with `excluding = [retain_seq]`,
+    /// only the retained seq survives the DID's wipe. Matches the
+    /// `delete_account` two-await sequence (sequence_account first,
+    /// then delete_all_for_user excluding the deletion seq).
+    #[tokio::test]
+    async fn test_delete_all_for_user_retains_excluded_seqs() {
+        let sequencer = create_test_sequencer().await;
+        for i in 1..=3 {
+            sequencer
+                .sequence_commit(CommitEvent::new(
+                    "did:plc:bob".to_string(),
+                    format!("bafyrei{}", i),
+                    "3".to_string(),
+                    None,
+                    None,
+                    vec![],
+                    vec![],
+                ))
+                .await
+                .unwrap();
+        }
+        // Seq 1, 2, 3 exist. Retain seq=2.
+        let removed = sequencer.delete_all_for_user("did:plc:bob", &[2]).await.unwrap();
+        assert_eq!(removed, 2);
+        // Verify only seq 2 remains.
+        let row = sqlx::query("SELECT seq FROM repo_seq WHERE did = $1")
+            .bind("did:plc:bob")
+            .fetch_one(&sequencer.db)
+            .await
+            .unwrap();
+        let seq: i64 = row.try_get("seq").unwrap();
+        assert_eq!(seq, 2);
+    }
+
+    /// Arc 15 §8.3.3 / Step 1.4: events for other DIDs are NOT touched.
+    #[tokio::test]
+    async fn test_delete_all_for_user_scoped_to_did() {
+        let sequencer = create_test_sequencer().await;
+        sequencer
+            .sequence_commit(CommitEvent::new(
+                "did:plc:alice".to_string(),
+                "bafyrei-alice".to_string(),
+                "3".to_string(),
+                None,
+                None,
+                vec![],
+                vec![],
+            ))
+            .await
+            .unwrap();
+        sequencer
+            .sequence_commit(CommitEvent::new(
+                "did:plc:bob".to_string(),
+                "bafyrei-bob".to_string(),
+                "3".to_string(),
+                None,
+                None,
+                vec![],
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let removed = sequencer.delete_all_for_user("did:plc:alice", &[]).await.unwrap();
+        assert_eq!(removed, 1);
+        // bob's event still present.
+        assert_eq!(sequencer.current_seq().await.unwrap(), Some(2));
+    }
+
+    /// Arc 14 §7.4 Step 3: with events present, `earliest_after_time`
+    /// with a cutoff earlier than all events returns the lowest seq.
+    #[tokio::test]
+    async fn test_earliest_after_time_returns_lowest_seq() {
+        let sequencer = create_test_sequencer().await;
+        for i in 1..=3 {
+            let evt = CommitEvent::new(
+                format!("did:plc:test{}", i),
+                format!("bafyrei{}", i),
+                "3".to_string(),
+                None,
+                None,
+                vec![],
+                vec![],
+            );
+            sequencer.sequence_commit(evt).await.unwrap();
+        }
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let result = sequencer.earliest_after_time(past).await.unwrap();
+        assert_eq!(result, Some(1));
     }
 }

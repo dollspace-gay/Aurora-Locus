@@ -498,6 +498,35 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(crate::api::aurora_admin::trigger_password_reset),
             CapsBuilder::new(Family::Admin, 1).extensions(["trigger-password-reset-v1"]),
         )
+        // ---- tools.aurora.lexicon.* (Arc 17 §17.3.7 / #133 pin) ----
+        //
+        // Three admin endpoints for the dynamic-lexicon resolver
+        // cache. Auth: AdminAuthContext extractor + Admin+ role
+        // (mirrors the AdminAll scope per Step 0.0h pin). When the
+        // resolver is not wired on AppContext (PDS_LEXICON_ENABLED=
+        // false, the v0.5 default) every handler responds with
+        // HTTP 503 LexiconDisabled.
+        //
+        // Registered as plain (non-registry) routes: registering
+        // under Family::Admin would advertise them as
+        // tools.aurora.admin.<name> in describeCapabilities (wrong
+        // namespace), and Family::Lexicon doesn't exist yet. The
+        // §17.1.1 promised wire path is honored by the URL itself;
+        // describeCapabilities will surface them once a future
+        // cycle adds Family::Lexicon (snapshot tests at admin.rs:
+        // 7726 will need refreshing then).
+        .route(
+            "/xrpc/tools.aurora.lexicon.getCacheState",
+            get(crate::api::aurora_lexicon::get_cache_state),
+        )
+        .route(
+            "/xrpc/tools.aurora.lexicon.evictCache",
+            post(crate::api::aurora_lexicon::evict_cache),
+        )
+        .route(
+            "/xrpc/tools.aurora.lexicon.fetchNow",
+            post(crate::api::aurora_lexicon::fetch_now),
+        )
         // Phase 3.7 (chainlink #104) — moderation aggregations.
         // Auth: AdminModeration scope, Moderator+ role enforced at
         // handler level. Powers Dashboard Moderator flavor + bell
@@ -828,8 +857,11 @@ async fn get_stats(
     // Set to 0 for now, can be improved later
     let total_posts: i64 = 0;
 
+    // chainlink #95: bind RFC-3339 from app code (see jobs/tasks.rs for rationale).
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
     let active_sessions: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')")
+        sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE expires_at > $1")
+            .bind(&now_rfc3339)
             .fetch_one(&ctx.account_db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1722,7 +1754,8 @@ async fn update_account_signing_key(
         req.did.clone(),
         (*ctx.actor_store).clone(),
         ctx.sequencer.clone(),
-    );
+    )
+    .with_blob_store(ctx.blob_store.clone());
     let repo_signer_pb: std::sync::Arc<dyn proto_blue::crypto::Signer> = {
         let key_bytes = hex::decode(&ctx.config.authentication.repo_signing_key).map_err(|e| {
             plain_err(
@@ -1739,7 +1772,11 @@ async fn update_account_signing_key(
         std::sync::Arc::new(s)
     };
     let (commit_cid, rev) = repo_mgr
-        .apply_writes(vec![], repo_signer_pb)
+        .apply_writes(
+            vec![],
+            repo_signer_pb,
+            std::sync::Arc::new(crate::blob_store::StrictPromoter),
+        )
         .await
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tracing::info!(
@@ -1888,6 +1925,27 @@ async fn takedown_account(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Arc 15 §8.3.6: emit Takendown #account event (Pattern B).
+    // Reverse-takedown deferred to v0.6+ per §8.1.2.
+    let acc_post = ctx
+        .account_manager
+        .get_account(&req.did)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let (active, status) = crate::api::sync_helpers::get_account_status(&acc_post);
+    debug_assert_eq!(
+        status,
+        Some(crate::sequencer::events::AccountStatus::Takendown)
+    );
+    ctx.sequencer
+        .sequence_account(crate::sequencer::events::AccountEvent {
+            did: req.did.clone(),
+            active,
+            status,
+        })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -3790,6 +3848,151 @@ async fn update_subject_status(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
 
+    // Arc 15 §8.3.4 / §8.3.5 / §8.3.6 — chainlink #85: fire
+    // sequencer emits for account-level state mutations applied via
+    // this endpoint. Pre-fix, the canonical lex path bypassed the
+    // handler-level emits wired into `deactivate_account` /
+    // `activate_account` / `takedown_account`, so downstream
+    // federation peers wouldn't see takedown / deactivate applied
+    // via updateSubjectStatus.
+    //
+    // Emits run post-commit (matching the handler-level pattern)
+    // and operate on the post-patch row state (Pattern B). Only the
+    // RepoRef branch is account-level; RepoBlobRef and StrongRef
+    // are blob/record concerns with no #account emit.
+    //
+    // Reverse-takedown (takedown.applied: false) is the documented
+    // §8.1.2 v0.5 deferral — no emit fires. Tracked for v0.6.
+    if let SubjectUnion::RepoRef { did } = &subject {
+        // Read post-patch row once; we may use it for two emits below.
+        let acc_post_opt = ctx.account_manager.get_account(did).await.ok();
+
+        // Takedown apply path → #account Takendown.
+        if let Some(td) = &takedown {
+            if td.applied {
+                if let Some(ref acc_post) = acc_post_opt {
+                    let (active, status) =
+                        crate::api::sync_helpers::get_account_status(acc_post);
+                    if let Err(e) = ctx
+                        .sequencer
+                        .sequence_account(crate::sequencer::events::AccountEvent {
+                            did: did.clone(),
+                            active,
+                            status,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: takedown emit failed (state mutated OK)"
+                        );
+                    }
+                }
+            }
+            // else: takedown.applied = false → reverse-takedown,
+            // §8.1.2 v0.5 deferral; no #account emit fires.
+            // v0.6 work tracked separately.
+        }
+
+        // Deactivate / reactivate path.
+        if let Some(d) = &deactivated {
+            if d.applied {
+                // §8.3.4 deactivate → #account Deactivated.
+                if let Some(ref acc_post) = acc_post_opt {
+                    let (active, status) =
+                        crate::api::sync_helpers::get_account_status(acc_post);
+                    if let Err(e) = ctx
+                        .sequencer
+                        .sequence_account(crate::sequencer::events::AccountEvent {
+                            did: did.clone(),
+                            active,
+                            status,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: deactivate emit failed (state mutated OK)"
+                        );
+                    }
+                }
+            } else {
+                // §8.3.5 reactivate → three-emit sequence
+                // (account → identity → sync).
+                if let Some(ref acc_post) = acc_post_opt {
+                    let (active, status) =
+                        crate::api::sync_helpers::get_account_status(acc_post);
+                    if let Err(e) = ctx
+                        .sequencer
+                        .sequence_account(crate::sequencer::events::AccountEvent {
+                            did: did.clone(),
+                            active,
+                            status,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: reactivate account emit failed"
+                        );
+                    }
+                    if let Err(e) = ctx
+                        .sequencer
+                        .sequence_identity(crate::sequencer::events::IdentityEvent {
+                            did: did.clone(),
+                            handle: acc_post.handle.clone(),
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: reactivate identity emit failed"
+                        );
+                    }
+                    let repo_mgr = crate::actor_store::RepositoryManager::with_sequencer(
+                        did.clone(),
+                        ctx.actor_store.as_ref().clone(),
+                        ctx.sequencer.clone(),
+                    );
+                    match repo_mgr.current_sync_event_data().await {
+                        Ok(sync_data) => {
+                            match crate::sequencer::events::SyncEvent::from_sync_data(
+                                did.clone(),
+                                sync_data,
+                            ) {
+                                Ok(sync_evt) => {
+                                    if let Err(e) =
+                                        ctx.sequencer.sequence_sync(sync_evt).await
+                                    {
+                                        tracing::warn!(
+                                            did = %did,
+                                            error = %e,
+                                            "updateSubjectStatus: reactivate sync emit failed"
+                                        );
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    did = %did,
+                                    error = %e,
+                                    "updateSubjectStatus: reactivate sync formatter failed"
+                                ),
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: reactivate no current sync data — skipping #sync"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     Ok(Json(UpdateSubjectStatusResponse {
         subject,
         takedown: response_takedown,
@@ -4612,9 +4815,12 @@ async fn get_database_status(
         .map(|(count,)| count)
         .unwrap_or(0);
 
+    // chainlink #95: bind RFC-3339 from app code (see jobs/tasks.rs for rationale).
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
     let session_count = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM session WHERE expires_at > datetime('now')",
+        "SELECT COUNT(*) FROM session WHERE expires_at > $1",
     )
+    .bind(&now_rfc3339)
     .fetch_one(&ctx.account_db)
     .await
     .map(|(count,)| count)
@@ -5044,7 +5250,7 @@ async fn list_blobs(
         let query = if let Some(cursor) = params.cursor {
             sqlx::query(
                 r#"
-                SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
+                SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid, temp_key
                 FROM blob_metadata
                 WHERE cid > ?1
                 ORDER BY cid ASC
@@ -5056,7 +5262,7 @@ async fn list_blobs(
         } else {
             sqlx::query(
                 r#"
-                SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid
+                SELECT cid, mime_type, size, creator_did, created_at, width, height, alt_text, thumbnail_cid, temp_key
                 FROM blob_metadata
                 ORDER BY cid ASC
                 LIMIT ?1
@@ -5103,6 +5309,12 @@ async fn list_blobs(
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
                 thumbnail_cid: row
                     .try_get("thumbnail_cid")
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                // Arc 16b §9.2.3.1: lifecycle discriminator.
+                // Admin listing reads the column; helper ships with
+                // zero production callers in Arc 16b per §9.2.5.1.
+                temp_key: row
+                    .try_get("temp_key")
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
             });
         }
@@ -6228,8 +6440,10 @@ async fn cleanup_nonce_stores(
 // Arc 2 Step 1 (§6.4.1) — canonical-JSON helper for snapshot
 // tests. See the matching declaration in `src/admin/defs.rs` for
 // the rationale on top-level placement vs nested-mod placement.
+// Twin inline include — see `src/admin/defs.rs` for the v0.6 cleanup note.
 #[cfg(test)]
 #[path = "../../tests/common/canonical_json.rs"]
+#[allow(clippy::duplicate_mod)]
 mod canonical_json_helper;
 
 #[cfg(test)]
@@ -6279,6 +6493,12 @@ mod tests {
                 service_did: "did:web:localhost".to_string(),
                 version: "0.1.0-test".to_string(),
                 blob_upload_limit: 5242880,
+                public_url: None,
+                max_blob_fetch_size: 50_000_000,
+                blob_fetch_timeout_seconds: 30,
+                blob_fetch_max_retries: 3,
+                accepting_imports: true,
+                max_import_size: None,
             },
             storage: StorageConfig {
                 data_directory: dir.clone(),
@@ -6314,6 +6534,7 @@ mod tests {
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {
@@ -6337,11 +6558,15 @@ mod tests {
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
                 auto_stream_events: false,
+                peer_pds: vec![],
             },
             validation_mode: crate::validation::ValidationMode::Required,
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            blob_metadata: Default::default(),
+            entryway: None,
+            lexicon: crate::config::LexiconConfig::default(),
         };
 
         // The admin module hosts `describe_capabilities`, which
@@ -7714,7 +7939,7 @@ mod tests {
             role: "moderator".to_string(),
             rationale: Some("on-call rotation".to_string()),
         };
-        grant_role(State(ctx.clone()), superadmin_test_auth(), Json(req))
+        let _ = grant_role(State(ctx.clone()), superadmin_test_auth(), Json(req))
             .await
             .expect("SuperAdmin grant succeeds");
         let count: i64 = sqlx::query_scalar(
@@ -8077,7 +8302,7 @@ mod tests {
             reason: "spam-ring".to_string(),
             notes: None,
         };
-        takedown_account(State(ctx.clone()), admin_test_auth(), Json(req))
+        let _ = takedown_account(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
             .expect("takedown succeeds");
         assert_eq!(
@@ -8217,7 +8442,7 @@ mod tests {
             val: "spam".to_string(),
             expires_days: None,
         };
-        apply_label(State(ctx.clone()), admin_test_auth(), Json(req))
+        let _ = apply_label(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
             .expect("apply_label succeeds");
         let count: i64 = sqlx::query_scalar(
@@ -8241,7 +8466,7 @@ mod tests {
             note: None,
             for_account: None,
         };
-        create_invite_code(State(ctx.clone()), admin_test_auth(), Json(req))
+        let _ = create_invite_code(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
             .expect("invite create succeeds");
         assert_eq!(count_chain_rows(&ctx, "invite.create", None).await, 1);
@@ -8252,7 +8477,7 @@ mod tests {
         // Category F: server-level no-subject. action "sequencer.pause"
         // with None subject — chain row's subject_did/uri/cid are all NULL.
         let ctx = create_test_context().await;
-        pause_sequencer(State(ctx.clone()), admin_test_auth())
+        let _ = pause_sequencer(State(ctx.clone()), admin_test_auth())
             .await
             .expect("pause sequencer succeeds");
         assert_eq!(count_chain_rows(&ctx, "sequencer.pause", None).await, 1);
@@ -8367,7 +8592,7 @@ mod tests {
             }),
             legacy_record_uri_used: false,
         };
-        update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
+        let _ = update_subject_status(State(ctx.clone()), admin_test_auth(), crate::api::extractors::AuroraJson(req))
             .await
             .expect("update_subject_status succeeds");
 

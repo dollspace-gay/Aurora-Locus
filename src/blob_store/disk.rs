@@ -62,6 +62,39 @@ impl BlobBackend for DiskBlobBackend {
         Ok(())
     }
 
+    /// Arc 16c §9.3.3.2 step 3 — durability establishment via
+    /// `sync_all()` on the file then on the containing directory.
+    /// Canonical order per Step 3.2 "Both absent" rule from Step 0.2
+    /// recon (disk backend had neither fsync today; Arc 16c adds
+    /// both).
+    async fn fsync(&self, cid: &str) -> PdsResult<()> {
+        let blob_path = self.get_blob_path(cid);
+
+        // file-fsync first.
+        let file = fs::File::open(&blob_path).await.map_err(|e| {
+            PdsError::BlobStorage(format!("fsync open file {}: {}", cid, e))
+        })?;
+        file.sync_all().await.map_err(|e| {
+            PdsError::BlobStorage(format!("fsync file {}: {}", cid, e))
+        })?;
+        drop(file);
+
+        // dir-fsync second.
+        let Some(parent) = blob_path.parent() else {
+            return Err(PdsError::BlobStorage(format!(
+                "fsync: blob path has no parent ({:?})",
+                blob_path
+            )));
+        };
+        let dir = fs::File::open(parent).await.map_err(|e| {
+            PdsError::BlobStorage(format!("fsync open dir {:?}: {}", parent, e))
+        })?;
+        dir.sync_all().await.map_err(|e| {
+            PdsError::BlobStorage(format!("fsync dir {:?}: {}", parent, e))
+        })?;
+        Ok(())
+    }
+
     async fn get(&self, cid: &str) -> PdsResult<Option<Vec<u8>>> {
         let blob_path = self.get_blob_path(cid);
 
@@ -159,19 +192,14 @@ impl BlobBackend for DiskBlobBackend {
                 }
 
                 let file_path = shard_path.join(filename);
-                let metadata = fs::metadata(&file_path).await.map_err(|e| {
-                    PdsError::BlobStorage(format!(
-                        "Failed to stat blob {}/{}: {}",
-                        shard, filename, e
-                    ))
-                })?;
-                let modified = metadata.modified().map_err(|e| {
-                    PdsError::BlobStorage(format!(
-                        "Failed to read modified time for {}/{}: {}",
-                        shard, filename, e
-                    ))
-                })?;
-                let last_modified = system_time_to_datetime(modified);
+                let last_modified = match stat_modified_skip_if_vanished(
+                    &file_path, shard, filename,
+                )
+                .await?
+                {
+                    Some(t) => t,
+                    None => continue,
+                };
 
                 entries.push(BlobListEntry {
                     cid: filename.clone(),
@@ -231,6 +259,48 @@ async fn list_sorted_dir(path: &std::path::Path) -> PdsResult<Vec<String>> {
     }
     names.sort();
     Ok(names)
+}
+
+/// Stat a candidate blob during `list_all_blobs`, tolerating
+/// the readdir/stat race.
+///
+/// Returns `Ok(Some(last_modified))` when the file is still present,
+/// `Ok(None)` when it vanished between the dir-walk and this stat
+/// (chainlink #104 — concurrent `backend.delete` from Arc 16d row-sweep,
+/// moderation takedown, or any other deleter), and `Err(...)` on real
+/// I/O failures. The caller skips `None` results and continues the walk
+/// so a single concurrent delete cannot abort the byte-walker cycle
+/// (Arc 10 §9.4 design: byte-walker and row-walker are deliberately
+/// concurrent).
+async fn stat_modified_skip_if_vanished(
+    file_path: &std::path::Path,
+    shard: &str,
+    filename: &str,
+) -> PdsResult<Option<DateTime<Utc>>> {
+    let metadata = match fs::metadata(file_path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                shard = shard,
+                filename = filename,
+                "list_all_blobs: entry vanished between readdir and stat; skipping (race lost)"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(PdsError::BlobStorage(format!(
+                "Failed to stat blob {}/{}: {}",
+                shard, filename, e
+            )));
+        }
+    };
+    let modified = metadata.modified().map_err(|e| {
+        PdsError::BlobStorage(format!(
+            "Failed to read modified time for {}/{}: {}",
+            shard, filename, e
+        ))
+    })?;
+    Ok(Some(system_time_to_datetime(modified)))
 }
 
 fn system_time_to_datetime(t: SystemTime) -> DateTime<Utc> {
@@ -436,6 +506,74 @@ mod tests {
             before,
             after
         );
+    }
+
+    // ---- chainlink #104: stat-after-readdir race tolerance ----
+
+    /// `stat_modified_skip_if_vanished` returns `Ok(None)` when the
+    /// candidate file does not exist (the readdir-vs-delete race
+    /// outcome). Caller treats `None` as "skip this entry, continue
+    /// the walk" rather than propagating an Err that would abort the
+    /// entire byte-walker cycle.
+    #[tokio::test]
+    async fn test_stat_modified_skip_if_vanished_returns_none_on_enoent() {
+        let dir = tempdir().unwrap();
+        let nonexistent = dir.path().join("does-not-exist");
+        let result = stat_modified_skip_if_vanished(&nonexistent, "ba", "does-not-exist")
+            .await
+            .unwrap();
+        assert!(result.is_none(), "ENOENT must map to Ok(None), got {:?}", result);
+    }
+
+    /// Existing file: returns `Ok(Some(last_modified))`. Pairs with
+    /// the ENOENT test above to pin the two outcomes of the helper.
+    #[tokio::test]
+    async fn test_stat_modified_skip_if_vanished_returns_some_for_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("real-file");
+        tokio::fs::write(&path, b"data").await.unwrap();
+        let result = stat_modified_skip_if_vanished(&path, "ba", "real-file")
+            .await
+            .unwrap();
+        assert!(result.is_some(), "existing file must map to Some(..)");
+    }
+
+    /// Deterministic readdir/stat race: a dangling symlink in the
+    /// shard directory makes readdir return the entry but `fs::metadata`
+    /// (which follows the symlink) fail with `ErrorKind::NotFound` on
+    /// the missing target. Pre-fix this aborted the entire walk with a
+    /// `PdsError::BlobStorage("Failed to stat blob ...")`; post-fix the
+    /// walk skips the vanished entry and returns the surviving CIDs.
+    /// This is the exact in-memory state produced by a concurrent
+    /// `backend.delete` (Arc 16d row-sweep) racing the byte-walker.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_list_all_blobs_skips_vanished_entry_when_stat_returns_enoent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let backend = DiskBlobBackend::new(dir.path().to_path_buf());
+
+        // Two real files in shard "ba".
+        backend.put("bafyaaaa001", b"data".to_vec(), "text/plain").await.unwrap();
+        backend.put("bafyaaaa003", b"data".to_vec(), "text/plain").await.unwrap();
+
+        // Dangling symlink in the same shard: readdir returns it, but
+        // stat-with-follow returns ENOENT on the target.
+        let shard_dir = dir.path().join("ba");
+        let dangling = shard_dir.join("bafyaaaa002");
+        let nonexistent_target = dir.path().join("never-existed");
+        symlink(&nonexistent_target, &dangling).unwrap();
+
+        let page = backend.list_all_blobs(None, 100).await.unwrap();
+        let mut cids: Vec<&str> = page.entries.iter().map(|e| e.cid.as_str()).collect();
+        cids.sort();
+        assert_eq!(
+            cids,
+            vec!["bafyaaaa001", "bafyaaaa003"],
+            "walk must skip vanished entry and return surviving CIDs, not abort"
+        );
+        assert!(page.next_cursor.is_none());
     }
 
     /// Malformed cursor (no `/`) returns a Validation error

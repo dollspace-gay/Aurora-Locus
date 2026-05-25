@@ -185,6 +185,54 @@ endpoints (listAccounts with broader filters, getInstanceMetrics).
 
 ---
 
+## com.atproto.repo.* (record-write surface — error contracts)
+
+Scope: the four record-write endpoints whose wire-error contracts
+were updated by Arc 16e §9.5.4 Step 3.8. Per the lexicons-as-Rust-
+types convention noted at the top of this file, the full request /
+response shapes live in the handler signatures at
+[src/api/repo.rs](../src/api/repo.rs); the table below enumerates
+the wire-error codes each handler can emit so the contract is
+discoverable from the endpoint surface without grep-tracing
+[`PdsError`](../src/error.rs)'s `IntoResponse` mapping.
+
+The Arc 16e additions on the write paths are `InvalidCid` (400 —
+validate-phase walker rejection) and `BlobNotFound` (400 — Phase B
+STRICT-missing-row); both are wire-pinned per V05_DESIGN.md
+§9.5.3.5 R0c.A to match bsky-PDS verbatim.
+
+Other `com.atproto.repo.*` endpoints (`getRecord`, `listRecords`,
+`describeRepo`, `listMissingBlobs`) are read-side and not in
+Arc 16e's scope; they can be added incrementally to this section
+as their error contracts get audited.
+
+| NSID | Type | Auth scope | Wire-error codes (HTTP status) |
+|---|---|---|---|
+| com.atproto.repo.createRecord | procedure | `RepoCreate` | `AuthRequired` (401), `InsufficientScope` / `Forbidden` (403), `RateLimitExceeded` (429), `InvalidCid` (400), `BlobNotFound` (400), `Validation` (400), `Database` / `Internal` (500) |
+| com.atproto.repo.putRecord | procedure | `RepoUpdate` | createRecord's set + `NotFound` (404, swap-CID against missing record) |
+| com.atproto.repo.deleteRecord | procedure | `RepoDelete` | `AuthRequired` (401), `InsufficientScope` / `Forbidden` (403), `RateLimitExceeded` (429), `Validation` (400, swap-CID mismatch), `NotFound` (404), `Database` / `Internal` (500). Phase B's `unreference_blob` six-variant `UnreferenceOutcome` is log-and-continue, so no Arc 16e-introduced error surfaces on this path. |
+| com.atproto.repo.applyWrites | procedure | `RepoAll` | putRecord's set + `Validation` (400) covers batch size limit (>200 ops) and duplicate-op detection. A malformed CID anywhere in the batch aborts the whole batch before Phase A opens — partial state mutation is structurally impossible. |
+
+### Aurora-owned `tools.aurora.repo.*` (importRepo error vocabulary)
+
+Per Arc 16f CF2: Aurora ships lexicons as Rust types, not JSON. The
+`tools.aurora.repo.importRepo` namespace exists as a documentation
+contract here (and as a rustdoc `# Errors` section on the handler
+function) — there is no `lexicons/tools/aurora/repo/importRepo.json`
+file. The wire route is registered at
+`/xrpc/com.atproto.repo.importRepo` (the standard ATProto NSID); the
+`tools.aurora.repo.importRepo` name addresses Aurora's
+implementation-specific *error vocabulary* — wire codes that bsky-PDS
+does not define and that downstream tooling needs to discriminate.
+
+Handler at [src/api/repo_import.rs](../src/api/repo_import.rs).
+
+| NSID | Type | Auth scope | Wire-error codes (HTTP status) |
+|---|---|---|---|
+| tools.aurora.repo.importRepo | procedure | `RepoAll` | `ActorNotInitialized` (400, no `plc_keys` row), `ConcurrentMutation` (409, single-flight lock contended), `InvalidCar` (400, structural CAR failure or root-DID mismatch or `max_import_size` exceeded), `InvalidCommitSignature` (400, `verify_diff_car` sig check failed against per-account key), `InvalidCid` (400, validate-phase walker), `QuarantinedBlobReferenced` (400, with coarse `public_reason` only), `BlobTooLarge` (413, fetched blob exceeds `max_blob_fetch_size`), `OriginFetchClientError` (502, origin 4xx — durable), `OriginFetchExhausted` (502, retry budget exhausted or per-CID failures aggregated), `ServiceUnavailable` (503, `accepting_imports = false`). |
+
+---
+
 ## Discrepancies
 
 1. **com.atproto.admin.* count higher than the upstream baseline**

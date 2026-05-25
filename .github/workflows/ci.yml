@@ -27,8 +27,12 @@
 name: CI
 
 on:
+  # No push branch-filter — runs on every push to the fork (every
+  # skydeval/v0.#-cycle branch, and any future branch). The
+  # previous filter named v0.2-cycle explicitly, which silently
+  # stopped firing once v0.3 / v0.4 / v0.5 work moved to new
+  # branches. Never needs per-cycle editing now.
   push:
-    branches: [main, "skydeval/v0.2-cycle"]
   pull_request:
     branches: [main]
 
@@ -44,15 +48,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo build --lib
-        run: cargo build --lib
+      - name: cargo build --tests
+        # Compile tests, not just lib — surfaces integration-test
+        # compile errors (e.g. struct-literal missing-field gaps)
+        # at the build step rather than letting them slip to the
+        # clippy / test runs.
+        run: cargo build --tests
       - name: cargo clippy
-        # `--no-deps` so we don't lint third-party crates. No `-D warnings`
-        # yet — the codebase carries a small backlog of dead_code
-        # warnings (run_migrations, is_held, etc.) from Phase 3 / 4 work
-        # that hasn't been swept; flipping to deny would block CI on
-        # known issues. Future hardening can tighten this.
-        run: cargo clippy --lib --tests --all-features --no-deps
+        # Match doll's upstream deny gate exactly: --all-targets
+        # so integration tests are linted too, and -- -D warnings
+        # so any warning fails the build. The v0.5 cycle-close
+        # CI fix swept the prior dead_code backlog (runtime route
+        # enumeration forward-substrate, db legacy factories,
+        # is_held trait method, etc.); the gate is clean as of
+        # that sweep.
+        run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
       - name: cargo test --lib
         run: cargo test --lib
 

@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # AT Protocol SDK (published crate, replaces the previously vendored ./Rust-Atproto-SDK)
-proto-blue = "0.2.6"
+proto-blue = "0.3.1"
 
 # Argon2id password hashing (vendored from the old SDK's server_auth module)
 argon2 = { version = "0.5", features = ["std"] }
@@ -80,6 +80,10 @@ unicode-segmentation = "1.11"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"] }
+
+# Arc 17 §17.4 Step 1.5 — DNS resolver for _lexicon.<host> TXT lookups.
+# Promoted from transitive to direct dep. Pure-Rust, tokio-native.
+hickory-resolver = "0.25"
 
 # WebSocket for relay support
 tokio-tungstenite = "0.27"

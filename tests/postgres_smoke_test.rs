@@ -330,6 +330,7 @@ async fn admin_managers_round_trip_on_postgres() {
 // ===========================================================================
 
 #[tokio::test]
+#[ignore = "requires a live PLC at the configured endpoint; see chainlink #109"]
 async fn account_manager_round_trip_on_postgres() {
     use aurora_locus::account::AccountManager;
     use aurora_locus::config::*;
@@ -350,6 +351,12 @@ async fn account_manager_round_trip_on_postgres() {
             service_did: "did:web:localhost".to_string(),
             version: "0.1.0-test".to_string(),
             blob_upload_limit: 5_242_880,
+                public_url: None,
+            max_blob_fetch_size: 50_000_000,
+            blob_fetch_timeout_seconds: 30,
+            blob_fetch_max_retries: 3,
+            accepting_imports: true,
+            max_import_size: None,
         },
         storage: StorageConfig {
             data_directory: PathBuf::from("./data"),
@@ -381,6 +388,7 @@ async fn account_manager_round_trip_on_postgres() {
             service_handle_domains: vec![".localhost".to_string()],
             did_cache_stale_ttl: 3600,
             did_cache_max_ttl: 86400,
+            recovery_did_key: None,
         },
         email: None,
         invites: InviteConfig {
@@ -404,11 +412,15 @@ async fn account_manager_round_trip_on_postgres() {
             crawl_enabled: false,
             public_url: None,
             auto_stream_events: false,
+                peer_pds: vec![],
         },
         validation_mode: ValidationMode::Optimistic,
         distributed_state_mode: Default::default(),
         maintenance_pool: Default::default(),
         gc_sweep: Default::default(),
+        blob_metadata: Default::default(),
+        entryway: None,
+        lexicon: aurora_locus::config::LexiconConfig::default(),
     });
 
     let mgr = AccountManager::new(pool, config);
@@ -423,6 +435,7 @@ async fn account_manager_round_trip_on_postgres() {
             Some("smoke@example.com".to_string()),
             "supersecret-test-pw".to_string(),
             None,
+                None,
         )
         .await
         .expect("create_account");
@@ -551,6 +564,143 @@ async fn backup_restore_roundtrip_on_postgres() {
         .await
         .expect("seeded row should be restored");
     assert_eq!(did, "did:plc:roundtrip");
+}
+
+// ===========================================================================
+// Group 6: session-expiry queries — chainlink #95 / Arc 16c Phase B
+//
+// Five production queries previously used the SQLite-only `datetime('now')`
+// function, which Postgres rejects with `function datetime(unknown) does
+// not exist`. The metrics_collection job (src/jobs/tasks.rs:333) was the
+// surface symptom — it failed after 3 retries on Postgres-backed Aurora-
+// Locus startup.
+//
+// The fix is NOT `CURRENT_TIMESTAMP` (the first-instinct SQL-standard
+// substitute): Postgres `CURRENT_TIMESTAMP` returns `timestamp with time
+// zone`, but `expires_at` is `TEXT` (per the explicit type-translation
+// comment at migrations/postgres/0001_initial.sql:19-34 — sqlx::Any can't
+// bind chrono types, so the codebase uses TEXT + lexicographic RFC3339
+// comparison everywhere). `TEXT > timestamptz` has no operator in Postgres
+// and would error with `operator does not exist: text > timestamp with
+// time zone`.
+//
+// The actual fix is the canonical pattern already used by
+// `AccountManager::cleanup_expired_sessions` (src/account/manager.rs:1072):
+// bind `Utc::now().to_rfc3339()` from application code, compare TEXT > TEXT
+// lexicographically. Works on both backends; matches the storage format
+// (sessions are inserted with `expires_at.to_rfc3339()` per
+// `create_session`).
+//
+// This smoke seeds two session rows (one expired, one valid) against a
+// real Postgres container and runs each of the three query shapes
+// post-fix — asserts (a) all three parse + run on Postgres and (b) return
+// the expected counts. Arc 13 Phase 5's 233-site sweep missed these
+// callsites; phase-b-gap label tracks the recon-coverage lesson.
+// ===========================================================================
+
+#[tokio::test]
+async fn session_expiry_query_runs_on_postgres() {
+    let (_pg, url) = start_postgres().await;
+    let pool = open_pool(&url).await;
+
+    // Seed two actor rows first — session has FK to actor(did).
+    let now = chrono::Utc::now().to_rfc3339();
+    for (did, handle) in [
+        ("did:plc:expired", "expired.test"),
+        ("did:plc:valid", "valid.test"),
+    ] {
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)",
+        )
+        .bind(did)
+        .bind(handle)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("seed actor {}: {}", did, e));
+    }
+
+    // Seed one expired session (expires_at in the past) and one valid
+    // session (expires_at in the future). All timestamp binds use RFC3339
+    // strings to match the documented sqlx::Any pattern (TEXT columns,
+    // lexicographic comparison).
+    let past = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339();
+    let future = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+
+    for (id, did, access, refresh, expires) in [
+        ("sess-expired", "did:plc:expired", "at-expired", "rt-expired", past.as_str()),
+        ("sess-valid", "did:plc:valid", "at-valid", "rt-valid", future.as_str()),
+    ] {
+        sqlx::query(
+            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(did)
+        .bind(access)
+        .bind(refresh)
+        .bind(&now)
+        .bind(expires)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("seed session {}: {}", id, e));
+    }
+
+    // Query 1 — verbatim from src/jobs/tasks.rs:333 + src/api/admin.rs:832
+    // + src/api/admin.rs:4782 post-fix. Three production callsites share
+    // this exact shape.
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session WHERE expires_at > $1",
+    )
+    .bind(&now)
+    .fetch_one(&pool)
+    .await
+    .expect(
+        "session-expiry query must parse + run on Postgres; \
+         pre-fix this query errored with \
+         `function datetime(unknown) does not exist`",
+    );
+    assert_eq!(
+        active, 1,
+        "Postgres TEXT > TEXT lexicographic comparison should match the \
+         valid session (future RFC3339 > now RFC3339) and exclude the \
+         expired session (past RFC3339 < now RFC3339)"
+    );
+
+    // Query 2 — verbatim from src/cli/migrate_oauth.rs:80 post-fix
+    // (`did = $1 AND expires_at > $2`).
+    let per_did_valid: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session WHERE did = $1 AND expires_at > $2",
+    )
+    .bind("did:plc:valid")
+    .bind(&now)
+    .fetch_one(&pool)
+    .await
+    .expect("per-did session-expiry query must parse + run on Postgres");
+    assert_eq!(per_did_valid, 1);
+
+    let per_did_expired: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session WHERE did = $1 AND expires_at > $2",
+    )
+    .bind("did:plc:expired")
+    .bind(&now)
+    .fetch_one(&pool)
+    .await
+    .expect("per-did session-expiry query must parse + run on Postgres");
+    assert_eq!(per_did_expired, 0);
+
+    // Query 3 — verbatim from src/cli/migrate_oauth.rs:134 post-fix.
+    let dids: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT did FROM session WHERE expires_at > $1",
+    )
+    .bind(&now)
+    .fetch_all(&pool)
+    .await
+    .expect("distinct-did session-expiry query must parse + run on Postgres");
+    assert_eq!(dids, vec!["did:plc:valid".to_string()]);
 }
 
 use std::fs::File;

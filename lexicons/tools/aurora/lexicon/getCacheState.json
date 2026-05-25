@@ -1,0 +1,72 @@
+{
+  "lexicon": 1,
+  "id": "tools.aurora.lexicon.getCacheState",
+  "description": "Arc 17 §17.3.7 — read the dynamic-lexicon resolver's in-memory cache. Returns the cached lexicon entry for a specific NSID, or a paginated list of all entries when no `nsid` is supplied. Auth: AdminAll scope. Idempotent.",
+  "defs": {
+    "main": {
+      "type": "query",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "nsid": {
+            "type": "string",
+            "description": "Optional. When supplied, return the single matching cache entry (or empty `entries` if not cached). When absent, return a paginated list."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50,
+            "description": "Max entries returned in list mode. Ignored when `nsid` is supplied."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor (the last NSID from the previous page). Ignored when `nsid` is supplied."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["entries"],
+          "properties": {
+            "entries": {
+              "type": "array",
+              "items": { "type": "ref", "ref": "#cacheEntry" }
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Present when more entries remain after this page. Pass to the next request as `cursor`."
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "LexiconDisabled" }
+      ]
+    },
+    "cacheEntry": {
+      "type": "object",
+      "required": [
+        "nsid",
+        "authorityDid",
+        "fetchedAt",
+        "lastUsedAt",
+        "expiresAt",
+        "isStale"
+      ],
+      "properties": {
+        "nsid": { "type": "string" },
+        "authorityDid": { "type": "string" },
+        "fetchedAt": { "type": "string", "format": "datetime" },
+        "lastUsedAt": { "type": "string", "format": "datetime" },
+        "expiresAt": { "type": "string", "format": "datetime" },
+        "isStale": {
+          "type": "boolean",
+          "description": "True when `now >= expiresAt`. The entry is still served until evicted or re-fetched; v0.5 does not background-refresh stale entries (§17.5.4 v0.6+ candidate)."
+        }
+      }
+    }
+  }
+}

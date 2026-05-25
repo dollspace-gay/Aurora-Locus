@@ -958,6 +958,12 @@ mod tests {
                 service_did: "did:web:localhost".to_string(),
                 version: "0.1.0-test".to_string(),
                 blob_upload_limit: 5_242_880,
+                public_url: None,
+                max_blob_fetch_size: 50_000_000,
+                blob_fetch_timeout_seconds: 30,
+                blob_fetch_max_retries: 3,
+                accepting_imports: true,
+                max_import_size: None,
             },
             storage: StorageConfig {
                 data_directory: dir.clone(),
@@ -990,6 +996,7 @@ mod tests {
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
+                recovery_did_key: None,
             },
             email: None,
             invites: InviteConfig {
@@ -1013,6 +1020,7 @@ mod tests {
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
                 auto_stream_events: false,
+                peer_pds: vec![],
             },
             validation_mode: PathBuf::from("required")
                 .into_os_string()
@@ -1022,6 +1030,9 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            blob_metadata: Default::default(),
+            entryway: None,
+            lexicon: crate::config::LexiconConfig::default(),
         };
         AppContext::new(
             config,
@@ -1287,7 +1298,7 @@ mod tests {
         // detection condition is `client_cursor < oldest - 1` exactly.
         let client_cursor = 2i64;
         assert!(
-            !(client_cursor < oldest.unwrap() - 1),
+            (client_cursor >= oldest.unwrap() - 1),
             "cursor 2 == oldest-1 is the boundary; not outdated"
         );
     }

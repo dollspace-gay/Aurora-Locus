@@ -175,10 +175,10 @@ async fn concurrent_cross_instance_inserts_serialize_to_one_winner() {
     // The losing side must report KeyExists, not some other
     // backend error. This pins the is_unique_violation()
     // detection against real Postgres SQLSTATE 23505.
-    let loser_err = if res_a.is_err() {
-        res_a.unwrap_err()
-    } else {
-        res_b.unwrap_err()
+    let loser_err = match (res_a, res_b) {
+        (Err(e), _) => e,
+        (_, Err(e)) => e,
+        _ => panic!("expected at least one CAS loser"),
     };
     assert!(
         matches!(loser_err, DistributedError::KeyExists { .. }),

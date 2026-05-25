@@ -214,7 +214,11 @@ async fn rotate_key_for_did(
     };
 
     let (commit_cid, rev) = repo_mgr
-        .apply_writes(vec![], repo_signer_pb)
+        .apply_writes(
+            vec![],
+            repo_signer_pb,
+            std::sync::Arc::new(crate::blob_store::StrictPromoter),
+        )
         .await
         .map_err(|e| {
             tracing::warn!("Failed to create commit for {}: {}", did, e);
