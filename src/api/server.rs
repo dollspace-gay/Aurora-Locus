@@ -1144,10 +1144,21 @@ async fn get_service_auth(
         }
     }
 
-    // Get signing key from config
-    let signing_key_hex = &ctx.config.authentication.repo_signing_key;
-    let signing_key_bytes = hex::decode(signing_key_hex)
-        .map_err(|e| PdsError::Internal(format!("Failed to decode signing key: {}", e)))?;
+    // Cluster 2 Member 2.1 (#143): sign with the per-account
+    // atproto_signing_key (Arc 13 §6.3.2 per-DID key surface) so the
+    // JWT signature matches the issuer DID's published verification
+    // method on receiver-side resolution. Pre-fix: signed with the
+    // server-wide ctx.config.authentication.repo_signing_key while
+    // claiming auth.did as iss — receiver fetches auth.did's
+    // published key, gets a per-account key, signature fails. Same
+    // bug shape as Arc 18 / #117 (record-write signer correctness),
+    // one layer up. Same key surface used by genesis-commit signing
+    // (Arc 15, api/account_emit.rs::create_account_emit_sequence)
+    // and Arc 18's record-write fix.
+    let signing_key_bytes = ctx
+        .account_manager
+        .get_atproto_signing_key_bytes(&auth.did)
+        .await?;
 
     if signing_key_bytes.len() != 32 {
         return Err(PdsError::Internal(
@@ -1161,7 +1172,7 @@ async fn get_service_auth(
         &req.aud,           // Audience DID (target service)
         exp_duration,       // Expiration duration in seconds
         req.lxm.as_deref(), // Optional lexicon method
-        &signing_key_bytes, // Signing key
+        &signing_key_bytes, // Per-account signing key (chainlink #143)
     )?;
 
     tracing::info!(
