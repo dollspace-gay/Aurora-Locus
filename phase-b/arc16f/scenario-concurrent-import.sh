@@ -16,11 +16,49 @@
 # scenario witnesses end-to-end that it ENFORCES under contention.
 #
 # Source-of-record: docs/V06_DESIGN.md Cluster 3 Member 3.3 +
-# docs/internal/v06-recon/V06_CLUSTER3_RECON.md +
-# chainlink #155.
+# docs/internal/v06-recon/V06_CLUSTER3_RECON.md + chainlink #155.
 #
 # Standalone — owns its own setup (mock PLC + fresh data dir + fresh
 # account + fixture CAR). Does NOT depend on other arc scripts.
+#
+# ── v0.5 importRepo precondition: target actor must be EMPTY ──
+#
+# Aurora v0.5 importRepo applies the CAR's records as additive
+# `WriteOp::Create`s against an empty MST per src/api/repo_import.rs:277-280
+# ("No prior-repo snapshot — Aurora's v0.5 importRepo applies imported
+# commits as additive diffs against an empty MST. v0.6+ may pass the
+# current repo's VerifiedRepo here to support incremental import.").
+# Importing INTO a populated repo (e.g. self-importing a CAR exported
+# from the same DID's current state, without first clearing the
+# actor's records) lands every record as a Create-on-existing-key,
+# which proto-blue's MST.add rejects with the literal message
+# "Key already exists: <collection>/<rkey>" — surfacing on the wire
+# as HTTP 500 InternalServerError. That known-failure mode is itself
+# documented at src/api/repo_import.rs:357-367 (the v5.3 / chainlink
+# #124 retry-into-collision closure).
+#
+# So this scenario seeds records on B, exports the CAR, then kills B,
+# wipes B's PER-ACTOR store (preserving account.sqlite + plc_keys,
+# the v5.2 / chainlink #123 "federation-into-fresh-instance case"
+# described verbatim at src/api/repo_import.rs:236-243), restarts B,
+# and ONLY THEN issues the race. The winner runs against the empty
+# actor that the import path's idempotent ctx.actor_store.create()
+# re-materialises at :244 → applies the 3 records cleanly → 200. The
+# loser hits the lock → 409 ConcurrentMutation. The pre-race seed +
+# wipe is the documented v0.5 precondition (account-seeded, actor-
+# empty), not state-suppression of a defect.
+#
+# Authorship note (recon 2026-05-26): an earlier draft of this script
+# raced two POSTs against the populated actor and counted equal
+# pre/post record counts as the no-double-write proof. That was wrong
+# in two ways: the winner crashed at "Key already exists" (was a 500,
+# not the asserted 200); and the equal count consistent with both
+# "winner succeeded idempotently" and "winner crashed before any
+# write" — the count could not distinguish success from failure. The
+# corrected shape below makes the winner do REAL work (import into
+# empty), so the count delta IS the no-double-write proof
+# (post-race == 3 reflects one complete import; not 3 + double-write,
+# not 0 from a winner-crashed).
 #
 # Kill-mid is explicitly OUT of scope: against the in-process lock,
 # "process dies holding the lock" is degenerate (lock dies with the
@@ -51,10 +89,11 @@ RESP_PATH_1="/tmp/arc16f-concurrent-import-resp-1"
 RESP_PATH_2="/tmp/arc16f-concurrent-import-resp-2"
 STATUS_PATH_1="/tmp/arc16f-concurrent-import-status-1"
 STATUS_PATH_2="/tmp/arc16f-concurrent-import-status-2"
+EXPECTED_IMPORT_RECORD_COUNT=3
 
-# Per-actor record count helper — same shape as scenario-16's. The
-# `record` table is backend-independent (lives in per-actor SQLite
-# regardless of PDS_DB_BACKEND).
+# Per-actor record count helper — same shape as arc17/scenario-16.sh.
+# The `record` table is backend-independent (lives in per-actor
+# SQLite regardless of PDS_DB_BACKEND).
 pb_record_count() {
     local did_var="${1:-B_DID}"
     local did="${!did_var}"
@@ -70,12 +109,20 @@ pb_record_count() {
         || echo "(sqlite3 unavailable — operator: sqlite3 '$actor_db' 'SELECT count(*) FROM record')"
 }
 
+# Path to B's per-actor directory for $B_DID. Used by the wipe step
+# to clear actor records while leaving account.sqlite + plc_keys
+# untouched. Shard is hash-derived (DefaultHasher % 256, not
+# bash-reproducible across Rust versions), so we resolve it by walk.
+pb_actor_dir_for_b_did() {
+    local safe_did="${B_DID//:/_}"
+    find "${B_DATA}/actors" -type d -name "${safe_did}" -print -quit 2>/dev/null
+}
+
 # ============================================================
-# Block 1 — Setup-to-confirmed-up: mock PLC, fresh data dir,
-# fresh account, seed a few records.
+# Block 1 — Setup-to-confirmed-up + seed records + export CAR
 # ============================================================
 echo
-echo "[concurrent-import] Block 1: setup-to-confirmed-up"
+echo "[concurrent-import] Block 1: setup + seed source records + export CAR"
 echo "============================================================"
 
 pb_mock_plc_start
@@ -100,28 +147,29 @@ pb_create_account b "concurrent-import.localhost" \
     "concurrent-import@localhost" "phase-b-arc16f-pw"
 pb_echo_creds b
 
-# Seed three records so the export CAR carries non-trivial state. The
-# count is what the no-double-write invariant compares against
-# post-race.
+# Seed 3 records (no blob refs — feed posts with text only, so the
+# import path doesn't need the blob-fetch primitive). SQLite seed
+# sleep between createRecords avoids SQLITE_BUSY on the writer-lock
+# (Phase B harness convention).
 echo
-echo "[concurrent-import] seeding 3 records on B for a non-trivial CAR…"
-for i in 1 2 3; do
+echo "[concurrent-import] seeding ${EXPECTED_IMPORT_RECORD_COUNT} records on B…"
+for i in $(seq 1 "${EXPECTED_IMPORT_RECORD_COUNT}"); do
     curl -sX POST "http://localhost:${B_PORT}/xrpc/com.atproto.repo.createRecord" \
         -H "Authorization: Bearer ${B_JWT}" \
         -H "Content-Type: application/json" \
         -d "$(jq -nc --arg repo "$B_DID" \
             '{repo:$repo, collection:"app.bsky.feed.post",
-              record:{text:"seed-record-'"$i"'", createdAt:"2026-01-01T00:00:00Z"}}')" \
+              record:{"$type":"app.bsky.feed.post",
+                      text:"seed-record-'"$i"'",
+                      createdAt:"2026-01-01T00:00:00Z"}}')" \
         -o /dev/null -w "  seed-${i} status: %{http_code}\n"
-    # SQLite seed sleep — three rapid createRecords can trip SQLITE_BUSY
-    # on the writer-lock (per Phase B harness conventions memory).
     sleep 0.3
 done
 
-BASELINE_COUNT=$(pb_record_count B_DID)
-echo "B baseline record count (post-seed, pre-race): ${BASELINE_COUNT}"
-test "${BASELINE_COUNT}" -ge 3 \
-    || { echo "[concurrent-import] FATAL: expected >= 3 records after seed, got '${BASELINE_COUNT}' — aborting"; exit 1; }
+SEED_COUNT=$(pb_record_count B_DID)
+echo "B record count (post-seed): ${SEED_COUNT}"
+test "${SEED_COUNT}" = "${EXPECTED_IMPORT_RECORD_COUNT}" \
+    || { echo "[concurrent-import] FATAL: expected ${EXPECTED_IMPORT_RECORD_COUNT} records after seed, got '${SEED_COUNT}' — aborting"; exit 1; }
 
 # Export B's repo to a CAR file (the source artifact for the race).
 echo
@@ -135,19 +183,67 @@ test "${CAR_SIZE:-0}" -gt 100 \
     || { echo "[concurrent-import] FATAL: CAR suspiciously small (${CAR_SIZE} bytes) — aborting"; exit 1; }
 
 # ============================================================
-# Block 2 — Race two concurrent importRepo POSTs against the
-# same DID. Capture both wire statuses + response bodies for
-# the operator's loser-shape assertion.
+# Block 2 — Empty B's actor store (keep account.sqlite + plc_keys);
+# restart B. The v5.2 (chainlink #123) federation-into-fresh-
+# instance precondition documented at src/api/repo_import.rs:236-243.
 # ============================================================
 echo
-echo "[concurrent-import] Block 2: race two concurrent importRepo POSTs"
+echo "[concurrent-import] Block 2: empty B's actor store + restart"
 echo "============================================================"
 
-# Fire both in background BEFORE either curl finishes its connect
-# phase so try_acquire contends in-flight. The lock is held for the
-# duration of the CAR parse + verify + apply, which is much longer
-# than two curl-start latencies on localhost — collision is reliable
-# with two requests, no need for higher fan-out.
+# Kill B first so SQLite file locks release. Find the per-actor
+# directory before kill so the path resolution doesn't race.
+ACTOR_DIR=$(pb_actor_dir_for_b_did)
+if [ -z "${ACTOR_DIR}" ]; then
+    echo "[concurrent-import] FATAL: could not locate B's per-actor dir under ${B_DATA}/actors/ — aborting"
+    exit 1
+fi
+echo "B per-actor dir: ${ACTOR_DIR}"
+
+pb_kill_instance b
+
+# Remove the per-actor records (store.sqlite + WAL + SHM + any blob
+# files; the latter are a no-op for our no-blob-refs fixture). The
+# account.sqlite + plc_keys row are untouched — they live at
+# ${B_DATA}/account.sqlite, distinct from the per-actor path.
+rm -rf "${ACTOR_DIR}"
+echo "wiped per-actor dir; account.sqlite + plc_keys preserved at ${B_DATA}/account.sqlite"
+
+# Confirm plc_keys row for B_DID survives the wipe — the v5.2 entry
+# gate depends on it (without the plc_keys row, importRepo would
+# fail ActorNotInitialized at :207 before ever reaching the lock).
+ACCT_DB="${B_DATA}/account.sqlite"
+PLC_ROWS=$(sqlite3 "${ACCT_DB}" "SELECT count(*) FROM plc_keys WHERE did='${B_DID}'" 2>/dev/null || echo "?")
+echo "plc_keys rows for ${B_DID} post-wipe: ${PLC_ROWS}"
+test "${PLC_ROWS}" = "1" \
+    || { echo "[concurrent-import] FATAL: plc_keys row missing after wipe (got ${PLC_ROWS}) — would fail ActorNotInitialized before reaching the lock; aborting"; exit 1; }
+
+pb_launch_instance b
+pb_wait_for_ready b
+pb_grep_banner b
+
+# Pre-race count — should be 0 (or no actor dir yet; the import path
+# re-materialises it via ctx.actor_store.create() at :244 on first
+# import call). The pre-race count is the baseline for the no-
+# double-write invariant: post-race == EXPECTED_IMPORT_RECORD_COUNT
+# proves one complete import landed.
+PRE_RACE_COUNT=$(pb_record_count B_DID)
+echo "B record count (pre-race, post-wipe): ${PRE_RACE_COUNT:-0}"
+echo "  expected 0 or missing-dir — the actor store will be re-"
+echo "  materialised idempotently by the first importRepo's :244 call."
+
+# ============================================================
+# Block 3 — Race two concurrent importRepo POSTs against the
+# same DID. Capture both wire statuses + response bodies.
+# ============================================================
+echo
+echo "[concurrent-import] Block 3: race two concurrent importRepo POSTs"
+echo "============================================================"
+
+# Fire both in background. The lock is held for the duration of the
+# CAR parse + verify + apply, which is much longer than two curl-
+# start latencies on localhost — collision is reliable with two
+# requests, no need for higher fan-out.
 (
     curl -sX POST "http://localhost:${B_PORT}/xrpc/com.atproto.repo.importRepo" \
         -H "Authorization: Bearer ${B_JWT}" \
@@ -165,9 +261,9 @@ PID_1=$!
 ) &
 PID_2=$!
 
-# Wait for both. Bash's `wait` blocks on the specified PIDs; using
-# named PIDs (not bare `wait`) per Phase B harness memory — `wait`
-# alone is unreliable for time-bounded background-wait coverage.
+# Named-PID waits per Phase B harness memory (`wait` builtin can't
+# be `timeout`-wrapped; named PIDs + bounded curl timeouts are the
+# right primitive).
 wait "${PID_1}"
 wait "${PID_2}"
 
@@ -175,49 +271,54 @@ STATUS_1=$(cat "${STATUS_PATH_1}")
 STATUS_2=$(cat "${STATUS_PATH_2}")
 echo "request-1 status: ${STATUS_1}"
 echo "request-1 body:"
-cat "${RESP_PATH_1}" | jq . 2>/dev/null || cat "${RESP_PATH_1}"
+jq . < "${RESP_PATH_1}" 2>/dev/null || cat "${RESP_PATH_1}"
 echo
 echo "request-2 status: ${STATUS_2}"
 echo "request-2 body:"
-cat "${RESP_PATH_2}" | jq . 2>/dev/null || cat "${RESP_PATH_2}"
+jq . < "${RESP_PATH_2}" 2>/dev/null || cat "${RESP_PATH_2}"
 
 # ============================================================
-# Block 3 — Loser-shape assertion + no-double-write invariant
+# Block 4 — Loser-shape assertion + no-double-write invariant
 # ============================================================
 echo
-echo "[concurrent-import] Block 3: side-effect-check"
+echo "[concurrent-import] Block 4: side-effect-check"
 echo "============================================================"
 
 # Round-3 #3 PIN: the loser must be the reject shape (409
 # ConcurrentMutation), NOT wait-then-succeed. The disjunction was
 # the recon HYPOTHESIS; the test pins the recon-confirmed truth so a
 # future regression that silently flipped reject→wait would fail
-# loud here (an "accept either" assertion would mask exactly that).
+# loud here.
 WINNER_COUNT=0
 LOSER_COUNT=0
+UNEXPECTED_STATUSES=()
 for s in "${STATUS_1}" "${STATUS_2}"; do
     case "$s" in
     200) WINNER_COUNT=$((WINNER_COUNT + 1)) ;;
     409) LOSER_COUNT=$((LOSER_COUNT + 1)) ;;
+    *)   UNEXPECTED_STATUSES+=("$s") ;;
     esac
 done
-echo "wire-shape tally: winners(200)=${WINNER_COUNT}  losers(409)=${LOSER_COUNT}"
+echo "wire-shape tally: winners(200)=${WINNER_COUNT}  losers(409)=${LOSER_COUNT}  other=${UNEXPECTED_STATUSES[*]:-none}"
 echo
-echo "expected:"
-echo "  winners(200) == 1  (one request acquired the lock and completed import)"
-echo "  losers(409)  == 1  (the other surfaced ConcurrentMutation)"
+echo "expected (load-bearing):"
+echo "  winners(200) == 1  (one request acquired the lock and imported the CAR"
+echo "                       into the now-empty actor store — REAL work)"
+echo "  losers(409)  == 1  (the other surfaced ConcurrentMutation, the recon-pinned"
+echo "                       round-3 #3 loser-shape from src/error.rs:728-732)"
 echo "  the 409 body should include error name 'ConcurrentMutation'"
-echo "    (per src/error.rs:728-732 IntoResponse arm — pinned"
-echo "    loser-shape for the regression-loud assertion)"
 echo
-echo "NOT expected:"
-echo "  winners(200) == 2  → lock not enforcing; both ran serially-but-uncontended"
-echo "                       (could mean the race lost to network startup latency;"
-echo "                       re-run, or raise concurrency. If reproducible at"
-echo "                       two-concurrent: the lock regressed.)"
-echo "  losers(409)  == 2  → both rejected (the only winner ran to completion"
-echo "                       BEFORE either request issued — try-acquire serialization"
-echo "                       failed end-to-end. Investigate."
+echo "NOT expected (regression signals):"
+echo "  any 500 'Key already exists' → the actor-empty precondition wasn't met;"
+echo "                                  Block 2's wipe didn't take effect."
+echo "  winners(200) == 2            → lock not enforcing (both ran serially-but-"
+echo "                                  uncontended; re-run, or raise concurrency."
+echo "                                  If reproducible: the lock regressed.)"
+echo "  losers(409)  == 2            → both rejected (one winner ran to completion"
+echo "                                  BEFORE either request issued — investigate."
+echo "  any 400 'ActorNotInitialized'→ Block 2's wipe took TOO MUCH (cleared the"
+echo "                                  plc_keys row); the pre-race check should"
+echo "                                  have caught this."
 
 echo
 echo "--- forensic log signature on B ---"
@@ -225,38 +326,49 @@ echo "expected one 'importRepo concurrent mutation rejected' warn line (the lose
 grep 'importRepo concurrent mutation rejected' "${B_LOG}" | tail -5 \
     || echo "(NOT FOUND — the lock's warn-emit at repo_import.rs:217 didn't fire)"
 
-# No-double-write invariant — the load-bearing teeth. Post-race
-# record count must reflect ONE import's worth of state, not two.
-# Since the CAR was exported from this same actor, a successful
-# self-import is idempotent: post-import count == baseline count.
-# (A future cross-account import scenario would see post == source
-# fixture count; here the simpler equality holds.)
+echo
+echo "expected one 'import_repo_starting' info line (the winner crossed validate-phase):"
+grep 'import_repo_starting' "${B_LOG}" | tail -5 \
+    || echo "(NOT FOUND — winner never reached :335; investigate)"
+
+# No-double-write invariant — load-bearing teeth. Post-race count
+# must equal EXPECTED_IMPORT_RECORD_COUNT (one import's worth). With
+# the corrected shape: pre-race=0, post-race=N proves one COMPLETE
+# import landed; pre-race=0, post-race!=N means either the winner
+# crashed (post=0 / partial), or the lock failed and two imports
+# clashed at the unique-key constraint (post varies, often a 500
+# from the loser).
 POST_RACE_COUNT=$(pb_record_count B_DID)
 echo
 echo "--- no-double-write invariant: post-race record count ---"
-echo "baseline (pre-race): ${BASELINE_COUNT}"
-echo "post-race:           ${POST_RACE_COUNT}"
+echo "pre-race (post-wipe): ${PRE_RACE_COUNT:-0}"
+echo "post-race:            ${POST_RACE_COUNT}"
+echo "expected:             ${EXPECTED_IMPORT_RECORD_COUNT}  (one complete import)"
 echo
-echo "expected: post-race count == baseline count (${BASELINE_COUNT})."
-echo "  self-import is idempotent at the MST level — one import maintains"
-echo "  the same record set; two SERIAL imports would also. A LOCK"
-echo "  FAILURE manifests as a half-apply / partial-state row count"
-echo "  (not necessarily double, but inconsistent with idempotent self-"
-echo "  import). Mismatch here = the actor's state is corrupted by"
-echo "  interleaving."
+echo "  expected (load-bearing): post-race == ${EXPECTED_IMPORT_RECORD_COUNT}."
+echo "  This is the corrected no-double-write invariant — pre-race=0 was the"
+echo "  documented v5.2 federation-into-fresh-instance state; post-race==N"
+echo "  proves the winner did a full import. Anything OTHER than"
+echo "  ${EXPECTED_IMPORT_RECORD_COUNT} indicates either a half-apply (winner"
+echo "  crashed) or a double-write (lock failed and the second import created"
+echo "  duplicate keys on top — proto-blue's MST would reject the second's"
+echo "  Create-on-existing-key with the Block 4 NOT-expected '500 Key already"
+echo "  exists' signal)."
 
 # ============================================================
-# Block 4 — Decision-point
+# Block 5 — Decision-point
 # ============================================================
 echo
 echo "[concurrent-import] decision-point:"
 echo "  expected (load-bearing):"
 echo "    1. winners(200) == 1 and losers(409) == 1"
 echo "    2. the 409 response body's error == 'ConcurrentMutation' (round-3 #3 pin)"
-echo "    3. post-race record count == baseline (no-double-write invariant)"
+echo "    3. post-race record count == ${EXPECTED_IMPORT_RECORD_COUNT}"
+echo "       (one complete import, not zero, not double)"
 echo "    4. 'importRepo concurrent mutation rejected' warn line in B's log"
+echo "    5. one 'import_repo_starting' info line in B's log"
 echo "  v0.6 Cluster 3 Member 3.3 (#155) — verification-only, no production touch."
 echo "  v0.6+ kill-mid coverage is the natural companion to the cross-process"
 echo "  pg_try_advisory_lock variant (src/api/repo_import.rs:57-65), not to"
 echo "  this in-process scenario."
-echo "  operator: confirm all four signals; the lock holds."
+echo "  operator: confirm all five signals; the lock holds."
