@@ -1979,8 +1979,7 @@ mod tests {
     /// 429 because each check returns immediately at the gate.
     #[test]
     fn test_disabled_flag_bypasses_all_checks() {
-        let mut config = RateLimitConfig::default();
-        config.enabled = false;
+        let config = RateLimitConfig { enabled: false, ..Default::default() };
         let limiter = RateLimiter::new(config);
 
         // Saturate the per-DID-per-endpoint bucket — under default
@@ -2043,8 +2042,7 @@ mod tests {
         // Sanity: the SAME limiter with enabled=true still saturates
         // (so the test would fail if the gate was missing — proves the
         // gate is the only reason the calls above succeeded).
-        let mut enabled_config = RateLimitConfig::default();
-        enabled_config.enabled = true;
+        let enabled_config = RateLimitConfig { enabled: true, ..Default::default() };
         let enabled_limiter = RateLimiter::new(enabled_config);
         let mut got_err = false;
         for _ in 0..200 {
