@@ -159,6 +159,16 @@ export PDS_DB_URL=$db_url
 export PDS_INVITE_REQUIRED=false
 export PDS_GC_SWEEP_ENABLED=false
 export PDS_GC_SWEEP_ROW_SWEEP_ENABLED=false
+# Rate limiting OFF for Phase B determinism. With this disabled, every
+# scenario's multi-call patterns (scenario-13's three serial sub-cases,
+# scenario-15's N-concurrent burst, any handler chain) run without the
+# per-DID-per-endpoint or middleware-level bucket racing them. Wired by
+# chainlink #153 (58f5a13 wire rate-limit enable flag); before that the
+# env var was dead. No scenario in arc17/ asserts rate-limiting as
+# desired behavior, so blanket-disabling is safe — if a future scenario
+# DOES want to test the limiter, it overrides this back to true in its
+# own env after pb_env_emit_role.
+export PDS_RATE_LIMITS_ENABLED=false
 export PDS_JWT_SECRET=\${PDS_JWT_SECRET:-pb-jwt-secret-$role-static-for-replayability-of-issued-tokens}
 export PDS_ADMIN_PASSWORD=\${PDS_ADMIN_PASSWORD:-pb-admin-static-$role}
 export PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=\${PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX:-$(openssl rand -hex 32)}
