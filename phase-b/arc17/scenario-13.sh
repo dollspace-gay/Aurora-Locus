@@ -199,6 +199,13 @@ cat "$RESP_PATH_13A" | jq . 2>/dev/null || cat "$RESP_PATH_13A"
 echo
 echo "expected: HTTP 502, body { error: 'LexiconAuthorityAmbiguous', ... }"
 
+# Pace between sub-cases — three same-DID same-endpoint createRecord calls
+# back-to-back trip the PDS's per-DID-per-endpoint rate-limit bucket
+# (src/rate_limit.rs::check_did_endpoint) on the 2nd/3rd request, 429ing
+# the call before the resolver/fetcher gets a chance to fire. Skipping the
+# pace would void 13b/13c (only 13a would reach the resolver).
+pb_pace_xrpc
+
 # ============================================================
 # Block 3 — Scenario-call 13b (two TXT records, each multi-chunk)
 # ============================================================
@@ -220,6 +227,9 @@ echo "expected: HTTP 502, body { error: 'LexiconAuthorityAmbiguous', ... }"
 echo "         (the resolver's chunks-join('') joins each record's two"
 echo "          character-strings into one 'did=did:plc:...' prefix-matching"
 echo "          value; two records -> two candidates -> ambiguity)"
+
+# Pace before 13c — same per-DID-per-endpoint bucket as 13a->13b.
+pb_pace_xrpc
 
 # ============================================================
 # Block 4 — Scenario-call 13c (malformed TXT — uppercase DID=, whitespace)
