@@ -45,6 +45,33 @@ fi
 # ============================================================
 # Block 2 — Capture baseline counter; fire N concurrent writes
 # ============================================================
+#
+# Rate-limit caveat (documented; not auto-mitigated):
+#
+# N concurrent createRecord against the SAME DID (B_DID) hits the PDS's
+# per-DID-per-endpoint check_did_endpoint() bucket
+# (src/rate_limit.rs::check_did_endpoint, called from the createRecord
+# handler). Burst tolerance is config-driven; under typical defaults a
+# burst of ~10 same-DID requests may pass cleanly, OR may 429 some.
+# If some return 429 BEFORE reaching the resolver, the delta=1
+# assertion below is still satisfied coincidentally (only the requests
+# that bypassed the limiter reach the de-dup gate). That's an easy-pass
+# trap — delta=1 looks like single-flight working, but it's actually
+# rate-limit masking the test.
+#
+# If you see N concurrent writes returning a mix of 200/429, the
+# deterministic fix is to give each concurrent call its OWN account
+# (per-DID buckets are fresh per DID; the de-dup gate is keyed by NSID,
+# so distinct DIDs against same NSID still tests single-flight). N=10
+# accounts in scenario-15 setup ~ +1s, but the assertion becomes real.
+#
+# Watch the http= lines surfaced below — any http=429 in the burst
+# invalidates the delta=1 read.
+#
+# Background: PDS_RATE_LIMITS_ENABLED env var is loaded into config but
+# never consulted by src/server.rs:98 (it unconditionally wires the
+# middleware). Out-of-scope production-code fix would let Phase B set
+# the env var to disable rate-limiting cleanly. See findings doc.
 echo
 echo "[scenario-15] Block 2: baseline counter + N concurrent writes"
 echo "============================================================"
@@ -62,10 +89,21 @@ for i in $(seq 1 $N); do
         -H "Content-Type: application/json" \
         -d "$(jq -nc --arg repo "$B_DID" --arg msg "concurrent $i" --arg collection "$TARGET_NSID" \
             '{repo:$repo, collection:$collection, record:{msg:$msg}}')" \
+        -w 'http=%{http_code}\n' \
         >"/tmp/scenario-15-conc-${i}.out" 2>&1 &
 done
 wait
 echo "all $N concurrent writes returned"
+
+# Surface any 429s in the burst so the operator can see if the
+# delta=1 assertion below is real or rate-limit-masked.
+RL_429S=$(grep -l 'http=429' /tmp/scenario-15-conc-*.out 2>/dev/null | wc -l)
+if [ "$RL_429S" -gt 0 ]; then
+    echo "[scenario-15] WARNING: ${RL_429S} of $N concurrent writes returned 429"
+    echo "[scenario-15] the delta=1 assertion below may be MASKED by rate-limiting"
+    echo "[scenario-15] rather than actually testing single-flight de-dup."
+    echo "[scenario-15] see the rate-limit caveat at the top of Block 2."
+fi
 
 # ============================================================
 # Block 3 — Side-effect-check: counter delta + event count
