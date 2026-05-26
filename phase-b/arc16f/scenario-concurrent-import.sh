@@ -212,8 +212,35 @@ echo "wiped per-actor dir; account.sqlite + plc_keys preserved at ${B_DATA}/acco
 # Confirm plc_keys row for B_DID survives the wipe — the v5.2 entry
 # gate depends on it (without the plc_keys row, importRepo would
 # fail ActorNotInitialized at :207 before ever reaching the lock).
-ACCT_DB="${B_DATA}/account.sqlite"
-PLC_ROWS=$(sqlite3 "${ACCT_DB}" "SELECT count(*) FROM plc_keys WHERE did='${B_DID}'" 2>/dev/null || echo "?")
+#
+# Backend-divergent storage location: under BACKEND=sqlite the
+# plc_keys row lives in ${B_DATA}/account.sqlite (alongside accounts
+# + sessions); under BACKEND=postgres it lives in the per-role pg
+# container's `plc_keys` table (container name
+# `aurora-phase-b-pg-b`, user `aurora`, db `aurora` per
+# lib/instance.sh:83 + :121-122). The wipe targets the per-actor
+# `store.sqlite` which is SQLite under BOTH backends (per the
+# arc17/scenario-16.sh docstring at :38-54 — actor store stays
+# SQLite even when the PDS-config backend is postgres), so Block 2's
+# rm step is backend-uniform; only the post-wipe survival CHECK
+# needs to branch by backend. Mirrors the idiom scenario-13 already
+# uses for its Block 6 cache-row check at arc17/scenario-13.sh:306.
+case "$BACKEND" in
+sqlite)
+    PLC_ROWS=$(sqlite3 "${B_DATA}/account.sqlite" \
+        "SELECT count(*) FROM plc_keys WHERE did='${B_DID}'" \
+        2>/dev/null || echo "?")
+    ;;
+postgres)
+    PLC_ROWS=$(docker exec aurora-phase-b-pg-b psql -U aurora -d aurora -At \
+        -c "SELECT count(*) FROM plc_keys WHERE did = '${B_DID}'" \
+        2>/dev/null || echo "?")
+    ;;
+*)
+    echo "[concurrent-import] FATAL: unsupported BACKEND='${BACKEND}' (expected sqlite|postgres) — aborting"
+    exit 1
+    ;;
+esac
 echo "plc_keys rows for ${B_DID} post-wipe: ${PLC_ROWS}"
 test "${PLC_ROWS}" = "1" \
     || { echo "[concurrent-import] FATAL: plc_keys row missing after wipe (got ${PLC_ROWS}) — would fail ActorNotInitialized before reaching the lock; aborting"; exit 1; }
