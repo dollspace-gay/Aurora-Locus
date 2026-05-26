@@ -311,8 +311,10 @@ pub enum PdsError {
     /// taxonomy: `"dns_fail"`, `"did_fail"`, `"pds_unreachable"`,
     /// `"http_5xx"`, `"http_4xx"`, `"timeout"`,
     /// `"authority_tombstoned"`, `"authority_ambiguous"`,
-    /// `"invalid_schema"`. Mapped to HTTP 502 per §17.3.6 wire-format
-    /// alignment with Arc 16f's `OriginFetchExhausted`.
+    /// `"invalid_schema"`, `"invalid_signature"` (the last added
+    /// alongside the §17.7 lexicon-fetch sig-verify wire-up,
+    /// v0.6 Cluster 3 Member 3.1). Mapped to HTTP 502 per
+    /// §17.3.6 wire-format alignment with Arc 16f's `OriginFetchExhausted`.
     #[error("Lexicon fetch failed for {nsid} ({failure_class}): {source_detail}")]
     #[allow(dead_code)]
     LexiconFetchFailed {

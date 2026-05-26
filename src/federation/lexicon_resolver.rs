@@ -105,6 +105,19 @@ pub enum LexiconFetcherError {
     /// reader think the origin returned 4xx when it returned 200).
     #[error("invalid response structure: {0}")]
     InvalidResponseStructure(String),
+
+    /// The CAR parsed into a structurally-valid `SignedCommit` but the
+    /// commit's signature did not verify against the authority DID's
+    /// published `#atproto` verification key. Maps to
+    /// `failure_class = "invalid_signature"` per the F14 taxonomy
+    /// extension landed alongside §17.7 lexicon-fetch sig-verify
+    /// wire-up (v0.6 Cluster 3 Member 3.1). Distinct from
+    /// `InvalidResponseStructure` so a sig rejection routes to its own
+    /// operator-grep target instead of collapsing into the
+    /// malformed-CAR / missing-record bucket — the wire-up's whole
+    /// point is to make signature failure observable.
+    #[error("commit signature verification failed: {0}")]
+    SignatureVerificationFailed(String),
 }
 
 impl LexiconFetcherError {
@@ -118,6 +131,7 @@ impl LexiconFetcherError {
             Self::Http5xx(_) => "http_5xx",
             Self::Timeout => "timeout",
             Self::InvalidResponseStructure(_) => "invalid_schema",
+            Self::SignatureVerificationFailed(_) => "invalid_signature",
         }
     }
 }

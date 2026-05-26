@@ -48,6 +48,7 @@ use crate::identity::IdentityResolverApi;
 use async_trait::async_trait;
 use proto_blue::repo::{
     car as pb_car,
+    ensure_commit_sig,
     storage::{MemoryBlockstore, RepoStorage},
     Repo,
 };
@@ -81,6 +82,37 @@ impl ProductionLexiconFetcher {
             http_client,
         }
     }
+}
+
+/// Reconstruct the `did:key:z…` URI for the authority's published
+/// atproto verification key from its resolved DID document.
+///
+/// The DID document's `verificationMethod[].publicKeyMultibase` is
+/// already in did:key multikey form (the `z`-prefixed base58 of the
+/// multicodec-tagged compressed pubkey). The did:key URI is just
+/// `"did:key:" + multikey`, which is the shape proto-blue's
+/// `ensure_commit_sig` expects.
+///
+/// A missing `#atproto` verification method or a method missing
+/// `publicKeyMultibase` both surface as `SignatureVerificationFailed`
+/// — not as `InvalidResponseStructure`, because the issue is the
+/// authority's published trust material, not the CAR body. The
+/// operator-grep target stays `failure_class = "invalid_signature"`.
+fn authority_did_key_from_doc(
+    doc: &crate::identity::did_document::DidDocument,
+    authority_did: &str,
+) -> Result<String, LexiconFetcherError> {
+    let vm = doc.get_signing_key().ok_or_else(|| {
+        LexiconFetcherError::SignatureVerificationFailed(format!(
+            "authority {authority_did}: DID document has no #atproto verification method"
+        ))
+    })?;
+    let multikey = vm.public_key_multibase.as_deref().ok_or_else(|| {
+        LexiconFetcherError::SignatureVerificationFailed(format!(
+            "authority {authority_did}: #atproto verification method missing publicKeyMultibase"
+        ))
+    })?;
+    Ok(format!("did:key:{multikey}"))
 }
 
 #[async_trait]
@@ -192,11 +224,36 @@ impl LexiconRecordFetcher for ProductionLexiconFetcher {
 
         // `Repo::load` walks the signed commit + MST. It calls
         // `SignedCommit::from_lex_value` (parse only) but NOT
-        // `verify_commit_sig` — signature verification is deferred
-        // per §17.7 / §17.3.9. v0.6+ adds the verify call here.
+        // `verify_commit_sig` — the post-load `ensure_commit_sig`
+        // below is what enforces trust on the authority's commit.
+        // §17.7 / §17.3.9 deferral closure: v0.6 Cluster 3 Member 3.1.
         let repo = Repo::load(storage).map_err(|e| {
             LexiconFetcherError::InvalidResponseStructure(format!(
                 "Repo::load failed (commit/MST structure invalid): {e}"
+            ))
+        })?;
+
+        // §17.7 / §17.3.9 wire-up (v0.6 Cluster 3 Member 3.1):
+        // verify the loaded SignedCommit against the authority DID's
+        // published `#atproto` verification key. The published key
+        // lives in `did_doc.verification_method[].public_key_multibase`
+        // already in did:key multikey form (prepending `did:key:`
+        // reconstructs the URI proto-blue's `ensure_commit_sig` expects).
+        // A `None` commit is a structural failure of `Repo::load`'s
+        // output (a successfully-loaded repo with no commit is a
+        // malformed shape, not a signature problem) → route to
+        // `InvalidResponseStructure`. A `verify` failure routes to
+        // the SignatureVerificationFailed variant so the wire-shape
+        // is wire-distinguishable from malformed-CAR / missing-record.
+        let signed_commit = repo.commit().ok_or_else(|| {
+            LexiconFetcherError::InvalidResponseStructure(format!(
+                "Repo::load returned a repo with no commit (CAR for {LEXICON_COLLECTION}/{nsid} from {authority_did})"
+            ))
+        })?;
+        let authority_did_key = authority_did_key_from_doc(&did_doc, authority_did)?;
+        ensure_commit_sig(signed_commit, &authority_did_key).map_err(|e| {
+            LexiconFetcherError::SignatureVerificationFailed(format!(
+                "commit for {LEXICON_COLLECTION}/{nsid} from authority {authority_did}: {e}"
             ))
         })?;
 
@@ -310,6 +367,33 @@ mod tests {
             "id": "did:plc:authority",
             "alsoKnownAs": [],
             "verificationMethod": [],
+            "service": [
+                {
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": endpoint,
+                }
+            ],
+        });
+        serde_json::from_value(json).expect("doc parse")
+    }
+
+    /// Build a DID document carrying `multikey` as the `#atproto`
+    /// verification key's `publicKeyMultibase`. Used by the sig-verify
+    /// fetcher-boundary tests so the published authority key is wire-
+    /// observable to `ProductionLexiconFetcher::fetch`'s signature path.
+    fn doc_pointing_at_with_atproto_multikey(endpoint: &str, multikey: &str) -> DidDocument {
+        let json = serde_json::json!({
+            "id": "did:plc:authority",
+            "alsoKnownAs": [],
+            "verificationMethod": [
+                {
+                    "id": "did:plc:authority#atproto",
+                    "type": "Multikey",
+                    "controller": "did:plc:authority",
+                    "publicKeyMultibase": multikey,
+                }
+            ],
             "service": [
                 {
                     "id": "#atproto_pds",
@@ -580,5 +664,159 @@ mod tests {
         // Fold-2 invariant: invalid commit structure on a 200 OK
         // response must NOT classify as http_4xx.
         assert_eq!(err.failure_class(), "invalid_schema");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Signature-verification fetcher-boundary (v0.6 Cluster 3 Member 3.1)
+    // ──────────────────────────────────────────────────────────────
+
+    /// Build a structurally-valid CAR whose `SignedCommit` is signed by
+    /// `signer` against `signer.did()` as the embedded DID. Returns the
+    /// CAR bytes. The CAR passes `pb_car::read_car_with_root` +
+    /// `Repo::load` + `repo.commit()` — verification of the signature
+    /// is what decides Ok/Err at the new sig-verify boundary.
+    fn valid_signed_car(signer: &proto_blue::crypto::K256Keypair) -> Vec<u8> {
+        use proto_blue::crypto::Keypair;
+        use proto_blue::lex_cbor::cid_for_lex;
+        use proto_blue::lex_data::LexValue;
+        use proto_blue::repo::{
+            blocks_to_car, sign_commit, BlockMap, MstNode, UnsignedCommit,
+        };
+        let mut mst = MstNode::empty();
+        let mut blocks = BlockMap::new();
+        // Any record will do — the sig-verify boundary fires before
+        // the MST lookup, so the (collection, rkey) the fetcher will
+        // later search for doesn't have to be present.
+        let record_key = "app.bsky.feed.post/3jzfcijpj2z2a";
+        let record_value = LexValue::String("payload".into());
+        let record_cid = cid_for_lex(&record_value).unwrap();
+        blocks.add_value(&record_value).unwrap();
+        mst = mst.add(record_key, record_cid).unwrap();
+        let (mst_root, mst_blocks) = mst.get_all_blocks().unwrap();
+        blocks.add_map(&mst_blocks);
+        let unsigned = UnsignedCommit::new(
+            signer.did(),
+            mst_root,
+            "3jzfcijpj2z2a".to_string(),
+            None,
+        );
+        let signed = sign_commit(&unsigned, signer).unwrap();
+        let commit_cid = signed.cid().unwrap();
+        blocks.set(commit_cid.clone(), signed.to_cbor().unwrap());
+        blocks_to_car(Some(&commit_cid), &blocks).unwrap()
+    }
+
+    /// The load-bearing boundary assertion the new wire-up exists to
+    /// uphold: a structurally-valid CAR signed by `key_a`, served by a
+    /// stub PDS, with the authority's DID document publishing `key_b`'s
+    /// `#atproto` verification key, must surface
+    /// `LexiconFetcherError::SignatureVerificationFailed` at the
+    /// `ProductionLexiconFetcher::fetch` boundary.
+    ///
+    /// Two anti-patterns this test is positioned against:
+    ///
+    /// 1. Asserting on `InvalidResponseStructure` would false-pass — a
+    ///    parse-malformed CAR satisfies that variant identically with
+    ///    `ensure_commit_sig` never invoked, which is exactly the
+    ///    "we forgot to wire the verifier" regression this exists to
+    ///    catch. The signature-specific variant is the only way the
+    ///    boundary assertion means what it claims.
+    /// 2. Calling `ensure_commit_sig` directly with a bad key would
+    ///    prove proto-blue's primitive works (already covered by
+    ///    proto-blue's own tests) but NOT that this fetcher wires it
+    ///    in. The boundary `fetch(..)` invocation is what ties the
+    ///    wire-up to the fetcher's contract.
+    #[tokio::test]
+    async fn fetch_rejects_bad_signature_at_fetcher_boundary_with_invalid_signature_class() {
+        use proto_blue::crypto::{K256Keypair, Keypair};
+
+        let key_a = K256Keypair::generate();
+        let key_b = K256Keypair::generate();
+        assert_ne!(key_a.did(), key_b.did(), "two distinct keys");
+
+        let car_bytes = valid_signed_car(&key_a);
+        let body_bytes = car_bytes.clone();
+        let stub = StubPds::start(move || {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/vnd.ipld.car")
+                .body(Body::from(body_bytes.clone()))
+                .unwrap()
+        })
+        .await;
+
+        // Authority publishes key_b's multikey; commit was signed by
+        // key_a → ensure_commit_sig rejects.
+        let key_b_did = key_b.did();
+        let key_b_multikey = key_b_did
+            .strip_prefix("did:key:")
+            .expect("K256Keypair::did returns did:key:z…");
+        let doc = doc_pointing_at_with_atproto_multikey(&stub.url, key_b_multikey);
+        let mock = Arc::new(MockIdentityResolver::with_doc(doc));
+        let fetcher = ProductionLexiconFetcher::new(mock, test_http_client());
+
+        let err = fetcher
+            .fetch("did:plc:authority", "com.example.foo.bar")
+            .await
+            .expect_err("bad-sig CAR must surface SignatureVerificationFailed");
+
+        match &err {
+            LexiconFetcherError::SignatureVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("did:plc:authority"),
+                    "error detail should name the authority DID, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected SignatureVerificationFailed (the wiring proof), got {other:?} \
+                 — a wildcard variant here would false-pass the regression this test exists to catch"
+            ),
+        }
+        assert_eq!(err.failure_class(), "invalid_signature");
+    }
+
+    /// Negative control on the boundary: an authority DID document
+    /// with NO `#atproto` verification method (the typical
+    /// minimal-fixture shape) must also route to
+    /// `SignatureVerificationFailed` — the absence of the published
+    /// trust material is treated as a sig-verify failure, not a
+    /// `InvalidResponseStructure` (the CAR itself is fine; the
+    /// authority's published trust is missing).
+    #[tokio::test]
+    async fn fetch_missing_atproto_verification_method_routes_to_invalid_signature() {
+        use proto_blue::crypto::K256Keypair;
+        let key_a = K256Keypair::generate();
+
+        let car_bytes = valid_signed_car(&key_a);
+        let body_bytes = car_bytes.clone();
+        let stub = StubPds::start(move || {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/vnd.ipld.car")
+                .body(Body::from(body_bytes.clone()))
+                .unwrap()
+        })
+        .await;
+
+        // `doc_pointing_at` builds a doc with verification_method = [].
+        let doc = doc_pointing_at(&stub.url);
+        let mock = Arc::new(MockIdentityResolver::with_doc(doc));
+        let fetcher = ProductionLexiconFetcher::new(mock, test_http_client());
+
+        let err = fetcher
+            .fetch("did:plc:authority", "com.example.foo.bar")
+            .await
+            .expect_err("absent #atproto vm must surface SignatureVerificationFailed");
+
+        match &err {
+            LexiconFetcherError::SignatureVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("no #atproto verification method"),
+                    "error detail should name the missing verification method, got: {msg}"
+                );
+            }
+            other => panic!("expected SignatureVerificationFailed, got {other:?}"),
+        }
+        assert_eq!(err.failure_class(), "invalid_signature");
     }
 }
