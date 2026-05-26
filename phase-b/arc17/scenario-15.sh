@@ -46,32 +46,28 @@ fi
 # Block 2 — Capture baseline counter; fire N concurrent writes
 # ============================================================
 #
-# Rate-limit caveat (documented; not auto-mitigated):
+# Rate-limiting is disabled in Phase B via PDS_RATE_LIMITS_ENABLED=false
+# emitted by lib/env.sh (chainlink #153 wired the dead config knob in
+# 58f5a13). The single-flight de-dup assertion (delta=1, not N) below
+# is what this scenario tests; with rate-limits off, the N=10 concurrent
+# burst all reaches the resolver and the de-dup gate (keyed by NSID at
+# the resolver level) coalesces them to a single fetch. Earlier versions
+# of this scenario carried a rate-limit-masking caveat (if N-1 of N
+# 429'd before reaching the resolver, the surviving 1 would still
+# produce delta=1 — coincidence, not de-dup); that caveat is moot under
+# the harness-disabled rate limits. The http= surfacing below stays as
+# a belt-and-suspenders diagnostic: if some future change re-enables
+# rate-limiting (or runs scenario-15 against a non-Phase-B PDS), any
+# http=429 in the burst will flag the masked-test risk.
 #
-# N concurrent createRecord against the SAME DID (B_DID) hits the PDS's
-# per-DID-per-endpoint check_did_endpoint() bucket
-# (src/rate_limit.rs::check_did_endpoint, called from the createRecord
-# handler). Burst tolerance is config-driven; under typical defaults a
-# burst of ~10 same-DID requests may pass cleanly, OR may 429 some.
-# If some return 429 BEFORE reaching the resolver, the delta=1
-# assertion below is still satisfied coincidentally (only the requests
-# that bypassed the limiter reach the de-dup gate). That's an easy-pass
-# trap — delta=1 looks like single-flight working, but it's actually
-# rate-limit masking the test.
-#
-# If you see N concurrent writes returning a mix of 200/429, the
-# deterministic fix is to give each concurrent call its OWN account
-# (per-DID buckets are fresh per DID; the de-dup gate is keyed by NSID,
-# so distinct DIDs against same NSID still tests single-flight). N=10
-# accounts in scenario-15 setup ~ +1s, but the assertion becomes real.
-#
-# Watch the http= lines surfaced below — any http=429 in the burst
-# invalidates the delta=1 read.
-#
-# Background: PDS_RATE_LIMITS_ENABLED env var is loaded into config but
-# never consulted by src/server.rs:98 (it unconditionally wires the
-# middleware). Out-of-scope production-code fix would let Phase B set
-# the env var to disable rate-limiting cleanly. See findings doc.
+# Recon resolution: createRecord doesn't actually call
+# check_did_endpoint() (that's an email/account-delete handler check
+# per src/api/server.rs:456, :621, :735). The pre-fix risk was really
+# the middleware-level governor at rate_limit.rs:579-587 (per-account
+# global authenticated limit, 100 req/sec + burst 50) — N=10 fits
+# inside the burst. So even pre-fix, scenario-15's burst would
+# probably not have 429'd from the per-DID-per-endpoint bucket. The
+# blanket disable closes both possible 429 sources.
 echo
 echo "[scenario-15] Block 2: baseline counter + N concurrent writes"
 echo "============================================================"
