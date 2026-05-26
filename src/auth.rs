@@ -341,6 +341,21 @@ pub(crate) async fn admin_auth_from_token(
     // Layer 4: ES256K service-auth verification against the resolver.
     // §5.3.1 specifies `expected_aud = state.service_did()`; §5.5.6
     // documents this as byte-for-byte strict-equal (no normalization).
+    //
+    // Cluster 2 Member 2.2 (#144) — site 7 of 8 (admin extractor, the
+    // only live caller of the free-fn). Pre-#144 this match
+    // unconditionally wrapped Err as `PdsError::Authentication`,
+    // destroying the typed `ServiceAuthError::DidTombstoned` (emitted
+    // by site 5's resolver match arm) and bypassing site 4's
+    // `From<ServiceAuthError> for PdsError` typed-routing impl. After
+    // the fix the typed variant propagates via `.into()` so
+    // IntoResponse for PdsError::DidTombstoned maps it to HTTP 400
+    // `{"error": "DidTombstoned", ...}`. All other ServiceAuthError
+    // variants preserve today's `PdsError::Authentication(format!(...))`
+    // shape byte-identical — the wrap string isn't grep'd by any
+    // test/runbook/metric. The tracing log line via
+    // log_service_auth_error stays unchanged for all variants
+    // (including DidTombstoned, which gets its own arm post-#144 site 6).
     let claims = match crate::service_auth::verify_service_jwt(
         token,
         state.service_did(),
@@ -351,10 +366,13 @@ pub(crate) async fn admin_auth_from_token(
         Ok(c) => c,
         Err(e) => {
             log_service_auth_error(&e, state.service_did());
-            return Err(PdsError::Authentication(format!(
-                "service-auth verification failed: {}",
-                e
-            )));
+            return match e {
+                crate::service_auth::ServiceAuthError::DidTombstoned(_) => Err(e.into()),
+                other => Err(PdsError::Authentication(format!(
+                    "service-auth verification failed: {}",
+                    other
+                ))),
+            };
         }
     };
 
@@ -532,6 +550,18 @@ fn log_service_auth_error(err: &crate::service_auth::ServiceAuthError, expected_
             tracing::warn!(
                 "service-auth: pre-check leak — verify_service_jwt rejected for missing-or-invalid alg"
             );
+        }
+        // Cluster 2 Member 2.2 (#144). The match above is exhaustive
+        // (no catch-all) by design — adding ServiceAuthError variants
+        // FORCES a tracing arm here at compile time. This is
+        // tracing-only; the message string is not grep'd by any
+        // test/runbook/metric, so detail/wording is free to evolve.
+        // The actual wire shape (HTTP 400 + `{"error":"DidTombstoned",
+        // ...}`) is produced by the From<ServiceAuthError> for
+        // PdsError impl + IntoResponse for PdsError::DidTombstoned
+        // (src/error.rs:620-624).
+        ServiceAuthError::DidTombstoned(did) => {
+            tracing::debug!("service-auth: issuer DID tombstoned: {}", did);
         }
     }
 }
@@ -1345,6 +1375,24 @@ async fn route_service_auth_fallback(
 
     if let Some(e) = last_err {
         tracing::warn!(error = %e, "service_auth_failed");
+        // Cluster 2 Member 2.2 (#144) — site 8 of 8 (cross-PDS
+        // fallback, the only live caller of the federation method
+        // `service_auth.authenticator.verify_service_jwt`). Pre-#144
+        // this final return unconditionally emitted
+        // `PdsError::Authentication("Invalid token")`, discarding the
+        // typed `last_err` that site 1's federation-method fix
+        // propagated. After the fix, when `last_err` is
+        // `PdsError::DidTombstoned`, propagate it unchanged so
+        // IntoResponse maps to HTTP 400 `{"error": "DidTombstoned",
+        // ...}`. All other typed variants preserve today's hardcoded
+        // `"Invalid token"` Authentication wrap (the aud-allowlist
+        // iteration uses string-equality on the wrap message; not
+        // grep'd by any test/runbook/metric, but conservative).
+        crate::metrics::record_error("AuthenticationFailed", "middleware");
+        return match e {
+            PdsError::DidTombstoned(_) => Err(e),
+            _ => Err(PdsError::Authentication("Invalid token".to_string())),
+        };
     } else {
         tracing::warn!("service_auth_failed: empty audience_allowlist");
     }
