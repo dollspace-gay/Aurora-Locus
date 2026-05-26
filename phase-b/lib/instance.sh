@@ -190,6 +190,37 @@ _pb_pg_fail_fast() {
 }
 
 # -----------------------------------------------------------------------------
+# pb_pace_xrpc
+# Sleep `${PB_RATE_LIMIT_PACE_SECS:-2}` seconds. Use between consecutive
+# same-DID same-endpoint XRPC calls in a scenario so the PDS's per-DID-
+# per-endpoint rate-limit bucket (src/rate_limit.rs::check_did_endpoint
+# handler-level checks, called from createRecord etc.) has time to refill.
+# Without this, rapid sub-case createRecord bursts trip 429 on the 2nd/3rd
+# call and never reach the resolver/fetcher under test — turning the
+# scenario void.
+#
+# Why a separate helper and not just `sleep N` inline: the helper makes the
+# intent legible (the pause is rate-limit shaping, not arbitrary timing),
+# centralizes the pace value (one place to tune), and surfaces in script
+# output as `[pb-pace] ...` so operators can see why the run paused.
+#
+# PB_RATE_LIMIT_PACE_SECS override: scenarios that need a longer pace
+# (or want to disable it under a custom rate-limit config) can set the
+# env var. Default 2s matches the v0.6 production defaults' per-DID-per-
+# endpoint refill window for createRecord-class XRPCs.
+#
+# NOT a substitute for fixing the underlying dead `PDS_RATE_LIMITS_ENABLED`
+# knob — that's a production-code change deferred to a separate kickoff
+# (see /mnt/d/aurora-locus-arc17-phase-b-reauthor-findings.md).
+# -----------------------------------------------------------------------------
+
+pb_pace_xrpc() {
+    local secs="${PB_RATE_LIMIT_PACE_SECS:-2}"
+    echo "[pb-pace] pausing ${secs}s between XRPC calls (rate-limit shaping; PB_RATE_LIMIT_PACE_SECS to override)"
+    sleep "$secs"
+}
+
+# -----------------------------------------------------------------------------
 # pb_launch_instance <role>
 # Expects role-env already emitted (A_ENV/B_ENV path set + file readable)
 # and the per-role data dir pre-created (call lib/data.sh helpers first).
