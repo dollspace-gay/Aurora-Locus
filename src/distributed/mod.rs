@@ -42,7 +42,6 @@
 //! ~50-100 LOC + tests.
 #![allow(dead_code)]
 
-pub mod cache;
 pub mod lease;
 pub mod postgres_cas;
 pub mod registry;
