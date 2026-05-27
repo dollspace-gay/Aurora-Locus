@@ -59,11 +59,43 @@ use super::{DistributedError, DistributedStore, Lease};
 #[derive(Clone)]
 pub struct PostgresCasStore {
     pool: Arc<AnyPool>,
+    /// Inactivity threshold for `rate_limit_buckets` sweeps, in
+    /// milliseconds. Buckets whose `window_start_at_epoch_ms`
+    /// hasn't been touched in this duration are presumed cold and
+    /// deleted by the reaper. Default is 7 days
+    /// ([`DEFAULT_RATE_LIMIT_RETENTION_MS`]); operator-tunable via
+    /// `PDS_RATE_LIMIT_BUCKETS_RETENTION_DAYS` per V06 batch tail
+    /// G7.2 (closes the v0.4-era "in-code constant" deferral
+    /// flagged at the previous reap-arm site).
+    rate_limit_retention_ms: i64,
 }
+
+/// 7-day default for the `rate_limit_buckets` inactivity sweep —
+/// the v0.4 in-code constant, now the default for the operator-
+/// tunable config. A bucket whose window_start hasn't been touched
+/// in 7 days is presumed cold; deleting it costs the next
+/// first-touch one extra INSERT (the bucket self-reconstructs at
+/// full max_tokens) but bounds table growth for deployments
+/// accumulating many unique bucket keys (one row per
+/// (client_id, endpoint_class) ever seen).
+pub const DEFAULT_RATE_LIMIT_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 
 impl PostgresCasStore {
     pub fn new(pool: Arc<AnyPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            rate_limit_retention_ms: DEFAULT_RATE_LIMIT_RETENTION_MS,
+        }
+    }
+
+    /// Override the `rate_limit_buckets` inactivity threshold (the
+    /// G7.2 operator-tunable). `days` is whole days; multiplied by
+    /// 86_400_000 ms internally. Production wiring at
+    /// [`crate::context::AppContext`] reads the value from
+    /// `config.rate_limit.buckets_retention_days`.
+    pub fn with_rate_limit_retention_days(mut self, days: u32) -> Self {
+        self.rate_limit_retention_ms = i64::from(days) * 24 * 3600 * 1000;
+        self
     }
 }
 
@@ -194,23 +226,12 @@ impl DistributedStore for PostgresCasStore {
             // Inactivity-based GC for rate_limit_buckets. Step 1
             // returned UnsupportedTable here because the policy
             // wasn't decided; Step 3 (V04_DESIGN.md §6.4.3
-            // post-recon resolution) commits to a 7-day
-            // inactivity threshold. A bucket whose
-            // `window_start_at_epoch_ms` hasn't been touched in
-            // 7 days is presumed cold; deleting it costs the next
-            // first-touch one extra INSERT (the bucket
-            // self-reconstructs at full max_tokens) but bounds
-            // table growth for deployments accumulating many
-            // unique bucket keys (one row per
-            // (client_id, endpoint_class) ever seen).
-            //
-            // The 7-day constant is in-code rather than
-            // configurable to keep the operator surface tight in
-            // v0.4; making it operator-tunable is a v0.6
-            // candidate (running accumulator).
+            // post-recon resolution) committed to a 7-day default;
+            // v0.6 batch tail G7.2 made the threshold operator-
+            // tunable via `PDS_RATE_LIMIT_BUCKETS_RETENTION_DAYS`
+            // (default 7) — see [`PostgresCasStore::with_rate_limit_retention_days`].
             "rate_limit_buckets" => {
-                const SEVEN_DAYS_MS: i64 = 7 * 24 * 3600 * 1000;
-                let cutoff = now_epoch_ms - SEVEN_DAYS_MS;
+                let cutoff = now_epoch_ms - self.rate_limit_retention_ms;
                 let result = sqlx::query(
                     "DELETE FROM rate_limit_buckets WHERE window_start_at_epoch_ms < $1",
                 )

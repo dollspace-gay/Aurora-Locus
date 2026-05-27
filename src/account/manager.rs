@@ -49,6 +49,21 @@ pub enum ConsumeResult {
     Error(PdsError),
 }
 
+/// Build the `<handle>.<domain>`-form full handle, stripping a
+/// leading dot off `domain` if present.
+///
+/// The `service_handle_domains` config defaults to a leading-dot
+/// shape (`.{hostname}`) for ATProto-handle suffix matching, so a
+/// naive `format!("{}.{}", handle, domain)` produces malformed
+/// `usera..localhost`. #69 closed this defect; the strip-or-skip
+/// here is the canonical join used by every create_account /
+/// did:web fallback site. When the operator-supplied domain has
+/// no leading dot, `strip_prefix` returns the original.
+fn join_handle_with_domain(handle: &str, domain: &str) -> String {
+    let suffix = domain.strip_prefix('.').unwrap_or(domain);
+    format!("{}.{}", handle, suffix)
+}
+
 /// Account manager service
 pub struct AccountManager {
     db: AnyPool,
@@ -863,9 +878,9 @@ impl AccountManager {
         // genesis op CBOR.
         let service_url = self.config.service.effective_public_url();
 
-        // Handle-to-full-handle. (#69 will fix the double-dot bug
-        // where service_handle_domains entries with leading-dot
-        // produce malformed `usera..localhost` shapes.)
+        // Handle-to-full-handle. #69 closed: the dot-strip below
+        // prevents `usera..localhost` when service_handle_domains
+        // entries carry a leading dot (the config default shape).
         let full_handle = if handle.contains('.')
             && self
                 .config
@@ -876,9 +891,9 @@ impl AccountManager {
         {
             handle.to_string()
         } else {
-            format!(
-                "{}.{}",
-                handle, self.config.identity.service_handle_domains[0]
+            join_handle_with_domain(
+                handle,
+                &self.config.identity.service_handle_domains[0],
             )
         };
 
@@ -3000,6 +3015,7 @@ mod tests {
                 enabled: true,
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
+                buckets_retention_days: 7,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -4229,6 +4245,43 @@ mod tests {
             err.to_string().contains("InvalidToken"),
             "wrong-did err: {}",
             err
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // #69 — did:web handle-join double-dot fix (Arc 12 Phase B
+    // Scenario 2 reproducer)
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn join_handle_with_domain_strips_leading_dot() {
+        // The config default builds `.{hostname}`; the join
+        // must produce `usera.localhost`, not `usera..localhost`.
+        assert_eq!(
+            join_handle_with_domain("usera", ".localhost"),
+            "usera.localhost"
+        );
+    }
+
+    #[test]
+    fn join_handle_with_domain_passes_through_no_leading_dot() {
+        // Operator-supplied domain entries without a leading dot
+        // pass through unchanged — strip_prefix returns the
+        // original.
+        assert_eq!(
+            join_handle_with_domain("usera", "localhost"),
+            "usera.localhost"
+        );
+    }
+
+    #[test]
+    fn join_handle_with_domain_handles_multi_segment_domain() {
+        // The most common production shape: a multi-segment
+        // domain with a leading dot. The strip targets only the
+        // single leading dot, not internal dots.
+        assert_eq!(
+            join_handle_with_domain("usera", ".example.com"),
+            "usera.example.com"
         );
     }
 }

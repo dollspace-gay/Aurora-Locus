@@ -325,8 +325,12 @@ impl AppContext {
                     db::create_any_pool(&maintenance_db_config, &config.storage.account_db)
                         .await?,
                 );
-                let substrate: Arc<dyn DistributedStore> =
-                    Arc::new(PostgresCasStore::new(Arc::clone(&pool)));
+                let substrate: Arc<dyn DistributedStore> = Arc::new(
+                    PostgresCasStore::new(Arc::clone(&pool))
+                        .with_rate_limit_retention_days(
+                            config.rate_limit.buckets_retention_days,
+                        ),
+                );
                 tracing::info!(
                     max_connections = config.maintenance_pool.max_connections,
                     min_connections = config.maintenance_pool.min_connections,

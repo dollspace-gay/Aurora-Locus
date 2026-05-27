@@ -1549,6 +1549,7 @@ mod admin_auth_third_path_tests {
                 enabled: false,
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
+            buckets_retention_days: 7,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

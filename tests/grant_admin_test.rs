@@ -85,6 +85,7 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
             enabled: false,
             global_requests_per_minute: 3000,
             exempt_admin_assets: true,
+            buckets_retention_days: 7,
         },
         logging: LoggingConfig {
             level: "info".to_string(),
