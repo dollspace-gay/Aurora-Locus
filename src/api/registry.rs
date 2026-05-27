@@ -47,7 +47,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
-use axum::http::Method;
 use axum::routing::MethodRouter;
 use axum::Router;
 use regex::Regex;
@@ -222,40 +221,34 @@ impl std::fmt::Display for Family {
 /// Distinct from [`Family`] because some families share the same
 /// authority tier (e.g., `Admin` and `Ops` both require admin-
 /// tier auth at the namespace middleware, with finer role
-/// checks at handler level). `Public` is reserved for non-admin
-/// routes if they ever enter the registry — none do today per
-/// Step 0 Q6's List C exclusion of public XRPC.
+/// checks at handler level). The `Public` variant was Arc 8
+/// forward-substrate for public XRPC entering the registry; no
+/// consumer materialized and the variant was removed in v0.6
+/// batch tail (#151) per the clean-decks-for-v0.7 disposition.
+/// Re-adds against a real consumer's actual shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FamilyKind {
     Admin,
     Moderator,
     SuperAdmin,
-    /// Forward-substrate per Step 0 Q6 — reserved for the day
-    /// public XRPC enters the registry. No constructor today.
-    #[allow(dead_code)]
-    Public,
 }
 
 /// Per-route capability metadata captured at registration time.
+///
+/// Two forward-substrate fields removed in v0.6 batch tail (#151):
+/// `methods: Vec<Method>` (axum 0.7.x doesn't expose accepted
+/// methods publicly — permanently-blocked scaffolding) and
+/// `version: u32` (capability-versioning v1→v2 path, never
+/// exercised; v0.7 kryphocron is likely v1, no breaking-change
+/// story). The CapsBuilder version arg was also dropped from the
+/// constructor in the same sweep.
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
     /// Full XRPC path, e.g. `/xrpc/tools.aurora.admin.emitEvent`.
     pub path: String,
-    /// HTTP methods the route accepts. v0.4 leaves this empty —
-    /// `axum::routing::MethodRouter` doesn't expose its accepted
-    /// methods publicly, and the current `describe_capabilities`
-    /// wire output doesn't include methods. Future cycles may
-    /// populate this if a consumer needs it (v0.6 candidate).
-    #[allow(dead_code)]
-    pub methods: Vec<Method>,
     /// The family this route belongs to. Family Display string
     /// becomes the namespace key in `describe_capabilities`.
     pub family: Family,
-    /// Capability version. Used by the `<kebab-family>-v<integer>`
-    /// versioning convention (V04_DESIGN.md §7.3.2). v0.4 routes
-    /// all use version 1; v2 ships when a breaking change lands.
-    #[allow(dead_code)]
-    pub version: u32,
     /// True iff this route is intentionally not advertised
     /// (§8.15 omission policy). Routes marked omitted are
     /// filtered out of [`RouteRegistry::advertised_entries`].
@@ -274,24 +267,22 @@ pub struct RouteEntry {
 /// route registration sites via
 /// [`RouteRegistryBuilder::route_with_caps`].
 ///
-/// Fluent shape: `CapsBuilder::new(family, version)
-/// .extensions([...]).omitted()`. Each setter consumes and
-/// returns `self` so chained calls stay readable.
+/// Fluent shape: `CapsBuilder::new(family).extensions([...]).omitted()`.
+/// Each setter consumes and returns `self` so chained calls stay
+/// readable. The `version` arg was removed in v0.6 batch tail
+/// (#151) alongside `RouteEntry.version`.
 #[derive(Debug, Clone)]
 pub struct CapsBuilder {
     family: Family,
-    version: u32,
     omitted: bool,
     extensions: Vec<String>,
 }
 
 impl CapsBuilder {
-    /// Start a new metadata builder for the given family and
-    /// version.
-    pub fn new(family: Family, version: u32) -> Self {
+    /// Start a new metadata builder for the given family.
+    pub fn new(family: Family) -> Self {
         Self {
             family,
-            version,
             omitted: false,
             extensions: Vec::new(),
         }
@@ -324,9 +315,6 @@ impl CapsBuilder {
     /// route-registration surface.
     pub fn family(&self) -> Family {
         self.family
-    }
-    pub fn version(&self) -> u32 {
-        self.version
     }
     pub fn is_omitted(&self) -> bool {
         self.omitted
@@ -491,9 +479,7 @@ where
     ) -> Self {
         let entry = RouteEntry {
             path: path.to_string(),
-            methods: Vec::new(),
             family: caps.family,
-            version: caps.version,
             omitted: caps.omitted,
             extensions: caps.extensions,
             registration_order: self.entries.len() as u32,
@@ -510,19 +496,6 @@ where
     /// registered through the same builder.
     pub fn route(mut self, path: &str, handler: MethodRouter<S>) -> Self {
         self.router = self.router.route(path, handler);
-        self
-    }
-
-    /// Merge another router (e.g., a sub-module's `routes()`
-    /// output). Does NOT add registry entries — merged routers
-    /// contribute their own entries via separate builders if
-    /// they need registry tracking. Today no sub-router needs
-    /// registry tracking (Step 0 Q1 found all admin-tier
-    /// registration in one site); this method exists for
-    /// forward-compat.
-    #[allow(dead_code)]
-    pub fn merge(mut self, other: Router<S>) -> Self {
-        self.router = self.router.merge(other);
         self
     }
 
@@ -606,22 +579,21 @@ mod tests {
 
     #[test]
     fn caps_builder_starts_with_no_omission_no_extensions() {
-        let caps = CapsBuilder::new(Family::Admin, 1);
+        let caps = CapsBuilder::new(Family::Admin);
         assert_eq!(caps.family(), Family::Admin);
-        assert_eq!(caps.version(), 1);
         assert!(!caps.is_omitted());
         assert!(caps.extension_strings().is_empty());
     }
 
     #[test]
     fn caps_builder_omitted_flips_the_flag() {
-        let caps = CapsBuilder::new(Family::Admin, 1).omitted();
+        let caps = CapsBuilder::new(Family::Admin).omitted();
         assert!(caps.is_omitted());
     }
 
     #[test]
     fn caps_builder_extensions_accumulates() {
-        let caps = CapsBuilder::new(Family::Moderator, 1)
+        let caps = CapsBuilder::new(Family::Moderator)
             .extensions(["audit-trail-v1", "subject-history-v1"]);
         assert_eq!(
             caps.extension_strings(),
@@ -631,11 +603,10 @@ mod tests {
 
     #[test]
     fn caps_builder_chained_calls_preserve_values() {
-        let caps = CapsBuilder::new(Family::Admin, 2)
+        let caps = CapsBuilder::new(Family::Admin)
             .extensions(["batch-takedown-v1"])
             .omitted();
         assert_eq!(caps.family(), Family::Admin);
-        assert_eq!(caps.version(), 2);
         assert!(caps.is_omitted());
         assert_eq!(caps.extension_strings(), &["batch-takedown-v1".to_string()]);
     }
@@ -733,9 +704,7 @@ mod tests {
     ) -> RouteEntry {
         RouteEntry {
             path: path.to_string(),
-            methods: Vec::new(),
             family,
-            version: 1,
             omitted,
             extensions: extensions.into_iter().map(String::from).collect(),
             registration_order: order,
@@ -888,12 +857,12 @@ mod tests {
             .route_with_caps(
                 "/xrpc/tools.aurora.admin.emitEvent",
                 axum::routing::post(dummy_handler),
-                CapsBuilder::new(Family::Admin, 1).extensions(["mod-events-emit-v1"]),
+                CapsBuilder::new(Family::Admin).extensions(["mod-events-emit-v1"]),
             )
             .route_with_caps(
                 "/xrpc/tools.aurora.moderator.queryEvents",
                 axum::routing::get(dummy_handler),
-                CapsBuilder::new(Family::Moderator, 1).extensions(["moderator-activity-v1"]),
+                CapsBuilder::new(Family::Moderator).extensions(["moderator-activity-v1"]),
             );
         let entries = builder.entries();
         assert_eq!(entries.len(), 2);
@@ -910,7 +879,7 @@ mod tests {
             .route_with_caps(
                 "/xrpc/tools.aurora.admin.emitEvent",
                 axum::routing::post(dummy_handler),
-                CapsBuilder::new(Family::Admin, 1),
+                CapsBuilder::new(Family::Admin),
             );
         // Only the `.route_with_caps` call added an entry.
         assert_eq!(builder.entries().len(), 1);
@@ -926,7 +895,7 @@ mod tests {
             .route_with_caps(
                 "/xrpc/tools.aurora.ops.getStats",
                 axum::routing::get(dummy_handler),
-                CapsBuilder::new(Family::Ops, 1),
+                CapsBuilder::new(Family::Ops),
             );
         let (_router, registry) = builder.build();
         assert_eq!(registry.len(), 1);
@@ -939,7 +908,7 @@ mod tests {
             .route_with_caps(
                 "/xrpc/tools.aurora.admin.hidden",
                 axum::routing::post(dummy_handler),
-                CapsBuilder::new(Family::Admin, 1).omitted(),
+                CapsBuilder::new(Family::Admin).omitted(),
             );
         let (_router, registry) = builder.build();
         assert_eq!(registry.advertised_entries().count(), 0);
