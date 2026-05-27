@@ -1,28 +1,38 @@
-# Aurora-Locus Endpoint Inventory
+# Admin & Moderation Endpoint Reference
 
-**Initial generation:** 2026-05-03 mid-cycle, post-Phase-3.4 / pre-3.5.
-**Status:** v0.2-cycle complete — admin/moderation Phases 1, 2, and 3.1
-through 3.10 all shipped. Endpoint tables below reflect the as-shipped
-v0.2 surface; the discrepancy notes at the end capture implementation-
-vs-design divergences that may be of interest to UI designers and
-downstream consumers.
+**Scope:** Aurora-Locus's admin / moderation / ops endpoint surface —
+the `tools.aurora.{describeCapabilities, moderator, admin, superadmin,
+ops}.*` namespaces plus the parity-floor `com.atproto.admin.*` namespace
+they extend and partially alias. The §Discrepancies section reconciles
+the alias relationships, tier asymmetries, and overlapping reads
+between the two namespaces.
 
-**Companion docs:** [AURORA_DESIGN.md](AURORA_DESIGN.md) for the
-server-side design that backs these endpoints;
-[AURORA_ADMIN_UI_DESIGN.md](AURORA_ADMIN_UI_DESIGN.md) for the admin UI
-surface that consumes them.
+**Not covered here:** the broader `com.atproto.server.*` (account /
+session / auth), `com.atproto.sync.*` (firehose, repo export),
+`com.atproto.identity.*`, OAuth endpoints (`/oauth/*`), `/health`, and
+`/.well-known/*` surfaces. Those follow the upstream ATProto spec and
+are not enumerated here.
+
+**As of:** 2026-05-03 mid-cycle, post-Phase-3.4 / pre-3.5 (v0.2-cycle
+complete on admin/moderation Phases 1, 2, and 3.1 through 3.10). Tables
+below capture the as-shipped surface at that snapshot; spot-checks
+against current source remain accurate for the endpoints inventoried,
+but an exhaustive re-audit covering net-new post-v0.2 additions (e.g.
+the `tools.aurora.lexicon.*` namespace) is a future-cycle concern.
+Source-link line numbers in this doc are similarly point-in-time;
+follow the file references and search for the named symbols if the
+exact line has shifted.
 
 **Lexicon convention:** Aurora-Locus does **not** ship JSON lexicon
 files. Per CLAUDE.md, lexicons are defined as Rust types — request /
 response shapes live in handler signatures and adjacent serde structs.
-The "lexicon surface" enumerated here is the route table at
-[src/api/admin.rs:38-350](../src/api/admin.rs#L38-L350) plus handler
-modules under [src/api/](../src/api/). NSID descriptions below come from
-the leading `///` doc comment on each handler (where present); empty
-cells indicate the handler has no explicit one-liner — derive from
-the NSID or the section comment block.
+The route table lives in [src/api/admin.rs](../../src/api/admin.rs)
+plus handler modules under [src/api/](../../src/api/). NSID
+descriptions below come from the leading `///` doc comment on each
+handler (where present); empty cells indicate the handler has no
+explicit one-liner — derive from the NSID or the section comment block.
 
-**Auth scope source:** [src/oauth/scope.rs:714-748](../src/oauth/scope.rs#L714).
+**Auth scope source:** [src/oauth/scope.rs](../../src/oauth/scope.rs).
 Mapping is uniform per namespace prefix — namespace-level scope
 enforcement happens in `namespace_scope_check` middleware before the
 handler runs. Within-tier role checks (Moderator vs Admin vs
@@ -32,7 +42,7 @@ SuperAdmin) happen at the handler level via
 **Handler-shipped column:** every NSID in the route table has a wired
 handler (no stub-only routes — `unimplemented!()` and `todo!()` are
 banned by CLAUDE.md). The column captures `✅ shipped` everywhere
-under the current build.
+under the snapshot build.
 
 ---
 
@@ -105,9 +115,9 @@ post-cycle the `tools.aurora.admin.*` namespace is heavily populated.
 §8.6/§8.7/§8.16. The override is a per-NSID lookup that runs before
 the namespace prefix match, **replacing** (not augmenting) the
 namespace default — `AdminModeration` alone is insufficient. See
-[src/oauth/scope.rs:848-865](../src/oauth/scope.rs#L848-L865) for the
-operator-NSID table and [AURORA_DESIGN.md §4.3.4](AURORA_DESIGN.md)
-for the auth-tier framing the override implements.
+[src/oauth/scope.rs](../../src/oauth/scope.rs) for the operator-NSID
+table; the auth-tier model behind the override is documented in
+[admin-auth.md](admin-auth.md).
 
 | NSID | Type | Description | Auth (within-tier) | Last commit | Shipped |
 |---|---|---|---|---|---|
@@ -191,10 +201,10 @@ Scope: the four record-write endpoints whose wire-error contracts
 were updated by Arc 16e §9.5.4 Step 3.8. Per the lexicons-as-Rust-
 types convention noted at the top of this file, the full request /
 response shapes live in the handler signatures at
-[src/api/repo.rs](../src/api/repo.rs); the table below enumerates
+[src/api/repo.rs](../../src/api/repo.rs); the table below enumerates
 the wire-error codes each handler can emit so the contract is
 discoverable from the endpoint surface without grep-tracing
-[`PdsError`](../src/error.rs)'s `IntoResponse` mapping.
+[`PdsError`](../../src/error.rs)'s `IntoResponse` mapping.
 
 The Arc 16e additions on the write paths are `InvalidCid` (400 —
 validate-phase walker rejection) and `BlobNotFound` (400 — Phase B
@@ -225,7 +235,7 @@ file. The wire route is registered at
 implementation-specific *error vocabulary* — wire codes that bsky-PDS
 does not define and that downstream tooling needs to discriminate.
 
-Handler at [src/api/repo_import.rs](../src/api/repo_import.rs).
+Handler at [src/api/repo_import.rs](../../src/api/repo_import.rs).
 
 | NSID | Type | Auth scope | Wire-error codes (HTTP status) |
 |---|---|---|---|
@@ -242,14 +252,14 @@ Handler at [src/api/repo_import.rs](../src/api/repo_import.rs).
    reflects accumulated parity work rather than scope drift.
 
 2. **`com.atproto.admin.listAccounts` is an alias to `getUsers`**
-   ([src/api/admin.rs:54](../src/api/admin.rs#L54)). Both routes wire
+   ([src/api/admin.rs:54](../../src/api/admin.rs#L54)). Both routes wire
    to the same handler. The operator-flavored `listAccounts` (broader
    filters) is at `tools.aurora.ops.listAccounts` instead. UI should
    not display both — pick one or treat them as a single endpoint
    with two URLs.
 
 3. **`com.atproto.admin.listRoles` kept at moderation tier
-   intentionally** ([src/api/admin.rs:107-111](../src/api/admin.rs#L107-L111)).
+   intentionally** ([src/api/admin.rs:107-111](../../src/api/admin.rs#L107-L111)).
    Phase 3.6 relocated `grantRole` and `revokeRole` to
    `tools.aurora.superadmin.*` but explicitly left `listRoles` at
    `com.atproto.admin.*` so Moderators can see who has what role
@@ -261,8 +271,8 @@ Handler at [src/api/repo_import.rs](../src/api/repo_import.rs).
    reading from `audit_chain_entry` per cycle's audit-chain
    migration; legacy wire shape preserved for back-compat) and the
    Phase 3.8 `getAuditTrail` (rich-context, hash-chain-aware,
-   `verified`/`chainVerified` flags). The UI design merges both into
-   a unified audit page; see [AURORA_ADMIN_UI_DESIGN.md §5.4.5](AURORA_ADMIN_UI_DESIGN.md).
+   `verified`/`chainVerified` flags). Consumers should pick one per
+   workflow rather than expose both.
 
 5. **`com.atproto.admin.{getModerationHistory, getModerationQueue,
    listReports, listRecentEvents}` overlap with Phase 3 reads.**
@@ -286,116 +296,6 @@ Handler at [src/api/repo_import.rs](../src/api/repo_import.rs).
    introducing commit was "initial commit" or pre-Phase-1 work; for
    routes touched by the proto-blue 0.2.6 SDK refactor (`c2d6fd2`),
    that mass refactor shows up because it modified most handler
-   signatures. The values are useful for UI designers tracking
-   surface evolution but don't reflect every audit-pass amendment.
-
----
-
-## Notes for UI design pass
-
-### Natural endpoint clusters → UI surfaces
-
-A reasonable first-cut UI grouping based on the inventory:
-
-- **Account browser** → `getUsers / listAccounts / searchAccounts +
-  getAccount + getAccountInfo + getAccountInfos` plus the operator-
-  flavored `tools.aurora.ops.listAccounts`. Six read endpoints, one
-  search box, paginated list, click-through to detail view.
-- **Account-mgmt drawer** (within account detail) →
-  `updateAccountEmail / updateAccountHandle / updateAccountPassword
-  / updateAccountSigningKey / deleteAccount` plus
-  `enableAccountInvites / disableAccountInvites`. Seven procedures
-  on one subject; collapsible action panel.
-- **Account moderation drawer** (within account detail) →
-  `takedownAccount / suspendAccount / restoreAccount +
-  updateSubjectStatus + getSubjectStatus + getModerationHistory`.
-  Six endpoints; the existing UI under `static/admin/` already has
-  partial coverage but treats them piecemeal.
-- **Reports queue** → `listReports + submitReport +
-  updateReportStatus + getModerationQueue`. Four endpoints; queue
-  + detail view + status-update action. UI partially exists.
-- **Mod Events page** (already shipped from Phase 3.3) →
-  `tools.aurora.moderator.{queryEvents, getEvent}`. Filter bar +
-  paginated table + detail modal.
-- **Appeals page** (already shipped from Phase 3.4) →
-  `tools.aurora.moderator.{listAppeals, getAppeal}`. Same pattern
-  as Mod Events.
-- **Subject-context deep-dive** (deferred per Phase 3.4 close) →
-  `tools.aurora.moderator.{getSubjectContext, getSubjectHistory,
-  queryStatuses}`. One-page comprehensive view per DID.
-- **Invite admin** → `createInviteCode / getInviteCodes /
-  listInviteCodes / disableInviteCode / disableInviteCodes`. Five
-  endpoints; UI exists.
-- **Label admin** → `applyLabel / removeLabel`. Two procedures;
-  needs a target-picker UI.
-- **Audit** → `getAuditLog + listRecentEvents` (parity floor) plus
-  Phase 3.8's `getAuditTrail` (when shipped). Reconcile per
-  Discrepancy #5.
-- **Email** → `sendEmail`. Single procedure; ad-hoc compose form.
-- **Roles** → `listRoles` (read, Moderator+) plus
-  `tools.aurora.superadmin.{grantRole, revokeRole}` (write,
-  SuperAdmin only). Asymmetric tier per Phase 3.6 — UI should hide
-  the write actions from non-SuperAdmin sessions.
-- **Settings / capabilities** → `tools.aurora.describeCapabilities`.
-  Already wired into the existing Settings page.
-- **Operator dashboard** → all 32 `tools.aurora.ops.*` endpoints.
-  Big surface; obvious sub-clusters:
-  - System health (getSystemHealth, runHealthChecks, getResourceUsage,
-    getDatabaseStatus, getVersionInfo, getSystemMetrics) → 6
-  - Sequencer (getSequencerStatus, pause, resume, reset, rebuild) → 5
-  - Blob ops (getBlobStatistics, listBlobs, deleteBlob,
-    quarantineBlob, restoreBlob, runBlobGC, getBlobQuotas) → 7
-  - Federation (getFederationStatus, getRelayConfig,
-    listKnownInstances, triggerPdsDiscovery) → 4
-  - Rate-limit (getRateLimitConfig, getRateLimitStatus,
-    cleanupRateLimitState) → 3
-  - Validation + jobs + nonce (getValidationFailures,
-    listBackgroundJobs, getNonceStoreStatus, cleanupNonceStores) → 4
-  - Stats / accounts / metrics (getStats, listAccounts,
-    getInstanceMetrics) → 3
-
-### Pagination patterns
-
-- **Cursor-based (Phase 3 standard, opaque base64 with composite
-  created_at+id):** all `tools.aurora.moderator.*` query endpoints
-  (queryEvents, queryStatuses, getSubjectHistory, listAppeals).
-- **Cursor-based (legacy, trailing-DID):** com.atproto.admin's
-  `searchAccounts`, `getAccountInfos`. Different cursor shape.
-- **Limit-only (no cursor):** `getInviteCodes`, `listInviteCodes`
-  (Phase 1.10 wired the lexicon's params but the cursor scheme
-  may differ from Phase 3's).
-- **Bounded (not paginated):** `getSubjectContext` returns 50-item
-  bounded categories; `listRecentEvents` is bounded.
-- **Unbounded / single-result:** all `getX`-by-id endpoints
-  (`getEvent`, `getAppeal`, `getAccount`, `getAccountInfo`,
-  `getSubjectStatus`).
-
-UI should reuse Phase 3's cursor-based table component for the
-moderator endpoints and not assume the legacy DID-cursor pattern
-generalizes.
-
-### Confusing names worth flagging
-
-- **`com.atproto.admin.listAccounts` vs `tools.aurora.ops.listAccounts`**
-  — same name, different filter sets (parity vs operator).
-- **`com.atproto.admin.getModerationHistory` vs
-  `tools.aurora.moderator.getSubjectHistory`** — overlap; latter is
-  Aurora's enriched version.
-- **`com.atproto.admin.getModerationQueue` vs
-  `tools.aurora.moderator.queryStatuses`** — partially overlapping
-  semantics.
-- **`com.atproto.admin.listRecentEvents` (sequencer events) vs
-  `tools.aurora.moderator.queryEvents` (moderation events)** —
-  similarly named, different domains.
-- **`com.atproto.admin.getAuditLog` vs Phase 3.8's
-  `getAuditTrail`** (forthcoming) — two audit surfaces.
-
-### Methodological note for the UI design pass
-
-The "Phase that introduced or last modified it" data in the tables
-above is `git blame` truth — many cells point to the proto-blue 0.2.6
-refactor, which was a mass touch but not the introducing change. If
-the UI design pass needs introducing-commit attribution per endpoint,
-re-run with `git log --follow --diff-filter=A -- src/api/admin.rs`
-filtered to handler-introducing changes; this inventory uses last-
-touch since the brief asked for "most recent commit subject."
+   signatures. The "last commit" cells reflect the introducing or
+   last-touching phase and are useful for tracking surface evolution
+   but don't reflect every audit-pass amendment.

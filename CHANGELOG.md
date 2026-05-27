@@ -1049,6 +1049,7 @@ the v0.4 cycle's headline arc.
   discoverability. Full handoff at `docs/V03_DESIGN.md` §9.8;
   v0.4 candidate accumulator at `docs/v04-candidates.md`.
 ### Changed
+- Promote AURORA_ENDPOINT_INVENTORY → docs/operator/admin-endpoint-reference.md (v0.6 docs) (#161)
 - Move AURORA_ADMIN_UI_DESIGN.md to docs/internal/design/ (v0.6 docs internal) (#160)
 - Archive Doll-authored root docs to docs/archive/ (v0.6 docs restructure stage 1) (#159)
 - Getting Started guide + README Getting Started trim (v0.6 docs) (#158)
