@@ -185,12 +185,12 @@ pub struct AuditEntry {
 /// behaviour. SQL column errors and `created_at` parse failures
 /// propagate as `PdsError::Internal`.
 ///
-/// `getAuditTrail`'s loop in `src/api/aurora_admin.rs` retains its
-/// inline construction for now per the Arc 9 Step 4 scope discipline
-/// (the stable contract surface must stay byte-identical). The unit
-/// test `forensic_audit_entries_match_get_audit_trail_shape` pins the
-/// two paths against each other so a future cycle can DRY both onto
-/// this helper with confidence.
+/// Consumed by both `exportAccountForensic`'s audit-chain section
+/// and `getAuditTrail` (v0.6 batch tail A.1 / G2 closure — the
+/// latter's manual row-parse block was DRY'd onto this helper).
+/// The unit test `forensic_audit_entries_match_get_audit_trail_shape`
+/// pins the byte-identical-shape invariant between the two callers
+/// — touching this helper must keep both paths' wire output stable.
 pub fn audit_entry_from_row(row: &sqlx::any::AnyRow) -> Result<AuditEntry, PdsError> {
     use sqlx::Row as _;
     let to_internal = |e: sqlx::Error| PdsError::Internal(e.to_string());
