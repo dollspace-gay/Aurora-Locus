@@ -7,36 +7,47 @@ Aurora Locus is a feature-complete Personal Data Server (PDS) for the AT Protoco
 ## Features
 
 ### Core ATProto Functionality ✅
-- [x] **Account Management** - User registration, OAuth admin authentication, session management
+- [x] **Account Management** - OAuth 2.1 and JWT session auth; account lifecycle (create/deactivate/restore/delete) with refresh-token rotation
 - [x] **Repository Operations** - Full CRUD with MST (Merkle Search Tree) integration
 - [x] **Blob Storage** - Disk and S3-compatible storage backends
 - [x] **Event Sequencing** - Monotonic event log for all repository operations
 - [x] **Sync API** - CAR file export, repository synchronization
 - [x] **Firehose** - Live WebSocket event streaming with backpressure handling
-- [x] **Identity Resolution** - DID:PLC and DID:Web support with auto-registration
-- [x] **Federation** - Integrated relay client for Bluesky network participation
+- [x] **Identity Resolution** - DID:PLC and DID:Web resolution with TTL-bounded handle and document cache
 
 ### Admin & Moderation ✅
 - [x] **Role Management** - Moderator, Admin, SuperAdmin roles with granular permissions
-- [x] **Account Moderation** - Takedown, suspend, restore capabilities
-- [x] **Content Labels** - Apply/remove content labels (NSFW, spam, etc.)
+- [x] **Account Moderation** - Discriminated `emitEvent` actions (takedown/suspend/restore/delete accounts; blob quarantine; record takedown; report and appeal resolution), single or batched
+- [x] **Content Labels** - Apply and remove content labels
 - [x] **Report System** - Submit and manage content/account reports
-- [x] **Invite Codes** - Invite code generation and validation
-- [x] **Admin Logging** - Comprehensive audit trail of all admin actions
+- [x] **Admin Namespace** - Canonical `tools.aurora.*` lex surface (admin/moderator/ops/superadmin)
+- [x] **Hash-Chained Audit Log** - Tamper-evident per-row and chain-level verification; paginated trail; forensic tar-bundle export
+- [x] **Runtime Settings** - `getRuntimeSetting`/`setRuntimeSetting` with four-tier config hierarchy
 
 ### Security & Performance ✅
-- [x] **OAuth 2.0 with PKCE** - Secure admin authentication
-- [x] **Rate Limiting** - Per-IP and per-user request throttling
-- [x] **Password Security** - Argon2id hashing with SDK implementation
-- [x] **JWT Sessions** - Secure session management with refresh tokens
+- [x] **OAuth 2.1 with PKCE** - Mandatory S256 PKCE and refresh-token rotation
+- [x] **DPoP** - Sender-constrained tokens with JTI replay tracking
+- [x] **Rate Limiting** - Multi-axis throttling (global, per-endpoint, per-IP, per-user); distributed across instances
+- [x] **Password Security** - Argon2id hashing
+- [x] **JWT Sessions** - Refresh-token session auth; live with deprecation headers (OAuth 2.1 is the primary path)
+- [x] **Required Validation Mode** - Hard-reject schema-violating writes before commit
 - [x] **Optimistic Concurrency** - Swap CID validation for conflict prevention
 
 ### Production Features ✅
-- [x] **Background Jobs** - Session cleanup, suspension expiry, cache maintenance
-- [x] **Email Integration** - SMTP support for notifications (configurable)
-- [x] **Database Migrations** - SQLx-based schema management
+- [x] **Postgres Dual-Backend** - SQLite WAL and Postgres as first-class peers
+- [x] **Multi-Instance Deployment** - HA via shared Postgres with leader election and LISTEN/NOTIFY cache invalidation
+- [x] **Database Migrations** - Per-backend schema management for SQLite and Postgres
+- [x] **Health Checks** - `/health` with live, ready, and detailed sub-endpoints
 - [x] **GDPR Compliance** - Account deletion with grace period
-- [x] **Health Checks** - Monitoring endpoints for uptime tracking
+- [x] **Background Jobs** - Grouped cleanup, cache reapers, sweeps, federation, and maintenance
+- [x] **WAL Archiving + PITR** - Postgres backup and recovery surface
+
+### Federation & Interop ✅
+- [x] **Event-Stream Emission** - Account-lifecycle events (`#commit`/`#sync`/`#identity`/`#account`) on every path
+- [x] **Dynamic Lexicon Loading** - DNS-TXT authority resolution, HTTP fetch, two-layer cache, single-flight de-dup
+- [x] **Repository Import** - `importRepo` with per-blob pre-fetch and single-flight per-DID lock
+- [x] **Cross-PDS Service Auth** - Per-account-signed service JWTs; tombstoned-issuer rejection
+- [x] **Lexicon-Fetch Signature Verification** - Commit-signature check on fetched CARs
 
 ## Architecture
 
