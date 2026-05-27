@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.6.0] - 2026-05-27
+
+The v0.6 cycle theme is **hardening + clearing the decks for v0.7**. The v0.5 deferrals are closed (cross-PDS auth correctness, lexicon-fetch trust, required-mode hard-reject coverage, concurrent-import safety); speculative forward-substrate that didn't find a consumer is deleted; the operator-driven Phase B verification substrate is automated as a first-class harness; the multi-binary workspace's documentation surface is reconciled. Both backends (SQLite WAL + Postgres READ COMMITTED) remain first-class peers throughout.
+
+### Cross-PDS authentication correctness
+
+`getServiceAuth` now signs service-auth JWTs with the per-account signing key (the key whose did:key form is published in each account's DID document), rather than the server-wide repo signing key. Receiving PDSes resolving the issuer's DID-document verification method now find the key that actually signed the token — a structural correctness fix paralleling Arc 18's record-write signer correctness one layer up. The verifier path (`verify_service_jwt`) propagates a typed `PdsError::DidTombstoned` end-to-end, so a token whose issuer DID is tombstoned in PLC now surfaces a clean HTTP 400 with the typed wire-error shape rather than the prior opaque 401. The Arc 12 `mint-then-flip` scenario verifies the wire shift live: mint a token pre-tombstone, tombstone the issuer DID, present the token, observe the 400 with `DidTombstoned` body. The pre-cycle framing of "four federation handlers share the gap" collapsed to one live verifier on recon — `verify_remote_token`, `fetch_remote_profile`, and `is_trusted_pds` are dead pub-API with zero production callers; `verify_service_jwt` is the only consumer of the propagation contract.
+
+### Lexicon-fetch trust
+
+`ProductionLexiconFetcher` now verifies the CAR's commit signature against the authority DID's published `#atproto` verification key before treating the fetched lexicon record as trusted. The previous load path parsed the `SignedCommit` structure but never invoked the signature verifier, so a structurally-valid CAR carrying a tampered signature would have been silently accepted; the wire-up closes that defense-in-depth gap. The federation-trust failure-class taxonomy gains a new `invalid_signature` value, surfaceable both at the structured-log layer (`failure_class=invalid_signature`) and the HTTP response (502 `LexiconFetchFailed`). Two new fetcher-boundary unit tests pin the rejection routing on the signature-specific variant — not on the generic `InvalidResponseStructure` variant a parse-malformed CAR would also satisfy.
+
+### Required-mode validation + import collision live coverage
+
+Required validation mode is now live-covered end-to-end: a lexicon-violating `createRecord` on a Required-mode instance hard-rejects with HTTP 400, no commit signs, no row writes. The chain — `should_propagate_validation_errors` returning unconditional-true under Required mode, `validate_write` returning `Err`, `apply_writes` short-circuiting pre-commit, the `Err` lifting to `PdsError::SchemaViolation` via `validation_errors_to_pds_error`, IntoResponse mapping to 400 — was unit-covered before; the new Phase B scenario witnesses it against a running binary. The concurrent same-DID `importRepo` collision path is live-covered via a scenario that races two concurrent imports on a single PDS process — the `SingleFlightImportLock` arbitrates, the winner imports cleanly into the documented account-seeded / actor-empty precondition state, and the loser surfaces a pinned `PdsError::ConcurrentMutation` → HTTP 409. The no-double-write invariant compares pre-race (zero records) against post-race (one import's worth) to distinguish complete success from any half-apply.
+
+### Verification substrate
+
+The Phase B harness moved from per-operator markdown runbooks to a first-class shell-script substrate under `phase-b/lib/`. Per-arc scenario scripts source the shared lib; the operator runs `BACKEND=sqlite ./phase-b/arc17/scenario-13.sh` (or `BACKEND=postgres ...`) and the lib handles container provisioning, fresh data dirs, instance launch, credential confirmation, and the side-effect-check command surface. Judgment stays the operator's; setup is mechanical. Arc 17 Scenario 13 now exercises live DNS resolution against a hand-rolled responder under `phase-b/dns_responder.rs`, with three layers of cache defeat (per-sub-case NSIDs, `cache_size=0`, TTL=0). The mock-PLC service is a first-class CI substrate now, and the `postgres_smoke_test` is re-enabled against it. `hickory-resolver` is bumped to 0.26 (the Dependabot pair-bump; the High-severity NSEC3 advisory was confirmed unreachable from our `txt_lookup` call shape, so the bump patches the Moderate while leaving the High structurally absent).
+
+### Configuration knobs + operator surface
+
+The `rate_limit_buckets` reaper retention window — the v0.4 hardcoded 7-day constant — is now operator-tunable via `PDS_RATE_LIMIT_BUCKETS_RETENTION_DAYS`. The validate-config CLI surfaces two new operator-error-prevention warnings: a custom `did:plc:` `PDS_SERVICE_DID` warns that the cross-PDS service-JWT path can't verify against it (use `did:web:<hostname>`), and a set `PDS_LEXICON_DNS_NAMESERVER` warns that the Phase B harness affordance must NOT be in any production-config deployment.
+
+### Bug fixes
+
+`did:web` handle construction no longer produces malformed `did:web:usera..localhost` when `service_handle_domains` carries the default leading-dot shape; the join strips the leading dot before concatenation. `stage_blob` now best-effort removes the temp file when the `temp_blob_metadata` INSERT fails, recovering disk space synchronously before the Arc 16d row-sweep would catch it. `uploadBlob` accepts `application/octet-stream` (the detection fallback substitutes it when content sniffing returns `None`; the prior allowlist immediately rejected the fallback). `grant_role` / `revoke_role` errors now ship the federation-aligned structured-envelope shape (`{error, message}` JSON body) rather than plain-text bodies.
+
+### Internal cleanup
+
+Three categories of dead-substrate / DRY cleanup landed to start v0.7 on clean decks. The Arc 7 `DistributedStore::cas` trait method, `CasResult` enum, and per-table CAS helper were removed — speculative forward-substrate awaiting a consumer that never came; the production rate-limit consumer (`DistributedRateLimiter`) bypassed the trait with direct SQL UPDATEs from arrival. The Arc 7 `TtlCache` parse-cache module was removed — same shape; the DPoP-claims short-circuit consumer never wired. The Arc 8 route-registry forward-substrate accessors (`FamilyKind::Public`, `RouteEntry.methods`, `RouteEntry.version`, `RouteRegistryBuilder::merge`, plus the cascading `CapsBuilder.version` constructor argument) were removed. The `getAuditTrail` handler's manual row-parse block was DRY'd onto the shared `audit_chain::audit_entry_from_row` helper that `exportAccountForensic` already uses; the byte-identical wire shape is regression-guarded by the existing parity test. Each removed surface re-adds against a real v0.7 consumer's actual shape rather than inheriting the speculative form.
+
+### Documentation
+
+The operator-readable docs reconcile to the new multi-binary workspace: every bare `cargo run` invocation across the arc-phase-b operator runbooks and the `docs/operator/` surface (including the top-level README) now carries `--bin aurora-locus`. A copy-paste-from-docs no longer fails with "could not determine which binary to run" — the new `phase-b-dns-responder` binary added the ambiguity that broke the bare invocation.
+
+### Deferred to v0.7
+
+- HA multi-process kill-one-mid-request Phase B coverage (the natural home is the v0.6+ cross-process `pg_try_advisory_lock` import-lock variant whenever it lands).
+- Signing-key-history TOCTOU on commit-sig verify (proto-blue verifies against a single signing key; a PLC-rotated source DID may have signed earlier commits with rotated-out keys).
+- `record_quarantine` substrate (arc-sized; three architectural blockers from the round-1 closure; v0.7's moderation requirements are the most likely shape-revealer).
+- Cosmetic batch-tail items: `Role` `Display` impl, `getRuntimeSetting` snapshot test (needs an `insta` dev-dep not in the tree today), the JWT-deprecation header disposition, and the dual blob-not-found wire-shape operator-doc note.
+
 ## [0.5.0] - 2026-05-23
 
 The v0.5 cycle theme is **federation activation**. Aurora-Locus is now a participating federation peer rather than an isolated server: it emits the full account-lifecycle event stream other peers consume, accepts and validates external lexicons dynamically at write-time, and imports complete repositories with first-class blob continuity. Both backends (SQLite WAL + Postgres READ COMMITTED) are exercised end-to-end at every shipped surface.
