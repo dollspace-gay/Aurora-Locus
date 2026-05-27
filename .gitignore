@@ -33,8 +33,10 @@ phase-b/pds-*/
 __pycache__/
 *.pyc
 
-# Working design docs (per-cycle, local-only artifacts)
-docs/*_DESIGN.md
+# Local-only docs (per-cycle working artifacts: design, scope, defer-lists,
+# recon, phase-b operator runbooks). Single rule: anything under
+# docs/internal/ is local-only. To make a doc local-only, place it under
+# docs/internal/ — the file's name no longer matters.
 docs/internal
 phase-b/data-*/
 phase-b/*.sh
