@@ -130,7 +130,7 @@ export PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=$(openssl rand -hex 32)
 export PDS_DID_PLC_URL=http://127.0.0.1:2582
 export PDS_FEDERATION_ENABLED=true
 export PDS_FEDERATION_PEER_PDS="did:plc:pdsbxxxxxxxxxxxxxxxxxx@http://127.0.0.1:2584"
-cargo run --release  # or `cargo run` for the dev-routes builds
+cargo run --bin aurora-locus --release  # or `cargo run --bin aurora-locus` for the dev-routes builds
 ```
 
 **PDS B** (`PDS_PORT=2584`): same shape; flip the peer entry to

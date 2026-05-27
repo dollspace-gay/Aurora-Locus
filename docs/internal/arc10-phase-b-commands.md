@@ -12,7 +12,7 @@ test-infra checks, no deployment framing.
 > Arc 11 (chainlink #56). The dev endpoints are present in
 > debug builds only via `#[cfg(debug_assertions)]`; running
 > Phase B against a release build requires falling back to the
-> legacy `cargo run -- grant-admin` CLI (and accepting the
+> legacy `cargo run --bin aurora-locus -- grant-admin` CLI (and accepting the
 > stop-PDS / restart-PDS cycle Arc 11 was built to eliminate).
 > Arc 10's CLI and scheduled-job surfaces are themselves
 > debug-build-agnostic; only the Setup section depends on
@@ -59,7 +59,7 @@ wrapper. Phase B exercises:
 ### Start the PDS
 
 ```bash
-cargo run -- serve
+cargo run --bin aurora-locus -- serve
 ```
 
 Expected log lines (order may vary):
@@ -90,7 +90,7 @@ Expected: `{"status":"ok",...}`.
 ### Provision the admin account (four POSTs, zero PDS restarts)
 
 Arc 11's [`dev.aurora.*`](dev-routes.md) HTTP endpoints replace
-the legacy `cargo run -- grant-admin` ceremony. The four POSTs
+the legacy `cargo run --bin aurora-locus -- grant-admin` ceremony. The four POSTs
 below provision an admin account end-to-end against the running
 PDS — no stop, no restart, no `createSession` follow-up.
 
@@ -203,7 +203,7 @@ block in the config file, restart the PDS:
 
 ```bash
 # Stop the previously-started PDS if any (Ctrl-C in its shell).
-RUST_LOG=aurora_locus=debug cargo run -- serve 2>&1 | grep "GC sweep"
+RUST_LOG=aurora_locus=debug cargo run --bin aurora-locus -- serve 2>&1 | grep "GC sweep"
 ```
 
 Expected (within a few seconds of startup):
@@ -227,7 +227,7 @@ Stop the PDS (Ctrl-C) before B2.
 export PDS_GC_SWEEP_ENABLED=true
 export PDS_GC_SWEEP_INTERVAL_SECS=30        # 30s for testing
 export PDS_GC_SWEEP_DRY_RUN=true            # safe default; explicit here
-RUST_LOG=aurora_locus=info cargo run -- serve
+RUST_LOG=aurora_locus=info cargo run --bin aurora-locus -- serve
 ```
 
 Expected log within a few seconds of startup (from
@@ -286,7 +286,7 @@ Stop the PDS (Ctrl-C):
 
 ```bash
 unset PDS_GC_SWEEP_ENABLED PDS_GC_SWEEP_INTERVAL_SECS PDS_GC_SWEEP_DRY_RUN
-RUST_LOG=aurora_locus=debug cargo run -- serve 2>&1 | grep "GC sweep"
+RUST_LOG=aurora_locus=debug cargo run --bin aurora-locus -- serve 2>&1 | grep "GC sweep"
 ```
 
 Expected:
@@ -310,7 +310,7 @@ fast-fail per C3).
 ### C1. CLI signature verification
 
 ```bash
-cargo run -- gc-sweep --help
+cargo run --bin aurora-locus -- gc-sweep --help
 ```
 
 Expected (verified against
@@ -358,7 +358,7 @@ override is intentional.
 Confirm no PDS is running on port 2583. Then:
 
 ```bash
-cargo run -- gc-sweep
+cargo run --bin aurora-locus -- gc-sweep
 ```
 
 Expected output (params block + report block, verified
@@ -399,13 +399,13 @@ inherits this when no override is passed.
 In one terminal:
 
 ```bash
-cargo run -- serve
+cargo run --bin aurora-locus -- serve
 ```
 
 In another, with the PDS still running:
 
 ```bash
-cargo run -- gc-sweep
+cargo run --bin aurora-locus -- gc-sweep
 echo "exit: $?"
 ```
 
@@ -434,7 +434,7 @@ Stop the PDS before continuing.
 With no PDS running:
 
 ```bash
-cargo run -- gc-sweep --report-only --threshold-secs 7200 --max-deletes 5 --page-size 100
+cargo run --bin aurora-locus -- gc-sweep --report-only --threshold-secs 7200 --max-deletes 5 --page-size 100
 ```
 
 Expected params block reflects the overrides (verified
@@ -458,7 +458,7 @@ safety-direction-only design).
 ### C5. Confirm `--dry-run` is safety-direction-only
 
 ```bash
-cargo run -- gc-sweep --no-dry-run 2>&1 | head -5
+cargo run --bin aurora-locus -- gc-sweep --no-dry-run 2>&1 | head -5
 ```
 
 Expected: clap error citing `--no-dry-run` as an
@@ -484,7 +484,7 @@ unset PDS_GC_SWEEP_ENABLED PDS_GC_SWEEP_DRY_RUN \
       PDS_GC_SWEEP_MAX_DELETES_PER_RUN \
       PDS_GC_SWEEP_FRESHNESS_THRESHOLD_SECS \
       PDS_GC_SWEEP_INTERVAL_SECS PDS_GC_SWEEP_PAGE_SIZE
-cargo run -- validate-config 2>&1 | grep -A 1 "GcSweep"
+cargo run --bin aurora-locus -- validate-config 2>&1 | grep -A 1 "GcSweep"
 ```
 
 Expected: empty output (no GcSweep-category warnings render
@@ -499,7 +499,7 @@ validate-config output may show other unrelated warnings
 ```bash
 export PDS_GC_SWEEP_ENABLED=true
 export PDS_GC_SWEEP_DRY_RUN=false
-cargo run -- validate-config 2>&1 | grep -A 2 "GcSweep"
+cargo run --bin aurora-locus -- validate-config 2>&1 | grep -A 2 "GcSweep"
 ```
 
 Expected (from
@@ -519,7 +519,7 @@ Keeping D2's env vars set:
 
 ```bash
 export PDS_GC_SWEEP_MAX_DELETES_PER_RUN=500000
-cargo run -- validate-config 2>&1 | grep -A 2 "GcSweep"
+cargo run --bin aurora-locus -- validate-config 2>&1 | grep -A 2 "GcSweep"
 ```
 
 Expected: both the dry-run-false advisory **and** the
@@ -545,7 +545,7 @@ Reset and re-set:
 unset PDS_GC_SWEEP_DRY_RUN PDS_GC_SWEEP_MAX_DELETES_PER_RUN
 export PDS_GC_SWEEP_ENABLED=true
 export PDS_GC_SWEEP_FRESHNESS_THRESHOLD_SECS=300
-cargo run -- validate-config 2>&1 | grep -A 2 "GcSweep"
+cargo run --bin aurora-locus -- validate-config 2>&1 | grep -A 2 "GcSweep"
 ```
 
 Expected (from
@@ -567,7 +567,7 @@ Reset and re-set:
 unset PDS_GC_SWEEP_FRESHNESS_THRESHOLD_SECS
 export PDS_GC_SWEEP_ENABLED=true
 export PDS_GC_SWEEP_INTERVAL_SECS=600
-cargo run -- validate-config 2>&1 | grep -A 2 "GcSweep"
+cargo run --bin aurora-locus -- validate-config 2>&1 | grep -A 2 "GcSweep"
 ```
 
 Expected (from
@@ -585,7 +585,7 @@ export PDS_GC_SWEEP_DRY_RUN=false
 export PDS_GC_SWEEP_MAX_DELETES_PER_RUN=500000
 export PDS_GC_SWEEP_FRESHNESS_THRESHOLD_SECS=300
 export PDS_GC_SWEEP_INTERVAL_SECS=600
-cargo run -- validate-config 2>&1 | grep "GcSweep"
+cargo run --bin aurora-locus -- validate-config 2>&1 | grep "GcSweep"
 ```
 
 Expected: exactly four `[GcSweep]` lines, one per warning
@@ -613,7 +613,7 @@ Exercises the three metrics registered in
 ```bash
 export PDS_GC_SWEEP_ENABLED=true
 export PDS_GC_SWEEP_INTERVAL_SECS=30
-cargo run -- serve
+cargo run --bin aurora-locus -- serve
 ```
 
 Wait ~35 seconds (one interval plus margin) for the first
@@ -918,7 +918,7 @@ Expected: file exists; mtime is ~2 hours in the past.
 ### I4. Run the CLI sweep in dry-run (default)
 
 ```bash
-cargo run -- gc-sweep
+cargo run --bin aurora-locus -- gc-sweep
 ```
 
 Expected in the report block:
@@ -951,7 +951,7 @@ The CLI has no `--no-dry-run` flag (per C5). Set the env
 var instead:
 
 ```bash
-PDS_GC_SWEEP_DRY_RUN=false cargo run -- gc-sweep
+PDS_GC_SWEEP_DRY_RUN=false cargo run --bin aurora-locus -- gc-sweep
 ```
 
 Expected report:
@@ -979,7 +979,7 @@ touch -d "2 hours ago" ./data/blobs/aa/bafyaaorphan002
 export PDS_GC_SWEEP_ENABLED=true
 export PDS_GC_SWEEP_INTERVAL_SECS=30
 export PDS_GC_SWEEP_DRY_RUN=false  # destructive mode
-cargo run -- serve
+cargo run --bin aurora-locus -- serve
 ```
 
 Wait ~35 seconds for the first scheduled sweep. Then in

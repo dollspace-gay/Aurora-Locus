@@ -43,7 +43,7 @@ cross-instance proof.
 
 If you want to exercise Arc 7 against local Postgres
 specifically, set `PDS_DB_BACKEND=postgres` and
-`PDS_DB_URL=postgres://...` before `cargo run -- serve`. All
+`PDS_DB_URL=postgres://...` before `cargo run --bin aurora-locus -- serve`. All
 the curl and sqlite3 commands below assume the default
 SQLite path; swap `sqlite3 data/account.sqlite` for
 `psql $PDS_DB_URL` if running against Postgres.
@@ -60,7 +60,7 @@ OAuth state cleanup, and rate-limit bucket reaper jobs all
 spawn at startup.
 
 ```bash
-cargo run --release -- serve
+cargo run --bin aurora-locus --release -- serve
 ```
 
 Expected log lines on startup:
@@ -100,7 +100,7 @@ state doesn't already have one.
 prior Phase B sessions.)
 
 ```bash
-cargo run --release -- grant-admin \
+cargo run --bin aurora-locus --release -- grant-admin \
   --did did:plc:<from-above> \
   --role SuperAdmin \
   --notes "Phase B sweep"
@@ -249,7 +249,7 @@ Stop the running PDS (`Ctrl-C` or `kill`).
 
 ```bash
 PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory \
-cargo run --release -- serve
+cargo run --bin aurora-locus --release -- serve
 ```
 
 Expected log line on startup:
@@ -325,7 +325,7 @@ Stop the PDS. Restart in default `Distributed` mode for the
 rest of the script:
 
 ```bash
-cargo run --release -- serve
+cargo run --bin aurora-locus --release -- serve
 ```
 
 Re-mint `$ADMIN_TOKEN`.
@@ -449,7 +449,7 @@ Stop the PDS. Restart:
 
 ```bash
 PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory \
-cargo run --release -- serve
+cargo run --bin aurora-locus --release -- serve
 ```
 
 Re-mint `$ADMIN_TOKEN` if needed.
@@ -489,7 +489,7 @@ in-process; no substrate-table writes.
 Stop the PDS. Restart in default `Distributed` mode:
 
 ```bash
-cargo run --release -- serve
+cargo run --bin aurora-locus --release -- serve
 ```
 
 ---
@@ -682,7 +682,7 @@ cross-instance tests
 Stop the PDS. Restart:
 
 ```bash
-PDS_DISTRIBUTED_STATE_MODE=redis cargo run --release -- serve
+PDS_DISTRIBUTED_STATE_MODE=redis cargo run --bin aurora-locus --release -- serve
 ```
 
 Expected: startup fails with an error message containing
@@ -694,7 +694,7 @@ attempt — validation runs at `config.validate()` time.
 ### G2. `PDS_DISTRIBUTED_STATE_MODE=garbage` startup rejection
 
 ```bash
-PDS_DISTRIBUTED_STATE_MODE=garbage cargo run --release -- serve
+PDS_DISTRIBUTED_STATE_MODE=garbage cargo run --bin aurora-locus --release -- serve
 ```
 
 Expected: startup fails with
@@ -707,7 +707,7 @@ Expected: startup fails with
 PDS_MAINTENANCE_DB_MAX_CONNECTIONS=5 \
 PDS_MAINTENANCE_DB_MIN_CONNECTIONS=1 \
 PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS=5 \
-cargo run --release -- serve
+cargo run --bin aurora-locus --release -- serve
 ```
 
 Expected log line:
@@ -723,7 +723,7 @@ PDS after observing the log.
 
 ```bash
 PDS_MAINTENANCE_DB_MAX_CONNECTIONS=0 \
-cargo run --release -- serve
+cargo run --bin aurora-locus --release -- serve
 ```
 
 Expected:
@@ -732,7 +732,7 @@ Expected:
 ```bash
 PDS_MAINTENANCE_DB_MIN_CONNECTIONS=20 \
 PDS_MAINTENANCE_DB_MAX_CONNECTIONS=15 \
-cargo run --release -- serve
+cargo run --bin aurora-locus --release -- serve
 ```
 
 Expected:
@@ -742,7 +742,7 @@ PDS_MAINTENANCE_DB_MAX_CONNECTIONS (15)`.
 ### Restart back to default mode
 
 ```bash
-cargo run --release -- serve
+cargo run --bin aurora-locus --release -- serve
 ```
 
 Re-mint `$ADMIN_TOKEN`.
@@ -885,7 +885,7 @@ unrelated to Arc 7), zero new warnings on Arc 7 code:
   `PDS_MAINTENANCE_DB_MAX_CONNECTIONS`, etc) are read at
   `AppContext::new` startup. Each mode-toggle exercise
   documents the restart inline. Order: stop with `Ctrl-C` or
-  `kill`, set env vars, `cargo run --release -- serve` (the
+  `kill`, set env vars, `cargo run --bin aurora-locus --release -- serve` (the
   `--release` flag is optional but recommended for cleaner
   log output).
 

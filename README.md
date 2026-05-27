@@ -104,7 +104,7 @@ openssl rsa -in plc_key.pem -outform DER | xxd -p -c 256 > plc_key.hex
 # PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=<contents of plc_key.hex>
 
 # Build and run
-cargo run --release
+cargo run --release --bin aurora-locus
 ```
 
 ### Configuration

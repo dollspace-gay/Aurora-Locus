@@ -30,7 +30,7 @@ fire.
 ### Start the PDS
 
 ```bash
-cargo run -- serve
+cargo run --bin aurora-locus -- serve
 ```
 
 Expected log lines (order may vary):
@@ -62,7 +62,7 @@ curl -s -X POST http://localhost:2583/xrpc/com.atproto.server.createAccount \
   -d '{"email":"alice@localhost","handle":"alice.localhost","password":"TestPassword123!"}' \
   | jq
 
-cargo run -- grant-admin \
+cargo run --bin aurora-locus -- grant-admin \
   --did did:plc:<from-above> \
   --role SuperAdmin \
   --notes "Arc 8 Phase B sweep"
@@ -430,7 +430,7 @@ warnings on Arc 8 files (`src/api/admin.rs`,
   env-var-driven paths. The `RouteRegistry` is built at
   startup and is the sole source of truth at request time;
   no restart sequence is needed beyond the initial
-  `cargo run -- serve`.
+  `cargo run --bin aurora-locus -- serve`.
 
 - **No DB substrate to inspect**: Arc 8's runtime data lives
   in process memory (`Arc<RouteRegistry>` on `AppContext`).

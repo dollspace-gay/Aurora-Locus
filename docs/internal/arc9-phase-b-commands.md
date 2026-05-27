@@ -12,7 +12,7 @@ test-infra checks, no deployment framing.
 > Arc 11 (chainlink #56). The dev endpoints are present in
 > debug builds only via `#[cfg(debug_assertions)]`; running
 > Phase B against a release build requires falling back to the
-> legacy `cargo run -- grant-admin` CLI (and accepting the
+> legacy `cargo run --bin aurora-locus -- grant-admin` CLI (and accepting the
 > stop-PDS / restart-PDS cycle Arc 11 was built to eliminate).
 > Arc 9's implementation work is debug-build-agnostic; only the
 > Setup section depends on Arc 11.
@@ -47,7 +47,7 @@ B-C, G), the decoupling discipline (Section H), and the docs
 ### Start the PDS
 
 ```bash
-cargo run -- serve
+cargo run --bin aurora-locus -- serve
 ```
 
 Expected log lines (order may vary):
@@ -68,7 +68,7 @@ Expected: `{"status":"ok",...}`.
 ### Provision the admin account (four POSTs, zero PDS restarts)
 
 Arc 11's [`dev.aurora.*`](dev-routes.md) HTTP endpoints replace
-the legacy `cargo run -- grant-admin` ceremony. The four POSTs
+the legacy `cargo run --bin aurora-locus -- grant-admin` ceremony. The four POSTs
 below provision an admin account end-to-end against the running
 PDS — no stop, no restart, no `createSession` follow-up.
 
@@ -733,7 +733,7 @@ the upgrade work is discoverable.
 - **No mode toggles in Arc 9**: unlike Arc 7's
   `PDS_DISTRIBUTED_STATE_MODE`, Arc 9 introduces no env-var-
   driven paths. Single mode of operation; no restart sequence
-  is needed beyond the initial `cargo run -- serve`.
+  is needed beyond the initial `cargo run --bin aurora-locus -- serve`.
 
 - **`exportAccountForensic` is POST, not GET**: takes a JSON
   body with `did`, `rationale` (required, non-empty), and
@@ -746,7 +746,7 @@ the upgrade work is discoverable.
   Setup uses [`dev.aurora.createAccount`](dev-routes.md) +
   `dev.aurora.grantAdmin` + `dev.aurora.mintToken` (four
   POSTs total including the auth-verification step). No PDS
-  restart, no `cargo run -- grant-admin` ceremony. The Arc 11
+  restart, no `cargo run --bin aurora-locus -- grant-admin` ceremony. The Arc 11
   endpoints are debug-build-only via
   `#[cfg(debug_assertions)]`; if running Phase B against a
   release build, fall back to the legacy CLI and pay the
@@ -776,7 +776,7 @@ the upgrade work is discoverable.
   release-build operator falls back to the CLI, the
   signature is positional `<DID> <ROLE>` followed by
   `--notes <NOTES>` and `--force` optional flags. Verified
-  via `cargo run -- grant-admin --help`. The Arc 7 and Arc 8
+  via `cargo run --bin aurora-locus -- grant-admin --help`. The Arc 7 and Arc 8
   Phase B scripts contained the wrong flag form
   (`--did ... --role ...`) carried over from earlier-draft
   CLI versions; the current binary's argument parser rejects

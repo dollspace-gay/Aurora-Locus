@@ -19,7 +19,7 @@ sweeps and local development:
 ## When to use these
 
 - Granting admin role without stopping the running PDS (the CLI
-  `cargo run -- grant-admin` holds a PDS-liveness lock that
+  `cargo run --bin aurora-locus -- grant-admin` holds a PDS-liveness lock that
   fails fast when a PDS is up).
 - Bypassing the `com.atproto.server.createAccount` ceremony's
   invite-code + email-verification gates for throwaway test
@@ -53,11 +53,11 @@ builds against these paths will see 404.
 ## Setup
 
 Start the PDS in debug mode (the default for `cargo run`).
-Release builds (`cargo build --release` / `cargo run --release`)
+Release builds (`cargo build --release` / `cargo run --bin aurora-locus --release`)
 do not expose dev routes.
 
 ```bash
-cargo run -- serve
+cargo run --bin aurora-locus -- serve
 ```
 
 Expected log lines include the usual:
@@ -233,7 +233,7 @@ Returns 404 if no actor row exists for the DID.
 
 ```bash
 # 1. Start the PDS (once per session)
-cargo run -- serve
+cargo run --bin aurora-locus -- serve
 
 # 2. Create a test admin account.
 RESP=$(curl -s -X POST http://localhost:2583/xrpc/dev.aurora.createAccount \

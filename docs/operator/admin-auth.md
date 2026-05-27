@@ -89,7 +89,7 @@ Three roles available: `moderator`, `admin`, `superadmin`.
 Case-insensitive.
 
 ```bash
-cargo run --release -- grant-admin \
+cargo run --release --bin aurora-locus -- grant-admin \
     did:plc:<from-step-1> admin \
     --notes "bootstrap operator"
 ```
@@ -110,7 +110,7 @@ Error: Validation error: did:plc:abc already has active role 'admin'.
 To re-grant a previously revoked role, add `--force`:
 
 ```bash
-cargo run --release -- grant-admin did:plc:abc admin --force
+cargo run --release --bin aurora-locus -- grant-admin did:plc:abc admin --force
 ```
 
 `--force` does NOT bypass an *active* grant — only a *revoked* one.
@@ -119,7 +119,7 @@ cargo run --release -- grant-admin did:plc:abc admin --force
 
 ```bash
 docker-compose up -d
-# OR re-run cargo run --release
+# OR re-run cargo run --release --bin aurora-locus
 
 # Log in as the admin account.
 curl -sX POST http://localhost:3000/xrpc/com.atproto.server.createSession \
