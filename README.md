@@ -89,127 +89,50 @@ Aurora Locus/
 
 ### Prerequisites
 
-- Rust 1.75+ (with Cargo)
-- SQLite 3.35+
-- Optional: S3-compatible storage (for blob storage)
+- Rust toolchain (stable, with Cargo)
+- OpenSSL (for key generation below)
+- Optional: Docker, for the Postgres upgrade path
 
-### Quick Start
+### Quick start (SQLite, default backend)
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd Aurora-Locus
+git clone <repository-url> aurora-locus
+cd aurora-locus
 
-# Copy environment template
+# Two secp256k1 private keys, hex-encoded — exactly 64 hex chars each.
+openssl rand -hex 32 > repo_key.hex
+openssl rand -hex 32 > plc_key.hex
+
 cp .env.example .env
 
-# Generate cryptographic keys
-openssl genrsa -out repo_key.pem 2048
-openssl rsa -in repo_key.pem -outform DER | xxd -p -c 256 > repo_key.hex
+# Add these three lines to .env (the only values without sensible defaults):
+#   PDS_JWT_SECRET=<32+ random chars>
+#   PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=<contents of repo_key.hex>
+#   PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=<contents of plc_key.hex>
 
-openssl genrsa -out plc_key.pem 2048
-openssl rsa -in plc_key.pem -outform DER | xxd -p -c 256 > plc_key.hex
-
-# Update .env with generated keys
-# PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=<contents of repo_key.hex>
-# PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=<contents of plc_key.hex>
-
-# Build and run
+cargo run --bin aurora-locus -- validate-config
 cargo run --release --bin aurora-locus
 ```
 
-### Configuration
-
-All configuration is done via environment variables. See [.env.example](.env.example) for complete options.
-
-**Required Settings:**
-```bash
-# Server
-PDS_HOSTNAME=pds.example.com
-PDS_PORT=3000
-PDS_SERVICE_DID=did:web:pds.example.com
-
-# Security
-PDS_JWT_SECRET=<random-32+-char-string>
-PDS_ADMIN_PASSWORD=<secure-password>
-
-# Cryptography
-PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=<from-repo_key.hex>
-PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=<from-plc_key.hex>
-
-# Storage
-PDS_DATA_DIRECTORY=./data
-PDS_BLOBSTORE_DISK_LOCATION=./data/blobs
-```
-
-**Optional - Federation:**
-```bash
-FEDERATION_ENABLED=true
-FEDERATION_RELAY_URLS=https://bsky.network
-```
-
-**Optional - S3 Blob Storage:**
-```bash
-PDS_BLOBSTORE_S3_BUCKET=my-pds-blobs
-PDS_BLOBSTORE_S3_REGION=us-east-1
-PDS_BLOBSTORE_S3_ACCESS_KEY_ID=<your-key>
-PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY=<your-secret>
-```
-
-### Initial Setup
-
-Bootstrap a fresh deployment by granting the first SuperAdmin
-through the `aurora-locus grant-admin` CLI subcommand. Admin
-authority comes from the `admin_roles` table only — no environment
-variable confers a role. After the first SuperAdmin exists, all
-subsequent role grants flow through
-`tools.aurora.superadmin.grantRole`, which writes to the audit
-chain.
-
-The bootstrap commands below require these env vars to be set
-(see [.env.example](.env.example) for the full configuration
-surface — these three are the bootstrap-critical subset that
-every CLI subcommand needs to construct an `AppContext`):
-
-- `PDS_JWT_SECRET` — secret for HS256 admin tokens.
-- `PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX` — 64-hex-char
-  secp256k1 private key for repo signing.
-- `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` — 64-hex-char
-  secp256k1 private key for PLC rotation.
-
-Plus one operator-supplied placeholder used by the bash block
-below:
-
-- `PDS_OPERATOR_DID` — the DID of the account being granted
-  superadmin (e.g. `did:plc:abc...` or `did:web:host`). This is
-  the account that will run all subsequent admin operations
-  through the live PDS.
-
-The PDS must be **stopped** while `grant-admin` runs. The CLI
-acquires the same cooperative liveness lock the `serve`
-subcommand holds, so it fast-fails if a PDS is already up
-against the same database.
+The server creates `./data/` on first start and listens on `2583` by
+default. Probe:
 
 ```bash
-set -euo pipefail
-
-# Grant SuperAdmin role to the operator's DID.
-aurora-locus grant-admin "${PDS_OPERATOR_DID}" superadmin \
-  --notes "Initial bootstrap"
-
-# Verify the audit chain is internally consistent.
-aurora-locus debug verify-audit-chain
+curl -s http://localhost:2583/health
+curl -s http://localhost:2583/xrpc/com.atproto.server.describeServer | jq
 ```
 
-The grant prints `Granted role 'superadmin' to <did>. Audit
-entry: #1.` on success. The chain-walk reports `1 entry verified,
-chain healthy.` immediately after — discontinuities indicate
-either a failed grant transaction (rare) or external tampering
-with the `audit_chain_entry` table; investigate before proceeding
-with further grants.
+### Further reading
 
-For a full list of CLI subcommands and their flags, run
-`aurora-locus --help`.
+- **[docs/getting-started.md](docs/getting-started.md)** — full install
+  walkthrough, including the Postgres upgrade path.
+- **[docs/operator/configuration.md](docs/operator/configuration.md)** —
+  exhaustive environment-variable reference (24 sections, every variable
+  the server reads).
+- **[docs/operator/admin-auth.md](docs/operator/admin-auth.md)** —
+  SuperAdmin bootstrap via `aurora-locus grant-admin` and the auth model.
+- **[docs/operator/multi-instance-deployment.md](docs/operator/multi-instance-deployment.md)**
+  — Postgres + leader election + LISTEN/NOTIFY topology.
 
 ## API Endpoints
 
