@@ -44,6 +44,29 @@ use std::sync::Arc;
 /// reaching it without an NSID rename, and the richer per-event reads
 /// that benefit from the new `tools.aurora.moderator.*` shape ship
 /// there alongside the unrelocated stream.
+/// Build an axum-friendly `(StatusCode, Json<serde_json::Value>)`
+/// error pair carrying the `{error, message}` envelope the
+/// federation/admin wire contract uses. Mirrors the `forbidden()`
+/// pattern at [`aurora_admin.rs`](src/api/aurora_admin.rs) but
+/// without the AuroraAdminError code-table coupling — accepts any
+/// `&str` code so the call sites can name their own
+/// wire-error variant. v0.6 batch tail G1.1 introduced this for
+/// the grant_role/revoke_role reshape; available to any other
+/// handler in this module that wants structured-error responses.
+fn json_error(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": code,
+            "message": message.into(),
+        })),
+    )
+}
+
 pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
     // Arc 8 Step 2 (chainlink #54): registration sites for the
     // four `tools.aurora.<family>.*` namespaces flow through
@@ -992,7 +1015,7 @@ async fn grant_role(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<GrantRoleRequest>,
-) -> Result<Json<GrantRoleOutput>, (StatusCode, String)> {
+) -> Result<Json<GrantRoleOutput>, (StatusCode, Json<serde_json::Value>)> {
     use crate::admin::roles::Role;
 
     // SuperAdmin only — relocated to tools.aurora.superadmin.* in
@@ -1000,8 +1023,9 @@ async fn grant_role(
     // management is structurally a SuperAdmin operation; the
     // namespace makes that boundary visible, this guard enforces it.
     if !auth.role.can_act_as(Role::SuperAdmin) {
-        return Err((
+        return Err(json_error(
             StatusCode::FORBIDDEN,
+            "Forbidden",
             format!(
                 "grantRole requires SuperAdmin role; have {}",
                 auth.role.as_str()
@@ -1017,16 +1041,17 @@ async fn grant_role(
         .as_deref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .ok_or((
-            StatusCode::BAD_REQUEST,
-            "rationale-required".to_string(),
-        ))?;
+        .ok_or_else(|| {
+            json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required")
+        })?;
 
     // Parse role
     let role: Role = req
         .role
         .parse()
-        .map_err(|e: PdsError| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e: PdsError| {
+            json_error(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string())
+        })?;
 
     let subject = Subject::Repo {
         did: req.did.clone(),
@@ -1041,7 +1066,9 @@ async fn grant_role(
         .account_db
         .begin()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?;
     let admin_role = crate::admin::AdminRoleManager::grant_role_in_tx(
         &mut tx,
         &req.did,
@@ -1050,7 +1077,9 @@ async fn grant_role(
         Some(rationale.to_string()),
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
     // Audit chain entry — replaces the legacy admin_audit_log path.
     // Subject is the target DID; the role being granted lives in the
     // rationale + the moderation_event details rather than as a
@@ -1069,10 +1098,14 @@ async fn grant_role(
         },
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
     tx.commit()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?;
 
     Ok(Json(GrantRoleOutput {
         success: true,
@@ -1117,14 +1150,15 @@ async fn revoke_role(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<RevokeRoleRequest>,
-) -> Result<Json<RevokeRoleOutput>, (StatusCode, String)> {
+) -> Result<Json<RevokeRoleOutput>, (StatusCode, Json<serde_json::Value>)> {
     use crate::admin::roles::Role;
 
     // SuperAdmin only — same rationale as grant_role above
     // (chainlink #103 / Phase 3.6).
     if !auth.role.can_act_as(Role::SuperAdmin) {
-        return Err((
+        return Err(json_error(
             StatusCode::FORBIDDEN,
+            "Forbidden",
             format!(
                 "revokeRole requires SuperAdmin role; have {}",
                 auth.role.as_str()
@@ -1137,10 +1171,9 @@ async fn revoke_role(
         .as_deref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .ok_or((
-            StatusCode::BAD_REQUEST,
-            "rationale-required".to_string(),
-        ))?;
+        .ok_or_else(|| {
+            json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required")
+        })?;
 
     let subject = Subject::Repo {
         did: req.did.clone(),
@@ -1152,7 +1185,9 @@ async fn revoke_role(
         .account_db
         .begin()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?;
     crate::admin::AdminRoleManager::revoke_role_in_tx(
         &mut tx,
         &req.did,
@@ -1160,7 +1195,9 @@ async fn revoke_role(
         Some(rationale.to_string()),
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
     let audit_entry_id = audit_chain::append_entry_in_tx(
         &mut tx,
         AppendEntryParams {
@@ -1175,10 +1212,14 @@ async fn revoke_role(
         },
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
     tx.commit()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?;
 
     Ok(Json(RevokeRoleOutput {
         success: true,
@@ -7861,10 +7902,13 @@ mod tests {
             .await
             .expect_err("Admin must not be allowed to grant roles");
         assert_eq!(status, StatusCode::FORBIDDEN);
+        // G1.1 structured-error shape: `{error: "Forbidden", message: "..."}`.
+        assert_eq!(body.0["error"], "Forbidden");
+        let message = body.0["message"].as_str().expect("message must be a string");
         assert!(
-            body.contains("SuperAdmin"),
+            message.contains("SuperAdmin"),
             "error message should reference SuperAdmin requirement, got: {}",
-            body
+            message
         );
     }
 
@@ -7879,7 +7923,9 @@ mod tests {
             .await
             .expect_err("Admin must not be allowed to revoke roles");
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(body.contains("SuperAdmin"));
+        assert_eq!(body.0["error"], "Forbidden");
+        let message = body.0["message"].as_str().expect("message must be a string");
+        assert!(message.contains("SuperAdmin"));
     }
 
     #[tokio::test]
@@ -7929,7 +7975,8 @@ mod tests {
             .await
             .expect_err("missing rationale must be rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body, "rationale-required");
+        assert_eq!(body.0["error"], "InvalidRequest");
+        assert_eq!(body.0["message"], "rationale-required");
     }
 
     #[tokio::test]
@@ -7966,7 +8013,8 @@ mod tests {
             .await
             .expect_err("missing rationale must be rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body, "rationale-required");
+        assert_eq!(body.0["error"], "InvalidRequest");
+        assert_eq!(body.0["message"], "rationale-required");
     }
 
     #[tokio::test]

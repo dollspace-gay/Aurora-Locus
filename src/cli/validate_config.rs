@@ -495,6 +495,30 @@ fn validate_identity_config(config: &ServerConfig, issues: &mut Vec<ValidationIs
             "DID cache max TTL cannot be less than stale TTL".to_string(),
         ));
     }
+
+    // v0.6 batch tail Section F — Cluster 2 Member 2.1
+    // operator-error-prevention. A custom did:plc:... service-DID
+    // is unusable for the cross-PDS signing-key path: federation
+    // verifiers expect the service DID to be did:web:<host> (the
+    // PDS's own identity), not a per-account did:plc. The
+    // getServiceAuth handler signs with the per-account key for
+    // did:plc DIDs but the receiving PDS's verifier resolves the
+    // service DID's published key, so a did:plc service DID would
+    // fail verification against any per-account-key-signed JWT.
+    // Warn at validate-time so this misconfiguration surfaces
+    // before any runtime auth failure.
+    if config.service.service_did.starts_with("did:plc:") {
+        issues.push(ValidationIssue::warning(
+            "Identity",
+            format!(
+                "PDS_SERVICE_DID is '{}' — custom did:plc service DIDs aren't \
+                 supported for the cross-PDS service-JWT path; the receiving PDS \
+                 verifies against the published service-DID key and will reject \
+                 per-account-key-signed JWTs. Use a did:web:<hostname> service DID.",
+                config.service.service_did
+            ),
+        ));
+    }
 }
 
 /// Validate email configuration
@@ -587,6 +611,30 @@ fn validate_federation_config(config: &ServerConfig, issues: &mut Vec<Validation
         issues.push(ValidationIssue::info(
             "Federation",
             "Federation is disabled - server will not connect to Bluesky network".to_string(),
+        ));
+    }
+
+    // v0.6 batch tail Section F — Cluster 1 Member 1.2
+    // forbidden-in-production. PDS_LEXICON_DNS_NAMESERVER is the
+    // Phase B harness affordance that re-targets the
+    // HickoryDnsTxtResolver to a local mock-DNS responder; setting
+    // it in production silently sends every lexicon DNS TXT lookup
+    // to the operator-supplied nameserver with caching disabled,
+    // breaking the live-DNS resolution path. The knob is intended
+    // for the Phase B Scenario 13 harness ONLY (Cluster 1 Member
+    // 1.2 design directive). Warn at validate-time so production
+    // operators see this immediately if it accidentally leaked
+    // into a release-config rollout.
+    if std::env::var("PDS_LEXICON_DNS_NAMESERVER").is_ok() {
+        issues.push(ValidationIssue::warning(
+            "Federation",
+            "PDS_LEXICON_DNS_NAMESERVER is set — this env var is a Phase B \
+             harness affordance for the live-DNS Arc 17 Scenario 13 test \
+             (Cluster 1 Member 1.2); when set in production it silently \
+             retargets all lexicon DNS TXT lookups to the operator-supplied \
+             nameserver with caching disabled, breaking live federation \
+             resolution. UNSET this env var for any production deployment."
+                .to_string(),
         ));
     }
 }

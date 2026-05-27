@@ -230,8 +230,28 @@ impl BlobStore {
             height,
         };
 
-        // Store temp blob metadata in database
-        self.store_temp_blob_metadata(&temp_blob).await?;
+        // Store temp blob metadata in database. #96 — if the
+        // INSERT errors after the temp file is on disk, the file
+        // would leak (no metadata row → row-driven sweep can't
+        // see it). Best-effort fs::remove_file on the Err arm
+        // recovers the disk space synchronously; we still log
+        // and propagate the original DB error. Failing the
+        // remove is non-fatal (the Arc 16d row-sweep picks up
+        // any surviving stragglers; the warn surfaces the rare
+        // case for operator visibility).
+        if let Err(e) = self.store_temp_blob_metadata(&temp_blob).await {
+            if let Err(rm_err) = fs::remove_file(&temp_path).await {
+                tracing::warn!(
+                    cid = %cid,
+                    temp_path = %temp_path.display(),
+                    metadata_error = %e,
+                    remove_error = %rm_err,
+                    "stage_blob: temp file orphan cleanup failed; \
+                     row-sweep will catch the stray"
+                );
+            }
+            return Err(e);
+        }
 
         tracing::info!("Staged blob {} in temp storage", cid);
 
@@ -544,7 +564,15 @@ impl BlobStore {
 
     /// Validate MIME type is allowed
     fn validate_mime_type(&self, mime_type: &str) -> PdsResult<()> {
-        // ATProto allows specific image and video types
+        // ATProto allows specific image and video types. #98 added
+        // `application/octet-stream` so the detection-fallback at
+        // stage_blob:191-199 (which substitutes octet-stream when
+        // `detect_mime_type_from_data` returns None) no longer
+        // immediately fails validation. The upload path already
+        // gates on `max_blob_size` (via `validate_blob_size`)
+        // before any disk write, so accepting generic binaries
+        // doesn't loosen the size posture — only the type
+        // allowlist.
         const ALLOWED_TYPES: &[&str] = &[
             "image/jpeg",
             "image/png",
@@ -553,6 +581,7 @@ impl BlobStore {
             "video/mp4",
             "video/quicktime",
             "video/webm",
+            "application/octet-stream",
         ];
 
         if ALLOWED_TYPES.contains(&mime_type) {
