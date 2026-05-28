@@ -2,9 +2,9 @@
 
 Operator guide for backing up and restoring the Aurora-Locus database.
 
-This guide covers the SQLite default and the Postgres backend
-(introduced in v0.2). The CLI wrappers are backend-aware: same
-command, dispatches based on `PDS_DB_BACKEND` / `PDS_DB_URL`.
+This guide covers both backends — SQLite (default) and Postgres. The
+CLI wrappers are backend-aware: same command, dispatches based on
+`PDS_DB_BACKEND` / `PDS_DB_URL`.
 
 For point-in-time recovery via WAL archiving (Postgres only), see
 [wal-archiving.md](wal-archiving.md).

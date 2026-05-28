@@ -5,10 +5,6 @@ Aurora-Locus instance, or wiring CI/test flows that need to call
 admin endpoints (`/admin/...`, `/xrpc/com.atproto.admin.*`,
 `/xrpc/dev.aurora.admin.*`).
 
-**Scope:** chainlink #84 — this page documents the model end-to-end,
-including the bootstrap flow that was previously undocumented and
-blocked Arc 15 Phase B Scenario 2.3 (takedown).
-
 ---
 
 ## Model in one paragraph
@@ -160,7 +156,7 @@ The same JWT shape as a regular session token. The admin-or-not
 distinction is invisible at the JWT layer — it surfaces only at
 request time when the endpoint runs admin-role lookup.
 
-Example — takedown an account (Arc 15 Phase B Scenario 2.3):
+Example — takedown an account:
 
 ```bash
 curl -sX POST http://localhost:3000/admin/accounts/takedown \

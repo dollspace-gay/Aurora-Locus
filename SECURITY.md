@@ -264,10 +264,10 @@ exposure proven unreachable in this build.**
 **Background.** `hickory-proto` (transitively via `hickory-resolver`) carries
 the NSEC3 unbounded-loop vulnerability advised at
 [RUSTSEC-2026-0118](https://rustsec.org/advisories/RUSTSEC-2026-0118).
-Upstream has not published a fix as of the v0.6 cycle; the bump to
-`hickory-resolver 0.26.1` (M1.3, chainlink #152) patches the sibling
-RUSTSEC-2026-0119 (Moderate) but cannot address the High because no
-patched release exists.
+Upstream has not published a fix yet; the bump to
+`hickory-resolver 0.26.1` patches the sibling RUSTSEC-2026-0119
+(Moderate) but cannot address the High because no patched release
+exists.
 
 **Why we accept rather than mitigate.** The vulnerable function
 `verify_nsec3` lives in
@@ -296,11 +296,11 @@ unreachable.
 `hickory-resolver 0.25.2` via `proto-blue-identity v0.3.2` (transitive
 through `proto-blue`). Our direct usage in `src/federation/dns_resolver.rs`
 is on the 0.26.1 binary and the reachability proof above governs it. The
-proto-blue-identity transitive copy is outside the v0.6 M1.3 bump scope; if
-that copy's DNS calls also flow through the unreachable-path shape (default
-features + no DNSSEC validation) the same reasoning applies, but the
-verification is upstream's responsibility and we have not audited it. A
-future cycle where proto-blue ships a release pinning hickory `>= 0.26.1`
+proto-blue-identity transitive copy is outside this bump's scope; if
+that copy's DNS calls also flow through the unreachable-path shape
+(default features + no DNSSEC validation) the same reasoning applies,
+but the verification is upstream's responsibility and we have not
+audited it. A future release of proto-blue pinning hickory `>= 0.26.1`
 will collapse the duplicate.
 
 **Reassessment triggers.** This disposition must reopen if ANY of:

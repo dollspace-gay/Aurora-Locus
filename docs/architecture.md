@@ -100,7 +100,7 @@ modules themselves carry doc-comments with the load-bearing detail.
 
 Plus binaries: `aurora-locus` (the PDS itself, default) and
 `phase-b-dns-responder` (a 220-line UDP-only TXT responder for a single
-Arc 17 federation scenario; not consumed by production code).
+federation test scenario; not consumed by production code).
 
 ---
 
@@ -204,11 +204,11 @@ live in [operator/multi-instance-deployment.md](operator/multi-instance-deployme
   + on-disk persistent) → single-flight de-dup on concurrent misses.
 - **`dns_resolver.rs`** — `hickory-resolver` wrapper for
   `_lexicon.<host>` TXT lookups; the `PDS_LEXICON_DNS_NAMESERVER`
-  override is a Phase B harness affordance and must not be set in
+  override is a test-harness affordance and must not be set in
   production.
 - **`entryway.rs` + `entryway_headers.rs`** — Entryway-mode HTTP
-  clients and pass-through header machinery for the Arc 12
-  entryway integration.
+  clients and pass-through header machinery for the entryway
+  integration.
 - **`discovery.rs`** — Trusted peer-PDS allowlist plus relay-driven
   PDS-instance discovery.
 - **`search.rs`** — Federated search (`searchActors`, `searchPosts`,

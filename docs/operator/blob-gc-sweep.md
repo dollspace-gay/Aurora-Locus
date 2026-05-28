@@ -6,11 +6,11 @@ metadata table and (optionally) deletes orphaned storage
 entries — blobs present in storage with no corresponding DB
 row.
 
-This is reconciliation infrastructure for the rare cases where
-Arc 4's `DeferredAction` queue's best-effort cleanup fails to
-land. The sweep is **off by default** in v0.4. Operators opt
-in via config after determining whether their deployment's
-orphan rate justifies the additional background task.
+This is reconciliation infrastructure for the rare cases where the
+`DeferredAction` queue's best-effort cleanup fails to land. The sweep
+is **off by default**. Operators opt in via config after determining
+whether their deployment's orphan rate justifies the additional
+background task.
 
 ---
 
@@ -43,7 +43,7 @@ infrastructure.
 
 ## When to enable the sweep
 
-Most deployments do not need it. The Arc 4 `DeferredAction`
+Most deployments do not need it. The `DeferredAction`
 queue handles the common case: when a blob is deleted from
 storage but the DB row deletion fails (or vice versa), the
 queue retries until both halves succeed. The sweep is for the
@@ -199,7 +199,7 @@ windows, batch reconciliation after a database migration).
 | Flag | Effect |
 |------|--------|
 | `--dry-run` | Force `dry_run = true` regardless of config. Safety-direction only — there is no `--no-dry-run`; edit config + restart for destructive mode. |
-| `--report-only` | Force `report_only = true`. Same loop behaviour as `--dry-run` in v0.4 (both classify-and-log); separate flag for operator-intent disambiguation in audit logs. |
+| `--report-only` | Force `report_only = true`. Same loop behaviour as `--dry-run` (both classify-and-log); separate flag for operator-intent disambiguation in audit logs. |
 | `--max-deletes <N>` | Override `gc_sweep.max_deletes_per_run` for this run. |
 | `--threshold-secs <N>` | Override `gc_sweep.freshness_threshold_secs` for this run. |
 | `--page-size <N>` | Override `gc_sweep.page_size` for this run. |
@@ -392,9 +392,8 @@ Address each warning before promoting the deployment.
 
 ## Related
 
-- **Arc 4 `DeferredAction` queue** — the primary cleanup
-  mechanism. The sweep is reconciliation for cases the queue
-  can't recover.
+- **`DeferredAction` queue** — the primary cleanup mechanism. The
+  sweep is reconciliation for cases the queue can't recover.
 - **[`docs/operator/file-tier-config.md`](file-tier-config.md)**
   — general file-tier configuration reference. `gc_sweep`
   is file-tier + env-var only (not a runtime-settable key);

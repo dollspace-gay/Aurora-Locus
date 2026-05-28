@@ -94,7 +94,7 @@ Only consulted when `PDS_DB_BACKEND=postgres`.
 | Variable | Default | Accepted values | Purpose |
 |---|---|---|---|
 | `PDS_SEQUENCER_LEADER_RETRY_MS` | `2000` | u64 (500-30000) | Standby retry interval for the sequencer leader-election loop. SQLite skips leader election entirely. |
-| `PDS_DATABASE_PG_TRANSACTION_ISOLATION` | `read committed` | `read uncommitted` / `read committed` / `repeatable read` / `serializable` (case-insensitive) | Postgres connection-level transaction isolation pin. Default preserves the GC sweep's predicate-disjointness argument; raising the isolation level may trigger serialization failures on the sweep DELETE (not retried in v0.5). `validate-config` warns when an active Postgres backend sets a non-default value. |
+| `PDS_DATABASE_PG_TRANSACTION_ISOLATION` | `read committed` | `read uncommitted` / `read committed` / `repeatable read` / `serializable` (case-insensitive) | Postgres connection-level transaction isolation pin. Default preserves the GC sweep's predicate-disjointness argument; raising the isolation level may trigger serialization failures on the sweep DELETE (currently not retried). `validate-config` warns when an active Postgres backend sets a non-default value. |
 
 ## 6. Distributed-State Substrate & Maintenance Pool
 
@@ -275,8 +275,8 @@ Dynamic lexicon loading is **off by default**. When enabled, the server
 resolves unknown-NSID record collections against authoring repositories via
 DNS-TXT authority resolution + HTTP fetch + two-layer cache.
 
-**`PDS_LEXICON_DNS_NAMESERVER` must NOT be set in production.** It is a Phase
-B harness affordance that silently retargets every lexicon DNS TXT lookup to
+**`PDS_LEXICON_DNS_NAMESERVER` must NOT be set in production.** It is a
+test-harness affordance that silently retargets every lexicon DNS TXT lookup to
 the operator-supplied nameserver with caching disabled, breaking live
 federation resolution. `validate-config` emits an explicit warning when this
 variable is present.
@@ -293,7 +293,7 @@ variable is present.
 | `PDS_LEXICON_NAMESPACE_DENYLIST` | None | CSV of NSID prefixes | Denylisted collections; rejected with `NamespaceDenied` error. |
 | `PDS_LEXICON_NAMESPACE_ALLOWLIST` | None | CSV of NSID prefixes | When non-empty: only matching collections route to lexicon fetch; non-matching fall through to Optimistic validation (exclusion, not rejection). |
 | `PDS_LEXICON_VALIDATE_IMPORTS` | `true` | boolean | Apply lexicon validation to CAR-import records. Heterogeneous-federation deployments leave this on; homogeneous deployments may disable it to skip redundant work. |
-| `PDS_LEXICON_DNS_NAMESERVER` | None | `ip:port` | Phase B harness affordance — custom DNS nameserver for `_lexicon.<host>` TXT lookups. **Forbidden in production.** |
+| `PDS_LEXICON_DNS_NAMESERVER` | None | `ip:port` | Test-harness affordance — custom DNS nameserver for `_lexicon.<host>` TXT lookups. **Forbidden in production.** |
 
 ## 21. Runtime Settings & Recovery
 
@@ -320,7 +320,7 @@ For the per-key value formats accepted by runtime settings, see
 
 | Variable | Default | Type | Purpose |
 |---|---|---|---|
-| `PDS_V03_WIRE_SUNSET_DATE` | `deprecated` (sentinel for "unset") | HTTP-date string or `deprecated` | When set to a real HTTP-date string, the `Sunset:` header emits on responses that use the v0.3 wire shape. The sentinel value `deprecated` suppresses the `Sunset:` header while still serving legacy fields. See [v03-wire-deprecation-rollout.md](v03-wire-deprecation-rollout.md). |
+| `PDS_V03_WIRE_SUNSET_DATE` | `deprecated` (sentinel for "unset") | HTTP-date string or `deprecated` | When set to a real HTTP-date string, the `Sunset:` header emits on responses that use the legacy wire shape. The sentinel value `deprecated` suppresses the `Sunset:` header while still serving legacy fields. |
 | `PDS_MOD_EVENT_RETENTION_DAYS` | `7` | i64 days (positive) | Retention window for `mod_event_seq` rows. Operators running long-lived deployments raise this; typos or non-positive values fall back to the default rather than infinite retention or immediate purge. |
 
 ## 24. Backup
@@ -338,5 +338,4 @@ backup operator workflow.
 - **WAL archiving + PITR** (Postgres backup): [wal-archiving.md](wal-archiving.md)
 - **SuperAdmin bootstrap + admin auth**: [admin-auth.md](admin-auth.md)
 - **Runtime-settings value formats**: [file-tier-config.md](file-tier-config.md)
-- **v0.3 wire-shape deprecation rollout**: [v03-wire-deprecation-rollout.md](v03-wire-deprecation-rollout.md)
 - **Backup + restore**: [backup-restore.md](backup-restore.md)

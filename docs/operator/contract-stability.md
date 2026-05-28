@@ -3,10 +3,10 @@
 Operator-and-integrator guide to Aurora-Locus's stability contracts
 on its admin-and-capability surfaces.
 
-Aurora-Locus v0.3 commits to six stability contracts. If you're
-deploying Aurora-Locus or building external tools against it, this
-document tells you which surfaces are stable and how to write code
-that won't break across releases.
+Aurora-Locus commits to six stability contracts. If you're deploying
+Aurora-Locus or building external tools against it, this document
+tells you which surfaces are stable and how to write code that won't
+break across releases.
 
 The contracts are committed in source via doc comments at canonical
 locations and pinned by automated tests. Removing a commitment
@@ -58,10 +58,10 @@ Three variants today: `Repo`, `Record`, `Blob`. The contract is
 that new variants may be added in future releases (additive), but
 the wire shape of these three will not change.
 
-The `record_uri` field on `Blob` is snake_case — this is a
-deliberate v0.3 reconciliation (Step 0.5) to byte-match the parsing
-dual `SubjectUnion::RepoBlobRef` on `updateSubjectStatus`. Once
-shipped, snake_case is part of the contract.
+The `record_uri` field on `Blob` is snake_case — a deliberate
+reconciliation to byte-match the parsing dual
+`SubjectUnion::RepoBlobRef` on `updateSubjectStatus`. Once shipped,
+snake_case is part of the contract.
 
 ### createReport subject
 
@@ -199,8 +199,7 @@ isn't on the allowlist) fails the lint.
 The `tools.aurora.admin.getAuditTrail` response shape is stable.
 The seven-filter set is locked (AND-combined): `actor_did`,
 `action`, `subject_did`, `subject_uri`, `subject_cid`,
-`after_created`, `before_created`. (`subject_cid` was added in
-the v0.3 cycle; the other six predate.) Pagination semantics
+`after_created`, `before_created`. Pagination semantics
 (forward-only, newest-first, base64-encoded `CursorPosition`
 cursor, default 50 max 100), per-entry wire format (`AuditEntry`
 with `cascadeSnapshotIds`), and verification semantics
@@ -273,13 +272,9 @@ the failing subject's index and identifier in the response body
 (`failingSubject`, `failingSubjectId` keys). Snapshot capture
 failures BEFORE the tx leave orphan snapshots (deliberate
 carve-out — the chain entry never lands, so the orphan rows
-have no chain-of-custody and can be reconciled by GC). The full
-two-phase failure model is documented at `docs/V03_DESIGN.md`
-§8.3.1.
+have no chain-of-custody and can be reconciled by GC).
 
 ### Chain row shape
-
-Per `docs/V03_DESIGN.md` §8.3.3:
 
 - **Single-subject events** populate BOTH the flat
   `subject_did`/`subject_uri`/`subject_cid` columns AND
@@ -308,21 +303,15 @@ queue ordering, internal database schemas, log line formats) are
 **not covered** by these contracts and may change between minor
 versions.
 
-The Aurora design doc at `docs/AURORA_DESIGN.md` and the admin
-UI design at `docs/AURORA_ADMIN_UI_DESIGN.md` are the canonical
-sources of truth for surfaces not committed here.
+The canonical source of truth for surfaces not committed here is
+the in-source doc comment on each handler / type.
 
 ---
 
 ## Versioning context
 
-These contracts apply to v0.3 forward. v0.2 surfaces are considered
-de-facto stable in retrospect but were not formally committed;
-consumers building against v0.3+ have the explicit guarantees
-above.
-
-Contract changes between major versions (v0.3 → v0.4 → ...) are
-possible but always announced in CHANGELOG with migration
-guidance. The contract phrases above are not promises that the
-contracts last forever; they are promises that breaking the
+These contracts are stable forward. Contract changes between major
+versions are possible but always announced in CHANGELOG with
+migration guidance. The contract phrases above are not promises that
+the contracts last forever; they are promises that breaking the
 contracts is **loud, not silent**.

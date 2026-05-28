@@ -248,14 +248,13 @@ docker run -d \
 
 ### Systemd Service
 
-Docker / k8s / systemd are all supported runtimes for v0.5. The one
-configuration v0.5 ships a *verified* forensic-recovery runbook for
-(Option A failures from `apply_writes` Phase B) is systemd + local
-journald — other sinks can host the same recovery procedure but
-v0.5 doesn't verify those adaptations. See
+Docker, Kubernetes, and bare-metal systemd are all supported runtimes.
+The one configuration that ships a *verified* forensic-recovery runbook
+for Option A failures (`apply_writes` Phase A committed, Phase B failed
+mid-flight) is systemd + local journald — other sinks can host the same
+recovery procedure but those adaptations aren't verified. See
 [`docs/operator/deployment-posture.md`](docs/operator/deployment-posture.md)
-for the verified runbook and the v0.6+ scope for non-journald
-recovery procedures.
+for the verified runbook.
 
 ```ini
 [Unit]
