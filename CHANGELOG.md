@@ -1049,6 +1049,7 @@ the v0.4 cycle's headline arc.
   discoverability. Full handoff at `docs/V03_DESIGN.md` §9.8;
   v0.4 candidate accumulator at `docs/v04-candidates.md`.
 ### Changed
+- Intern 3 cycle-artifact docs from docs/operator/ (v0.6 docs restructure stage 2d) (#164)
 - docs/operator/performance.md (v0.6 docs restructure stage 2c) (#163)
 - docs/architecture.md (v0.6 docs restructure stage 2c) (#162)
 - Promote AURORA_ENDPOINT_INVENTORY → docs/operator/admin-endpoint-reference.md (v0.6 docs) (#161)
