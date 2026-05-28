@@ -1049,6 +1049,7 @@ the v0.4 cycle's headline arc.
   discoverability. Full handoff at `docs/V03_DESIGN.md` §9.8;
   v0.4 candidate accumulator at `docs/v04-candidates.md`.
 ### Changed
+- Untrack stragglers under gitignored docs/internal/ (forward tree hygiene) (#170)
 - Untrack local dev-artifact subtree + drop matching Cargo bin (repo hygiene) (#169)
 - phase-b/README crossref drops (v0.6 docs stage 4) (#168)
 - README restructure: front-door rewrite + Federation section deletion (v0.6 docs stage 4) (#167)
