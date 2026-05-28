@@ -33,6 +33,9 @@ __pycache__/
 
 # Local-only docs (per-cycle working artifacts). Single rule: anything
 # under docs/internal/ is local-only. Same convention applies to local
-# dev-verification apparatus under phase-b/.
+# dev-verification apparatus under phase-b/ — mock-plc.py is the
+# exception: CI launches it as a fixture for the postgres smoke tests
+# (.github/workflows/ci.yml).
 docs/internal
-phase-b/
+phase-b/*
+!phase-b/mock-plc.py
