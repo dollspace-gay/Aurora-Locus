@@ -40,6 +40,22 @@ Three categories of dead-substrate / DRY cleanup landed to start v0.7 on clean d
 
 The operator-readable docs reconcile to the new multi-binary workspace: every bare `cargo run` invocation across the arc-phase-b operator runbooks and the `docs/operator/` surface (including the top-level README) now carries `--bin aurora-locus`. A copy-paste-from-docs no longer fails with "could not determine which binary to run" — the new `phase-b-dns-responder` binary added the ambiguity that broke the bare invocation.
 
+### Changed
+
+- Untrack stragglers under gitignored docs/internal/ (forward tree hygiene) (#170)
+- Untrack local dev-artifact subtree + drop matching Cargo bin (repo hygiene) (#169)
+- phase-b/README crossref drops (v0.6 docs stage 4) (#168)
+- README restructure: front-door rewrite + Federation section deletion (v0.6 docs stage 4) (#167)
+- Strip internal-development provenance from public docs (v0.6 docs stage 3b) (#166)
+- Relocate Doll OAuth docs to archive + V0_2 cycle handoff to internal (v0.6 docs stage 3a) (#165)
+- Intern 3 cycle-artifact docs from docs/operator/ (v0.6 docs restructure stage 2d) (#164)
+- docs/operator/performance.md (v0.6 docs restructure stage 2c) (#163)
+- docs/architecture.md (v0.6 docs restructure stage 2c) (#162)
+- Promote AURORA_ENDPOINT_INVENTORY → docs/operator/admin-endpoint-reference.md (v0.6 docs) (#161)
+- Move AURORA_ADMIN_UI_DESIGN.md to docs/internal/design/ (v0.6 docs internal) (#160)
+- Archive Doll-authored root docs to docs/archive/ (v0.6 docs restructure stage 1) (#159)
+- Getting Started guide + README Getting Started trim (v0.6 docs) (#158)
+
 ### Deferred to v0.7
 
 - HA multi-process kill-one-mid-request Phase B coverage (the natural home is the v0.6+ cross-process `pg_try_advisory_lock` import-lock variant whenever it lands).
@@ -1021,47 +1037,80 @@ the v0.4 cycle's headline arc.
   by `.github/workflows/ci.yml`. Low-cost to add; flagged for
   cycle-close audit. [Arc 6 Step 5]
 
+
 ## [0.3.0] - 2026-05-10
 
-### Documentation
-- **`ModEventAction` flat-shape commitment** (#125, Arc 5
-  Step 4). The 16-variant flat enum is the v0.3 committed
-  contract; compositional reshape (separating action-verb from
-  subject-type into orthogonal axes) is a v0.4-or-later
-  candidate gated on use-case surface. Subject set is a peer
-  axis at the request level (per Arc 4's multi-subject
-  `emitEvent`), not an enum-internal axis. Aurora Admin UI and
-  third-party tooling can build switch tables on the
-  discriminator without anticipating a structural reshape
-  during the v0.3 series. Documented in `docs/AURORA_DESIGN.md`
-  §4.1.2; cross-referenced from `docs/v04-candidates.md`.
-- **#123 LB-3 runtime route enumeration handoff to v0.4**
-  (Arc 5 Step 4). `tools.aurora.admin.describeCapabilities`
-  continues to advertise a hand-curated capability list, with
-  the v0.2 reconciliation conclusion (manual list stays)
-  carried forward. The drift-detection test at
-  `src/api/admin.rs:7223-7331`
-  (`describe_capabilities_snapshot`) ensures any new route not
-  in the hand-curated list fails CI. Code-level anchors at
-  `src/api/admin.rs:2939` and `:3041` (immediately preceding
-  `aurora_capability_families` and `aurora_capability_extensions`
-  respectively) carry `TODO(#123, v0.4)` comments for v0.4
-  discoverability. Full handoff at `docs/V03_DESIGN.md` §9.8;
-  v0.4 candidate accumulator at `docs/v04-candidates.md`.
+### Added
+- **File-tier runtime configuration** (#124). Aurora-Locus
+  resolves `runtime_settings` keys through a four-tier
+  hierarchy from highest to lowest precedence: recovery-mode
+  env-var override (`AURORA_RECOVERY_MODE`, `moderation-mode`
+  reads only), runtime row, **file-tier YAML**, compiled-in
+  default. The new file tier sits between operator runtime
+  control and the compiled-in defaults — load-once-at-startup
+  YAML at `<data_directory>/runtime.yaml` (override via
+  `PDS_RUNTIME_FILE`) for deployment-stable values that don't
+  need the runtime API surface. Unknown keys (vs.
+  `KNOWN_RUNTIME_KEYS`) and invalid per-key values
+  warn-and-skip; malformed YAML produces a clear startup error
+  with the file path. The `getRuntimeSetting` response's
+  `source` field gains a fourth value, `"File"`, distinguishing
+  file-tier-resolved reads from runtime/default. The field
+  becomes a typed `SettingSource` enum with a custom
+  `Serialize` impl emitting the existing string literals —
+  wire-additive, no contract amendment (the `source` field is
+  open per Arc 2's contract framing). New dependency
+  `serde_yaml = "0.9"`. Operator setup at
+  `docs/operator/file-tier-config.md`. Reload-on-SIGHUP is a
+  v0.4 follow-up; `setRuntimeSetting` remains the in-process
+  hot path for setting changes.
+- **Arc 3: Audit-trail read contract.**
+  `tools.aurora.admin.getAuditTrail` is committed as the fifth
+  stability surface under the v0.3 contract-lockdown framework.
+  The endpoint exposes `cascadeSnapshotIds` on the wire
+  (load-bearing for independent chain verification per
+  `docs/operator/audit-chain-verification.md`), ships a
+  seven-filter set (`actor_did`, `action`, `subject_did`,
+  `subject_uri`, `subject_cid`, `after_created`, `before_created`)
+  with `subject_cid` newly added in this cycle, and pins
+  pagination/verification semantics via doc-comment commitment
+  on `GetAuditTrailOutput` (literal phrase
+  "audit-trail read contract is committed"). The wire-to-canonical
+  bridge documentation enables external consumers to recompute
+  SHA-256 hashes independently from response data, with all
+  transformation rules verified against production behavior by
+  `tests/audit_chain_canonical_verification.rs` (six worked
+  examples with reproducible hashes plus seven production-roundtrip
+  tests). Drift caught by `tests/contract_phrases.rs` (sixth
+  phrase added) and the structural lint from Arc 2.
+
+  Operator summary at `docs/operator/contract-stability.md`
+  (now five committed surfaces).
+
+- **Arc 2: Contract lockdown.** Aurora-Locus v0.3 commits to four
+  stability contracts on its admin-and-capability surfaces:
+  Subject vocabulary stability (canonical Aurora `Subject` and
+  createReport `ReportSubject` — two distinct surfaces;
+  internally-tagged for the former, untagged-at-the-enum-level for
+  the latter), `describeCapabilities` response shape stability,
+  capability string versioning convention
+  (`<kebab-family>-v<integer>`), and action-ID surfacing
+  (`auditEntryId` and optionally `eventId` on Aurora-namespace
+  handlers writing audit chain entries). Each contract is committed
+  in a doc comment at the canonical source location and pinned by
+  snapshot tests (`Subject` and `ReportSubject` wire-format
+  snapshots in their respective modules; `describe_capabilities_snapshot`
+  in `src/api/admin.rs`) plus a structural lint
+  (`tests/admin_handler_contract.rs`) and a phrase-presence test
+  (`tests/contract_phrases.rs`). Operator summary at
+  `docs/operator/contract-stability.md`. Drift becomes a loud
+  CI failure: any future PR that silently removes a commitment
+  phrase from its canonical location, breaks a wire-format
+  snapshot, or drops the audit-entry-ID field from a typed
+  `*Output` struct (without an explicit allowlist entry) fails
+  the appropriate test.
+
 ### Changed
-- Untrack stragglers under gitignored docs/internal/ (forward tree hygiene) (#170)
-- Untrack local dev-artifact subtree + drop matching Cargo bin (repo hygiene) (#169)
-- phase-b/README crossref drops (v0.6 docs stage 4) (#168)
-- README restructure: front-door rewrite + Federation section deletion (v0.6 docs stage 4) (#167)
-- Strip internal-development provenance from public docs (v0.6 docs stage 3b) (#166)
-- Relocate Doll OAuth docs to archive + V0_2 cycle handoff to internal (v0.6 docs stage 3a) (#165)
-- Intern 3 cycle-artifact docs from docs/operator/ (v0.6 docs restructure stage 2d) (#164)
-- docs/operator/performance.md (v0.6 docs restructure stage 2c) (#163)
-- docs/architecture.md (v0.6 docs restructure stage 2c) (#162)
-- Promote AURORA_ENDPOINT_INVENTORY → docs/operator/admin-endpoint-reference.md (v0.6 docs) (#161)
-- Move AURORA_ADMIN_UI_DESIGN.md to docs/internal/design/ (v0.6 docs internal) (#160)
-- Archive Doll-authored root docs to docs/archive/ (v0.6 docs restructure stage 1) (#159)
-- Getting Started guide + README Getting Started trim (v0.6 docs) (#158)
 - **`TimeRange` wrapper + selective `u32` retype** (#126). Three
   bundled changes close the v0.3 cycle's TimeRange + numeric-typing
   cleanup:
@@ -1110,57 +1159,6 @@ the v0.4 cycle's headline arc.
   continue to work without modification. New callers should
   prefer the canonical `timeRange` field.
 
-### Added
-- **File-tier runtime configuration** (#124). Aurora-Locus
-  resolves `runtime_settings` keys through a four-tier
-  hierarchy from highest to lowest precedence: recovery-mode
-  env-var override (`AURORA_RECOVERY_MODE`, `moderation-mode`
-  reads only), runtime row, **file-tier YAML**, compiled-in
-  default. The new file tier sits between operator runtime
-  control and the compiled-in defaults — load-once-at-startup
-  YAML at `<data_directory>/runtime.yaml` (override via
-  `PDS_RUNTIME_FILE`) for deployment-stable values that don't
-  need the runtime API surface. Unknown keys (vs.
-  `KNOWN_RUNTIME_KEYS`) and invalid per-key values
-  warn-and-skip; malformed YAML produces a clear startup error
-  with the file path. The `getRuntimeSetting` response's
-  `source` field gains a fourth value, `"File"`, distinguishing
-  file-tier-resolved reads from runtime/default. The field
-  becomes a typed `SettingSource` enum with a custom
-  `Serialize` impl emitting the existing string literals —
-  wire-additive, no contract amendment (the `source` field is
-  open per Arc 2's contract framing). New dependency
-  `serde_yaml = "0.9"`. Operator setup at
-  `docs/operator/file-tier-config.md`. Reload-on-SIGHUP is a
-  v0.4 follow-up; `setRuntimeSetting` remains the in-process
-  hot path for setting changes.
-
-### Removed
-- **`PDS_ADMIN_DIDS` configuration** (#155). The `admin_dids`
-  field on `AuthConfig` and the `PDS_ADMIN_DIDS` env-var parsing
-  in `src/config.rs` are removed. Admin authority is gated solely
-  by the `admin_role` table (per #95); the dead config and its
-  `validate_config` warning ("admin panel will not be accessible")
-  predated #95 and gave operators incorrect guidance — a populated
-  `admin_dids` list never conferred admin authority on its own.
-  Operators with `PDS_ADMIN_DIDS` set in their environment should
-  remove the variable; it's no longer read. The first SuperAdmin
-  is bootstrapped by inserting a row directly into `admin_role`
-  (see README "First Admin User"); subsequent grants flow through
-  `tools.aurora.superadmin.grantRole` and the audit chain.
-
-### Documentation
-- **`AURORA_DESIGN.md` S3 framing corrected** (#156). Two stale
-  lines in `docs/AURORA_DESIGN.md` claimed S3 backend support
-  "has not landed in v0.2" and listed S3 activation as deferred
-  to v0.3. S3 actually shipped in v0.2: AWS SDK dependencies are
-  live, `src/blob_store/s3.rs` is exported from
-  `src/blob_store/mod.rs`, and `AppContext` selects between Disk
-  and S3 via `BlobstoreConfig` from `PDS_BLOBSTORE_*` env vars.
-  §2.2's "Status post-cycle" and §8.2's deferred-to-v0.3 entry
-  are updated to reflect the as-built reality.
-
-### Changed
 
 - **Wire-format breaking change (v0.3 / Arc 4 multi-subject + atomicity unification).**
   Five intertwined cycle changes ship together:
@@ -1248,55 +1246,6 @@ the v0.4 cycle's headline arc.
   (seventh phrase added). Operator summary at
   `docs/operator/contract-stability.md` (now six committed
   surfaces).
-
-### Added
-- **Arc 3: Audit-trail read contract.**
-  `tools.aurora.admin.getAuditTrail` is committed as the fifth
-  stability surface under the v0.3 contract-lockdown framework.
-  The endpoint exposes `cascadeSnapshotIds` on the wire
-  (load-bearing for independent chain verification per
-  `docs/operator/audit-chain-verification.md`), ships a
-  seven-filter set (`actor_did`, `action`, `subject_did`,
-  `subject_uri`, `subject_cid`, `after_created`, `before_created`)
-  with `subject_cid` newly added in this cycle, and pins
-  pagination/verification semantics via doc-comment commitment
-  on `GetAuditTrailOutput` (literal phrase
-  "audit-trail read contract is committed"). The wire-to-canonical
-  bridge documentation enables external consumers to recompute
-  SHA-256 hashes independently from response data, with all
-  transformation rules verified against production behavior by
-  `tests/audit_chain_canonical_verification.rs` (six worked
-  examples with reproducible hashes plus seven production-roundtrip
-  tests). Drift caught by `tests/contract_phrases.rs` (sixth
-  phrase added) and the structural lint from Arc 2.
-
-  Operator summary at `docs/operator/contract-stability.md`
-  (now five committed surfaces).
-
-- **Arc 2: Contract lockdown.** Aurora-Locus v0.3 commits to four
-  stability contracts on its admin-and-capability surfaces:
-  Subject vocabulary stability (canonical Aurora `Subject` and
-  createReport `ReportSubject` — two distinct surfaces;
-  internally-tagged for the former, untagged-at-the-enum-level for
-  the latter), `describeCapabilities` response shape stability,
-  capability string versioning convention
-  (`<kebab-family>-v<integer>`), and action-ID surfacing
-  (`auditEntryId` and optionally `eventId` on Aurora-namespace
-  handlers writing audit chain entries). Each contract is committed
-  in a doc comment at the canonical source location and pinned by
-  snapshot tests (`Subject` and `ReportSubject` wire-format
-  snapshots in their respective modules; `describe_capabilities_snapshot`
-  in `src/api/admin.rs`) plus a structural lint
-  (`tests/admin_handler_contract.rs`) and a phrase-presence test
-  (`tests/contract_phrases.rs`). Operator summary at
-  `docs/operator/contract-stability.md`. Drift becomes a loud
-  CI failure: any future PR that silently removes a commitment
-  phrase from its canonical location, breaks a wire-format
-  snapshot, or drops the audit-entry-ID field from a typed
-  `*Output` struct (without an explicit allowlist entry) fails
-  the appropriate test.
-
-### Changed
 - **Wire-format breaking change (v0.3 / Arc 2 contract lockdown).**
   `tools.aurora.superadmin.grantRole` and `tools.aurora.superadmin.revokeRole`
   responses are now typed structs with `rename_all = "camelCase"` wire fields,
@@ -1313,6 +1262,57 @@ the v0.4 cycle's headline arc.
   `src/api/admin.rs` (updated alongside this change); the admin UI invokes
   these endpoints but discards the response, so no UI-side coordination
   needed.
+
+### Removed
+- **`PDS_ADMIN_DIDS` configuration** (#155). The `admin_dids`
+  field on `AuthConfig` and the `PDS_ADMIN_DIDS` env-var parsing
+  in `src/config.rs` are removed. Admin authority is gated solely
+  by the `admin_role` table (per #95); the dead config and its
+  `validate_config` warning ("admin panel will not be accessible")
+  predated #95 and gave operators incorrect guidance — a populated
+  `admin_dids` list never conferred admin authority on its own.
+  Operators with `PDS_ADMIN_DIDS` set in their environment should
+  remove the variable; it's no longer read. The first SuperAdmin
+  is bootstrapped by inserting a row directly into `admin_role`
+  (see README "First Admin User"); subsequent grants flow through
+  `tools.aurora.superadmin.grantRole` and the audit chain.
+
+### Documentation
+- **`ModEventAction` flat-shape commitment** (#125, Arc 5
+  Step 4). The 16-variant flat enum is the v0.3 committed
+  contract; compositional reshape (separating action-verb from
+  subject-type into orthogonal axes) is a v0.4-or-later
+  candidate gated on use-case surface. Subject set is a peer
+  axis at the request level (per Arc 4's multi-subject
+  `emitEvent`), not an enum-internal axis. Aurora Admin UI and
+  third-party tooling can build switch tables on the
+  discriminator without anticipating a structural reshape
+  during the v0.3 series. Documented in `docs/AURORA_DESIGN.md`
+  §4.1.2; cross-referenced from `docs/v04-candidates.md`.
+- **#123 LB-3 runtime route enumeration handoff to v0.4**
+  (Arc 5 Step 4). `tools.aurora.admin.describeCapabilities`
+  continues to advertise a hand-curated capability list, with
+  the v0.2 reconciliation conclusion (manual list stays)
+  carried forward. The drift-detection test at
+  `src/api/admin.rs:7223-7331`
+  (`describe_capabilities_snapshot`) ensures any new route not
+  in the hand-curated list fails CI. Code-level anchors at
+  `src/api/admin.rs:2939` and `:3041` (immediately preceding
+  `aurora_capability_families` and `aurora_capability_extensions`
+  respectively) carry `TODO(#123, v0.4)` comments for v0.4
+  discoverability. Full handoff at `docs/V03_DESIGN.md` §9.8;
+  v0.4 candidate accumulator at `docs/v04-candidates.md`.
+- **`AURORA_DESIGN.md` S3 framing corrected** (#156). Two stale
+  lines in `docs/AURORA_DESIGN.md` claimed S3 backend support
+  "has not landed in v0.2" and listed S3 activation as deferred
+  to v0.3. S3 actually shipped in v0.2: AWS SDK dependencies are
+  live, `src/blob_store/s3.rs` is exported from
+  `src/blob_store/mod.rs`, and `AppContext` selects between Disk
+  and S3 via `BlobstoreConfig` from `PDS_BLOBSTORE_*` env vars.
+  §2.2's "Status post-cycle" and §8.2's deferred-to-v0.3 entry
+  are updated to reflect the as-built reality.
+
+## [0.2.0] - 2026-05-04
 
 ### Added
 - Design corpus updated to reflect as-built reality on five surfaces. Forensic export's `account-state.json` is always included with operational fields; sensitive fields remain `includeAccountMetadata`-gated (CR-7). `describeCapabilities` advertises a hand-curated capability list; runtime route enumeration deferred to v0.3 (#123). Runtime settings configuration is two-tier (Runtime + Default with RecoveryMode override) rather than the originally-specified three-tier; file-tier addition deferred to v0.3 (#124). `ModEventAction` is subject-aware (`TakedownAccount` vs `TakedownRecord` etc.) rather than the originally-specified compositional shape; compositional revisit deferred to v0.3 (#125). `getModerationMetrics` and `getQueueStats` use flat `start`/`end` strings and `i64` rather than the `TimeRange` wrapper and `u32`; typed-shape revisit deferred to v0.3 (#126).
@@ -1396,7 +1396,9 @@ the v0.4 cycle's headline arc.
 - `/admin/debug.html` no longer reachable in production builds. The page renders the bearer token from localStorage as visible page text — useful locally for endpoint probing without DevTools, but a token-disclosure surface for any operator screen-access vector in production. Now gated behind `PDS_ENABLE_DEBUG_PAGES` env var (default off); production deployments 404 the page; local devs set the var to opt in. (#107)
 - `PDS_ADMIN_DIDS` shadow grant of authority closed (listed under Removed). Operators who relied on the env var for admin access need to add a row to the `admin_role` table directly per the bootstrap path; subsequent grants flow through the SuperAdmin endpoints. (#95)
 
-### Pre-cycle (proto-blue migration)
+## [0.1.0] - 2026-04-30
+
+### Changed
 - Fix rotted integration tests in tests/ (#14)
 - Update deps + run clippy/fmt (#13)
 - Migrate from embedded Rust-Atproto-SDK to proto-blue crate (#1)
