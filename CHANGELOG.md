@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Federation-trust failure-class taxonomy gains an `invalid_signature` value, surfaceable at both the log layer and the HTTP 502 `LexiconFetchFailed` response.
 - `cargo run` invocations across operator-facing docs now carry `--bin aurora-locus` to disambiguate against the new dev binary.
 - Bumped `hickory-resolver` to 0.26.
+- Bumped `proto-blue` to 0.3.3, collapsing the transitive `hickory-resolver` duplicate to the single patched copy.
+- Bumped `openssl` to 0.10.80.
 - Reorganized documentation to match the current codebase.
+- Federation is now enabled by default; set `PDS_FEDERATION_ENABLED=false` to opt out.
 
 ### Removed
 
@@ -40,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `uploadBlob` accepts `application/octet-stream` (the detection fallback).
 - `grant_role` / `revoke_role` error responses ship the structured `{error, message}` JSON envelope rather than plain-text bodies.
 - `getAuditTrail` handler uses the shared `audit_chain::audit_entry_from_row` helper that `exportAccountForensic` already uses; wire shape unchanged.
+- `resolveHandle` returns HTTP 400 `HandleNotFound` on unresolvable handles instead of HTTP 500.
 
 ## [0.5.0] - 2026-05-23
 
