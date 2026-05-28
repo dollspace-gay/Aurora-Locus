@@ -247,7 +247,7 @@ dependencies = [
  "futures-util",
  "governor",
  "hex",
- "hickory-resolver 0.26.1",
+ "hickory-resolver",
  "hmac",
  "image",
  "jsonwebtoken",
@@ -1618,7 +1618,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d162beedaa69905488a8da94f5ac3edb4dd4788b732fadb7bd120b2625c1976"
 dependencies = [
  "data-encoding",
- "syn 2.0.107",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1836,18 +1836,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "enum-as-inner"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.107",
-]
-
-[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1880,7 +1868,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2480,36 +2468,11 @@ dependencies = [
  "futures-channel",
  "futures-io",
  "futures-util",
- "hickory-proto 0.26.1",
+ "hickory-proto",
  "idna",
  "ipnet",
  "jni",
  "rand 0.10.1",
- "thiserror 2.0.17",
- "tinyvec",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "hickory-proto"
-version = "0.25.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8a6fe56c0038198998a6f217ca4e7ef3a5e51f46163bd6dd60b5c71ca6c6502"
-dependencies = [
- "async-trait",
- "cfg-if",
- "data-encoding",
- "enum-as-inner",
- "futures-channel",
- "futures-io",
- "futures-util",
- "idna",
- "ipnet",
- "once_cell",
- "rand 0.9.4",
- "ring",
  "thiserror 2.0.17",
  "tinyvec",
  "tokio",
@@ -2539,27 +2502,6 @@ dependencies = [
 
 [[package]]
 name = "hickory-resolver"
-version = "0.25.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc62a9a99b0bfb44d2ab95a7208ac952d31060efc16241c87eaf36406fecf87a"
-dependencies = [
- "cfg-if",
- "futures-util",
- "hickory-proto 0.25.2",
- "ipconfig",
- "moka",
- "once_cell",
- "parking_lot",
- "rand 0.9.4",
- "resolv-conf",
- "smallvec",
- "thiserror 2.0.17",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "hickory-resolver"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0d58d28879ceecde6607729660c2667a081ccdc082e082675042793960f178c"
@@ -2567,7 +2509,7 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "hickory-net",
- "hickory-proto 0.26.1",
+ "hickory-proto",
  "ipconfig",
  "ipnet",
  "jni",
@@ -3609,7 +3551,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3714,9 +3656,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openssl"
-version = "0.10.79"
+version = "0.10.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf0b434746ee2832f4f0baf10137e1cabb18cbe6912c69e2e33263c45250f542"
+checksum = "a45fa2aa886c42762255da344f0a0d313e254066c46aad76f300c3d3da62d967"
 dependencies = [
  "bitflags 2.10.0",
  "cfg-if",
@@ -3751,9 +3693,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.115"
+version = "0.9.116"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "158fe5b292746440aa6e7a7e690e55aeb72d41505e2804c23c6973ad0e9c9781"
+checksum = "f28a22dc7140cda5f096e5e7724a6962ca81a7f8bfd2979f9b18c11af56318c4"
 dependencies = [
  "cc",
  "libc",
@@ -4131,9 +4073,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue"
-version = "0.3.1"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5ccd8865a5ff69c9e64da44084e227202124341539af5a63556f04d578babe3"
+checksum = "f0496f1e47a65960577f967268e709b2149d8348753f316450c1ce8104463a93"
 dependencies = [
  "proto-blue-api",
  "proto-blue-common",
@@ -4152,9 +4094,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-api"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23a98fb92dd58dc471a8d242de1320639b582eba6911a62b3837ecd55c34e119"
+checksum = "d2d4678f5669058609c2ac0386d5036ccc1b0bc6cd71fb1634ca057b700852ab"
 dependencies = [
  "chrono",
  "once_cell",
@@ -4173,9 +4115,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-common"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fd60de4395c3d095f87665e034332986e1c984674e771fba0181b58681bd86b"
+checksum = "0a097408ed41aeefb44f1a25e8b43d7072ddd1dcb6d58304dc7bff02eea3b1e7"
 dependencies = [
  "async-trait",
  "base64",
@@ -4202,9 +4144,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-crypto"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06b6008801558dee3dd08e3e049ba9576c61d8395364e38b39bffaa33a67515a"
+checksum = "2f30d359b27dc973a16c849ad9fa62fef1e4da271a3d33b91cf9a1acd37ce3dc"
 dependencies = [
  "base64",
  "bs58",
@@ -4220,12 +4162,12 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-identity"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e938e6601adb0487442e9a0659810296341bb22b0b66c7535e102773919bb9e2"
+checksum = "f343ad4e5a0fc271a91173350f39aefe23dcc449aa8081da0088a2da0772aac0"
 dependencies = [
  "futures",
- "hickory-resolver 0.25.2",
+ "hickory-resolver",
  "proto-blue-common",
  "proto-blue-crypto",
  "serde",
@@ -4237,9 +4179,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-lex-cbor"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9a9b5487d7031dba1b07dde8490fb1b3173e3a322aa9bd1bc44965077bdd199"
+checksum = "c3401aceb571e86b15ed0b67f8acb3a34353f27bcda6ea4be1bc07f5f3930821"
 dependencies = [
  "ciborium",
  "proto-blue-lex-data",
@@ -4249,9 +4191,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-lex-data"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed864ff6ddd3feff731e118190fcf05a7d5b521512911db8de51b7d5f2f05e5c"
+checksum = "2d1cbe6b58f9f8fcd303478f482d41472e92ae2c4f72249d537f9acfe9e13bd6"
 dependencies = [
  "multibase",
  "serde",
@@ -4262,9 +4204,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-lex-json"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cafadb2fadd986d4da7ed3266a212cf3374692fdd296b922a476265e0a6aa4a1"
+checksum = "d979414e5232ce0e934ed05775a5c119e1d51a221df1f90932b18216d290c3b4"
 dependencies = [
  "base64",
  "proto-blue-lex-data",
@@ -4274,9 +4216,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-lexicon"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99ce2af9a938c24009ddca8e5b26e1665224f87a45ad502cac9845dd29b9e411"
+checksum = "cf281ccbf0fc30f1d075ececdc85c5ec793a41c989e4b346e04f98ecedf2a07b"
 dependencies = [
  "proto-blue-common",
  "proto-blue-lex-data",
@@ -4288,9 +4230,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-oauth"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72e8b30a8dd1c187ba69aa456bb34172255f880096be959bdcea6dffe07a2ecf"
+checksum = "d68f63e577caeebcc9bd517dc8a273c5caf11142cb6644514749f3a863682ae0"
 dependencies = [
  "async-trait",
  "base64",
@@ -4313,9 +4255,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-repo"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e1442c0edb3da5dca81b798933455ecd86be0b1e887d07c75df717c2902f6c2"
+checksum = "3a854867c28fbf24ed09402dcb9f2b8745917639120f596b449b0e81b0ea6802"
 dependencies = [
  "futures",
  "proto-blue-common",
@@ -4335,9 +4277,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-syntax"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbca4e91264c34c5068b3e3da279ba73451623b37f20be1d531a71a75fdb3dab"
+checksum = "7a90d01d1c84072229bfed56be3062fe605ace06bebb5b9ca011f069c374048f"
 dependencies = [
  "chrono",
  "once_cell",
@@ -4348,9 +4290,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-ws"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e80f15bf98a876c80643135fc462bebead4c01ea896f8c5449ed61f6351f6e70"
+checksum = "5fda321b044859f23d9ca2726549b7faacaeb13dfb154f8e012ead4cb0c7345f"
 dependencies = [
  "async-trait",
  "futures",
@@ -4367,9 +4309,9 @@ dependencies = [
 
 [[package]]
 name = "proto-blue-xrpc"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68a82786622e725c5e1319892b59d5dbd0878e6b4321b33fdb35e55aa806860b"
+checksum = "5d4b312395ef65853d2577517814b13015a438962f344e88ba6f3fbf682cd548"
 dependencies = [
  "axum 0.8.9",
  "chrono",
@@ -4875,7 +4817,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5825,7 +5767,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6804,7 +6746,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
