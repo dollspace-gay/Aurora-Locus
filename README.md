@@ -2,7 +2,7 @@
 
 **Production-Ready ATProto Personal Data Server in Rust**
 
-Aurora Locus is a feature-complete Personal Data Server (PDS) for the AT Protocol network, written in Rust. It provides secure, high-performance data storage and federation capabilities fully compatible with the Bluesky social network and other ATProto applications.
+Aurora Locus is a feature-complete Personal Data Server (PDS) for the AT Protocol network, written in Rust. Both SQLite (single-host) and Postgres (multi-instance HA) are first-class backends — the same binary adapts to whichever the operator configures. Federation, OAuth 2.1, and admin/moderation are all in the default build; compatible with the Bluesky social network and other ATProto applications.
 
 ## Features
 
@@ -51,39 +51,9 @@ Aurora Locus is a feature-complete Personal Data Server (PDS) for the AT Protoco
 
 ## Architecture
 
-Aurora Locus is built with modern, production-grade technologies:
+Aurora Locus is built on Rust with Tokio as the async runtime, Axum for type-safe HTTP routing, and sqlx (with the `any` feature) as the dual SQLite/Postgres database layer. The AT Protocol surface is provided by the [`proto-blue`](https://crates.io/crates/proto-blue) crate. Cryptography uses k256 (secp256k1) for repo signing and PLC rotation, p256 for DPoP, and Argon2id for password hashing.
 
-- **HTTP Server**: Axum (async, type-safe routing)
-- **Database**: SQLite with sqlx (compiled queries, migrations)
-- **ATProto SDK**: Custom Rust implementation from [Rust-Atproto-SDK](./Rust-Atproto-SDK/)
-- **Runtime**: Tokio async runtime
-- **Cryptography**: k256 (secp256k1), SHA-256
-- **Blob Storage**: Local filesystem or S3-compatible (MinIO, DigitalOcean Spaces, AWS S3)
-
-### Key Components
-
-```
-Aurora Locus/
-├── src/
-│   ├── account/          # Account manager, authentication, sessions
-│   ├── actor_store/      # Repository manager, MST integration
-│   ├── admin/            # Role, moderation, label, report managers
-│   ├── api/              # XRPC endpoints (repo, sync, admin, firehose)
-│   ├── auth.rs           # OAuth authentication middleware
-│   ├── blob_store/       # Blob storage (disk/S3)
-│   ├── config.rs         # Environment-based configuration
-│   ├── context.rs        # Dependency injection container
-│   ├── crypto/           # Key management, PLC operations
-│   ├── federation/       # Relay client integration
-│   ├── identity/         # DID resolution and caching
-│   ├── jobs/             # Background task runners
-│   ├── rate_limit/       # Request throttling
-│   ├── sequencer/        # Event log and sequencing
-│   └── validation/       # Record schema validation
-├── migrations/           # SQLx database migrations
-├── Rust-Atproto-SDK/     # ATProto SDK implementation
-└── Cargo.toml
-```
+For the full architecture — module layout, dual-backend design, multi-instance shape, federation surface — see [docs/architecture.md](docs/architecture.md).
 
 ## Getting Started
 
@@ -136,51 +106,9 @@ curl -s http://localhost:2583/xrpc/com.atproto.server.describeServer | jq
 
 ## API Endpoints
 
-### Account Management
-- `POST /xrpc/com.atproto.server.createAccount` - Register new account
-- `POST /xrpc/com.atproto.server.createSession` - Login
-- `POST /xrpc/com.atproto.server.refreshSession` - Refresh access token
-- `POST /xrpc/com.atproto.server.deleteSession` - Logout
-- `GET /xrpc/com.atproto.server.getSession` - Get current session
+Aurora Locus serves the standard ATProto XRPC surface (`com.atproto.*` for accounts, repo, sync, identity, and blob; OAuth at `/oauth/*`; well-known endpoints at `/.well-known/*`) plus the `tools.aurora.*` admin / moderator / ops / superadmin namespace with Aurora-specific extensions. The broad XRPC surface follows the ATProto spec and is discoverable at runtime from `com.atproto.server.describeServer`; the admin / moderation / ops surface is documented in detail.
 
-### Repository Operations
-- `POST /xrpc/com.atproto.repo.createRecord` - Create record
-- `PUT /xrpc/com.atproto.repo.putRecord` - Update record
-- `POST /xrpc/com.atproto.repo.deleteRecord` - Delete record
-- `GET /xrpc/com.atproto.repo.getRecord` - Get single record
-- `GET /xrpc/com.atproto.repo.listRecords` - List collection records
-- `GET /xrpc/com.atproto.repo.describeRepo` - Get repository info
-
-### Blob Management
-- `POST /xrpc/com.atproto.repo.uploadBlob` - Upload blob
-- `GET /xrpc/com.atproto.sync.getBlob` - Download blob
-
-### Synchronization
-- `GET /xrpc/com.atproto.sync.getRepo` - Export repository as CAR
-- `GET /xrpc/com.atproto.sync.getBlocks` - Get specific blocks
-- `GET /xrpc/com.atproto.sync.getLatestCommit` - Get HEAD commit
-- `GET /xrpc/com.atproto.sync.subscribeRepos` - WebSocket firehose
-
-### Admin Endpoints (OAuth Required)
-- `POST /xrpc/com.atproto.admin.grantRole` - Grant admin role
-- `POST /xrpc/com.atproto.admin.revokeRole` - Revoke admin role
-- `GET /xrpc/com.atproto.admin.listRoles` - List roles
-- `POST /xrpc/com.atproto.admin.takedownAccount` - Takedown account
-- `POST /xrpc/com.atproto.admin.suspendAccount` - Suspend account
-- `POST /xrpc/com.atproto.admin.restoreAccount` - Restore account
-- `POST /xrpc/com.atproto.admin.applyLabel` - Apply content label
-- `POST /xrpc/com.atproto.admin.removeLabel` - Remove content label
-- `POST /xrpc/com.atproto.admin.submitReport` - Submit report
-- `POST /xrpc/com.atproto.admin.updateReportStatus` - Update report
-- `GET /xrpc/com.atproto.admin.listReports` - List reports
-- `POST /xrpc/com.atproto.admin.createInviteCode` - Create invite code
-- `GET /xrpc/com.atproto.admin.getStats` - Server statistics
-
-### Server Info
-- `GET /health` - Health check
-- `GET /xrpc/com.atproto.server.describeServer` - Server capabilities
-- `GET /.well-known/did.json` - DID document
-- `GET /.well-known/oauth-authorization-server` - OAuth metadata
+See [docs/operator/admin-endpoint-reference.md](docs/operator/admin-endpoint-reference.md) for the admin / moderation / ops endpoint inventory.
 
 ## Development
 
@@ -239,12 +167,17 @@ docker build -t aurora-locus .
 
 # Run container
 docker run -d \
-  -p 3000:3000 \
+  -p 2583:2583 \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/.env:/app/.env \
   --name aurora-locus \
   aurora-locus
 ```
+
+The container listens on `PDS_PORT` (default `2583`). To run on a different
+port, set `PDS_PORT` in `.env` and adjust the port mapping to match
+(`-p <host-port>:<PDS_PORT>`) — the container-side port must equal
+`PDS_PORT` or the published mapping won't reach the server.
 
 ### Systemd Service
 
@@ -298,207 +231,15 @@ server {
 
 ## Performance
 
-Aurora Locus is designed for high performance:
+Aurora Locus is designed for low-latency async operation: non-blocking I/O via Tokio, connection pooling via sqlx, streaming for large CAR exports and the firehose, and compile-time query validation. Real-world performance is workload-and-hardware-dependent; this README does not carry canonical benchmark numbers.
 
-- **Async I/O**: All operations are non-blocking using Tokio
-- **Connection Pooling**: SQLx manages database connections efficiently
-- **Streaming**: Large CAR exports and firehose use streaming to minimize memory
-- **Compiled Queries**: SQLx compiles queries at build time
-- **Zero-Copy**: Efficient binary handling with minimal allocations
-
-**Benchmarks** (on modest hardware):
-- Account creation: ~50ms
-- Record CRUD: ~10-20ms
-- Blob upload (1MB): ~100ms
-- Firehose throughput: 1000+ events/sec
+See [docs/operator/performance.md](docs/operator/performance.md) for the observability surface (health endpoints, Prometheus `/metrics`, tracing) and profiling guidance.
 
 ## Security
 
-Aurora Locus implements multiple security layers:
+OAuth 2.1 with mandatory PKCE, DPoP sender-bound tokens with JTI replay tracking, Argon2id password hashing, role-based access control, schema validation on writes, and multi-axis rate limiting (distributed across instances under the Postgres backend) — the security posture details and the disclosure process live in the security policy.
 
-- **Authentication**: OAuth 2.0 with PKCE for admin, JWT for user sessions
-- **Authorization**: Role-based access control (RBAC)
-- **Rate Limiting**: Per-IP and per-user throttling
-- **Input Validation**: Schema validation for all records
-- **Password Hashing**: Argon2id with secure parameters
-- **HTTPS**: TLS recommended for production
-- **CORS**: Configurable cross-origin policies
-
-## Federation
-
-Aurora Locus includes comprehensive federation infrastructure (~1,200 lines of production-quality code) for full ATProto network integration.
-
-### Current Status
-
-#### ✅ **Working Now** (Relay Publishing)
-
-When federation is enabled, your PDS automatically publishes events to the ATProto relay network:
-
-```bash
-# Enable in .env
-PDS_FEDERATION_ENABLED=true
-PDS_FEDERATION_RELAY_URLS=https://bsky.network
-PDS_FEDERATION_AUTO_STREAM=true
-```
-
-**What works:**
-- ✅ Event publishing to relay servers (commits, identity changes, account updates)
-- ✅ Firehose WebSocket endpoint (`com.atproto.sync.subscribeRepos`)
-- ✅ Repository synchronization endpoints (CAR exports, block retrieval)
-- ✅ Auto-reconnect and error recovery
-- ✅ Multiple relay server support
-
-Your PDS is discoverable and can be crawled by relay servers when:
-```bash
-PDS_FEDERATION_FIREHOSE_ENABLED=true
-PDS_FEDERATION_CRAWL_ENABLED=true
-PDS_PUBLIC_URL=https://your-pds.example.com  # Must be publicly accessible
-```
-
-#### 🔄 **Planned** (Additional Features)
-
-The following federation features are fully implemented but not yet activated:
-
-- **PDS Discovery** - Automatic discovery of other PDS instances in the network
-- **Federated Search** - Search users and content across multiple PDSs
-- **Inbound Events** - Subscribe to relay firehose for remote events
-- **Cross-PDS Authentication** - Allow users from other PDSs to interact with yours
-
-See our [Federation Roadmap](https://github.com/your-repo/issues) for implementation timeline.
-
-### Quick Start - Enable Federation Today
-
-**Basic Federation** (outbound events only):
-
-```bash
-# Add to .env
-PDS_FEDERATION_ENABLED=true
-PDS_FEDERATION_RELAY_URLS=https://bsky.network
-PDS_FEDERATION_AUTO_STREAM=true
-
-# Restart service
-sudo systemctl restart aurora-locus
-```
-
-Verify it's working:
-```bash
-# Check logs
-sudo journalctl -u aurora-locus -f | grep -i federation
-
-# You should see:
-# "Federation enabled with 1 relay server(s)"
-# "Publishing event to relay: commit"
-```
-
-**Full Federation** (make PDS crawlable):
-
-```bash
-# Additional settings
-PDS_FEDERATION_FIREHOSE_ENABLED=true
-PDS_FEDERATION_CRAWL_ENABLED=true
-PDS_PUBLIC_URL=https://pds.example.com  # Your public URL
-
-# Ensure your PDS is accessible from the internet
-# Configure firewall/reverse proxy to allow inbound HTTPS
-```
-
-### Architecture
-
-```
-┌─────────────────────────┐
-│   Your Aurora PDS       │
-│                         │
-│  • Commits              │
-│  • Identity Updates     │
-│  • Account Changes      │
-└──────────┬──────────────┘
-           │ Publishes
-           ▼
-    ┌──────────────┐
-    │ Relay Server │ (bsky.network)
-    │  (Firehose)  │
-    └──────────────┘
-           │
-           ▼
-    ATProto Network
-  (Bluesky, other PDSs)
-```
-
-**Event Flow:**
-1. User creates post → Commit recorded
-2. Sequencer publishes event to relay
-3. Relay distributes to network
-4. Other PDSs/apps receive via firehose
-
-### Configuration Reference
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PDS_FEDERATION_ENABLED` | `false` | Master switch for federation |
-| `PDS_FEDERATION_RELAY_URLS` | `https://bsky.network` | Comma-separated relay URLs |
-| `PDS_FEDERATION_FIREHOSE_ENABLED` | `false` | Enable WebSocket firehose endpoint |
-| `PDS_FEDERATION_CRAWL_ENABLED` | `false` | Allow relay to sync repositories |
-| `PDS_PUBLIC_URL` | - | Public URL (required for federation) |
-| `PDS_FEDERATION_AUTO_STREAM` | `false` | Auto-publish events to relay |
-
-### Federation Endpoints
-
-**Outbound (implemented):**
-- `GET /xrpc/com.atproto.sync.subscribeRepos` - WebSocket firehose
-- `GET /xrpc/com.atproto.sync.getRepo` - Export repository as CAR
-- `GET /xrpc/com.atproto.sync.getBlocks` - Get specific blocks
-- `GET /xrpc/com.atproto.sync.listRepos` - List repositories
-- `GET /xrpc/com.atproto.sync.getLatestCommit` - Get HEAD commit
-
-**Future (planned):**
-- `GET /xrpc/app.bsky.actor.searchActors` - Federated user search
-- `GET /xrpc/app.bsky.feed.searchPosts` - Federated content search
-- Admin endpoints for federation management
-
-### Monitoring
-
-Check federation health:
-```bash
-# Metrics endpoint
-curl http://localhost:2583/metrics | grep -E "(relay|federation)"
-
-# Health check
-curl http://localhost:2583/health
-```
-
-**Key Metrics:**
-- `pds_relay_events_total` - Events published to relay
-- `pds_relay_connection_status` - Connection health (0=down, 1=up)
-- `pds_federation_requests_total` - Federation API calls
-
-### Troubleshooting
-
-**Problem:** "Federation enabled but no relay connection"
-- Check `PDS_FEDERATION_RELAY_URLS` is correct
-- Verify internet connectivity
-- Check firewall rules for outbound HTTPS
-
-**Problem:** "Relay cannot crawl my PDS"
-- Ensure `PDS_PUBLIC_URL` points to publicly accessible URL
-- Verify `PDS_FEDERATION_FIREHOSE_ENABLED=true`
-- Check reverse proxy configuration
-- Test: `curl https://your-pds.example.com/xrpc/com.atproto.sync.subscribeRepos`
-
-**Problem:** "Events not appearing in Bluesky"
-- Verify `PDS_FEDERATION_AUTO_STREAM=true`
-- Check logs for "Publishing event to relay"
-- May take 5-10 minutes for propagation
-- Relay may throttle new PDSs initially
-
-### Security Considerations
-
-- **Public Exposure**: Enabling firehose makes your data crawlable
-- **Rate Limiting**: Federation respects your rate limits
-- **Privacy**: Public posts are federated; private data stays local
-- **HTTPS Required**: Always use TLS for federation endpoints
-- **DID Verification**: All federation uses DID-based authentication
-
-For more details, see [FEDERATION.md](FEDERATION.md) (coming soon).
+See [SECURITY.md](SECURITY.md) for the security policy and the disclosure process.
 
 ## Contributing
 
@@ -517,17 +258,7 @@ Dual-licensed under MIT OR Apache-2.0
 
 - Inspired by [bluesky-social/pds](https://github.com/bluesky-social/pds)
 - Built with the [AT Protocol](https://atproto.com/)
-- Uses custom Rust ATProto SDK
-
-## Status
-
-**Production Ready**: YES ✅
-
-**Version**: 0.3.0
-
-**Federation**: Enabled (Bluesky network compatible)
-
-**Last Updated**: 2026
+- Built on the [`proto-blue`](https://crates.io/crates/proto-blue) ATProto SDK
 
 ---
 
