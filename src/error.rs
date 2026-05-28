@@ -43,9 +43,23 @@ pub enum PdsError {
     #[allow(dead_code)] // Future DID resolution errors
     DidResolution(String),
 
-    /// Identity resolution errors
+    /// Identity resolution errors (genuine resolution failures — DNS
+    /// timeout, PLC unreachable, network error, etc.). Falls through
+    /// to HTTP 500. For the distinct "resolution completed but the
+    /// handle does not resolve to any DID" case (client-input issue,
+    /// not server-side failure), use `HandleNotFound` instead.
     #[error("Identity resolution error: {0}")]
     IdentityResolution(String),
+
+    /// `com.atproto.identity.resolveHandle` completed resolution and
+    /// determined the handle does not resolve to any DID. Per the
+    /// ATProto lexicon for `com.atproto.identity.resolveHandle`, the
+    /// canonical error name is `HandleNotFound`. Mapped to HTTP 400.
+    /// Distinct from `IdentityResolution` so the not-found case
+    /// (client error) doesn't get conflated with genuine resolution
+    /// infrastructure failures (server error).
+    #[error("Handle not found: {0}")]
+    HandleNotFound(String),
 
     /// Rate limiting errors
     #[error("Rate limit exceeded")]
@@ -624,6 +638,11 @@ impl IntoResponse for PdsError {
                 "DidTombstoned",
                 self.to_string(),
             ),
+            PdsError::HandleNotFound(_) => (
+                StatusCode::BAD_REQUEST,
+                "HandleNotFound",
+                self.to_string(),
+            ),
             // Arc 14 §7.3.5 / §7.6.5: sync-namespace typed errors.
             // HTTP status code defaults verified against bsky-PDS via
             // Step 0 Sub-step 0.D recon (envelope already-correct
@@ -885,6 +904,40 @@ mod tests {
             body.message,
             "Invalid CID in record body: bafyrei-malformed-input"
         );
+    }
+
+    /// `PdsError::HandleNotFound` (the "resolveHandle completed but the
+    /// handle does not resolve to any DID" case) maps to HTTP 400 with
+    /// the lexicon-canonical `HandleNotFound` error name, per the
+    /// `com.atproto.identity.resolveHandle` ATProto lexicon. Locks in
+    /// the distinction from `IdentityResolution` (genuine resolution
+    /// failure → 500) — see paired test below.
+    #[tokio::test]
+    async fn handle_not_found_maps_to_http_400_with_lexicon_error_name() {
+        let err = PdsError::HandleNotFound("alice.example.com".to_string());
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: XrpcErrorResponse = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body.error, "HandleNotFound");
+        assert_eq!(body.message, "Handle not found: alice.example.com");
+    }
+
+    /// `PdsError::IdentityResolution` (the genuine resolution failure
+    /// case — DNS timeout, PLC unreachable, etc.) preserves its HTTP
+    /// 500 fall-through mapping. Paired with the `HandleNotFound`
+    /// test above to ensure the two cases are NOT collapsed into one
+    /// status — a real infrastructure failure is a server error, not
+    /// a client error.
+    #[tokio::test]
+    async fn identity_resolution_failure_preserves_http_500() {
+        let err = PdsError::IdentityResolution(
+            "Failed to resolve handle: DNS query timed out".to_string(),
+        );
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     fn quarantine_test_cid() -> Cid {
