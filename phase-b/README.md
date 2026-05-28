@@ -87,8 +87,8 @@ terminal restarts.
 - **NEVER `--release`.** Phase B exercises debug-built behavior
   including `debug!` emission.
 - **Ready probe = `describeServer`, NOT `/xrpc/_health`.** The PDS
-  `/xrpc/_health` returns 404 (chainlink #97). The harness
-  `pb_wait_for_ready` polls `describeServer`. NB: `mock-plc.py`'s own
+  `/xrpc/_health` returns 404. The harness `pb_wait_for_ready` polls
+  `describeServer`. NB: `mock-plc.py`'s own
   `/_health` is a *different service* on a *different port* (mock-PLC
   on `:$MOCK_PLC_PORT`, PDS on `:$PDS_SERVICE_PORT`) and DOES work —
   this is what the mock-PLC liveness probe in `pb_mock_plc_wait` uses.
@@ -161,7 +161,7 @@ The harness-managed lifecycle is a deliberate revision of the v0.5
 inherited from the markdown scripts without recorded rationale and
 left SQLite ergonomically favorable, quietly biasing operators toward
 sqlite-only runs and undermining the "always run twice, no backend
-carve-out" discipline (V06_DESIGN.md Settled Decision 3).
+carve-out" discipline.
 
 ## CI vs operator harness
 
@@ -169,9 +169,8 @@ The CI postgres-tests job launches `phase-b/mock-plc.py` directly via
 the workflow yaml — it does NOT consume `lib/mock-plc.sh`. Same script,
 different launcher, different assertion philosophy. The operator
 harness hands judgment to the operator; CI asserts pass/fail
-automatically. This separation is deliberate (Settled Decision 4 in
-V06_DESIGN.md Cluster 1) — routing CI through the harness would erode
-the setup-vs-judgment boundary.
+automatically. This separation is deliberate — routing CI through the
+harness would erode the setup-vs-judgment boundary.
 
 ## Mock-PLC requirements
 
