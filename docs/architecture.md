@@ -98,9 +98,7 @@ modules themselves carry doc-comments with the load-bearing detail.
 | [`service_auth.rs`](../src/service_auth.rs) | Cross-PDS service-JWT issuance (per-account ES256K signing). |
 | [`validation/`](../src/validation/) | Record schema validation; Required / Optimistic / None modes per `VALIDATION_MODE`. |
 
-Plus binaries: `aurora-locus` (the PDS itself, default) and
-`phase-b-dns-responder` (a 220-line UDP-only TXT responder for a single
-federation test scenario; not consumed by production code).
+The crate builds a single binary, `aurora-locus`.
 
 ---
 

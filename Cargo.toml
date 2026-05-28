@@ -6,14 +6,6 @@ authors = ["Aurora Locus Contributors"]
 description = "ATProto Personal Data Server implementation in Rust"
 license = "MIT OR Apache-2.0"
 
-# Phase B DNS responder for Arc 17 Scenario 13 (Cluster 1 Member 1.2).
-# Tiny UDP-only TXT-record responder; reuses tokio + serde_json from the
-# main dependency graph, no new transitive deps. NOT consumed by
-# production code paths.
-[[bin]]
-name = "phase-b-dns-responder"
-path = "phase-b/dns_responder.rs"
-
 [dependencies]
 # AT Protocol SDK (published crate, replaces the previously vendored ./Rust-Atproto-SDK)
 proto-blue = "0.3.1"

@@ -23,8 +23,6 @@ Cargo.lock
 data/
 data.backup/
 data.bak/
-# Phase B local PDS runtime state (per-instance SQLite + actor stores)
-phase-b/pds-*/
 
 # Local tooling
 .claude/
@@ -33,10 +31,8 @@ phase-b/pds-*/
 __pycache__/
 *.pyc
 
-# Local-only docs (per-cycle working artifacts: design, scope, defer-lists,
-# recon, phase-b operator runbooks). Single rule: anything under
-# docs/internal/ is local-only. To make a doc local-only, place it under
-# docs/internal/ — the file's name no longer matters.
+# Local-only docs (per-cycle working artifacts). Single rule: anything
+# under docs/internal/ is local-only. Same convention applies to local
+# dev-verification apparatus under phase-b/.
 docs/internal
-phase-b/data-*/
-phase-b/*.sh
+phase-b/
