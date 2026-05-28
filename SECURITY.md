@@ -41,6 +41,13 @@ a fix or remediation timeline.
   — handle and DID resolution via the `proto-blue-identity` SDK, with
   two-tier (in-memory + on-disk) caching and stale-fallback semantics.
 
+**Federation posture.** Federation is on by default; the binary participates
+in the ATProto network and publishes events on startup. Operators with
+closed-network, single-tenant, or development deployments disable federation
+via `PDS_FEDERATION_ENABLED=false`. With federation disabled, the receive-side
+service-auth verification path is not active and outbound firehose
+publication is skipped.
+
 ## Cryptography
 
 - **ES256K (secp256k1)** — ATProto-canonical signing for repo commits, PLC
@@ -150,7 +157,3 @@ or certificates to the AWS SDK.
   coherent under `PDS_DISTRIBUTED_STATE_MODE=distributed` via the
   Postgres-CAS substrate; the federation service-auth nonce store
   remains in-process.
-- **Federation is off by default** (`PDS_FEDERATION_ENABLED=false`).
-  Operators opting in publish events to relays and may expose federation
-  endpoints; review [`docs/operator/configuration.md`](docs/operator/configuration.md)
-  §17 before enabling in production.

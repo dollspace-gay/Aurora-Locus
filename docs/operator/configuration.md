@@ -215,6 +215,13 @@ OAuth 2.1 migration.
 
 ## 17. Federation
 
+**Federation is on by default.** ATProto PDSes are federation peers; a fresh
+deployment participates in the ATProto network on startup. Operators with
+closed-network, single-tenant, development, or pre-go-live deployments opt
+out by setting `PDS_FEDERATION_ENABLED=false`. An opted-out PDS is not a
+participating ATProto peer — users on it can't be followed from elsewhere,
+posts don't appear in cross-PDS feeds, and the firehose doesn't emit.
+
 **The two PUBLIC_URL vars are easy to confuse:**
 
 - **`PDS_PUBLIC_URL`** (this section) — federation-specific. Used when relays
@@ -229,7 +236,7 @@ when the federation-crawl URL differs from the server's general public URL
 
 | Variable | Default | Type | Purpose |
 |---|---|---|---|
-| `PDS_FEDERATION_ENABLED` | `false` | boolean | Master switch for federation with relays. |
+| `PDS_FEDERATION_ENABLED` | `true` | boolean | Master switch for federation with relays. Set `false` to disable for closed-network / single-tenant / development deployments. |
 | `PDS_FEDERATION_RELAY_URLS` | `https://bsky.network` | comma-separated URLs | Relay server URLs. An empty list disables the relay loop entirely (federation may still be active for peer-PDS / entryway flows). |
 | `PDS_FEDERATION_FIREHOSE_ENABLED` | `false` | boolean | Enable the WebSocket firehose endpoint (`com.atproto.sync.subscribeRepos`). |
 | `PDS_FEDERATION_CRAWL_ENABLED` | `false` | boolean | Allow relays to crawl this PDS's repositories. |

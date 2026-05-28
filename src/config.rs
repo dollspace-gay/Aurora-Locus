@@ -1765,11 +1765,14 @@ impl ServerConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or_default();
 
-        // Federation configuration
+        // Federation configuration. ATProto PDSes are federation peers by
+        // design; the default is `true`. Operators with closed-network,
+        // single-tenant, or development deployments set
+        // `PDS_FEDERATION_ENABLED=false` to opt out.
         let federation_enabled = env::var("PDS_FEDERATION_ENABLED")
-            .unwrap_or_else(|_| "false".to_string())
+            .unwrap_or_else(|_| "true".to_string())
             .parse()
-            .unwrap_or(false);
+            .unwrap_or(true);
         // Empty-entry filter is load-bearing: `AppContext::new` gates
         // RelayClient construction (and JobScheduler's
         // relay_firehose_subscription_job spawn) on
