@@ -1,27 +1,23 @@
-# Aurora-Locus deployment posture (v0.5)
+# Aurora-Locus deployment posture
 
-Operator guide pinning the v0.5 forensic-recovery procedure for
-Option A failures (`apply_writes` Phase A committed; Phase B failed
-mid-flight). Introduced by Arc 16e §9.5.4 Step 3.9 (round-4 F4
-closure) — see [`docs/V05_DESIGN.md`](../V05_DESIGN.md) §9.5.1.2 +
-§9.5.3.1.3 + §9.5.5.8 for the design rationale.
+Operator guide pinning the forensic-recovery procedure for Option A
+failures (`apply_writes` Phase A committed; Phase B failed mid-flight).
 
 ## TL;DR
 
-**Docker, k8s, and bare-metal systemd are all supported runtimes
-for v0.5.** You can deploy and run the binary in any of them today.
+**Docker, Kubernetes, and bare-metal systemd are all supported
+runtimes.** You can deploy and run the binary in any of them today.
 
 **What's pinned to systemd+journald is the *verified* forensic-
-recovery procedure.** v0.5 ships one fully-tested runbook for
-investigating Option A failures: it queries `journalctl` against a
-local-journald-attached service unit. Other configurations (Docker
-with `--log-driver=journald`, k8s with a durable log sink, fluent-bit
-/ vector / promtail aggregators) can in principle achieve equivalent
+recovery procedure.** One fully-tested runbook exists for investigating
+Option A failures: it queries `journalctl` against a local-journald-
+attached service unit. Other configurations (Docker with
+`--log-driver=journald`, k8s with a durable log sink, fluent-bit /
+vector / promtail aggregators) can in principle achieve equivalent
 recovery — they just need the procedure adapted to their query
-surface. v0.5 doesn't document or verify those adaptations; that's
-v0.6+ scope.
+surface. Those adaptations are not documented or verified here.
 
-Net for an operator deploying v0.5:
+Net for an operator deploying Aurora-Locus:
 
 - Run it however your platform fits — Docker / k8s / systemd / nomad
   / etc. **all work as runtimes.**
@@ -45,17 +41,18 @@ The recovery procedure is then: query the sink for the
 `phase_b_starting` line in the failure window, pull its full
 `touch_set` + `record_uris`, walk those CIDs against
 `blob_metadata` + `record_blob` to identify which rows committed
-on Phase A and need reconciliation against Phase B's intended end-
-state.
+on Phase A and need reconciliation against Phase B's intended
+end-state.
 
 Any sink that satisfies "durable + queryable + flushed line arrives
 before crash" can host this procedure. The choices of sink and the
 adapted query surface are deployment-specific; the binary doesn't
 care.
 
-## v0.5 verified path: systemd + local journald
+## Verified path: systemd + local journald
 
-This is the single configuration v0.5 ships a tested runbook for.
+This is the single configuration the project ships a tested runbook
+for.
 
 | Aspect | This configuration |
 |---|---|
@@ -70,9 +67,8 @@ in-process `flush()` call drains the Rust-side stdio buffer but
 not that kernel-side buffer. The window between flush-returns and
 kernel-delivers is microseconds on this path (local Unix datagram
 socket, no network round trip, journald persists to disk after
-arrival). v0.5 explicitly accepts this microsecond window per
-V05_DESIGN.md §9.5.5.8 — this is the **tightest window** any v0.5
-configuration achieves, which is why it's the verified runbook.
+arrival). This is the **tightest window** any configuration
+achieves, which is why it's the verified runbook.
 
 Other sinks have wider windows (network shippers add ms-to-s round
 trips, in-process buffered writers add their flush latency, etc.).
@@ -99,7 +95,7 @@ identify which rows committed on Phase A and need manual
 reconciliation against Phase B's intended end-state.
 
 ```text
-# Sample expected log shape (round-4 F6: format-grep verification).
+# Sample expected log shape (format-grep verification).
 # tracing-subscriber 0.3.20 Full-format renders fields as
 # field="value" for strings; the grep pattern above is verified
 # against this format. Sample line:
@@ -110,15 +106,15 @@ reconciliation against Phase B's intended end-state.
 #   touch_set=["bafyrei..."]
 ```
 
-The Phase B test artifact (Step 4 / §9.5.4) records a real
-captured `phase_b_starting` line emitted by Aurora-Locus's actual
-subscriber config so the grep pattern is verified end-to-end.
+The Phase B test artifact records a real captured `phase_b_starting`
+line emitted by Aurora-Locus's actual subscriber config so the grep
+pattern is verified end-to-end.
 
-## Other configurations: capable in principle, unverified in v0.5
+## Other configurations: capable in principle, unverified
 
 These all work as runtimes. None of them are "broken" or
-"unsupported"; v0.5 just hasn't shipped a tested recovery runbook
-for them.
+"unsupported"; the project just hasn't shipped a tested recovery
+runbook for them.
 
 ### Docker with a durable log driver
 
@@ -127,8 +123,8 @@ into the host's journald. With this driver, the same `journalctl
 _SYSTEMD_UNIT=...` query works against the container's unit name
 — the recovery procedure adapts trivially. Other drivers
 (`json-file`, syslog over UDP, network shippers) still capture the
-flushed line but the query surface differs and v0.5 hasn't
-verified the adaptation.
+flushed line but the query surface differs and the adaptation
+isn't verified here.
 
 ### Kubernetes with a log shipper
 
@@ -139,8 +135,8 @@ runs (Loki, Elasticsearch, CloudWatch, etc.). The recovery
 requirement (durable + queryable + flushed line arrives before
 crash) is satisfied as long as the shipper's pipeline doesn't
 drop logs at high water, and the query surface is whatever the
-log store exposes. v0.5 doesn't characterize the residual-window
-magnitude for any specific shipper; that's deployment-specific.
+log store exposes. Residual-window magnitude is shipper-specific
+and not characterized here.
 
 ### Bare-metal non-systemd
 
@@ -148,26 +144,17 @@ Aurora-Locus run under any other supervisor (s6, runit, supervisord,
 or no supervisor at all writing to a file) emits the line; the
 operator's job is to ensure the chosen sink is durable + queryable.
 
-## What v0.5 explicitly does NOT do
+## What this doc explicitly does NOT do
 
 - **Verify a recovery procedure for non-journald log sinks.** Other
-  sinks can host the procedure; v0.5 just doesn't ship the verified
-  runbook. Doing so is v0.6+ scope.
+  sinks can host the procedure; the verified runbook only covers
+  systemd + local journald. Per-shipper adaptations are future work.
 - **Characterize residual-window magnitude for non-local sinks.**
   Local-journald is microseconds; network-shipped paths are
-  ms-to-s. v0.5 pins the microsecond window for the verified path
-  only.
-- **Document per-shipper recovery procedures.** v0.6+ will add
-  per-shipper adaptations matching the journalctl runbook above.
+  ms-to-s. The microsecond window pin applies only to the verified
+  path.
 
 ## Cross-references
 
-- [V05_DESIGN.md §9.5.1.2](../V05_DESIGN.md) — Arc 16e
-  out-of-scope deferrals (verification of non-journald recovery
-  procedures → v0.6+).
-- [V05_DESIGN.md §9.5.3.1.3](../V05_DESIGN.md) — forensic log
-  discipline + flush-primitive rationale.
-- [V05_DESIGN.md §9.5.5.8](../V05_DESIGN.md) — local-journald
-  microsecond residual-window acceptance posture.
 - [src/actor_store/repository.rs](../../src/actor_store/repository.rs)
   `run_phase_b` — emits `phase_b_starting` / `phase_b_failed`.

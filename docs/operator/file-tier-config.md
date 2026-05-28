@@ -87,8 +87,8 @@ For each key, `getRuntimeSetting` walks:
 The response's `source` field reflects which tier resolved the
 read: `"Runtime"`, `"File"`, `"Default"`, or `"RecoveryMode"`.
 External tooling reading the field can rely on this value set.
-The field shape is open per Arc 2's contract framing — new tier
-labels may be added additively in future cycles.
+The field shape is open — new tier labels may be added additively
+in future releases.
 
 ## Operator workflow
 
@@ -125,9 +125,9 @@ For values that need to change on the hot path, use
 `tools.aurora.admin.setRuntimeSetting` (writes a runtime row
 which takes precedence over file tier).
 
-Reload-on-`SIGHUP` is a v0.4 follow-up. The current design
-treats the runtime_settings table as the in-process change
-mechanism and the file tier as the deployment-stable layer.
+Reload-on-`SIGHUP` is future work. The current design treats the
+runtime_settings table as the in-process change mechanism and the
+file tier as the deployment-stable layer.
 
 ## Security notes
 

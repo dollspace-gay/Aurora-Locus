@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{CasResult, DistributedError, DistributedStore, Lease};
+use super::{DistributedError, DistributedStore, Lease};
 
 /// Per-table router over multiple `DistributedStore` impls.
 ///
@@ -120,18 +120,6 @@ impl DistributedStore for DistributedStoreRegistry {
         self.dispatch(table)?.delete(table, key).await
     }
 
-    async fn cas(
-        &self,
-        table: &str,
-        key: &str,
-        expected_version: i64,
-        new_value: &[u8],
-    ) -> Result<CasResult, DistributedError> {
-        self.dispatch(table)?
-            .cas(table, key, expected_version, new_value)
-            .await
-    }
-
     async fn reap_expired(
         &self,
         table: &str,
@@ -202,16 +190,6 @@ mod tests {
             self.record("delete", table);
             Ok(true)
         }
-        async fn cas(
-            &self,
-            table: &str,
-            _key: &str,
-            _expected_version: i64,
-            _new_value: &[u8],
-        ) -> Result<CasResult, DistributedError> {
-            self.record("cas", table);
-            Ok(CasResult::Success { new_version: 1 })
-        }
         async fn reap_expired(
             &self,
             table: &str,
@@ -276,10 +254,6 @@ mod tests {
             .await
             .unwrap();
         registry
-            .cas("rate_limit_buckets", "k", 0, b"{}")
-            .await
-            .unwrap();
-        registry
             .reap_expired("dpop_jti_replay", 0)
             .await
             .unwrap();
@@ -288,7 +262,6 @@ mod tests {
             substrate.calls(),
             vec![
                 ("insert", "dpop_jti_replay".to_string()),
-                ("cas", "rate_limit_buckets".to_string()),
                 ("reap_expired", "dpop_jti_replay".to_string()),
             ]
         );

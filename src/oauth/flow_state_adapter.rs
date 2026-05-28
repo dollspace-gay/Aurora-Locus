@@ -65,7 +65,7 @@ use chrono::Utc;
 use sqlx::{AnyPool, Row};
 
 use crate::distributed::{
-    CasResult, DistributedError, DistributedStore, Lease,
+    DistributedError, DistributedStore, Lease,
 };
 use crate::oauth::models::{AuthorizationRequest, AuthorizationRequestData};
 
@@ -247,22 +247,6 @@ impl DistributedStore for OAuthFlowStateAdapter {
         .map_err(DistributedError::Database)?;
 
         Ok(result.rows_affected() > 0)
-    }
-
-    async fn cas(
-        &self,
-        table: &str,
-        _key: &str,
-        _expected_version: i64,
-        _new_value: &[u8],
-    ) -> Result<CasResult, DistributedError> {
-        // oauth_flow_state has no version column. Surface
-        // UnsupportedTable rather than silently no-op'ing —
-        // consumers shouldn't be calling cas on this table.
-        Err(DistributedError::UnsupportedTable(format!(
-            "{} (cas not supported)",
-            table
-        )))
     }
 
     async fn reap_expired(
@@ -580,19 +564,6 @@ mod tests {
                 .await
                 .unwrap()
         );
-    }
-
-    // ---------- cas ----------
-
-    #[tokio::test]
-    async fn cas_returns_unsupported_table() {
-        let pool = fresh_pool().await;
-        let adapter = OAuthFlowStateAdapter::new(pool);
-        let err = adapter
-            .cas("oauth_flow_state", "key", 0, b"{}")
-            .await
-            .expect_err("cas not supported on this table");
-        assert!(matches!(err, DistributedError::UnsupportedTable(_)));
     }
 
     // ---------- reap_expired ----------

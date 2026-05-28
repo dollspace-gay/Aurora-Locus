@@ -325,8 +325,12 @@ impl AppContext {
                     db::create_any_pool(&maintenance_db_config, &config.storage.account_db)
                         .await?,
                 );
-                let substrate: Arc<dyn DistributedStore> =
-                    Arc::new(PostgresCasStore::new(Arc::clone(&pool)));
+                let substrate: Arc<dyn DistributedStore> = Arc::new(
+                    PostgresCasStore::new(Arc::clone(&pool))
+                        .with_rate_limit_retention_days(
+                            config.rate_limit.buckets_retention_days,
+                        ),
+                );
                 tracing::info!(
                     max_connections = config.maintenance_pool.max_connections,
                     min_connections = config.maintenance_pool.min_connections,
@@ -660,11 +664,15 @@ impl AppContext {
         let sequencer = Arc::new(seq);
 
         // Initialize rate limiter with Bluesky-compatible endpoint limits.
-        // The `exempt_admin_assets` flag is the only env-driven runtime
-        // tuning currently plumbed through; the rest of the runtime quotas
-        // remain at their compiled-in defaults.
+        // The env-driven `enabled` master switch and the `exempt_admin_assets`
+        // flag are plumbed through here; the rest of the runtime quotas
+        // remain at their compiled-in defaults. Before chainlink #153 the
+        // `enabled` value loaded from PDS_RATE_LIMITS_ENABLED was dropped on
+        // the floor — config::RateLimitConfig held it but it never reached
+        // the rate_limit::RateLimitConfig the enforcement layers consult.
         let rate_limiter = Arc::new(RateLimiter::with_bluesky_defaults(
             crate::rate_limit::RateLimitConfig {
+                enabled: config.rate_limit.enabled,
                 exempt_admin_assets: config.rate_limit.exempt_admin_assets,
                 ..crate::rate_limit::RateLimitConfig::default()
             },

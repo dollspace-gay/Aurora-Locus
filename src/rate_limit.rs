@@ -125,6 +125,17 @@ pub struct RateLimitInfo {
 /// Rate limiter configuration
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
+    /// Master enable flag. When `false`, every rate-limit check
+    /// (middleware + all per-method `check_*` calls) short-circuits to
+    /// `Ok(())` without consuming tokens. Loaded from
+    /// `PDS_RATE_LIMITS_ENABLED` via `config::RateLimitConfig` and
+    /// propagated through `context::AppContext`. Production default:
+    /// `true`. Phase B harness emits `false` so multi-call scenarios
+    /// (scenario-13's three rapid sub-cases, scenario-15's N-concurrent
+    /// burst) don't race the per-DID-per-endpoint bucket. See chainlink
+    /// #153 for the dead-knob writeup; before #153 this field didn't
+    /// exist and the env var was loaded but never reached enforcement.
+    pub enabled: bool,
     /// Requests per second for authenticated users
     pub authenticated_rps: u32,
     /// Requests per second for unauthenticated users
@@ -156,6 +167,7 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
+            enabled: true,             // Rate limiting on by default; Phase B opts out
             authenticated_rps: 100,    // 100 req/sec for authenticated
             unauthenticated_rps: 10,   // 10 req/sec for unauthenticated
             admin_rps: 1000,           // 1000 req/sec for admins
@@ -577,6 +589,7 @@ impl RateLimiter {
 
     /// Check rate limit for authenticated user
     pub fn check_authenticated(&self) -> PdsResult<()> {
+        if !self.config.enabled { return Ok(()); }
         self.track_request("global:authenticated");
         match self.authenticated.check() {
             Ok(_) => Ok(()),
@@ -588,6 +601,7 @@ impl RateLimiter {
 
     /// Check rate limit for unauthenticated user
     pub fn check_unauthenticated(&self) -> PdsResult<()> {
+        if !self.config.enabled { return Ok(()); }
         self.track_request("global:unauthenticated");
         match self.unauthenticated.check() {
             Ok(_) => Ok(()),
@@ -599,6 +613,7 @@ impl RateLimiter {
 
     /// Check rate limit for admin user
     pub fn check_admin(&self) -> PdsResult<()> {
+        if !self.config.enabled { return Ok(()); }
         self.track_request("global:admin");
         match self.admin.check() {
             Ok(_) => Ok(()),
@@ -613,6 +628,7 @@ impl RateLimiter {
     /// This is 10x stricter than local authenticated users to prevent abuse
     /// from federated instances.
     pub fn check_cross_pds(&self) -> PdsResult<()> {
+        if !self.config.enabled { return Ok(()); }
         self.track_request("global:cross_pds");
         match self.cross_pds.check() {
             Ok(_) => Ok(()),
@@ -632,6 +648,7 @@ impl RateLimiter {
     /// Uses both global limit and per-handle keyed limit to prevent
     /// both aggregate abuse and targeted enumeration.
     pub fn check_handle_resolution(&self, handle: &str) -> PdsResult<()> {
+        if !self.config.enabled { return Ok(()); }
         self.track_request("identity:handle_resolution");
 
         // Check global handle resolution limit
@@ -664,6 +681,7 @@ impl RateLimiter {
     /// Uses both global limit and per-DID keyed limit to prevent
     /// both aggregate abuse and targeted enumeration.
     pub fn check_did_resolution(&self, did: &str) -> PdsResult<()> {
+        if !self.config.enabled { return Ok(()); }
         self.track_request("identity:did_resolution");
 
         // Check global DID resolution limit
@@ -690,6 +708,7 @@ impl RateLimiter {
     /// This is a combined check for DID resolution (since keys come from DID docs)
     /// with an additional identifier for tracking key-specific requests.
     pub fn check_signing_key_resolution(&self, did: &str) -> PdsResult<()> {
+        if !self.config.enabled { return Ok(()); }
         self.track_request("identity:signing_key");
 
         // Use DID resolution limits since signing keys come from DID documents
@@ -705,6 +724,7 @@ impl RateLimiter {
     /// - Short-term limit (burst protection): 30 requests per 5 minutes
     /// - Long-term limit (sustained attack protection): 300 requests per day
     pub fn check_endpoint(&self, endpoint: &str) -> Option<PdsResult<()>> {
+        if !self.config.enabled { return Some(Ok(())); }
         self.endpoint_limiters.get(endpoint).map(|limiters| {
             // Check ALL limiters - if any fail, return error
             for limiter in limiters.iter() {
@@ -731,6 +751,7 @@ impl RateLimiter {
     ///
     /// Uses keyed rate limiting to track requests per IP address
     pub fn check_ip(&self, ip: &IpAddr) -> PdsResult<()> {
+        if !self.config.enabled { return Ok(()); }
         let key = ip.to_string();
         match self.ip_limiter.check_key(&key) {
             Ok(_) => Ok(()),
@@ -745,6 +766,7 @@ impl RateLimiter {
     /// Useful for endpoints like createSession where we want to rate limit by both
     /// identifier and IP to prevent distributed brute-force attacks
     pub fn check_composite_key(&self, key: &str) -> PdsResult<()> {
+        if !self.config.enabled { return Ok(()); }
         let key_string = key.to_string();
         match self.ip_limiter.check_key(&key_string) {
             Ok(_) => Ok(()),
@@ -870,6 +892,16 @@ impl RateLimiter {
         &self.config
     }
 
+    /// Master enable flag accessor. When `false`, every `check_*`
+    /// method short-circuits to `Ok(())` and the middleware skips
+    /// distributed + governor enforcement. Driven by
+    /// `PDS_RATE_LIMITS_ENABLED` via `config::RateLimitConfig` (see
+    /// chainlink #153). Consumed by the rate-limit middleware to gate
+    /// the distributed-bucket layer alongside the method-level gates.
+    pub fn enabled(&self) -> bool {
+        self.config.enabled
+    }
+
     /// Get the list of endpoints with custom rate limits
     ///
     /// Returns endpoints that have per-endpoint rate limiting configured.
@@ -971,6 +1003,17 @@ pub async fn rate_limit_middleware(
     next: Next,
 ) -> Result<Response, StatusCode> {
     let endpoint_path = request.uri().path();
+
+    // Master enable gate (chainlink #153). When PDS_RATE_LIMITS_ENABLED=false,
+    // skip the distributed-bucket layer below + all governor checks in this
+    // middleware. Method-level `check_*` calls in handlers (check_did_endpoint
+    // etc.) are gated separately at the method entry, so the env flag fully
+    // disables enforcement everywhere. Production default `true` preserves
+    // existing behavior; Phase B harness emits `false` for deterministic
+    // multi-call scenarios.
+    if !ctx.rate_limiter.enabled() {
+        return Ok(next.run(request).await);
+    }
 
     // Bypass the limiter for admin UI static assets when the exemption is
     // enabled. This is path-and-method specific (see `is_admin_asset_exempt`)
@@ -1926,6 +1969,89 @@ mod tests {
 
         let result5 = limiter.check_did_endpoint(did2, endpoint1);
         assert!(result5.is_ok());
+    }
+
+    /// chainlink #153 — PDS_RATE_LIMITS_ENABLED=false must short-circuit
+    /// every check_* method to Ok(()) regardless of bucket exhaustion.
+    /// This mirrors the test_did_endpoint_rate_limiting saturation pattern
+    /// (~30 rapid same-key calls) which is exactly what trips a default
+    /// bucket — with `enabled: false`, the saturation never produces a
+    /// 429 because each check returns immediately at the gate.
+    #[test]
+    fn test_disabled_flag_bypasses_all_checks() {
+        let config = RateLimitConfig { enabled: false, ..Default::default() };
+        let limiter = RateLimiter::new(config);
+
+        // Saturate the per-DID-per-endpoint bucket — under default
+        // enabled=true this is the exact pattern that hits 429 in
+        // test_did_endpoint_rate_limiting; with enabled=false EVERY
+        // call must succeed.
+        let did = "did:plc:disabledtest";
+        let endpoint = "/xrpc/com.atproto.repo.createRecord";
+        for _ in 0..200 {
+            assert!(
+                limiter.check_did_endpoint(did, endpoint).is_ok(),
+                "check_did_endpoint must short-circuit when enabled=false"
+            );
+        }
+
+        // Same shape for check_identifier_ip (composite-key path,
+        // distinct call site).
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        for _ in 0..200 {
+            assert!(
+                limiter.check_identifier_ip("disabled@test", &ip).is_ok(),
+                "check_identifier_ip must short-circuit when enabled=false"
+            );
+        }
+
+        // Direct check_composite_key — single bucket, fully gateable.
+        for _ in 0..200 {
+            assert!(
+                limiter.check_composite_key("composite-disabled-key").is_ok(),
+                "check_composite_key must short-circuit when enabled=false"
+            );
+        }
+
+        // Per-auth-type globals.
+        for _ in 0..1000 {
+            assert!(limiter.check_authenticated().is_ok());
+            assert!(limiter.check_unauthenticated().is_ok());
+            assert!(limiter.check_admin().is_ok());
+            assert!(limiter.check_cross_pds().is_ok());
+        }
+
+        // Outbound resolution buckets.
+        for _ in 0..200 {
+            assert!(limiter.check_handle_resolution("disabled.test").is_ok());
+            assert!(limiter.check_did_resolution(did).is_ok());
+            assert!(limiter.check_signing_key_resolution(did).is_ok());
+        }
+
+        // check_endpoint returns Option<PdsResult<()>>; when gated it
+        // returns Some(Ok(())) so callers see "limit configured + allowed"
+        // rather than the None "no limit configured" branch.
+        let ep_result = limiter.check_endpoint("/xrpc/com.atproto.repo.createRecord");
+        assert!(matches!(ep_result, Some(Ok(()))));
+
+        // check_ip on a hot key — 200 rapid same-IP checks.
+        for _ in 0..200 {
+            assert!(limiter.check_ip(&ip).is_ok());
+        }
+
+        // Sanity: the SAME limiter with enabled=true still saturates
+        // (so the test would fail if the gate was missing — proves the
+        // gate is the only reason the calls above succeeded).
+        let enabled_config = RateLimitConfig { enabled: true, ..Default::default() };
+        let enabled_limiter = RateLimiter::new(enabled_config);
+        let mut got_err = false;
+        for _ in 0..200 {
+            if enabled_limiter.check_did_endpoint(did, endpoint).is_err() {
+                got_err = true;
+                break;
+            }
+        }
+        assert!(got_err, "enabled=true limiter MUST saturate at default burst");
     }
 
     #[test]

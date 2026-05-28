@@ -83,7 +83,14 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # Arc 17 §17.4 Step 1.5 — DNS resolver for _lexicon.<host> TXT lookups.
 # Promoted from transitive to direct dep. Pure-Rust, tokio-native.
-hickory-resolver = "0.25"
+# v0.6 M1.3: bumped 0.25 -> 0.26.1 (chainlink #152). Patches
+# RUSTSEC-2026-0119 (O(n^2) name compression on encode, Moderate).
+# RUSTSEC-2026-0118 (NSEC3 unbounded-loop on cross-zone proof, High) is
+# accepted: the DNSSEC validation path is unreachable in our build
+# (default features = no __dnssec; ResolverOpts.validate=false default;
+# read_system_conf never sets validate). See SECURITY.md + the
+# constructor note in src/federation/dns_resolver.rs.
+hickory-resolver = "0.26.1"
 
 # WebSocket for relay support
 tokio-tungstenite = "0.27"

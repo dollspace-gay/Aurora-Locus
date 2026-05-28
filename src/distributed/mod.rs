@@ -30,14 +30,18 @@
 //! fall back to per-instance in-memory state (auth state is lost
 //! on restart — operator-accepted trade-off per §6.3.6).
 //!
-//! Trait methods + result types (`DistributedStore::cas`, `CasResult`)
-//! and the per-surface bucket helpers (`cas_rate_limit_bucket`) are
-//! the full substrate surface; some consumers landed in Arc 7,
-//! others land with v0.6 federation work. Module-level allow covers
-//! the incomplete-but-deliberately-scoped surface.
+//! Trait methods are insert / get / delete / reap_expired. The Arc 7
+//! cas surface (DistributedStore::cas + CasResult + per-table CAS
+//! helpers) was speculative forward-substrate for the rate-limit
+//! consumer; the consumer arrived at DistributedRateLimiter and
+//! chose direct SQL UPDATEs at rate_limit.rs (V04_DESIGN.md §6.3.5
+//! favoured row-locking over CAS-loop retries for production), so
+//! the trait surface was removed in v0.6 Cluster 4 (#150). If
+//! cross-instance CAS ever lands a real consumer, the trait method
+//! re-adds against that consumer's actual shape — bounded
+//! ~50-100 LOC + tests.
 #![allow(dead_code)]
 
-pub mod cache;
 pub mod lease;
 pub mod postgres_cas;
 pub mod registry;
@@ -109,25 +113,6 @@ pub trait DistributedStore: Send + Sync {
         key: &str,
     ) -> Result<bool, DistributedError>;
 
-    /// Compare-and-swap on a row's `version` column.
-    ///
-    /// Returns [`CasResult::Success`] with the post-update
-    /// version on success, or [`CasResult::Conflict`] with the
-    /// actual current version on failure. Implementations
-    /// increment `version` by exactly 1 on success.
-    ///
-    /// Tables without a `version` column return
-    /// [`DistributedError::UnsupportedTable`] for this method;
-    /// this is intentional, not silent — consumers shouldn't
-    /// call `cas` against a table that doesn't support it.
-    async fn cas(
-        &self,
-        table: &str,
-        key: &str,
-        expected_version: i64,
-        new_value: &[u8],
-    ) -> Result<CasResult, DistributedError>;
-
     /// Sweep expired rows from the given table.
     ///
     /// `now_epoch_ms` is supplied by the caller (the reaper
@@ -146,20 +131,6 @@ pub trait DistributedStore: Send + Sync {
         table: &str,
         now_epoch_ms: i64,
     ) -> Result<usize, DistributedError>;
-}
-
-/// Outcome of a [`DistributedStore::cas`] call. Distinguishes
-/// success (with the new version) from optimistic-concurrency
-/// conflict (with the version the caller is racing against).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CasResult {
-    /// CAS succeeded; the row's new version is `new_version`.
-    Success { new_version: i64 },
-    /// CAS failed because the row's current version doesn't
-    /// match the caller's `expected_version`. `current_version`
-    /// is the version the caller is actually racing against;
-    /// retry loops can use it to refetch + recompute.
-    Conflict { current_version: i64 },
 }
 
 /// Errors a [`DistributedStore`] implementation can return.
@@ -193,23 +164,6 @@ pub enum DistributedError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cas_result_pattern_matches() {
-        // Compile-time check that the variants are usable in
-        // exhaustive pattern matches without falling through.
-        fn classify(result: CasResult) -> &'static str {
-            match result {
-                CasResult::Success { new_version: _ } => "ok",
-                CasResult::Conflict { current_version: _ } => "racing",
-            }
-        }
-        assert_eq!(classify(CasResult::Success { new_version: 7 }), "ok");
-        assert_eq!(
-            classify(CasResult::Conflict { current_version: 5 }),
-            "racing"
-        );
-    }
 
     #[test]
     fn key_exists_error_carries_table_and_key() {

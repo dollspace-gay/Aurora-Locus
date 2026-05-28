@@ -23,8 +23,6 @@ Cargo.lock
 data/
 data.backup/
 data.bak/
-# Phase B local PDS runtime state (per-instance SQLite + actor stores)
-phase-b/pds-*/
 
 # Local tooling
 .claude/
@@ -33,8 +31,11 @@ phase-b/pds-*/
 __pycache__/
 *.pyc
 
-# Working design docs (per-cycle, local-only artifacts)
-docs/*_DESIGN.md
+# Local-only docs (per-cycle working artifacts). Single rule: anything
+# under docs/internal/ is local-only. Same convention applies to local
+# dev-verification apparatus under phase-b/ — mock-plc.py is the
+# exception: CI launches it as a fixture for the postgres smoke tests
+# (.github/workflows/ci.yml).
 docs/internal
-phase-b/data-*/
-phase-b/*.sh
+phase-b/*
+!phase-b/mock-plc.py

@@ -55,7 +55,7 @@ Each item is an `AuditEntry`:
 | `currentHash` | string | SHA-256 over the canonical input — the hash this doc tells you how to reproduce. Hex-lowercase, 64 chars. |
 | `previousHash` | string \| null | Prior row's `currentHash`. **`null` for the genesis row.** |
 | `verified` | boolean | Aurora-Locus's per-row verify check. Independent verification is what this doc enables. |
-| `cascadeSubjects` | array of object | Per-subject Subject objects. Per Arc 4 §8.3.3, single-subject events carry a one-element array (mirroring the `subjectRef` field); multi-subject events carry one element per subject. The array is empty only on pre-Arc-4 single-subject chain rows or chain entries written without a subject. |
+| `cascadeSubjects` | array of object | Per-subject Subject objects. Single-subject events carry a one-element array (mirroring the `subjectRef` field); multi-subject events carry one element per subject. The array is empty only on legacy single-subject chain rows that pre-date the cascade-population convention, or on chain entries written without a subject. |
 | `cascadeSnapshotIds` | array of (string \| null) | Per-subject snapshot ids paired by index with `cascadeSubjects`. **Stringified i64** values; `null` per element when the subject wasn't snapshottable at decision time. Empty array when `snapshot_capture: false` was passed or for chain entries without subjects. |
 
 `subjectRef` is one of three discriminated shapes:
@@ -268,13 +268,13 @@ fixed (not the production `Utc::now()`) so the hashes are
 reproducible. In production, `timestamp` is the row's `created_at`
 column value verbatim.
 
-### Examples 1–4 (single-subject events) and Arc 4 chain-row shape
+### Examples 1–4 (single-subject events) and the single-subject chain-row shape
 
-Per Arc 4 §8.3.3, single-subject events populate BOTH the flat
+Single-subject events populate BOTH the flat
 `subject_did`/`subject_uri`/`subject_cid` columns AND a
 single-element `cascade_subjects: [s]`. Multi-subject events
 (Example 5) use synthetic-primary (NULL flat columns, populated
-cascade). Examples 1–4 below reflect the post-Arc-4 single-subject
+cascade). Examples 1–4 below reflect the current single-subject
 shape; the `cascade_subjects` canonical column is a JSON-encoded
 string of the one-element array. The production writer emits the
 embedded Subject with `$type` first (from the internal-tag) and
@@ -436,9 +436,8 @@ f0465eef6ef0318ae497e97d5fe7adf76143090f577266bfd812e6b7f4739d27
 - `snapshot_id: null`, `event_id: null`
 - `previous_hash:
   "3e5c0aca41c91b941e7382218fb063be599a9f50266aee7a188991096a2450bc"`
-  (Example 1's `currentHash` — post-Arc-4 cascade-populated shape)
-- `cascade_subjects`: JSON-encoded string (single-subject; populated
-  per Arc 4 §8.3.3):
+  (Example 1's `currentHash` — cascade-populated shape)
+- `cascade_subjects`: JSON-encoded string (single-subject):
   ```
   [{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:test1234567890abcdef"}]
   ```
@@ -463,7 +462,7 @@ the chain provides.
   independent response shape that drops several fields and emits
   i64 ids as JSON numbers (not stringified). Forensic export
   verification is not covered by this document. Rationalizing the
-  two surfaces is a v0.4 follow-up.
+  two surfaces is future work.
 - **`tools.aurora.admin.subscribeModEvents`** shares the
   `AuditEntry` wire shape (verified by an internal parity test)
   but has its own filter set and stream semantics. The per-entry
@@ -472,9 +471,9 @@ the chain provides.
 
 ## Versioning
 
-This contract applies to **v0.3 forward**. Any future change to the
-canonical hash-input shape (field additions, field ordering,
-representation changes) is a chain-incompatible breaking change
+This contract is stable. Any future change to the canonical
+hash-input shape (field additions, field ordering, representation
+changes) is a chain-incompatible breaking change
 and would constitute a new chain era; consumers should expect to
 update their verification implementation in lockstep with such a
 release.
@@ -482,5 +481,5 @@ release.
 The four contract surfaces from
 [contract-stability.md](contract-stability.md) commit to additive
 evolution of the wire shape. The audit-trail read contract here is
-a fifth surface, committed in Arc 3 Step 3's doc comment on
+a fifth surface, committed in the doc comment on
 `crate::api::aurora_admin::GetAuditTrailOutput`.

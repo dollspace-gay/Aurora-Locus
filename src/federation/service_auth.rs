@@ -14,12 +14,11 @@
 
 use crate::error::{PdsError, PdsResult};
 use crate::identity::IdentityResolverApi;
-use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use chrono::Utc;
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 /// Service auth JWT claims (ATProto spec)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,66 +54,22 @@ impl ServiceAuthenticator {
         Self { identity_resolver }
     }
 
-    /// Create a service auth JWT for cross-PDS request
-    ///
-    /// This JWT is signed with the user's atproto signing key from their DID document.
-    /// The receiving service will verify by resolving the issuer DID and checking the signature.
-    ///
-    /// # Arguments
-    /// * `user_did` - The user's DID (issuer)
-    /// * `target_service_did` - The target service's DID (audience)
-    /// * `endpoint` - Optional endpoint identifier (e.g., "com.atproto.repo.getRecord")
-    ///
-    /// # Returns
-    /// A signed JWT token string
-    pub async fn create_service_jwt(
-        &self,
-        user_did: &str,
-        target_service_did: &str,
-        endpoint: Option<&str>,
-    ) -> PdsResult<String> {
-        debug!(
-            "Creating service JWT: user={}, target={}, endpoint={:?}",
-            user_did, target_service_did, endpoint
-        );
-
-        // Get user's atproto signing key from DID document
-        let signing_key = self
-            .identity_resolver
-            .get_signing_key(user_did)
-            .await
-            .map_err(|e| {
-                PdsError::Internal(format!("Failed to get signing key for {}: {}", user_did, e))
-            })?;
-
-        // Create JWT claims
-        let now = Utc::now();
-        let exp = now + Duration::seconds(59); // <60 seconds (ATProto requirement)
-
-        let claims = ServiceAuthClaims {
-            iss: user_did.to_string(),
-            aud: target_service_did.to_string(),
-            exp: exp.timestamp(),
-            iat: now.timestamp(),
-            lxm: endpoint.map(|s| s.to_string()),
-            jti: Uuid::new_v4().to_string(), // Unique nonce
-        };
-
-        // Create JWT header (ES256 algorithm)
-        let mut header = Header::new(Algorithm::ES256);
-        header.typ = Some("at+jwt".to_string()); // ATProto JWT type
-
-        // Sign JWT with user's atproto key
-        let encoding_key = EncodingKey::from_ec_pem(&signing_key)
-            .map_err(|e| PdsError::Internal(format!("Invalid signing key: {}", e)))?;
-
-        let token = encode(&header, &claims, &encoding_key)
-            .map_err(|e| PdsError::Internal(format!("Failed to create JWT: {}", e)))?;
-
-        debug!("✓ Created service JWT with jti={}", claims.jti);
-
-        Ok(token)
-    }
+    // Cluster 2 Member 2.3 — deleted `create_service_jwt` method
+    // here. It called `identity_resolver.get_signing_key(user_did)`
+    // (which returns a PUBLIC key from the issuer's DID document) and
+    // tried to use it as a PRIVATE signing key via
+    // EncodingKey::from_ec_pem — cannot work; public keys don't sign.
+    // Zero callers (grep confirmed; file carries `#![allow(dead_code)]`
+    // so the compiler didn't flag it). Deleting removes a foot-gun: the
+    // method looked callable on a type wired into AppContext, and a
+    // future contributor searching for "how do I mint a service JWT"
+    // could have landed here and shipped the public-key-as-private bug
+    // to production. The correct minting path is the free function
+    // `src/service_auth.rs::create_service_jwt`, which takes the
+    // private-key bytes as a parameter — that's the path
+    // src/api/server.rs::get_service_auth uses (post-Member 2.1 fix,
+    // with the per-account `get_atproto_signing_key_bytes` bytes).
+    // Folded into the Member 2.1 chainlink (#143) as hygiene.
 
     /// Verify a service auth JWT from another PDS
     ///
@@ -153,14 +108,35 @@ impl ServiceAuthenticator {
 
         debug!("JWT issuer: {}", issuer_did);
 
-        // Resolve issuer's DID document to get signing key
+        // Resolve issuer's DID document to get signing key.
+        //
+        // Cluster 2 Member 2.2 (#144): propagate typed
+        // PdsError::DidTombstoned unchanged so IntoResponse maps it to
+        // HTTP 400 `{"error": "DidTombstoned", ...}` per
+        // src/error.rs:620-624. Pre-#144 the .map_err destroyed the
+        // typed variant by stringifying into PdsError::Authentication
+        // → HTTP 401 opaque. The PLC-410 → DidTombstoned mapping in
+        // src/identity/resolver.rs::fetch_plc_document (#134 / Arc
+        // 13 v4.2) emitted the typed variant but never reached the
+        // wire because every live `verify_service_jwt` caller
+        // swallowed it here. Pattern-match: pass DidTombstoned
+        // through; wrap everything else as Authentication (preserving
+        // today's wire shape with the source-detail appended for
+        // tracing — non-tombstone strings are tracing-only, not
+        // grep'd by any test/runbook/metric).
         let signing_key = self
             .identity_resolver
             .get_signing_key(issuer_did)
             .await
-            .map_err(|e| {
-                warn!("Failed to resolve signing key for {}: {}", issuer_did, e);
-                PdsError::Authentication(format!("Could not verify issuer DID: {}", issuer_did))
+            .map_err(|e| match e {
+                PdsError::DidTombstoned(_) => e,
+                other => {
+                    warn!("Failed to resolve signing key for {}: {}", issuer_did, other);
+                    PdsError::Authentication(format!(
+                        "Could not verify issuer DID: {}: {}",
+                        issuer_did, other
+                    ))
+                }
             })?;
 
         // Verify JWT signature with issuer's public key

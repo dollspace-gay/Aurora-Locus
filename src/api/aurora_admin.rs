@@ -3441,87 +3441,27 @@ pub async fn get_audit_trail(
     let has_more = rows.len() as i64 > limit;
     let page_rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
 
-    use sqlx::Row as _;
+    // v0.6 batch tail A.1 — DRY consolidation. The inline manual
+    // row-parse + verify + AuditEntry-construct block here used to
+    // mirror `audit_chain::audit_entry_from_row` field-by-field
+    // (~80 LOC duplicate). Now consumes the shared helper; cursor
+    // tracking pulls id/timestamp from the constructed AuditEntry
+    // (entry.id is the i64 round-tripped through String — infallible
+    // parse because the helper just stringified it). The
+    // `forensic_audit_entries_match_get_audit_trail_shape` test still
+    // pins the byte-identical-shape invariant between this path and
+    // the exportAccountForensic loop at :3041-3062 (now both consume
+    // the helper).
     let mut items = Vec::with_capacity(page_rows.len());
     let mut last_at = None;
     let mut last_id = None;
     for row in page_rows {
-        let id: i64 = row.try_get("id").map_err(internal)?;
-        let sequence: i64 = row.try_get("sequence").map_err(internal)?;
-        let created_at_str: String = row.try_get("created_at").map_err(internal)?;
-        let timestamp = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-            .map_err(internal)?
-            .with_timezone(&chrono::Utc);
-        let actor_did: String = row.try_get("actor_did").map_err(internal)?;
-        let action: String = row.try_get("action").map_err(internal)?;
-        let subject_did: Option<String> = row.try_get("subject_did").ok().flatten();
-        let subject_uri: Option<String> = row.try_get("subject_uri").ok().flatten();
-        let subject_cid: Option<String> = row.try_get("subject_cid").ok().flatten();
-        let rationale: String = row.try_get("rationale").map_err(internal)?;
-        let snapshot_id: Option<i64> = row.try_get("snapshot_id").ok().flatten();
-        let event_id: Option<i64> = row.try_get("event_id").ok().flatten();
-        let current_hash: String = row.try_get("current_hash").map_err(internal)?;
-        let previous_hash: Option<String> = row.try_get("previous_hash").ok().flatten();
-        let cascade_str: Option<String> = row.try_get("cascade_subjects").ok().flatten();
-        let cascade_subjects: Vec<Subject> = cascade_str
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        let cascade_snapshot_ids_str: Option<String> =
-            row.try_get("cascade_snapshot_ids").ok().flatten();
-        // Parse the on-disk numeric JSON for the wire field. The
-        // verify_entry call below still receives the raw string
-        // form because the canonical hash sees the JSON-encoded
-        // string nested inside the canonical object (Arc 3 Step 2
-        // documents the wire-vs-canonical asymmetry).
-        let cascade_snapshot_ids_i64: Vec<Option<i64>> = cascade_snapshot_ids_str
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        let cascade_snapshot_ids: Vec<Option<String>> = cascade_snapshot_ids_i64
-            .iter()
-            .map(|opt| opt.map(|v| v.to_string()))
-            .collect();
-
-        let verified = audit_chain::verify_entry(
-            sequence,
-            &created_at_str,
-            &actor_did,
-            &action,
-            subject_did.as_deref(),
-            subject_uri.as_deref(),
-            subject_cid.as_deref(),
-            &rationale,
-            snapshot_id,
-            event_id,
-            previous_hash.as_deref(),
-            cascade_str.as_deref(),
-            cascade_snapshot_ids_str.as_deref(),
-            &current_hash,
-        );
-        let subject_ref = Subject::from_columns(
-            subject_did.as_deref(),
-            subject_uri.as_deref(),
-            subject_cid.as_deref(),
-        );
-        last_at = Some(timestamp);
-        last_id = Some(id);
-        items.push(AuditEntry {
-            id: id.to_string(),
-            sequence,
-            timestamp,
-            actor_did,
-            action,
-            subject_ref,
-            rationale,
-            snapshot_id: snapshot_id.map(|i| i.to_string()),
-            event_id: event_id.map(|i| i.to_string()),
-            current_hash,
-            previous_hash,
-            verified,
-            cascade_subjects,
-            cascade_snapshot_ids,
-        });
+        let entry = audit_chain::audit_entry_from_row(&row).map_err(internal)?;
+        last_at = Some(entry.timestamp);
+        last_id = Some(entry.id.parse::<i64>().expect(
+            "audit_entry_from_row stringified an i64 from the row; parse-back is infallible",
+        ));
+        items.push(entry);
     }
 
     let next_cursor = if has_more {
@@ -4080,6 +4020,7 @@ mod tests {
                 enabled: false,
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
+                buckets_retention_days: 7,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -6814,13 +6755,16 @@ mod tests {
 
     /// Arc 9 Step 4 / chainlink #55 Item 2: the forensic bundle's
     /// `audit-entries.json` must match `getAuditTrail`'s wire shape
-    /// field-for-field. Prior to this migration the two surfaces
+    /// field-for-field. Prior to that migration the two surfaces
     /// diverged on field names (`createdAt` vs `timestamp`), types
     /// (raw `i64` vs stringified), and four entirely-missing fields
     /// (`subjectRef`, `verified`, `cascadeSubjects`,
-    /// `cascadeSnapshotIds`). This test pins the two paths against
-    /// each other so a future cycle can DRY both onto
-    /// `audit_chain::audit_entry_from_row` with confidence.
+    /// `cascadeSnapshotIds`). v0.6 batch tail A.1 / G2 closed the
+    /// DRY gap — both paths now consume
+    /// `audit_chain::audit_entry_from_row`. This test is the
+    /// byte-identical-shape regression guard on top of the shared
+    /// helper: touching the helper must keep both wire outputs
+    /// stable.
     #[tokio::test]
     async fn forensic_audit_entries_match_get_audit_trail_shape() {
         let ctx = create_test_context().await;
@@ -7090,6 +7034,7 @@ mod tests {
                 enabled: false,
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
+                buckets_retention_days: 7,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

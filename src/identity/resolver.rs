@@ -146,14 +146,20 @@ impl IdentityResolver {
             }
         }
 
-        // Cache miss - resolve via SDK
+        // Cache miss - resolve via SDK. Two failure modes are
+        // distinguished: an Err from the resolver is a genuine
+        // resolution failure (DNS timeout, PLC unreachable, etc.) →
+        // PdsError::IdentityResolution → HTTP 500. An Ok(None) is the
+        // resolver completing cleanly but determining no DID maps to
+        // the handle → PdsError::HandleNotFound → HTTP 400 with the
+        // lexicon-canonical `HandleNotFound` error name.
         let did_str = self
             .handle_resolver
             .resolve(&normalized)
             .await
             .map_err(|e| PdsError::IdentityResolution(format!("Failed to resolve handle: {}", e)))?
             .ok_or_else(|| {
-                PdsError::IdentityResolution(format!(
+                PdsError::HandleNotFound(format!(
                     "Handle {} did not resolve to any DID",
                     normalized
                 ))

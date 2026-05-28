@@ -15,6 +15,9 @@
 //! transport-level seam, not the policy layer.
 
 use async_trait::async_trait;
+use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::{RData, RecordType};
 use hickory_resolver::TokioResolver;
 use std::sync::Arc;
 
@@ -58,13 +61,134 @@ impl HickoryDnsTxtResolver {
     /// Build a resolver from the system DNS configuration (`/etc/resolv.conf`
     /// on Unix, registry on Windows — `hickory-resolver`'s `system-config`
     /// feature handles both, on by default).
+    ///
+    /// ## RUSTSEC-2026-0118 (NSEC3 unbounded-loop) — accept-disposition
+    ///
+    /// The advisory's vulnerable code path is `verify_nsec3` in
+    /// `hickory-proto::dnssec::dnssec_dns_handle::nsec3_validation`. That
+    /// function is only callable through `DnssecDnsHandle`, which the
+    /// resolver builder wires in only when BOTH of the following hold:
+    ///
+    /// 1. The `__dnssec` feature is active on `hickory-resolver` — we do
+    ///    NOT enable it (`Cargo.toml` declares `hickory-resolver = "0.26.1"`
+    ///    with default features only; no `dnssec-ring` / `dnssec-aws-lc-rs`
+    ///    activation).
+    /// 2. `ResolverOpts.validate` is `true` — the `Default` impl sets it to
+    ///    `false`, and `read_system_conf`'s `parse_resolv_conf` never
+    ///    writes the field.
+    ///
+    /// Under `builder_tokio().build()` the resulting handle is
+    /// unconditionally `LookupEither::Retry`, never `Secure(DnssecDnsHandle)`.
+    /// NSEC3 validation is unreachable; the High advisory is therefore an
+    /// accepted exposure rather than an active risk in this build. See
+    /// `SECURITY.md` for the full reasoning + upstream-tracking note.
+    ///
+    /// **Reassessment trigger:** any future change that enables DNSSEC
+    /// validation (adds the `dnssec-ring` feature on the hickory pin, or
+    /// flips `options.validate = true` on this builder) re-exposes the
+    /// vulnerable path and must reopen this disposition.
     pub fn from_system() -> Result<Self, DnsResolverError> {
-        let resolver = TokioResolver::builder_tokio()
-            .map_err(|e| DnsResolverError::Transport {
+        // Phase-B-only env-var branch (Cluster 1 Member 1.2 — Scenario 13).
+        // When `PDS_LEXICON_DNS_NAMESERVER` is set, the constructor builds
+        // a hand-configured `ResolverConfig` pointing at the operator-
+        // supplied nameserver (typically `127.0.0.1:5353` for the Phase B
+        // mock-DNS responder) instead of reading `/etc/resolv.conf`. This
+        // is the env-var foot-gun the design doc calls out as forbidden
+        // in production: the operator-docs companion item documents the
+        // forbidden-in-production posture; this code does NOT enforce it
+        // (an unset env var is the only safe production state).
+        //
+        // Layer 2 cache-defeat: when the env-var path fires, also set
+        // `ResolverOpts.cache_size = 0` so the resolver doesn't satisfy
+        // a Scenario-13 sub-case from a prior sub-case's cached answer.
+        // Best-effort — Moka has no synchronous admission reject at
+        // cap=0; Layers 1 (responder TTL=0) and 3 (per-sub-case unique
+        // NSIDs) are belt-and-suspenders. Production keeps the default
+        // (cache_size=32).
+        //
+        // **NSEC3 reassessment-trigger note (RUSTSEC-2026-0118):** this
+        // Phase-B branch must NEVER set `options.validate = true` —
+        // doing so would activate the cfg-gated DnssecDnsHandle (subject
+        // to the `__dnssec` feature being on, which we also do not
+        // enable) and reopen the accepted advisory. The accept-
+        // disposition in SECURITY.md depends on BOTH gates staying
+        // closed; this branch keeps `validate` at its default false.
+        if let Ok(addr_str) = std::env::var("PDS_LEXICON_DNS_NAMESERVER") {
+            return Self::from_phase_b_nameserver(&addr_str);
+        }
+
+        let builder = TokioResolver::builder_tokio().map_err(|e| {
+            DnsResolverError::Transport {
                 name: "<system-config>".to_string(),
                 source_detail: format!("hickory builder: {e}"),
-            })?
-            .build();
+            }
+        })?;
+        // hickory-resolver 0.26: `.build()` returns `Result<Resolver<P>, NetError>`
+        // (was infallible in 0.25). Map the NetError into our Transport variant
+        // so callers don't have to know about hickory's internal error type.
+        let resolver = builder.build().map_err(|e| DnsResolverError::Transport {
+            name: "<system-config>".to_string(),
+            source_detail: format!("hickory build: {e}"),
+        })?;
+        Ok(Self {
+            inner: Arc::new(resolver),
+        })
+    }
+
+    /// Phase-B-only constructor — points at an operator-supplied
+    /// nameserver (typically `127.0.0.1:5353` for the Cluster 1 Member 1.2
+    /// mock-DNS responder). Reached from `from_system` when
+    /// `PDS_LEXICON_DNS_NAMESERVER` is set.
+    ///
+    /// The env-var precedence is "set wins" — if set in production by
+    /// accident this silently retargets all lexicon DNS to the operator-
+    /// supplied nameserver with caching disabled. The operator-docs item
+    /// in V06_DESIGN.md batch-tail Section F documents this as forbidden
+    /// in production; this code is the Phase B affordance, not a runtime
+    /// config knob.
+    fn from_phase_b_nameserver(addr_str: &str) -> Result<Self, DnsResolverError> {
+        let addr: std::net::SocketAddr =
+            addr_str.parse().map_err(|e| DnsResolverError::Transport {
+                name: "<phase-b-nameserver>".to_string(),
+                source_detail: format!(
+                    "PDS_LEXICON_DNS_NAMESERVER '{addr_str}' is not a SocketAddr: {e}"
+                ),
+            })?;
+
+        // Build a single-nameserver ResolverConfig with the port
+        // carried natively on the ConnectionConfig (resolv.conf's
+        // `nameserver` syntax rejects `:port`, so this code path
+        // avoids the resolv.conf parse entirely — Stage-1 GT-1 recon
+        // confirmed the resolv.conf approach is broken).
+        let mut connection = ConnectionConfig::udp();
+        connection.port = addr.port();
+        let name_server = NameServerConfig::new(addr.ip(), true, vec![connection]);
+        let config = ResolverConfig::from_parts(None, vec![], vec![name_server]);
+
+        let mut builder = TokioResolver::builder_with_config(
+            config,
+            TokioRuntimeProvider::default(),
+        );
+        // Layer 2 cache-defeat: cap the per-instance cache at zero so
+        // a 13a answer can't be served to a 13b query under Moka
+        // cache-key collision (Layer 3 makes the keys distinct, but
+        // this is belt-and-suspenders).
+        builder.options_mut().cache_size = 0;
+        // Note: `ResolverOpts::validate` is `#[cfg(feature =
+        // "__dnssec")]` in hickory-resolver 0.26.1, so the field
+        // **does not exist** in our build (no `dnssec-ring` /
+        // `dnssec-aws-lc-rs` features active). The
+        // RUSTSEC-2026-0118 accept-disposition's "validate=false"
+        // gate is structurally enforced by the missing field; a
+        // defensive `builder.options_mut().validate = false;` here
+        // wouldn't compile under our feature set. If a future build
+        // ever flips `__dnssec` on, the SECURITY.md reassessment
+        // trigger fires.
+
+        let resolver = builder.build().map_err(|e| DnsResolverError::Transport {
+            name: "<phase-b-nameserver>".to_string(),
+            source_detail: format!("hickory build (phase-b): {e}"),
+        })?;
         Ok(Self {
             inner: Arc::new(resolver),
         })
@@ -89,14 +213,32 @@ impl DnsTxtResolver for HickoryDnsTxtResolver {
         // each TXT record's character-data chunks into one string. Multiple
         // TXT records remain as separate Vec entries — the caller decides
         // policy (strict-fail-on-multiple vs accept-first-etc).
+        //
+        // hickory-resolver 0.26 changed the iteration model: `txt_lookup`
+        // returns the generic `Lookup` (was the specialized `TxtLookup`),
+        // which exposes `.answers() -> &[Record]` instead of an
+        // `iter()`-yielding-`&TXT` shape. The semantic is preserved:
+        // (a) filter answers to RecordType::TXT (the message can carry
+        //     auxiliary records — CNAME for the alias, signatures, etc.,
+        //     even though our `txt_lookup` is type-narrow);
+        // (b) match `record.data()` on `RData::TXT` to access the chunk
+        //     vector (`TXT::txt_data: Box<[Box<[u8]>]>`);
+        // (c) join the chunks with empty separator, lossy-utf8 per chunk
+        //     (`from_utf8_lossy`), matching the 0.25 behaviour exactly.
         let mut out = Vec::new();
-        for record in lookup.iter() {
-            let joined: String = record
-                .iter()
-                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                .collect::<Vec<_>>()
-                .join("");
-            out.push(joined);
+        for record in lookup.answers() {
+            if record.record_type() != RecordType::TXT {
+                continue;
+            }
+            if let RData::TXT(txt) = &record.data {
+                let joined: String = txt
+                    .txt_data
+                    .iter()
+                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("");
+                out.push(joined);
+            }
         }
 
         if out.is_empty() {

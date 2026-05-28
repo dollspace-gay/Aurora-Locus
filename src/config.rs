@@ -1123,6 +1123,13 @@ pub struct RateLimitConfig {
     /// for the exact path/method matrix. Set to `false` to opt admin
     /// assets back into the limiter.
     pub exempt_admin_assets: bool,
+    /// Inactivity threshold for `rate_limit_buckets` reaper sweeps,
+    /// in whole days. Buckets whose `window_start_at_epoch_ms`
+    /// hasn't been touched in this duration are deleted at the
+    /// hourly sweep. Defaults to 7 (the v0.4 in-code constant);
+    /// operator-tunable via `PDS_RATE_LIMIT_BUCKETS_RETENTION_DAYS`
+    /// per V06 batch tail G7.2.
+    pub buckets_retention_days: u32,
 }
 
 /// Logging configuration
@@ -1740,6 +1747,15 @@ impl ServerConfig {
             .unwrap_or_else(|_| "true".to_string())
             .parse()
             .unwrap_or(true);
+        // V06 batch tail G7.2 — rate_limit_buckets reaper inactivity
+        // threshold, in whole days. Default 7 preserves the v0.4
+        // in-code constant exactly; operator-tunable to handle
+        // deployments with different bucket churn / retention asks.
+        let rate_limit_buckets_retention_days =
+            env::var("PDS_RATE_LIMIT_BUCKETS_RETENTION_DAYS")
+                .unwrap_or_else(|_| "7".to_string())
+                .parse()
+                .unwrap_or(7);
 
         let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
@@ -1749,11 +1765,14 @@ impl ServerConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or_default();
 
-        // Federation configuration
+        // Federation configuration. ATProto PDSes are federation peers by
+        // design; the default is `true`. Operators with closed-network,
+        // single-tenant, or development deployments set
+        // `PDS_FEDERATION_ENABLED=false` to opt out.
         let federation_enabled = env::var("PDS_FEDERATION_ENABLED")
-            .unwrap_or_else(|_| "false".to_string())
+            .unwrap_or_else(|_| "true".to_string())
             .parse()
-            .unwrap_or(false);
+            .unwrap_or(true);
         // Empty-entry filter is load-bearing: `AppContext::new` gates
         // RelayClient construction (and JobScheduler's
         // relay_firehose_subscription_job spawn) on
@@ -1944,6 +1963,7 @@ impl ServerConfig {
                 enabled: rate_limit_enabled,
                 global_requests_per_minute: rate_limit_requests,
                 exempt_admin_assets: rate_limit_exempt_admin_assets,
+                buckets_retention_days: rate_limit_buckets_retention_days,
             },
             logging: LoggingConfig { level: log_level },
             federation: FederationConfig {

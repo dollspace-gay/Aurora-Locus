@@ -1,9 +1,7 @@
 # Multi-instance Aurora-Locus deployment
 
 Operator guide for running Aurora-Locus across two or more
-instances sharing a single Postgres backend. Introduced in
-v0.4 / Arc 7 (chainlink #53; design at
-[`docs/V04_DESIGN.md`](../V04_DESIGN.md) §6).
+instances sharing a single Postgres backend.
 
 ## Overview
 
@@ -13,10 +11,9 @@ HTTP server, behind a load balancer, sharing one Postgres
 database and one blob store. Each instance handles arbitrary
 requests; routing is the load balancer's responsibility.
 
-Prior to v0.4, Aurora-Locus could share Postgres and a blob
-store across instances (those primitives have been in place
-since v0.2), but three pieces of in-process state were
-per-instance:
+Aurora-Locus can share Postgres and a blob store across
+instances, but three pieces of state can be per-instance unless the
+distributed-state substrate is enabled:
 
 - **DPoP JTI replay tracking** — a client's authentication
   proof, identified by its JTI claim, was accepted-or-rejected
@@ -26,15 +23,13 @@ per-instance:
 - **Rate-limit token buckets** — each instance ran its own
   in-memory counters. A client hitting two instances
   round-robin saw their effective rate doubled.
-- (OAuth flow state was already DB-backed even before Arc 7.
-  Step 0 reconnaissance corrected the original design's
-  framing on that point.)
+- OAuth flow state is DB-backed by default and is already
+  cross-instance-coherent.
 
-Arc 7 introduces the **`DistributedStore` substrate** — a
-trait-shaped abstraction backed by Postgres-CAS that makes
-both of the above cross-instance-coherent. Operators get to
-choose between the substrate (cross-instance correct,
-slightly higher hot-path latency) and the pre-Arc-7 in-memory
+The **`DistributedStore` substrate** is a trait-shaped abstraction
+backed by Postgres-CAS that makes both of the above cross-instance-
+coherent. Operators get to choose between the substrate (cross-instance
+correct, slightly higher hot-path latency) and the in-memory
 behaviour (lower latency, single-instance only).
 
 ### When multi-instance makes sense
@@ -45,7 +40,7 @@ behaviour (lower latency, single-instance only).
   other(s) keep serving.
 - **Vertical-scale ceiling reached**: a single instance's
   CPU / memory / file-descriptor budget is the limit. Adding
-  instances scales request handling horizontally.
+  instances scales request handling across more hardware.
 - **Geographic redundancy**: instances in multiple
   availability zones (sharing one Postgres + blob store)
   reduce blast radius for regional outages.
@@ -70,8 +65,7 @@ behaviour (lower latency, single-instance only).
 ## Prerequisites
 
 - **Postgres backend** (required for any multi-instance
-  Aurora-Locus deployment; v0.2 introduced this and
-  Arc 7 extends its use).
+  Aurora-Locus deployment).
 - **Connection budget**: the Postgres `max_connections`
   server-side limit must accommodate
   `(main_pool + maintenance_pool + 2) × instance_count`,
@@ -97,8 +91,8 @@ The headline operator knob. Three values:
 | Value | Behaviour |
 |---|---|
 | **`distributed`** *(default)* | Substrate enabled. OAuth state, DPoP JTI replay, rate-limit buckets all cross-instance-coherent via the maintenance-pool-backed Postgres tables. |
-| `single_instance_inmemory` | Substrate skipped. DPoP JTI replay + rate-limit buckets live in process memory; OAuth state is still DB-backed (the pre-Arc-7 behaviour). Lower latency on the auth hot path; **lost on restart** for the in-memory surfaces. |
-| `redis` | **Forward-compat slot only — not implemented in v0.4.** Setting this fails fast at startup with `PdsError::Validation`. Reserved so a future cycle can ship a Redis backend without re-shaping the operator config surface. |
+| `single_instance_inmemory` | Substrate skipped. DPoP JTI replay + rate-limit buckets live in process memory; OAuth state is still DB-backed. Lower latency on the auth hot path; **lost on restart** for the in-memory surfaces. |
+| `redis` | **Forward-compat slot only — not currently implemented.** Setting this fails fast at startup with `PdsError::Validation`. Reserved so a future Redis backend can land without re-shaping the operator config surface. |
 
 The default is the right choice for both deployment shapes:
 
@@ -109,8 +103,8 @@ The default is the right choice for both deployment shapes:
   request. Most operators see this as a fair trade for the
   durability win (DPoP JTI replay state and rate-limit
   buckets survive restarts). Single-instance operators who
-  explicitly prefer the pre-Arc-7 latency profile and accept
-  restart loss opt into `single_instance_inmemory`.
+  explicitly prefer the lower-latency in-memory profile and
+  accept restart loss opt into `single_instance_inmemory`.
 
 ### Maintenance pool sizing
 
@@ -150,35 +144,15 @@ state in the corresponding mode).
 | `PDS_MAINTENANCE_DB_MAX_CONNECTIONS` | `AppContext::new` | See above. |
 | `PDS_MAINTENANCE_DB_MIN_CONNECTIONS` | `AppContext::new` | See above. |
 | `PDS_MAINTENANCE_DB_ACQUIRE_TIMEOUT_SECS` | `AppContext::new` | See above. |
-| `PDS_DB_BACKEND` | Existing (v0.2). | Must be `postgres` for genuine multi-instance benefit. Arc 7 emits a startup warning if `distributed` mode is paired with `sqlite`. |
-| `PDS_DB_URL` | Existing (v0.2). | Required for `postgres` backend. |
-| `PDS_DB_MAX_CONNECTIONS` | Existing (v0.2). | Main application pool. Default 25. |
+| `PDS_DB_BACKEND` | Database backend selector. | Must be `postgres` for genuine multi-instance benefit. A startup warning fires if `distributed` mode is paired with `sqlite`. |
+| `PDS_DB_URL` | Database connection URL. | Required for `postgres` backend. |
+| `PDS_DB_MAX_CONNECTIONS` | Main application pool. | Default 25. |
 
-## Migration path
+## Scaling out
 
-### Upgrading a single-instance v0.3 deployment to v0.4
+### Single instance to many
 
-1. **Stop the v0.3 instance.**
-2. **Deploy the v0.4 binary.** On first start, the
-   `sqlx::migrate!` macro auto-applies migration
-   `0007_distributed_state.sql`, creating two new tables
-   (`dpop_jti_replay` and `rate_limit_buckets`). No data
-   migration runs; existing tables (including
-   `authorization_request`) are untouched.
-3. **Start the v0.4 binary.** Default
-   `PDS_DISTRIBUTED_STATE_MODE=distributed`. The
-   maintenance pool is constructed, reapers spawn,
-   substrate is wired into the auth hot path.
-4. *(Optional)* If you want the pre-Arc-7 latency profile
-   on a still-single-instance deployment, set
-   `PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory`
-   and restart.
 
-Total operator-visible downtime for the v0.3 → v0.4
-upgrade: the same as any v0.3 binary swap — ~30 seconds
-for typical deployments.
-
-### Scaling a v0.4 deployment from one instance to many
 
 1. **Provision additional instances** pointing at the same
    Postgres and the same blob store. Each instance gets its
@@ -190,13 +164,12 @@ for typical deployments.
    produce inconsistent rate-limit and DPoP-replay behaviour
    and are unsupported.
 3. **Set the load balancer** to route to all instances.
-   Health-check each instance on `/health` (existing
-   pre-Arc-7 endpoint).
+   Health-check each instance on `/health`.
 4. **Verify cross-instance behaviour** with the smoke
    checks listed under "Verification" below.
 
 No schema migration runs when scaling up — the tables are
-already in place from step 2 of the v0.3 → v0.4 upgrade.
+already in place from the initial deployment.
 
 ### Verification smoke checks (multi-instance)
 
@@ -206,9 +179,7 @@ balancer:
 - **OAuth flow continuity**: initiate the OAuth flow against
   the load balancer. The authorization endpoint may land on
   instance A; the token endpoint may land on instance B.
-  Confirm completion succeeds. (This was already true
-  pre-Arc-7 since the OAuth flow state was DB-backed; it's
-  retained as a regression check.)
+  Confirm completion succeeds.
 - **DPoP replay rejection across instances**: capture an
   authenticated request's DPoP proof; replay it twice
   through the load balancer. The first request succeeds;
@@ -259,15 +230,13 @@ operator-visible, and doesn't compound across cycles.
 
 ## Monitoring
 
-Arc 7's distributed-state substrate plugs into Aurora-Locus's
-existing Prometheus + tracing instrumentation; no new
-Arc-7-specific Prometheus metric families were added in
-v0.4. The existing metrics that DO reflect substrate
-behaviour:
+The distributed-state substrate plugs into Aurora-Locus's existing
+Prometheus + tracing instrumentation. The metrics that reflect
+substrate behaviour:
 
 | Metric | What it tells you |
 |---|---|
-| `background_jobs_total{job_type,status}` | Reaper sweep run counts. Arc 7's reapers report under `job_type` values matching the in-job tracing labels (`dpop_jti_replay`, `oauth_flow_state`, `rate_limit_buckets`); the existing `cleanup_*` jobs report under their own names. Alert on `status="failed"` count climbing. |
+| `background_jobs_total{job_type,status}` | Reaper sweep run counts. Substrate reapers report under `job_type` values matching the in-job tracing labels (`dpop_jti_replay`, `oauth_flow_state`, `rate_limit_buckets`); the existing `cleanup_*` jobs report under their own names. Alert on `status="failed"` count climbing. |
 | `background_job_duration_seconds{job_type}` | Histogram of reaper sweep duration. Sustained elevation indicates table growth outpacing the sweep budget. |
 | `background_jobs_active` | Gauge of in-flight background jobs. |
 | `db_query_duration_seconds{operation,table}` | Per-query Postgres latency. The substrate's operations show up under the relevant `table` value (`dpop_jti_replay`, `rate_limit_buckets`, `authorization_request`). Histogram p99 climbing past ~50ms indicates either Postgres saturation or maintenance-pool exhaustion. |
@@ -286,29 +255,23 @@ seams:
 - `tracing::info!` on reaper sweeps that swept ≥1 row, with
   the table and count.
 
-**v0.6 roadmap**: dedicated Prometheus metric families for
-substrate operations
+Dedicated Prometheus metric families for substrate operations
 (`aurora_distributed_store_operations_total`,
 `aurora_distributed_store_latency_seconds`,
-`rate_limit_substrate_fallthrough_total`) are on the v0.6
-candidate accumulator. v0.4 ships with the tracing-side
-observability and the existing DB-query / background-job
-metrics; if your deployment needs more granular surfaces,
-you can build them on top of the existing labels or wait
-for v0.6.
+`rate_limit_substrate_fallthrough_total`) are future work; until
+they ship, deployments needing more granular surfaces can build
+them on top of the existing labels.
 
 ### Substrate-consult fall-through
 
-A deliberate Step-3 design decision: **if the distributed-store
-consult fails on the rate-limit hot path** (Postgres
-hiccup, maintenance-pool saturation, transient network
-error), the request continues via the existing in-process
-governor rather than failing closed with a 503. The
-fall-through is non-fatal:
+A deliberate design decision: **if the distributed-store consult
+fails on the rate-limit hot path** (Postgres hiccup, maintenance-
+pool saturation, transient network error), the request continues
+via the existing in-process governor rather than failing closed
+with a 503. The fall-through is non-fatal:
 
 - Operators see degraded cross-instance protection in the
-  warn-log stream and (eventually, post-v0.6) in dedicated
-  metrics.
+  warn-log stream and in the (future) dedicated metrics.
 - Users see continued service.
 
 This trades a brief window of per-instance-only rate limit
@@ -323,49 +286,40 @@ to invert the decision; doing so is a one-line change in
 follow up with the maintainers if this is a deployment
 requirement.
 
-## Known limitations (v0.4)
+## Known limitations
 
-- **Distributed rate-limit defaults are hardcoded**: 100
-  tokens at 100 tokens/sec for the per-endpoint pre-check.
-  The existing governor's `EndpointRateLimitConfig::bluesky_defaults`
-  per-endpoint multi-limit configuration is unchanged and
-  remains active in series with the distributed check.
-  Per-endpoint configurability for the distributed path is
-  a v0.6 candidate.
-- **`rate_limit_buckets` retention is hardcoded at 7 days**.
-  The reaper sweeps buckets whose `window_start_at_epoch_ms`
-  hasn't moved in a week. Configurable threshold is a v0.6
-  candidate.
+- **Distributed rate-limit defaults are hardcoded**: 100 tokens at
+  100 tokens/sec for the per-endpoint pre-check. The existing
+  governor's `EndpointRateLimitConfig::bluesky_defaults`
+  per-endpoint multi-limit configuration is unchanged and remains
+  active in series with the distributed check. Per-endpoint
+  configurability for the distributed path is future work.
+- **`rate_limit_buckets` retention is hardcoded at 7 days**. The
+  reaper sweeps buckets whose `window_start_at_epoch_ms` hasn't
+  moved in a week. Configurable threshold is future work.
 - **DPoP server-side nonce issuance stays in-memory**. The
-  `/xrpc/com.atproto.federation.getDpopNonce` endpoint
-  issues §8 nonces; those are *not* migrated to the
-  substrate in v0.4. The substrate's DPoP scope is JTI
-  replay only (RFC 9449 §11.1). The `dpop_jti_replay`
-  table name reflects this honestly.
-- **No DPoP parse-result cache** in v0.4. The `TtlCache`
-  primitive (`src/distributed/cache.rs`) is in place from
-  Step 1, but no consumer wires through it; Step 3 deferred
-  shipping pending profiling that demonstrates parse-step
-  latency is a real bottleneck. v0.6 candidate.
+  `/xrpc/com.atproto.federation.getDpopNonce` endpoint issues
+  nonces in process memory; those are not migrated to the
+  substrate. The substrate's DPoP scope is JTI replay only
+  (RFC 9449 §11.1). The `dpop_jti_replay` table name reflects
+  this honestly.
 - **Redis backend slot reserved but not implemented**.
-  `PDS_DISTRIBUTED_STATE_MODE=redis` fails fast at startup.
-  No deployment work-around in v0.4; future cycles may add
-  a Redis backend against the same trait surface.
-- **Manual hot-path smoke testing is the operator's
-  responsibility**. The Arc 7 cycle validated correctness
-  via 924 lib unit tests + 11 cross-instance integration
-  tests against real Postgres (testcontainers). End-to-end
-  HTTP-level smoke tests across two `axum::serve` instances
-  were not built; the substrate-level tests cover the
-  cross-instance correctness invariants but don't exercise
-  the full handler wire.
-- **No dedicated Arc-7 Prometheus metrics**. See "Monitoring"
-  above. v0.6 candidate.
+  `PDS_DISTRIBUTED_STATE_MODE=redis` fails fast at startup. No
+  deployment work-around today; a future Redis backend can land
+  against the same trait surface.
+- **Manual hot-path smoke testing is the operator's responsibility**.
+  Substrate correctness is validated by lib unit tests +
+  cross-instance integration tests against real Postgres
+  (testcontainers). End-to-end HTTP-level smoke tests across two
+  `axum::serve` instances are not built in; the substrate-level
+  tests cover cross-instance correctness invariants but don't
+  exercise the full handler wire.
+- **No dedicated substrate-operation Prometheus metric families**.
+  See "Monitoring" above for what's currently observable.
 
 ## Performance characteristics
 
-The Arc 7 cycle did not perform formal benchmarks; the
-numbers below are **engineering estimates against healthy
+The numbers below are **engineering estimates against healthy
 infrastructure**, not measured deployment data:
 
 - **DPoP verification** (with substrate consult): adds one
@@ -404,7 +358,7 @@ the most likely causes are:
 
 ## Troubleshooting
 
-### "Why is my deployment slow after upgrading to v0.4?"
+### "Why is my deployment slow after enabling the substrate?"
 
 Likely the maintenance pool is saturated or
 `PDS_MAINTENANCE_DB_MAX_CONNECTIONS` is set too low for
@@ -428,19 +382,18 @@ is the issue. If you see different JTIs being rejected,
 look for clock skew between the client and server (JTIs
 have an `exp` claim; past-exp proofs are rejected).
 
-### "Rate limits feel tighter than v0.3"
+### "Rate limits feel tighter than before enabling the substrate"
 
-Expected when running in `distributed` mode for the
-first time. Pre-Arc-7 each instance ran its own rate-limit
-counter; if you had 4 instances, a client effectively saw
-4× the rate budget. Arc 7's distributed pre-check
-aggregates across instances — the deployment-wide limit
-is what the bucket configuration says it is.
+Expected when running in `distributed` mode for the first time.
+Without the substrate each instance ran its own rate-limit counter;
+if you had 4 instances, a client effectively saw 4× the rate
+budget. The distributed pre-check aggregates across instances — the
+deployment-wide limit is what the bucket configuration says it is.
 
-For single-instance deployments where you preferred the
-pre-Arc-7 latency profile, set
-`PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory` to
-fall back to per-instance limits.
+For single-instance deployments where the lower-latency in-memory
+profile is preferred, set
+`PDS_DISTRIBUTED_STATE_MODE=single_instance_inmemory` to fall back
+to per-instance limits.
 
 ### "I see `distributed rate-limit consult failed, falling
 through to governor` in logs"
@@ -472,14 +425,8 @@ effect — check mode configuration first.
 
 ## References
 
-- Design doc: [`docs/V04_DESIGN.md`](../V04_DESIGN.md) §6
-  for the full Arc 7 design including friction-risk
-  analysis (§6.5) and verification criteria (§6.6).
 - Migration file:
   [`migrations/0007_distributed_state.sql`](../../migrations/0007_distributed_state.sql)
   + Postgres twin.
 - Substrate code: [`src/distributed/`](../../src/distributed/)
-  for the trait surface, registry, and backend
-  implementations.
-- Issue tracker: chainlink #53 (Arc 7 — Multi-instance
-  auth state + rate limiting).
+  for the trait surface, registry, and backend implementations.

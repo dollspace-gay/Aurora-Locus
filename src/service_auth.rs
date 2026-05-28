@@ -81,6 +81,15 @@ pub enum ServiceAuthError {
     /// `exp` claim is too far in the future for the token's lxm
     /// presence/absence, per `ServiceAuthClaims::validate`.
     InvalidExpirationWindow(String),
+    /// `identity_resolver.resolve_did(...)` returned typed
+    /// `PdsError::DidTombstoned` (PLC-410 per Arc 13 v4.2 /
+    /// `src/identity/resolver.rs::fetch_plc_document`). Cluster 2
+    /// Member 2.2 (#144): split out from `ResolverError` so the
+    /// `From<ServiceAuthError> for PdsError` impl below routes this
+    /// typed variant to `PdsError::DidTombstoned` (→ HTTP 400) rather
+    /// than the catch-all `PdsError::Authentication` (→ HTTP 401).
+    /// The detail is the DID string from the resolver's typed payload.
+    DidTombstoned(String),
 }
 
 impl std::fmt::Display for ServiceAuthError {
@@ -103,6 +112,7 @@ impl std::fmt::Display for ServiceAuthError {
             Self::SignatureVerificationFailed => write!(f, "Signature verification failed"),
             Self::Expired => write!(f, "Service auth token has expired"),
             Self::InvalidExpirationWindow(detail) => write!(f, "Invalid expiration: {}", detail),
+            Self::DidTombstoned(did) => write!(f, "Issuer DID tombstoned: {}", did),
         }
     }
 }
@@ -126,6 +136,18 @@ impl From<ServiceAuthError> for PdsError {
             // Validation-window violations stay as Validation errors
             // (matching `ServiceAuthClaims::validate`).
             ServiceAuthError::InvalidExpirationWindow(_) => PdsError::Validation(e.to_string()),
+            // Cluster 2 Member 2.2 (#144) — LOAD-BEARING. Route the
+            // typed DidTombstoned variant to PdsError::DidTombstoned
+            // (→ HTTP 400 `{"error": "DidTombstoned", ...}` via
+            // src/error.rs:620-624) BEFORE the catch-all below.
+            // Omitting this arm — or placing it after the catch-all —
+            // silently defeats the entire #144 fix: the new variant
+            // falls through to PdsError::Authentication → HTTP 401
+            // opaque, the typed wire shape never reaches IntoResponse.
+            // The verifier paths (federation/service_auth.rs and the
+            // free-fn `verify_service_jwt` in this file) emit the
+            // typed variant so the typed mapping has somewhere to land.
+            ServiceAuthError::DidTombstoned(did) => PdsError::DidTombstoned(did),
             // Everything else is an authentication failure (401).
             _ => PdsError::Authentication(e.to_string()),
         }
@@ -389,10 +411,21 @@ pub async fn verify_service_jwt(
         });
     }
 
+    // Cluster 2 Member 2.2 (#144): pattern-match the resolver error so
+    // PdsError::DidTombstoned (PLC-410 → typed variant per Arc 13 v4.2
+    // / fetch_plc_document) reaches the From<ServiceAuthError> for
+    // PdsError impl via the typed DidTombstoned variant rather than
+    // being stringified into ResolverError → catch-all → HTTP 401
+    // opaque. Non-tombstone resolver errors preserve today's
+    // ResolverError(e.to_string()) shape byte-identical (the surface
+    // is tracing-only — not grep'd by any test/runbook/metric).
     let did_doc = identity_resolver
         .resolve_did(&claims.iss)
         .await
-        .map_err(|e| ServiceAuthError::ResolverError(e.to_string()))?;
+        .map_err(|e| match e {
+            PdsError::DidTombstoned(did) => ServiceAuthError::DidTombstoned(did),
+            other => ServiceAuthError::ResolverError(other.to_string()),
+        })?;
 
     let verification_method = did_doc.get_signing_key().ok_or_else(|| {
         ServiceAuthError::InvalidPublicKey(format!(
@@ -639,6 +672,100 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    /// Cluster 2 Member 2.1 (chainlink #143). Per-account-key
+    /// correctness: when `create_service_jwt` is given the bytes of
+    /// per-account key K_did (the value
+    /// `AccountManager::get_atproto_signing_key_bytes(did)` returns),
+    /// the resulting JWT signature MUST verify against the public key
+    /// derived from K_did — and MUST NOT verify against an
+    /// unrelated key (e.g. the server-wide `repo_signing_key` the
+    /// pre-#143 handler used). This is the invariant
+    /// `src/api/server.rs::get_service_auth` depends on post-#143:
+    /// the handler reads per-account bytes, calls create_service_jwt,
+    /// and a receiving PDS resolving `iss = auth.did` fetches the
+    /// per-account published verification method (derived on
+    /// account-create from the same K_did's public half) and verifies
+    /// the JWT successfully.
+    ///
+    /// True unit test: the expected verifying key is derived LOCALLY
+    /// from the seeded private key — no DID resolution, no mock
+    /// resolver, no PDS roundtrip. The "different key MUST NOT
+    /// verify" half is what proves the test isn't trivially
+    /// passing; it's the test that catches the pre-#143
+    /// server-wide-key bug (in pre-fix code the JWT would carry the
+    /// server-wide signature and verify against the server-wide
+    /// verifying key, NOT K_did's — that's the bug).
+    #[test]
+    fn create_service_jwt_signature_verifies_against_per_account_key_only() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        // K_did — the per-account atproto_signing_key bytes the
+        // post-#143 get_service_auth handler would hand to
+        // create_service_jwt via
+        // ctx.account_manager.get_atproto_signing_key_bytes(&auth.did).
+        let per_account_signing_key = SigningKey::random(&mut rand::thread_rng());
+        let per_account_bytes = per_account_signing_key.to_bytes();
+        let per_account_verifying_key = *per_account_signing_key.verifying_key();
+
+        // Unrelated key — stands in for the pre-#143 server-wide
+        // `repo_signing_key`. Verifies the test would fail to false-
+        // green if the handler regressed back to a non-per-account
+        // key.
+        let unrelated_signing_key = SigningKey::random(&mut rand::thread_rng());
+        let unrelated_verifying_key = *unrelated_signing_key.verifying_key();
+
+        let token = create_service_jwt(
+            "did:plc:issuer-per-account-test",
+            "did:plc:audience-per-account-test",
+            None,
+            None,
+            &per_account_bytes,
+        )
+        .expect("create_service_jwt with per-account bytes must succeed");
+
+        // Split header.claims.sig and reconstruct the signing input
+        // (header_b64 || "." || claims_b64) — same format
+        // create_service_jwt emits (src/service_auth.rs::~290).
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have header.claims.sig");
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(parts[2])
+            .expect("signature segment must be valid base64url-no-pad");
+        // create_service_jwt emits DER-encoded signatures
+        // (`signature.to_der()` at the sign site); decode with the
+        // matching DER constructor, NOT from_slice (which expects
+        // fixed-length r||s).
+        let signature = Signature::from_der(&sig_bytes)
+            .expect("signature segment must be valid k256 ECDSA DER");
+
+        // Positive half: per-account verifying key MUST verify.
+        // `Verifier::verify` matches `Signer::sign`'s ES256K shape
+        // (internal sha256 + secp256k1 ECDSA) — symmetric to the
+        // sign call at create_service_jwt's signing line.
+        per_account_verifying_key
+            .verify(signing_input.as_bytes(), &signature)
+            .expect(
+                "JWT signature MUST verify against the verifying key derived from \
+                 per-account signing bytes — Cluster 2 Member 2.1 (#143) invariant",
+            );
+
+        // Negative half: unrelated verifying key MUST NOT verify.
+        // This is the load-bearing check — it proves the JWT carries
+        // the per-account signature specifically, not a signature
+        // that would coincidentally verify against any key. If this
+        // assertion ever passes, create_service_jwt is signing with
+        // the wrong key or the test is trivially-passing (false-green
+        // for the pre-#143 server-wide-key bug shape).
+        assert!(
+            unrelated_verifying_key
+                .verify(signing_input.as_bytes(), &signature)
+                .is_err(),
+            "JWT signature MUST NOT verify against an unrelated key"
+        );
     }
 
     #[test]

@@ -330,7 +330,6 @@ async fn admin_managers_round_trip_on_postgres() {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "requires a live PLC at the configured endpoint; see chainlink #109"]
 async fn account_manager_round_trip_on_postgres() {
     use aurora_locus::account::AccountManager;
     use aurora_locus::config::*;
@@ -384,7 +383,18 @@ async fn account_manager_round_trip_on_postgres() {
             oauth_features: Default::default(),
         },
         identity: IdentityConfig {
-            did_plc_url: "https://plc.directory".to_string(),
+            // chainlink #109 Option A — point at the CI mock PLC on
+            // localhost:2582 so the integration test goes through the
+            // production path against a real (mock) PLC. The
+            // #[cfg(test)] sentinel at src/account/manager.rs:790-831
+            // synthesizes a fake DID when did_plc_url is the literal
+            // "https://plc.directory", but that sentinel does NOT
+            // fire for integration tests (lib compiled without
+            // #[cfg(test)]). Retargeting the URL routes the test
+            // through the real PLC interaction with the mock as
+            // counterpart. CI launches phase-b/mock-plc.py via the
+            // ci.yml "Launch mock PLC" step in the postgres-tests job.
+            did_plc_url: "http://localhost:2582".to_string(),
             service_handle_domains: vec![".localhost".to_string()],
             did_cache_stale_ttl: 3600,
             did_cache_max_ttl: 86400,
@@ -400,6 +410,7 @@ async fn account_manager_round_trip_on_postgres() {
             enabled: false,
             global_requests_per_minute: 3000,
             exempt_admin_assets: true,
+            buckets_retention_days: 7,
         },
         logging: LoggingConfig {
             level: "info".to_string(),

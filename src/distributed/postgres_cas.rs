@@ -45,7 +45,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::{AnyPool, Row};
 
-use super::{CasResult, DistributedError, DistributedStore, Lease};
+use super::{DistributedError, DistributedStore, Lease};
 
 /// Postgres-CAS backend for the [`DistributedStore`] trait.
 ///
@@ -59,11 +59,43 @@ use super::{CasResult, DistributedError, DistributedStore, Lease};
 #[derive(Clone)]
 pub struct PostgresCasStore {
     pool: Arc<AnyPool>,
+    /// Inactivity threshold for `rate_limit_buckets` sweeps, in
+    /// milliseconds. Buckets whose `window_start_at_epoch_ms`
+    /// hasn't been touched in this duration are presumed cold and
+    /// deleted by the reaper. Default is 7 days
+    /// ([`DEFAULT_RATE_LIMIT_RETENTION_MS`]); operator-tunable via
+    /// `PDS_RATE_LIMIT_BUCKETS_RETENTION_DAYS` per V06 batch tail
+    /// G7.2 (closes the v0.4-era "in-code constant" deferral
+    /// flagged at the previous reap-arm site).
+    rate_limit_retention_ms: i64,
 }
+
+/// 7-day default for the `rate_limit_buckets` inactivity sweep —
+/// the v0.4 in-code constant, now the default for the operator-
+/// tunable config. A bucket whose window_start hasn't been touched
+/// in 7 days is presumed cold; deleting it costs the next
+/// first-touch one extra INSERT (the bucket self-reconstructs at
+/// full max_tokens) but bounds table growth for deployments
+/// accumulating many unique bucket keys (one row per
+/// (client_id, endpoint_class) ever seen).
+pub const DEFAULT_RATE_LIMIT_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 
 impl PostgresCasStore {
     pub fn new(pool: Arc<AnyPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            rate_limit_retention_ms: DEFAULT_RATE_LIMIT_RETENTION_MS,
+        }
+    }
+
+    /// Override the `rate_limit_buckets` inactivity threshold (the
+    /// G7.2 operator-tunable). `days` is whole days; multiplied by
+    /// 86_400_000 ms internally. Production wiring at
+    /// [`crate::context::AppContext`] reads the value from
+    /// `config.rate_limit.buckets_retention_days`.
+    pub fn with_rate_limit_retention_days(mut self, days: u32) -> Self {
+        self.rate_limit_retention_ms = i64::from(days) * 24 * 3600 * 1000;
+        self
     }
 }
 
@@ -176,28 +208,6 @@ impl DistributedStore for PostgresCasStore {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn cas(
-        &self,
-        table: &str,
-        key: &str,
-        expected_version: i64,
-        new_value: &[u8],
-    ) -> Result<CasResult, DistributedError> {
-        match table {
-            "rate_limit_buckets" => {
-                self.cas_rate_limit_bucket(key, expected_version, new_value)
-                    .await
-            }
-            // Tables without a `version` column. Calling cas on
-            // them is a consumer-side bug; surface explicitly
-            // rather than silently no-op'ing.
-            "dpop_jti_replay" => {
-                Err(DistributedError::UnsupportedTable(table.to_string()))
-            }
-            other => Err(DistributedError::UnsupportedTable(other.to_string())),
-        }
-    }
-
     async fn reap_expired(
         &self,
         table: &str,
@@ -216,23 +226,12 @@ impl DistributedStore for PostgresCasStore {
             // Inactivity-based GC for rate_limit_buckets. Step 1
             // returned UnsupportedTable here because the policy
             // wasn't decided; Step 3 (V04_DESIGN.md §6.4.3
-            // post-recon resolution) commits to a 7-day
-            // inactivity threshold. A bucket whose
-            // `window_start_at_epoch_ms` hasn't been touched in
-            // 7 days is presumed cold; deleting it costs the next
-            // first-touch one extra INSERT (the bucket
-            // self-reconstructs at full max_tokens) but bounds
-            // table growth for deployments accumulating many
-            // unique bucket keys (one row per
-            // (client_id, endpoint_class) ever seen).
-            //
-            // The 7-day constant is in-code rather than
-            // configurable to keep the operator surface tight in
-            // v0.4; making it operator-tunable is a v0.6
-            // candidate (running accumulator).
+            // post-recon resolution) committed to a 7-day default;
+            // v0.6 batch tail G7.2 made the threshold operator-
+            // tunable via `PDS_RATE_LIMIT_BUCKETS_RETENTION_DAYS`
+            // (default 7) — see [`PostgresCasStore::with_rate_limit_retention_days`].
             "rate_limit_buckets" => {
-                const SEVEN_DAYS_MS: i64 = 7 * 24 * 3600 * 1000;
-                let cutoff = now_epoch_ms - SEVEN_DAYS_MS;
+                let cutoff = now_epoch_ms - self.rate_limit_retention_ms;
                 let result = sqlx::query(
                     "DELETE FROM rate_limit_buckets WHERE window_start_at_epoch_ms < $1",
                 )
@@ -371,64 +370,6 @@ impl PostgresCasStore {
         Ok(Some(bytes))
     }
 
-    async fn cas_rate_limit_bucket(
-        &self,
-        bucket_key: &str,
-        expected_version: i64,
-        new_value: &[u8],
-    ) -> Result<CasResult, DistributedError> {
-        let parsed: RateLimitBucketValue = serde_json::from_slice(new_value).map_err(|e| {
-            sqlx::Error::Decode(Box::new(e))
-        })?;
-
-        // Atomic UPDATE: only writes when the version still
-        // matches the caller's expectation. Returns
-        // rows_affected = 1 on success, 0 on conflict.
-        let result = sqlx::query(
-            "UPDATE rate_limit_buckets \
-             SET tokens_remaining = $1, \
-                 max_tokens = $2, \
-                 refill_rate = $3, \
-                 window_start_at_epoch_ms = $4, \
-                 version = version + 1 \
-             WHERE bucket_key = $5 AND version = $6",
-        )
-        .bind(parsed.tokens_remaining)
-        .bind(parsed.max_tokens)
-        .bind(parsed.refill_rate)
-        .bind(parsed.window_start_at_epoch_ms)
-        .bind(bucket_key)
-        .bind(expected_version)
-        .execute(self.pool.as_ref())
-        .await?;
-
-        if result.rows_affected() == 1 {
-            return Ok(CasResult::Success {
-                new_version: expected_version + 1,
-            });
-        }
-
-        // CAS lost. Read the current version so the caller can
-        // refetch + recompute. A second query is unavoidable
-        // (the UPDATE returns no row when WHERE doesn't match);
-        // the cost is acceptable for a contention path.
-        let row = sqlx::query(
-            "SELECT version FROM rate_limit_buckets WHERE bucket_key = $1",
-        )
-        .bind(bucket_key)
-        .fetch_optional(self.pool.as_ref())
-        .await?;
-
-        // Row missing entirely: treat as "racing against
-        // version 0" so the caller can decide between insert
-        // and retry. Returning a Conflict with version 0 is
-        // honest about the observed state.
-        let current_version: i64 = match row {
-            Some(r) => r.try_get("version")?,
-            None => 0,
-        };
-        Ok(CasResult::Conflict { current_version })
-    }
 }
 
 #[cfg(test)]
@@ -627,17 +568,6 @@ mod tests {
         assert_eq!(remaining, 1);
     }
 
-    #[tokio::test]
-    async fn dpop_cas_returns_unsupported_table() {
-        let pool = fresh_pool().await;
-        let store = PostgresCasStore::new(pool);
-        let err = store
-            .cas("dpop_jti_replay", "k", 0, b"{}")
-            .await
-            .expect_err("cas on dpop table must error");
-        assert!(matches!(err, DistributedError::UnsupportedTable(_)));
-    }
-
     // ---------- rate_limit_buckets path ----------
 
     #[tokio::test]
@@ -659,78 +589,6 @@ mod tests {
         assert_eq!(parsed.tokens_remaining, 50);
         assert_eq!(parsed.max_tokens, 100);
         assert_eq!(parsed.refill_rate, 10);
-    }
-
-    #[tokio::test]
-    async fn rate_limit_cas_success_increments_version() {
-        let pool = fresh_pool().await;
-        let store = PostgresCasStore::new(Arc::clone(&pool));
-        store
-            .insert(
-                "rate_limit_buckets",
-                "b1",
-                &bucket_value(50, 100, 10, 0),
-                None,
-            )
-            .await
-            .unwrap();
-        let result = store
-            .cas("rate_limit_buckets", "b1", 0, &bucket_value(40, 100, 10, 1))
-            .await
-            .unwrap();
-        match result {
-            CasResult::Success { new_version } => assert_eq!(new_version, 1),
-            other => panic!("expected Success, got {:?}", other),
-        }
-        let version: i64 =
-            sqlx::query_scalar("SELECT version FROM rate_limit_buckets WHERE bucket_key = 'b1'")
-                .fetch_one(pool.as_ref())
-                .await
-                .unwrap();
-        assert_eq!(version, 1);
-    }
-
-    #[tokio::test]
-    async fn rate_limit_cas_conflict_reports_current_version() {
-        let pool = fresh_pool().await;
-        let store = PostgresCasStore::new(pool);
-        store
-            .insert(
-                "rate_limit_buckets",
-                "b2",
-                &bucket_value(50, 100, 10, 0),
-                None,
-            )
-            .await
-            .unwrap();
-        // Bump to version 1 successfully.
-        store
-            .cas("rate_limit_buckets", "b2", 0, &bucket_value(40, 100, 10, 1))
-            .await
-            .unwrap();
-        // Now race against the stale version 0.
-        let result = store
-            .cas("rate_limit_buckets", "b2", 0, &bucket_value(30, 100, 10, 2))
-            .await
-            .unwrap();
-        match result {
-            CasResult::Conflict { current_version } => assert_eq!(current_version, 1),
-            other => panic!("expected Conflict, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn rate_limit_cas_on_missing_row_reports_version_zero() {
-        let pool = fresh_pool().await;
-        let store = PostgresCasStore::new(pool);
-        let result = store
-            .cas("rate_limit_buckets", "ghost", 0, &bucket_value(1, 1, 1, 0))
-            .await
-            .unwrap();
-        match result {
-            CasResult::Conflict { current_version } => assert_eq!(current_version, 0),
-            other => panic!("expected Conflict for missing row, got {:?}", other),
-        }
     }
 
     #[tokio::test]
@@ -794,11 +652,6 @@ mod tests {
         assert!(matches!(err, DistributedError::UnsupportedTable(_)));
         let err = store
             .delete("zorblax", "k")
-            .await
-            .expect_err("unknown table");
-        assert!(matches!(err, DistributedError::UnsupportedTable(_)));
-        let err = store
-            .cas("zorblax", "k", 0, b"{}")
             .await
             .expect_err("unknown table");
         assert!(matches!(err, DistributedError::UnsupportedTable(_)));
