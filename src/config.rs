@@ -71,6 +71,18 @@ pub struct ServerConfig {
     /// opt in via `PDS_LEXICON_ENABLED=true`. See [`LexiconConfig`].
     #[serde(default)]
     pub lexicon: LexiconConfig,
+    /// v0.7 arc 1 — kryphocron substrate integration. Off-by-default
+    /// (master switch `enabled: false`). When enabled, kryphocron
+    /// lexicons are validated against `kryphocron::lexicons()` at
+    /// startup, the `tools.kryphocron.*` namespace becomes closed
+    /// (no dynamic-resolver fall-through), and Aurora-Locus's
+    /// dedicated kryphocron endpoints (arc 3+) become reachable.
+    /// In arc 1 ship state with the switch on, every kryphocron
+    /// NSID through the generic write path returns
+    /// `KryphocronRecordNotYetSupported` because no dedicated
+    /// endpoints exist yet. See [`KryphocronConfig`].
+    #[serde(default)]
+    pub kryphocron: KryphocronConfig,
 }
 
 /// Distributed-state substrate selector (Arc 7, V04_DESIGN.md
@@ -1217,6 +1229,45 @@ pub struct LexiconConfig {
     pub validate_imports: bool,
 }
 
+/// kryphocron substrate integration config (v0.7 arc 1).
+///
+/// Master switch + (later arcs) per-feature knobs. Arc 1 ships with
+/// just the `enabled` flag; arc 2+ adds audit-retry tuning, audience
+/// member limits, oracle cache TTLs, etc.
+///
+/// Env-var loading lives in [`KryphocronConfig::from_env_values`].
+/// Default `enabled: false` per v07_DESIGN.md §9 — closed-namespace
+/// policy applies whether the switch is on or off, but the registered-
+/// NSID branch of the dispatcher and the `kryphocron::lexicons()`
+/// startup load only fire when enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KryphocronConfig {
+    /// Master switch. Default `false`. When `false`, the dispatcher's
+    /// closed-namespace check still rejects `tools.kryphocron.*` writes
+    /// from the generic path with `UnsupportedNamespace`, but the
+    /// registry tier lookup, lexicon validation, and bind pipeline are
+    /// inert. Per v07_DESIGN.md §6 lines 3247-3257 the master-switch-off
+    /// state is behaviorally indistinguishable from "not compiled in"
+    /// for clients.
+    pub enabled: bool,
+}
+
+impl Default for KryphocronConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+impl KryphocronConfig {
+    /// Build a [`KryphocronConfig`] from already-extracted env values.
+    /// Single-knob in arc 1; later arcs add fields here.
+    pub fn from_env_values(enabled: Option<String>) -> PdsResult<Self> {
+        let defaults = Self::default();
+        let enabled = parse_bool_env("PDS_KRYPHOCRON_ENABLED", enabled, defaults.enabled)?;
+        Ok(Self { enabled })
+    }
+}
+
 /// Arc 17 §17.3.6 / round-1 F1 — what to do when a lexicon fetch fails
 /// at validate-phase. `Quarantine` (v1) was DROPPED for v0.5 per §17.5.7
 /// because Arc 16b's `blob_quarantine` is blob-CID-keyed while lexicon
@@ -1868,6 +1919,11 @@ impl ServerConfig {
             env::var("PDS_LEXICON_VALIDATE_IMPORTS").ok(),
         )?;
 
+        // v0.7 arc 1 — kryphocron substrate integration. Off-by-default.
+        let kryphocron = KryphocronConfig::from_env_values(
+            env::var("PDS_KRYPHOCRON_ENABLED").ok(),
+        )?;
+
         // Arc 12 §5.3.2 Gap 1: public_url override via env var.
         // Renamed locally to avoid shadowing federation's
         // existing `public_url` binding (different env var,
@@ -1983,6 +2039,7 @@ impl ServerConfig {
             blob_metadata,
             entryway,
             lexicon,
+            kryphocron,
         })
     }
 

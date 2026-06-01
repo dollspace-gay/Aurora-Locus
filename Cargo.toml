@@ -10,6 +10,15 @@ license = "MIT OR Apache-2.0"
 # AT Protocol SDK (published crate, replaces the previously vendored ./Rust-Atproto-SDK)
 proto-blue = "0.3.1"
 
+# kryphocron substrate (v0.7 integration). Consumed via path-dep during
+# the v0.7 cycle while the substrate evolves in lockstep with arc work;
+# flips to `kryphocron = "0.2"` at v0.7 close per v07_DESIGN.md §1.
+# kryphocron-lexicons is brought in transitively via kryphocron but
+# also declared directly so we can refer to the registry and tier
+# vocabulary by name.
+kryphocron = { path = "../kryphocron" }
+kryphocron-lexicons = { path = "../kryphocron-lexicons" }
+
 # Argon2id password hashing (vendored from the old SDK's server_auth module)
 argon2 = { version = "0.5", features = ["std"] }
 

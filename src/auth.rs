@@ -1575,6 +1575,7 @@ mod admin_auth_third_path_tests {
             blob_metadata: Default::default(),
             entryway: None,
             lexicon: crate::config::LexiconConfig::default(),
+            kryphocron: crate::config::KryphocronConfig::default(),
         };
         let mut ctx = AppContext::new(
             config,

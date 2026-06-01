@@ -133,6 +133,7 @@ async fn build_test_ctx() -> (AppContext, Arc<MockIdentityResolver>) {
         blob_metadata: Default::default(),
         entryway: None,
         lexicon: aurora_locus::config::LexiconConfig::default(),
+        kryphocron: aurora_locus::config::KryphocronConfig::default(),
     };
 
     let mut ctx = AppContext::new(

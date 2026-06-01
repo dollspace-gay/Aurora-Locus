@@ -23,6 +23,7 @@ mod error;
 mod federation;
 mod identity;
 mod jobs;
+mod kryphocron;
 mod mailer;
 mod metrics;
 mod oauth;

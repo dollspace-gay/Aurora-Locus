@@ -4052,6 +4052,7 @@ mod tests {
             blob_metadata: Default::default(),
             entryway: None,
             lexicon: crate::config::LexiconConfig::default(),
+            kryphocron: crate::config::KryphocronConfig::default(),
         };
         AppContext::new(
             config,
@@ -7081,6 +7082,7 @@ mod tests {
             blob_metadata: Default::default(),
             entryway: None,
             lexicon: crate::config::LexiconConfig::default(),
+            kryphocron: crate::config::KryphocronConfig::default(),
         };
         AppContext::new(
             config,

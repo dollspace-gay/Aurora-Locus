@@ -420,6 +420,99 @@ pub enum PdsError {
     #[error("Lexicon subsystem is disabled (PDS_LEXICON_ENABLED=false)")]
     #[allow(dead_code)]
     LexiconDisabled,
+
+    // v0.7 arc 1 — kryphocron dispatcher errors. The dispatcher in
+    // `RepositoryManager::validate_write` returns these per v07_DESIGN.md
+    // §6 Order A pseudocode. All map to HTTP 400 (client-side error)
+    // unless otherwise noted at the variant. The arc 1 ship state
+    // populates `KryphocronRecordNotYetSupported` for every registered
+    // NSID since no dedicated endpoints exist yet; the others surface
+    // when their respective edge conditions trip.
+
+    /// Master-switch-off rejection for any NSID claiming the closed
+    /// `tools.kryphocron.*` namespace. Per v07_DESIGN.md §6 lines
+    /// 3247-3257: the wording is deliberately generic so the
+    /// master-switch-off state is behaviorally indistinguishable
+    /// from "kryphocron not compiled in" for clients, avoiding
+    /// namespace-knowledge disclosure to probes.
+    #[error("Unsupported namespace: {nsid}")]
+    UnsupportedNamespace { nsid: String },
+
+    /// NSID claims the closed `tools.kryphocron.*` namespace but is
+    /// not present in `KRYPHOCRON_LEXICON_REGISTRY`. The kryphocron
+    /// namespace is closed; A1's dynamic resolver does not get to
+    /// accept records claiming it. Indicates a client trying to
+    /// register a fake NSID under the kryphocron prefix.
+    #[error("Unregistered NSID in closed kryphocron namespace: {nsid}")]
+    KryphocronUnregisteredNsidInClosedNamespace { nsid: String },
+
+    /// `Tier::from_nsid` returned a non-`NotRegistered` error variant
+    /// for an NSID claiming the kryphocron namespace. Reserved for
+    /// forward compatibility — currently unreachable because
+    /// `UnknownNsid` has only the `NotRegistered` variant in
+    /// kryphocron 0.1/0.2. Reachable when a future kryphocron release
+    /// adds tier-classification variants (reserved / version-
+    /// mismatched lexicons) and the dispatcher's `Ok(tier)` branch
+    /// ships in arc 3+.
+    #[error("kryphocron tier classification failed for {nsid}: {detail}")]
+    #[allow(dead_code)]
+    KryphocronTierClassificationFailed { nsid: String, detail: String },
+
+    /// `Tier::from_nsid` returned a non-`NotRegistered` error variant
+    /// for an NSID NOT claiming the kryphocron namespace. Same forward-
+    /// compat posture as the kryphocron variant above.
+    #[error("Tier classification failed for {nsid}: {detail}")]
+    #[allow(dead_code)]
+    TierClassificationFailed { nsid: String, detail: String },
+
+    /// Registry says NSID is registered but `kryphocron::lexicons()`'s
+    /// `get_def(NSID#main)` returned `None`. Indicates substrate-side
+    /// drift between the registry (compiled-in metadata) and the
+    /// runtime lexicon documents — should not happen in correct
+    /// kryphocron 0.2+ builds. Mapped to HTTP 500. Reachable only when
+    /// `kryphocron::lexicon_validate` ships (arc 3+ Ok(tier) branch).
+    #[error("kryphocron lexicon definition missing for {def_uri}")]
+    #[allow(dead_code)]
+    KryphocronLexiconMissing { def_uri: String },
+
+    /// `kryphocron::lexicons().get_def(NSID#main)` returned something
+    /// other than `LexUserType::Record`. Indicates a malformed
+    /// kryphocron lexicon JSON at the substrate (the `#main` def of
+    /// a record lexicon must be a record). Mapped to HTTP 500.
+    /// Reachable only when `kryphocron::lexicon_validate` ships
+    /// (arc 3+ Ok(tier) branch).
+    #[error("kryphocron lexicon at {def_uri} is not a record def")]
+    #[allow(dead_code)]
+    KryphocronLexiconNotRecord { def_uri: String },
+
+    /// `proto_blue::lexicon::validate_record` failed on a kryphocron
+    /// record. The supplied record does not conform to the declared
+    /// lexicon shape. Mapped to HTTP 400. Reachable only when
+    /// `kryphocron::lexicon_validate` ships (arc 3+ Ok(tier) branch).
+    #[error("kryphocron lexicon validation failed for {nsid}: {detail}")]
+    #[allow(dead_code)]
+    KryphocronLexiconValidationFailed { nsid: String, detail: String },
+
+    /// Per v07_DESIGN.md §8: a `tools.kryphocron.*` write arrived via
+    /// the generic path when a dedicated endpoint is the legitimate
+    /// origin. The optional `suggested_endpoint` directs the client.
+    /// Arc 1 ship state never sets `suggested_endpoint` because no
+    /// dedicated endpoints exist yet; arc 3+ populates it from the
+    /// dedicated-endpoint registration code.
+    #[error("kryphocron record requires the dedicated endpoint for {nsid}")]
+    #[allow(dead_code)]
+    KryphocronRecordRequiresDedicatedEndpoint {
+        nsid: String,
+        suggested_endpoint: Option<String>,
+    },
+
+    /// Per v07_DESIGN.md §8: a `tools.kryphocron.*` write arrived for
+    /// a registered NSID that has no dedicated endpoint yet (arc 1
+    /// default for every registered NSID; arc 3+ overrides for endpoints
+    /// that ship). The error tells clients to wait for the endpoint
+    /// to land rather than to find an existing alternative.
+    #[error("kryphocron NSID {nsid} is registered but no endpoint exposes it yet")]
+    KryphocronRecordNotYetSupported { nsid: String },
 }
 
 /// Manual PartialEq implementation for PdsError
@@ -517,6 +610,43 @@ impl PartialEq for PdsError {
                 PdsError::NamespaceDenied { nsid: bn },
             ) => an == bn,
             (PdsError::LexiconDisabled, PdsError::LexiconDisabled) => true,
+            // v0.7 arc 1 — kryphocron dispatcher variants.
+            (
+                PdsError::UnsupportedNamespace { nsid: a },
+                PdsError::UnsupportedNamespace { nsid: b },
+            ) => a == b,
+            (
+                PdsError::KryphocronUnregisteredNsidInClosedNamespace { nsid: a },
+                PdsError::KryphocronUnregisteredNsidInClosedNamespace { nsid: b },
+            ) => a == b,
+            (
+                PdsError::KryphocronTierClassificationFailed { nsid: an, detail: ad },
+                PdsError::KryphocronTierClassificationFailed { nsid: bn, detail: bd },
+            ) => an == bn && ad == bd,
+            (
+                PdsError::TierClassificationFailed { nsid: an, detail: ad },
+                PdsError::TierClassificationFailed { nsid: bn, detail: bd },
+            ) => an == bn && ad == bd,
+            (
+                PdsError::KryphocronLexiconMissing { def_uri: a },
+                PdsError::KryphocronLexiconMissing { def_uri: b },
+            ) => a == b,
+            (
+                PdsError::KryphocronLexiconNotRecord { def_uri: a },
+                PdsError::KryphocronLexiconNotRecord { def_uri: b },
+            ) => a == b,
+            (
+                PdsError::KryphocronLexiconValidationFailed { nsid: an, detail: ad },
+                PdsError::KryphocronLexiconValidationFailed { nsid: bn, detail: bd },
+            ) => an == bn && ad == bd,
+            (
+                PdsError::KryphocronRecordRequiresDedicatedEndpoint { nsid: an, suggested_endpoint: ae },
+                PdsError::KryphocronRecordRequiresDedicatedEndpoint { nsid: bn, suggested_endpoint: be },
+            ) => an == bn && ae == be,
+            (
+                PdsError::KryphocronRecordNotYetSupported { nsid: a },
+                PdsError::KryphocronRecordNotYetSupported { nsid: b },
+            ) => a == b,
             // Database and Io errors cannot be compared, so we use error message comparison
             (PdsError::Database(a), PdsError::Database(b)) => a.to_string() == b.to_string(),
             (PdsError::Io(a), PdsError::Io(b)) => a.to_string() == b.to_string(),
@@ -814,6 +944,54 @@ impl IntoResponse for PdsError {
             PdsError::LexiconDisabled => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "LexiconDisabled",
+                self.to_string(),
+            ),
+            // v0.7 arc 1 — kryphocron dispatcher errors.
+            // Per v07_DESIGN.md §6 / §8: client errors are 400; substrate
+            // drift (registry vs lexicon docs out of sync) is 500.
+            PdsError::UnsupportedNamespace { .. } => (
+                StatusCode::BAD_REQUEST,
+                "UnsupportedNamespace",
+                self.to_string(),
+            ),
+            PdsError::KryphocronUnregisteredNsidInClosedNamespace { .. } => (
+                StatusCode::BAD_REQUEST,
+                "KryphocronUnregisteredNsidInClosedNamespace",
+                self.to_string(),
+            ),
+            PdsError::KryphocronTierClassificationFailed { .. } => (
+                StatusCode::BAD_REQUEST,
+                "KryphocronTierClassificationFailed",
+                self.to_string(),
+            ),
+            PdsError::TierClassificationFailed { .. } => (
+                StatusCode::BAD_REQUEST,
+                "TierClassificationFailed",
+                self.to_string(),
+            ),
+            PdsError::KryphocronLexiconMissing { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "KryphocronLexiconMissing",
+                self.to_string(),
+            ),
+            PdsError::KryphocronLexiconNotRecord { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "KryphocronLexiconNotRecord",
+                self.to_string(),
+            ),
+            PdsError::KryphocronLexiconValidationFailed { .. } => (
+                StatusCode::BAD_REQUEST,
+                "KryphocronLexiconValidationFailed",
+                self.to_string(),
+            ),
+            PdsError::KryphocronRecordRequiresDedicatedEndpoint { .. } => (
+                StatusCode::BAD_REQUEST,
+                "KryphocronRecordRequiresDedicatedEndpoint",
+                self.to_string(),
+            ),
+            PdsError::KryphocronRecordNotYetSupported { .. } => (
+                StatusCode::BAD_REQUEST,
+                "KryphocronRecordNotYetSupported",
                 self.to_string(),
             ),
             _ => (

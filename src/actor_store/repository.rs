@@ -55,7 +55,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Write operation action
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WriteOpAction {
     Create,
@@ -140,6 +140,25 @@ pub struct RepositoryManager {
     /// Paired with the validator's own `with_lexicon` wiring —
     /// production handlers chain both onto the constructor.
     lexicon_config: Option<crate::config::LexiconConfig>,
+    /// v0.7 arc 1 — kryphocron master-switch snapshot. Consulted at the
+    /// top of [`validate_write`] for the closed-namespace dispatcher.
+    /// `false` for the default constructors used in tests; populated by
+    /// [`for_writer`] from `ctx.config.kryphocron.enabled`.
+    kryphocron_enabled: bool,
+    /// v0.7 arc 1 — kryphocron deny-error map. `Some` when the master
+    /// switch is on; `None` otherwise (the dispatcher's master-switch-off
+    /// branch never consults the map). Built once at startup in
+    /// [`crate::context::AppContext::new`] from
+    /// `kryphocron::KRYPHOCRON_LEXICON_REGISTRY`; shared via `Arc` across
+    /// every per-request `RepositoryManager`.
+    kryphocron_deny_map: Option<
+        Arc<
+            std::collections::HashMap<
+                (String, WriteOpAction),
+                crate::kryphocron::KryphocronDenyVariant,
+            >,
+        >,
+    >,
 }
 
 impl RepositoryManager {
@@ -157,6 +176,8 @@ impl RepositoryManager {
             sequencer: None,
             blob_store: None,
             lexicon_config: None,
+            kryphocron_enabled: false,
+            kryphocron_deny_map: None,
         }
     }
 
@@ -179,6 +200,8 @@ impl RepositoryManager {
             sequencer: Some(sequencer),
             blob_store: None,
             lexicon_config: None,
+            kryphocron_enabled: false,
+            kryphocron_deny_map: None,
         }
     }
 
@@ -226,6 +249,13 @@ impl RepositoryManager {
         if let Some(resolver) = ctx.lexicon_resolver.as_ref().cloned() {
             mgr = mgr.with_lexicon(resolver, ctx.config.lexicon.clone());
         }
+        // v0.7 arc 1 — kryphocron dispatcher snapshot. The master switch
+        // is copied so per-request `validate_write` can check it without
+        // following the ctx.config Arc chain on every call; the deny-map
+        // is shared via Arc and consulted only on the kryphocron-prefix
+        // branch.
+        mgr.kryphocron_enabled = ctx.config.kryphocron.enabled;
+        mgr.kryphocron_deny_map = ctx.kryphocron_deny_map.clone();
         mgr
     }
 
@@ -420,6 +450,53 @@ impl RepositoryManager {
     /// BOTH known NSIDs (hand-coded path) and unknown NSIDs (lexicon
     /// fall-through) — see V05_DESIGN_arc17.md §17.3.4 matrix.
     async fn validate_write(&self, write: &WriteOp) -> PdsResult<()> {
+        // v0.7 arc 1 — Order A dispatcher closed-namespace policy. Per
+        // v07_DESIGN.md §6 lines 3236-3305 the kryphocron-prefix check
+        // runs BEFORE any lexicon validation or registry lookup so that
+        // records claiming the closed namespace cannot be accepted via
+        // the generic write path under any configuration.
+        //
+        // Path A from the implementation kickoff: arc 1 ships deny-by-
+        // default with no `WriteOp.kryphocron_authorization` flag check
+        // because the flag doesn't exist yet (Q1 / Option A is arc 2's
+        // first deliverable). Arc 2 wires the flag and adapts the deny
+        // rule to bypass for dedicated-endpoint / cascade origins; arc
+        // 3+ ships the dedicated endpoints themselves. In arc 1 ship
+        // state every kryphocron NSID through the generic path fails:
+        // registered NSIDs get the deny-map entry (NotYetSupported per
+        // §8); unregistered NSIDs get `KryphocronUnregisteredNsidInClosedNamespace`.
+        //
+        // The error class for unregistered NSIDs follows v07_DESIGN.md
+        // §6 lines 3274-3283 (Err(NotRegistered) → unregistered-in-
+        // closed-namespace), not the implementation kickoff's Path A
+        // pseudocode which defaults to RequiresDedicatedEndpoint —
+        // surfaced as a kickoff-vs-design contradiction in the commit
+        // body. RequiresDedicatedEndpoint is misleading for unregistered
+        // NSIDs because no endpoint will ever exist for them.
+        if write.collection.starts_with("tools.kryphocron.") {
+            if !self.kryphocron_enabled {
+                // Master switch off — generic UnsupportedNamespace per
+                // §6 lines 3247-3257 so master-switch-off is
+                // behaviorally indistinguishable from "not compiled in".
+                return Err(crate::error::PdsError::UnsupportedNamespace {
+                    nsid: write.collection.clone(),
+                });
+            }
+            // Master switch on — Path A unconditional deny. The deny
+            // map is built from `kryphocron::KRYPHOCRON_LEXICON_REGISTRY`
+            // at startup; map presence indicates a registered NSID.
+            return match self
+                .kryphocron_deny_map
+                .as_ref()
+                .and_then(|m| m.get(&(write.collection.clone(), write.action)))
+            {
+                Some(variant) => Err(variant.clone().into_pds_error(&write.collection)),
+                None => Err(crate::error::PdsError::KryphocronUnregisteredNsidInClosedNamespace {
+                    nsid: write.collection.clone(),
+                }),
+            };
+        }
+
         let value = match &write.value {
             Some(v) => v,
             None => return Ok(()), // delete or no-op
