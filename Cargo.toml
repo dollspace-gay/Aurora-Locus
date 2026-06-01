@@ -16,8 +16,8 @@ proto-blue = "0.3.1"
 # kryphocron-lexicons is brought in transitively via kryphocron but
 # also declared directly so we can refer to the registry and tier
 # vocabulary by name.
-kryphocron = { path = "../kryphocron" }
-kryphocron-lexicons = { path = "../kryphocron-lexicons" }
+kryphocron = { git = "https://github.com/skydeval/kryphocron", branch = "0.2-dev" }
+kryphocron-lexicons = { git = "https://github.com/skydeval/kryphocron-lexicons", branch = "0.2-dev" }
 
 # Argon2id password hashing (vendored from the old SDK's server_auth module)
 argon2 = { version = "0.5", features = ["std"] }
