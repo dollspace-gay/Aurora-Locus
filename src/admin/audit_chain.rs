@@ -633,20 +633,34 @@ async fn write_chain_entry_inner(
     // re-running verification on legacy rows uses the new canonical
     // form, but legacy rows would never be in the cascade-snapshot-ids
     // population since the field defaults to empty.
+    // Source-order is alphabetical. `serde_json::Map`'s key ordering at
+    // serialization time depends on whether the `preserve_order` cargo
+    // feature is enabled anywhere in the dependency graph: without it
+    // `Map` is a `BTreeMap` (always-alphabetical regardless of source
+    // order); with it `Map` is an `IndexMap` (insertion-order
+    // preserved). v0.7 arc 1's path-dep on kryphocron-lexicons flipped
+    // the feature on transitively (see that crate's Cargo.toml). Pre-
+    // arc-1 stored hashes were computed under BTreeMap semantics
+    // (alphabetical); the canonical form in
+    // `docs/operator/audit-chain-verification.md` §B documents
+    // alphabetical as the wire-invariant. Writing keys here in
+    // alphabetical source order makes the serialized output alphabetical
+    // regardless of which `Map` backing serde_json is using — durable
+    // against future feature-graph drift either direction.
     let canon = serde_json::json!({
-        "sequence": seq,
-        "timestamp": now_str,
-        "actor_did": params.actor_did,
         "action": params.action,
-        "subject_did": subject_did,
-        "subject_uri": subject_uri,
-        "subject_cid": subject_cid,
-        "rationale": params.rationale,
-        "snapshot_id": params.snapshot_id,
+        "actor_did": params.actor_did,
+        "cascade_snapshot_ids": cascade_snapshot_ids_json,
+        "cascade_subjects": cascade_json,
         "event_id": params.event_id,
         "previous_hash": prev_hash,
-        "cascade_subjects": cascade_json,
-        "cascade_snapshot_ids": cascade_snapshot_ids_json,
+        "rationale": params.rationale,
+        "sequence": seq,
+        "snapshot_id": params.snapshot_id,
+        "subject_cid": subject_cid,
+        "subject_did": subject_did,
+        "subject_uri": subject_uri,
+        "timestamp": now_str,
     });
     let canon_str = serde_json::to_string(&canon)
         .map_err(|e| PdsError::Internal(e.to_string()))?;
@@ -972,20 +986,22 @@ pub fn verify_entry(
     cascade_snapshot_ids: Option<&str>,
     expected_hash: &str,
 ) -> bool {
+    // Alphabetical source order — see write_chain_entry_inner's
+    // canonical-form note for the cargo-feature-unification rationale.
     let canon = serde_json::json!({
-        "sequence": sequence,
-        "timestamp": timestamp,
-        "actor_did": actor_did,
         "action": action,
-        "subject_did": subject_did,
-        "subject_uri": subject_uri,
-        "subject_cid": subject_cid,
-        "rationale": rationale,
-        "snapshot_id": snapshot_id,
+        "actor_did": actor_did,
+        "cascade_snapshot_ids": cascade_snapshot_ids,
+        "cascade_subjects": cascade_subjects,
         "event_id": event_id,
         "previous_hash": previous_hash,
-        "cascade_subjects": cascade_subjects,
-        "cascade_snapshot_ids": cascade_snapshot_ids,
+        "rationale": rationale,
+        "sequence": sequence,
+        "snapshot_id": snapshot_id,
+        "subject_cid": subject_cid,
+        "subject_did": subject_did,
+        "subject_uri": subject_uri,
+        "timestamp": timestamp,
     });
     let canon_str = match serde_json::to_string(&canon) {
         Ok(s) => s,
@@ -1648,20 +1664,21 @@ mod tests {
         )
         .fetch_one(&db).await.unwrap();
         let new_rationale = "attacker-rewrite";
+        // Alphabetical source order — see write_chain_entry_inner.
         let canon = serde_json::json!({
-            "sequence": 2,
-            "timestamp": row.try_get::<String, _>("created_at").unwrap(),
-            "actor_did": row.try_get::<String, _>("actor_did").unwrap(),
             "action": row.try_get::<String, _>("action").unwrap(),
-            "subject_did": row.try_get::<Option<String>, _>("subject_did").unwrap(),
-            "subject_uri": row.try_get::<Option<String>, _>("subject_uri").unwrap(),
-            "subject_cid": row.try_get::<Option<String>, _>("subject_cid").unwrap(),
-            "rationale": new_rationale,
-            "snapshot_id": row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            "actor_did": row.try_get::<String, _>("actor_did").unwrap(),
+            "cascade_snapshot_ids": row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap(),
+            "cascade_subjects": row.try_get::<Option<String>, _>("cascade_subjects").unwrap(),
             "event_id": row.try_get::<Option<i64>, _>("event_id").unwrap(),
             "previous_hash": row.try_get::<Option<String>, _>("previous_hash").unwrap(),
-            "cascade_subjects": row.try_get::<Option<String>, _>("cascade_subjects").unwrap(),
-            "cascade_snapshot_ids": row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap(),
+            "rationale": new_rationale,
+            "sequence": 2,
+            "snapshot_id": row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            "subject_cid": row.try_get::<Option<String>, _>("subject_cid").unwrap(),
+            "subject_did": row.try_get::<Option<String>, _>("subject_did").unwrap(),
+            "subject_uri": row.try_get::<Option<String>, _>("subject_uri").unwrap(),
+            "timestamp": row.try_get::<String, _>("created_at").unwrap(),
         });
         let canon_str = serde_json::to_string(&canon).unwrap();
         let mut hasher = Sha256::new();
