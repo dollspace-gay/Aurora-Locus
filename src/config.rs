@@ -1240,7 +1240,7 @@ pub struct LexiconConfig {
 /// policy applies whether the switch is on or off, but the registered-
 /// NSID branch of the dispatcher and the `kryphocron::lexicons()`
 /// startup load only fire when enabled.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KryphocronConfig {
     /// Master switch. Default `false`. When `false`, the dispatcher's
     /// closed-namespace check still rejects `tools.kryphocron.*` writes
@@ -1252,11 +1252,6 @@ pub struct KryphocronConfig {
     pub enabled: bool,
 }
 
-impl Default for KryphocronConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
-}
 
 impl KryphocronConfig {
     /// Build a [`KryphocronConfig`] from already-extracted env values.
