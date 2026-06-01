@@ -2,7 +2,7 @@
 //! invariant on Aurora-namespace admin handlers (Arc 2 §6.4.2).
 //!
 //! Scans Aurora-namespace handler files; for every `pub async fn`
-//! whose body invokes `append_entry_in_tx`, asserts the function
+//! whose body invokes `insert_chain_entry`, asserts the function
 //! returns a typed `*Output` struct that is defined in the same
 //! file with a Rust-side `audit_entry_id` field. Drift is loud:
 //! drop the field, drop the typed-struct conversion, or return
@@ -79,7 +79,7 @@ fn aurora_namespace_handlers_surface_audit_entry_id() {
             if !scope.is_empty() && !scope.contains(&handler.name.as_str()) {
                 continue;
             }
-            if !handler.body.contains("append_entry_in_tx") {
+            if !handler.body.contains("insert_chain_entry") {
                 continue;
             }
             if let Some((_, justification)) =
@@ -91,7 +91,7 @@ fn aurora_namespace_handlers_surface_audit_entry_id() {
                 );
                 continue;
             }
-            // The body invokes `append_entry_in_tx` and the handler
+            // The body invokes `insert_chain_entry` and the handler
             // is not allowlisted — the contract requires a typed
             // `*Output` return with an `audit_entry_id` field.
             let Some(output_type) = extract_output_type(&handler.return_type) else {

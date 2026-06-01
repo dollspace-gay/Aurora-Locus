@@ -765,8 +765,9 @@ pub async fn emit_event(
         None
     };
 
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: action_str,
@@ -1347,7 +1348,7 @@ fn require_blob_cid_pds(subject: &Subject) -> Result<&str, PdsError> {
 //      flat subject columns NULL; full subject list lives in
 //      `details` JSON and chain row's `cascade_subjects`).
 //   5. Append chain entry inside the same tx via
-//      `audit_chain::append_entry_in_tx`.
+//      `audit_chain::insert_chain_entry`.
 //   6. Commit; the response body's `affected_count` always equals
 //      `cascade_subjects.len()` for successful responses.
 //
@@ -1523,7 +1524,7 @@ fn check_moderator_role(
 /// Insert per-DID `account_moderation` rows + the batch
 /// `moderation_event` row inside the caller-supplied transaction.
 /// LB-1 / chainlink #128: callers wrap this together with the
-/// per-subject actor mutations and `append_entry_in_tx` in one
+/// per-subject actor mutations and `insert_chain_entry` in one
 /// transaction so the chain entry, the moderation_event, and
 /// (where applicable) the per-subject actor-table mutations all
 /// land or all roll back.
@@ -1696,8 +1697,9 @@ pub async fn batch_takedown_accounts(
         .iter()
         .map(|d| Subject::Repo { did: d.clone() })
         .collect();
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.batch_takedown",
@@ -1787,8 +1789,9 @@ pub async fn batch_suspend_accounts(
         .iter()
         .map(|d| Subject::Repo { did: d.clone() })
         .collect();
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.batch_suspend",
@@ -1864,8 +1867,9 @@ pub async fn batch_restore_accounts(
         .iter()
         .map(|d| Subject::Repo { did: d.clone() })
         .collect();
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.batch_restore",
@@ -1953,8 +1957,9 @@ pub async fn batch_takedown_records(
             cid: String::new(),
         })
         .collect();
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "record.batch_takedown",
@@ -2065,8 +2070,9 @@ pub async fn batch_apply_label(
     )
     .await
     .map_err(internal)?;
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "label.batch_apply",
@@ -2224,8 +2230,9 @@ pub async fn batch_remove_label(
         .iter()
         .map(|(_, _, _, snap)| *snap)
         .collect();
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "label.batch_remove",
@@ -2340,8 +2347,9 @@ pub async fn trigger_password_reset(
     )
     .await
     .map_err(internal)?;
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.trigger_password_reset",
@@ -3191,8 +3199,9 @@ pub async fn export_account_forensic(
         audit_chain::capture_snapshot(&ctx.account_db, &subject)
             .await
             .map_err(internal_pds)?;
-    let audit_entry_id = audit_chain::append_entry(
+    let audit_entry_id = audit_chain::insert_chain_entry_pool(
         &ctx.account_db,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "ForensicExport",
@@ -3896,8 +3905,9 @@ pub async fn set_runtime_setting(
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "SetRuntimeSetting",
@@ -4537,7 +4547,7 @@ mod tests {
         assert_eq!(resp.affected_count, 3);
         assert_eq!(resp.snapshots.len(), 3);
         // Audit chain entry id surfaces on the response (Block 1
-        // wired all six batch endpoints through append_entry).
+        // wired all six batch endpoints through insert_chain_entry_pool).
         assert!(
             !resp.audit_entry_id.is_empty(),
             "batch_takedown_accounts populates audit_entry_id"
@@ -5673,8 +5683,9 @@ mod tests {
         let ctx = create_test_context().await;
         seed_actor(&ctx, "did:plc:s1", "s1.test").await;
         // Two events from different actors via direct chain inserts.
-        crate::admin::audit_chain::append_entry(
+        crate::admin::audit_chain::insert_chain_entry_pool(
             &ctx.account_db,
+            ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
@@ -5686,8 +5697,9 @@ mod tests {
                 cascade_snapshot_ids: &[],
             },
         ).await.unwrap();
-        crate::admin::audit_chain::append_entry(
+        crate::admin::audit_chain::insert_chain_entry_pool(
             &ctx.account_db,
+            ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
                 actor_did: "did:plc:m2",
                 action: "RestoreAccount",
@@ -5727,11 +5739,12 @@ mod tests {
         seed_actor(&ctx, "did:plc:victim", "victim.test").await;
         // Two entries with distinct subject_cids (Subject::Blob carries
         // the CID through to the chain row's subject_cid column via
-        // append_entry's flat-column mapping).
+        // insert_chain_entry_pool's flat-column mapping).
         let target_cid = "bafyblobtarget";
         let other_cid = "bafyblobother";
-        crate::admin::audit_chain::append_entry(
+        crate::admin::audit_chain::insert_chain_entry_pool(
             &ctx.account_db,
+            ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
@@ -5749,8 +5762,9 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::admin::audit_chain::append_entry(
+        crate::admin::audit_chain::insert_chain_entry_pool(
             &ctx.account_db,
+            ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
@@ -5826,8 +5840,9 @@ mod tests {
             ("did:plc:m2", cid_a, "m2+A"),
             ("did:plc:m2", cid_b, "m2+B"),
         ] {
-            crate::admin::audit_chain::append_entry(
+            crate::admin::audit_chain::insert_chain_entry_pool(
                 &ctx.account_db,
+                ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
                     actor_did: actor,
                     action: "TakedownAccount",
@@ -5991,8 +6006,9 @@ mod tests {
     /// Reused across the coverage-gap tests below.
     async fn append_n_chain_entries(ctx: &AppContext, n: usize) {
         for i in 0..n {
-            crate::admin::audit_chain::append_entry(
+            crate::admin::audit_chain::insert_chain_entry_pool(
                 &ctx.account_db,
+                ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
@@ -6087,8 +6103,9 @@ mod tests {
         for actor in &actors {
             for action in &actions {
                 for subj in &subjects {
-                    crate::admin::audit_chain::append_entry(
+                    crate::admin::audit_chain::insert_chain_entry_pool(
                         &ctx.account_db,
+                        ctx.config.database.backend,
                         crate::admin::audit_chain::AppendEntryParams {
                             actor_did: actor,
                             action,
@@ -6141,13 +6158,14 @@ mod tests {
         let ctx = create_test_context().await;
         seed_actor(&ctx, "did:plc:victim", "victim.test").await;
         // Append 5 entries; record their actual stored timestamps.
-        // append_entry uses Utc::now() so entries land at the
+        // insert_chain_entry_pool uses Utc::now() so entries land at the
         // wall-clock instant of insertion. Stagger by sleeps to make
         // the timestamps distinguishable at sub-millisecond resolution.
         let mut timestamps: Vec<String> = Vec::new();
         for i in 0..5 {
-            crate::admin::audit_chain::append_entry(
+            crate::admin::audit_chain::insert_chain_entry_pool(
                 &ctx.account_db,
+                ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
@@ -6374,8 +6392,9 @@ mod tests {
         let ctx = create_test_context().await;
         seed_actor(&ctx, "did:plc:s1", "s1.test").await;
         for i in 0..3 {
-            crate::admin::audit_chain::append_entry(
+            crate::admin::audit_chain::insert_chain_entry_pool(
                 &ctx.account_db,
+                ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
@@ -6419,8 +6438,9 @@ mod tests {
         let ctx = create_test_context().await;
         seed_actor(&ctx, "did:plc:s1", "s1.test").await;
         for i in 0..3 {
-            crate::admin::audit_chain::append_entry(
+            crate::admin::audit_chain::insert_chain_entry_pool(
                 &ctx.account_db,
+                ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
@@ -6783,8 +6803,9 @@ mod tests {
         .unwrap();
         // Append one chain entry against the subject so both paths
         // have something non-empty to render.
-        crate::admin::audit_chain::append_entry(
+        crate::admin::audit_chain::insert_chain_entry_pool(
             &ctx.account_db,
+            ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
                 actor_did: "did:plc:moderator",
                 action: "TakedownAccount",
@@ -7944,7 +7965,7 @@ mod tests {
         assert!(su.as_deref().unwrap().contains("at://did:plc:x"));
         let cascade_json = cs.expect("cascade_subjects populated");
         assert!(cascade_json.contains("at://did:plc:x"));
-        // Either NULL or empty array per Step 0.6 / append_entry rules.
+        // Either NULL or empty array per Step 0.6 / insert_chain_entry_pool rules.
         match csi {
             None => {} // empty cascade_snapshot_ids stored as NULL
             Some(s) => assert!(

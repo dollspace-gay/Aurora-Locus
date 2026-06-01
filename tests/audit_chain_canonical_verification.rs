@@ -4,7 +4,7 @@
 //! test:
 //!
 //! 1. Appends a fresh chain entry via the production
-//!    `append_entry` API — Aurora-Locus's writer computes
+//!    `insert_chain_entry_pool` API — Aurora-Locus's writer computes
 //!    `current_hash` and stores it.
 //! 2. Reads the row back via direct SQL.
 //! 3. Reconstructs the canonical hash input from the row's columns
@@ -23,7 +23,7 @@
 //! output. To capture: temporarily un-comment the `eprintln!`
 //! lines below, run, copy the hashes verbatim, re-comment.
 
-use aurora_locus::admin::audit_chain::{append_entry, AppendEntryParams};
+use aurora_locus::admin::audit_chain::{insert_chain_entry_pool, AppendEntryParams};
 use aurora_locus::admin::defs::Subject;
 use sha2::{Digest, Sha256};
 use sqlx::any::AnyPoolOptions;
@@ -199,8 +199,9 @@ async fn canonical_form_matches_for_repo_ref_subject() {
     let subject = Subject::Repo {
         did: "did:plc:test1234567890abcdef".to_string(),
     };
-    append_entry(
+    insert_chain_entry_pool(
         &db,
+        aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
             actor_did: "did:plc:moderator",
             action: "TakedownAccount",
@@ -224,8 +225,9 @@ async fn canonical_form_matches_for_strong_ref_subject() {
         uri: "at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string(),
         cid: "bafyreidemorecord".to_string(),
     };
-    append_entry(
+    insert_chain_entry_pool(
         &db,
+        aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
             actor_did: "did:plc:moderator",
             action: "TakedownRecord",
@@ -250,8 +252,9 @@ async fn canonical_form_matches_for_repo_blob_ref_subject_with_record_uri() {
         cid: "bafyreidemoblob".to_string(),
         record_uri: Some("at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc".to_string()),
     };
-    append_entry(
+    insert_chain_entry_pool(
         &db,
+        aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
             actor_did: "did:plc:moderator",
             action: "TakedownBlob",
@@ -276,8 +279,9 @@ async fn canonical_form_matches_for_repo_blob_ref_subject_without_record_uri() {
         cid: "bafyreidemoblob".to_string(),
         record_uri: None,
     };
-    append_entry(
+    insert_chain_entry_pool(
         &db,
+        aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
             actor_did: "did:plc:moderator",
             action: "TakedownBlob",
@@ -309,8 +313,9 @@ async fn canonical_form_matches_for_batch_with_cascades() {
         },
     ];
     let cascade_snapshot_ids = vec![Some(7_i64), None, Some(12_i64)];
-    append_entry(
+    insert_chain_entry_pool(
         &db,
+        aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
             actor_did: "did:plc:moderator",
             action: "BatchTakedownAccounts",
@@ -337,8 +342,9 @@ async fn canonical_form_matches_for_genesis_entry() {
     let subject = Subject::Repo {
         did: "did:plc:genesis".to_string(),
     };
-    append_entry(
+    insert_chain_entry_pool(
         &db,
+        aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
             actor_did: "did:plc:bootstrap",
             action: "BootstrapGrant",
@@ -615,8 +621,9 @@ async fn canonical_form_matches_for_single_subject_with_cascade_per_arc4() {
         cid: "bafyreidemorecord".to_string(),
     }];
     let subject = cascade[0].clone();
-    append_entry(
+    insert_chain_entry_pool(
         &db,
+        aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
             actor_did: "did:plc:moderator",
             action: "TakedownRecord",
@@ -650,8 +657,9 @@ async fn canonical_form_matches_for_second_entry_with_previous_hash() {
         did: "did:plc:victim".to_string(),
     };
     for i in 0..2 {
-        append_entry(
+        insert_chain_entry_pool(
             &db,
+            aurora_locus::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
                 actor_did: "did:plc:moderator",
                 action: "TakedownAccount",

@@ -44,7 +44,8 @@ pub const PDS_LIVENESS_LOCK_KEY: i64 =
 
 // Audit-chain append serialization is the third active advisory-lock
 // site — a transaction-scoped `pg_advisory_xact_lock` taken inside
-// `audit_chain::append_entry_in_tx`. The key constant lives at
+// `audit_chain::insert_chain_entry` (v0.7 arc 1 step 2 rename of the
+// former `append_entry_in_tx`). The key constant lives at
 // [`crate::admin::audit_chain::AUDIT_CHAIN_LOCK_KEY`] and is derived
 // from SHA-256("aurora.audit_chain"). A future relocation of that
 // constant into this registry (matching the [`SEQUENCER_LEADER_LOCK_KEY`]
