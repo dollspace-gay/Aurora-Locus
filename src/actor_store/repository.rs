@@ -478,6 +478,11 @@ impl RepositoryManager {
                 // Master switch off — generic UnsupportedNamespace per
                 // §6 lines 3247-3257 so master-switch-off is
                 // behaviorally indistinguishable from "not compiled in".
+                tracing::warn!(
+                    nsid = %write.collection,
+                    did = %self.did,
+                    "kryphocron_namespace_rejected_switch_off",
+                );
                 return Err(crate::error::PdsError::UnsupportedNamespace {
                     nsid: write.collection.clone(),
                 });
@@ -490,10 +495,25 @@ impl RepositoryManager {
                 .as_ref()
                 .and_then(|m| m.get(&(write.collection.clone(), write.action)))
             {
-                Some(variant) => Err(variant.clone().into_pds_error(&write.collection)),
-                None => Err(crate::error::PdsError::KryphocronUnregisteredNsidInClosedNamespace {
-                    nsid: write.collection.clone(),
-                }),
+                Some(variant) => {
+                    tracing::warn!(
+                        nsid = %write.collection,
+                        did = %self.did,
+                        action = ?write.action,
+                        "kryphocron_registered_nsid_denied",
+                    );
+                    Err(variant.clone().into_pds_error(&write.collection))
+                }
+                None => {
+                    tracing::warn!(
+                        nsid = %write.collection,
+                        did = %self.did,
+                        "kryphocron_unregistered_nsid_rejected",
+                    );
+                    Err(crate::error::PdsError::KryphocronUnregisteredNsidInClosedNamespace {
+                        nsid: write.collection.clone(),
+                    })
+                }
             };
         }
 
