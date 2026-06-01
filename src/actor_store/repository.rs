@@ -63,8 +63,14 @@ pub enum WriteOpAction {
     Delete,
 }
 
-/// Write operation for applyWrites
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Write operation for applyWrites.
+///
+/// **v0.7 arc 2.** `Clone` derive removed: `kryphocron_authorization`
+/// carries a non-clonable `CascadeToken` per v07_DESIGN.md §5. R1
+/// recon confirmed zero `WriteOp.clone()` sites across the workspace
+/// (search at `docs/internal/v07-recon/arc2_recon.md` R1 "Clone sites
+/// — ZERO"); dropping `Clone` is a zero-cost migration.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WriteOp {
     pub action: WriteOpAction,
@@ -78,6 +84,21 @@ pub struct WriteOp {
     /// If provided, the operation will fail if the current record's CID doesn't match
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swap_cid: Option<String>,
+    /// v0.7 arc 2 — kryphocron write-authorization carrier per
+    /// v07_DESIGN.md §5 lines 2100-2193. Populated at the originating
+    /// call site (dedicated endpoint handler, cascade worker,
+    /// account-setup path, recovery-mode entry, system-cleanup task);
+    /// consulted at `validate_write` (arc 2 step 4) under the
+    /// dispatcher's `Ok(tier)` branch.
+    ///
+    /// `#[serde(skip)]`: the field is in-process state, not
+    /// request-bearable input. `applyWrites` request bodies don't
+    /// carry it (default `None` on deserialize), and sequencer
+    /// payloads don't persist it (default `None` on the
+    /// hypothetically-stored value). Wire-shape compatibility with
+    /// v0.6 is preserved.
+    #[serde(skip)]
+    pub kryphocron_authorization: Option<crate::kryphocron::KryphocronWriteAuthorization>,
 }
 
 /// Per-record bookkeeping captured during commit prep so we can update
@@ -1185,6 +1206,7 @@ impl RepositoryManager {
             value: Some(value),
             validate,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
 
         let (commit_cid, rev) = self
@@ -1210,6 +1232,7 @@ impl RepositoryManager {
             value: Some(value),
             validate,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
 
         self.apply_writes(writes, signer, Arc::new(crate::blob_store::StrictPromoter)).await
@@ -1229,6 +1252,7 @@ impl RepositoryManager {
             value: None,
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
 
         self.apply_writes(writes, signer, Arc::new(crate::blob_store::StrictPromoter)).await
@@ -1521,6 +1545,7 @@ impl RepositoryManager {
                     value: w.record,
                     validate: w.validate,
                     swap_cid: w.swap_cid,
+                    kryphocron_authorization: None,
                 }
             })
             .collect();
@@ -1620,6 +1645,7 @@ mod tests {
                 value: Some(serde_json::json!({"text": "Post 1"})),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Create,
@@ -1628,6 +1654,7 @@ mod tests {
                 value: Some(serde_json::json!({"text": "Post 2"})),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
         ];
 
@@ -1825,6 +1852,7 @@ mod tests {
             })),
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
         repo_mgr
             .apply_writes(writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
@@ -1878,6 +1906,7 @@ mod tests {
             })),
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
         unwired_mgr
             .apply_writes(writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
@@ -1923,6 +1952,7 @@ mod tests {
             })),
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
         let err = repo_mgr
             .apply_writes(writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
@@ -1996,6 +2026,7 @@ mod tests {
                 })),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Create,
@@ -2004,6 +2035,7 @@ mod tests {
                 value: Some(serde_json::json!({"$type": "app.test.record", "refs": []})),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Create,
@@ -2015,6 +2047,7 @@ mod tests {
                 })),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
         ];
         repo_mgr
@@ -2041,6 +2074,7 @@ mod tests {
                 value: None,
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Update,
@@ -2052,6 +2086,7 @@ mod tests {
                 })),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Update,
@@ -2060,6 +2095,7 @@ mod tests {
                 value: Some(serde_json::json!({"$type": "app.test.record", "refs": []})),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Create,
@@ -2071,6 +2107,7 @@ mod tests {
                 })),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
         ];
         repo_mgr
@@ -2145,6 +2182,7 @@ mod tests {
             })),
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
         let result = repo_mgr
             .apply_writes(
@@ -2208,6 +2246,7 @@ mod tests {
             })),
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
         let result = repo_mgr
             .apply_writes(
@@ -2519,6 +2558,7 @@ mod tests {
                 })),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             }
         }
 
