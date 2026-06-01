@@ -180,6 +180,16 @@ pub struct RepositoryManager {
             >,
         >,
     >,
+    /// v0.7 arc 2 step 3.5 — shared account-DB pool for the
+    /// relay-race tx-lending mechanism. When `Some(_)`,
+    /// `apply_writes` opens both a per-actor SQLite tx and a
+    /// shared `sqlx::Any` tx, threads them through
+    /// `SqliteRepoStorage::with_lent_txns`, and commits in
+    /// audit-first order via `commit_with_orphan_recovery`. When
+    /// `None`, the legacy per-statement auto-commit path is used
+    /// (preserving back-compat for `RepositoryManager::new`-
+    /// constructed test instances that have no shared pool).
+    shared_pool: Option<sqlx::AnyPool>,
 }
 
 impl RepositoryManager {
@@ -199,6 +209,7 @@ impl RepositoryManager {
             lexicon_config: None,
             kryphocron_enabled: false,
             kryphocron_deny_map: None,
+            shared_pool: None,
         }
     }
 
@@ -223,7 +234,22 @@ impl RepositoryManager {
             lexicon_config: None,
             kryphocron_enabled: false,
             kryphocron_deny_map: None,
+            shared_pool: None,
         }
+    }
+
+    /// v0.7 arc 2 step 3.5 — attach the shared account-DB pool so
+    /// `apply_writes` can open a shared `sqlx::Any` tx for the
+    /// bind-pipeline audit emit and run the relay-race commit
+    /// orchestration. When not chained, `apply_writes` falls back
+    /// to the pre-3.5 per-statement auto-commit path. Every
+    /// production write-handler constructor MUST chain this — the
+    /// dispatcher-side tx-lending mechanism is only active when
+    /// the shared pool is plumbed.
+    #[must_use]
+    pub fn with_shared_pool(mut self, shared_pool: sqlx::AnyPool) -> Self {
+        self.shared_pool = Some(shared_pool);
+        self
     }
 
     /// Arc 16e §9.5.3.2.2: attach the shared-DB `BlobStore`. Every
@@ -266,7 +292,8 @@ impl RepositoryManager {
             ctx.sequencer.clone(),
             ctx.config.validation_mode,
         )
-        .with_blob_store(ctx.blob_store.clone());
+        .with_blob_store(ctx.blob_store.clone())
+        .with_shared_pool(ctx.account_db.clone());
         if let Some(resolver) = ctx.lexicon_resolver.as_ref().cloned() {
             mgr = mgr.with_lexicon(resolver, ctx.config.lexicon.clone());
         }
@@ -740,97 +767,272 @@ impl RepositoryManager {
         // Drive proto-blue's commit machinery on a blocking thread —
         // the storage adapter calls `block_on` internally, which would
         // dead-lock a worker thread if invoked directly.
-        let storage = self.make_storage();
-        let did = self.did.clone();
-        let signer_arc = signer;
-
-        let (commit_cid, new_rev, prev_commit, prev_data, blocks): (
+        //
+        // **v0.7 arc 2 step 3.5 — relay-race lent-tx path.** When
+        // `self.shared_pool` is `Some(_)` (every production
+        // `for_writer` construction), open per-actor + shared txns
+        // up-front, run proto-blue's commit and Phase A metadata
+        // through `with_lent_txns`, and commit in audit-first
+        // order via `commit_with_orphan_recovery`. Tests that
+        // construct via `RepositoryManager::new` (no shared pool)
+        // fall through to the legacy per-statement auto-commit
+        // path below, preserving back-compat.
+        let (commit_cid, new_rev, prev_commit, prev_data, blocks, commit_ops): (
             Cid,
             String,
             Option<Cid>,
             Option<Cid>,
             BlockMap,
-        ) = tokio::task::spawn_blocking(
-            move || -> Result<_, ProtoRepoError> {
-                // Load the existing repo, or seed an empty one on the first commit.
-                let storage_dyn: Arc<dyn RepoStorage> = storage.clone();
-                let mut repo = match Repo::load(storage_dyn.clone()) {
-                    Ok(r) => r,
-                    Err(ProtoRepoError::Storage(_)) => {
-                        // Empty store — initialise with an empty signed commit.
-                        Repo::create(storage_dyn.clone(), did, signer_arc.as_ref())?
+            Vec<CommitOp>,
+        ) = if let Some(shared_pool) = self.shared_pool.clone() {
+            // ----- Relay-race lent-tx path -----
+            let actor_pool = self.store.open_db(&self.did).await?;
+            let actor_tx = actor_pool.begin().await.map_err(PdsError::Database)?;
+            let shared_tx = shared_pool.begin().await.map_err(PdsError::Database)?;
+            let storage = self.make_storage();
+            let did = self.did.clone();
+            let signer_arc = signer.clone();
+            let repo_writes_owned = repo_writes;
+            let prepared_owned = prepared;
+            let prior_record_cids_owned = prior_record_cids.clone();
+
+            let (actor_tx_back, shared_tx_back, scope_outcome) = storage
+                .with_lent_txns(actor_tx, shared_tx, move |scoped_storage| async move {
+                    // Drive proto-blue's sync commit on a blocking
+                    // thread. The storage Arc carries the lent
+                    // actor-tx handle into the spawn_blocking via
+                    // shared Mutex state — `apply_commit` reads
+                    // the same lent_actor_tx because both clones
+                    // share the same Arc.
+                    let storage_for_blocking = scoped_storage.clone();
+                    let did_for_blocking = did.clone();
+                    let signer_for_blocking = signer_arc.clone();
+                    let proto_blue_join = tokio::task::spawn_blocking(
+                        move || -> Result<_, ProtoRepoError> {
+                            let storage_dyn: Arc<dyn RepoStorage> = storage_for_blocking;
+                            let mut repo = match Repo::load(storage_dyn.clone()) {
+                                Ok(r) => r,
+                                Err(ProtoRepoError::Storage(_)) => Repo::create(
+                                    storage_dyn.clone(),
+                                    did_for_blocking,
+                                    signer_for_blocking.as_ref(),
+                                )?,
+                                Err(e) => return Err(e),
+                            };
+                            let prev = repo.commit_cid().cloned();
+                            let prev_data = repo.commit().map(|c| c.data.clone());
+                            let data =
+                                repo.apply_writes(&repo_writes_owned, signer_for_blocking.as_ref())?;
+                            Ok((
+                                data.commit_cid,
+                                data.commit.rev.clone(),
+                                prev,
+                                prev_data,
+                                data.blocks,
+                            ))
+                        },
+                    )
+                    .await
+                    .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?;
+                    let (commit_cid, new_rev, prev_commit, prev_data, blocks) = proto_blue_join
+                        .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
+
+                    // Phase A metadata — route through the lent
+                    // actor tx so the record-table updates land
+                    // atomically with proto-blue's block writes
+                    // from `apply_commit` above.
+                    let mut commit_ops_inner: Vec<CommitOp> =
+                        Vec::with_capacity(prepared_owned.len());
+                    for rec in &prepared_owned {
+                        let prev_cid = match rec.op {
+                            OpAction::Update | OpAction::Delete => {
+                                prior_record_cids_owned.get(&rec.uri).cloned()
+                            }
+                            OpAction::Create => None,
+                        };
+                        {
+                            let mut tx_guard = scoped_storage.lent_actor_tx().lock().await;
+                            let tx = tx_guard.as_mut().ok_or_else(|| {
+                                PdsError::Internal(
+                                    "lent_actor_tx vanished mid-scope".to_string(),
+                                )
+                            })?;
+                            match rec.op {
+                                OpAction::Create | OpAction::Update => {
+                                    let cid = rec
+                                        .cid
+                                        .clone()
+                                        .expect("create/update has cid by construction");
+                                    ActorStore::put_record_in_tx(
+                                        tx,
+                                        &rec.uri,
+                                        &cid,
+                                        &rec.collection,
+                                        &rec.rkey,
+                                        &new_rev,
+                                    )
+                                    .await?;
+                                    commit_ops_inner.push(CommitOp {
+                                        action: rec.op.clone(),
+                                        path: format!("{}/{}", rec.collection, rec.rkey),
+                                        cid: Some(cid),
+                                        prev: prev_cid,
+                                    });
+                                }
+                                OpAction::Delete => {
+                                    ActorStore::delete_record_in_tx(tx, &rec.uri).await?;
+                                    commit_ops_inner.push(CommitOp {
+                                        action: rec.op.clone(),
+                                        path: format!("{}/{}", rec.collection, rec.rkey),
+                                        cid: None,
+                                        prev: prev_cid,
+                                    });
+                                }
+                            }
+                        }
                     }
-                    Err(e) => return Err(e),
-                };
+                    Ok::<_, PdsError>((
+                        commit_cid,
+                        new_rev,
+                        prev_commit,
+                        prev_data,
+                        blocks,
+                        commit_ops_inner,
+                        prepared_owned,
+                    ))
+                })
+                .await?;
 
-                let prev = repo.commit_cid().cloned();
-                // Arc 14 §7.3.2: prior commit's MST root CID (`data`
-                // field of the prior signed commit). `None` for
-                // genesis (no prior commit exists). Captured BEFORE
-                // apply_writes so it reflects the prior state.
-                let prev_data = repo.commit().map(|c| c.data.clone());
-                let data = repo.apply_writes(&repo_writes, signer_arc.as_ref())?;
-
-                Ok((
-                    data.commit_cid,
-                    data.commit.rev.clone(),
-                    prev,
-                    prev_data,
-                    data.blocks,
-                ))
-            },
-        )
-        .await
-        .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?
-        .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
-
-        // Phase A — per-actor metadata writes (Arc 16e §9.5.3.2.2).
-        // Iterate by reference so `prepared` survives into Phase B
-        // below for the per-record STRICT/unref plan enumeration.
-        let mut commit_ops: Vec<CommitOp> = Vec::with_capacity(prepared.len());
-        for rec in &prepared {
-            // Arc 14 §7.3.2: `prev` = prior record version CID for
-            // update/delete ops; None for create ops.
-            let prev_cid = match rec.op {
-                OpAction::Update | OpAction::Delete => {
-                    prior_record_cids.get(&rec.uri).cloned()
+            // Recover `prepared` from the scope's return tuple
+            // (the scope took ownership for the Phase A loop).
+            let (
+                commit_cid_v,
+                new_rev_v,
+                prev_commit_v,
+                prev_data_v,
+                blocks_v,
+                commit_ops_v,
+                prepared_returned,
+            ) = match scope_outcome {
+                Ok(tuple) => tuple,
+                Err(e) => {
+                    // Scope failed (validation or storage error
+                    // inside the lent-tx region). Roll both txns
+                    // back so neither side commits, then propagate
+                    // the error.
+                    let _ = actor_tx_back.rollback().await;
+                    let _ = shared_tx_back.rollback().await;
+                    return Err(e);
                 }
-                OpAction::Create => None,
             };
-            match rec.op {
-                OpAction::Create | OpAction::Update => {
-                    let cid = rec
-                        .cid
-                        .clone()
-                        .expect("create/update has cid by construction");
-                    self.store
-                        .put_record(
-                            &self.did,
-                            &rec.uri,
-                            &cid,
-                            &rec.collection,
-                            &rec.rkey,
-                            &new_rev,
-                        )
-                        .await?;
-                    commit_ops.push(CommitOp {
-                        action: rec.op.clone(),
-                        path: format!("{}/{}", rec.collection, rec.rkey),
-                        cid: Some(cid),
-                        prev: prev_cid,
-                    });
-                }
-                OpAction::Delete => {
-                    self.store.delete_record(&self.did, &rec.uri).await?;
-                    commit_ops.push(CommitOp {
-                        action: rec.op.clone(),
-                        path: format!("{}/{}", rec.collection, rec.rkey),
-                        cid: None,
-                        prev: prev_cid,
-                    });
+
+            // Re-install `prepared` into the outer scope so
+            // Phase B (below) can read its blob-cid plans.
+            prepared = prepared_returned;
+
+            // Audit-first relay-race commit per the arc 2
+            // step-3.5 addendum: shared tx commits first; on
+            // failure the actor tx rolls back. Actor tx commits
+            // second; on failure an orphan-marker is emitted
+            // (`tracing::error!`) for the reconciliation sweep.
+            crate::actor_store::repo_storage::commit_with_orphan_recovery(
+                actor_tx_back,
+                shared_tx_back,
+                &self.did,
+            )
+            .await?;
+
+            (
+                commit_cid_v,
+                new_rev_v,
+                prev_commit_v,
+                prev_data_v,
+                blocks_v,
+                commit_ops_v,
+            )
+        } else {
+            // ----- Legacy per-statement auto-commit path -----
+            let storage = self.make_storage();
+            let did = self.did.clone();
+            let signer_arc = signer;
+
+            let (commit_cid, new_rev, prev_commit, prev_data, blocks): (
+                Cid,
+                String,
+                Option<Cid>,
+                Option<Cid>,
+                BlockMap,
+            ) = tokio::task::spawn_blocking(
+                move || -> Result<_, ProtoRepoError> {
+                    let storage_dyn: Arc<dyn RepoStorage> = storage.clone();
+                    let mut repo = match Repo::load(storage_dyn.clone()) {
+                        Ok(r) => r,
+                        Err(ProtoRepoError::Storage(_)) => {
+                            Repo::create(storage_dyn.clone(), did, signer_arc.as_ref())?
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    let prev = repo.commit_cid().cloned();
+                    let prev_data = repo.commit().map(|c| c.data.clone());
+                    let data = repo.apply_writes(&repo_writes, signer_arc.as_ref())?;
+                    Ok((
+                        data.commit_cid,
+                        data.commit.rev.clone(),
+                        prev,
+                        prev_data,
+                        data.blocks,
+                    ))
+                },
+            )
+            .await
+            .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?
+            .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
+
+            let mut commit_ops: Vec<CommitOp> = Vec::with_capacity(prepared.len());
+            for rec in &prepared {
+                let prev_cid = match rec.op {
+                    OpAction::Update | OpAction::Delete => {
+                        prior_record_cids.get(&rec.uri).cloned()
+                    }
+                    OpAction::Create => None,
+                };
+                match rec.op {
+                    OpAction::Create | OpAction::Update => {
+                        let cid = rec
+                            .cid
+                            .clone()
+                            .expect("create/update has cid by construction");
+                        self.store
+                            .put_record(
+                                &self.did,
+                                &rec.uri,
+                                &cid,
+                                &rec.collection,
+                                &rec.rkey,
+                                &new_rev,
+                            )
+                            .await?;
+                        commit_ops.push(CommitOp {
+                            action: rec.op.clone(),
+                            path: format!("{}/{}", rec.collection, rec.rkey),
+                            cid: Some(cid),
+                            prev: prev_cid,
+                        });
+                    }
+                    OpAction::Delete => {
+                        self.store.delete_record(&self.did, &rec.uri).await?;
+                        commit_ops.push(CommitOp {
+                            action: rec.op.clone(),
+                            path: format!("{}/{}", rec.collection, rec.rkey),
+                            cid: None,
+                            prev: prev_cid,
+                        });
+                    }
                 }
             }
-        }
+
+            (commit_cid, new_rev, prev_commit, prev_data, blocks, commit_ops)
+        };
 
         // Phase B — shared-DB blob-ref reconciliation (Arc 16e
         // §9.5.3.2.2). Production HTTP handlers chain

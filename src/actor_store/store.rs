@@ -511,6 +511,103 @@ impl ActorStore {
         Ok(())
     }
 
+    /// v0.7 arc 2 step 3.5 — per-actor `put_block` against a
+    /// caller-managed `sqlx::Sqlite` transaction instead of the
+    /// per-statement auto-commit path. Same SQL as `put_block`,
+    /// minus the `open_db` step (the caller provides the tx,
+    /// which is already on the per-DID pool).
+    pub async fn put_block_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Sqlite>,
+        cid: &str,
+        content: &[u8],
+    ) -> PdsResult<()> {
+        sqlx::query(
+            "INSERT INTO repo_block (cid, content, indexed_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(cid) DO NOTHING",
+        )
+        .bind(cid)
+        .bind(content)
+        .bind(chrono::Utc::now())
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
+    /// v0.7 arc 2 step 3.5 — per-actor `update_repo_root` against
+    /// a caller-managed `sqlx::Sqlite` transaction. Same SQL as
+    /// `update_repo_root`.
+    pub async fn update_repo_root_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Sqlite>,
+        did: &str,
+        cid: &str,
+        rev: &str,
+    ) -> PdsResult<()> {
+        sqlx::query(
+            "INSERT INTO repo_root (did, cid, rev, indexed_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(did) DO UPDATE SET
+                 cid = excluded.cid,
+                 rev = excluded.rev,
+                 indexed_at = excluded.indexed_at",
+        )
+        .bind(did)
+        .bind(cid)
+        .bind(rev)
+        .bind(chrono::Utc::now())
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
+    /// v0.7 arc 2 step 3.5 — per-actor `put_record` against a
+    /// caller-managed `sqlx::Sqlite` transaction. Same SQL as
+    /// `put_record`.
+    pub async fn put_record_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Sqlite>,
+        uri: &str,
+        cid: &str,
+        collection: &str,
+        rkey: &str,
+        repo_rev: &str,
+    ) -> PdsResult<()> {
+        sqlx::query(
+            "INSERT INTO record (uri, cid, collection, rkey, repo_rev, indexed_at, takedown_ref)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+             ON CONFLICT(uri) DO UPDATE SET
+                cid = excluded.cid,
+                repo_rev = excluded.repo_rev,
+                indexed_at = excluded.indexed_at",
+        )
+        .bind(uri)
+        .bind(cid)
+        .bind(collection)
+        .bind(rkey)
+        .bind(repo_rev)
+        .bind(chrono::Utc::now())
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
+    /// v0.7 arc 2 step 3.5 — per-actor `delete_record` against a
+    /// caller-managed `sqlx::Sqlite` transaction. Same SQL as
+    /// `delete_record`.
+    pub async fn delete_record_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Sqlite>,
+        uri: &str,
+    ) -> PdsResult<()> {
+        sqlx::query("DELETE FROM record WHERE uri = ?1")
+            .bind(uri)
+            .execute(&mut **tx)
+            .await?;
+
+        Ok(())
+    }
+
     /// Get a block from the repository
     pub async fn get_block(&self, did: &str, cid: &str) -> PdsResult<Option<Vec<u8>>> {
         let pool = self.open_db(did).await?;
