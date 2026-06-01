@@ -62,6 +62,52 @@
 //! form of that document — both must agree, and the doc's worked
 //! examples are sourced from the side-script's deterministic
 //! hash captures.
+//!
+//! # Centralized chain-write commitment (v0.7 arc 1)
+//!
+//! This module is the ONLY path that issues
+//! `INSERT INTO audit_chain_entry`. The canonical helpers are
+//! [`insert_chain_entry`] (caller-managed transaction with explicit
+//! backend) and its pool-API sibling [`insert_chain_entry_pool`].
+//! A build-script grep linter at the repo root (`build.rs`) fails
+//! the build if any source file under `src/` other than this module
+//! contains the literal `INSERT INTO audit_chain_entry`. New
+//! audit-inserting code MUST go through these helpers; raw SQL
+//! bypasses are a build failure with an actionable diagnostic.
+//!
+//! The structural enforcement is the grep linter + this
+//! module-level commitment + the in-process [`AppendChainGuard`]
+//! that callers acquire ahead of the transaction. On Postgres,
+//! [`insert_chain_entry`] additionally acquires
+//! `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` for cross-process
+//! serialization in multi-instance deployments.
+//!
+//! ## BEGIN IMMEDIATE on SQLite — known limitation
+//!
+//! v07_audit_coherence.md §6.1 specifies `BEGIN IMMEDIATE` for
+//! SQLite chain-writing transactions. sqlx 0.8's Any-backed
+//! `Pool::begin()` does not expose transaction-mode options for
+//! SQLite, so `BEGIN IMMEDIATE` cannot be set without abandoning
+//! the typed `Transaction` wrapper. AppendChainGuard (in-process
+//! mutex held across the caller's `tx.commit()`) plus SQLite's
+//! DB-level write lock provides equivalent single-writer-at-a-time
+//! serialization for single-instance SQLite deployments — the
+//! v0.6 deployment posture. Multi-instance SQLite is not a
+//! supported posture; multi-instance deployments use Postgres,
+//! where the advisory lock provides true cross-process
+//! serialization. A future sqlx upgrade exposing per-transaction
+//! BEGIN modes (or a refactor to backend-specific drivers for
+//! chain writes) would let this defense-in-depth land cleanly.
+//!
+//! ## Step-2 transition (v0.7 arc 1)
+//!
+//! Step 2 of arc 1 introduces [`insert_chain_entry`] and
+//! [`insert_chain_entry_pool`] as the new canonical helpers with
+//! explicit backend gating. The legacy [`append_entry_in_tx`] and
+//! [`append_entry`] survive as thin forwarders during the
+//! transition; step 3 (`migrate bsky audit paths`) updates the 23
+//! production call sites to the new helpers and retires the
+//! legacy forwarders.
 
 use crate::{admin::defs::Subject, error::PdsError};
 use chrono::{DateTime, Utc};
@@ -122,6 +168,15 @@ const fn audit_chain_lock_key() -> i64 {
     // collide.
     i64::from_be_bytes([0x2a, 0x28, 0x50, 0x8f, 0x76, 0xb6, 0x8d, 0x08])
 }
+
+/// Sentinel advisory-lock key used by `insert_chain_entry`'s debug-mode
+/// runtime assertion (v0.7 arc 1 step 2e). The probe attempts
+/// `pg_try_advisory_xact_lock(AUDIT_CHAIN_LOCK_SENTINEL_KEY)` to confirm
+/// the advisory-lock primitive is reachable on the active transaction;
+/// it intentionally uses a distinct key from `AUDIT_CHAIN_LOCK_KEY` so
+/// the probe never collides with the actual chain-serialization lock.
+/// Postgres-only; not relevant on SQLite.
+pub const AUDIT_CHAIN_LOCK_SENTINEL_KEY: i64 = AUDIT_CHAIN_LOCK_KEY.wrapping_add(1);
 
 /// One audit chain entry. Ships in `getAuditTrail` responses and is
 /// what the Audit page renders rows for.
@@ -449,41 +504,109 @@ impl AppendChainGuard {
 
 /// Append an entry to the chain inside an existing transaction.
 ///
-/// This is the LB-1 / chainlink #122 "atomic" entry point: the
-/// caller's transaction wraps both the underlying mutation
-/// (e.g., `UPDATE actor SET takedown_ref = ...`) and this chain
-/// append, so a crash between mutation and chain-append leaves
-/// neither row instead of an audit-blind mutation. Pre-LB-1, the
-/// pool-API `append_entry` opened its own transaction and the
-/// two writes could be torn at process death.
+/// **Legacy entry point (v0.7 arc 1 step 2).** Forwards to
+/// [`write_chain_entry_inner`] after issuing the Postgres advisory-lock
+/// query unconditionally — the v0.6 silent-fail-on-SQLite behavior is
+/// preserved verbatim so admin handlers keep working until step 3
+/// migrates them to [`insert_chain_entry`]. New code MUST call
+/// [`insert_chain_entry`] (which takes an explicit
+/// [`crate::config::DatabaseBackend`] and gates the advisory-lock
+/// query on it); this wrapper retires in step 3.
 ///
-/// Concurrency: the caller is responsible for holding an
-/// [`AppendChainGuard`] across their own `tx.commit()`. Inside
-/// this function we additionally take
-/// `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` so concurrent
-/// appenders serialize at the Postgres lock rather than racing on
-/// the chain head. The advisory lock auto-releases at COMMIT
-/// (caller-managed). On SQLite the advisory-lock query is
-/// best-effort (it errors silently on SQLite, which gets
-/// serialization for free via its DB-level write lock); the
-/// in-process guard is what actually serializes SQLite appenders.
+/// Original LB-1 / chainlink #122 commitment (still applies): the
+/// caller's transaction wraps both the underlying mutation (e.g.,
+/// `UPDATE actor SET takedown_ref = ...`) and this chain append, so a
+/// crash between mutation and chain-append leaves neither row instead
+/// of an audit-blind mutation. The caller is responsible for holding
+/// an [`AppendChainGuard`] across their own `tx.commit()`.
 pub async fn append_entry_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     params: AppendEntryParams<'_>,
 ) -> Result<i64, PdsError> {
-    // Postgres: serialize concurrent appenders behind a single
-    // advisory lock keyed on AUDIT_CHAIN_LOCK_KEY. Best-effort —
-    // SQLite errors on the function call ("no such function
-    // pg_advisory_xact_lock") and we ignore that. The caller's
-    // transaction provides write-serialization on both backends;
-    // the advisory lock is a Postgres refinement that lets
-    // multiple admins block briefly rather than collide on
-    // UNIQUE(sequence).
+    // v0.6 behavior preserved: issue the advisory-lock SELECT
+    // unconditionally. On Postgres this acquires the lock; on
+    // SQLite the function-not-found error is silently absorbed.
+    // The caller-acquired AppendChainGuard provides the actual
+    // in-process serialization on SQLite.
     let _ = sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(AUDIT_CHAIN_LOCK_KEY)
         .execute(&mut **tx)
         .await;
+    write_chain_entry_inner(tx, params).await
+}
 
+/// Append an entry to the chain inside an existing transaction (the
+/// canonical v0.7 helper).
+///
+/// Backend-gated: on [`crate::config::DatabaseBackend::Postgres`] the
+/// helper issues `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` to
+/// serialize concurrent appenders across processes. On
+/// [`crate::config::DatabaseBackend::Sqlite`] the advisory-lock query
+/// is skipped (the function does not exist on SQLite); the
+/// caller-acquired [`AppendChainGuard`] plus SQLite's DB-level write
+/// lock serialize chain writers in single-instance deployments. See the
+/// module-level "BEGIN IMMEDIATE on SQLite — known limitation" note
+/// for the multi-instance-SQLite caveat.
+///
+/// Caller contract:
+/// - Hold an [`AppendChainGuard`] across the caller's `tx.commit()`.
+/// - Pass the active [`crate::config::DatabaseBackend`] (typically
+///   `ctx.config.database.backend`).
+/// - The caller-managed transaction wraps both the underlying
+///   mutation and this chain append for atomicity (LB-1 / chainlink
+///   #122).
+///
+/// Runtime assertion: in debug builds on Postgres, a sentinel-key
+/// `pg_try_advisory_xact_lock(AUDIT_CHAIN_LOCK_SENTINEL_KEY)` probe
+/// confirms the advisory-lock primitive is reachable on the current
+/// transaction. The probe runs after the real chain-lock acquisition
+/// and is compiled out in release builds.
+pub async fn insert_chain_entry(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    backend: crate::config::DatabaseBackend,
+    params: AppendEntryParams<'_>,
+) -> Result<i64, PdsError> {
+    match backend {
+        crate::config::DatabaseBackend::Postgres => {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(AUDIT_CHAIN_LOCK_KEY)
+                .execute(&mut **tx)
+                .await?;
+            #[cfg(debug_assertions)]
+            {
+                // Debug-only defense-in-depth: probe the advisory-lock
+                // infrastructure via a sentinel key. The real chain lock
+                // is held above; the sentinel acquisition confirms the
+                // primitive is reachable on the active transaction.
+                let _: Option<bool> =
+                    sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                        .bind(AUDIT_CHAIN_LOCK_SENTINEL_KEY)
+                        .fetch_optional(&mut **tx)
+                        .await?;
+            }
+        }
+        crate::config::DatabaseBackend::Sqlite => {
+            // No advisory-lock equivalent. Serialization via
+            // AppendChainGuard (caller-acquired) + SQLite's
+            // DB-write lock. See module-level note for the
+            // BEGIN IMMEDIATE limitation.
+        }
+    }
+    write_chain_entry_inner(tx, params).await
+}
+
+/// Inner chain-write body. Computes sequence, canonical hash, and
+/// issues the `INSERT INTO audit_chain_entry` statement. Called by
+/// both [`insert_chain_entry`] (canonical) and the legacy
+/// [`append_entry_in_tx`] forwarder.
+///
+/// Pre-condition: the caller has acquired the appropriate
+/// chain-serialization primitive for the active backend (Postgres
+/// advisory lock or SQLite AppendChainGuard).
+async fn write_chain_entry_inner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    params: AppendEntryParams<'_>,
+) -> Result<i64, PdsError> {
     // Determine sequence + previous hash from the chain head.
     // Inside the transaction so this read sees the same snapshot
     // the subsequent INSERT will write into.
@@ -602,22 +725,16 @@ pub async fn append_entry_in_tx(
 /// [`append_entry_in_tx`] that opens its own transaction and
 /// commits — for callers without an enclosing mutation transaction.
 ///
-/// Concurrency: holds an [`AppendChainGuard`] across the whole
-/// transaction so the SELECT-head + INSERT-next sequence is
-/// single-flighted in-process; on Postgres,
-/// `pg_advisory_xact_lock` (taken inside the transaction by
-/// `append_entry_in_tx`) provides cross-process serialization.
+/// **Legacy entry point (v0.7 arc 1 step 2).** Retires in step 3
+/// alongside `append_entry_in_tx`; new code MUST call
+/// [`insert_chain_entry_pool`] which takes an explicit
+/// [`crate::config::DatabaseBackend`].
 ///
-/// ADMIN_MOD_PHASE_3 §6.1's "concurrency commitment" specified
-/// either advisory-lock or SERIALIZABLE-isolation as acceptable
-/// solutions; this implementation picks advisory-lock to match the
-/// codebase's existing leader-election pattern.
-///
-/// LB-1 / chainlink #122: prefer [`append_entry_in_tx`] from
-/// handlers that mutate other tables in the same audit decision —
-/// the chain entry then lands atomically with the underlying
-/// mutation. This wrapper is for chain-only writes (fewer in
-/// practice; mostly tests and infrastructure events).
+/// LB-1 / chainlink #122: prefer the caller-managed transaction
+/// path (`*_in_tx`) from handlers that mutate other tables in the
+/// same audit decision — the chain entry then lands atomically with
+/// the underlying mutation. This wrapper is for chain-only writes
+/// (fewer in practice; mostly tests and infrastructure events).
 pub async fn append_entry(
     db: &AnyPool,
     params: AppendEntryParams<'_>,
@@ -625,6 +742,28 @@ pub async fn append_entry(
     let _guard = AppendChainGuard::acquire().await;
     let mut tx = db.begin().await?;
     let id = append_entry_in_tx(&mut tx, params).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Append an entry to the chain via a self-managed transaction (the
+/// canonical pool-API helper, v0.7).
+///
+/// Acquires an [`AppendChainGuard`] across the open/INSERT/commit
+/// sequence, opens a sqlx transaction, calls [`insert_chain_entry`]
+/// with the supplied backend, and commits. For callers without an
+/// enclosing mutation transaction; per LB-1 / chainlink #122,
+/// callers mutating other tables should open their own transaction
+/// and call [`insert_chain_entry`] directly so the chain entry lands
+/// atomically with the mutation.
+pub async fn insert_chain_entry_pool(
+    db: &AnyPool,
+    backend: crate::config::DatabaseBackend,
+    params: AppendEntryParams<'_>,
+) -> Result<i64, PdsError> {
+    let _guard = AppendChainGuard::acquire().await;
+    let mut tx = db.begin().await?;
+    let id = insert_chain_entry(&mut tx, backend, params).await?;
     tx.commit().await?;
     Ok(id)
 }
