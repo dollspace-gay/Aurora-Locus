@@ -3004,9 +3004,13 @@ mod tests {
         }
 
         /// Auth=None on a kryphocron-prefix write continues to fall
-        /// through to arc 1's deny logic (registered NSID → deny-
-        /// map entry, NotYetSupported in arc 2 ship state). Step 4
-        /// must not regress this path.
+        /// through to arc 1's deny logic. In arc 2 step 5 the deny-
+        /// map for the four dedicated-endpoint NSIDs now returns
+        /// `RequiresDedicatedEndpoint { suggested_endpoint }` —
+        /// pointing clients at the dedicated endpoint rather than
+        /// the generic `NotYetSupported` arc 1 produced. The test
+        /// covers a `tools.kryphocron.feed.postPrivate` create:
+        /// suggestion must be `tools.kryphocron.feed.createPostPrivate`.
         #[tokio::test(flavor = "multi_thread")]
         async fn auth_none_falls_through_to_deny_map() {
             let (mgr, _tmp, _did) = kryphocron_test_mgr();
@@ -3023,13 +3027,55 @@ mod tests {
             };
 
             let result = mgr.validate_write(&write, None, None).await;
+            match result {
+                Err(PdsError::KryphocronRecordRequiresDedicatedEndpoint {
+                    nsid,
+                    suggested_endpoint,
+                }) => {
+                    assert_eq!(nsid, "tools.kryphocron.feed.postPrivate");
+                    assert_eq!(
+                        suggested_endpoint.as_deref(),
+                        Some("tools.kryphocron.feed.createPostPrivate"),
+                        "deny-map source-1 must point clients at the \
+                         dedicated endpoint for postPrivate.create",
+                    );
+                }
+                other => panic!(
+                    "expected KryphocronRecordRequiresDedicatedEndpoint, got {other:?}"
+                ),
+            }
+        }
+
+        /// The non-dedicated-endpoint NSIDs (every kryphocron NSID
+        /// that step 5 didn't add an override for) still produce
+        /// `KryphocronRecordNotYetSupported` — verifying the
+        /// source-2 default the registry walk populates.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn auth_none_non_dedicated_nsid_still_not_yet_supported() {
+            let (mgr, _tmp, _did) = kryphocron_test_mgr();
+            // `tools.kryphocron.feed.like` is registered but has
+            // no arc 2 step 5 dedicated endpoint — it falls
+            // through to source-2 NotYetSupported.
+            let write = WriteOp {
+                action: WriteOpAction::Create,
+                collection: "tools.kryphocron.feed.like".to_string(),
+                rkey: "abc123".to_string(),
+                value: Some(serde_json::json!({
+                    "$type": "tools.kryphocron.feed.like",
+                })),
+                validate: None,
+                swap_cid: None,
+                kryphocron_authorization: None,
+            };
+
+            let result = mgr.validate_write(&write, None, None).await;
             assert!(
                 matches!(
                     result,
                     Err(PdsError::KryphocronRecordNotYetSupported { .. })
                 ),
-                "auth=None must hit the deny-map / NotYetSupported \
-                 path (arc 1 deny-by-default), got {result:?}",
+                "non-dedicated-endpoint NSIDs must stay at \
+                 NotYetSupported, got {result:?}",
             );
         }
 

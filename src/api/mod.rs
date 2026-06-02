@@ -20,6 +20,7 @@ pub mod middleware;
 pub mod moderation;
 pub mod oauth_admin;
 pub mod oauth_server;
+pub mod kryphocron_endpoints;
 pub mod registry;
 pub mod repo;
 pub mod repo_import;
@@ -53,6 +54,7 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
         .merge(server::routes())
         .merge(repo::routes())
         .merge(repo_import::routes())
+        .merge(kryphocron_endpoints::routes())
         .merge(blob::routes())
         .merge(identity::routes())
         .merge(admin_router)

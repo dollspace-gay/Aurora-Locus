@@ -80,18 +80,38 @@ impl KryphocronDenyVariant {
 /// Build the deny-error map from `kryphocron::KRYPHOCRON_LEXICON_REGISTRY`.
 ///
 /// Per v07_DESIGN.md §8 lines 4849-4855: a static
-/// `HashMap<(nsid, op), DenyError>` populated from two sources. Arc 1
-/// only has source 2 (registry-without-dedicated-endpoint); arc 3+ adds
-/// source 1 (per-endpoint overrides that fire before the automatic
-/// derivation pass). Both populate the same map at the same startup
-/// step.
+/// `HashMap<(nsid, op), DenyError>` populated from two sources:
 ///
-/// Arc 1 implementation: walks the registry, fills `NotYetSupported`
-/// for every (NSID, Create | Update | Delete) tuple. Operators wanting
-/// to verify the surface can `cargo run -- list-kryphocron-nsids` once
-/// that CLI ships (post-arc-1), or inspect the registry directly.
+/// - **Source 1** (per-endpoint override): for the NSIDs that now
+///   have a dedicated XRPC procedure, the map points clients at
+///   the dedicated endpoint via
+///   `RequiresDedicatedEndpoint { suggested_endpoint: ... }`. The
+///   four step-5 dedicated endpoints land entries here:
+///   `tools.kryphocron.feed.postPrivate` (Create →
+///   `createPostPrivate`; Delete → `deletePostPrivate`) and
+///   `tools.kryphocron.policy.audience` (Create →
+///   `manageAudience`). The `Update` action on `postPrivate` and
+///   the `participatePrivate` endpoint's underlying record write
+///   are left in source 2 (`NotYetSupported`) — there is no
+///   dedicated edit-existing-private-post endpoint in arc 2,
+///   and `participatePrivate` writes the same `postPrivate`
+///   record collection so its create-path entry is the same
+///   `createPostPrivate` suggestion.
+///
+/// - **Source 2** (registry-without-dedicated-endpoint): every
+///   other `(NSID, action)` tuple gets `NotYetSupported`. The
+///   registry walk runs first; source-1 overrides apply
+///   afterward so the dedicated-endpoint entries replace the
+///   defaults.
+///
+/// Both sources populate the same map at the same startup step.
+/// Operators wanting to verify the surface can `cargo run --
+/// list-kryphocron-nsids` once that CLI ships (post-arc-2), or
+/// inspect the registry directly.
 pub fn build_deny_map() -> HashMap<(String, WriteOpAction), KryphocronDenyVariant> {
     let mut map = HashMap::new();
+    // Source 2 — default NotYetSupported for every registered
+    // (NSID, action) tuple.
     for entry in kryphocron::KRYPHOCRON_LEXICON_REGISTRY {
         let nsid = entry.nsid.to_string();
         for action in [
@@ -105,6 +125,43 @@ pub fn build_deny_map() -> HashMap<(String, WriteOpAction), KryphocronDenyVarian
             );
         }
     }
+    // Source 1 — per-endpoint overrides. Applied AFTER the
+    // registry walk so these entries replace the source-2
+    // defaults for the NSIDs the four arc 2 step 5 dedicated
+    // endpoints cover.
+    map.insert(
+        (
+            crate::api::kryphocron_endpoints::NSID_POST_PRIVATE.to_string(),
+            WriteOpAction::Create,
+        ),
+        KryphocronDenyVariant::RequiresDedicatedEndpoint {
+            suggested_endpoint: Some(
+                crate::api::kryphocron_endpoints::PROC_CREATE_POST_PRIVATE.to_string(),
+            ),
+        },
+    );
+    map.insert(
+        (
+            crate::api::kryphocron_endpoints::NSID_POST_PRIVATE.to_string(),
+            WriteOpAction::Delete,
+        ),
+        KryphocronDenyVariant::RequiresDedicatedEndpoint {
+            suggested_endpoint: Some(
+                crate::api::kryphocron_endpoints::PROC_DELETE_POST_PRIVATE.to_string(),
+            ),
+        },
+    );
+    map.insert(
+        (
+            crate::api::kryphocron_endpoints::NSID_AUDIENCE.to_string(),
+            WriteOpAction::Create,
+        ),
+        KryphocronDenyVariant::RequiresDedicatedEndpoint {
+            suggested_endpoint: Some(
+                crate::api::kryphocron_endpoints::PROC_MANAGE_AUDIENCE.to_string(),
+            ),
+        },
+    );
     map
 }
 
@@ -1290,5 +1347,120 @@ mod bind_pipeline_tests {
 
         assert!(logs_contain("kryphocron_bind_pipeline_authorized"));
         assert!(logs_contain("SystemCleanup"));
+    }
+}
+
+#[cfg(test)]
+mod deny_map_step_5_tests {
+    //! v0.7 arc 2 step 5 — deny-map source-1 override coverage.
+    //!
+    //! Asserts the three NSID-action tuples the four dedicated
+    //! endpoints cover get
+    //! `RequiresDedicatedEndpoint { suggested_endpoint: Some(...) }`
+    //! pointing at the right XRPC procedure. Adjacent NSIDs and
+    //! actions stay at the source-2 `NotYetSupported` default.
+
+    use super::*;
+    use crate::api::kryphocron_endpoints::{
+        NSID_AUDIENCE, NSID_POST_PRIVATE, PROC_CREATE_POST_PRIVATE,
+        PROC_DELETE_POST_PRIVATE, PROC_MANAGE_AUDIENCE,
+    };
+
+    fn assert_dedicated_endpoint(
+        map: &HashMap<(String, WriteOpAction), KryphocronDenyVariant>,
+        nsid: &str,
+        action: WriteOpAction,
+        expected_proc: &str,
+    ) {
+        match map.get(&(nsid.to_string(), action)) {
+            Some(KryphocronDenyVariant::RequiresDedicatedEndpoint {
+                suggested_endpoint: Some(proc),
+            }) => {
+                assert_eq!(
+                    proc, expected_proc,
+                    "suggested_endpoint mismatch for ({nsid}, {action:?})"
+                );
+            }
+            other => panic!(
+                "expected RequiresDedicatedEndpoint(Some({expected_proc})) for ({nsid}, {action:?}), got {other:?}"
+            ),
+        }
+    }
+
+    fn assert_not_yet_supported(
+        map: &HashMap<(String, WriteOpAction), KryphocronDenyVariant>,
+        nsid: &str,
+        action: WriteOpAction,
+    ) {
+        match map.get(&(nsid.to_string(), action)) {
+            Some(KryphocronDenyVariant::NotYetSupported) => {}
+            other => panic!(
+                "expected NotYetSupported for ({nsid}, {action:?}), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn post_private_create_routes_to_create_post_private_proc() {
+        let map = build_deny_map();
+        assert_dedicated_endpoint(
+            &map,
+            NSID_POST_PRIVATE,
+            WriteOpAction::Create,
+            PROC_CREATE_POST_PRIVATE,
+        );
+    }
+
+    #[test]
+    fn post_private_delete_routes_to_delete_post_private_proc() {
+        let map = build_deny_map();
+        assert_dedicated_endpoint(
+            &map,
+            NSID_POST_PRIVATE,
+            WriteOpAction::Delete,
+            PROC_DELETE_POST_PRIVATE,
+        );
+    }
+
+    #[test]
+    fn audience_create_routes_to_manage_audience_proc() {
+        let map = build_deny_map();
+        assert_dedicated_endpoint(
+            &map,
+            NSID_AUDIENCE,
+            WriteOpAction::Create,
+            PROC_MANAGE_AUDIENCE,
+        );
+    }
+
+    /// Update action on postPrivate has no dedicated endpoint in
+    /// arc 2 — must stay at NotYetSupported.
+    #[test]
+    fn post_private_update_stays_not_yet_supported() {
+        let map = build_deny_map();
+        assert_not_yet_supported(&map, NSID_POST_PRIVATE, WriteOpAction::Update);
+    }
+
+    /// Adjacent registered NSID (`tools.kryphocron.feed.like`)
+    /// stays at NotYetSupported — only the three explicit
+    /// override tuples flip to RequiresDedicatedEndpoint.
+    #[test]
+    fn adjacent_registered_nsid_stays_not_yet_supported() {
+        let map = build_deny_map();
+        assert_not_yet_supported(
+            &map,
+            "tools.kryphocron.feed.like",
+            WriteOpAction::Create,
+        );
+        assert_not_yet_supported(
+            &map,
+            "tools.kryphocron.feed.like",
+            WriteOpAction::Delete,
+        );
+        assert_not_yet_supported(
+            &map,
+            "tools.kryphocron.graph.block",
+            WriteOpAction::Create,
+        );
     }
 }
