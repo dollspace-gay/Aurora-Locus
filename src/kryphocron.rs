@@ -173,22 +173,14 @@ pub fn lexicon_validate(nsid: &str, record: &serde_json::Value) -> Result<(), Pd
     })
 }
 
-/// Authorisation check for a kryphocron write under the `Ok(tier)`
-/// dispatcher branch.
-///
-/// **Arc 1 stub.** Always returns `Ok(())`. The real implementation
-/// in arc 2 consults a `WriteOp.kryphocron_authorization` field
-/// (Q1 / Option A) populated by dedicated endpoints, cascade workers,
-/// account-setup paths, and recovery-mode bypass. Arc 1's deny-by-
-/// default rule makes this branch unreachable through the generic
-/// write path, so the stub returning `Ok(())` is not exercised in
-/// arc-1 ship state regardless of master-switch value.
-#[allow(dead_code)]
-pub fn check_authorization(
-    _write: &crate::actor_store::repository::WriteOp,
-) -> Result<(), PdsError> {
-    Ok(())
-}
+// Arc 1's `check_authorization` stub was removed at arc 2 step 4.
+// The dispatcher (in `RepositoryManager::validate_write`) now
+// consults the `WriteOp.kryphocron_authorization` field directly
+// and routes to [`bind_pipeline`] when it's `Some(_)`. The
+// "authorization missing" semantic the kickoff named is the same
+// as the existing deny-map / unregistered-NSID path: when auth is
+// `None`, the dispatcher falls through to the arc-1 deny logic
+// rather than calling a now-removed check function.
 
 // ---------------------------------------------------------------------------
 // Arc 2 — WriteOp authorization carrier (v07_DESIGN.md §5 lines 2140-2265)
@@ -647,6 +639,222 @@ impl CascadeContext {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Arc 2 step 4 — bind pipeline call
+// ---------------------------------------------------------------------------
+//
+// `bind_pipeline` is the consumer side of the
+// `KryphocronWriteAuthorization` carrier from step 2 and the
+// `CascadeContext::verify_token` machinery from step 3. The
+// dispatcher in `RepositoryManager::validate_write` routes
+// `Some(_)` authorizations through this function; `None` falls
+// through to arc 1's existing deny-by-default logic.
+//
+// Per v07_DESIGN.md §5/§6 the function fires one of three new
+// tracing events on each call:
+//
+// - `kryphocron_bind_pipeline_authorized` — happy path
+// - `kryphocron_bind_pipeline_denied` — reject for any reason
+// - `kryphocron_cascade_token_invalid` — Cascade variant verify
+//   failed (subset of `denied`)
+//
+// Arc 2 step 4 wires the framework; the actual oracle calls,
+// stage-0/stage-5 predicates, audit-emit payloads, and timing
+// equalization land at step 7 ("Audit emit shape for bind
+// pipeline"). The five match arms here are the minimum surface
+// step 5 ("Dedicated endpoints") needs to construct
+// `DedicatedEndpoint`-variant WriteOps.
+
+/// v0.7 arc 2 step 4 — execute the bind pipeline for a
+/// kryphocron-authorized write.
+///
+/// **Audit emit lands on `shared_tx`.** Per the step-3.5 addendum's
+/// audit-first relay-race ordering, all bind-pipeline audit
+/// writes (step 7's payload-bearing inserts into
+/// `moderation_event` + `mod_event_seq`) go to the shared
+/// account-DB transaction the caller lent to `SqliteRepoStorage`.
+/// Step 4 takes the `tx` parameter so step 7's wiring is a
+/// trailing-additive change rather than a signature-break.
+///
+/// **CascadeContext** is consulted only by the `Cascade` arm.
+/// When the variant is `Cascade { source, token }`, the function
+/// expects `cascade_context: Some(_)` and calls
+/// `verify_token(token, source)`. When `cascade_context: None` is
+/// supplied with a `Cascade` variant, the function emits
+/// `kryphocron_cascade_token_invalid` and rejects — there is no
+/// active context, so the token cannot be verified.
+///
+/// **Arc 2 ship-state semantics.** No production code path
+/// constructs `KryphocronWriteAuthorization::*` variants in arc 2
+/// step 4. The first production constructor lands at step 5
+/// (`DedicatedEndpoint` for the four user-class capabilities).
+/// `Cascade`, `SystemCleanup`, `AccountSetup`, and `RecoveryBypass`
+/// remain dead in production code at arc 2 ship state — the match
+/// arms ship for forward compat and exhaustive coverage. The arc
+/// 2 recon resolution supplement's R3 deferral applies to
+/// `RecoveryBypass`; the deferral note on `AccountSetup` from
+/// step 2 also applies here.
+#[allow(dead_code)] // reached at arc 2 step 5 and onward
+pub async fn bind_pipeline(
+    write_op: &crate::actor_store::repository::WriteOp,
+    shared_tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    cascade_context: Option<&mut CascadeContext>,
+    did: &str,
+) -> Result<(), PdsError> {
+    // The `tx` parameter is reserved for step 7's audit-emit
+    // inserts. Step 4 ships only the routing + tracing framework,
+    // so the parameter is silenced here.
+    let _ = &shared_tx;
+
+    let auth = write_op
+        .kryphocron_authorization
+        .as_ref()
+        .ok_or_else(|| {
+            // Programmer error: the dispatcher only calls
+            // bind_pipeline when authorization is Some(_).
+            tracing::warn!(
+                target: "aurora_locus::kryphocron",
+                event = "kryphocron_bind_pipeline_denied",
+                did = %did,
+                nsid = %write_op.collection,
+                reason = "no_authorization",
+            );
+            PdsError::Internal(
+                "bind_pipeline invoked without kryphocron_authorization".to_string(),
+            )
+        })?;
+
+    match auth {
+        KryphocronWriteAuthorization::DedicatedEndpoint { capability_class } => {
+            tracing::info!(
+                target: "aurora_locus::kryphocron",
+                event = "kryphocron_bind_pipeline_authorized",
+                did = %did,
+                nsid = %write_op.collection,
+                variant = "DedicatedEndpoint",
+                capability_class = ?capability_class,
+            );
+            // TODO step 7: per-class bind-pipeline stages
+            // (oracle consultation, stage-0/stage-5, audit emit
+            // on shared_tx, timing equalization). Step 4 ships
+            // routing + tracing only.
+            Ok(())
+        }
+        KryphocronWriteAuthorization::Cascade { source, token } => {
+            let ctx = match cascade_context {
+                Some(c) => c,
+                None => {
+                    tracing::warn!(
+                        target: "aurora_locus::kryphocron",
+                        event = "kryphocron_cascade_token_invalid",
+                        did = %did,
+                        nsid = %write_op.collection,
+                        reason = "no_active_cascade_context",
+                    );
+                    tracing::warn!(
+                        target: "aurora_locus::kryphocron",
+                        event = "kryphocron_bind_pipeline_denied",
+                        did = %did,
+                        nsid = %write_op.collection,
+                        variant = "Cascade",
+                        reason = "no_active_cascade_context",
+                    );
+                    return Err(PdsError::KryphocronCascadeTokenInvalid(
+                        "no active CascadeContext at bind_pipeline call site".to_string(),
+                    ));
+                }
+            };
+            match ctx.verify_token(token, source) {
+                Ok(()) => {
+                    tracing::info!(
+                        target: "aurora_locus::kryphocron",
+                        event = "kryphocron_bind_pipeline_authorized",
+                        did = %did,
+                        nsid = %write_op.collection,
+                        variant = "Cascade",
+                        source = ?source,
+                    );
+                    // TODO step 7: per-source cascade bind stages
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "aurora_locus::kryphocron",
+                        event = "kryphocron_cascade_token_invalid",
+                        did = %did,
+                        nsid = %write_op.collection,
+                        verify_error = %e,
+                    );
+                    tracing::warn!(
+                        target: "aurora_locus::kryphocron",
+                        event = "kryphocron_bind_pipeline_denied",
+                        did = %did,
+                        nsid = %write_op.collection,
+                        variant = "Cascade",
+                        verify_error = %e,
+                    );
+                    Err(PdsError::KryphocronCascadeTokenInvalid(e.to_string()))
+                }
+            }
+        }
+        KryphocronWriteAuthorization::AccountSetup { origin } => {
+            tracing::info!(
+                target: "aurora_locus::kryphocron",
+                event = "kryphocron_bind_pipeline_authorized",
+                did = %did,
+                nsid = %write_op.collection,
+                variant = "AccountSetup",
+                origin = ?origin,
+            );
+            // Account-setup writes don't run the bind pipeline
+            // proper (no oracle consultation for system-initiated
+            // auto-creates); per the design they emit an
+            // AccountSetup audit event only. Step 4 ships the
+            // routing + tracing; step 7 wires the audit emit.
+            // R3-deferred per the supplement — no production
+            // constructor exists in arc 2.
+            Ok(())
+        }
+        KryphocronWriteAuthorization::RecoveryBypass { cascade_source } => {
+            tracing::info!(
+                target: "aurora_locus::kryphocron",
+                event = "kryphocron_bind_pipeline_authorized",
+                did = %did,
+                nsid = %write_op.collection,
+                variant = "RecoveryBypass",
+                cascade_source = ?cascade_source,
+            );
+            // Per v07_DESIGN.md §5 lines 2160-2181: the
+            // RecoveryBypass arm emits the recovery-bypass audit
+            // event (no bind-pipeline run) and returns Ok. R3
+            // deferral applies — no production constructor exists
+            // in arc 2 ship state; the arm is dead code per the
+            // arc 2 recon resolution supplement, kept for
+            // exhaustive match coverage and forward-compat with
+            // the post-arc-2 cycle that wires the real recovery-
+            // mode write path.
+            Ok(())
+        }
+        KryphocronWriteAuthorization::SystemCleanup { origin } => {
+            tracing::info!(
+                target: "aurora_locus::kryphocron",
+                event = "kryphocron_bind_pipeline_authorized",
+                did = %did,
+                nsid = %write_op.collection,
+                variant = "SystemCleanup",
+                origin = ?origin,
+            );
+            // System-cleanup writes (orphan-companion sweep,
+            // bsky-delete cascade completion, orphan-cascade
+            // revert) don't run the bind pipeline — authorization
+            // was established at the originating user action.
+            // Audit emit happens at step 7. No production
+            // constructor in arc 2.
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod cascade_context_tests {
     use super::*;
@@ -791,5 +999,296 @@ mod cascade_context_tests {
 
         let _ = ctx.mint_secondary_token(root.clone());
         assert_eq!(ctx.root_source(), &root, "after depth-2 mint");
+    }
+}
+
+#[cfg(test)]
+mod bind_pipeline_tests {
+    //! v0.7 arc 2 step 4 — bind_pipeline unit tests.
+    //!
+    //! Coverage:
+    //!  - DedicatedEndpoint arm fires `kryphocron_bind_pipeline_authorized`
+    //!  - Cascade arm with valid token → `authorized`; with invalid
+    //!    token → `cascade_token_invalid` + `denied`; with no
+    //!    context → `cascade_token_invalid` + `denied`
+    //!  - AccountSetup, RecoveryBypass, SystemCleanup arms fire
+    //!    `authorized` (R3-deferred — no production constructor;
+    //!    arm exists for exhaustive match coverage)
+
+    use super::*;
+    use crate::actor_store::repository::{WriteOp, WriteOpAction};
+    use sqlx::AnyPool;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    async fn fresh_shared_pool() -> AnyPool {
+        sqlx::any::install_default_drivers();
+        AnyPool::connect("sqlite::memory:")
+            .await
+            .expect("shared pool")
+    }
+
+    fn make_write(nsid: &str, auth: KryphocronWriteAuthorization) -> WriteOp {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        WriteOp {
+            action: WriteOpAction::Create,
+            collection: nsid.to_string(),
+            rkey: format!("bp{}", n),
+            value: Some(serde_json::json!({"$type": nsid})),
+            validate: None,
+            swap_cid: None,
+            kryphocron_authorization: Some(auth),
+        }
+    }
+
+    fn bsky_source() -> CascadeSource {
+        CascadeSource::BskyDeleteCascade {
+            bsky_uri: "at://did:plc:bp/app.bsky.feed.post/abc".to_string(),
+        }
+    }
+
+    fn block_source() -> CascadeSource {
+        CascadeSource::BlockCascade {
+            block_uri: "at://did:plc:bp/app.bsky.graph.block/xyz".to_string(),
+        }
+    }
+
+    /// DedicatedEndpoint arm → authorized event, returns Ok.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn dedicated_endpoint_emits_authorized() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let write = make_write(
+            "tools.kryphocron.feed.postPrivate",
+            KryphocronWriteAuthorization::DedicatedEndpoint {
+                capability_class: CapabilityClass::User,
+            },
+        );
+
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp1")
+            .await
+            .expect("DedicatedEndpoint arm must succeed");
+
+        assert!(
+            logs_contain("kryphocron_bind_pipeline_authorized"),
+            "authorized event must fire",
+        );
+        assert!(
+            logs_contain("DedicatedEndpoint"),
+            "variant tag must surface in the event",
+        );
+        assert!(
+            !logs_contain("kryphocron_bind_pipeline_denied"),
+            "no denied event on the happy path",
+        );
+    }
+
+    /// Cascade arm with a valid token + matching CascadeContext →
+    /// authorized event, returns Ok, token marked spent.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn cascade_with_valid_token_emits_authorized() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let mut ctx = CascadeContext::new(bsky_source());
+        let token = ctx.mint_token(bsky_source());
+
+        let write = make_write(
+            "tools.kryphocron.feed.postPrivate",
+            KryphocronWriteAuthorization::Cascade {
+                source: bsky_source(),
+                token,
+            },
+        );
+
+        bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp2")
+            .await
+            .expect("Cascade with valid token must succeed");
+
+        assert!(
+            logs_contain("kryphocron_bind_pipeline_authorized"),
+            "authorized event must fire",
+        );
+        assert!(
+            !logs_contain("kryphocron_cascade_token_invalid"),
+            "no invalid event for the valid-token path",
+        );
+    }
+
+    /// Cascade arm with NO active CascadeContext → cascade_token_invalid
+    /// + denied events, returns KryphocronCascadeTokenInvalid.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn cascade_without_context_rejected() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+
+        // Construct a Cascade WriteOp with a synthetic token —
+        // there's no CascadeContext to mint it from, so the token
+        // points to a context that won't be supplied at verify
+        // time. The bind_pipeline must reject regardless of token
+        // validity because no context is available to verify
+        // against.
+        let dummy_ctx = CascadeContext::new(bsky_source());
+        let synthetic_token = CascadeToken {
+            cascade_context_id: dummy_ctx.id(),
+            mint_id: uuid::Uuid::new_v4(),
+        };
+        let write = make_write(
+            "tools.kryphocron.feed.postPrivate",
+            KryphocronWriteAuthorization::Cascade {
+                source: bsky_source(),
+                token: synthetic_token,
+            },
+        );
+
+        let result = bind_pipeline(&write, &mut tx, None, "did:plc:bp3").await;
+        assert!(
+            matches!(result, Err(PdsError::KryphocronCascadeTokenInvalid(_))),
+            "must reject Cascade with no active context: {result:?}",
+        );
+        assert!(
+            logs_contain("kryphocron_cascade_token_invalid"),
+            "invalid event must fire",
+        );
+        assert!(
+            logs_contain("kryphocron_bind_pipeline_denied"),
+            "denied event must fire alongside invalid",
+        );
+        assert!(
+            logs_contain("no_active_cascade_context"),
+            "reason tag must surface",
+        );
+    }
+
+    /// Cascade arm with a token from a DIFFERENT context (cross-
+    /// context isolation, same as step-3 hostile #4) → invalid +
+    /// denied, rejects.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn cascade_with_cross_context_token_rejected() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+
+        // Mint a token from ctx_a, supply ctx_b at verify time.
+        let mut ctx_a = CascadeContext::new(bsky_source());
+        let mut ctx_b = CascadeContext::new(bsky_source());
+        let token_from_a = ctx_a.mint_token(bsky_source());
+
+        let write = make_write(
+            "tools.kryphocron.feed.postPrivate",
+            KryphocronWriteAuthorization::Cascade {
+                source: bsky_source(),
+                token: token_from_a,
+            },
+        );
+
+        let result = bind_pipeline(&write, &mut tx, Some(&mut ctx_b), "did:plc:bp4").await;
+        assert!(
+            matches!(result, Err(PdsError::KryphocronCascadeTokenInvalid(_))),
+            "ctx_b must reject a token minted by ctx_a: {result:?}",
+        );
+        assert!(
+            logs_contain("kryphocron_cascade_token_invalid"),
+            "invalid event must fire on context mismatch",
+        );
+    }
+
+    /// Cascade arm with a source-mismatched token (mint with
+    /// BskyDeleteCascade, present BlockCascade — same as step-3
+    /// hostile #5) → invalid + denied, rejects.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn cascade_with_source_mismatched_token_rejected() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let mut ctx = CascadeContext::new(bsky_source());
+        let token = ctx.mint_token(bsky_source());
+
+        // Present the token with a DIFFERENT source.
+        let write = make_write(
+            "tools.kryphocron.feed.postPrivate",
+            KryphocronWriteAuthorization::Cascade {
+                source: block_source(),
+                token,
+            },
+        );
+
+        let result = bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp5").await;
+        assert!(
+            matches!(result, Err(PdsError::KryphocronCascadeTokenInvalid(_))),
+            "source mismatch must reject: {result:?}",
+        );
+        assert!(
+            logs_contain("kryphocron_cascade_token_invalid"),
+            "invalid event must fire on source mismatch",
+        );
+    }
+
+    /// AccountSetup arm → authorized event, returns Ok. R3-deferred
+    /// (no production constructor) but the arm is reachable in
+    /// tests; coverage proves the match arm exists and the
+    /// tracing event names the variant.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn account_setup_emits_authorized() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let write = make_write(
+            "tools.kryphocron.audience.list",
+            KryphocronWriteAuthorization::AccountSetup {
+                origin: AccountSetupOrigin::AccountSetup,
+            },
+        );
+
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp6")
+            .await
+            .expect("AccountSetup arm must succeed");
+
+        assert!(logs_contain("kryphocron_bind_pipeline_authorized"));
+        assert!(logs_contain("AccountSetup"));
+    }
+
+    /// RecoveryBypass arm → authorized event, returns Ok. R3-
+    /// deferred per arc 2 supplement; arm exists for exhaustive
+    /// coverage of the design's authorization surface.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn recovery_bypass_emits_authorized() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let write = make_write(
+            "tools.kryphocron.feed.postPrivate",
+            KryphocronWriteAuthorization::RecoveryBypass { cascade_source: None },
+        );
+
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp7")
+            .await
+            .expect("RecoveryBypass arm must succeed");
+
+        assert!(logs_contain("kryphocron_bind_pipeline_authorized"));
+        assert!(logs_contain("RecoveryBypass"));
+    }
+
+    /// SystemCleanup arm → authorized event, returns Ok.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn system_cleanup_emits_authorized() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let write = make_write(
+            "tools.kryphocron.feed.postPrivate",
+            KryphocronWriteAuthorization::SystemCleanup {
+                origin: SystemCleanupOrigin::OrphanCompanionSweep { dual_link_id: 42 },
+            },
+        );
+
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp8")
+            .await
+            .expect("SystemCleanup arm must succeed");
+
+        assert!(logs_contain("kryphocron_bind_pipeline_authorized"));
+        assert!(logs_contain("SystemCleanup"));
     }
 }

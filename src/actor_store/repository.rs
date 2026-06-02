@@ -497,30 +497,29 @@ impl RepositoryManager {
     /// received zero validation by default. The override applies to
     /// BOTH known NSIDs (hand-coded path) and unknown NSIDs (lexicon
     /// fall-through) — see V05_DESIGN_arc17.md §17.3.4 matrix.
-    async fn validate_write(&self, write: &WriteOp) -> PdsResult<()> {
+    async fn validate_write(
+        &self,
+        write: &WriteOp,
+        shared_tx: Option<&mut sqlx::Transaction<'_, sqlx::Any>>,
+        cascade_context: Option<&mut crate::kryphocron::CascadeContext>,
+    ) -> PdsResult<()> {
         // v0.7 arc 1 — Order A dispatcher closed-namespace policy. Per
         // v07_DESIGN.md §6 lines 3236-3305 the kryphocron-prefix check
         // runs BEFORE any lexicon validation or registry lookup so that
         // records claiming the closed namespace cannot be accepted via
         // the generic write path under any configuration.
         //
-        // Path A from the implementation kickoff: arc 1 ships deny-by-
-        // default with no `WriteOp.kryphocron_authorization` flag check
-        // because the flag doesn't exist yet (Q1 / Option A is arc 2's
-        // first deliverable). Arc 2 wires the flag and adapts the deny
-        // rule to bypass for dedicated-endpoint / cascade origins; arc
-        // 3+ ships the dedicated endpoints themselves. In arc 1 ship
-        // state every kryphocron NSID through the generic path fails:
-        // registered NSIDs get the deny-map entry (NotYetSupported per
-        // §8); unregistered NSIDs get `KryphocronUnregisteredNsidInClosedNamespace`.
-        //
-        // The error class for unregistered NSIDs follows v07_DESIGN.md
-        // §6 lines 3274-3283 (Err(NotRegistered) → unregistered-in-
-        // closed-namespace), not the implementation kickoff's Path A
-        // pseudocode which defaults to RequiresDedicatedEndpoint —
-        // surfaced as a kickoff-vs-design contradiction in the commit
-        // body. RequiresDedicatedEndpoint is misleading for unregistered
-        // NSIDs because no endpoint will ever exist for them.
+        // v0.7 arc 2 step 4 — when the write carries a populated
+        // `kryphocron_authorization`, the dispatcher routes through
+        // [`crate::kryphocron::bind_pipeline`] before falling through
+        // to arc 1's deny-by-default. When the field is `None`, the
+        // arc 1 deny path runs unchanged (registered NSID → deny-map
+        // entry; unregistered NSID →
+        // `KryphocronUnregisteredNsidInClosedNamespace`). No
+        // production code path constructs `Some(_)` authorization in
+        // arc 2 ship state; the first constructor lands at step 5
+        // ("Dedicated endpoints"). The branch is reachable via tests
+        // and via step 5+ production handlers.
         if write.collection.starts_with("tools.kryphocron.") {
             if !self.kryphocron_enabled {
                 // Master switch off — generic UnsupportedNamespace per
@@ -535,9 +534,40 @@ impl RepositoryManager {
                     nsid: write.collection.clone(),
                 });
             }
-            // Master switch on — Path A unconditional deny. The deny
-            // map is built from `kryphocron::KRYPHOCRON_LEXICON_REGISTRY`
-            // at startup; map presence indicates a registered NSID.
+
+            // v0.7 arc 2 step 4 — bind-pipeline route. When the write
+            // is `Some(_)`-authorized, run the bind pipeline (audit
+            // emit lands on the lent shared tx per the step-3.5
+            // addendum's audit-first relay-race ordering). The lent
+            // shared tx is `Some(_)` whenever `apply_writes` opened a
+            // relay-race scope (every production `for_writer` path);
+            // it's `None` for back-compat callers that constructed
+            // the manager via `::new()`. In the latter case a
+            // `Some(_)` authorization is a programmer error —
+            // surface as `KryphocronBindPipelineOutsideScope`.
+            if write.kryphocron_authorization.is_some() {
+                let tx = shared_tx.ok_or_else(|| {
+                    tracing::warn!(
+                        nsid = %write.collection,
+                        did = %self.did,
+                        "kryphocron_bind_pipeline_denied",
+                    );
+                    crate::error::PdsError::KryphocronBindPipelineOutsideScope
+                })?;
+                crate::kryphocron::bind_pipeline(
+                    write,
+                    tx,
+                    cascade_context,
+                    &self.did,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            // Master switch on, no authorization — arc 1 deny-by-
+            // default. The deny map is built from
+            // `kryphocron::KRYPHOCRON_LEXICON_REGISTRY` at startup;
+            // map presence indicates a registered NSID.
             return match self
                 .kryphocron_deny_map
                 .as_ref()
@@ -657,8 +687,22 @@ impl RepositoryManager {
         }
 
         // Validate every write up-front so we don't half-apply.
+        //
+        // v0.7 arc 2 step 4 — `validate_write` gained two optional
+        // parameters: the shared-DB tx (for the bind-pipeline audit
+        // emit) and the active CascadeContext (for the Cascade
+        // variant). At the top of `apply_writes` neither is
+        // available yet (the relay-race scope opens later), so we
+        // pass `None, None`. No production `WriteOp` carries a
+        // `kryphocron_authorization: Some(_)` in arc 2 ship state
+        // (step 5's dedicated endpoints land the first constructors),
+        // so the dispatcher's bind-pipeline branch is unreachable
+        // from this call site for now — when it IS reached it
+        // returns `KryphocronBindPipelineOutsideScope`, which step
+        // 5 will resolve by restructuring this call site to install
+        // the txns before validation.
         for write in &writes {
-            self.validate_write(write).await?;
+            self.validate_write(write, None, None).await?;
         }
 
         // Arc 14 §7.3.2: capture prior record CIDs for update/delete
@@ -2771,7 +2815,7 @@ mod tests {
             // HTTP layer maps to 502.
             let (mgr, _temp, _did) = build_mgr(FetchFailureBehavior::HardFail).await;
             let write = unknown_collection_write();
-            let result = mgr.validate_write(&write).await;
+            let result = mgr.validate_write(&write, None, None).await;
             match result {
                 Err(PdsError::LexiconFetchFailed { nsid, failure_class, .. }) => {
                     assert_eq!(nsid, "com.example.thing.foo");
@@ -2797,10 +2841,143 @@ mod tests {
             // is never re-emitted. The new gate must not interfere.
             let (mgr, _temp, _did) = build_mgr(FetchFailureBehavior::Warn).await;
             let write = unknown_collection_write();
-            let result = mgr.validate_write(&write).await;
+            let result = mgr.validate_write(&write, None, None).await;
             assert!(
                 result.is_ok(),
                 "validate_write must return Ok under Warn+Optimistic (warn_fallback ordering): {result:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------
+    // v0.7 arc 2 step 4 — validate_write dispatcher routing tests
+    // -----------------------------------------------------------
+    //
+    // The dispatcher's new bind-pipeline branch fires when a
+    // kryphocron-namespaced WriteOp carries
+    // `kryphocron_authorization: Some(_)`. With no `shared_tx`
+    // available (the `apply_writes` legacy path, or any unit
+    // test calling `validate_write` outside an `apply_writes`
+    // scope) the dispatcher returns
+    // `KryphocronBindPipelineOutsideScope` — a strong assertion
+    // that the bind pipeline only runs inside the write
+    // pipeline's relay-race scope.
+    //
+    // The opposite-success case (`Some(_)` auth + `Some(tx)`
+    // routes to `bind_pipeline`) is exercised by the
+    // `kryphocron::bind_pipeline_tests` module, which calls
+    // `bind_pipeline` directly with synthetic txns and asserts
+    // on tracing-event capture. Step 5 will add the production-
+    // path integration test once dedicated endpoints land the
+    // first real `Some(_)` constructor.
+    mod step_4_dispatcher_tests {
+        use super::*;
+        use crate::kryphocron::{
+            CapabilityClass, KryphocronWriteAuthorization,
+        };
+
+        fn kryphocron_test_mgr() -> (RepositoryManager, tempfile::TempDir, String) {
+            let (store, tmp) = test_store();
+            let did = unique_did();
+            let mut mgr = RepositoryManager::new(did.clone(), store);
+            // Production `for_writer` snapshots the master switch
+            // and deny map from `AppContext`; here we set them
+            // directly so the dispatcher reaches the bind-pipeline
+            // branch instead of the master-switch-off rejection.
+            mgr.kryphocron_enabled = true;
+            mgr.kryphocron_deny_map = Some(Arc::new(
+                crate::kryphocron::build_deny_map(),
+            ));
+            (mgr, tmp, did)
+        }
+
+        /// Auth=Some + shared_tx=None on a kryphocron-prefix write
+        /// must return `KryphocronBindPipelineOutsideScope` —
+        /// the strong assertion the step-4 supplement names.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn bind_pipeline_outside_scope_when_tx_missing() {
+            let (mgr, _tmp, _did) = kryphocron_test_mgr();
+            let write = WriteOp {
+                action: WriteOpAction::Create,
+                collection: "tools.kryphocron.feed.postPrivate".to_string(),
+                rkey: "abc123".to_string(),
+                value: Some(serde_json::json!({
+                    "$type": "tools.kryphocron.feed.postPrivate",
+                })),
+                validate: None,
+                swap_cid: None,
+                kryphocron_authorization: Some(
+                    KryphocronWriteAuthorization::DedicatedEndpoint {
+                        capability_class: CapabilityClass::User,
+                    },
+                ),
+            };
+
+            let result = mgr.validate_write(&write, None, None).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(PdsError::KryphocronBindPipelineOutsideScope)
+                ),
+                "expected KryphocronBindPipelineOutsideScope, got {result:?}",
+            );
+        }
+
+        /// Auth=None on a kryphocron-prefix write continues to fall
+        /// through to arc 1's deny logic (registered NSID → deny-
+        /// map entry, NotYetSupported in arc 2 ship state). Step 4
+        /// must not regress this path.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn auth_none_falls_through_to_deny_map() {
+            let (mgr, _tmp, _did) = kryphocron_test_mgr();
+            let write = WriteOp {
+                action: WriteOpAction::Create,
+                collection: "tools.kryphocron.feed.postPrivate".to_string(),
+                rkey: "abc123".to_string(),
+                value: Some(serde_json::json!({
+                    "$type": "tools.kryphocron.feed.postPrivate",
+                })),
+                validate: None,
+                swap_cid: None,
+                kryphocron_authorization: None,
+            };
+
+            let result = mgr.validate_write(&write, None, None).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(PdsError::KryphocronRecordNotYetSupported { .. })
+                ),
+                "auth=None must hit the deny-map / NotYetSupported \
+                 path (arc 1 deny-by-default), got {result:?}",
+            );
+        }
+
+        /// Unregistered NSID with auth=None still rejects with the
+        /// arc 1 `KryphocronUnregisteredNsidInClosedNamespace` —
+        /// the closed-namespace rule isn't affected by the step-4
+        /// bind-pipeline addition.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn auth_none_unregistered_nsid_still_rejected() {
+            let (mgr, _tmp, _did) = kryphocron_test_mgr();
+            let write = WriteOp {
+                action: WriteOpAction::Create,
+                collection: "tools.kryphocron.totally.fake".to_string(),
+                rkey: "abc123".to_string(),
+                value: Some(serde_json::json!({})),
+                validate: None,
+                swap_cid: None,
+                kryphocron_authorization: None,
+            };
+
+            let result = mgr.validate_write(&write, None, None).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(PdsError::KryphocronUnregisteredNsidInClosedNamespace { .. })
+                ),
+                "unregistered NSID must still hit the closed-namespace \
+                 rejection, got {result:?}",
             );
         }
     }

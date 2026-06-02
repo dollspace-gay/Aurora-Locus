@@ -513,6 +513,37 @@ pub enum PdsError {
     /// to land rather than to find an existing alternative.
     #[error("kryphocron NSID {nsid} is registered but no endpoint exposes it yet")]
     KryphocronRecordNotYetSupported { nsid: String },
+
+    /// v0.7 arc 2 step 4 — cascade token verification failed inside
+    /// `bind_pipeline`'s `Cascade` arm. The token's
+    /// `CascadeContext`-identity, source, or spent-marker check
+    /// failed, OR no `CascadeContext` was active at the verify
+    /// site. Mapped to HTTP 403 (the caller's authorization
+    /// claim is invalid). Reachable when arc 2 step 5's
+    /// dedicated endpoints and cascade-initiating handlers ship
+    /// the producer side; arc 2 step 4 wires only the consumer.
+    #[error("kryphocron cascade token invalid: {0}")]
+    #[allow(dead_code)] // produced by step 5+ cascade flows
+    KryphocronCascadeTokenInvalid(String),
+
+    /// v0.7 arc 2 step 4 — `validate_write` reached the bind
+    /// pipeline path (`kryphocron_authorization` is `Some(_)`)
+    /// without an active lent shared-DB transaction on the
+    /// storage layer. Indicates `apply_writes` did NOT open the
+    /// relay-race scope (typically because the
+    /// `RepositoryManager` was constructed via `::new()` without
+    /// chaining `with_shared_pool`, the back-compat test-only
+    /// path). Production handlers go through `for_writer` which
+    /// always plumbs the shared pool, so this is unreachable in
+    /// production.
+    ///
+    /// Mapped to HTTP 500 because it signals a programmer error,
+    /// not a client error: callers who construct a kryphocron-
+    /// authorized write must route it through a
+    /// shared-pool-equipped `RepositoryManager`.
+    #[error("kryphocron bind pipeline reached without an active apply_writes scope")]
+    #[allow(dead_code)] // reachable only via programmer error
+    KryphocronBindPipelineOutsideScope,
 }
 
 /// Manual PartialEq implementation for PdsError
@@ -647,6 +678,14 @@ impl PartialEq for PdsError {
                 PdsError::KryphocronRecordNotYetSupported { nsid: a },
                 PdsError::KryphocronRecordNotYetSupported { nsid: b },
             ) => a == b,
+            (
+                PdsError::KryphocronCascadeTokenInvalid(a),
+                PdsError::KryphocronCascadeTokenInvalid(b),
+            ) => a == b,
+            (
+                PdsError::KryphocronBindPipelineOutsideScope,
+                PdsError::KryphocronBindPipelineOutsideScope,
+            ) => true,
             // Database and Io errors cannot be compared, so we use error message comparison
             (PdsError::Database(a), PdsError::Database(b)) => a.to_string() == b.to_string(),
             (PdsError::Io(a), PdsError::Io(b)) => a.to_string() == b.to_string(),
@@ -992,6 +1031,16 @@ impl IntoResponse for PdsError {
             PdsError::KryphocronRecordNotYetSupported { .. } => (
                 StatusCode::BAD_REQUEST,
                 "KryphocronRecordNotYetSupported",
+                self.to_string(),
+            ),
+            PdsError::KryphocronCascadeTokenInvalid(_) => (
+                StatusCode::FORBIDDEN,
+                "KryphocronCascadeTokenInvalid",
+                self.to_string(),
+            ),
+            PdsError::KryphocronBindPipelineOutsideScope => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "KryphocronBindPipelineOutsideScope",
                 self.to_string(),
             ),
             _ => (
