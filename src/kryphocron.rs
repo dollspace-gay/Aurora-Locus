@@ -791,10 +791,109 @@ pub async fn bind_pipeline(
                 variant = "DedicatedEndpoint",
                 capability_class = ?capability_class,
             );
-            // TODO step 7: per-class bind-pipeline stages
-            // (oracle consultation, stage-0/stage-5, audit emit
-            // on shared_tx, timing equalization). Step 4 ships
-            // routing + tracing only.
+
+            // v0.7 arc 2 step 7 — housekeeping audit emit per
+            // v07_DESIGN.md §4 category B. The lent shared tx
+            // committed by `commit_with_orphan_recovery` (step
+            // 3.5) commits BEFORE the actor tx carrying the
+            // record write, so this row commits transactionally
+            // with the record write — the audit-coherence
+            // design's "transactional with record write" property
+            // now actually holds end-to-end (not best-effort).
+            //
+            // Per the §4 "Where housekeeping events fire" table,
+            // the audience-list dedicated endpoint
+            // (`manageAudience`) emits
+            // `KryphocronAudienceUpdated`. The block / mute /
+            // threadgate dedicated endpoints are post-arc-2 work
+            // — their B variants ship as enum + payload only
+            // (see `kryphocron_audit` module rustdoc).
+            //
+            // Per-class bind-pipeline stages (oracle consultation,
+            // stage-0/stage-5, timing equalization) are
+            // substrate-integration work scheduled for cycles
+            // beyond arc 2. The substrate's bind pipeline is the
+            // authoritative source for the per-class stages;
+            // Aurora-Locus's job is the audit emit + the host-
+            // side audience check (wired below for
+            // ParticipatePrivate). For `DedicatedEndpoint`-
+            // authorized writes that DON'T hit the audience
+            // collection, the bind succeeds with tracing-only
+            // until later cycles wire per-class stages.
+            if write_op.collection == "tools.kryphocron.policy.audience" {
+                let audience_uri = format!(
+                    "at://{}/{}/{}",
+                    did, write_op.collection, write_op.rkey
+                );
+                let operation = match write_op.action {
+                    crate::actor_store::repository::WriteOpAction::Create => {
+                        crate::kryphocron_audit::AudienceOperation::Created
+                    }
+                    crate::actor_store::repository::WriteOpAction::Update => {
+                        crate::kryphocron_audit::AudienceOperation::Updated
+                    }
+                    crate::actor_store::repository::WriteOpAction::Delete => {
+                        crate::kryphocron_audit::AudienceOperation::Deleted
+                    }
+                };
+
+                // Arc 2 step 7 ships a minimal payload — the
+                // mode / member-diff / cascade-field extraction
+                // requires walking the record body and the
+                // resume-state table. Post-arc-2 cycles can
+                // tighten this without re-shaping the event
+                // surface (the payload struct's shape is the
+                // design's §4 shape). Members are emitted as the
+                // raw `did:plc:...` list from the record body if
+                // present; mode is read from the record's
+                // top-level `mode` field if present, defaulting
+                // to `"list"`.
+                let value = write_op.value.as_ref();
+                let mode_after = value
+                    .and_then(|v| v.get("mode"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("list")
+                    .to_string();
+                let members_added = value
+                    .and_then(|v| v.get("members"))
+                    .and_then(|m| m.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let members_total_after = members_added.len() as i64;
+                let name = value
+                    .and_then(|v| v.get("name"))
+                    .and_then(|m| m.as_str())
+                    .map(String::from);
+
+                let payload = crate::kryphocron_audit::AudienceUpdatedPayload {
+                    audience_uri,
+                    owner_did: did.to_string(),
+                    operation,
+                    members_added,
+                    members_removed: vec![],
+                    members_total_after,
+                    mode_before: None,
+                    mode_after,
+                    name,
+                    origin: crate::kryphocron_audit::AudienceOrigin::User,
+                    cascade_id: None,
+                    cascade_reassigned_to: None,
+                    cascade_post_count: None,
+                    cascade_progress: None,
+                };
+
+                crate::kryphocron_audit::emit_audience_updated_in_tx(
+                    shared_tx,
+                    did,
+                    payload,
+                )
+                .await?;
+            }
+
             Ok(())
         }
         KryphocronWriteAuthorization::Cascade { source, token } => {

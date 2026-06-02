@@ -85,7 +85,25 @@ pub async fn insert_moderation_event_in_tx<'c>(
     Ok(event_id)
 }
 
-/// Moderation event types
+/// Moderation event types.
+///
+/// v0.7 arc 2 step 7 — 12 new variants for kryphocron audit events
+/// per `v07_DESIGN.md` §4 (the §4 "Written by" column splits them
+/// into three emission categories — A: async-flushed from substrate
+/// sinks, B: emitted by Aurora-Locus handlers transactionally with
+/// the record write via the lent shared tx from step 3.5, C:
+/// emitted by Aurora-Locus handlers in their own short tx). For
+/// step 7's ship state, B-variant emit is wired for the
+/// `KryphocronAudienceUpdated` path (the only B variant whose
+/// triggering record-write endpoint exists in arc 2 — the other
+/// B variants need block / mute / threadgate / recovery / cleanup
+/// infrastructure that's post-arc-2 work). C-variant
+/// `KryphocronAudienceCheckDenied` is wired into
+/// `participatePrivate`'s host-side audience-oracle pre-check. A
+/// variants and `KryphocronFallback` ship as enum + payload only;
+/// the substrate async flusher and sentinel-sink infrastructure
+/// they need is post-arc-2 work documented in their per-variant
+/// rustdoc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModerationEventType {
@@ -113,6 +131,64 @@ pub enum ModerationEventType {
     AppealSubmit,
     /// Appeal reviewed
     AppealReview,
+
+    // ---- v0.7 arc 2 step 7 — kryphocron audit events ----
+    /// Substrate emitted `CapabilityBound` via the user-sink; flushed
+    /// from the buffer by Aurora-Locus's async flusher into a
+    /// `moderation_event` row carrying the [`KryphocronBindGrantedPayload`].
+    /// Category A — async flusher path. v0.7 arc 2 ships the variant
+    /// plus payload shape; the flusher itself is post-arc-2
+    /// substrate-integration work.
+    KryphocronBindGranted,
+    /// Substrate emitted `CapabilityIssuanceDenied` via the user-sink.
+    /// Category A — same async-flusher path as `KryphocronBindGranted`.
+    KryphocronBindDenied,
+    /// Host-side audience check (per `v07_DESIGN.md` §3 "Where
+    /// audience enforcement lives") denied a `ParticipatePrivate`
+    /// attempt before the bind pipeline was invoked. Category C —
+    /// emitted by `participatePrivate` in its own short tx.
+    KryphocronAudienceCheckDenied,
+    /// Substrate emitted `ReborrowFailed` via the user-sink.
+    /// Category A — async flusher.
+    KryphocronReborrowFailed,
+    /// Substrate's composite_audit fired a rollback marker.
+    /// Category A — async flusher. v0.7 caveat per the design:
+    /// effectively never fires under v0.7's all-user-class workloads.
+    KryphocronCompositeRollbackMarker,
+    /// Audience-list record created / updated / deleted. Category
+    /// B — emitted by `bind_pipeline`'s DedicatedEndpoint arm via
+    /// the lent shared tx, transactionally with the record write.
+    KryphocronAudienceUpdated,
+    /// Block record created / deleted. Category B. v0.7 arc 2 ships
+    /// the variant + payload; the create/delete endpoint pair and
+    /// the block-cascade machinery are post-arc-2 work.
+    KryphocronBlockChanged,
+    /// Mute record created / deleted. Category B. Same arc-2-ship-
+    /// without-emit-wiring as `KryphocronBlockChanged`.
+    KryphocronMuteChanged,
+    /// Threadgate record created / updated / deleted. Category B.
+    /// Same arc-2-ship-without-emit-wiring as
+    /// `KryphocronBlockChanged`.
+    KryphocronThreadgateChanged,
+    /// Sink panic, composite-failure, flush drop, chain-integrity
+    /// violation, or fail-loud sentinel-sink emit. Category C —
+    /// would be emitted by the housekeeping audit path's panic
+    /// guard / sentinel sinks. v0.7 arc 2 ships the variant +
+    /// payload; the sentinel-sink + panic-guard infrastructure is
+    /// post-arc-2 substrate-integration work.
+    KryphocronFallback,
+    /// A `tools.kryphocron.*` write landed via the generic path
+    /// under `AURORA_RECOVERY_MODE=true`. Category B. R3-deferred
+    /// per the arc 2 recon resolution supplement — no production
+    /// emit site in arc 2; the variant + payload exist for the
+    /// post-arc-2 recovery-mode cycle.
+    KryphocronRecoveryWrite,
+    /// System-initiated automated cleanup wrote a record outside
+    /// any user request and outside recovery mode. Category B.
+    /// v0.7 arc 2 ships the variant + payload; the cascade-
+    /// initiating handler + orphan-sweep infrastructure that
+    /// triggers this event is post-arc-2 work.
+    KryphocronSystemCleanup,
 }
 
 impl ModerationEventType {
@@ -130,6 +206,21 @@ impl ModerationEventType {
             ModerationEventType::ReportReview => "report_review",
             ModerationEventType::AppealSubmit => "appeal_submit",
             ModerationEventType::AppealReview => "appeal_review",
+            // v0.7 arc 2 step 7 — kryphocron variants
+            ModerationEventType::KryphocronBindGranted => "kryphocron_bind_granted",
+            ModerationEventType::KryphocronBindDenied => "kryphocron_bind_denied",
+            ModerationEventType::KryphocronAudienceCheckDenied => "kryphocron_audience_check_denied",
+            ModerationEventType::KryphocronReborrowFailed => "kryphocron_reborrow_failed",
+            ModerationEventType::KryphocronCompositeRollbackMarker => {
+                "kryphocron_composite_rollback_marker"
+            }
+            ModerationEventType::KryphocronAudienceUpdated => "kryphocron_audience_updated",
+            ModerationEventType::KryphocronBlockChanged => "kryphocron_block_changed",
+            ModerationEventType::KryphocronMuteChanged => "kryphocron_mute_changed",
+            ModerationEventType::KryphocronThreadgateChanged => "kryphocron_threadgate_changed",
+            ModerationEventType::KryphocronFallback => "kryphocron_fallback",
+            ModerationEventType::KryphocronRecoveryWrite => "kryphocron_recovery_write",
+            ModerationEventType::KryphocronSystemCleanup => "kryphocron_system_cleanup",
         }
     }
 }
@@ -151,6 +242,23 @@ impl FromStr for ModerationEventType {
             "report_review" => Ok(ModerationEventType::ReportReview),
             "appeal_submit" => Ok(ModerationEventType::AppealSubmit),
             "appeal_review" => Ok(ModerationEventType::AppealReview),
+            // v0.7 arc 2 step 7 — kryphocron variants
+            "kryphocron_bind_granted" => Ok(ModerationEventType::KryphocronBindGranted),
+            "kryphocron_bind_denied" => Ok(ModerationEventType::KryphocronBindDenied),
+            "kryphocron_audience_check_denied" => {
+                Ok(ModerationEventType::KryphocronAudienceCheckDenied)
+            }
+            "kryphocron_reborrow_failed" => Ok(ModerationEventType::KryphocronReborrowFailed),
+            "kryphocron_composite_rollback_marker" => {
+                Ok(ModerationEventType::KryphocronCompositeRollbackMarker)
+            }
+            "kryphocron_audience_updated" => Ok(ModerationEventType::KryphocronAudienceUpdated),
+            "kryphocron_block_changed" => Ok(ModerationEventType::KryphocronBlockChanged),
+            "kryphocron_mute_changed" => Ok(ModerationEventType::KryphocronMuteChanged),
+            "kryphocron_threadgate_changed" => Ok(ModerationEventType::KryphocronThreadgateChanged),
+            "kryphocron_fallback" => Ok(ModerationEventType::KryphocronFallback),
+            "kryphocron_recovery_write" => Ok(ModerationEventType::KryphocronRecoveryWrite),
+            "kryphocron_system_cleanup" => Ok(ModerationEventType::KryphocronSystemCleanup),
             _ => Err(PdsError::Validation(format!("Invalid event type: {}", s))),
         }
     }

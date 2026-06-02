@@ -260,14 +260,37 @@ async fn delete_post_private(
 }
 
 /// `tools.kryphocron.actor.participatePrivate` — participate in a
-/// private thread (write a reply / participation marker) under the
-/// `ParticipatePrivate` (user-class) capability. Step 5 ships the
-/// endpoint that routes the WriteOp through `bind_pipeline`; the
-/// exact reply-vs-create split + the parent-post audience-oracle
-/// integration arrive at step 7 when the bind pipeline stages
-/// land. The endpoint accepts the same `record` body shape as
-/// `createPostPrivate` (a `postPrivate` record) and writes to
-/// `tools.kryphocron.feed.postPrivate`.
+/// private thread under the `ParticipatePrivate` (user-class)
+/// capability.
+///
+/// **Reply-vs-create discrimination.** The endpoint REQUIRES the
+/// supplied `record` to carry a `reply.parent.uri` field (the
+/// `postPrivate` lexicon's reply ref per
+/// `tools.kryphocron.feed.postPublic#replyRef`). Posts without a
+/// reply parent are rejected — that shape is what
+/// `createPostPrivate` is for (capability `EditPrivatePost`).
+/// The presence of `reply.parent.uri` is the structural
+/// discriminator the design uses to identify "participating in
+/// someone else's thread" vs "creating a fresh post".
+///
+/// **Audience-oracle integration.** Before the bind pipeline
+/// runs, the host-side audience check inspects the parent post's
+/// `audienceList` and verifies the requester DID is in the
+/// referenced audience. On rejection the handler emits
+/// `KryphocronAudienceCheckDenied` (per design §4) in its own
+/// short tx on the shared account DB and returns HTTP 403. The
+/// 403's body is intentionally coarse-grained (per design §10
+/// "BindDenied diagnostic ambiguity") to avoid leaking audience
+/// membership info.
+///
+/// **Local vs cross-DID parents.** Arc 2 step 7 implements the
+/// check for parents whose owner DID is a local account. Cross-
+/// DID parents (the writer is participating in a thread hosted
+/// on another PDS) are deferred with a `tracing::warn!` —
+/// federation-backed audience read-through is post-arc-2 work.
+/// The deferred path allows the participation; the warning makes
+/// the deferred check visible in operator logs so the gap
+/// doesn't sit silent.
 async fn participate_private(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -275,6 +298,57 @@ async fn participate_private(
 ) -> PdsResult<Json<WriteResponse>> {
     let auth_did =
         authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoCreate).await?;
+
+    // Reply-vs-create discrimination: extract the reply parent URI.
+    // Reject if absent — participatePrivate is for participating
+    // in someone else's thread, not for fresh posts.
+    let parent_uri = req
+        .record
+        .get("reply")
+        .and_then(|r| r.get("parent"))
+        .and_then(|p| p.get("uri"))
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| {
+            PdsError::Validation(
+                "participatePrivate requires record.reply.parent.uri \
+                 (the post being participated in)"
+                    .to_string(),
+            )
+        })?
+        .to_string();
+
+    match check_participate_audience(&ctx, &parent_uri, &auth_did).await? {
+        ParticipateAudienceOutcome::Allowed => {}
+        ParticipateAudienceOutcome::DeferredCrossDid { parent_owner } => {
+            tracing::warn!(
+                target: "aurora_locus::kryphocron",
+                event = "participate_private_audience_check_deferred",
+                requester_did = %auth_did,
+                parent_uri = %parent_uri,
+                parent_owner = %parent_owner,
+                reason = "cross_did_audience_lookup_not_yet_wired",
+                "audience-oracle check deferred — parent owner is \
+                 not a local actor; arc 2 step 7 ships local-DID \
+                 lookup only, federation-backed lookup is post-arc-2",
+            );
+        }
+        ParticipateAudienceOutcome::Denied(payload) => {
+            let mut tx = ctx
+                .account_db
+                .begin()
+                .await
+                .map_err(PdsError::Database)?;
+            crate::kryphocron_audit::emit_audience_check_denied_in_tx(
+                &mut tx, &auth_did, payload,
+            )
+            .await?;
+            tx.commit().await.map_err(PdsError::Database)?;
+            return Err(PdsError::Authorization(
+                "Audience check denied".to_string(),
+            ));
+        }
+    }
+
     let resp = apply_single_create(
         &ctx,
         &auth_did,
@@ -285,6 +359,218 @@ async fn participate_private(
     )
     .await?;
     Ok(Json(resp))
+}
+
+/// Outcome of the host-side audience-oracle pre-check that runs
+/// before `participatePrivate` invokes the bind pipeline. See
+/// [`check_participate_audience`].
+#[derive(Debug)]
+enum ParticipateAudienceOutcome {
+    /// Requester is in the parent's audience — proceed.
+    Allowed,
+    /// Parent owner is not a local actor; cross-DID audience
+    /// lookup is deferred to a post-arc-2 cycle. The
+    /// participation is allowed; the deferred check is logged
+    /// via tracing.
+    DeferredCrossDid { parent_owner: String },
+    /// Parent post or audience is misconfigured, or the
+    /// requester is not a member. The handler emits the
+    /// audience-check-denied event and returns HTTP 403.
+    Denied(crate::kryphocron_audit::AudienceCheckDeniedPayload),
+}
+
+/// Host-side audience check for participatePrivate per
+/// `v07_DESIGN.md` §3 "Where audience enforcement lives". Reads
+/// the parent post record's `audienceList` field, looks up the
+/// referenced audience record, and checks the requester DID
+/// against the audience's member list.
+///
+/// Arc 2 step 7 implements the check for parents whose owner DID
+/// is a local account. Cross-DID parents return
+/// `DeferredCrossDid` — federation-backed audience read-through
+/// is post-arc-2 work documented in `participate_private`'s
+/// rustdoc.
+async fn check_participate_audience(
+    ctx: &AppContext,
+    parent_uri: &str,
+    requester_did: &str,
+) -> PdsResult<ParticipateAudienceOutcome> {
+    let parent_owner = parse_at_uri_did(parent_uri).ok_or_else(|| {
+        PdsError::Validation(format!("invalid parent URI: {parent_uri}"))
+    })?;
+
+    if !ctx.actor_store.exists(&parent_owner).await {
+        return Ok(ParticipateAudienceOutcome::DeferredCrossDid { parent_owner });
+    }
+
+    let parent_record = match ctx
+        .actor_store
+        .get_record(&parent_owner, parent_uri)
+        .await?
+    {
+        Some(r) => r,
+        None => {
+            return Ok(ParticipateAudienceOutcome::Denied(
+                build_denied_payload(parent_uri, requester_did, None, "unknown"),
+            ));
+        }
+    };
+
+    let parent_block_bytes = match ctx
+        .actor_store
+        .get_block(&parent_owner, &parent_record.cid)
+        .await?
+    {
+        Some(b) => b,
+        None => {
+            return Ok(ParticipateAudienceOutcome::Denied(
+                build_denied_payload(parent_uri, requester_did, None, "unknown"),
+            ));
+        }
+    };
+
+    let parent_lex = proto_blue::lex_cbor::decode(&parent_block_bytes).map_err(|e| {
+        PdsError::Internal(format!("decode parent post block: {e}"))
+    })?;
+    let parent_json = proto_blue::lex_json::lex_to_json(&parent_lex);
+    let audience_uri = parent_json
+        .get("audienceList")
+        .and_then(|v| v.get("uri").or(Some(v)))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let audience_uri = match audience_uri {
+        Some(uri) => uri,
+        None => {
+            return Ok(ParticipateAudienceOutcome::Denied(
+                build_denied_payload(parent_uri, requester_did, None, "unknown"),
+            ));
+        }
+    };
+
+    let audience_owner = parse_at_uri_did(&audience_uri).ok_or_else(|| {
+        PdsError::Validation(format!("invalid audience URI: {audience_uri}"))
+    })?;
+
+    if !ctx.actor_store.exists(&audience_owner).await {
+        return Ok(ParticipateAudienceOutcome::DeferredCrossDid {
+            parent_owner: audience_owner,
+        });
+    }
+
+    let audience_record = match ctx
+        .actor_store
+        .get_record(&audience_owner, &audience_uri)
+        .await?
+    {
+        Some(r) => r,
+        None => {
+            return Ok(ParticipateAudienceOutcome::Denied(build_denied_payload(
+                parent_uri,
+                requester_did,
+                Some(audience_uri.clone()),
+                "unknown",
+            )));
+        }
+    };
+
+    let audience_block_bytes = match ctx
+        .actor_store
+        .get_block(&audience_owner, &audience_record.cid)
+        .await?
+    {
+        Some(b) => b,
+        None => {
+            return Ok(ParticipateAudienceOutcome::Denied(build_denied_payload(
+                parent_uri,
+                requester_did,
+                Some(audience_uri.clone()),
+                "unknown",
+            )));
+        }
+    };
+
+    let audience_lex = proto_blue::lex_cbor::decode(&audience_block_bytes).map_err(|e| {
+        PdsError::Internal(format!("decode audience record block: {e}"))
+    })?;
+    let audience_json = proto_blue::lex_json::lex_to_json(&audience_lex);
+    let mode = audience_json
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("list")
+        .to_string();
+
+    // Arc 2 step 7 implements list-mode membership check. Other
+    // modes (`everyone`, `followers`, `following`, `nobody`)
+    // need follow-graph / public-default semantics that are
+    // post-arc-2 work; for those modes we conservatively defer
+    // to `NoAudienceConfigured` so the request fails closed
+    // until the per-mode logic ships.
+    if mode != "list" {
+        return Ok(ParticipateAudienceOutcome::Denied(build_denied_payload(
+            parent_uri,
+            requester_did,
+            Some(audience_uri),
+            &mode,
+        )));
+    }
+    let is_member = audience_json
+        .get("members")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().any(|m| m.as_str() == Some(requester_did)))
+        .unwrap_or(false);
+
+    if is_member {
+        Ok(ParticipateAudienceOutcome::Allowed)
+    } else {
+        Ok(ParticipateAudienceOutcome::Denied(
+            crate::kryphocron_audit::AudienceCheckDeniedPayload {
+                capability_attempted: "ParticipatePrivate".to_string(),
+                subject_uri: parent_uri.to_string(),
+                requester_did: requester_did.to_string(),
+                audience_uri: Some(audience_uri),
+                audience_mode: mode,
+                audience_check_result: crate::kryphocron_audit::AudienceCheckResult::NotInAudience,
+                trace_id: crate::kryphocron_audit::synthesize_trace_id(),
+                payload_completeness: crate::kryphocron_audit::PayloadCompleteness::Full,
+            },
+        ))
+    }
+}
+
+/// Build a denial payload for the `NoAudienceConfigured` path.
+/// Used when the parent post is missing, its block isn't
+/// fetchable, the audience URI isn't extractable, or the audience
+/// record/block isn't fetchable.
+fn build_denied_payload(
+    parent_uri: &str,
+    requester_did: &str,
+    audience_uri: Option<String>,
+    audience_mode: &str,
+) -> crate::kryphocron_audit::AudienceCheckDeniedPayload {
+    crate::kryphocron_audit::AudienceCheckDeniedPayload {
+        capability_attempted: "ParticipatePrivate".to_string(),
+        subject_uri: parent_uri.to_string(),
+        requester_did: requester_did.to_string(),
+        audience_uri,
+        audience_mode: audience_mode.to_string(),
+        audience_check_result: crate::kryphocron_audit::AudienceCheckResult::NoAudienceConfigured,
+        trace_id: crate::kryphocron_audit::synthesize_trace_id(),
+        payload_completeness: crate::kryphocron_audit::PayloadCompleteness::Full,
+    }
+}
+
+/// Extract the owner DID from an `at://<did>/<collection>/<rkey>`
+/// URI. Returns `None` if the URI doesn't match the expected
+/// shape.
+fn parse_at_uri_did(uri: &str) -> Option<String> {
+    let after_scheme = uri.strip_prefix("at://")?;
+    let did = after_scheme.split('/').next()?;
+    if did.starts_with("did:") {
+        Some(did.to_string())
+    } else {
+        None
+    }
 }
 
 /// `tools.kryphocron.policy.manageAudience` — create or update a
