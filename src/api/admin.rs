@@ -1979,7 +1979,7 @@ async fn takedown_account(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Arc 15 §8.3.6: emit Takendown #account event (Pattern B).
-    // Reverse-takedown deferred to v0.6+ per §8.1.2.
+    // Reverse-takedown deferred to a future cycle per §8.1.2.
     let acc_post = ctx
         .account_manager
         .get_account(&req.did)
@@ -3948,8 +3948,7 @@ async fn update_subject_status(
                 }
             }
             // else: takedown.applied = false → reverse-takedown,
-            // §8.1.2 v0.5 deferral; no #account emit fires.
-            // v0.6 work tracked separately.
+            // §8.1.2 future-cycle deferral; no #account emit fires.
         }
 
         // Deactivate / reactivate path.
