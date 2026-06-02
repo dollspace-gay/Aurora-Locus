@@ -3210,8 +3210,9 @@ dependencies = [
 
 [[package]]
 name = "kryphocron"
-version = "0.1.1"
-source = "git+https://github.com/skydeval/kryphocron?branch=0.2-dev#11b5ac4ecc6e840f8458fc1237c13aa5fd34e4ba"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28a1c46527100c0dd3bbbbe6694be91b4f4a3194c4501a609113d48125c5ffea"
 dependencies = [
  "async-trait",
  "base64",
@@ -3228,8 +3229,9 @@ dependencies = [
 
 [[package]]
 name = "kryphocron-lexicons"
-version = "0.1.0"
-source = "git+https://github.com/skydeval/kryphocron-lexicons?branch=0.2-dev#9b90430ce2afbe2832606fb1d5fd575f593a9ec7"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fc540592bb1c348fa138377cf9ec3600d44f0d1be1c1b0128a514cf0036af51"
 dependencies = [
  "proto-blue-lex-data",
  "proto-blue-lexicon",
