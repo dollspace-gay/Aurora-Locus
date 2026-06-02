@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-02
+
+### Added
+
+- kryphocron substrate integration: four dedicated XRPC procedures under `tools.kryphocron.*` for the user-class capabilities — `tools.kryphocron.feed.createPostPrivate` (EditPrivatePost), `tools.kryphocron.feed.deletePostPrivate` (DeletePrivatePost), `tools.kryphocron.actor.participatePrivate` (ParticipatePrivate), and `tools.kryphocron.policy.manageAudience` (ManageAudience).
+- Host-side audience-oracle pre-check on `participatePrivate` for local-DID parent posts; out-of-audience writes are rejected with HTTP 403 and an audit emit. Cross-DID parents are deferred with a `tracing::warn!` (federation-backed audience read-through is post-v0.7 work).
+- `KryphocronWriteAuthorization` per-write authorization carrier on `WriteOp` with five variants — `DedicatedEndpoint`, `Cascade`, `AccountSetup`, `RecoveryBypass`, `SystemCleanup` — matching `v07_DESIGN.md` §5 exhaustively.
+- `bind_pipeline` dispatch in `validate_write` with three new structured tracing events: `kryphocron_bind_pipeline_authorized`, `kryphocron_bind_pipeline_denied`, `kryphocron_cascade_token_invalid`.
+- `CascadeContext` + `CascadeToken` mint/verify machinery for cascade-authorized writes: single-use spent marker, cross-context isolation, source-mismatch rejection, and a one-shot depth-2 cap per context.
+- Twelve new `ModerationEventType` variants per `v07_DESIGN.md` §4 covering substrate-flusher binds, host-side audience denial, housekeeping audit emits, and forensic-fallback paths. Payload structs land in a new `kryphocron_audit` module.
+- Audit-first relay-race transaction ordering across the per-actor SQLite and shared account-DB transactions, with `commit_with_orphan_recovery` and an operator-visible `bind_audit_orphan_marker` `tracing::error!` emit on the narrow window where the per-actor commit fails after the shared-DB audit commit succeeded.
+- `kryphocron`-prefix deny-map source-1 overrides redirect generic `createRecord` traffic for the four NSIDs with dedicated endpoints to the appropriate dedicated procedure via `KryphocronRecordRequiresDedicatedEndpoint { suggested_endpoint: Some(...) }`.
+- Two new `PdsError` variants: `KryphocronCascadeTokenInvalid` (HTTP 403) and `KryphocronBindPipelineOutsideScope` (HTTP 500).
+
+### Changed
+
+- `WriteOp` lost its `Clone` derive: the `CascadeToken` carried by the `Cascade` authorization variant is single-use by design, and cloning a write op would double-spend the token. The `kryphocron_authorization` field is `#[serde(skip)]` so the `applyWrites` wire shape is unchanged.
+- `SqliteRepoStorage`'s `RepoStorage` trait methods (`get_block`, `put_block`, `get_root`, `update_root`, plus the already-aware `apply_commit`) are now lent-transaction-aware. proto-blue's commit-assembly reads now see writes staged earlier in the same scope.
+- `apply_writes` opens both transactions up front, threads them through `with_lent_txns`, and commits in audit-first order. The validate loop moved into each branch of the relay-race vs. legacy split.
+- `validate_write` signature gained optional `shared_tx: Option<&mut sqlx::Transaction<'_, sqlx::Any>>` and `cascade_context: Option<&mut CascadeContext>` parameters; the dispatcher's bind-pipeline branch routes through them.
+- `kryphocron` and `kryphocron-lexicons` dependencies moved from git+branch to crates.io version-deps now that both are published at v0.2.0.
+
+### Notes
+
+- The cascade-context infrastructure ships in v0.7, but no production caller constructs a `CascadeContext` yet. The first production use lands in a future cycle alongside the bsky-side cascade integration (per-audience updates on `block.create`, audience-delete cascade-reassign, bsky-delete cascade completion).
+- The `RecoveryBypass` write-authorization variant ships for exhaustive coverage; no production constructor exists in v0.7. Write-path recovery-mode integration is deferred to a future cycle.
+- Six of the twelve new `ModerationEventType` variants ship enum + payload only, pending the post-v0.7 cycles that wire their emit sites (substrate async flusher for category A; block / mute / threadgate dedicated endpoints; recovery-mode write-path; cascade-initiating handlers + orphan-companion sweep; sentinel-sink + panic-guard infrastructure for `KryphocronFallback`).
+- End-to-end Phase B coverage of the orphan-marker forensic emit is deferred to the hardening cycle that ships the reconciliation sweep. Unit-test coverage at `src/actor_store/repo_storage.rs::step_3_5_tests` (`step_3_5_t6`, `step_3_5_t7`) exercises the emit path and the clean-failure path directly.
+- Non-`list` audience modes (`everyone`, `followers`, `following`, `nobody`) fail closed to `NoAudienceConfigured` in v0.7's `participatePrivate` audience check until per-mode logic ships in a follow-up.
+
 ## [0.6.0] - 2026-05-27
 
 ### Added

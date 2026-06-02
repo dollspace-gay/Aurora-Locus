@@ -107,6 +107,7 @@ async fn build_test_ctx() -> (AppContext, TempDir) {
         blob_metadata: Default::default(),
         entryway: None,
         lexicon: aurora_locus::config::LexiconConfig::default(),
+        kryphocron: aurora_locus::config::KryphocronConfig::default(),
     };
     let ctx = AppContext::new(
         config,

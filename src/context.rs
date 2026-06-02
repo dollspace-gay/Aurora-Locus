@@ -160,6 +160,24 @@ pub struct AppContext {
     /// `None`; validate-phase callers skip the Arc 17 fall-through
     /// entirely.
     pub lexicon_resolver: Option<Arc<crate::federation::lexicon_resolver::LexResolver>>,
+
+    /// v0.7 arc 1 — kryphocron deny-error map. `Some` when
+    /// `config.kryphocron.enabled` is true; `None` when the master
+    /// switch is off. Built at startup from
+    /// `kryphocron::KRYPHOCRON_LEXICON_REGISTRY` per v07_DESIGN.md §8
+    /// lines 4849-4855 (one entry per (NSID, action) tuple). Consulted
+    /// by the dispatcher's deny-by-default branch to surface
+    /// `KryphocronRecordNotYetSupported` (or, post-arc-1,
+    /// `KryphocronRecordRequiresDedicatedEndpoint` with a populated
+    /// suggested-endpoint).
+    pub kryphocron_deny_map: Option<
+        Arc<
+            std::collections::HashMap<
+                (String, crate::actor_store::repository::WriteOpAction),
+                crate::kryphocron::KryphocronDenyVariant,
+            >,
+        >,
+    >,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -869,6 +887,25 @@ impl AppContext {
             None
         };
 
+        // v0.7 arc 1 step 4c + 4f — kryphocron startup. When the master
+        // switch is on, force-initialise `kryphocron::lexicons()` so any
+        // embedded-JSON parse failure surfaces at startup rather than
+        // mid-request; build the deny-error map from
+        // `kryphocron::KRYPHOCRON_LEXICON_REGISTRY`. When the switch is
+        // off, both are skipped: the registry stays uninitialised and
+        // `kryphocron_deny_map` stays `None`.
+        let kryphocron_deny_map = if config.kryphocron.enabled {
+            crate::kryphocron::warm_lexicons();
+            let map = crate::kryphocron::build_deny_map();
+            tracing::info!(
+                deny_map_entries = map.len(),
+                "kryphocron enabled; lexicons warmed and deny-error map built",
+            );
+            Some(Arc::new(map))
+        } else {
+            None
+        };
+
         Ok(Self {
             config: Arc::new(config),
             account_db,
@@ -908,6 +945,9 @@ impl AppContext {
             // Admin endpoints under tools.aurora.lexicon.* and the
             // validate-phase fall-through gate on this field.
             lexicon_resolver,
+            // v0.7 arc 1 — kryphocron deny-error map constructed below
+            // (Some when config.kryphocron.enabled, None otherwise).
+            kryphocron_deny_map,
         })
     }
 

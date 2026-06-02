@@ -642,7 +642,7 @@ pub(crate) async fn run_verify_audit_chain<W: std::io::Write>(
 #[cfg(test)]
 mod verify_audit_chain_tests {
     use super::*;
-    use crate::admin::audit_chain::{append_entry, AppendEntryParams};
+    use crate::admin::audit_chain::{insert_chain_entry_pool, AppendEntryParams};
     use crate::admin::defs::Subject;
     use sqlx::any::AnyPoolOptions;
     use sqlx::AnyPool;
@@ -708,8 +708,9 @@ mod verify_audit_chain_tests {
             did: "did:plc:s".to_string(),
         };
         for i in 0..n {
-            append_entry(
+            insert_chain_entry_pool(
                 db,
+                crate::config::DatabaseBackend::Sqlite,
                 AppendEntryParams {
                     actor_did: "did:plc:m1",
                     action: "TakedownAccount",

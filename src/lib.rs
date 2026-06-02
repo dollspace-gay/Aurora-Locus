@@ -24,6 +24,8 @@ pub mod error;
 pub mod federation;
 pub mod identity;
 pub mod jobs;
+pub mod kryphocron;
+pub mod kryphocron_audit;
 pub mod mailer;
 pub mod metrics;
 pub mod oauth;

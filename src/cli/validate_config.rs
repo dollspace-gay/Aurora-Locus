@@ -71,6 +71,7 @@ pub fn validate_config(config: &ServerConfig) -> PdsResult<()> {
     validate_rate_limit_config(config, &mut issues);
     validate_federation_config(config, &mut issues);
     validate_gc_sweep_config(config, &mut issues);
+    validate_kryphocron_config(config, &mut issues);
     check_production_readiness(config, &mut issues);
 
     // Categorize and display issues
@@ -645,6 +646,38 @@ fn validate_federation_config(config: &ServerConfig, issues: &mut Vec<Validation
 /// targets a specific operator-misconfiguration mode the v0.4
 /// design flagged as worth surfacing at validate-time rather than
 /// at sweep-time.
+/// v0.7 arc 1 — kryphocron config status surface.
+///
+/// Arc 1 ships a single-flag config (`enabled: bool`); the only thing
+/// to surface is whether the integration is on. Later arcs add real
+/// validation (audit-retry tuning bounds, audience-member-limit ranges,
+/// oracle-cache TTL sanity, etc.). For now: an informational note so
+/// `validate-config` output documents the operator's choice without
+/// being silent about it.
+fn validate_kryphocron_config(config: &ServerConfig, issues: &mut Vec<ValidationIssue>) {
+    if config.kryphocron.enabled {
+        issues.push(ValidationIssue::info(
+            "Kryphocron",
+            "kryphocron substrate integration enabled (PDS_KRYPHOCRON_ENABLED=true). \
+             Lexicons warm at startup; all `tools.kryphocron.*` NSIDs are routed \
+             through the closed-namespace dispatcher. Arc 1 ship state: every \
+             kryphocron NSID through the generic write path returns \
+             KryphocronRecordNotYetSupported (no dedicated endpoints exist yet \
+             — arc 3+)."
+                .to_string(),
+        ));
+    } else {
+        issues.push(ValidationIssue::info(
+            "Kryphocron",
+            "kryphocron substrate integration disabled (PDS_KRYPHOCRON_ENABLED=false, \
+             default). `tools.kryphocron.*` NSIDs through the generic write path \
+             return UnsupportedNamespace; lexicons are not warmed; deny-error \
+             map is not built. Set PDS_KRYPHOCRON_ENABLED=true to enable."
+                .to_string(),
+        ));
+    }
+}
+
 fn validate_gc_sweep_config(config: &ServerConfig, issues: &mut Vec<ValidationIssue>) {
     if !config.gc_sweep.enabled {
         // Sweep disabled — config knobs irrelevant. No warnings.

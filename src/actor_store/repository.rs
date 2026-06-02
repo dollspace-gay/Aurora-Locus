@@ -55,7 +55,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Write operation action
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WriteOpAction {
     Create,
@@ -63,8 +63,14 @@ pub enum WriteOpAction {
     Delete,
 }
 
-/// Write operation for applyWrites
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Write operation for applyWrites.
+///
+/// **v0.7 arc 2.** `Clone` derive removed: `kryphocron_authorization`
+/// carries a non-clonable `CascadeToken` per v07_DESIGN.md §5. R1
+/// recon confirmed zero `WriteOp.clone()` sites across the workspace
+/// (search at `docs/internal/v07-recon/arc2_recon.md` R1 "Clone sites
+/// — ZERO"); dropping `Clone` is a zero-cost migration.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WriteOp {
     pub action: WriteOpAction,
@@ -78,6 +84,21 @@ pub struct WriteOp {
     /// If provided, the operation will fail if the current record's CID doesn't match
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swap_cid: Option<String>,
+    /// v0.7 arc 2 — kryphocron write-authorization carrier per
+    /// v07_DESIGN.md §5 lines 2100-2193. Populated at the originating
+    /// call site (dedicated endpoint handler, cascade worker,
+    /// account-setup path, recovery-mode entry, system-cleanup task);
+    /// consulted at `validate_write` (arc 2 step 4) under the
+    /// dispatcher's `Ok(tier)` branch.
+    ///
+    /// `#[serde(skip)]`: the field is in-process state, not
+    /// request-bearable input. `applyWrites` request bodies don't
+    /// carry it (default `None` on deserialize), and sequencer
+    /// payloads don't persist it (default `None` on the
+    /// hypothetically-stored value). Wire-shape compatibility with
+    /// v0.6 is preserved.
+    #[serde(skip)]
+    pub kryphocron_authorization: Option<crate::kryphocron::KryphocronWriteAuthorization>,
 }
 
 /// Per-record bookkeeping captured during commit prep so we can update
@@ -140,6 +161,35 @@ pub struct RepositoryManager {
     /// Paired with the validator's own `with_lexicon` wiring —
     /// production handlers chain both onto the constructor.
     lexicon_config: Option<crate::config::LexiconConfig>,
+    /// v0.7 arc 1 — kryphocron master-switch snapshot. Consulted at the
+    /// top of [`validate_write`] for the closed-namespace dispatcher.
+    /// `false` for the default constructors used in tests; populated by
+    /// [`for_writer`] from `ctx.config.kryphocron.enabled`.
+    kryphocron_enabled: bool,
+    /// v0.7 arc 1 — kryphocron deny-error map. `Some` when the master
+    /// switch is on; `None` otherwise (the dispatcher's master-switch-off
+    /// branch never consults the map). Built once at startup in
+    /// [`crate::context::AppContext::new`] from
+    /// `kryphocron::KRYPHOCRON_LEXICON_REGISTRY`; shared via `Arc` across
+    /// every per-request `RepositoryManager`.
+    kryphocron_deny_map: Option<
+        Arc<
+            std::collections::HashMap<
+                (String, WriteOpAction),
+                crate::kryphocron::KryphocronDenyVariant,
+            >,
+        >,
+    >,
+    /// v0.7 arc 2 step 3.5 — shared account-DB pool for the
+    /// relay-race tx-lending mechanism. When `Some(_)`,
+    /// `apply_writes` opens both a per-actor SQLite tx and a
+    /// shared `sqlx::Any` tx, threads them through
+    /// `SqliteRepoStorage::with_lent_txns`, and commits in
+    /// audit-first order via `commit_with_orphan_recovery`. When
+    /// `None`, the legacy per-statement auto-commit path is used
+    /// (preserving back-compat for `RepositoryManager::new`-
+    /// constructed test instances that have no shared pool).
+    shared_pool: Option<sqlx::AnyPool>,
 }
 
 impl RepositoryManager {
@@ -157,6 +207,9 @@ impl RepositoryManager {
             sequencer: None,
             blob_store: None,
             lexicon_config: None,
+            kryphocron_enabled: false,
+            kryphocron_deny_map: None,
+            shared_pool: None,
         }
     }
 
@@ -179,7 +232,24 @@ impl RepositoryManager {
             sequencer: Some(sequencer),
             blob_store: None,
             lexicon_config: None,
+            kryphocron_enabled: false,
+            kryphocron_deny_map: None,
+            shared_pool: None,
         }
+    }
+
+    /// v0.7 arc 2 step 3.5 — attach the shared account-DB pool so
+    /// `apply_writes` can open a shared `sqlx::Any` tx for the
+    /// bind-pipeline audit emit and run the relay-race commit
+    /// orchestration. When not chained, `apply_writes` falls back
+    /// to the pre-3.5 per-statement auto-commit path. Every
+    /// production write-handler constructor MUST chain this — the
+    /// dispatcher-side tx-lending mechanism is only active when
+    /// the shared pool is plumbed.
+    #[must_use]
+    pub fn with_shared_pool(mut self, shared_pool: sqlx::AnyPool) -> Self {
+        self.shared_pool = Some(shared_pool);
+        self
     }
 
     /// Arc 16e §9.5.3.2.2: attach the shared-DB `BlobStore`. Every
@@ -222,10 +292,18 @@ impl RepositoryManager {
             ctx.sequencer.clone(),
             ctx.config.validation_mode,
         )
-        .with_blob_store(ctx.blob_store.clone());
+        .with_blob_store(ctx.blob_store.clone())
+        .with_shared_pool(ctx.account_db.clone());
         if let Some(resolver) = ctx.lexicon_resolver.as_ref().cloned() {
             mgr = mgr.with_lexicon(resolver, ctx.config.lexicon.clone());
         }
+        // v0.7 arc 1 — kryphocron dispatcher snapshot. The master switch
+        // is copied so per-request `validate_write` can check it without
+        // following the ctx.config Arc chain on every call; the deny-map
+        // is shared via Arc and consulted only on the kryphocron-prefix
+        // branch.
+        mgr.kryphocron_enabled = ctx.config.kryphocron.enabled;
+        mgr.kryphocron_deny_map = ctx.kryphocron_deny_map.clone();
         mgr
     }
 
@@ -408,114 +486,32 @@ impl RepositoryManager {
         ))
     }
 
-    /// Validate a single write — runs the codec validator under the
-    /// configured mode and tracks failures on the actor store.
+    /// v0.7 arc 2 step 5 (apply_writes restructure) — capture
+    /// prior record CIDs and project each `WriteOp` into the
+    /// `proto_blue::repo::RepoWrite` + `PreparedRecord` pair the
+    /// downstream commit path consumes.
     ///
-    /// Arc 17 §17.3.4 / round-1 F4 closure: when `lexicon.enabled` and
-    /// `lexicon.validate_imports = true` (default), the per-write
-    /// `validate = Some(false)` bypass is OVERRIDDEN — validate fires
-    /// regardless. This closes the v1 gap where CAR-imported records
-    /// (which the Arc 16f handler sets to `validate = Some(false)`)
-    /// received zero validation by default. The override applies to
-    /// BOTH known NSIDs (hand-coded path) and unknown NSIDs (lexicon
-    /// fall-through) — see V05_DESIGN_arc17.md §17.3.4 matrix.
-    async fn validate_write(&self, write: &WriteOp) -> PdsResult<()> {
-        let value = match &write.value {
-            Some(v) => v,
-            None => return Ok(()), // delete or no-op
-        };
-
-        // §17.3.4 per-write bypass evaluation. Delegated to
-        // `should_validate_per_lexicon_imports` so the matrix is
-        // unit-tested in isolation; see that function's doc-comment
-        // table for the full rule set. Quick mental model: the
-        // override only fires when both `lexicon.enabled` and
-        // `validate_imports` are true; otherwise pre-Arc-17 semantics
-        // (the `validate = Some(false)` bypass) are preserved.
-        if !should_validate_per_lexicon_imports(write.validate, self.lexicon_config.as_ref()) {
-            return Ok(());
-        }
-
-        if let Err(errors) = self.validator.validate(&write.collection, value).await {
-            let uri = format!("at://{}/{}/{}", self.did, write.collection, write.rkey);
-
-            // Arc 17 §17.3.3 Phase B bug #2 — lexicon fetch-class
-            // failures (HardFail, authority-trust, deny, invalid-NSID)
-            // bypass `ValidationMode::Optimistic` per the §17.3.3
-            // precedence ("HardFail propagates; record validation
-            // fails" is strictly stronger than Optimistic's accept-
-            // on-failure). `SchemaViolation` and hand-coded validator
-            // errors remain absorbable under Optimistic — the matrix
-            // lives in `should_propagate_validation_errors` so the
-            // precedence is unit-tested in isolation. Warn-mode lexicon
-            // failures never reach this branch as fetch-class variants
-            // (handle_fetch_error short-circuits to handle_unknown
-            // before re-emitting an error), so the gate doesn't
-            // interfere with the warn_fallback path.
-            let propagate = should_propagate_validation_errors(&errors, self.validator.mode());
-
-            if !propagate {
-                // Optimistic absorb — track and accept.
-                if let Err(e) = self
-                    .store
-                    .track_validation_failure(&self.did, &write.collection, &uri, &errors)
-                    .await
-                {
-                    tracing::warn!("Failed to track validation failure for {}: {}", uri, e);
-                }
-                tracing::warn!(
-                    "Validation failed for {} but accepting in Optimistic mode: {} error(s)",
-                    uri,
-                    errors.len()
-                );
-                return Ok(());
-            }
-
-            // Required mode OR fetch-class lexicon variant under
-            // Optimistic — track and reject. `validation_errors_to_pds_error`
-            // routes `@lexicon/LexiconFetchFailed` to `PdsError::LexiconFetchFailed`
-            // → HTTP 502 per §17.3.6 wire alignment.
-            let _ = self
-                .store
-                .track_validation_failure(&self.did, &write.collection, &uri, &errors)
-                .await;
-            return Err(validation_errors_to_pds_error(errors));
-        }
-        Ok(())
-    }
-
-    /// Apply write operations and create a new commit.
+    /// Extracted into a helper so both branches of `apply_writes`
+    /// (relay-race lent-tx and legacy auto-commit) share the same
+    /// projection without duplicating the prior-cid loop or the
+    /// per-write match arm. Both branches' validate loops run
+    /// BEFORE this helper, so any validation error fails fast
+    /// before any of the projection work happens.
     ///
-    /// The `signer` produces ECDSA signatures over the unsigned commit
-    /// payload — pass a `RepoSigner` wrapping the actor's repo-signing
-    /// key.
-    ///
-    /// Arc 16e v5.1 (Arc 16f Step 4 §9.6.3.4): the `promoter`
-    /// parameter selects the Phase B per-CID promotion discipline.
-    /// Every Arc 16e caller (createRecord / putRecord / deleteRecord
-    /// / applyWrites / admin key rotation / CLI key rotation) passes
-    /// [`StrictPromoter`], preserving Arc 16e v5 behavior verbatim.
-    /// The Arc 16f importRepo handler passes [`TolerantPromoter`],
-    /// which signals `NeedsFetch` on row-absent CIDs for the
-    /// caller-driven fetch-and-retry loop per §9.6.3.5.
-    pub async fn apply_writes(
+    /// `prior_record_cids` is populated by querying
+    /// [`ActorStore::get_record`] for each `Update` / `Delete`
+    /// write; `Create` writes have no prior version and don't get
+    /// queried. The map flows into the per-record `prev` field on
+    /// the `CommitOp` so the firehose event carries the
+    /// pre-update CID per Arc 14 §7.3.2.
+    async fn compute_prior_cids_and_prepared(
         &self,
         writes: Vec<WriteOp>,
-        signer: Arc<dyn Signer>,
-        promoter: Arc<dyn crate::blob_store::BlobPromoter>,
-    ) -> PdsResult<(String, String)> {
-        // ATProto spec: max 200 writes per commit.
-        if writes.len() > 200 {
-            return Err(PdsError::Validation(
-                "Too many writes in batch. Maximum: 200 operations per commit".to_string(),
-            ));
-        }
-
-        // Validate every write up-front so we don't half-apply.
-        for write in &writes {
-            self.validate_write(write).await?;
-        }
-
+    ) -> PdsResult<(
+        std::collections::HashMap<String, String>,
+        Vec<RepoWrite>,
+        Vec<PreparedRecord>,
+    )> {
         // Arc 14 §7.3.2: capture prior record CIDs for update/delete
         // ops before applying writes, so each CommitOp can carry its
         // `prev` (prior record version CID) on the firehose event.
@@ -619,100 +615,548 @@ impl RepositoryManager {
             }
         }
 
+        Ok((prior_record_cids, repo_writes, prepared))
+    }
+
+    /// Validate a single write — runs the codec validator under the
+    /// configured mode and tracks failures on the actor store.
+    ///
+    /// Arc 17 §17.3.4 / round-1 F4 closure: when `lexicon.enabled` and
+    /// `lexicon.validate_imports = true` (default), the per-write
+    /// `validate = Some(false)` bypass is OVERRIDDEN — validate fires
+    /// regardless. This closes the v1 gap where CAR-imported records
+    /// (which the Arc 16f handler sets to `validate = Some(false)`)
+    /// received zero validation by default. The override applies to
+    /// BOTH known NSIDs (hand-coded path) and unknown NSIDs (lexicon
+    /// fall-through) — see V05_DESIGN_arc17.md §17.3.4 matrix.
+    async fn validate_write(
+        &self,
+        write: &WriteOp,
+        shared_tx: Option<&mut sqlx::Transaction<'_, sqlx::Any>>,
+        cascade_context: Option<&mut crate::kryphocron::CascadeContext>,
+    ) -> PdsResult<()> {
+        // v0.7 arc 1 — Order A dispatcher closed-namespace policy. Per
+        // v07_DESIGN.md §6 lines 3236-3305 the kryphocron-prefix check
+        // runs BEFORE any lexicon validation or registry lookup so that
+        // records claiming the closed namespace cannot be accepted via
+        // the generic write path under any configuration.
+        //
+        // v0.7 arc 2 step 4 — when the write carries a populated
+        // `kryphocron_authorization`, the dispatcher routes through
+        // [`crate::kryphocron::bind_pipeline`] before falling through
+        // to arc 1's deny-by-default. When the field is `None`, the
+        // arc 1 deny path runs unchanged (registered NSID → deny-map
+        // entry; unregistered NSID →
+        // `KryphocronUnregisteredNsidInClosedNamespace`). No
+        // production code path constructs `Some(_)` authorization in
+        // arc 2 ship state; the first constructor lands at step 5
+        // ("Dedicated endpoints"). The branch is reachable via tests
+        // and via step 5+ production handlers.
+        if write.collection.starts_with("tools.kryphocron.") {
+            if !self.kryphocron_enabled {
+                // Master switch off — generic UnsupportedNamespace per
+                // §6 lines 3247-3257 so master-switch-off is
+                // behaviorally indistinguishable from "not compiled in".
+                tracing::warn!(
+                    nsid = %write.collection,
+                    did = %self.did,
+                    "kryphocron_namespace_rejected_switch_off",
+                );
+                return Err(crate::error::PdsError::UnsupportedNamespace {
+                    nsid: write.collection.clone(),
+                });
+            }
+
+            // v0.7 arc 2 step 4 — bind-pipeline route. When the write
+            // is `Some(_)`-authorized, run the bind pipeline (audit
+            // emit lands on the lent shared tx per the step-3.5
+            // addendum's audit-first relay-race ordering). The lent
+            // shared tx is `Some(_)` whenever `apply_writes` opened a
+            // relay-race scope (every production `for_writer` path);
+            // it's `None` for back-compat callers that constructed
+            // the manager via `::new()`. In the latter case a
+            // `Some(_)` authorization is a programmer error —
+            // surface as `KryphocronBindPipelineOutsideScope`.
+            if write.kryphocron_authorization.is_some() {
+                let tx = shared_tx.ok_or_else(|| {
+                    tracing::warn!(
+                        nsid = %write.collection,
+                        did = %self.did,
+                        "kryphocron_bind_pipeline_denied",
+                    );
+                    crate::error::PdsError::KryphocronBindPipelineOutsideScope
+                })?;
+                crate::kryphocron::bind_pipeline(
+                    write,
+                    tx,
+                    cascade_context,
+                    &self.did,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            // Master switch on, no authorization — arc 1 deny-by-
+            // default. The deny map is built from
+            // `kryphocron::KRYPHOCRON_LEXICON_REGISTRY` at startup;
+            // map presence indicates a registered NSID.
+            return match self
+                .kryphocron_deny_map
+                .as_ref()
+                .and_then(|m| m.get(&(write.collection.clone(), write.action)))
+            {
+                Some(variant) => {
+                    tracing::warn!(
+                        nsid = %write.collection,
+                        did = %self.did,
+                        action = ?write.action,
+                        "kryphocron_registered_nsid_denied",
+                    );
+                    Err(variant.clone().into_pds_error(&write.collection))
+                }
+                None => {
+                    tracing::warn!(
+                        nsid = %write.collection,
+                        did = %self.did,
+                        "kryphocron_unregistered_nsid_rejected",
+                    );
+                    Err(crate::error::PdsError::KryphocronUnregisteredNsidInClosedNamespace {
+                        nsid: write.collection.clone(),
+                    })
+                }
+            };
+        }
+
+        let value = match &write.value {
+            Some(v) => v,
+            None => return Ok(()), // delete or no-op
+        };
+
+        // §17.3.4 per-write bypass evaluation. Delegated to
+        // `should_validate_per_lexicon_imports` so the matrix is
+        // unit-tested in isolation; see that function's doc-comment
+        // table for the full rule set. Quick mental model: the
+        // override only fires when both `lexicon.enabled` and
+        // `validate_imports` are true; otherwise pre-Arc-17 semantics
+        // (the `validate = Some(false)` bypass) are preserved.
+        if !should_validate_per_lexicon_imports(write.validate, self.lexicon_config.as_ref()) {
+            return Ok(());
+        }
+
+        if let Err(errors) = self.validator.validate(&write.collection, value).await {
+            let uri = format!("at://{}/{}/{}", self.did, write.collection, write.rkey);
+
+            // Arc 17 §17.3.3 Phase B bug #2 — lexicon fetch-class
+            // failures (HardFail, authority-trust, deny, invalid-NSID)
+            // bypass `ValidationMode::Optimistic` per the §17.3.3
+            // precedence ("HardFail propagates; record validation
+            // fails" is strictly stronger than Optimistic's accept-
+            // on-failure). `SchemaViolation` and hand-coded validator
+            // errors remain absorbable under Optimistic — the matrix
+            // lives in `should_propagate_validation_errors` so the
+            // precedence is unit-tested in isolation. Warn-mode lexicon
+            // failures never reach this branch as fetch-class variants
+            // (handle_fetch_error short-circuits to handle_unknown
+            // before re-emitting an error), so the gate doesn't
+            // interfere with the warn_fallback path.
+            let propagate = should_propagate_validation_errors(&errors, self.validator.mode());
+
+            if !propagate {
+                // Optimistic absorb — track and accept.
+                if let Err(e) = self
+                    .store
+                    .track_validation_failure(&self.did, &write.collection, &uri, &errors)
+                    .await
+                {
+                    tracing::warn!("Failed to track validation failure for {}: {}", uri, e);
+                }
+                tracing::warn!(
+                    "Validation failed for {} but accepting in Optimistic mode: {} error(s)",
+                    uri,
+                    errors.len()
+                );
+                return Ok(());
+            }
+
+            // Required mode OR fetch-class lexicon variant under
+            // Optimistic — track and reject. `validation_errors_to_pds_error`
+            // routes `@lexicon/LexiconFetchFailed` to `PdsError::LexiconFetchFailed`
+            // → HTTP 502 per §17.3.6 wire alignment.
+            let _ = self
+                .store
+                .track_validation_failure(&self.did, &write.collection, &uri, &errors)
+                .await;
+            return Err(validation_errors_to_pds_error(errors));
+        }
+        Ok(())
+    }
+
+    /// Apply write operations and create a new commit.
+    ///
+    /// The `signer` produces ECDSA signatures over the unsigned commit
+    /// payload — pass a `RepoSigner` wrapping the actor's repo-signing
+    /// key.
+    ///
+    /// Arc 16e v5.1 (Arc 16f Step 4 §9.6.3.4): the `promoter`
+    /// parameter selects the Phase B per-CID promotion discipline.
+    /// Every Arc 16e caller (createRecord / putRecord / deleteRecord
+    /// / applyWrites / admin key rotation / CLI key rotation) passes
+    /// [`StrictPromoter`], preserving Arc 16e v5 behavior verbatim.
+    /// The Arc 16f importRepo handler passes [`TolerantPromoter`],
+    /// which signals `NeedsFetch` on row-absent CIDs for the
+    /// caller-driven fetch-and-retry loop per §9.6.3.5.
+    pub async fn apply_writes(
+        &self,
+        writes: Vec<WriteOp>,
+        signer: Arc<dyn Signer>,
+        promoter: Arc<dyn crate::blob_store::BlobPromoter>,
+    ) -> PdsResult<(String, String)> {
+        // ATProto spec: max 200 writes per commit.
+        if writes.len() > 200 {
+            return Err(PdsError::Validation(
+                "Too many writes in batch. Maximum: 200 operations per commit".to_string(),
+            ));
+        }
+
+        // v0.7 arc 2 step 5 (apply_writes restructure) — validation
+        // moves INTO each branch below so the relay-race path can
+        // pass `&mut shared_tx` to `validate_write`, which threads
+        // into `bind_pipeline`'s audit-emit signature per the
+        // step-3.5 addendum. The legacy path (no shared pool —
+        // `RepositoryManager::new`-style test instances) still
+        // validates with `None, None`; the dispatcher's bind-
+        // pipeline branch errors with
+        // `KryphocronBindPipelineOutsideScope` if a `Some(_)`-
+        // authorization write reaches that path, which is a
+        // programmer error (production handlers go through
+        // `for_writer` which always plumbs the shared pool).
+        //
+        // The validate loop's old position at the top of this
+        // function (calling with `None, None`) made the dispatcher
+        // unreachable from the production write path. Step 4
+        // shipped the framework + tests; this step's restructure
+        // makes the path reachable so step 5's dedicated endpoints
+        // exercise `bind_pipeline` end-to-end via the standard
+        // `apply_writes` flow.
+        //
+        // `prior_record_cids` + `repo_writes` + `prepared`
+        // computation is extracted into
+        // [`compute_prior_cids_and_prepared`] below — both
+        // branches call it after their own validate loop.
+
         // Drive proto-blue's commit machinery on a blocking thread —
         // the storage adapter calls `block_on` internally, which would
         // dead-lock a worker thread if invoked directly.
-        let storage = self.make_storage();
-        let did = self.did.clone();
-        let signer_arc = signer;
-
-        let (commit_cid, new_rev, prev_commit, prev_data, blocks): (
+        //
+        // **v0.7 arc 2 step 3.5 — relay-race lent-tx path.** When
+        // `self.shared_pool` is `Some(_)` (every production
+        // `for_writer` construction), open per-actor + shared txns
+        // up-front, run proto-blue's commit and Phase A metadata
+        // through `with_lent_txns`, and commit in audit-first
+        // order via `commit_with_orphan_recovery`. Tests that
+        // construct via `RepositoryManager::new` (no shared pool)
+        // fall through to the legacy per-statement auto-commit
+        // path below, preserving back-compat.
+        // Aliased to satisfy clippy::type_complexity — the
+        // restructure has both branches converging on this 7-tuple
+        // so each can supply `prepared` for Phase B.
+        type CommitProjection = (
             Cid,
             String,
             Option<Cid>,
             Option<Cid>,
             BlockMap,
-        ) = tokio::task::spawn_blocking(
-            move || -> Result<_, ProtoRepoError> {
-                // Load the existing repo, or seed an empty one on the first commit.
-                let storage_dyn: Arc<dyn RepoStorage> = storage.clone();
-                let mut repo = match Repo::load(storage_dyn.clone()) {
-                    Ok(r) => r,
-                    Err(ProtoRepoError::Storage(_)) => {
-                        // Empty store — initialise with an empty signed commit.
-                        Repo::create(storage_dyn.clone(), did, signer_arc.as_ref())?
+            Vec<CommitOp>,
+            Vec<PreparedRecord>,
+        );
+        let (commit_cid, new_rev, prev_commit, prev_data, blocks, commit_ops, prepared): CommitProjection =
+            if let Some(shared_pool) = self.shared_pool.clone() {
+            // ----- Relay-race lent-tx path -----
+            let actor_pool = self.store.open_db(&self.did).await?;
+            let actor_tx = actor_pool.begin().await.map_err(PdsError::Database)?;
+            let mut shared_tx = shared_pool.begin().await.map_err(PdsError::Database)?;
+
+            // Validate every write with the shared tx threaded
+            // through so the dispatcher's bind-pipeline branch can
+            // reach `bind_pipeline(write_op, &mut shared_tx, ...)`.
+            // Any `Some(_)` authorization on a kryphocron-prefix
+            // write fires the bind pipeline here; the audit-emit
+            // writes step 7 will add land on `shared_tx`, which
+            // commits first in `commit_with_orphan_recovery` per
+            // the step-3.5 addendum's audit-first ordering.
+            //
+            // No active CascadeContext is plumbed yet — production
+            // cascade-initiating handlers (post-arc-2 work) will
+            // construct one and pass it as `Some(&mut ctx)`. Step
+            // 5's dedicated endpoints don't construct cascades, so
+            // `None` here is correct for arc 2 ship state.
+            for write in &writes {
+                self.validate_write(write, Some(&mut shared_tx), None).await?;
+            }
+
+            // The shared_tx mutable borrow ends with the validate
+            // loop; we now move it into `with_lent_txns` alongside
+            // `actor_tx` for the proto-blue + Phase A scope.
+            let (prior_record_cids, repo_writes, prepared) =
+                self.compute_prior_cids_and_prepared(writes).await?;
+
+            let storage = self.make_storage();
+            let did = self.did.clone();
+            let signer_arc = signer.clone();
+            let repo_writes_owned = repo_writes;
+            let prepared_owned = prepared;
+            let prior_record_cids_owned = prior_record_cids;
+
+            let (actor_tx_back, shared_tx_back, scope_outcome) = storage
+                .with_lent_txns(actor_tx, shared_tx, move |scoped_storage| async move {
+                    // Drive proto-blue's sync commit on a blocking
+                    // thread. The storage Arc carries the lent
+                    // actor-tx handle into the spawn_blocking via
+                    // shared Mutex state — `apply_commit` reads
+                    // the same lent_actor_tx because both clones
+                    // share the same Arc.
+                    let storage_for_blocking = scoped_storage.clone();
+                    let did_for_blocking = did.clone();
+                    let signer_for_blocking = signer_arc.clone();
+                    let proto_blue_join = tokio::task::spawn_blocking(
+                        move || -> Result<_, ProtoRepoError> {
+                            let storage_dyn: Arc<dyn RepoStorage> = storage_for_blocking;
+                            let mut repo = match Repo::load(storage_dyn.clone()) {
+                                Ok(r) => r,
+                                Err(ProtoRepoError::Storage(_)) => Repo::create(
+                                    storage_dyn.clone(),
+                                    did_for_blocking,
+                                    signer_for_blocking.as_ref(),
+                                )?,
+                                Err(e) => return Err(e),
+                            };
+                            let prev = repo.commit_cid().cloned();
+                            let prev_data = repo.commit().map(|c| c.data.clone());
+                            let data =
+                                repo.apply_writes(&repo_writes_owned, signer_for_blocking.as_ref())?;
+                            Ok((
+                                data.commit_cid,
+                                data.commit.rev.clone(),
+                                prev,
+                                prev_data,
+                                data.blocks,
+                            ))
+                        },
+                    )
+                    .await
+                    .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?;
+                    let (commit_cid, new_rev, prev_commit, prev_data, blocks) = proto_blue_join
+                        .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
+
+                    // Phase A metadata — route through the lent
+                    // actor tx so the record-table updates land
+                    // atomically with proto-blue's block writes
+                    // from `apply_commit` above.
+                    let mut commit_ops_inner: Vec<CommitOp> =
+                        Vec::with_capacity(prepared_owned.len());
+                    for rec in &prepared_owned {
+                        let prev_cid = match rec.op {
+                            OpAction::Update | OpAction::Delete => {
+                                prior_record_cids_owned.get(&rec.uri).cloned()
+                            }
+                            OpAction::Create => None,
+                        };
+                        {
+                            let mut tx_guard = scoped_storage.lent_actor_tx().lock().await;
+                            let tx = tx_guard.as_mut().ok_or_else(|| {
+                                PdsError::Internal(
+                                    "lent_actor_tx vanished mid-scope".to_string(),
+                                )
+                            })?;
+                            match rec.op {
+                                OpAction::Create | OpAction::Update => {
+                                    let cid = rec
+                                        .cid
+                                        .clone()
+                                        .expect("create/update has cid by construction");
+                                    ActorStore::put_record_in_tx(
+                                        tx,
+                                        &rec.uri,
+                                        &cid,
+                                        &rec.collection,
+                                        &rec.rkey,
+                                        &new_rev,
+                                    )
+                                    .await?;
+                                    commit_ops_inner.push(CommitOp {
+                                        action: rec.op.clone(),
+                                        path: format!("{}/{}", rec.collection, rec.rkey),
+                                        cid: Some(cid),
+                                        prev: prev_cid,
+                                    });
+                                }
+                                OpAction::Delete => {
+                                    ActorStore::delete_record_in_tx(tx, &rec.uri).await?;
+                                    commit_ops_inner.push(CommitOp {
+                                        action: rec.op.clone(),
+                                        path: format!("{}/{}", rec.collection, rec.rkey),
+                                        cid: None,
+                                        prev: prev_cid,
+                                    });
+                                }
+                            }
+                        }
                     }
-                    Err(e) => return Err(e),
-                };
+                    Ok::<_, PdsError>((
+                        commit_cid,
+                        new_rev,
+                        prev_commit,
+                        prev_data,
+                        blocks,
+                        commit_ops_inner,
+                        prepared_owned,
+                    ))
+                })
+                .await?;
 
-                let prev = repo.commit_cid().cloned();
-                // Arc 14 §7.3.2: prior commit's MST root CID (`data`
-                // field of the prior signed commit). `None` for
-                // genesis (no prior commit exists). Captured BEFORE
-                // apply_writes so it reflects the prior state.
-                let prev_data = repo.commit().map(|c| c.data.clone());
-                let data = repo.apply_writes(&repo_writes, signer_arc.as_ref())?;
-
-                Ok((
-                    data.commit_cid,
-                    data.commit.rev.clone(),
-                    prev,
-                    prev_data,
-                    data.blocks,
-                ))
-            },
-        )
-        .await
-        .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?
-        .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
-
-        // Phase A — per-actor metadata writes (Arc 16e §9.5.3.2.2).
-        // Iterate by reference so `prepared` survives into Phase B
-        // below for the per-record STRICT/unref plan enumeration.
-        let mut commit_ops: Vec<CommitOp> = Vec::with_capacity(prepared.len());
-        for rec in &prepared {
-            // Arc 14 §7.3.2: `prev` = prior record version CID for
-            // update/delete ops; None for create ops.
-            let prev_cid = match rec.op {
-                OpAction::Update | OpAction::Delete => {
-                    prior_record_cids.get(&rec.uri).cloned()
+            // Recover `prepared` from the scope's return tuple
+            // (the scope took ownership for the Phase A loop).
+            let (
+                commit_cid_v,
+                new_rev_v,
+                prev_commit_v,
+                prev_data_v,
+                blocks_v,
+                commit_ops_v,
+                prepared_returned,
+            ) = match scope_outcome {
+                Ok(tuple) => tuple,
+                Err(e) => {
+                    // Scope failed (validation or storage error
+                    // inside the lent-tx region). Roll both txns
+                    // back so neither side commits, then propagate
+                    // the error.
+                    let _ = actor_tx_back.rollback().await;
+                    let _ = shared_tx_back.rollback().await;
+                    return Err(e);
                 }
-                OpAction::Create => None,
             };
-            match rec.op {
-                OpAction::Create | OpAction::Update => {
-                    let cid = rec
-                        .cid
-                        .clone()
-                        .expect("create/update has cid by construction");
-                    self.store
-                        .put_record(
-                            &self.did,
-                            &rec.uri,
-                            &cid,
-                            &rec.collection,
-                            &rec.rkey,
-                            &new_rev,
-                        )
-                        .await?;
-                    commit_ops.push(CommitOp {
-                        action: rec.op.clone(),
-                        path: format!("{}/{}", rec.collection, rec.rkey),
-                        cid: Some(cid),
-                        prev: prev_cid,
-                    });
-                }
-                OpAction::Delete => {
-                    self.store.delete_record(&self.did, &rec.uri).await?;
-                    commit_ops.push(CommitOp {
-                        action: rec.op.clone(),
-                        path: format!("{}/{}", rec.collection, rec.rkey),
-                        cid: None,
-                        prev: prev_cid,
-                    });
+
+            // Audit-first relay-race commit per the arc 2
+            // step-3.5 addendum: shared tx commits first; on
+            // failure the actor tx rolls back. Actor tx commits
+            // second; on failure an orphan-marker is emitted
+            // (`tracing::error!`) for the reconciliation sweep.
+            crate::actor_store::repo_storage::commit_with_orphan_recovery(
+                actor_tx_back,
+                shared_tx_back,
+                &self.did,
+            )
+            .await?;
+
+            (
+                commit_cid_v,
+                new_rev_v,
+                prev_commit_v,
+                prev_data_v,
+                blocks_v,
+                commit_ops_v,
+                prepared_returned,
+            )
+        } else {
+            // ----- Legacy per-statement auto-commit path -----
+            //
+            // No shared pool → no `bind_pipeline` reachable. Validate
+            // with `None, None`; any `Some(_)` authorization on a
+            // kryphocron-prefix write errors with
+            // `KryphocronBindPipelineOutsideScope` from the
+            // dispatcher (production handlers use `for_writer` which
+            // plumbs the shared pool, so this is a programmer-error
+            // path only).
+            for write in &writes {
+                self.validate_write(write, None, None).await?;
+            }
+
+            let (prior_record_cids, repo_writes, prepared_owned) =
+                self.compute_prior_cids_and_prepared(writes).await?;
+            let prepared = prepared_owned;
+
+            let storage = self.make_storage();
+            let did = self.did.clone();
+            let signer_arc = signer;
+
+            let (commit_cid, new_rev, prev_commit, prev_data, blocks): (
+                Cid,
+                String,
+                Option<Cid>,
+                Option<Cid>,
+                BlockMap,
+            ) = tokio::task::spawn_blocking(
+                move || -> Result<_, ProtoRepoError> {
+                    let storage_dyn: Arc<dyn RepoStorage> = storage.clone();
+                    let mut repo = match Repo::load(storage_dyn.clone()) {
+                        Ok(r) => r,
+                        Err(ProtoRepoError::Storage(_)) => {
+                            Repo::create(storage_dyn.clone(), did, signer_arc.as_ref())?
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    let prev = repo.commit_cid().cloned();
+                    let prev_data = repo.commit().map(|c| c.data.clone());
+                    let data = repo.apply_writes(&repo_writes, signer_arc.as_ref())?;
+                    Ok((
+                        data.commit_cid,
+                        data.commit.rev.clone(),
+                        prev,
+                        prev_data,
+                        data.blocks,
+                    ))
+                },
+            )
+            .await
+            .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?
+            .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
+
+            let mut commit_ops: Vec<CommitOp> = Vec::with_capacity(prepared.len());
+            for rec in &prepared {
+                let prev_cid = match rec.op {
+                    OpAction::Update | OpAction::Delete => {
+                        prior_record_cids.get(&rec.uri).cloned()
+                    }
+                    OpAction::Create => None,
+                };
+                match rec.op {
+                    OpAction::Create | OpAction::Update => {
+                        let cid = rec
+                            .cid
+                            .clone()
+                            .expect("create/update has cid by construction");
+                        self.store
+                            .put_record(
+                                &self.did,
+                                &rec.uri,
+                                &cid,
+                                &rec.collection,
+                                &rec.rkey,
+                                &new_rev,
+                            )
+                            .await?;
+                        commit_ops.push(CommitOp {
+                            action: rec.op.clone(),
+                            path: format!("{}/{}", rec.collection, rec.rkey),
+                            cid: Some(cid),
+                            prev: prev_cid,
+                        });
+                    }
+                    OpAction::Delete => {
+                        self.store.delete_record(&self.did, &rec.uri).await?;
+                        commit_ops.push(CommitOp {
+                            action: rec.op.clone(),
+                            path: format!("{}/{}", rec.collection, rec.rkey),
+                            cid: None,
+                            prev: prev_cid,
+                        });
+                    }
                 }
             }
-        }
+
+            (commit_cid, new_rev, prev_commit, prev_data, blocks, commit_ops, prepared)
+        };
 
         // Phase B — shared-DB blob-ref reconciliation (Arc 16e
         // §9.5.3.2.2). Production HTTP handlers chain
@@ -1088,6 +1532,7 @@ impl RepositoryManager {
             value: Some(value),
             validate,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
 
         let (commit_cid, rev) = self
@@ -1113,6 +1558,7 @@ impl RepositoryManager {
             value: Some(value),
             validate,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
 
         self.apply_writes(writes, signer, Arc::new(crate::blob_store::StrictPromoter)).await
@@ -1132,6 +1578,7 @@ impl RepositoryManager {
             value: None,
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
 
         self.apply_writes(writes, signer, Arc::new(crate::blob_store::StrictPromoter)).await
@@ -1424,6 +1871,7 @@ impl RepositoryManager {
                     value: w.record,
                     validate: w.validate,
                     swap_cid: w.swap_cid,
+                    kryphocron_authorization: None,
                 }
             })
             .collect();
@@ -1523,6 +1971,7 @@ mod tests {
                 value: Some(serde_json::json!({"text": "Post 1"})),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Create,
@@ -1531,6 +1980,7 @@ mod tests {
                 value: Some(serde_json::json!({"text": "Post 2"})),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
         ];
 
@@ -1728,6 +2178,7 @@ mod tests {
             })),
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
         repo_mgr
             .apply_writes(writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
@@ -1781,6 +2232,7 @@ mod tests {
             })),
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
         unwired_mgr
             .apply_writes(writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
@@ -1826,6 +2278,7 @@ mod tests {
             })),
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
         let err = repo_mgr
             .apply_writes(writes, test_signer(), std::sync::Arc::new(crate::blob_store::StrictPromoter))
@@ -1899,6 +2352,7 @@ mod tests {
                 })),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Create,
@@ -1907,6 +2361,7 @@ mod tests {
                 value: Some(serde_json::json!({"$type": "app.test.record", "refs": []})),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Create,
@@ -1918,6 +2373,7 @@ mod tests {
                 })),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
         ];
         repo_mgr
@@ -1944,6 +2400,7 @@ mod tests {
                 value: None,
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Update,
@@ -1955,6 +2412,7 @@ mod tests {
                 })),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Update,
@@ -1963,6 +2421,7 @@ mod tests {
                 value: Some(serde_json::json!({"$type": "app.test.record", "refs": []})),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
             WriteOp {
                 action: WriteOpAction::Create,
@@ -1974,6 +2433,7 @@ mod tests {
                 })),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             },
         ];
         repo_mgr
@@ -2048,6 +2508,7 @@ mod tests {
             })),
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
         let result = repo_mgr
             .apply_writes(
@@ -2111,6 +2572,7 @@ mod tests {
             })),
             validate: None,
             swap_cid: None,
+            kryphocron_authorization: None,
         }];
         let result = repo_mgr
             .apply_writes(
@@ -2422,6 +2884,7 @@ mod tests {
                 })),
                 validate: None,
                 swap_cid: None,
+                kryphocron_authorization: None,
             }
         }
 
@@ -2432,7 +2895,7 @@ mod tests {
             // HTTP layer maps to 502.
             let (mgr, _temp, _did) = build_mgr(FetchFailureBehavior::HardFail).await;
             let write = unknown_collection_write();
-            let result = mgr.validate_write(&write).await;
+            let result = mgr.validate_write(&write, None, None).await;
             match result {
                 Err(PdsError::LexiconFetchFailed { nsid, failure_class, .. }) => {
                     assert_eq!(nsid, "com.example.thing.foo");
@@ -2458,10 +2921,189 @@ mod tests {
             // is never re-emitted. The new gate must not interfere.
             let (mgr, _temp, _did) = build_mgr(FetchFailureBehavior::Warn).await;
             let write = unknown_collection_write();
-            let result = mgr.validate_write(&write).await;
+            let result = mgr.validate_write(&write, None, None).await;
             assert!(
                 result.is_ok(),
                 "validate_write must return Ok under Warn+Optimistic (warn_fallback ordering): {result:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------
+    // v0.7 arc 2 step 4 — validate_write dispatcher routing tests
+    // -----------------------------------------------------------
+    //
+    // The dispatcher's new bind-pipeline branch fires when a
+    // kryphocron-namespaced WriteOp carries
+    // `kryphocron_authorization: Some(_)`. With no `shared_tx`
+    // available (the `apply_writes` legacy path, or any unit
+    // test calling `validate_write` outside an `apply_writes`
+    // scope) the dispatcher returns
+    // `KryphocronBindPipelineOutsideScope` — a strong assertion
+    // that the bind pipeline only runs inside the write
+    // pipeline's relay-race scope.
+    //
+    // The opposite-success case (`Some(_)` auth + `Some(tx)`
+    // routes to `bind_pipeline`) is exercised by the
+    // `kryphocron::bind_pipeline_tests` module, which calls
+    // `bind_pipeline` directly with synthetic txns and asserts
+    // on tracing-event capture. Step 5 will add the production-
+    // path integration test once dedicated endpoints land the
+    // first real `Some(_)` constructor.
+    mod step_4_dispatcher_tests {
+        use super::*;
+        use crate::kryphocron::{
+            CapabilityClass, KryphocronWriteAuthorization,
+        };
+
+        fn kryphocron_test_mgr() -> (RepositoryManager, tempfile::TempDir, String) {
+            let (store, tmp) = test_store();
+            let did = unique_did();
+            let mut mgr = RepositoryManager::new(did.clone(), store);
+            // Production `for_writer` snapshots the master switch
+            // and deny map from `AppContext`; here we set them
+            // directly so the dispatcher reaches the bind-pipeline
+            // branch instead of the master-switch-off rejection.
+            mgr.kryphocron_enabled = true;
+            mgr.kryphocron_deny_map = Some(Arc::new(
+                crate::kryphocron::build_deny_map(),
+            ));
+            (mgr, tmp, did)
+        }
+
+        /// Auth=Some + shared_tx=None on a kryphocron-prefix write
+        /// must return `KryphocronBindPipelineOutsideScope` —
+        /// the strong assertion the step-4 supplement names.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn bind_pipeline_outside_scope_when_tx_missing() {
+            let (mgr, _tmp, _did) = kryphocron_test_mgr();
+            let write = WriteOp {
+                action: WriteOpAction::Create,
+                collection: "tools.kryphocron.feed.postPrivate".to_string(),
+                rkey: "abc123".to_string(),
+                value: Some(serde_json::json!({
+                    "$type": "tools.kryphocron.feed.postPrivate",
+                })),
+                validate: None,
+                swap_cid: None,
+                kryphocron_authorization: Some(
+                    KryphocronWriteAuthorization::DedicatedEndpoint {
+                        capability_class: CapabilityClass::User,
+                    },
+                ),
+            };
+
+            let result = mgr.validate_write(&write, None, None).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(PdsError::KryphocronBindPipelineOutsideScope)
+                ),
+                "expected KryphocronBindPipelineOutsideScope, got {result:?}",
+            );
+        }
+
+        /// Auth=None on a kryphocron-prefix write continues to fall
+        /// through to arc 1's deny logic. In arc 2 step 5 the deny-
+        /// map for the four dedicated-endpoint NSIDs now returns
+        /// `RequiresDedicatedEndpoint { suggested_endpoint }` —
+        /// pointing clients at the dedicated endpoint rather than
+        /// the generic `NotYetSupported` arc 1 produced. The test
+        /// covers a `tools.kryphocron.feed.postPrivate` create:
+        /// suggestion must be `tools.kryphocron.feed.createPostPrivate`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn auth_none_falls_through_to_deny_map() {
+            let (mgr, _tmp, _did) = kryphocron_test_mgr();
+            let write = WriteOp {
+                action: WriteOpAction::Create,
+                collection: "tools.kryphocron.feed.postPrivate".to_string(),
+                rkey: "abc123".to_string(),
+                value: Some(serde_json::json!({
+                    "$type": "tools.kryphocron.feed.postPrivate",
+                })),
+                validate: None,
+                swap_cid: None,
+                kryphocron_authorization: None,
+            };
+
+            let result = mgr.validate_write(&write, None, None).await;
+            match result {
+                Err(PdsError::KryphocronRecordRequiresDedicatedEndpoint {
+                    nsid,
+                    suggested_endpoint,
+                }) => {
+                    assert_eq!(nsid, "tools.kryphocron.feed.postPrivate");
+                    assert_eq!(
+                        suggested_endpoint.as_deref(),
+                        Some("tools.kryphocron.feed.createPostPrivate"),
+                        "deny-map source-1 must point clients at the \
+                         dedicated endpoint for postPrivate.create",
+                    );
+                }
+                other => panic!(
+                    "expected KryphocronRecordRequiresDedicatedEndpoint, got {other:?}"
+                ),
+            }
+        }
+
+        /// The non-dedicated-endpoint NSIDs (every kryphocron NSID
+        /// that step 5 didn't add an override for) still produce
+        /// `KryphocronRecordNotYetSupported` — verifying the
+        /// source-2 default the registry walk populates.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn auth_none_non_dedicated_nsid_still_not_yet_supported() {
+            let (mgr, _tmp, _did) = kryphocron_test_mgr();
+            // `tools.kryphocron.feed.like` is registered but has
+            // no arc 2 step 5 dedicated endpoint — it falls
+            // through to source-2 NotYetSupported.
+            let write = WriteOp {
+                action: WriteOpAction::Create,
+                collection: "tools.kryphocron.feed.like".to_string(),
+                rkey: "abc123".to_string(),
+                value: Some(serde_json::json!({
+                    "$type": "tools.kryphocron.feed.like",
+                })),
+                validate: None,
+                swap_cid: None,
+                kryphocron_authorization: None,
+            };
+
+            let result = mgr.validate_write(&write, None, None).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(PdsError::KryphocronRecordNotYetSupported { .. })
+                ),
+                "non-dedicated-endpoint NSIDs must stay at \
+                 NotYetSupported, got {result:?}",
+            );
+        }
+
+        /// Unregistered NSID with auth=None still rejects with the
+        /// arc 1 `KryphocronUnregisteredNsidInClosedNamespace` —
+        /// the closed-namespace rule isn't affected by the step-4
+        /// bind-pipeline addition.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn auth_none_unregistered_nsid_still_rejected() {
+            let (mgr, _tmp, _did) = kryphocron_test_mgr();
+            let write = WriteOp {
+                action: WriteOpAction::Create,
+                collection: "tools.kryphocron.totally.fake".to_string(),
+                rkey: "abc123".to_string(),
+                value: Some(serde_json::json!({})),
+                validate: None,
+                swap_cid: None,
+                kryphocron_authorization: None,
+            };
+
+            let result = mgr.validate_write(&write, None, None).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(PdsError::KryphocronUnregisteredNsidInClosedNamespace { .. })
+                ),
+                "unregistered NSID must still hit the closed-namespace \
+                 rejection, got {result:?}",
             );
         }
     }

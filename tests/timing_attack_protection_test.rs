@@ -108,6 +108,7 @@ async fn create_test_manager() -> AccountManager {
         blob_metadata: Default::default(),
         entryway: None,
         lexicon: aurora_locus::config::LexiconConfig::default(),
+        kryphocron: aurora_locus::config::KryphocronConfig::default(),
     });
 
     AccountManager::new(db, config)

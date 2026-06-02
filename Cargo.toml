@@ -1,6 +1,6 @@
 [package]
 name = "aurora-locus"
-version = "0.3.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Aurora Locus Contributors"]
 description = "ATProto Personal Data Server implementation in Rust"
@@ -9,6 +9,13 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # AT Protocol SDK (published crate, replaces the previously vendored ./Rust-Atproto-SDK)
 proto-blue = "0.3.1"
+
+# kryphocron substrate (v0.7 integration). v0.2.0 of both crates is
+# published on crates.io; kryphocron-lexicons is brought in
+# transitively via kryphocron but is also declared directly so we can
+# refer to the registry and tier vocabulary by name.
+kryphocron = "0.2"
+kryphocron-lexicons = "0.2"
 
 # Argon2id password hashing (vendored from the old SDK's server_auth module)
 argon2 = { version = "0.5", features = ["std"] }

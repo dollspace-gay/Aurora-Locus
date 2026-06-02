@@ -14,7 +14,7 @@
 
 use crate::{
     admin::{
-        audit_chain::{append_entry_in_tx, AppendChainGuard, AppendEntryParams},
+        audit_chain::{insert_chain_entry, AppendChainGuard, AppendEntryParams},
         defs::Subject,
         roles::Role,
     },
@@ -126,7 +126,7 @@ struct GrantOutcome {
 /// with the subsequent write — concurrent grants on the same DID
 /// can't both observe "no active row" and both INSERT.
 ///
-/// The audit-chain append uses `append_entry_in_tx` so it lands in
+/// The audit-chain append uses `insert_chain_entry` so it lands in
 /// the same transaction as the role write. `AppendChainGuard` is
 /// held across the commit per LB-1 / chainlink #122.
 async fn perform_grant(
@@ -206,8 +206,9 @@ async fn perform_grant(
     let subject = Subject::Repo {
         did: did.to_string(),
     };
-    let entry_id = append_entry_in_tx(
+    let entry_id = insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: CLI_GRANT_ACTOR_DID,
             action: GRANT_ACTION,

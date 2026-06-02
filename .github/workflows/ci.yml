@@ -48,6 +48,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install proto-blue-codegen (kryphocron-lexicons build dep)
+        run: cargo install proto-blue-codegen --version "~0.3.1"
       - name: cargo build --tests
         # Compile tests, not just lib — surfaces integration-test
         # compile errors (e.g. struct-literal missing-field gaps)
@@ -73,6 +75,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install proto-blue-codegen (kryphocron-lexicons build dep)
+        run: cargo install proto-blue-codegen --version "~0.3.1"
       # GitHub Actions runners come with Docker pre-installed and the
       # daemon running, so testcontainers-rs (which shells out to
       # docker for postgres:16-alpine) works without setup.

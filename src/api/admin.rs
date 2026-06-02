@@ -678,8 +678,9 @@ async fn create_invite_code(
         "created invite code {} (uses: {})",
         code.code, code.available
     );
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "invite.create",
@@ -1084,8 +1085,9 @@ async fn grant_role(
     // Subject is the target DID; the role being granted lives in the
     // rationale + the moderation_event details rather than as a
     // first-class chain field (chain schema is intentionally narrow).
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "role.grant",
@@ -1198,8 +1200,9 @@ async fn revoke_role(
     .map_err(|e| {
         json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
     })?;
-    let audit_entry_id = audit_chain::append_entry_in_tx(
+    let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "role.revoke",
@@ -1390,8 +1393,9 @@ async fn update_account_email(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.update_email",
@@ -1466,8 +1470,9 @@ async fn update_account_handle(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.update_handle",
@@ -1544,8 +1549,9 @@ async fn update_account_password(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.reset_password",
@@ -1614,8 +1620,9 @@ async fn admin_delete_account(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.delete",
@@ -1865,8 +1872,9 @@ async fn update_account_signing_key(
         .begin()
         .await
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.update_signing_key",
@@ -1950,8 +1958,9 @@ async fn takedown_account(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
     })?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.takedown",
@@ -2048,8 +2057,9 @@ async fn suspend_account(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.suspend",
@@ -2117,8 +2127,9 @@ async fn restore_account(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.restore",
@@ -2219,8 +2230,9 @@ async fn apply_label(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "label.apply",
@@ -2286,8 +2298,9 @@ async fn remove_label(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "label.remove",
@@ -2434,8 +2447,9 @@ async fn update_report_status(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
     })?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "report.update",
@@ -2602,8 +2616,9 @@ async fn send_email(
         .begin()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: sender,
             action: "email.send",
@@ -3868,8 +3883,9 @@ async fn update_subject_status(
     // useful, but there's no decision to record).
     if !effects.is_empty() {
         let rationale = effects.join("; ");
-        audit_chain::append_entry_in_tx(
+        audit_chain::insert_chain_entry(
             &mut tx,
+            ctx.config.database.backend,
             AppendEntryParams {
                 actor_did: &auth.did,
                 action: "subject.update_status",
@@ -4514,8 +4530,9 @@ async fn disable_invite_code(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "invite.disable",
@@ -4593,8 +4610,9 @@ async fn disable_invite_codes(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "invite.disable_batch",
@@ -4675,8 +4693,9 @@ async fn enable_account_invites(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.invites.enable",
@@ -4734,8 +4753,9 @@ async fn disable_account_invites(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })?;
-    audit_chain::append_entry_in_tx(
+    audit_chain::insert_chain_entry(
         &mut tx,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "account.invites.disable",
@@ -5729,8 +5749,9 @@ async fn pause_sequencer(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    audit_chain::append_entry(
+    audit_chain::insert_chain_entry_pool(
         &ctx.account_db,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "sequencer.pause",
@@ -5763,8 +5784,9 @@ async fn resume_sequencer(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    audit_chain::append_entry(
+    audit_chain::insert_chain_entry_pool(
         &ctx.account_db,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "sequencer.resume",
@@ -5828,8 +5850,9 @@ async fn reset_sequencer_cursor(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let rationale = format!("reset sequencer cursor to {}", target);
-    audit_chain::append_entry(
+    audit_chain::insert_chain_entry_pool(
         &ctx.account_db,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "sequencer.reset_cursor",
@@ -5903,8 +5926,9 @@ async fn rebuild_sequencer(
             "sequencer integrity check {}",
             if integrity_ok { "passed" } else { "failed" }
         );
-        audit_chain::append_entry(
+        audit_chain::insert_chain_entry_pool(
             &ctx.account_db,
+            ctx.config.database.backend,
             AppendEntryParams {
                 actor_did: &auth.did,
                 action: "sequencer.verify",
@@ -5939,8 +5963,9 @@ async fn rebuild_sequencer(
         // 3. Update all references
         // This is a destructive operation and should be done carefully
 
-        audit_chain::append_entry(
+        audit_chain::insert_chain_entry_pool(
             &ctx.account_db,
+            ctx.config.database.backend,
             AppendEntryParams {
                 actor_did: &auth.did,
                 action: "sequencer.rebuild",
@@ -6111,8 +6136,9 @@ async fn cleanup_rate_limit_state(
         cleaned_count,
         if req.force { " (forced)" } else { "" }
     );
-    audit_chain::append_entry(
+    audit_chain::insert_chain_entry_pool(
         &ctx.account_db,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "rate_limit.cleanup",
@@ -6335,8 +6361,9 @@ async fn trigger_pds_discovery(
         match discovery.discover_from_relays().await {
             Ok(instances) => {
                 let rationale = format!("discovered {} PDS instances", instances.len());
-                audit_chain::append_entry(
+                audit_chain::insert_chain_entry_pool(
                     &ctx.account_db,
+                    ctx.config.database.backend,
                     AppendEntryParams {
                         actor_did: &auth.did,
                         action: "federation.discover",
@@ -6445,8 +6472,9 @@ async fn cleanup_nonce_stores(
         "cleaned {} nonces ({} service-auth, {} DPoP)",
         total_cleaned, cleaned_service_auth, cleaned_dpop
     );
-    audit_chain::append_entry(
+    audit_chain::insert_chain_entry_pool(
         &ctx.account_db,
+        ctx.config.database.backend,
         AppendEntryParams {
             actor_did: &auth.did,
             action: "federation.nonce_cleanup",
@@ -6609,6 +6637,7 @@ mod tests {
             blob_metadata: Default::default(),
             entryway: None,
             lexicon: crate::config::LexiconConfig::default(),
+            kryphocron: crate::config::KryphocronConfig::default(),
         };
 
         // The admin module hosts `describe_capabilities`, which
@@ -7763,7 +7792,7 @@ mod tests {
             r#"},"#,
             // ---- implementation, version (literals) ----
             r#""implementation":"aurora-locus","#,
-            r#""version":"0.3.0""#,
+            r#""version":"0.7.0""#,
             r#"}"#,
         );
         assert_eq!(
@@ -7828,7 +7857,7 @@ mod tests {
         // version comes from CARGO_PKG_VERSION; pinned to the
         // current cycle release per CR-4 / chainlink #117. Bump in
         // lockstep with Cargo.toml when the cycle increments.
-        assert_eq!(resp.version, "0.3.0");
+        assert_eq!(resp.version, "0.7.0");
 
         // Families object must include the four Aurora namespaces, each
         // a JSON array (possibly empty for namespaces that haven't
@@ -8388,8 +8417,9 @@ mod tests {
             )
             .await
             .unwrap();
-            audit_chain::append_entry_in_tx(
+            audit_chain::insert_chain_entry(
                 &mut tx,
+                ctx.config.database.backend,
                 AppendEntryParams {
                     actor_did: "did:plc:admin",
                     action: "account.takedown",
@@ -8447,8 +8477,9 @@ mod tests {
             )
             .await
             .unwrap();
-            audit_chain::append_entry_in_tx(
+            audit_chain::insert_chain_entry(
                 &mut tx,
+                ctx.config.database.backend,
                 AppendEntryParams {
                     actor_did: "did:plc:admin",
                     action: "account.update_handle",
@@ -8581,8 +8612,9 @@ mod tests {
             )
             .await
             .unwrap();
-            audit_chain::append_entry_in_tx(
+            audit_chain::insert_chain_entry(
                 &mut tx,
+                ctx.config.database.backend,
                 AppendEntryParams {
                     actor_did: "did:plc:admin",
                     action: "account.update_email",

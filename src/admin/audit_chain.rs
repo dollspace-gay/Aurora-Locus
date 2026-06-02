@@ -38,7 +38,7 @@
 //! Drift is caught by `tests/admin_handler_contract.rs`, a
 //! structural lint that scans Aurora-namespace handler files for
 //! `pub async fn` declarations whose body invokes
-//! `append_entry_in_tx` and asserts each one returns a typed
+//! `insert_chain_entry` and asserts each one returns a typed
 //! `*Output` struct with the required `audit_entry_id` field. A
 //! short allowlist carves out handlers that surface the ID outside
 //! the typed-JSON convention (currently only `export_account_forensic`,
@@ -62,6 +62,43 @@
 //! form of that document — both must agree, and the doc's worked
 //! examples are sourced from the side-script's deterministic
 //! hash captures.
+//!
+//! # Centralized chain-write commitment (v0.7 arc 1)
+//!
+//! This module is the ONLY path that issues
+//! `INSERT INTO audit_chain_entry`. The canonical helpers are
+//! [`insert_chain_entry`] (caller-managed transaction with explicit
+//! backend) and its pool-API sibling [`insert_chain_entry_pool`].
+//! A build-script grep linter at the repo root (`build.rs`) fails
+//! the build if any source file under `src/` other than this module
+//! contains the literal `INSERT INTO audit_chain_entry`. New
+//! audit-inserting code MUST go through these helpers; raw SQL
+//! bypasses are a build failure with an actionable diagnostic.
+//!
+//! The structural enforcement is the grep linter + this
+//! module-level commitment + the in-process [`AppendChainGuard`]
+//! that callers acquire ahead of the transaction. On Postgres,
+//! [`insert_chain_entry`] additionally acquires
+//! `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` for cross-process
+//! serialization in multi-instance deployments.
+//!
+//! ## BEGIN IMMEDIATE on SQLite — known limitation
+//!
+//! v07_audit_coherence.md §6.1 specifies `BEGIN IMMEDIATE` for
+//! SQLite chain-writing transactions. sqlx 0.8's Any-backed
+//! `Pool::begin()` does not expose transaction-mode options for
+//! SQLite, so `BEGIN IMMEDIATE` cannot be set without abandoning
+//! the typed `Transaction` wrapper. AppendChainGuard (in-process
+//! mutex held across the caller's `tx.commit()`) plus SQLite's
+//! DB-level write lock provides equivalent single-writer-at-a-time
+//! serialization for single-instance SQLite deployments — the
+//! v0.6 deployment posture. Multi-instance SQLite is not a
+//! supported posture; multi-instance deployments use Postgres,
+//! where the advisory lock provides true cross-process
+//! serialization. A future sqlx upgrade exposing per-transaction
+//! BEGIN modes (or a refactor to backend-specific drivers for
+//! chain writes) would let this defense-in-depth land cleanly.
+//!
 
 use crate::{admin::defs::Subject, error::PdsError};
 use chrono::{DateTime, Utc};
@@ -122,6 +159,15 @@ const fn audit_chain_lock_key() -> i64 {
     // collide.
     i64::from_be_bytes([0x2a, 0x28, 0x50, 0x8f, 0x76, 0xb6, 0x8d, 0x08])
 }
+
+/// Sentinel advisory-lock key used by `insert_chain_entry`'s debug-mode
+/// runtime assertion (v0.7 arc 1 step 2e). The probe attempts
+/// `pg_try_advisory_xact_lock(AUDIT_CHAIN_LOCK_SENTINEL_KEY)` to confirm
+/// the advisory-lock primitive is reachable on the active transaction;
+/// it intentionally uses a distinct key from `AUDIT_CHAIN_LOCK_KEY` so
+/// the probe never collides with the actual chain-serialization lock.
+/// Postgres-only; not relevant on SQLite.
+pub const AUDIT_CHAIN_LOCK_SENTINEL_KEY: i64 = AUDIT_CHAIN_LOCK_KEY.wrapping_add(1);
 
 /// One audit chain entry. Ships in `getAuditTrail` responses and is
 /// what the Audit page renders rows for.
@@ -419,11 +465,11 @@ pub struct AppendEntryParams<'a> {
 ///
 /// Per LB-1 / chainlink #122: when callers do their own
 /// transaction management (so the chain entry lands atomically
-/// with the underlying mutation via `append_entry_in_tx`), the
+/// with the underlying mutation via `insert_chain_entry`), the
 /// in-process AsyncMutex that single-flights chain appends must
 /// be held _across_ the caller's `tx.commit()`. Otherwise, a
 /// second appender could observe the same chain head between
-/// guard-release-on-_in_tx-return and commit-on-caller, racing
+/// guard-release-on-helper-return and commit-on-caller, racing
 /// for the same `seq` value.
 ///
 /// Acquire before opening the caller's transaction; drop after
@@ -431,8 +477,8 @@ pub struct AppendEntryParams<'a> {
 /// scope-end is fine — the only thing that matters is that the
 /// guard outlives the commit).
 ///
-/// `append_entry` (the pool-API wrapper that opens its own tx)
-/// continues to acquire the guard internally, so existing call
+/// `insert_chain_entry_pool` (the pool-API wrapper that opens its
+/// own tx) continues to acquire the guard internally, so existing call
 /// sites are unaffected.
 pub struct AppendChainGuard {
     _inner: tokio::sync::MutexGuard<'static, ()>,
@@ -447,43 +493,78 @@ impl AppendChainGuard {
     }
 }
 
-/// Append an entry to the chain inside an existing transaction.
+/// Append an entry to the chain inside an existing transaction (the
+/// canonical v0.7 helper).
 ///
-/// This is the LB-1 / chainlink #122 "atomic" entry point: the
-/// caller's transaction wraps both the underlying mutation
-/// (e.g., `UPDATE actor SET takedown_ref = ...`) and this chain
-/// append, so a crash between mutation and chain-append leaves
-/// neither row instead of an audit-blind mutation. Pre-LB-1, the
-/// pool-API `append_entry` opened its own transaction and the
-/// two writes could be torn at process death.
+/// Backend-gated: on [`crate::config::DatabaseBackend::Postgres`] the
+/// helper issues `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` to
+/// serialize concurrent appenders across processes. On
+/// [`crate::config::DatabaseBackend::Sqlite`] the advisory-lock query
+/// is skipped (the function does not exist on SQLite); the
+/// caller-acquired [`AppendChainGuard`] plus SQLite's DB-level write
+/// lock serialize chain writers in single-instance deployments. See the
+/// module-level "BEGIN IMMEDIATE on SQLite — known limitation" note
+/// for the multi-instance-SQLite caveat.
 ///
-/// Concurrency: the caller is responsible for holding an
-/// [`AppendChainGuard`] across their own `tx.commit()`. Inside
-/// this function we additionally take
-/// `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` so concurrent
-/// appenders serialize at the Postgres lock rather than racing on
-/// the chain head. The advisory lock auto-releases at COMMIT
-/// (caller-managed). On SQLite the advisory-lock query is
-/// best-effort (it errors silently on SQLite, which gets
-/// serialization for free via its DB-level write lock); the
-/// in-process guard is what actually serializes SQLite appenders.
-pub async fn append_entry_in_tx(
+/// Caller contract:
+/// - Hold an [`AppendChainGuard`] across the caller's `tx.commit()`.
+/// - Pass the active [`crate::config::DatabaseBackend`] (typically
+///   `ctx.config.database.backend`).
+/// - The caller-managed transaction wraps both the underlying
+///   mutation and this chain append for atomicity (LB-1 / chainlink
+///   #122).
+///
+/// Runtime assertion: in debug builds on Postgres, a sentinel-key
+/// `pg_try_advisory_xact_lock(AUDIT_CHAIN_LOCK_SENTINEL_KEY)` probe
+/// confirms the advisory-lock primitive is reachable on the current
+/// transaction. The probe runs after the real chain-lock acquisition
+/// and is compiled out in release builds.
+pub async fn insert_chain_entry(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    backend: crate::config::DatabaseBackend,
+    params: AppendEntryParams<'_>,
+) -> Result<i64, PdsError> {
+    match backend {
+        crate::config::DatabaseBackend::Postgres => {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(AUDIT_CHAIN_LOCK_KEY)
+                .execute(&mut **tx)
+                .await?;
+            #[cfg(debug_assertions)]
+            {
+                // Debug-only defense-in-depth: probe the advisory-lock
+                // infrastructure via a sentinel key. The real chain lock
+                // is held above; the sentinel acquisition confirms the
+                // primitive is reachable on the active transaction.
+                let _: Option<bool> =
+                    sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                        .bind(AUDIT_CHAIN_LOCK_SENTINEL_KEY)
+                        .fetch_optional(&mut **tx)
+                        .await?;
+            }
+        }
+        crate::config::DatabaseBackend::Sqlite => {
+            // No advisory-lock equivalent. Serialization via
+            // AppendChainGuard (caller-acquired) + SQLite's
+            // DB-write lock. See module-level note for the
+            // BEGIN IMMEDIATE limitation.
+        }
+    }
+    write_chain_entry_inner(tx, params).await
+}
+
+/// Inner chain-write body. Computes sequence, canonical hash, and
+/// issues the `INSERT INTO audit_chain_entry` statement. Called by
+/// [`insert_chain_entry`] after the backend-conditional chain-
+/// serialization primitive has been acquired.
+///
+/// Pre-condition: the caller has acquired the appropriate
+/// chain-serialization primitive for the active backend (Postgres
+/// advisory lock or SQLite AppendChainGuard).
+async fn write_chain_entry_inner(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     params: AppendEntryParams<'_>,
 ) -> Result<i64, PdsError> {
-    // Postgres: serialize concurrent appenders behind a single
-    // advisory lock keyed on AUDIT_CHAIN_LOCK_KEY. Best-effort —
-    // SQLite errors on the function call ("no such function
-    // pg_advisory_xact_lock") and we ignore that. The caller's
-    // transaction provides write-serialization on both backends;
-    // the advisory lock is a Postgres refinement that lets
-    // multiple admins block briefly rather than collide on
-    // UNIQUE(sequence).
-    let _ = sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(AUDIT_CHAIN_LOCK_KEY)
-        .execute(&mut **tx)
-        .await;
-
     // Determine sequence + previous hash from the chain head.
     // Inside the transaction so this read sees the same snapshot
     // the subsequent INSERT will write into.
@@ -552,20 +633,34 @@ pub async fn append_entry_in_tx(
     // re-running verification on legacy rows uses the new canonical
     // form, but legacy rows would never be in the cascade-snapshot-ids
     // population since the field defaults to empty.
+    // Source-order is alphabetical. `serde_json::Map`'s key ordering at
+    // serialization time depends on whether the `preserve_order` cargo
+    // feature is enabled anywhere in the dependency graph: without it
+    // `Map` is a `BTreeMap` (always-alphabetical regardless of source
+    // order); with it `Map` is an `IndexMap` (insertion-order
+    // preserved). v0.7 arc 1's path-dep on kryphocron-lexicons flipped
+    // the feature on transitively (see that crate's Cargo.toml). Pre-
+    // arc-1 stored hashes were computed under BTreeMap semantics
+    // (alphabetical); the canonical form in
+    // `docs/operator/audit-chain-verification.md` §B documents
+    // alphabetical as the wire-invariant. Writing keys here in
+    // alphabetical source order makes the serialized output alphabetical
+    // regardless of which `Map` backing serde_json is using — durable
+    // against future feature-graph drift either direction.
     let canon = serde_json::json!({
-        "sequence": seq,
-        "timestamp": now_str,
-        "actor_did": params.actor_did,
         "action": params.action,
-        "subject_did": subject_did,
-        "subject_uri": subject_uri,
-        "subject_cid": subject_cid,
-        "rationale": params.rationale,
-        "snapshot_id": params.snapshot_id,
+        "actor_did": params.actor_did,
+        "cascade_snapshot_ids": cascade_snapshot_ids_json,
+        "cascade_subjects": cascade_json,
         "event_id": params.event_id,
         "previous_hash": prev_hash,
-        "cascade_subjects": cascade_json,
-        "cascade_snapshot_ids": cascade_snapshot_ids_json,
+        "rationale": params.rationale,
+        "sequence": seq,
+        "snapshot_id": params.snapshot_id,
+        "subject_cid": subject_cid,
+        "subject_did": subject_did,
+        "subject_uri": subject_uri,
+        "timestamp": now_str,
     });
     let canon_str = serde_json::to_string(&canon)
         .map_err(|e| PdsError::Internal(e.to_string()))?;
@@ -598,33 +693,24 @@ pub async fn append_entry_in_tx(
     Ok(id)
 }
 
-/// Append an entry to the chain. Pool-API wrapper around
-/// [`append_entry_in_tx`] that opens its own transaction and
-/// commits — for callers without an enclosing mutation transaction.
+/// Append an entry to the chain via a self-managed transaction (the
+/// canonical pool-API helper, v0.7).
 ///
-/// Concurrency: holds an [`AppendChainGuard`] across the whole
-/// transaction so the SELECT-head + INSERT-next sequence is
-/// single-flighted in-process; on Postgres,
-/// `pg_advisory_xact_lock` (taken inside the transaction by
-/// `append_entry_in_tx`) provides cross-process serialization.
-///
-/// ADMIN_MOD_PHASE_3 §6.1's "concurrency commitment" specified
-/// either advisory-lock or SERIALIZABLE-isolation as acceptable
-/// solutions; this implementation picks advisory-lock to match the
-/// codebase's existing leader-election pattern.
-///
-/// LB-1 / chainlink #122: prefer [`append_entry_in_tx`] from
-/// handlers that mutate other tables in the same audit decision —
-/// the chain entry then lands atomically with the underlying
-/// mutation. This wrapper is for chain-only writes (fewer in
-/// practice; mostly tests and infrastructure events).
-pub async fn append_entry(
+/// Acquires an [`AppendChainGuard`] across the open/INSERT/commit
+/// sequence, opens a sqlx transaction, calls [`insert_chain_entry`]
+/// with the supplied backend, and commits. For callers without an
+/// enclosing mutation transaction; per LB-1 / chainlink #122,
+/// callers mutating other tables should open their own transaction
+/// and call [`insert_chain_entry`] directly so the chain entry lands
+/// atomically with the mutation.
+pub async fn insert_chain_entry_pool(
     db: &AnyPool,
+    backend: crate::config::DatabaseBackend,
     params: AppendEntryParams<'_>,
 ) -> Result<i64, PdsError> {
     let _guard = AppendChainGuard::acquire().await;
     let mut tx = db.begin().await?;
-    let id = append_entry_in_tx(&mut tx, params).await?;
+    let id = insert_chain_entry(&mut tx, backend, params).await?;
     tx.commit().await?;
     Ok(id)
 }
@@ -900,20 +986,22 @@ pub fn verify_entry(
     cascade_snapshot_ids: Option<&str>,
     expected_hash: &str,
 ) -> bool {
+    // Alphabetical source order — see write_chain_entry_inner's
+    // canonical-form note for the cargo-feature-unification rationale.
     let canon = serde_json::json!({
-        "sequence": sequence,
-        "timestamp": timestamp,
-        "actor_did": actor_did,
         "action": action,
-        "subject_did": subject_did,
-        "subject_uri": subject_uri,
-        "subject_cid": subject_cid,
-        "rationale": rationale,
-        "snapshot_id": snapshot_id,
+        "actor_did": actor_did,
+        "cascade_snapshot_ids": cascade_snapshot_ids,
+        "cascade_subjects": cascade_subjects,
         "event_id": event_id,
         "previous_hash": previous_hash,
-        "cascade_subjects": cascade_subjects,
-        "cascade_snapshot_ids": cascade_snapshot_ids,
+        "rationale": rationale,
+        "sequence": sequence,
+        "snapshot_id": snapshot_id,
+        "subject_cid": subject_cid,
+        "subject_did": subject_did,
+        "subject_uri": subject_uri,
+        "timestamp": timestamp,
     });
     let canon_str = match serde_json::to_string(&canon) {
         Ok(s) => s,
@@ -1057,15 +1145,15 @@ mod tests {
     }
 
     // LB-1 / chainlink #122: atomicity regression. The per-tx
-    // entry point `append_entry_in_tx` must roll back together
+    // entry point `insert_chain_entry` must roll back together
     // with the caller's underlying mutation when the caller's tx
-    // is rolled back. Pre-LB-1, `append_entry` opened its own tx
+    // is rolled back. Pre-LB-1, `insert_chain_entry_pool` opened its own tx
     // and committed before returning — so a caller's later error
     // couldn't unwind the chain entry, leaving the chain row
     // out of sync with whatever the caller's mutation should
     // have done.
     #[tokio::test]
-    async fn append_entry_in_tx_rolls_back_with_caller_mutation() {
+    async fn insert_chain_entry_rolls_back_with_caller_mutation() {
         let db = open_test_pool().await;
         sqlx::query(
             "INSERT INTO actor (did, handle, created_at) \
@@ -1091,8 +1179,9 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-            let chain_id = append_entry_in_tx(
+            let chain_id = insert_chain_entry(
                 &mut tx,
+                crate::config::DatabaseBackend::Sqlite,
                 AppendEntryParams {
                     actor_did: "did:plc:m1",
                     action: "TakedownAccount",
@@ -1134,7 +1223,7 @@ mod tests {
     // underlying mutation and the chain entry land. This is the
     // happy path the atomicity contract guarantees.
     #[tokio::test]
-    async fn append_entry_in_tx_commits_with_caller_mutation() {
+    async fn insert_chain_entry_commits_with_caller_mutation() {
         let db = open_test_pool().await;
         sqlx::query(
             "INSERT INTO actor (did, handle, created_at) \
@@ -1156,8 +1245,9 @@ mod tests {
         .execute(&mut *tx)
         .await
         .unwrap();
-        let chain_id = append_entry_in_tx(
+        let chain_id = insert_chain_entry(
             &mut tx,
+            crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
@@ -1194,8 +1284,9 @@ mod tests {
         let subject = Subject::Repo {
             did: "did:plc:s".to_string(),
         };
-        let id = append_entry(
+        let id = insert_chain_entry_pool(
             &db,
+            crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
@@ -1224,12 +1315,12 @@ mod tests {
         let subject = Subject::Repo {
             did: "did:plc:s".to_string(),
         };
-        append_entry(&db, AppendEntryParams {
+        insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
             actor_did: "did:plc:m1", action: "TakedownAccount",
             subject: Some(&subject), rationale: "first",
             snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
         }).await.unwrap();
-        append_entry(&db, AppendEntryParams {
+        insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
             actor_did: "did:plc:m1", action: "RestoreAccount",
             subject: Some(&subject), rationale: "second",
             snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1260,8 +1351,9 @@ mod tests {
             cid: "bafkreiabc".to_string(),
             record_uri: Some("at://did:plc:victim/app.bsky.feed.post/3kxyz".to_string()),
         };
-        let id = append_entry(
+        let id = insert_chain_entry_pool(
             &db,
+            crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
                 actor_did: "did:plc:m1",
                 action: "TakedownRecord",
@@ -1306,8 +1398,9 @@ mod tests {
             cid: "bafkreidef".to_string(),
             record_uri: None,
         };
-        let id = append_entry(
+        let id = insert_chain_entry_pool(
             &db,
+            crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
                 actor_did: "did:plc:m1",
                 action: "TakedownRecord",
@@ -1346,7 +1439,7 @@ mod tests {
     // that shape as a Blob (with record_uri = None) rather than
     // returning None and losing the subject identity. This test
     // simulates a legacy row by inserting directly via SQL,
-    // bypassing the post-fix `append_entry` path.
+    // bypassing the post-fix `insert_chain_entry_pool` path.
     #[tokio::test]
     async fn audit_chain_legacy_blob_row_reads_back_as_blob() {
         let db = open_test_pool().await;
@@ -1356,8 +1449,9 @@ mod tests {
         // current_hash of seed entry, but for the from_columns
         // assertion we actually only care about the three subject
         // columns — read back via SELECT.
-        let id = append_entry(
+        let id = insert_chain_entry_pool(
             &db,
+            crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
@@ -1418,7 +1512,7 @@ mod tests {
         let subject = Subject::Repo {
             did: "did:plc:victim".to_string(),
         };
-        let id = append_entry(&db, AppendEntryParams {
+        let id = insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
             actor_did: "did:plc:m1", action: "SuspendAccount",
             subject: Some(&subject), rationale: "rationale text",
             snapshot_id: Some(42), event_id: Some(7), cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1458,7 +1552,7 @@ mod tests {
         let subject = Subject::Repo {
             did: "did:plc:victim".to_string(),
         };
-        let id = append_entry(&db, AppendEntryParams {
+        let id = insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
             actor_did: "did:plc:m1", action: "TakedownAccount",
             subject: Some(&subject), rationale: "original rationale",
             snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1505,7 +1599,7 @@ mod tests {
             did: "did:plc:s".to_string(),
         };
         for i in 0..3 {
-            append_entry(&db, AppendEntryParams {
+            insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&subject),
@@ -1525,7 +1619,7 @@ mod tests {
             did: "did:plc:s".to_string(),
         };
         for i in 0..3 {
-            append_entry(&db, AppendEntryParams {
+            insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("orig-{}", i),
                 snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1552,7 +1646,7 @@ mod tests {
             did: "did:plc:s".to_string(),
         };
         for i in 0..3 {
-            append_entry(&db, AppendEntryParams {
+            insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("orig-{}", i),
                 snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1570,20 +1664,21 @@ mod tests {
         )
         .fetch_one(&db).await.unwrap();
         let new_rationale = "attacker-rewrite";
+        // Alphabetical source order — see write_chain_entry_inner.
         let canon = serde_json::json!({
-            "sequence": 2,
-            "timestamp": row.try_get::<String, _>("created_at").unwrap(),
-            "actor_did": row.try_get::<String, _>("actor_did").unwrap(),
             "action": row.try_get::<String, _>("action").unwrap(),
-            "subject_did": row.try_get::<Option<String>, _>("subject_did").unwrap(),
-            "subject_uri": row.try_get::<Option<String>, _>("subject_uri").unwrap(),
-            "subject_cid": row.try_get::<Option<String>, _>("subject_cid").unwrap(),
-            "rationale": new_rationale,
-            "snapshot_id": row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            "actor_did": row.try_get::<String, _>("actor_did").unwrap(),
+            "cascade_snapshot_ids": row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap(),
+            "cascade_subjects": row.try_get::<Option<String>, _>("cascade_subjects").unwrap(),
             "event_id": row.try_get::<Option<i64>, _>("event_id").unwrap(),
             "previous_hash": row.try_get::<Option<String>, _>("previous_hash").unwrap(),
-            "cascade_subjects": row.try_get::<Option<String>, _>("cascade_subjects").unwrap(),
-            "cascade_snapshot_ids": row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap(),
+            "rationale": new_rationale,
+            "sequence": 2,
+            "snapshot_id": row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            "subject_cid": row.try_get::<Option<String>, _>("subject_cid").unwrap(),
+            "subject_did": row.try_get::<Option<String>, _>("subject_did").unwrap(),
+            "subject_uri": row.try_get::<Option<String>, _>("subject_uri").unwrap(),
+            "timestamp": row.try_get::<String, _>("created_at").unwrap(),
         });
         let canon_str = serde_json::to_string(&canon).unwrap();
         let mut hasher = Sha256::new();
@@ -1622,7 +1717,7 @@ mod tests {
         // Two real chain entries follow. They should chain together
         // independently of the sentinel row above.
         for i in 0..2 {
-            append_entry(&db, AppendEntryParams {
+            insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("post-{}", i),
                 snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1704,7 +1799,7 @@ mod tests {
 
     // ---- Concurrency stress test ----
     //
-    // Spawns N concurrent tasks that all call `append_entry` and
+    // Spawns N concurrent tasks that all call `insert_chain_entry_pool` and
     // verifies each task succeeded, exactly N rows landed,
     // sequences are contiguous from 1..=N, and verify_chain_range
     // passes across the whole window.
@@ -1801,8 +1896,9 @@ mod tests {
                 let subject = Subject::Repo {
                     did: format!("did:plc:s{}", i),
                 };
-                append_entry(
+                insert_chain_entry_pool(
                     &pool,
+                    crate::config::DatabaseBackend::Sqlite,
                     AppendEntryParams {
                         actor_did: "did:plc:m1",
                         action: "TakedownAccount",
@@ -1879,8 +1975,9 @@ mod tests {
         };
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
-            let id = append_entry(
+            let id = insert_chain_entry_pool(
                 db,
+                crate::config::DatabaseBackend::Sqlite,
                 AppendEntryParams {
                     actor_did: "did:plc:m1",
                     action: "TakedownAccount",

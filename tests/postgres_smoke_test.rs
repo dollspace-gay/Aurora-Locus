@@ -432,6 +432,7 @@ async fn account_manager_round_trip_on_postgres() {
         blob_metadata: Default::default(),
         entryway: None,
         lexicon: aurora_locus::config::LexiconConfig::default(),
+        kryphocron: aurora_locus::config::KryphocronConfig::default(),
     });
 
     let mgr = AccountManager::new(pool, config);

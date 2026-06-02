@@ -713,7 +713,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::audit_chain::{append_entry, AppendEntryParams};
+    use crate::admin::audit_chain::{insert_chain_entry_pool, AppendEntryParams};
     use crate::admin::defs::Subject;
     use crate::admin::roles::Role;
 
@@ -1034,6 +1034,7 @@ mod tests {
             blob_metadata: Default::default(),
             entryway: None,
             lexicon: crate::config::LexiconConfig::default(),
+            kryphocron: crate::config::KryphocronConfig::default(),
         };
         AppContext::new(
             config,
@@ -1047,8 +1048,9 @@ mod tests {
         let subject = Subject::Repo {
             did: "did:plc:s".to_string(),
         };
-        append_entry(
+        insert_chain_entry_pool(
             &ctx.account_db,
+            ctx.config.database.backend,
             AppendEntryParams {
                 actor_did: "did:plc:m1",
                 action,

@@ -98,11 +98,15 @@ Subject vocabulary stability is a separate contract — see
 
 The bytes that get SHA-256'd are the UTF-8 encoding of a JSON
 object with these 13 fields. Aurora-Locus's writer constructs the
-object via `serde_json::json!({...})`, which is backed by
-`serde_json::Map<String, Value>`. Without the `preserve_order`
-feature (Aurora-Locus does not enable it), `Map` is a
-`BTreeMap<String, Value>`, so **serialized keys come out in
-alphabetical order** regardless of source-order in the macro.
+object via `serde_json::json!({...})` with the 13 keys listed in
+alphabetical source order, so **serialized keys come out in
+alphabetical order** regardless of which `serde_json::Map` backing
+the build graph happens to select (`BTreeMap` when the
+`preserve_order` cargo feature is off, `IndexMap` when it's on —
+v0.7+ has `preserve_order` enabled transitively via a dependency,
+and writing keys in alphabetical source order is what guarantees
+the wire invariant durably across feature-graph drift in either
+direction).
 
 Field order in the canonical JSON (alphabetical):
 
