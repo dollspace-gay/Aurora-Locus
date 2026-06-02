@@ -486,6 +486,138 @@ impl RepositoryManager {
         ))
     }
 
+    /// v0.7 arc 2 step 5 (apply_writes restructure) — capture
+    /// prior record CIDs and project each `WriteOp` into the
+    /// `proto_blue::repo::RepoWrite` + `PreparedRecord` pair the
+    /// downstream commit path consumes.
+    ///
+    /// Extracted into a helper so both branches of `apply_writes`
+    /// (relay-race lent-tx and legacy auto-commit) share the same
+    /// projection without duplicating the prior-cid loop or the
+    /// per-write match arm. Both branches' validate loops run
+    /// BEFORE this helper, so any validation error fails fast
+    /// before any of the projection work happens.
+    ///
+    /// `prior_record_cids` is populated by querying
+    /// [`ActorStore::get_record`] for each `Update` / `Delete`
+    /// write; `Create` writes have no prior version and don't get
+    /// queried. The map flows into the per-record `prev` field on
+    /// the `CommitOp` so the firehose event carries the
+    /// pre-update CID per Arc 14 §7.3.2.
+    async fn compute_prior_cids_and_prepared(
+        &self,
+        writes: Vec<WriteOp>,
+    ) -> PdsResult<(
+        std::collections::HashMap<String, String>,
+        Vec<RepoWrite>,
+        Vec<PreparedRecord>,
+    )> {
+        // Arc 14 §7.3.2: capture prior record CIDs for update/delete
+        // ops before applying writes, so each CommitOp can carry its
+        // `prev` (prior record version CID) on the firehose event.
+        // Create ops have no prior version → not queried.
+        let mut prior_record_cids: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for write in &writes {
+            if matches!(
+                write.action,
+                WriteOpAction::Update | WriteOpAction::Delete
+            ) {
+                let uri = format!(
+                    "at://{}/{}/{}",
+                    self.did, write.collection, write.rkey
+                );
+                if let Some(prior) =
+                    self.store.get_record(&self.did, &uri).await?
+                {
+                    prior_record_cids.insert(uri, prior.cid);
+                }
+            }
+        }
+
+        // Convert each WriteOp into:
+        //   * a `proto_blue::repo::RepoWrite` for the MST/commit machinery
+        //   * a `PreparedRecord` for the post-commit metadata writeback
+        let mut repo_writes: Vec<RepoWrite> = Vec::with_capacity(writes.len());
+        let mut prepared: Vec<PreparedRecord> = Vec::with_capacity(writes.len());
+
+        for write in writes {
+            let collection = write.collection;
+            let rkey = write.rkey;
+            let uri = format!("at://{}/{}/{}", self.did, collection, rkey);
+
+            match write.action {
+                WriteOpAction::Create | WriteOpAction::Update => {
+                    let value = write.value.ok_or_else(|| {
+                        PdsError::Validation("Create/Update requires value".to_string())
+                    })?;
+
+                    // Arc 16e §9.5.3.2.0 validate-phase walker:
+                    // surface client-malformed CIDs as PdsError::InvalidCid
+                    // (HTTP 400) BEFORE Phase A so no state mutation
+                    // happens on bad input.
+                    let blob_cids = extract_blob_cids(&value)?;
+
+                    // Convert serde_json -> LexValue (lenient — mirrors TS lex-json
+                    // behaviour, recognising $link/$bytes special objects).
+                    let lex_value = json_to_lex(&value);
+
+                    // Pre-compute the CID we'll store in the per-record metadata
+                    // table. This MUST equal the CID proto-blue assigns to the
+                    // record block during apply_writes — both go through
+                    // `cid_for_lex` over the same LexValue, so they agree by
+                    // construction.
+                    let record_cid = cid_for_lex(&lex_value).map_err(|e| {
+                        PdsError::Internal(format!("CID computation failed: {}", e))
+                    })?;
+
+                    let op = match write.action {
+                        WriteOpAction::Create => OpAction::Create,
+                        WriteOpAction::Update => OpAction::Update,
+                        WriteOpAction::Delete => unreachable!(),
+                    };
+
+                    prepared.push(PreparedRecord {
+                        op,
+                        collection: collection.clone(),
+                        rkey: rkey.clone(),
+                        uri,
+                        cid: Some(record_cid.to_string()),
+                        blob_cids: Some(blob_cids),
+                    });
+
+                    let pb_write = match write.action {
+                        WriteOpAction::Create => RepoWrite::Create {
+                            collection,
+                            rkey,
+                            value: lex_value,
+                        },
+                        WriteOpAction::Update => RepoWrite::Update {
+                            collection,
+                            rkey,
+                            value: lex_value,
+                        },
+                        WriteOpAction::Delete => unreachable!(),
+                    };
+                    repo_writes.push(pb_write);
+                }
+                WriteOpAction::Delete => {
+                    prepared.push(PreparedRecord {
+                        op: OpAction::Delete,
+                        collection: collection.clone(),
+                        rkey: rkey.clone(),
+                        uri,
+                        cid: None,
+                        blob_cids: None,
+                    });
+                    repo_writes.push(RepoWrite::Delete { collection, rkey });
+                }
+            }
+        }
+
+        Ok((prior_record_cids, repo_writes, prepared))
+    }
+
     /// Validate a single write — runs the codec validator under the
     /// configured mode and tracks failures on the actor store.
     ///
@@ -686,127 +818,31 @@ impl RepositoryManager {
             ));
         }
 
-        // Validate every write up-front so we don't half-apply.
+        // v0.7 arc 2 step 5 (apply_writes restructure) — validation
+        // moves INTO each branch below so the relay-race path can
+        // pass `&mut shared_tx` to `validate_write`, which threads
+        // into `bind_pipeline`'s audit-emit signature per the
+        // step-3.5 addendum. The legacy path (no shared pool —
+        // `RepositoryManager::new`-style test instances) still
+        // validates with `None, None`; the dispatcher's bind-
+        // pipeline branch errors with
+        // `KryphocronBindPipelineOutsideScope` if a `Some(_)`-
+        // authorization write reaches that path, which is a
+        // programmer error (production handlers go through
+        // `for_writer` which always plumbs the shared pool).
         //
-        // v0.7 arc 2 step 4 — `validate_write` gained two optional
-        // parameters: the shared-DB tx (for the bind-pipeline audit
-        // emit) and the active CascadeContext (for the Cascade
-        // variant). At the top of `apply_writes` neither is
-        // available yet (the relay-race scope opens later), so we
-        // pass `None, None`. No production `WriteOp` carries a
-        // `kryphocron_authorization: Some(_)` in arc 2 ship state
-        // (step 5's dedicated endpoints land the first constructors),
-        // so the dispatcher's bind-pipeline branch is unreachable
-        // from this call site for now — when it IS reached it
-        // returns `KryphocronBindPipelineOutsideScope`, which step
-        // 5 will resolve by restructuring this call site to install
-        // the txns before validation.
-        for write in &writes {
-            self.validate_write(write, None, None).await?;
-        }
-
-        // Arc 14 §7.3.2: capture prior record CIDs for update/delete
-        // ops before applying writes, so each CommitOp can carry its
-        // `prev` (prior record version CID) on the firehose event.
-        // Create ops have no prior version → not queried.
-        let mut prior_record_cids: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for write in &writes {
-            if matches!(
-                write.action,
-                WriteOpAction::Update | WriteOpAction::Delete
-            ) {
-                let uri = format!(
-                    "at://{}/{}/{}",
-                    self.did, write.collection, write.rkey
-                );
-                if let Some(prior) =
-                    self.store.get_record(&self.did, &uri).await?
-                {
-                    prior_record_cids.insert(uri, prior.cid);
-                }
-            }
-        }
-
-        // Convert each WriteOp into:
-        //   * a `proto_blue::repo::RepoWrite` for the MST/commit machinery
-        //   * a `PreparedRecord` for the post-commit metadata writeback
-        let mut repo_writes: Vec<RepoWrite> = Vec::with_capacity(writes.len());
-        let mut prepared: Vec<PreparedRecord> = Vec::with_capacity(writes.len());
-
-        for write in writes {
-            let collection = write.collection;
-            let rkey = write.rkey;
-            let uri = format!("at://{}/{}/{}", self.did, collection, rkey);
-
-            match write.action {
-                WriteOpAction::Create | WriteOpAction::Update => {
-                    let value = write.value.ok_or_else(|| {
-                        PdsError::Validation("Create/Update requires value".to_string())
-                    })?;
-
-                    // Arc 16e §9.5.3.2.0 validate-phase walker:
-                    // surface client-malformed CIDs as PdsError::InvalidCid
-                    // (HTTP 400) BEFORE Phase A so no state mutation
-                    // happens on bad input.
-                    let blob_cids = extract_blob_cids(&value)?;
-
-                    // Convert serde_json -> LexValue (lenient — mirrors TS lex-json
-                    // behaviour, recognising $link/$bytes special objects).
-                    let lex_value = json_to_lex(&value);
-
-                    // Pre-compute the CID we'll store in the per-record metadata
-                    // table. This MUST equal the CID proto-blue assigns to the
-                    // record block during apply_writes — both go through
-                    // `cid_for_lex` over the same LexValue, so they agree by
-                    // construction.
-                    let record_cid = cid_for_lex(&lex_value).map_err(|e| {
-                        PdsError::Internal(format!("CID computation failed: {}", e))
-                    })?;
-
-                    let op = match write.action {
-                        WriteOpAction::Create => OpAction::Create,
-                        WriteOpAction::Update => OpAction::Update,
-                        WriteOpAction::Delete => unreachable!(),
-                    };
-
-                    prepared.push(PreparedRecord {
-                        op,
-                        collection: collection.clone(),
-                        rkey: rkey.clone(),
-                        uri,
-                        cid: Some(record_cid.to_string()),
-                        blob_cids: Some(blob_cids),
-                    });
-
-                    let pb_write = match write.action {
-                        WriteOpAction::Create => RepoWrite::Create {
-                            collection,
-                            rkey,
-                            value: lex_value,
-                        },
-                        WriteOpAction::Update => RepoWrite::Update {
-                            collection,
-                            rkey,
-                            value: lex_value,
-                        },
-                        WriteOpAction::Delete => unreachable!(),
-                    };
-                    repo_writes.push(pb_write);
-                }
-                WriteOpAction::Delete => {
-                    prepared.push(PreparedRecord {
-                        op: OpAction::Delete,
-                        collection: collection.clone(),
-                        rkey: rkey.clone(),
-                        uri,
-                        cid: None,
-                        blob_cids: None,
-                    });
-                    repo_writes.push(RepoWrite::Delete { collection, rkey });
-                }
-            }
-        }
+        // The validate loop's old position at the top of this
+        // function (calling with `None, None`) made the dispatcher
+        // unreachable from the production write path. Step 4
+        // shipped the framework + tests; this step's restructure
+        // makes the path reachable so step 5's dedicated endpoints
+        // exercise `bind_pipeline` end-to-end via the standard
+        // `apply_writes` flow.
+        //
+        // `prior_record_cids` + `repo_writes` + `prepared`
+        // computation is extracted into
+        // [`compute_prior_cids_and_prepared`] below — both
+        // branches call it after their own validate loop.
 
         // Drive proto-blue's commit machinery on a blocking thread —
         // the storage adapter calls `block_on` internally, which would
@@ -821,24 +857,55 @@ impl RepositoryManager {
         // construct via `RepositoryManager::new` (no shared pool)
         // fall through to the legacy per-statement auto-commit
         // path below, preserving back-compat.
-        let (commit_cid, new_rev, prev_commit, prev_data, blocks, commit_ops): (
+        // Aliased to satisfy clippy::type_complexity — the
+        // restructure has both branches converging on this 7-tuple
+        // so each can supply `prepared` for Phase B.
+        type CommitProjection = (
             Cid,
             String,
             Option<Cid>,
             Option<Cid>,
             BlockMap,
             Vec<CommitOp>,
-        ) = if let Some(shared_pool) = self.shared_pool.clone() {
+            Vec<PreparedRecord>,
+        );
+        let (commit_cid, new_rev, prev_commit, prev_data, blocks, commit_ops, prepared): CommitProjection =
+            if let Some(shared_pool) = self.shared_pool.clone() {
             // ----- Relay-race lent-tx path -----
             let actor_pool = self.store.open_db(&self.did).await?;
             let actor_tx = actor_pool.begin().await.map_err(PdsError::Database)?;
-            let shared_tx = shared_pool.begin().await.map_err(PdsError::Database)?;
+            let mut shared_tx = shared_pool.begin().await.map_err(PdsError::Database)?;
+
+            // Validate every write with the shared tx threaded
+            // through so the dispatcher's bind-pipeline branch can
+            // reach `bind_pipeline(write_op, &mut shared_tx, ...)`.
+            // Any `Some(_)` authorization on a kryphocron-prefix
+            // write fires the bind pipeline here; the audit-emit
+            // writes step 7 will add land on `shared_tx`, which
+            // commits first in `commit_with_orphan_recovery` per
+            // the step-3.5 addendum's audit-first ordering.
+            //
+            // No active CascadeContext is plumbed yet — production
+            // cascade-initiating handlers (post-arc-2 work) will
+            // construct one and pass it as `Some(&mut ctx)`. Step
+            // 5's dedicated endpoints don't construct cascades, so
+            // `None` here is correct for arc 2 ship state.
+            for write in &writes {
+                self.validate_write(write, Some(&mut shared_tx), None).await?;
+            }
+
+            // The shared_tx mutable borrow ends with the validate
+            // loop; we now move it into `with_lent_txns` alongside
+            // `actor_tx` for the proto-blue + Phase A scope.
+            let (prior_record_cids, repo_writes, prepared) =
+                self.compute_prior_cids_and_prepared(writes).await?;
+
             let storage = self.make_storage();
             let did = self.did.clone();
             let signer_arc = signer.clone();
             let repo_writes_owned = repo_writes;
             let prepared_owned = prepared;
-            let prior_record_cids_owned = prior_record_cids.clone();
+            let prior_record_cids_owned = prior_record_cids;
 
             let (actor_tx_back, shared_tx_back, scope_outcome) = storage
                 .with_lent_txns(actor_tx, shared_tx, move |scoped_storage| async move {
@@ -970,10 +1037,6 @@ impl RepositoryManager {
                 }
             };
 
-            // Re-install `prepared` into the outer scope so
-            // Phase B (below) can read its blob-cid plans.
-            prepared = prepared_returned;
-
             // Audit-first relay-race commit per the arc 2
             // step-3.5 addendum: shared tx commits first; on
             // failure the actor tx rolls back. Actor tx commits
@@ -993,9 +1056,26 @@ impl RepositoryManager {
                 prev_data_v,
                 blocks_v,
                 commit_ops_v,
+                prepared_returned,
             )
         } else {
             // ----- Legacy per-statement auto-commit path -----
+            //
+            // No shared pool → no `bind_pipeline` reachable. Validate
+            // with `None, None`; any `Some(_)` authorization on a
+            // kryphocron-prefix write errors with
+            // `KryphocronBindPipelineOutsideScope` from the
+            // dispatcher (production handlers use `for_writer` which
+            // plumbs the shared pool, so this is a programmer-error
+            // path only).
+            for write in &writes {
+                self.validate_write(write, None, None).await?;
+            }
+
+            let (prior_record_cids, repo_writes, prepared_owned) =
+                self.compute_prior_cids_and_prepared(writes).await?;
+            let prepared = prepared_owned;
+
             let storage = self.make_storage();
             let did = self.did.clone();
             let signer_arc = signer;
@@ -1075,7 +1155,7 @@ impl RepositoryManager {
                 }
             }
 
-            (commit_cid, new_rev, prev_commit, prev_data, blocks, commit_ops)
+            (commit_cid, new_rev, prev_commit, prev_data, blocks, commit_ops, prepared)
         };
 
         // Phase B — shared-DB blob-ref reconciliation (Arc 16e
