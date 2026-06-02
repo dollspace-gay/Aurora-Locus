@@ -332,31 +332,68 @@ pub(crate) async fn commit_with_orphan_recovery(
 
 impl RepoStorage for SqliteRepoStorage {
     fn get_block(&self, cid: &Cid) -> Result<Option<Vec<u8>>, RepoError> {
+        // v0.7 arc 2 phase B fix-up — route reads through the
+        // lent actor tx when one is installed. proto-blue stages
+        // blocks via `put_block` during commit assembly and reads
+        // them back via `get_block` for signature computation; if
+        // the writes go into the lent tx (via the patched
+        // `put_block` below) but the reads come from a fresh
+        // auto-commit pool connection, proto-blue sees "Missing
+        // block" because the staged row isn't yet committed.
+        // Routing both sides through the same tx closes the
+        // visibility seam. When no tx is lent (the legacy auto-
+        // commit path or any non-`apply_writes` consumer of
+        // `RepoStorage`), behavior is unchanged.
         let cid_str = cid.to_string();
         Self::block_on(async {
-            self.store
-                .get_block(&self.did, &cid_str)
-                .await
-                .map_err(|e| RepoError::Storage(format!("get_block({}): {}", cid_str, e)))
+            let mut tx_guard = self.lent_actor_tx.lock().await;
+            if let Some(tx) = tx_guard.as_mut() {
+                ActorStore::get_block_in_tx(tx, &cid_str)
+                    .await
+                    .map_err(|e| RepoError::Storage(format!("get_block({}): {}", cid_str, e)))
+            } else {
+                self.store
+                    .get_block(&self.did, &cid_str)
+                    .await
+                    .map_err(|e| RepoError::Storage(format!("get_block({}): {}", cid_str, e)))
+            }
         })
     }
 
     fn put_block(&self, cid: Cid, bytes: Vec<u8>) -> Result<(), RepoError> {
+        // v0.7 arc 2 phase B fix-up — route writes through the
+        // lent actor tx when installed. See get_block above for
+        // the full visibility-seam rationale.
         let cid_str = cid.to_string();
         Self::block_on(async {
-            self.store
-                .put_block(&self.did, &cid_str, &bytes)
-                .await
-                .map_err(|e| RepoError::Storage(format!("put_block({}): {}", cid_str, e)))
+            let mut tx_guard = self.lent_actor_tx.lock().await;
+            if let Some(tx) = tx_guard.as_mut() {
+                ActorStore::put_block_in_tx(tx, &cid_str, &bytes)
+                    .await
+                    .map_err(|e| RepoError::Storage(format!("put_block({}): {}", cid_str, e)))
+            } else {
+                self.store
+                    .put_block(&self.did, &cid_str, &bytes)
+                    .await
+                    .map_err(|e| RepoError::Storage(format!("put_block({}): {}", cid_str, e)))
+            }
         })
     }
 
     fn get_root(&self) -> Result<Option<Cid>, RepoError> {
+        // v0.7 arc 2 phase B fix-up — route through the lent
+        // actor tx when installed so root reads see staged-but-
+        // uncommitted updates. The NotFound-→-Ok(None) mapping
+        // for uninitialised repos is preserved across both
+        // branches.
         Self::block_on(async {
-            // `get_repo_root` returns NotFound for an uninitialised repo; map
-            // that to `Ok(None)` so `Repo::load` sees an empty store rather
-            // than an error.
-            match self.store.get_repo_root(&self.did).await {
+            let mut tx_guard = self.lent_actor_tx.lock().await;
+            let root_result = if let Some(tx) = tx_guard.as_mut() {
+                ActorStore::get_repo_root_in_tx(tx, &self.did).await
+            } else {
+                self.store.get_repo_root(&self.did).await
+            };
+            match root_result {
                 Ok(root) => {
                     let cid = Cid::from_str(&root.cid).map_err(|e| {
                         RepoError::Storage(format!("invalid stored root CID {}: {}", root.cid, e))
@@ -375,19 +412,33 @@ impl RepoStorage for SqliteRepoStorage {
     /// changing the underlying MST, which doesn't happen in our flow.
     /// We override `apply_commit` below; this method exists only to
     /// satisfy the trait.
+    ///
+    /// v0.7 arc 2 phase B fix-up — both the rev read and the root
+    /// upsert route through the lent actor tx when installed.
     fn update_root(&self, new_root: Cid) -> Result<(), RepoError> {
         let new_root_str = new_root.to_string();
         Self::block_on(async {
-            let existing_rev = self
-                .store
-                .get_repo_root(&self.did)
-                .await
-                .map(|r| r.rev)
-                .unwrap_or_default();
-            self.store
-                .update_repo_root(&self.did, &new_root_str, &existing_rev)
-                .await
-                .map_err(|e| RepoError::Storage(format!("update_root: {}", e)))
+            let mut tx_guard = self.lent_actor_tx.lock().await;
+            if let Some(tx) = tx_guard.as_mut() {
+                let existing_rev = match ActorStore::get_repo_root_in_tx(tx, &self.did).await {
+                    Ok(r) => r.rev,
+                    Err(_) => String::new(),
+                };
+                ActorStore::update_repo_root_in_tx(tx, &self.did, &new_root_str, &existing_rev)
+                    .await
+                    .map_err(|e| RepoError::Storage(format!("update_root: {}", e)))
+            } else {
+                let existing_rev = self
+                    .store
+                    .get_repo_root(&self.did)
+                    .await
+                    .map(|r| r.rev)
+                    .unwrap_or_default();
+                self.store
+                    .update_repo_root(&self.did, &new_root_str, &existing_rev)
+                    .await
+                    .map_err(|e| RepoError::Storage(format!("update_root: {}", e)))
+            }
         })
     }
 
@@ -855,4 +906,185 @@ mod step_3_5_tests {
         );
     }
 
+    // -----------------------------------------------------------
+    // Phase B fix-up — RepoStorage trait-method lent-tx routing.
+    //
+    // Arc 2's Phase B Block 2.4 (vanilla bsky baseline write)
+    // surfaced HTTP 500 from `Repo::apply_writes` with `Missing
+    // block`. Root cause: step 3.5 wired `apply_commit` to consult
+    // `lent_actor_tx` but left the four other RepoStorage trait
+    // methods (get_block, put_block, get_root, update_root)
+    // routing through the auto-commit pool. proto-blue stages a
+    // block via `put_block` (auto-commit), then reads it back via
+    // `get_block` (also auto-commit, but on a FRESH pool
+    // connection) during signature computation — the lent tx
+    // holds the write lock and the read-back doesn't see the
+    // staged row. proto-blue aborts with `Missing block`.
+    //
+    // The fix routes all four methods through the lent tx when
+    // installed, fall-through to the existing auto-commit path
+    // when no tx is installed. These tests pin both directions of
+    // the property:
+    //
+    //   #1 read-during-lent-tx visibility: stage via
+    //      put_block_in_tx, read back via the trait's get_block
+    //      → Some(bytes). The pre-fix code would return None.
+    //   #2 no-tx fallback unchanged: with lent_actor_tx empty,
+    //      the trait's put_block / get_block route through the
+    //      auto-commit helpers exactly as before.
+
+    /// Helper — install a `Some(_)` actor tx on the storage and
+    /// return it for caller-managed commit/rollback at end of
+    /// scope. Used by the two visibility tests below.
+    async fn install_lent_actor_tx_for_test(
+        storage: &SqliteRepoStorage,
+        actor_pool: &sqlx::SqlitePool,
+    ) {
+        let tx = actor_pool
+            .begin()
+            .await
+            .expect("begin actor tx for visibility test");
+        *storage.lent_actor_tx().lock().await = Some(tx);
+    }
+
+    /// Compute a real CID over a synthetic record — the trait
+    /// methods take `&Cid`, and `Cid::from_str` rejects bare
+    /// sentinel strings. Round-tripping through `json_to_lex` +
+    /// `cid_for_lex` (the same pipeline `RepositoryManager`'s
+    /// per-record CID computation uses) gives a CID that
+    /// round-trips through `to_string` / `from_str` cleanly. The
+    /// test only cares that the same Cid serializes into the SQL
+    /// key consistently across stage and read; the stored bytes
+    /// are a sentinel since storage doesn't enforce
+    /// content == cid.
+    fn synth_cid_and_bytes(seed: &str) -> (Cid, Vec<u8>) {
+        let value = serde_json::json!({ "seed": seed });
+        let lex = proto_blue::lex_json::json_to_lex(&value);
+        let cid = proto_blue::lex_cbor::cid_for_lex(&lex)
+            .expect("cid_for_lex over synth record");
+        (cid, seed.as_bytes().to_vec())
+    }
+
+    /// Phase B fix-up #1 — read-during-lent-tx visibility.
+    /// Stage a block via `put_block_in_tx`, then call the trait's
+    /// `get_block` (sync, the path proto-blue takes during
+    /// commit assembly). The fix routes the read through the
+    /// same tx so the staged-but-uncommitted block is visible.
+    /// The pre-fix code would return `None` here.
+    ///
+    /// **spawn_blocking wrap.** Per the module-level docs at the
+    /// top of this file, callers MUST run work that touches the
+    /// trait methods inside `tokio::task::spawn_blocking` —
+    /// `block_on` from a worker thread panics. We mirror
+    /// production by spawning the trait calls.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fixup_t1_trait_get_block_sees_staged_block_via_lent_tx() {
+        let (store, did, actor_pool, _shared_pool, _tmp) = test_pools().await;
+        let storage = Arc::new(make_storage(store, did));
+        let (cid, bytes) = synth_cid_and_bytes("fixup-t1-seed");
+        let cid_str = cid.to_string();
+
+        // Install lent actor tx on the storage. Then stage a
+        // block directly via the in_tx helper — this is what
+        // happens when proto-blue's put_block call routes through
+        // the patched trait method.
+        install_lent_actor_tx_for_test(&storage, &actor_pool).await;
+        {
+            let mut g = storage.lent_actor_tx().lock().await;
+            let tx = g.as_mut().expect("lent tx installed");
+            ActorStore::put_block_in_tx(tx, &cid_str, &bytes)
+                .await
+                .expect("stage block via in_tx");
+        }
+
+        // Call the trait method on a blocking-pool thread (the
+        // path proto-blue takes from `Repo::apply_writes` during
+        // commit assembly). Must return Some(bytes) — the staged
+        // block is visible because the read routes through the
+        // SAME lent tx.
+        let storage_for_blocking = storage.clone();
+        let cid_for_blocking = cid.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            <SqliteRepoStorage as RepoStorage>::get_block(
+                &storage_for_blocking,
+                &cid_for_blocking,
+            )
+        })
+        .await
+        .expect("join blocking task")
+        .expect("get_block trait call ok");
+
+        assert_eq!(
+            read,
+            Some(bytes.clone()),
+            "trait get_block must see the staged-via-lent-tx block; \
+             the pre-fix code returned None because the read \
+             opened a fresh auto-commit connection that didn't \
+             see the lent tx's uncommitted state",
+        );
+
+        // Recover the tx so it can be cleanly rolled back. Phase
+        // B fix-up doesn't change rollback semantics.
+        let tx = storage
+            .lent_actor_tx()
+            .lock()
+            .await
+            .take()
+            .expect("extract lent tx for rollback");
+        tx.rollback().await.expect("rollback lent tx");
+    }
+
+    /// Phase B fix-up #2 — no-tx fallback unchanged. With
+    /// `lent_actor_tx` empty, the trait's put_block / get_block
+    /// must route through the auto-commit ActorStore helpers
+    /// exactly as before. This is the back-compat path that
+    /// every test that constructs via `RepositoryManager::new`
+    /// (and any non-`apply_writes` RepoStorage consumer) relies
+    /// on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fixup_t2_no_lent_tx_falls_back_to_auto_commit_path() {
+        let (store, did, actor_pool, _shared_pool, _tmp) = test_pools().await;
+        let storage = Arc::new(make_storage(store, did));
+        let (cid, bytes) = synth_cid_and_bytes("fixup-t2-seed");
+        let cid_str = cid.to_string();
+
+        // No `install_lent_actor_tx_for_test` call here — the
+        // storage's lent slot stays None for this test.
+
+        let storage_for_put = storage.clone();
+        let cid_for_put = cid.clone();
+        let bytes_for_put = bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            <SqliteRepoStorage as RepoStorage>::put_block(
+                &storage_for_put,
+                cid_for_put,
+                bytes_for_put,
+            )
+        })
+        .await
+        .expect("join put blocking task")
+        .expect("put_block trait call ok (auto-commit fallback)");
+
+        // The block is committed via the auto-commit path, so
+        // both the trait's get_block AND a direct pool query see
+        // it.
+        let storage_for_get = storage.clone();
+        let cid_for_get = cid.clone();
+        let trait_read = tokio::task::spawn_blocking(move || {
+            <SqliteRepoStorage as RepoStorage>::get_block(&storage_for_get, &cid_for_get)
+        })
+        .await
+        .expect("join get blocking task")
+        .expect("get_block trait call ok");
+        assert_eq!(
+            trait_read,
+            Some(bytes.clone()),
+            "trait get_block must see the block written via the auto-commit fallback",
+        );
+        assert!(
+            block_exists(&actor_pool, &cid_str).await,
+            "the auto-commit fallback must persist the block — a \
+             pool-level query sees it after the trait's put_block returns",
+        );
+    }
 }

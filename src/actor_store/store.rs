@@ -535,6 +535,49 @@ impl ActorStore {
         Ok(())
     }
 
+    /// v0.7 arc 2 phase B fix-up — per-actor `get_block` against a
+    /// caller-managed `sqlx::Sqlite` transaction. Same SQL as
+    /// `get_block`. Read-during-lent-tx visibility: when proto-blue
+    /// stages a block via `put_block_in_tx` and immediately reads
+    /// it back during commit assembly, the auto-commit `get_block`
+    /// would open a fresh pool connection that doesn't see the
+    /// staged-but-uncommitted row — the read-back fails with
+    /// `Missing block`. Routing reads through the same tx solves
+    /// the visibility seam.
+    pub async fn get_block_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Sqlite>,
+        cid: &str,
+    ) -> PdsResult<Option<Vec<u8>>> {
+        let content: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT content FROM repo_block WHERE cid = ?1")
+                .bind(cid)
+                .fetch_optional(&mut **tx)
+                .await?;
+        Ok(content)
+    }
+
+    /// v0.7 arc 2 phase B fix-up — per-actor `get_repo_root`
+    /// against a caller-managed `sqlx::Sqlite` transaction. Same
+    /// SQL as `get_repo_root`, same NotFound-on-uninitialised-repo
+    /// semantic.
+    pub async fn get_repo_root_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Sqlite>,
+        did: &str,
+    ) -> PdsResult<RepoRoot> {
+        let row = sqlx::query("SELECT did, cid, rev, indexed_at FROM repo_root WHERE did = ?1")
+            .bind(did)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| PdsError::NotFound("Repository root not found".to_string()))?;
+
+        Ok(RepoRoot {
+            did: row.get("did"),
+            cid: row.get("cid"),
+            rev: row.get("rev"),
+            indexed_at: row.get("indexed_at"),
+        })
+    }
+
     /// v0.7 arc 2 step 3.5 — per-actor `update_repo_root` against
     /// a caller-managed `sqlx::Sqlite` transaction. Same SQL as
     /// `update_repo_root`.
