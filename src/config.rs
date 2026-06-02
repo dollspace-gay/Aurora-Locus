@@ -484,8 +484,8 @@ pub struct DatabaseConfig {
     /// (§9.4.3.4) relies on statement-scoped snapshot semantics.
     /// Higher isolation levels (REPEATABLE READ / SERIALIZABLE)
     /// produce serialization-failure (40001) errors on the sweep's
-    /// per-row autocommit DELETE that the v0.5 sweep doesn't
-    /// retry-classify (deferred to v0.6+ per §9.4.1.2). Pool builder
+    /// per-row autocommit DELETE that the sweep doesn't
+    /// retry-classify (deferred to a future cycle per V05_DESIGN.md §9.4.1.2). Pool builder
     /// reads this; `validate_gc_sweep_config` warns case-insensitively
     /// when Postgres is the active backend and the value differs
     /// from "read committed". SQLite-only deployments don't trip

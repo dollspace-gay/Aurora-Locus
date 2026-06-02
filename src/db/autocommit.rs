@@ -55,7 +55,7 @@ pub async fn autocommit_execute<'q>(
 
 /// Fetch all rows from a SELECT outside a transaction context.
 /// Page-materializes the result set — `.fetch(` streaming is
-/// explicitly out of scope for v0.5 (round-4 F10, deferred to v0.6+
+/// explicitly out of scope (round-4 F10, deferred to a future cycle
 /// per V05_DESIGN.md §9.4.1.2).
 pub async fn autocommit_fetch_all<'q>(
     pool: &AnyPool,

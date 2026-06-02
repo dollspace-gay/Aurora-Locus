@@ -842,17 +842,17 @@ async fn fetch_and_stage_one(
 }
 
 // ============================================================
-// Single-flight lock (in-process actor-keyed mutex, v0.5 posture)
+// Single-flight lock (in-process actor-keyed mutex)
 // ============================================================
 
 /// Process-global lock registry. The OnceLock pattern lets every
 /// importRepo invocation hit the same in-memory state without
 /// threading a registry handle through `AppContext` (which would
 /// expand the test-fixture surface considerably). For multi-process
-/// HA deployments — out of scope for v0.5 — the kickoff's
+/// HA deployments a future-cycle
 /// `pg_try_advisory_lock(SHA-256("aurora-locus.import_repo." +
-/// did))` variant replaces this. Tracked as a v0.6+ hardening
-/// chainlink.
+/// did))` variant would replace this. Tracked as a future-cycle
+/// hardening chainlink.
 fn import_lock_registry() -> &'static SingleFlightImportLock {
     static REGISTRY: OnceLock<SingleFlightImportLock> = OnceLock::new();
     REGISTRY.get_or_init(SingleFlightImportLock::new)

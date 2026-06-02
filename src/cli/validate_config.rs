@@ -771,8 +771,8 @@ fn validate_gc_sweep_config(config: &ServerConfig, issues: &mut Vec<ValidationIs
                  (V05_DESIGN.md §9.4.3.4) is keyed to Postgres READ \
                  COMMITTED. Higher isolation (REPEATABLE READ / \
                  SERIALIZABLE) produces 40001 serialization-failure errors \
-                 on the per-row autocommit DELETE that v0.5's sweep does \
-                 NOT retry-classify (deferred to v0.6+ per §9.4.1.2). \
+                 on the per-row autocommit DELETE that the sweep does \
+                 NOT retry-classify (deferred to a future cycle per V05_DESIGN.md §9.4.1.2). \
                  Either set pg_transaction_isolation back to \"read \
                  committed\" or accept elevated db_error_skip_count from \
                  the sweep job.",

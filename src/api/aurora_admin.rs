@@ -3661,9 +3661,9 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
 /// - Top-level non-mapping → `PdsError::Validation`.
 ///
 /// The returned map is loaded once at `AppContext::new` and cached
-/// for the process lifetime. Reload-on-SIGHUP is deferred to v0.4;
-/// the runtime_settings table provides the hot path for changes
-/// inside a running process.
+/// for the process lifetime. Reload-on-SIGHUP is deferred to a
+/// future cycle; the runtime_settings table provides the hot path
+/// for changes inside a running process.
 pub fn load_file_tier_settings(
     path: &std::path::Path,
 ) -> crate::error::PdsResult<std::collections::HashMap<String, serde_json::Value>> {
