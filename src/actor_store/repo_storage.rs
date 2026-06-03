@@ -310,6 +310,28 @@ pub(crate) async fn commit_with_orphan_recovery(
     // short tx on this pool.
     shared_pool: &sqlx::AnyPool,
 ) -> Result<(), PdsError> {
+    // v0.8 arc 1 (#180) debug injection — force the shared-commit
+    // failure (clean-failure path) before either side commits. Gated
+    // to debug builds (inert in release); Phase B Scenario 6 Block 6.3
+    // drives this. Observable end state matches a real shared-commit
+    // failure: neither side committed, no audit row, no orphan marker.
+    if debug_force_shared_commit_failure(did) {
+        let _ = shared_tx.rollback().await;
+        if let Err(rb_err) = actor_tx.rollback().await {
+            tracing::warn!(
+                target: "aurora_locus::repo_storage",
+                event = "actor_tx_rollback_failed_after_shared_commit_failure",
+                did = %did,
+                rollback_error = %rb_err,
+                "actor tx rollback failed after debug-forced shared-commit failure",
+            );
+        }
+        return Err(PdsError::Database(sqlx::Error::Protocol(
+            "AURORA_DEBUG_FORCE_SHARED_COMMIT_FAILURE (debug-build test affordance)"
+                .to_string(),
+        )));
+    }
+
     // Step 1: shared tx (audit emit) first.
     if let Err(shared_err) = shared_tx.commit().await {
         // Roll back the actor tx — record commit must not land
@@ -328,6 +350,21 @@ pub(crate) async fn commit_with_orphan_recovery(
             );
         }
         return Err(PdsError::Database(shared_err));
+    }
+
+    // v0.8 arc 1 (#180) debug injection — force the actor-commit
+    // failure AFTER the shared commit succeeded (the orphan path).
+    // Gated to debug builds (inert in release); Phase B Scenario 6
+    // Blocks 6.1/6.2 drive this. The shared audit row has already
+    // landed, so this produces a genuine orphan for the sweep.
+    if debug_force_actor_commit_failure(did) {
+        let _ = actor_tx.rollback().await;
+        let actor_err = sqlx::Error::Protocol(
+            "AURORA_DEBUG_FORCE_ACTOR_COMMIT_FAILURE (debug-build test affordance)"
+                .to_string(),
+        );
+        record_orphan_marker(did, &actor_err, &emitted_event_ids, shared_pool).await;
+        return Err(PdsError::Database(actor_err));
     }
 
     // Step 2: actor tx second.
@@ -436,6 +473,72 @@ pub(crate) async fn insert_persistent_orphan_marker(
              for the missing-marker context."
         );
     }
+}
+
+/// v0.8 arc 1 (#180) debug injection — returns `true` when
+/// `AURORA_DEBUG_FORCE_ACTOR_COMMIT_FAILURE` is set to `did`, so
+/// `commit_with_orphan_recovery` can simulate an actor-commit failure
+/// (the orphan path) for Phase B Scenario 6. Debug builds only; the
+/// release stub below compiles the env read out entirely. First trigger
+/// per process emits a `warn!` so an accidental debug-build-with-env-set
+/// is diagnosable from logs.
+#[cfg(debug_assertions)]
+fn debug_force_actor_commit_failure(did: &str) -> bool {
+    match std::env::var("AURORA_DEBUG_FORCE_ACTOR_COMMIT_FAILURE") {
+        Ok(target) if target == did => {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    target: "aurora_locus::repo_storage",
+                    event = "aurora_debug_force_actor_commit_failure_active",
+                    did = %did,
+                    "AURORA_DEBUG_FORCE_ACTOR_COMMIT_FAILURE is active for this DID; \
+                     this is a debug-build-only test affordance (Phase B Scenario 6)",
+                );
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Release stub — the env var is inert; the read is compiled out.
+#[cfg(not(debug_assertions))]
+#[inline]
+fn debug_force_actor_commit_failure(_did: &str) -> bool {
+    false
+}
+
+/// v0.8 arc 1 (#180) debug injection — returns `true` when
+/// `AURORA_DEBUG_FORCE_SHARED_COMMIT_FAILURE` is set to `did`, so
+/// `commit_with_orphan_recovery` can simulate a shared-commit failure
+/// (the clean-failure path) for Phase B Scenario 6 Block 6.3. Debug
+/// builds only; the release stub below compiles the env read out.
+#[cfg(debug_assertions)]
+fn debug_force_shared_commit_failure(did: &str) -> bool {
+    match std::env::var("AURORA_DEBUG_FORCE_SHARED_COMMIT_FAILURE") {
+        Ok(target) if target == did => {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    target: "aurora_locus::repo_storage",
+                    event = "aurora_debug_force_shared_commit_failure_active",
+                    did = %did,
+                    "AURORA_DEBUG_FORCE_SHARED_COMMIT_FAILURE is active for this DID; \
+                     this is a debug-build-only test affordance (Phase B Scenario 6)",
+                );
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Release stub — the env var is inert; the read is compiled out.
+#[cfg(not(debug_assertions))]
+#[inline]
+fn debug_force_shared_commit_failure(_did: &str) -> bool {
+    false
 }
 
 impl RepoStorage for SqliteRepoStorage {
