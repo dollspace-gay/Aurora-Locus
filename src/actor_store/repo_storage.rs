@@ -300,6 +300,15 @@ pub(crate) async fn commit_with_orphan_recovery(
     actor_tx: sqlx::Transaction<'static, sqlx::Sqlite>,
     shared_tx: sqlx::Transaction<'static, sqlx::Any>,
     did: &str,
+    // v0.8 arc 1 (#180) — moderation_event.id(s) committed onto
+    // `shared_tx` during the bind pipeline. Empty unless an audit row
+    // was emitted. Keys the persistent orphan marker on the
+    // actor-commit-failure path.
+    emitted_event_ids: Vec<i64>,
+    // v0.8 arc 1 (#180) — the orphan-marker INSERT must run AFTER
+    // `shared_tx.commit()` consumes `shared_tx`, so it opens its own
+    // short tx on this pool.
+    shared_pool: &sqlx::AnyPool,
 ) -> Result<(), PdsError> {
     // Step 1: shared tx (audit emit) first.
     if let Err(shared_err) = shared_tx.commit().await {
@@ -323,11 +332,110 @@ pub(crate) async fn commit_with_orphan_recovery(
 
     // Step 2: actor tx second.
     if let Err(actor_err) = actor_tx.commit().await {
-        emit_bind_audit_orphan_marker(did, &actor_err);
+        record_orphan_marker(did, &actor_err, &emitted_event_ids, shared_pool).await;
         return Err(PdsError::Database(actor_err));
     }
 
     Ok(())
+}
+
+/// v0.8 arc 1 (#180) — sibling-emit ordering for the orphan path,
+/// factored so the real-failure branch and the debug-injection branch
+/// share one definition. Per §3.5: **tracing emit first** (the
+/// sync, can't-fail forensic safety net), **persistent INSERT second**
+/// (async, returns `()`, can't fail the caller). The caller propagates
+/// the ORIGINAL `actor_err` — never a marker-INSERT error.
+async fn record_orphan_marker(
+    did: &str,
+    actor_err: &(dyn std::fmt::Display + Sync),
+    emitted_event_ids: &[i64],
+    shared_pool: &sqlx::AnyPool,
+) {
+    // SIBLING EMIT — TRACING FIRST (forensic-detail safety net).
+    emit_bind_audit_orphan_marker(did, actor_err);
+    // SIBLING EMIT — INSERT SECOND (persistent, sweep target).
+    insert_persistent_orphan_marker(
+        shared_pool,
+        did,
+        &actor_err.to_string(),
+        emitted_event_ids,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .await;
+}
+
+/// v0.8 arc 1 (#180) — persistent sibling of
+/// [`emit_bind_audit_orphan_marker`]. Inserts one
+/// `bind_audit_orphan_marker` row per `moderation_event_id` in
+/// `emitted_event_ids`, joining each id back to its committed
+/// `moderation_event` row for the `subject_uri`. `ON CONFLICT
+/// (moderation_event_id) DO NOTHING` keeps the `UNIQUE` constraint
+/// idempotent under retried/duplicate failures.
+///
+/// **Cannot fail the caller** — returns `()`. Internal errors are
+/// logged via `tracing::warn!` and swallowed; the sibling
+/// `tracing::error!` emit (already fired by
+/// [`emit_bind_audit_orphan_marker`]) retains the forensic detail even
+/// when the INSERT can't land. This is the sibling-emit invariant
+/// (§3.5): a marker-INSERT error must never replace the `actor_err` the
+/// caller propagates.
+pub(crate) async fn insert_persistent_orphan_marker(
+    shared_pool: &sqlx::AnyPool,
+    did: &str,
+    actor_err_string: &str,
+    emitted_event_ids: &[i64],
+    now_rfc3339: &str,
+) {
+    // Internal try-block: `?` for early exit on the first sqlx error;
+    // the outer wrapper below catches it.
+    let result: Result<(), sqlx::Error> = async {
+        let mut tx = shared_pool.begin().await?;
+        for event_id in emitted_event_ids {
+            // subject_uri is read as String (NOT Option<String>): the
+            // v0.7 orphan-able emit set unconditionally populates it
+            // (round-1 L2). A future emit type that lands a NULL
+            // subject_uri before the migration lifts NOT NULL would
+            // surface here as sqlx::Error::ColumnDecode — the outer
+            // wrapper catches it, the row doesn't land, the tracing
+            // sibling already fired.
+            let subject_uri: String = sqlx::query_scalar(
+                "SELECT subject_uri FROM moderation_event WHERE id = $1",
+            )
+            .bind(event_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO bind_audit_orphan_marker \
+                 (moderation_event_id, actor_did, subject_uri, actor_commit_error, \
+                  state, created_at, resolved_at, resolution_detail) \
+                 VALUES ($1, $2, $3, $4, 'unresolved', $5, NULL, NULL) \
+                 ON CONFLICT (moderation_event_id) DO NOTHING",
+            )
+            .bind(event_id)
+            .bind(did)
+            .bind(&subject_uri)
+            .bind(actor_err_string)
+            .bind(now_rfc3339)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "aurora_locus::repo_storage",
+            event = "bind_audit_orphan_marker_persistent_insert_failed",
+            did = %did,
+            error = %e,
+            "persistent orphan marker insert failed; tracing emit \
+             retained the forensic detail (sibling-emit invariant). \
+             Operator can grep bind_audit_orphan_marker tracing events \
+             for the missing-marker context."
+        );
+    }
 }
 
 impl RepoStorage for SqliteRepoStorage {

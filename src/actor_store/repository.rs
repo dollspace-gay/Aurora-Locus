@@ -634,6 +634,14 @@ impl RepositoryManager {
         write: &WriteOp,
         shared_tx: Option<&mut sqlx::Transaction<'_, sqlx::Any>>,
         cascade_context: Option<&mut crate::kryphocron::CascadeContext>,
+        // v0.8 arc 1 (#180) — bind_pipeline pushes the emitted
+        // moderation_event.id here so `commit_with_orphan_recovery`
+        // can key a persistent orphan marker off it. Only the
+        // relay-race caller threads the real Vec; the legacy
+        // auto-commit caller passes a throwaway because it gates out
+        // of the bind pipeline (shared_tx is None there) and never
+        // pushes.
+        emitted_event_ids: &mut Vec<i64>,
     ) -> PdsResult<()> {
         // v0.7 arc 1 — Order A dispatcher closed-namespace policy. Per
         // v07_DESIGN.md §6 lines 3236-3305 the kryphocron-prefix check
@@ -691,6 +699,7 @@ impl RepositoryManager {
                     tx,
                     cascade_context,
                     &self.did,
+                    emitted_event_ids,
                 )
                 .await?;
                 return Ok(());
@@ -890,8 +899,24 @@ impl RepositoryManager {
             // construct one and pass it as `Some(&mut ctx)`. Step
             // 5's dedicated endpoints don't construct cascades, so
             // `None` here is correct for arc 2 ship state.
+            //
+            // v0.8 arc 1 (#180) — capture the moderation_event.id of
+            // every audit row emitted onto `shared_tx` during the
+            // bind pipeline. The emit fires here in the validate loop
+            // (validate_write → bind_pipeline → emit_audience_updated_in_tx),
+            // BEFORE `with_lent_txns`, so this plain local is fully
+            // populated by the time `commit_with_orphan_recovery` runs.
+            // If the actor commit fails after `shared_tx` commits, the
+            // persistent orphan marker is keyed off these ids.
+            let mut emitted_event_ids: Vec<i64> = Vec::new();
             for write in &writes {
-                self.validate_write(write, Some(&mut shared_tx), None).await?;
+                self.validate_write(
+                    write,
+                    Some(&mut shared_tx),
+                    None,
+                    &mut emitted_event_ids,
+                )
+                .await?;
             }
 
             // The shared_tx mutable borrow ends with the validate
@@ -1041,11 +1066,17 @@ impl RepositoryManager {
             // step-3.5 addendum: shared tx commits first; on
             // failure the actor tx rolls back. Actor tx commits
             // second; on failure an orphan-marker is emitted
-            // (`tracing::error!`) for the reconciliation sweep.
+            // (`tracing::error!` + persistent row, v0.8 arc 1 #180)
+            // for the reconciliation sweep. `emitted_event_ids`
+            // carries the audit rows committed into `shared_tx`;
+            // `shared_pool` lets the persistent INSERT open its own
+            // short tx after the shared commit consumed `shared_tx`.
             crate::actor_store::repo_storage::commit_with_orphan_recovery(
                 actor_tx_back,
                 shared_tx_back,
                 &self.did,
+                emitted_event_ids,
+                &shared_pool,
             )
             .await?;
 
@@ -1069,7 +1100,10 @@ impl RepositoryManager {
             // plumbs the shared pool, so this is a programmer-error
             // path only).
             for write in &writes {
-                self.validate_write(write, None, None).await?;
+                // Legacy auto-commit path: shared_tx is None, so
+                // validate_write gates out of bind_pipeline and never
+                // pushes — the throwaway Vec stays empty (#180 §3.2).
+                self.validate_write(write, None, None, &mut Vec::new()).await?;
             }
 
             let (prior_record_cids, repo_writes, prepared_owned) =
@@ -2895,7 +2929,7 @@ mod tests {
             // HTTP layer maps to 502.
             let (mgr, _temp, _did) = build_mgr(FetchFailureBehavior::HardFail).await;
             let write = unknown_collection_write();
-            let result = mgr.validate_write(&write, None, None).await;
+            let result = mgr.validate_write(&write, None, None, &mut Vec::new()).await;
             match result {
                 Err(PdsError::LexiconFetchFailed { nsid, failure_class, .. }) => {
                     assert_eq!(nsid, "com.example.thing.foo");
@@ -2921,7 +2955,7 @@ mod tests {
             // is never re-emitted. The new gate must not interfere.
             let (mgr, _temp, _did) = build_mgr(FetchFailureBehavior::Warn).await;
             let write = unknown_collection_write();
-            let result = mgr.validate_write(&write, None, None).await;
+            let result = mgr.validate_write(&write, None, None, &mut Vec::new()).await;
             assert!(
                 result.is_ok(),
                 "validate_write must return Ok under Warn+Optimistic (warn_fallback ordering): {result:?}"
@@ -2993,7 +3027,7 @@ mod tests {
                 ),
             };
 
-            let result = mgr.validate_write(&write, None, None).await;
+            let result = mgr.validate_write(&write, None, None, &mut Vec::new()).await;
             assert!(
                 matches!(
                     result,
@@ -3026,7 +3060,7 @@ mod tests {
                 kryphocron_authorization: None,
             };
 
-            let result = mgr.validate_write(&write, None, None).await;
+            let result = mgr.validate_write(&write, None, None, &mut Vec::new()).await;
             match result {
                 Err(PdsError::KryphocronRecordRequiresDedicatedEndpoint {
                     nsid,
@@ -3068,7 +3102,7 @@ mod tests {
                 kryphocron_authorization: None,
             };
 
-            let result = mgr.validate_write(&write, None, None).await;
+            let result = mgr.validate_write(&write, None, None, &mut Vec::new()).await;
             assert!(
                 matches!(
                     result,
@@ -3096,7 +3130,7 @@ mod tests {
                 kryphocron_authorization: None,
             };
 
-            let result = mgr.validate_write(&write, None, None).await;
+            let result = mgr.validate_write(&write, None, None, &mut Vec::new()).await;
             assert!(
                 matches!(
                     result,

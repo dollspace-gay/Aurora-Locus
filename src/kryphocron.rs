@@ -757,6 +757,11 @@ pub async fn bind_pipeline(
     shared_tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     cascade_context: Option<&mut CascadeContext>,
     did: &str,
+    // v0.8 arc 1 (#180) — when an audit row is emitted onto
+    // `shared_tx`, its `moderation_event.id` is pushed here so the
+    // caller can persist an orphan marker if the paired actor commit
+    // later fails. Empty when this write emits no audit row.
+    emitted_event_ids: &mut Vec<i64>,
 ) -> Result<(), PdsError> {
     // The `tx` parameter is reserved for step 7's audit-emit
     // inserts. Step 4 ships only the routing + tracing framework,
@@ -886,12 +891,18 @@ pub async fn bind_pipeline(
                     cascade_progress: None,
                 };
 
-                crate::kryphocron_audit::emit_audience_updated_in_tx(
+                // v0.8 arc 1 (#180) — capture the new
+                // moderation_event.id so the relay-race caller can
+                // persist a `bind_audit_orphan_marker` row keyed off
+                // it if the paired actor commit fails after this audit
+                // row commits on `shared_tx`.
+                let event_id = crate::kryphocron_audit::emit_audience_updated_in_tx(
                     shared_tx,
                     did,
                     payload,
                 )
                 .await?;
+                emitted_event_ids.push(event_id);
             }
 
             Ok(())
@@ -1222,7 +1233,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        bind_pipeline(&write, &mut tx, None, "did:plc:bp1")
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp1", &mut Vec::new())
             .await
             .expect("DedicatedEndpoint arm must succeed");
 
@@ -1258,7 +1269,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp2")
+        bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp2", &mut Vec::new())
             .await
             .expect("Cascade with valid token must succeed");
 
@@ -1299,7 +1310,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        let result = bind_pipeline(&write, &mut tx, None, "did:plc:bp3").await;
+        let result = bind_pipeline(&write, &mut tx, None, "did:plc:bp3", &mut Vec::new()).await;
         assert!(
             matches!(result, Err(PdsError::KryphocronCascadeTokenInvalid(_))),
             "must reject Cascade with no active context: {result:?}",
@@ -1340,7 +1351,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        let result = bind_pipeline(&write, &mut tx, Some(&mut ctx_b), "did:plc:bp4").await;
+        let result = bind_pipeline(&write, &mut tx, Some(&mut ctx_b), "did:plc:bp4", &mut Vec::new()).await;
         assert!(
             matches!(result, Err(PdsError::KryphocronCascadeTokenInvalid(_))),
             "ctx_b must reject a token minted by ctx_a: {result:?}",
@@ -1371,7 +1382,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        let result = bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp5").await;
+        let result = bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp5", &mut Vec::new()).await;
         assert!(
             matches!(result, Err(PdsError::KryphocronCascadeTokenInvalid(_))),
             "source mismatch must reject: {result:?}",
@@ -1398,7 +1409,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        bind_pipeline(&write, &mut tx, None, "did:plc:bp6")
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp6", &mut Vec::new())
             .await
             .expect("AccountSetup arm must succeed");
 
@@ -1419,7 +1430,7 @@ mod bind_pipeline_tests {
             KryphocronWriteAuthorization::RecoveryBypass { cascade_source: None },
         );
 
-        bind_pipeline(&write, &mut tx, None, "did:plc:bp7")
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp7", &mut Vec::new())
             .await
             .expect("RecoveryBypass arm must succeed");
 
@@ -1440,7 +1451,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        bind_pipeline(&write, &mut tx, None, "did:plc:bp8")
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp8", &mut Vec::new())
             .await
             .expect("SystemCleanup arm must succeed");
 
