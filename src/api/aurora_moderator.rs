@@ -1663,6 +1663,7 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            bind_audit_orphan_marker: Default::default(),
             blob_metadata: Default::default(),
             entryway: None,
             lexicon: crate::config::LexiconConfig::default(),

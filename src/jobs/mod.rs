@@ -7,6 +7,12 @@ use tracing::{error, info, warn};
 
 pub mod tasks;
 
+/// v0.8 arc 1 (#180) — keyset page size for the bind-audit orphan-marker
+/// reconciliation sweep. Matches `GcSweepConfig`'s default page size; the
+/// marker table is bounded by the (rare-by-construction) relay-race
+/// failure rate, so a fixed constant suffices rather than a config knob.
+const BIND_AUDIT_ORPHAN_RECONCILE_PAGE_SIZE: usize = 500;
+
 /// Job execution result with retry support
 #[derive(Debug)]
 pub enum JobResult {
@@ -175,6 +181,22 @@ impl JobScheduler {
             tracing::debug!(
                 "row-sweep job disabled (gc_sweep.row_sweep_enabled = false)"
             );
+        }
+
+        // v0.8 arc 1 (#180): bind-audit orphan-marker reconciliation.
+        // On-by-default (BindAuditOrphanMarkerConfig::enabled, opposite
+        // polarity from gc_sweep) — orphan reconciliation is a
+        // forensic/safety mechanism. Mirrors the conditional-spawn
+        // shape of the GC sweeps above.
+        if self.context.config.bind_audit_orphan_marker.enabled {
+            tokio::spawn(Self::bind_audit_orphan_reconcile_job(Arc::clone(&self)));
+            info!(
+                interval_secs =
+                    self.context.config.bind_audit_orphan_marker.reconcile_interval_secs,
+                "bind-audit orphan reconcile job scheduled (v0.8 arc 1)"
+            );
+        } else {
+            tracing::debug!("bind-audit orphan reconcile job disabled");
         }
 
         info!("Background jobs started");
@@ -442,6 +464,59 @@ impl JobScheduler {
                     );
                 }
                 Err(e) => error!("row-sweep failed: {}", e),
+            }
+        }
+    }
+
+    /// v0.8 arc 1 (#180) — bind-audit orphan-marker reconciliation
+    /// sweep. Mirrors `row_sweep_job`'s shape: `MissedTickBehavior::Skip`
+    /// plus an immediate first tick (no offset = startup pass that
+    /// catches markers left over from a process death between insert and
+    /// sweep), snapshot config per cycle, INFO-log the report, and warn
+    /// on failure then continue (the next cycle re-acquires leftovers).
+    async fn bind_audit_orphan_reconcile_job(scheduler: Arc<Self>) {
+        let interval_secs = scheduler
+            .context
+            .config
+            .bind_audit_orphan_marker
+            .reconcile_interval_secs;
+        let mut interval = interval(Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+
+            let now = chrono::Utc::now();
+            match crate::actor_store::orphan_reconcile::run_reconcile_pass(
+                &scheduler.context.account_db,
+                &scheduler.context.actor_store,
+                BIND_AUDIT_ORPHAN_RECONCILE_PAGE_SIZE,
+                now,
+            )
+            .await
+            {
+                Ok(report) => {
+                    info!(
+                        examined = report.examined,
+                        marked_confirmed_orphan = report.marked_confirmed_orphan,
+                        marked_record_present = report.marked_record_present,
+                        left_unresolved_for_retry = report.left_unresolved_for_retry,
+                        pages_scanned = report.pages_scanned,
+                        duration_seconds = report.duration.as_secs_f64(),
+                        "bind_audit_orphan_reconcile cycle complete"
+                    );
+                }
+                // Best-effort posture (mirrors mod_event_seq_cleanup_job):
+                // a failed run logs at warn-level; the next run picks up
+                // the work.
+                Err(e) => {
+                    tracing::warn!(
+                        target: "aurora_locus::orphan_reconcile",
+                        event = "bind_audit_orphan_reconcile_cycle_failed",
+                        error = %e,
+                        "bind-audit orphan reconcile cycle failed; retrying next cycle"
+                    );
+                }
             }
         }
     }

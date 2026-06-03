@@ -46,6 +46,12 @@ pub struct ServerConfig {
     /// ([`crate::blob_store::gc::run_sweep`]) is the consumer.
     #[serde(default)]
     pub gc_sweep: GcSweepConfig,
+    /// v0.8 arc 1 (#180) — bind-audit orphan-marker reconciliation.
+    /// On by default; the scheduled sweep flips persisted orphan
+    /// markers to their terminal state. Interval env override:
+    /// `PDS_BIND_AUDIT_ORPHAN_RECONCILE_INTERVAL_SECS`.
+    #[serde(default)]
+    pub bind_audit_orphan_marker: BindAuditOrphanMarkerConfig,
     /// Arc 16c §9.3.4 Step 1 — blob lifecycle config.
     /// `stage_ttl_seconds` controls the temp_blob_metadata reaper's
     /// TTL window (product knob: how long a client has to commit
@@ -445,6 +451,75 @@ impl BlobMetadataConfig {
             defaults.stage_ttl_seconds,
         )?;
         Ok(Self { stage_ttl_seconds })
+    }
+}
+
+/// v0.8 arc 1 (#180) — bind-audit orphan-marker reconciliation config.
+///
+/// Drives [`crate::actor_store::orphan_reconcile::run_reconcile_pass`]
+/// via the scheduled `bind_audit_orphan_reconcile_job`. Unlike the
+/// off-by-default `GcSweepConfig`, this is **on by default**: orphan
+/// reconciliation is a forensic/safety mechanism that should run unless
+/// an operator explicitly disables it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindAuditOrphanMarkerConfig {
+    /// If `true` (default), `JobScheduler::start()` spawns the
+    /// reconciliation sweep. The off case logs at `debug` and skips
+    /// the spawn.
+    #[serde(default = "default_bind_audit_orphan_enabled")]
+    pub enabled: bool,
+
+    /// Cadence between sweep cycles, in seconds. Default 300 (5 min),
+    /// matching the `nonce_cleanup_job` / `dpop_jti_replay_reaper_job`
+    /// cadence — operationally responsive for a relay-race-window
+    /// signal, cheap when (usually) empty. Env override:
+    /// `PDS_BIND_AUDIT_ORPHAN_RECONCILE_INTERVAL_SECS`.
+    #[serde(default = "default_bind_audit_orphan_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
+}
+
+impl Default for BindAuditOrphanMarkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_bind_audit_orphan_enabled(),
+            reconcile_interval_secs: default_bind_audit_orphan_reconcile_interval_secs(),
+        }
+    }
+}
+
+/// Default `true` — opposite polarity from `GcSweepConfig`'s historical
+/// off-by-default; orphan reconciliation runs unless opted out.
+fn default_bind_audit_orphan_enabled() -> bool {
+    true
+}
+
+fn default_bind_audit_orphan_reconcile_interval_secs() -> u64 {
+    300
+}
+
+impl BindAuditOrphanMarkerConfig {
+    /// Build from the optional interval env-var override; `enabled`
+    /// comes from config/serde default (no env override per design
+    /// §4.1). Mirrors `BlobMetadataConfig::from_env_values`.
+    pub fn from_env_values(
+        reconcile_interval_secs: Option<String>,
+    ) -> PdsResult<Self> {
+        let defaults = Self::default();
+        let reconcile_interval_secs = parse_u64_env(
+            "PDS_BIND_AUDIT_ORPHAN_RECONCILE_INTERVAL_SECS",
+            reconcile_interval_secs,
+            defaults.reconcile_interval_secs,
+        )?;
+        if reconcile_interval_secs == 0 {
+            return Err(PdsError::Validation(
+                "PDS_BIND_AUDIT_ORPHAN_RECONCILE_INTERVAL_SECS must be greater than 0"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            enabled: defaults.enabled,
+            reconcile_interval_secs,
+        })
     }
 }
 
@@ -1898,6 +1973,11 @@ impl ServerConfig {
             env::var("PDS_BLOB_STAGE_TTL_SECONDS").ok(),
         )?;
 
+        // v0.8 arc 1 (#180): bind-audit orphan-marker reconciliation.
+        let bind_audit_orphan_marker = BindAuditOrphanMarkerConfig::from_env_values(
+            env::var("PDS_BIND_AUDIT_ORPHAN_RECONCILE_INTERVAL_SECS").ok(),
+        )?;
+
         // Arc 17 §17.3 — dynamic lexicon loading. Off-by-default;
         // operators opt in via PDS_LEXICON_ENABLED=true. See
         // [`LexiconConfig`] for every knob.
@@ -2031,6 +2111,7 @@ impl ServerConfig {
             distributed_state_mode,
             maintenance_pool,
             gc_sweep,
+            bind_audit_orphan_marker,
             blob_metadata,
             entryway,
             lexicon,
