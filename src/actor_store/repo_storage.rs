@@ -1118,6 +1118,139 @@ mod step_3_5_tests {
     }
 
     // -----------------------------------------------------------
+    // #8 — v0.8 arc 1 (#180): insert_persistent_orphan_marker
+    //      round-trips. (1) a successful invocation lands exactly one
+    //      marker row with the expected shape; (2) ON CONFLICT DO
+    //      NOTHING keeps it idempotent under a repeat with the same
+    //      moderation_event_id; (3) a closed pool drives the
+    //      warn-fallback (sibling-emit invariant) — the helper returns
+    //      () and emits the warn rather than failing the caller.
+    //
+    //      The shared pool is file-backed (not sqlite::memory:) so the
+    //      helper's own pool.begin() connection sees the schema + seed
+    //      set up here — an in-memory Any pool gives each connection a
+    //      distinct DB.
+    // -----------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn step_3_5_t8_insert_persistent_orphan_marker_round_trips() {
+        use sqlx::Row;
+
+        sqlx::any::install_default_drivers();
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("shared.sqlite");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let shared_pool = AnyPool::connect(&url).await.expect("shared pool");
+
+        // Minimal shared-DB schema the helper touches: it reads
+        // subject_uri from moderation_event and inserts into
+        // bind_audit_orphan_marker (full Arc 1 schema, migration 0013).
+        sqlx::query(
+            "CREATE TABLE moderation_event (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 subject_uri TEXT)",
+        )
+        .execute(&shared_pool)
+        .await
+        .expect("create moderation_event");
+        sqlx::query(
+            "CREATE TABLE bind_audit_orphan_marker (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 moderation_event_id INTEGER NOT NULL, \
+                 actor_did TEXT NOT NULL, \
+                 subject_uri TEXT NOT NULL, \
+                 actor_commit_error TEXT NOT NULL, \
+                 state TEXT NOT NULL DEFAULT 'unresolved', \
+                 created_at TEXT NOT NULL, \
+                 resolved_at TEXT, \
+                 resolution_detail TEXT, \
+                 UNIQUE (moderation_event_id))",
+        )
+        .execute(&shared_pool)
+        .await
+        .expect("create bind_audit_orphan_marker");
+
+        let did = "did:plc:step35t8";
+        let subject_uri = "at://did:plc:step35t8/tools.kryphocron.policy.audience/self";
+        sqlx::query("INSERT INTO moderation_event (subject_uri) VALUES ($1)")
+            .bind(subject_uri)
+            .execute(&shared_pool)
+            .await
+            .expect("seed moderation_event");
+        let event_id: i64 = sqlx::query_scalar("SELECT id FROM moderation_event LIMIT 1")
+            .fetch_one(&shared_pool)
+            .await
+            .expect("read seeded id");
+
+        // (1) Successful round-trip — one row, expected shape.
+        insert_persistent_orphan_marker(
+            &shared_pool,
+            did,
+            "simulated actor commit failure",
+            &[event_id],
+            "2026-06-03T00:00:00+00:00",
+        )
+        .await;
+
+        let row = sqlx::query(
+            "SELECT moderation_event_id, actor_did, subject_uri, \
+                    actor_commit_error, state, created_at \
+             FROM bind_audit_orphan_marker WHERE moderation_event_id = $1",
+        )
+        .bind(event_id)
+        .fetch_one(&shared_pool)
+        .await
+        .expect("marker row present after insert");
+        assert_eq!(row.try_get::<i64, _>("moderation_event_id").unwrap(), event_id);
+        assert_eq!(row.try_get::<String, _>("actor_did").unwrap(), did);
+        assert_eq!(row.try_get::<String, _>("subject_uri").unwrap(), subject_uri);
+        assert_eq!(
+            row.try_get::<String, _>("actor_commit_error").unwrap(),
+            "simulated actor commit failure"
+        );
+        assert_eq!(row.try_get::<String, _>("state").unwrap(), "unresolved");
+        assert_eq!(
+            row.try_get::<String, _>("created_at").unwrap(),
+            "2026-06-03T00:00:00+00:00"
+        );
+
+        // (2) ON CONFLICT DO NOTHING idempotency — a repeat with the
+        //     same event_id leaves exactly one row.
+        insert_persistent_orphan_marker(
+            &shared_pool,
+            did,
+            "second observation of the same failure",
+            &[event_id],
+            "2026-06-03T01:00:00+00:00",
+        )
+        .await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bind_audit_orphan_marker")
+            .fetch_one(&shared_pool)
+            .await
+            .expect("count markers");
+        assert_eq!(count, 1, "ON CONFLICT DO NOTHING must keep a single row");
+
+        // (3) Warn-fallback — close the pool BEFORE invoking (no tx
+        //     outstanding) so begin() returns PoolClosed deterministically.
+        //     Closing while a tx is held would deadlock (step_3_5_t7
+        //     rustdoc). The helper must return () + emit the warn.
+        shared_pool.close().await;
+        insert_persistent_orphan_marker(
+            &shared_pool,
+            did,
+            "pool is closed",
+            &[event_id],
+            "2026-06-03T02:00:00+00:00",
+        )
+        .await;
+        assert!(
+            logs_contain("bind_audit_orphan_marker_persistent_insert_failed"),
+            "closed-pool insert must emit the warn-fallback event \
+             (sibling-emit invariant), not fail the caller",
+        );
+    }
+
+    // -----------------------------------------------------------
     // Phase B fix-up — RepoStorage trait-method lent-tx routing.
     //
     // Arc 2's Phase B Block 2.4 (vanilla bsky baseline write)
