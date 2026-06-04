@@ -192,6 +192,87 @@ pub struct RepositoryManager {
     shared_pool: Option<sqlx::AnyPool>,
 }
 
+// ---------------------------------------------------------------------------
+// v0.8 arc 2 (#183) — write-path recovery mode (`AURORA_RECOVERY_MODE`)
+// ---------------------------------------------------------------------------
+//
+// These three concerns — read the env var, decide whether to synthesize a
+// `RecoveryBypass` authorization, and fire the once-per-process warn-log —
+// are factored into module-private free functions so the synthesis logic
+// (M3) and the once-fire (M5) get deterministic unit coverage without
+// `std::env` manipulation or static-state hazards (the env read is the only
+// env-touching surface; the synthesis decision and the once-fire inner are
+// pure / injected-state). The `validate_write` kryphocron-prefix branch is a
+// thin assembly of them. See docs/internal/design/v08_arc2.md §3.2.
+
+/// Pure parse core for `AURORA_RECOVERY_MODE` — the value, decided.
+///
+/// Mirrors the v0.7 read-path at `aurora_admin.rs` exactly (D5): `"true"`
+/// and `"1"` are on; **everything else** is off — including `"TRUE"`,
+/// `" 1"`, `"true "`, `"True\n"`, `"True"`, `"false"`, `"0"`, `""`, and
+/// `None` (unset). Exact-string match is fail-closed (M3): we do NOT trim
+/// or case-fold, so accidental whitespace/case never enables recovery mode.
+///
+/// Split out from the env read so the full parse-case enumeration (M3 / the
+/// case+whitespace fail-closed variants) is unit-tested **without** mutating
+/// the process environment — set/restore of a global env var would bleed
+/// `AURORA_RECOVERY_MODE` into any concurrently-running `tools.kryphocron.*`
+/// deny test (which `serial_test` cannot serialize against, since those are
+/// not `#[serial]`). Production behavior is unchanged.
+fn recovery_mode_value_is_active(value: Option<&str>) -> bool {
+    matches!(value, Some("true") | Some("1"))
+}
+
+/// Read `AURORA_RECOVERY_MODE` and decide whether recovery mode is active.
+/// Thin env wrapper over the pure [`recovery_mode_value_is_active`] core.
+fn recovery_mode_active_from_env() -> bool {
+    recovery_mode_value_is_active(std::env::var("AURORA_RECOVERY_MODE").ok().as_deref())
+}
+
+/// Pure synthesis decision (M3) — no env read, no static mutation, so it is
+/// unit-tested directly across the full 2×2 of `(authorization, active)`.
+/// Synthesizes `RecoveryBypass { cascade_source: None }` iff the write
+/// carries no authorization AND recovery mode is active; otherwise `None`
+/// (an already-authorized write is never overridden; recovery-off leaves the
+/// deny path unchanged).
+fn resolve_recovery_override(
+    write: &WriteOp,
+    recovery_active: bool,
+) -> Option<crate::kryphocron::KryphocronWriteAuthorization> {
+    if write.kryphocron_authorization.is_none() && recovery_active {
+        Some(crate::kryphocron::KryphocronWriteAuthorization::RecoveryBypass { cascade_source: None })
+    } else {
+        None
+    }
+}
+
+/// Process-wide once-guard for the M5 first-trigger warn-log.
+static RECOVERY_MODE_ACTIVE_LOG_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// M5 first-trigger-per-process warn-log. Production wraps the process-wide
+/// `RECOVERY_MODE_ACTIVE_LOG_ONCE`; the call site gates on
+/// `recovery_override.is_some()` so the log fires **iff** synthesis happened.
+fn log_recovery_mode_active_once(did: &str, nsid: &str) {
+    log_recovery_mode_active_once_inner(&RECOVERY_MODE_ACTIVE_LOG_ONCE, did, nsid);
+}
+
+/// Injected-state inner — unit-tested with a fresh `Once` so the once-fire
+/// is verified deterministically without touching the production static.
+fn log_recovery_mode_active_once_inner(once: &std::sync::Once, did: &str, nsid: &str) {
+    once.call_once(|| {
+        tracing::warn!(
+            target: "aurora_locus::recovery",
+            event = "aurora_recovery_mode_write_active",
+            did = %did,
+            nsid = %nsid,
+            "AURORA_RECOVERY_MODE=true detected on a write path — \
+             synthesizing RecoveryBypass authorization. This warning fires \
+             once per process; subsequent recovery writes are silent. \
+             Forensic trail in moderation_event (event_type=kryphocron_recovery_write).",
+        );
+    });
+}
+
 impl RepositoryManager {
     /// Create a new repository manager for a DID with default validation mode
     pub fn new(did: String, store: ActorStore) -> Self {
@@ -685,7 +766,20 @@ impl RepositoryManager {
             // the manager via `::new()`. In the latter case a
             // `Some(_)` authorization is a programmer error —
             // surface as `KryphocronBindPipelineOutsideScope`.
-            if write.kryphocron_authorization.is_some() {
+            // v0.8 arc 2 (#183) — recovery-mode synthesis. After the
+            // master-switch check above (M4 ordering) and before the arc-1
+            // deny path below: when `AURORA_RECOVERY_MODE` is active and the
+            // write carries no authorization, synthesize a `RecoveryBypass`
+            // and route it through `bind_pipeline` instead of denying (Q3).
+            // The once-log is gated on `recovery_override.is_some()`, so it
+            // fires iff synthesis happens (M5, structural — not a duplicated
+            // env condition).
+            let recovery_override =
+                resolve_recovery_override(write, recovery_mode_active_from_env());
+            if recovery_override.is_some() {
+                log_recovery_mode_active_once(&self.did, &write.collection);
+            }
+            if write.kryphocron_authorization.is_some() || recovery_override.is_some() {
                 let tx = shared_tx.ok_or_else(|| {
                     tracing::warn!(
                         nsid = %write.collection,
@@ -700,6 +794,7 @@ impl RepositoryManager {
                     cascade_context,
                     &self.did,
                     emitted_event_ids,
+                    recovery_override,
                 )
                 .await?;
                 return Ok(());
@@ -3138,6 +3233,112 @@ mod tests {
                 ),
                 "unregistered NSID must still hit the closed-namespace \
                  rejection, got {result:?}",
+            );
+        }
+
+        // -------------------------------------------------------------
+        // v0.8 arc 2 (#183) — recovery-mode helper coverage (§6.4–6.8).
+        // The §3.2 free helpers are module-private; these tests reach
+        // them via `super::super::` (descendant-module visibility).
+        // -------------------------------------------------------------
+
+        fn recovery_test_write(auth: Option<KryphocronWriteAuthorization>) -> WriteOp {
+            WriteOp {
+                action: WriteOpAction::Create,
+                collection: "tools.kryphocron.feed.postPrivate".to_string(),
+                rkey: "abc123".to_string(),
+                value: Some(serde_json::json!({
+                    "$type": "tools.kryphocron.feed.postPrivate",
+                })),
+                validate: None,
+                swap_cid: None,
+                kryphocron_authorization: auth,
+            }
+        }
+
+        /// §6.4 — `resolve_recovery_override` full 2×2 quadrant of the
+        /// `is_none() && recovery_active` guard. Pure: no env, no static.
+        #[test]
+        fn resolve_recovery_override_quadrant() {
+            use super::super::resolve_recovery_override;
+            let no_auth = recovery_test_write(None);
+            let with_auth = recovery_test_write(Some(
+                KryphocronWriteAuthorization::DedicatedEndpoint {
+                    capability_class: CapabilityClass::User,
+                },
+            ));
+
+            // (no_auth, true) → the only synthesis case.
+            assert!(matches!(
+                resolve_recovery_override(&no_auth, true),
+                Some(KryphocronWriteAuthorization::RecoveryBypass { cascade_source: None })
+            ));
+            // (with_auth, true) → None (auth-present blocks override).
+            assert!(resolve_recovery_override(&with_auth, true).is_none());
+            // (no_auth, false) → None (recovery-off blocks override).
+            assert!(resolve_recovery_override(&no_auth, false).is_none());
+            // (with_auth, false) → None (both blockers — quadrant complete).
+            assert!(resolve_recovery_override(&with_auth, false).is_none());
+        }
+
+        /// §6.5 — `recovery_mode_value_is_active` parse cases. Only `"true"`
+        /// and `"1"` are on; everything else (incl. case/whitespace variants
+        /// operators produce by accident) is fail-closed off. Tested on the
+        /// pure parse core so the suite never mutates the process env.
+        #[test]
+        fn recovery_mode_value_is_active_parse_cases() {
+            use super::super::recovery_mode_value_is_active as active;
+            assert!(active(Some("true")));
+            assert!(active(Some("1")));
+            for off in [
+                "false", "0", "", "TRUE", " 1", "true ", "True\n", "True", "yes", "on",
+            ] {
+                assert!(!active(Some(off)), "must be fail-closed off: {off:?}");
+            }
+            assert!(!active(None), "unset must be off");
+        }
+
+        /// §6.6 — `log_recovery_mode_active_once_inner` fires its warn event
+        /// exactly once across repeated calls with the same `Once` (M5). Uses
+        /// an injected fresh `Once`, never the production static.
+        #[test]
+        #[tracing_test::traced_test]
+        fn log_recovery_mode_active_once_inner_fires_once() {
+            use super::super::log_recovery_mode_active_once_inner;
+            let once = std::sync::Once::new();
+            log_recovery_mode_active_once_inner(&once, "did:plc:a", "tools.kryphocron.x");
+            log_recovery_mode_active_once_inner(&once, "did:plc:a", "tools.kryphocron.x");
+            assert!(logs_contain("aurora_recovery_mode_write_active"));
+            logs_assert(|lines: &[&str]| {
+                let n = lines
+                    .iter()
+                    .filter(|l| l.contains("aurora_recovery_mode_write_active"))
+                    .count();
+                if n == 1 {
+                    Ok(())
+                } else {
+                    Err(format!("expected exactly one once-fire, got {n}"))
+                }
+            });
+        }
+
+        /// §6.8 — recovery-mode-OFF end-to-end backstop. With
+        /// `AURORA_RECOVERY_MODE` unset (the default; no test mutates it —
+        /// see `recovery_mode_value_is_active`), a no-auth `tools.kryphocron.*`
+        /// write still hits the arc-1 deny path; the recovery synthesis is a
+        /// no-op. (`resolve_recovery_override(_, false) → None` is unit-covered
+        /// in §6.4; this is the validate_write-level confirmation.)
+        #[tokio::test(flavor = "multi_thread")]
+        async fn recovery_off_no_auth_kryphocron_write_still_denies() {
+            let (mgr, _tmp, _did) = kryphocron_test_mgr();
+            let write = recovery_test_write(None);
+            let result = mgr.validate_write(&write, None, None, &mut Vec::new()).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(PdsError::KryphocronRecordRequiresDedicatedEndpoint { .. })
+                ),
+                "recovery-off: no-auth kryphocron write must still deny, got {result:?}",
             );
         }
     }
