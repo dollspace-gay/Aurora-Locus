@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `bind_audit_orphan_marker` persistent forensic table replacing v0.7's tracing-only orphan emit. State lifecycle (`unresolved → confirmed_orphan | record_present`), `(state, id)` keyset index for sweep pagination, RFC3339 TEXT timestamps for dual-backend compatibility. Migrations 0013 (SQLite) and 0014 (Postgres).
+- `bind_audit_orphan_reconcile` background job — 5-second default tick (env override `PDS_BIND_AUDIT_ORPHAN_RECONCILE_INTERVAL_SECS`), `MissedTickBehavior::Skip`, keyset pagination for cycle bounded-work guarantees. Conditional spawn on `bind_audit_orphan_marker.enabled` (default `true`). Per-cycle structured tracing emits `examined / marked_confirmed_orphan / marked_record_present / left_unresolved_for_retry / pages_scanned / duration_seconds`.
+- `AURORA_DEBUG_FORCE_ACTOR_COMMIT_FAILURE` and `AURORA_DEBUG_FORCE_SHARED_COMMIT_FAILURE` env-var gates for Phase B Scenario 6 verification. Debug-build-only via `#[cfg(debug_assertions)]`; not compiled into release builds. First-trigger warn-log via `aurora_debug_force_actor_commit_failure_active` / `aurora_debug_force_shared_commit_failure_active` events.
+- End-to-end Phase B coverage of the orphan-marker forensic emit — the hardening-cycle deliverable v0.7 deferred. Positive path (gated actor failure → marker landed `unresolved` → sweep transitions to `confirmed_orphan` with `resolution_detail="actor store reports record absent"`) and negative path (gated shared failure → no marker, no audit row — audit-first ordering invariant holds) both verified on SQLite and Postgres.
+
+### Changed
+
+- `validate_write` and `bind_pipeline` thread an `&mut Vec<i64>` for moderation event-id capture into `commit_with_orphan_recovery`, populating the new orphan marker row's `moderation_event_id` foreign-key reference.
+
 ## [0.7.0] - 2026-06-02
 
 ### Added
