@@ -557,8 +557,32 @@ impl AccountManager {
         })
     }
 
-    /// Find account by handle or email (public for password reset)
+    /// Find account by DID, handle, or email (public for password reset).
     pub async fn get_account_by_identifier(&self, identifier: &str) -> PdsResult<ActorAccount> {
+        // v0.8 arc 3 (#184) — DID-form identifier. atproto's createSession
+        // identifier accepts a DID; route it straight to the by-DID lookup
+        // (`get_account`). The `did:` prefix is unambiguous — handles and
+        // emails can never start `did:` (the handle charset rule and the
+        // email `:`-reject forbid it; M4/M5) — so this is DID-lookup-only
+        // with NO handle/email fallback after a miss: a `did:`-prefixed miss
+        // is a real miss.
+        if identifier.starts_with("did:") {
+            let result = self.get_account(identifier).await;
+            if matches!(&result, Err(PdsError::NotFound(_))) {
+                // Forensic anchor — a DID identifier that misses means the
+                // DID genuinely has no local account (vs. a typo'd handle).
+                // debug-level: silent under the default `aurora_locus=info`
+                // filter; visible with RUST_LOG=aurora_locus::auth=debug.
+                tracing::debug!(
+                    target: "aurora_locus::auth",
+                    event = "login_did_identifier_miss",
+                    did = %identifier,
+                    "DID identifier did not resolve to a local account",
+                );
+            }
+            return result;
+        }
+
         // Try handle first
         if let Ok(account) = self.get_account_by_handle(identifier).await {
             return Ok(account);
@@ -3084,6 +3108,96 @@ mod tests {
 
         // No regression: ordinary emails still validate.
         assert!(manager.validate_email("alice@example.com").is_ok());
+    }
+
+    /// v0.8 arc 3 (#184) §6.1/§6.2/§6.3 — the DID-identifier resolver branch.
+    /// Positive: a DID identifier resolves the local account. Negative +
+    /// malformed: a `did:`-prefixed miss is a real miss (no syntax check,
+    /// no handle/email fallback), surfacing `get_account`'s NotFound.
+    #[tokio::test]
+    async fn get_account_by_identifier_routes_did_to_by_did_lookup() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "s8user".to_string(),
+                Some("s8@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // §6.1 positive — DID identifier resolves the account.
+        let by_did = manager
+            .get_account_by_identifier(&account.did)
+            .await
+            .unwrap();
+        assert_eq!(by_did.did, account.did);
+        assert_eq!(by_did.handle, account.handle);
+
+        // §6.2 negative + malformed — all `did:`-prefixed misses are real
+        // misses (prefix-only detection, no syntax validation).
+        for miss in ["did:plc:doesnotexist", "did:", "did:%@!"] {
+            match manager.get_account_by_identifier(miss).await {
+                Err(PdsError::NotFound(msg)) => {
+                    // §6.3 — it is `get_account`'s NotFound ("Account not
+                    // found"), i.e. the DID branch did not fall through to
+                    // the handle/email lookups.
+                    assert_eq!(msg, "Account not found", "miss: {miss}");
+                }
+                other => panic!("expected NotFound for {miss}, got {other:?}"),
+            }
+        }
+    }
+
+    /// v0.8 arc 3 (#184) §6.4 — per-caller DID smoke tripwires. The DID
+    /// identifier must carry through all three callers of
+    /// `get_account_by_identifier` to *past* the resolver (an `Authentication`
+    /// / `Ok`, never a `NotFound`/404) — proving the funnel, not just the
+    /// resolver in isolation.
+    #[tokio::test]
+    async fn did_identifier_funnels_through_all_three_callers() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "s8funnel".to_string(),
+                Some("s8funnel@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // login: DID resolves → password check fails → Authentication
+        // (got past the resolver; did NOT 404).
+        match manager.login(&account.did, "wrong-password").await {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("login(did, wrong): expected Authentication, got {other:?}"),
+        }
+
+        // login_with_app_password: DID resolves → no app password matches →
+        // Authentication (not NotFound).
+        match manager
+            .login_with_app_password(&account.did, "wrong-app-password")
+            .await
+        {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!(
+                "login_with_app_password(did, wrong): expected Authentication, got {other:?}"
+            ),
+        }
+
+        // generate_password_reset_token: DID resolves → account has an email
+        // → Ok (past the resolver).
+        assert!(
+            manager
+                .generate_password_reset_token(&account.did)
+                .await
+                .is_ok(),
+            "generate_password_reset_token(did) must resolve a local account with an email",
+        );
     }
 
     #[tokio::test]
