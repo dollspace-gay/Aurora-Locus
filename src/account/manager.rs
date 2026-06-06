@@ -2276,6 +2276,18 @@ impl AccountManager {
 
     /// Validate email format
     fn validate_email(&self, email: &str) -> PdsResult<()> {
+        // v0.8 arc 3 (#184) — reject ':' in the email. Keeps the login
+        // resolver's DID branch a clean DID-only lookup: a 'did:'-leading
+        // email can no longer be created, so a 'did:'-prefixed login
+        // identifier is unambiguously a DID. General charset rule, not a
+        // did:-special-case (a bare ':' outside a quoted local-part is
+        // non-RFC5321-compliant in any case).
+        if email.contains(':') {
+            return Err(PdsError::Validation(
+                "Email address must not contain ':'".to_string(),
+            ));
+        }
+
         // Basic email validation
         if !email.contains('@') {
             return Err(PdsError::Validation("Invalid email format".to_string()));
@@ -3042,6 +3054,36 @@ mod tests {
         });
 
         AccountManager::new(db, config)
+    }
+
+    /// v0.8 arc 3 (#184) — Gate 1 of the email `:`-reject. A `did:`-leading
+    /// email can no longer be created, so the login resolver's `did:`-prefix
+    /// branch is unambiguously a DID (M4/M5 no-fallback invariant). Asserts
+    /// the charset-specific message fires, fires *before* the `@` check
+    /// (ordering / message uniformity, M-5), and that ordinary emails pass.
+    #[tokio::test]
+    async fn validate_email_rejects_colon_local_part() {
+        let manager = create_test_manager().await;
+
+        match manager.validate_email("did:foo@example.com").unwrap_err() {
+            PdsError::Validation(msg) => {
+                assert_eq!(msg, "Email address must not contain ':'")
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // ':' is rejected before the '@' check: "did:foo" has a ':' and no
+        // '@', and must still surface the charset message (not "Invalid
+        // email format") — proving the guard ordering.
+        match manager.validate_email("did:foo").unwrap_err() {
+            PdsError::Validation(msg) => {
+                assert_eq!(msg, "Email address must not contain ':'")
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // No regression: ordinary emails still validate.
+        assert!(manager.validate_email("alice@example.com").is_ok());
     }
 
     #[tokio::test]

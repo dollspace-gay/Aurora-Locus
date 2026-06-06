@@ -1350,6 +1350,16 @@ async fn update_account_email(
     let canonical_did =
         resolve_account_or_did(&ctx, req.account.as_deref(), req.did.as_deref()).await?;
 
+    // v0.8 arc 3 (#184) — reject ':' in the email (see
+    // AccountManager::validate_email). Separate guard before the existing
+    // check so the charset-specific message fires (M-5).
+    if req.email.contains(':') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Email address must not contain ':'".to_string(),
+        ));
+    }
+
     if !req.email.contains('@') || req.email.len() < 5 {
         return Err((StatusCode::BAD_REQUEST, "Invalid email format".to_string()));
     }
@@ -8585,6 +8595,27 @@ mod tests {
                 .await,
             1
         );
+    }
+
+    /// v0.8 arc 3 (#184) — Gate 3 of the email `:`-reject (admin
+    /// update-email). A `did:`-leading email is rejected with the
+    /// charset-specific message before the existing `@`/length check
+    /// (M-5 message uniformity), matching Gate 1 (`validate_email`) and
+    /// Gate 2 (updateEmail handler).
+    #[tokio::test]
+    async fn update_account_email_rejects_colon_email() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:colontest", "ct.test", Some("a@b.com")).await;
+        let req = UpdateAccountEmailRequest {
+            account: None,
+            did: Some("did:plc:colontest".to_string()),
+            email: "did:foo@example.com".to_string(),
+        };
+        let err = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "Email address must not contain ':'");
     }
 
     // LB-1 / chainlink #128: pin the atomicity invariant for

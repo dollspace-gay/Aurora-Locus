@@ -688,6 +688,15 @@ async fn update_email(
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
+    // v0.8 arc 3 (#184) — reject ':' in the email (see
+    // AccountManager::validate_email). Separate guard before the existing
+    // check so the charset-specific message fires (M-5).
+    if req.email.contains(':') {
+        return Err(crate::error::PdsError::Validation(
+            "Email address must not contain ':'".to_string(),
+        ));
+    }
+
     // Basic email format validation
     if !req.email.contains('@') || req.email.len() < 3 {
         return Err(crate::error::PdsError::Validation(
