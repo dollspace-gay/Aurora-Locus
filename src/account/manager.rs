@@ -372,6 +372,33 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Look up a refresh-token row by its opaque token value and verify it has
+    /// not expired. SIDE-EFFECT-FREE: a single SELECT plus an expiry
+    /// comparison, no mutation. Shared by [`validate_refresh_token`] (the
+    /// delete/identity path) and [`refresh_session`] (the rotate/mint path) so
+    /// the lookup+expiry semantics live in one place (Arc 4 design §3.1, s-2:
+    /// the statement spans manager.rs :384-401 pre-refactor). Returns the row;
+    /// callers read whichever columns they need.
+    async fn lookup_refresh_token_row(&self, token: &str) -> PdsResult<sqlx::any::AnyRow> {
+        let row = sqlx::query(
+            "SELECT id, did, token, created_at, expires_at, used, used_at, next_id FROM refresh_token WHERE token = $1"
+        )
+        .bind(token)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?
+        .ok_or_else(|| PdsError::Authentication("Invalid refresh token".to_string()))?;
+
+        let expires_at: DateTime<Utc> = parse_timestamp(&row.get::<String, _>("expires_at"))?;
+        if Utc::now() > expires_at {
+            return Err(PdsError::Authentication(
+                "Refresh token expired".to_string(),
+            ));
+        }
+
+        Ok(row)
+    }
+
     /// Refresh session tokens with 2-hour grace period
     ///
     /// Implements token rotation with a grace period to handle concurrent refresh requests.
@@ -380,28 +407,15 @@ impl AccountManager {
     pub async fn refresh_session(&self, refresh_token: &str) -> PdsResult<Session> {
         let now = Utc::now();
 
-        // Find and validate refresh token
-        let row = sqlx::query(
-            "SELECT id, did, token, created_at, expires_at, used, used_at, next_id FROM refresh_token WHERE token = $1"
-        )
-        .bind(refresh_token)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(PdsError::Database)?
-        .ok_or_else(|| PdsError::Authentication("Invalid refresh token".to_string()))?;
+        // Find and validate refresh token. Lookup + expiry are shared with
+        // `validate_refresh_token` via `lookup_refresh_token_row` (Arc 4 §3.1);
+        // the used/grace + mint logic below is unchanged (M4 byte-identical).
+        let row = self.lookup_refresh_token_row(refresh_token).await?;
 
         let _token_id: String = row.get("id");
         let did: String = row.get("did");
-        let expires_at: DateTime<Utc> = parse_timestamp(&row.get::<String, _>("expires_at"))?;
         let used: bool = crate::db::read_bool(&row, "used")?;
         let next_id: Option<String> = row.get("next_id");
-
-        // Check expiration
-        if now > expires_at {
-            return Err(PdsError::Authentication(
-                "Refresh token expired".to_string(),
-            ));
-        }
 
         // If token was already used but has a next_id (grace period scenario)
         if used {
@@ -3311,6 +3325,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refresh_count, 1, "Valid refresh token should remain");
+    }
+
+    // ---- Arc 4 (§6) — lookup_refresh_token_row extraction / refresh_session refactor ----
+
+    /// §6 test #5 — refresh_session post-extraction still rotates (M4
+    /// byte-identical at the function level after composing the shared
+    /// `lookup_refresh_token_row` helper). The `validate_refresh_token` path
+    /// and its tests #1–4 land in commit 2 alongside their handler consumer.
+    #[tokio::test]
+    async fn test_refresh_session_post_extraction_rotates() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        // refresh_session composes the extracted lookup helper and still rotates.
+        let refreshed = manager
+            .refresh_session(&session.refresh_token)
+            .await
+            .unwrap();
+        assert_ne!(refreshed.refresh_token, session.refresh_token);
+        assert_ne!(refreshed.access_token, session.access_token);
+        assert_eq!(refreshed.did, account.did);
+
+        // The not-found path still fail-closes through the helper.
+        let missing = manager.refresh_session("no-such-token").await;
+        assert!(matches!(missing, Err(PdsError::Authentication(_))));
     }
 
     #[tokio::test]
