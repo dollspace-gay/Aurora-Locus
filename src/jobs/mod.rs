@@ -158,7 +158,7 @@ impl JobScheduler {
                 "GC sweep job scheduled"
             );
         } else {
-            tracing::debug!("GC sweep job disabled (gc_sweep.enabled = false)");
+            tracing::warn!("GC sweep job disabled (gc_sweep.enabled = false)");
         }
 
         // Arc 16d §9.4.4 Step 3.4: conditional spawn for row-walker.
@@ -178,7 +178,7 @@ impl JobScheduler {
                 "row-sweep job scheduled (Arc 16d)"
             );
         } else {
-            tracing::debug!(
+            tracing::warn!(
                 "row-sweep job disabled (gc_sweep.row_sweep_enabled = false)"
             );
         }
