@@ -361,13 +361,35 @@ impl AccountManager {
         })
     }
 
-    /// Delete a session (logout)
+    /// Delete a session (logout), atomically revoking its refresh token.
+    ///
+    /// Arc 4 Q8 chokepoint (design §3.3 / §9 M5): in one transaction, delete the
+    /// `refresh_token` row the session points at, then delete the session row.
+    /// Complete-by-construction for every caller — logout fully revokes, and no
+    /// token in the chain can mint a new session (the chain's only `used=false`
+    /// token is the deleted head; `refresh_session`'s mint path is gated behind
+    /// `if used`, so it is unreachable chain-wide). Same `sqlx::Any` transaction
+    /// pattern as `deactivate_account_in_tx` / `takedown_account_in_tx`.
     pub async fn delete_session(&self, session_id: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+
+        // Revoke the refresh token bound to this session (subquery reads the
+        // session row, so it must run before the session DELETE below).
+        sqlx::query(
+            "DELETE FROM refresh_token WHERE token IN (SELECT refresh_token FROM session WHERE id = $1)",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdsError::Database)?;
+
         sqlx::query("DELETE FROM session WHERE id = $1")
             .bind(session_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
+
+        tx.commit().await.map_err(PdsError::Database)?;
 
         Ok(())
     }
@@ -399,6 +421,45 @@ impl AccountManager {
         Ok(row)
     }
 
+    /// Validate a refresh token: existence + expiry (refresh_token table), then
+    /// resolve the live session it belongs to (session table). TWO READS, both
+    /// SIDE-EFFECT-FREE (M3) — no rotation, no mint, no mark-used, no delete.
+    /// Composers (`refresh_session` → mint, `delete_session` → delete) own all
+    /// state mutation. Do NOT add mutation here; it would silently re-couple
+    /// validation with rotation/deletion and break composer separation.
+    ///
+    /// Returns `Authentication("refresh token not bound to a live session")`
+    /// for a rotated-out token whose `session.refresh_token` has already moved
+    /// to its successor (Arc 4 design §3.1, prompt 3 — fail-closed).
+    pub async fn validate_refresh_token(
+        &self,
+        token: &str,
+    ) -> PdsResult<crate::account::RefreshTokenIdentity> {
+        // Read 1: refresh_token existence + expiry (shared helper).
+        let row = self.lookup_refresh_token_row(token).await?;
+        let token_id: String = row.get("id");
+        let did: String = row.get("did");
+
+        // Read 2: resolve the live session this token is bound to. `session.refresh_token`
+        // is UNIQUE → at most one row; a rotated-out token finds none.
+        let session_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM session WHERE refresh_token = $1")
+                .bind(token)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
+
+        let session_id = session_id.ok_or_else(|| {
+            PdsError::Authentication("refresh token not bound to a live session".to_string())
+        })?;
+
+        Ok(crate::account::RefreshTokenIdentity {
+            did,
+            session_id,
+            token_id,
+        })
+    }
+
     /// Refresh session tokens with 2-hour grace period
     ///
     /// Implements token rotation with a grace period to handle concurrent refresh requests.
@@ -408,11 +469,13 @@ impl AccountManager {
         let now = Utc::now();
 
         // Find and validate refresh token. Lookup + expiry are shared with
-        // `validate_refresh_token` via `lookup_refresh_token_row` (Arc 4 §3.1);
-        // the used/grace + mint logic below is unchanged (M4 byte-identical).
+        // `validate_refresh_token` via `lookup_refresh_token_row` (Arc 4 §3.1).
+        // The used/grace + mint logic below is otherwise unchanged; the
+        // mark-used UPDATE gains its previously-missing WHERE-id bind (Arc 4
+        // M9 / #191) so rotated tokens actually transition to used=true.
         let row = self.lookup_refresh_token_row(refresh_token).await?;
 
-        let _token_id: String = row.get("id");
+        let token_id: String = row.get("id");
         let did: String = row.get("did");
         let used: bool = crate::db::read_bool(&row, "used")?;
         let next_id: Option<String> = row.get("next_id");
@@ -470,7 +533,9 @@ impl AccountManager {
         .await
         .map_err(PdsError::Database)?;
 
-        // Update old refresh token: mark as used, set next_id, and shorten expiration to 2 hours
+        // Update old refresh token: mark as used, set next_id, and shorten expiration to 2 hours.
+        // Arc 4 M9 / #191: the WHERE-id bind ($4) was missing, so this UPDATE
+        // matched 0 rows and rotated tokens never became used=true. Bind it.
         let grace_period_expires = now + Duration::hours(2);
         sqlx::query(
             "UPDATE refresh_token SET used = TRUE, used_at = $1, next_id = $2, expires_at = $3 WHERE id = $4"
@@ -478,6 +543,7 @@ impl AccountManager {
         .bind(now.to_rfc3339())
         .bind(&new_token_id)
         .bind(grace_period_expires.to_rfc3339())
+        .bind(&token_id)
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -2189,29 +2255,62 @@ impl AccountManager {
         Ok(passwords)
     }
 
-    /// Revoke (delete) an app password
+    /// Revoke (delete) an app password, atomically revoking its refresh tokens.
+    ///
+    /// Arc 4 Q9 (design §3.6 / §9 M8): wraps the previously-non-transactional
+    /// method in a transaction and adds a paired `refresh_token` revoke so
+    /// app-password revocation actually revokes (the app's refresh tokens no
+    /// longer mint via `refresh_session`).
+    ///
+    /// Two load-bearing details. First, ordering: the `refresh_token` subquery
+    /// reads the app-password's `session` rows, so it must run before the
+    /// session DELETE; otherwise it reads zero rows and silently no-ops, leaving
+    /// the orphan. Second, the not-found guard is preserved — when no
+    /// `app_password` row matches, the early-return drops `tx` (rollback; the
+    /// 0-row DELETE was a no-op).
+    ///
+    /// The subquery scopes by `did` + `app_password_name`, so primary-credential
+    /// refresh tokens of the same DID are untouched (`refresh_token` has no
+    /// `app_password_name` column to target directly).
     pub async fn revoke_app_password(&self, did: &str, name: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+
         let result = sqlx::query("DELETE FROM app_password WHERE did = $1 AND name = $2")
             .bind(did)
             .bind(name)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
         if result.rows_affected() == 0 {
+            // `tx` drops here → rollback; the 0-row DELETE above was a no-op.
             return Err(PdsError::NotFound(format!(
                 "App password '{}' not found",
                 name
             )));
         }
 
+        // Revoke the app-password's refresh tokens BEFORE deleting its sessions
+        // (the subquery reads the session rows).
+        sqlx::query(
+            "DELETE FROM refresh_token WHERE token IN \
+             (SELECT refresh_token FROM session WHERE did = $1 AND app_password_name = $2)",
+        )
+        .bind(did)
+        .bind(name)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdsError::Database)?;
+
         // Delete all sessions created with this app password
         sqlx::query("DELETE FROM session WHERE did = $1 AND app_password_name = $2")
             .bind(did)
             .bind(name)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
+
+        tx.commit().await.map_err(PdsError::Database)?;
 
         tracing::info!("Revoked app password '{}' for DID: {}", name, did);
 
@@ -3362,6 +3461,188 @@ mod tests {
         assert!(matches!(missing, Err(PdsError::Authentication(_))));
     }
 
+    // ---- Arc 4 (§6) — validate_refresh_token + deleteSession (Q8) ----
+
+    /// §6 test #1 — validate_refresh_token positive → right {did, session_id, token_id}.
+    #[tokio::test]
+    async fn test_validate_refresh_token_positive() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        let identity = manager
+            .validate_refresh_token(&session.refresh_token)
+            .await
+            .unwrap();
+        assert_eq!(identity.did, account.did);
+        assert_eq!(identity.session_id, session.id);
+        assert!(!identity.token_id.is_empty());
+    }
+
+    /// §6 test #2 — validate_refresh_token expired → Authentication.
+    #[tokio::test]
+    async fn test_validate_refresh_token_expired() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        sqlx::query("UPDATE refresh_token SET expires_at = $1 WHERE token = $2")
+            .bind((Utc::now() - Duration::days(1)).to_rfc3339())
+            .bind(&session.refresh_token)
+            .execute(&manager.db)
+            .await
+            .unwrap();
+
+        let result = manager.validate_refresh_token(&session.refresh_token).await;
+        assert!(matches!(result, Err(PdsError::Authentication(_))));
+    }
+
+    /// §6 test #3 — validate_refresh_token not-found → Authentication. This is
+    /// also the deleteSession-with-an-access-token negative (#9): an access
+    /// token is not a `refresh_token` row, so validation misses → handler 401.
+    #[tokio::test]
+    async fn test_validate_refresh_token_not_found() {
+        let manager = create_test_manager().await;
+        let result = manager.validate_refresh_token("no-such-token").await;
+        assert!(matches!(result, Err(PdsError::Authentication(_))));
+    }
+
+    /// §6 test #4 — validate_refresh_token rotated-out / no-live-session →
+    /// Authentication("refresh token not bound to a live session") (prompt 3).
+    #[tokio::test]
+    async fn test_validate_refresh_token_rotated_out_no_live_session() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        // Delete the session row but leave the (unexpired) refresh_token row:
+        // the lookup succeeds, the session resolve finds nothing → fail-closed.
+        sqlx::query("DELETE FROM session WHERE id = $1")
+            .bind(&session.id)
+            .execute(&manager.db)
+            .await
+            .unwrap();
+
+        match manager.validate_refresh_token(&session.refresh_token).await {
+            Err(PdsError::Authentication(msg)) => {
+                assert!(msg.contains("not bound to a live session"), "got: {msg}");
+            }
+            other => panic!("expected Authentication(no-live-session), got {other:?}"),
+        }
+    }
+
+    /// §6 tests #8/#10/#11 — deleteSession via the validated session id: the
+    /// session row is gone, its access token no longer validates (#10), and its
+    /// refresh token cannot mint (#11 — the Q8 chokepoint revoked the row).
+    #[tokio::test]
+    async fn test_delete_session_revokes_access_and_refresh() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        let identity = manager
+            .validate_refresh_token(&session.refresh_token)
+            .await
+            .unwrap();
+        manager.delete_session(&identity.session_id).await.unwrap();
+
+        // #10 — access token death (session-row lookup miss).
+        assert!(matches!(
+            manager.validate_access_token(&session.access_token).await,
+            Err(PdsError::Authentication(_))
+        ));
+        // #11 — refresh token revoked: cannot mint (Q8 deleted the row).
+        assert!(matches!(
+            manager.refresh_session(&session.refresh_token).await,
+            Err(PdsError::Authentication(_))
+        ));
+        // #8 — the session row is gone.
+        let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE id = $1")
+            .bind(&identity.session_id)
+            .fetch_one(&manager.db)
+            .await
+            .unwrap();
+        assert_eq!(cnt, 0);
+        // The refresh_token row is gone too (chokepoint).
+        let tok: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token WHERE token = $1")
+            .bind(&session.refresh_token)
+            .fetch_one(&manager.db)
+            .await
+            .unwrap();
+        assert_eq!(tok, 0);
+    }
+
+    /// §6 test #12 — rotated-out-chain replay revoked after deleteSession
+    /// (single rotation T1 → T2). Replaying the predecessor T1 hits the grace
+    /// path, whose JOIN to the (now-deleted) successor session is 0 rows →
+    /// fail-closed (addendum-3 Focus F.4).
+    #[tokio::test]
+    async fn test_rotated_out_chain_replay_revoked_after_delete() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let s1 = manager.create_session(&account.did, None).await.unwrap();
+        // Rotate T1 → T2 (mints a new token + session).
+        let s2 = manager.refresh_session(&s1.refresh_token).await.unwrap();
+
+        // Log out of the live (T2) session — Q8 deletes T2's session + token.
+        let identity = manager
+            .validate_refresh_token(&s2.refresh_token)
+            .await
+            .unwrap();
+        manager.delete_session(&identity.session_id).await.unwrap();
+
+        // Replay the predecessor T1: grace path, successor session gone → 401.
+        match manager.refresh_session(&s1.refresh_token).await {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_cleanup_no_expired_sessions() {
         let manager = create_test_manager().await;
@@ -3592,11 +3873,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Create session with app password
-        manager
+        // Create session with app password (capture for the Q9 assertion)
+        let (_, app_session, _) = manager
             .login_with_app_password("testuser", &app_password)
             .await
             .unwrap();
+
+        // Also mint a primary-credential session (no app_password_name) — the
+        // negative control for Q9's subquery scoping (§6 test #13b).
+        let primary_session = manager.create_session(&account.did, None).await.unwrap();
 
         // Verify session exists
         let count: i64 = sqlx::query_scalar(
@@ -3629,6 +3914,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 0);
+
+        // §6 test #13a — the app-password's refresh token is revoked (Q9): it
+        // can no longer mint a session.
+        assert!(
+            matches!(
+                manager.refresh_session(&app_session.refresh_token).await,
+                Err(PdsError::Authentication(_))
+            ),
+            "app-password refresh token must be revoked by Q9"
+        );
+
+        // §6 test #13b — the primary-credential refresh token of the SAME DID
+        // survives (the subquery scopes by app_password_name; no leakage).
+        assert!(
+            manager
+                .refresh_session(&primary_session.refresh_token)
+                .await
+                .is_ok(),
+            "primary-credential refresh token must survive app-password revocation"
+        );
     }
 
     #[tokio::test]

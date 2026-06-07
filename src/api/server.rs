@@ -3,7 +3,7 @@ use crate::{
     account::{
         CreateAccountRequest, CreateAccountResponse, CreateAppPasswordRequest,
         CreateAppPasswordResponse, CreateSessionRequest, ListAppPasswordsResponse,
-        RefreshSessionRequest, RevokeAppPasswordRequest, SessionInfo, SessionResponse,
+        RevokeAppPasswordRequest, SessionInfo, SessionResponse,
     },
     api::middleware,
     auth::AuthContext,
@@ -401,32 +401,68 @@ async fn get_session(
     }))
 }
 
-/// Delete session (logout) endpoint
+/// Forensic debug log for session endpoints that receive no usable refresh
+/// token (Arc 4 Q6, design §3.2/§3.3). Coarse by design — fires on any
+/// no-bearer-token / wrong-token-type request. Production-silent under the
+/// default `aurora_locus=info` filter; visible with
+/// `RUST_LOG=aurora_locus::api::server=debug`.
+fn log_no_valid_refresh_token(endpoint: &str, reason: &str) {
+    tracing::debug!(
+        target: "aurora_locus::api::server",
+        event = "aurora_session_endpoint_no_valid_refresh_token",
+        endpoint,
+        reason,
+    );
+}
+
+/// Delete session (logout) endpoint.
+///
+/// atproto authenticates `deleteSession` with the **refresh** token in
+/// `Authorization: Bearer` (Arc 4 §3.3) — not an access token. The underlying
+/// `delete_session` chokepoint atomically revokes the refresh token (Q8).
 async fn delete_session(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<Json<serde_json::Value>> {
-    // Require authentication
-    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
+    let token = middleware::extract_bearer_token(&headers).ok_or_else(|| {
+        log_no_valid_refresh_token("deleteSession", "no_bearer_token");
+        PdsError::Authentication("Missing or invalid Authorization header".to_string())
+    })?;
 
-    // Delete session
+    let identity = ctx.account_manager.validate_refresh_token(&token).await?;
+
+    // Forensic record of the credential being revoked (production-silent under
+    // the default `aurora_locus=info` filter; visible at debug).
+    tracing::debug!(
+        target: "aurora_locus::api::server",
+        event = "aurora_session_deleted",
+        did = %identity.did,
+        token_id = %identity.token_id,
+        "deleteSession: revoking session and its refresh token",
+    );
+
     ctx.account_manager
-        .delete_session(&validated.session_id)
+        .delete_session(&identity.session_id)
         .await?;
 
     Ok(Json(serde_json::json!({})))
 }
 
-/// Refresh session endpoint
+/// Refresh session endpoint.
+///
+/// atproto authenticates `refreshSession` with the refresh token in
+/// `Authorization: Bearer` (Arc 4 §3.2) — not a JSON body. Downstream
+/// rotate/mint is unchanged (M4).
 async fn refresh_session(
     State(ctx): State<AppContext>,
-    Json(req): Json<RefreshSessionRequest>,
+    headers: HeaderMap,
 ) -> PdsResult<Json<SessionResponse>> {
-    // Refresh session
-    let session = ctx
-        .account_manager
-        .refresh_session(&req.refresh_jwt)
-        .await?;
+    let token = middleware::extract_bearer_token(&headers).ok_or_else(|| {
+        log_no_valid_refresh_token("refreshSession", "no_bearer_token");
+        PdsError::Authentication("Missing or invalid Authorization header".to_string())
+    })?;
+
+    let session = ctx.account_manager.refresh_session(&token).await?;
 
     // Get account info
     let account = ctx.account_manager.get_account(&session.did).await?;

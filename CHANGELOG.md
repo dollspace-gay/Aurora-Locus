@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `validate_write` and `bind_pipeline` thread an `&mut Vec<i64>` for moderation event-id capture into `commit_with_orphan_recovery`, populating the new orphan marker row's `moderation_event_id` foreign-key reference.
 - `bind_pipeline` signature gains `recovery_override: Option<KryphocronWriteAuthorization>` with override-first auth precedence. Production cannot reach the both-`Some` state — synthesis only fires when `write_op.kryphocron_authorization.is_none()` — so the override never masks a real per-write authorization.
+- **atproto wire-shape compliance for session endpoints** (#185). `com.atproto.server.refreshSession` now reads the refresh token from `Authorization: Bearer <jwt>` instead of a JSON body; the legacy `{"refreshJwt": …}` body shape is no longer accepted (HTTP 401). `com.atproto.server.deleteSession` now authenticates with the refresh token from `Authorization: Bearer <jwt>` instead of an access token; access-token auth is no longer accepted (HTTP 401). Logout now atomically revokes the refresh token alongside the session — no replay-mint after logout. `com.atproto.server.revokeAppPassword` extended symmetrically: it now revokes the app password's refresh tokens alongside its sessions, closing a pre-existing orphan. The internal `test_endpoints.sh` harness is updated in the same change. **Breaking change** for any client using the legacy body shape on `refreshSession` or the access-token credential on `deleteSession`. This change also fixes a pre-existing bug where `refreshSession`'s rotation never marked rotated tokens `used` (the mark-used `UPDATE` was missing its `WHERE id` bind, so it matched 0 rows), leaving rotated tokens `used=false` and replayable through the mint path (#191); the "logout fully revokes" guarantee now holds on disk.
+
+### Fixed
+
+- Identifier-login endpoints (createSession, app-password login, requestPasswordReset) now accept DIDs for locally-created accounts (#184). Email addresses may no longer contain ':'.
 
 ## [0.7.0] - 2026-06-02
 
