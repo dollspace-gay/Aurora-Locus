@@ -1,6 +1,6 @@
 /// com.atproto.repo.* endpoints
 use crate::{
-    actor_store::{RepositoryManager, WriteOp},
+    actor_store::{RepositoryManager, WriteOp, WriteOpAction},
     api::{labels::LabelView, middleware},
     context::AppContext,
     error::{PdsError, PdsResult},
@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use proto_blue::common::next_tid;
 use serde::{Deserialize, Serialize};
 
 /// Build repository routes
@@ -183,10 +184,144 @@ struct ApplyWritesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[allow(dead_code)] // TODO: Implement record validation
     validate: Option<bool>,
-    writes: Vec<WriteOp>,
+    writes: Vec<WriteOpInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_commit: Option<String>,
+}
+
+/// A single applyWrites operation as received on the wire (#110, Option A).
+///
+/// Accepts BOTH shapes and normalizes to the internal [`WriteOp`]:
+/// - the atproto-spec `$type`-discriminated shape
+///   (`com.atproto.repo.applyWrites#{create,update,delete}`), which standard
+///   bsky-PDS-shaped clients send, and
+/// - Aurora's legacy flat `{action, collection, rkey, value}` shape, which
+///   existing internal consumers (Phase B cookbooks, admin UI, dev scripts)
+///   send.
+///
+/// `#[serde(untagged)]` tries the discriminated variant first (its `$type` tag
+/// is a strong discriminator); a body lacking `$type` falls through to flat.
+/// Each `writes` entry deserializes independently, so a request that mixes
+/// shapes across entries is accepted — flagged but not policed (no deprecation
+/// planned for either shape).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WriteOpInput {
+    Discriminated(WriteOpDiscriminated),
+    Flat(WriteOpFlat),
+}
+
+/// atproto-spec discriminated applyWrites operation (lexicon shape).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "$type")]
+enum WriteOpDiscriminated {
+    #[serde(rename = "com.atproto.repo.applyWrites#create")]
+    Create {
+        collection: String,
+        #[serde(default)]
+        rkey: Option<String>,
+        value: serde_json::Value,
+    },
+    #[serde(rename = "com.atproto.repo.applyWrites#update")]
+    Update {
+        collection: String,
+        rkey: String,
+        value: serde_json::Value,
+    },
+    #[serde(rename = "com.atproto.repo.applyWrites#delete")]
+    Delete { collection: String, rkey: String },
+}
+
+/// Aurora's legacy flat applyWrites operation.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteOpFlat {
+    action: WriteOpAction,
+    collection: String,
+    #[serde(default)]
+    rkey: Option<String>,
+    #[serde(default)]
+    value: Option<serde_json::Value>,
+    #[serde(default)]
+    validate: Option<bool>,
+    #[serde(default)]
+    swap_cid: Option<String>,
+}
+
+impl WriteOpInput {
+    /// Normalize either wire shape into the canonical internal [`WriteOp`].
+    ///
+    /// `create` with an absent rkey gets a server-generated TID (proto-blue
+    /// `next_tid`), matching the lexicon (`rkey` optional on create) and the
+    /// single-record `createRecord` path. `update`/`delete` require an rkey
+    /// (you cannot target a record without one); a flat update/delete missing
+    /// rkey is rejected rather than silently mis-targeted. `kryphocron_
+    /// authorization` is always `None` here — it is in-process state populated
+    /// at internal call sites, never request-bearable (see `WriteOp`).
+    fn into_write_op(self) -> PdsResult<WriteOp> {
+        match self {
+            WriteOpInput::Discriminated(d) => Ok(match d {
+                WriteOpDiscriminated::Create {
+                    collection,
+                    rkey,
+                    value,
+                } => WriteOp {
+                    action: WriteOpAction::Create,
+                    collection,
+                    rkey: rkey.unwrap_or_else(|| next_tid(None).to_string()),
+                    value: Some(value),
+                    validate: None,
+                    swap_cid: None,
+                    kryphocron_authorization: None,
+                },
+                WriteOpDiscriminated::Update {
+                    collection,
+                    rkey,
+                    value,
+                } => WriteOp {
+                    action: WriteOpAction::Update,
+                    collection,
+                    rkey,
+                    value: Some(value),
+                    validate: None,
+                    swap_cid: None,
+                    kryphocron_authorization: None,
+                },
+                WriteOpDiscriminated::Delete { collection, rkey } => WriteOp {
+                    action: WriteOpAction::Delete,
+                    collection,
+                    rkey,
+                    value: None,
+                    validate: None,
+                    swap_cid: None,
+                    kryphocron_authorization: None,
+                },
+            }),
+            WriteOpInput::Flat(f) => {
+                let rkey = match (f.action, f.rkey) {
+                    // create with no rkey → server-generated TID.
+                    (WriteOpAction::Create, None) => next_tid(None).to_string(),
+                    (_, Some(rkey)) => rkey,
+                    // update/delete must name a record.
+                    (WriteOpAction::Update, None) | (WriteOpAction::Delete, None) => {
+                        return Err(PdsError::Validation(
+                            "applyWrites update/delete requires rkey".to_string(),
+                        ));
+                    }
+                };
+                Ok(WriteOp {
+                    action: f.action,
+                    collection: f.collection,
+                    rkey,
+                    value: f.value,
+                    validate: f.validate,
+                    swap_cid: f.swap_cid,
+                    kryphocron_authorization: None,
+                })
+            }
+        }
+    }
 }
 
 /// Build the proto-blue Signer that the repository manager uses to sign
@@ -753,7 +888,13 @@ async fn apply_writes(
     let repo_mgr = RepositoryManager::for_writer(&ctx, auth_did.to_string());
 
     // Prepare writes (converts to PreparedWrite format)
-    let prepared = repo_mgr.prepare_writes(req.writes)?;
+    // Normalize both accepted wire shapes (#110) into the canonical WriteOp.
+    let writes = req
+        .writes
+        .into_iter()
+        .map(WriteOpInput::into_write_op)
+        .collect::<PdsResult<Vec<WriteOp>>>()?;
+    let prepared = repo_mgr.prepare_writes(writes)?;
 
     tracing::info!(
         "Applying batch of {} operations for {}",
@@ -852,4 +993,72 @@ async fn list_missing_blobs(
         .collect();
 
     Ok(Json(ListMissingBlobsResponse { blobs, cursor }))
+}
+
+#[cfg(test)]
+mod apply_writes_shape_tests {
+    //! #110: applyWrites accepts both the atproto-spec `$type`-discriminated
+    //! shape and Aurora's legacy flat shape; both normalize to `WriteOp`.
+    use super::*;
+
+    fn norm(json: &str) -> WriteOp {
+        serde_json::from_str::<WriteOpInput>(json)
+            .expect("deserialize WriteOpInput")
+            .into_write_op()
+            .expect("normalize to WriteOp")
+    }
+
+    #[test]
+    fn both_shapes_normalize_equivalently() {
+        // create
+        let disc = norm(
+            r#"{"$type":"com.atproto.repo.applyWrites#create","collection":"app.bsky.feed.post","rkey":"rk1","value":{"text":"hi"}}"#,
+        );
+        let flat = norm(
+            r#"{"action":"create","collection":"app.bsky.feed.post","rkey":"rk1","value":{"text":"hi"}}"#,
+        );
+        assert_eq!(disc.action, WriteOpAction::Create);
+        assert_eq!(flat.action, WriteOpAction::Create);
+        assert_eq!(disc.collection, flat.collection);
+        assert_eq!(disc.rkey, "rk1");
+        assert_eq!(disc.rkey, flat.rkey);
+        assert_eq!(disc.value, flat.value);
+
+        // update
+        let disc = norm(
+            r#"{"$type":"com.atproto.repo.applyWrites#update","collection":"c","rkey":"rk2","value":{"a":1}}"#,
+        );
+        let flat = norm(r#"{"action":"update","collection":"c","rkey":"rk2","value":{"a":1}}"#);
+        assert_eq!(disc.action, WriteOpAction::Update);
+        assert_eq!(flat.action, WriteOpAction::Update);
+        assert_eq!(disc.rkey, flat.rkey);
+        assert_eq!(disc.value, flat.value);
+
+        // delete — discriminated #delete has no `value` field at all.
+        let disc =
+            norm(r#"{"$type":"com.atproto.repo.applyWrites#delete","collection":"c","rkey":"rk3"}"#);
+        let flat = norm(r#"{"action":"delete","collection":"c","rkey":"rk3"}"#);
+        assert_eq!(disc.action, WriteOpAction::Delete);
+        assert_eq!(flat.action, WriteOpAction::Delete);
+        assert_eq!(disc.rkey, "rk3");
+        assert_eq!(flat.rkey, "rk3");
+        assert!(disc.value.is_none());
+    }
+
+    #[test]
+    fn create_without_rkey_server_generates_and_update_delete_require_it() {
+        // create with no rkey → server-generated TID (both shapes).
+        let disc = norm(
+            r#"{"$type":"com.atproto.repo.applyWrites#create","collection":"c","value":{"x":1}}"#,
+        );
+        let flat = norm(r#"{"action":"create","collection":"c","value":{"x":1}}"#);
+        assert!(!disc.rkey.is_empty(), "discriminated create rkey server-generated");
+        assert!(!flat.rkey.is_empty(), "flat create rkey server-generated");
+
+        // flat update/delete without rkey is rejected (cannot target a record).
+        let err = serde_json::from_str::<WriteOpInput>(r#"{"action":"delete","collection":"c"}"#)
+            .expect("deserialize")
+            .into_write_op();
+        assert!(err.is_err(), "flat delete without rkey must error");
+    }
 }
