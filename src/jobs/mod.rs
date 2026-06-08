@@ -196,7 +196,7 @@ impl JobScheduler {
                 "bind-audit orphan reconcile job scheduled (v0.8 arc 1)"
             );
         } else {
-            tracing::debug!("bind-audit orphan reconcile job disabled");
+            tracing::warn!("bind-audit orphan reconcile job disabled");
         }
 
         info!("Background jobs started");

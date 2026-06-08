@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - gc_sweep startup log severity raised from debug to warn so operators see "orphan-recovery is off" without filter tuning (#112).
 - migrate_oauth CLI `revoke_all_sessions` now deletes paired refresh_token rows alongside session rows in a single transaction, matching the Q8/Q9 paired-revoke chokepoint pattern from Arc 4 (#190).
 - `restore_account` and the `updateSubjectStatus` reverse-takedown path now emit `AccountEvent{active:true}` to the sequencer/firehose after restore, symmetrizing with the takedown direction's emit. Previously the takedown event landed but the restoration didn't, leaving downstream subscribers (firehose, AppView indexers) in stale-takedown state (#179).
+- Oversized-commit WARN now fires at 25KB threshold in the sequencer commit-event path, giving operators a signal when client write paths produce unusually large commits (#90).
+- Bind-audit reconcile job disabled-startup log raised debug→warn (adjacent to #112's gc_sweep + row_sweep fixes from commit `af05ed1`; same operator-blindness class).
 
 ## [0.7.0] - 2026-06-02
 
