@@ -361,15 +361,103 @@ impl AccountManager {
         })
     }
 
-    /// Delete a session (logout)
+    /// Delete a session (logout), atomically revoking its refresh token.
+    ///
+    /// Arc 4 Q8 chokepoint (design §3.3 / §9 M5): in one transaction, delete the
+    /// `refresh_token` row the session points at, then delete the session row.
+    /// Complete-by-construction for every caller — logout fully revokes, and no
+    /// token in the chain can mint a new session (the chain's only `used=false`
+    /// token is the deleted head; `refresh_session`'s mint path is gated behind
+    /// `if used`, so it is unreachable chain-wide). Same `sqlx::Any` transaction
+    /// pattern as `deactivate_account_in_tx` / `takedown_account_in_tx`.
     pub async fn delete_session(&self, session_id: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+
+        // Revoke the refresh token bound to this session (subquery reads the
+        // session row, so it must run before the session DELETE below).
+        sqlx::query(
+            "DELETE FROM refresh_token WHERE token IN (SELECT refresh_token FROM session WHERE id = $1)",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdsError::Database)?;
+
         sqlx::query("DELETE FROM session WHERE id = $1")
             .bind(session_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
+        tx.commit().await.map_err(PdsError::Database)?;
+
         Ok(())
+    }
+
+    /// Look up a refresh-token row by its opaque token value and verify it has
+    /// not expired. SIDE-EFFECT-FREE: a single SELECT plus an expiry
+    /// comparison, no mutation. Shared by [`validate_refresh_token`] (the
+    /// delete/identity path) and [`refresh_session`] (the rotate/mint path) so
+    /// the lookup+expiry semantics live in one place (Arc 4 design §3.1, s-2:
+    /// the statement spans manager.rs :384-401 pre-refactor). Returns the row;
+    /// callers read whichever columns they need.
+    async fn lookup_refresh_token_row(&self, token: &str) -> PdsResult<sqlx::any::AnyRow> {
+        let row = sqlx::query(
+            "SELECT id, did, token, created_at, expires_at, used, used_at, next_id FROM refresh_token WHERE token = $1"
+        )
+        .bind(token)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?
+        .ok_or_else(|| PdsError::Authentication("Invalid refresh token".to_string()))?;
+
+        let expires_at: DateTime<Utc> = parse_timestamp(&row.get::<String, _>("expires_at"))?;
+        if Utc::now() > expires_at {
+            return Err(PdsError::Authentication(
+                "Refresh token expired".to_string(),
+            ));
+        }
+
+        Ok(row)
+    }
+
+    /// Validate a refresh token: existence + expiry (refresh_token table), then
+    /// resolve the live session it belongs to (session table). TWO READS, both
+    /// SIDE-EFFECT-FREE (M3) — no rotation, no mint, no mark-used, no delete.
+    /// Composers (`refresh_session` → mint, `delete_session` → delete) own all
+    /// state mutation. Do NOT add mutation here; it would silently re-couple
+    /// validation with rotation/deletion and break composer separation.
+    ///
+    /// Returns `Authentication("refresh token not bound to a live session")`
+    /// for a rotated-out token whose `session.refresh_token` has already moved
+    /// to its successor (Arc 4 design §3.1, prompt 3 — fail-closed).
+    pub async fn validate_refresh_token(
+        &self,
+        token: &str,
+    ) -> PdsResult<crate::account::RefreshTokenIdentity> {
+        // Read 1: refresh_token existence + expiry (shared helper).
+        let row = self.lookup_refresh_token_row(token).await?;
+        let token_id: String = row.get("id");
+        let did: String = row.get("did");
+
+        // Read 2: resolve the live session this token is bound to. `session.refresh_token`
+        // is UNIQUE → at most one row; a rotated-out token finds none.
+        let session_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM session WHERE refresh_token = $1")
+                .bind(token)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
+
+        let session_id = session_id.ok_or_else(|| {
+            PdsError::Authentication("refresh token not bound to a live session".to_string())
+        })?;
+
+        Ok(crate::account::RefreshTokenIdentity {
+            did,
+            session_id,
+            token_id,
+        })
     }
 
     /// Refresh session tokens with 2-hour grace period
@@ -380,28 +468,17 @@ impl AccountManager {
     pub async fn refresh_session(&self, refresh_token: &str) -> PdsResult<Session> {
         let now = Utc::now();
 
-        // Find and validate refresh token
-        let row = sqlx::query(
-            "SELECT id, did, token, created_at, expires_at, used, used_at, next_id FROM refresh_token WHERE token = $1"
-        )
-        .bind(refresh_token)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(PdsError::Database)?
-        .ok_or_else(|| PdsError::Authentication("Invalid refresh token".to_string()))?;
+        // Find and validate refresh token. Lookup + expiry are shared with
+        // `validate_refresh_token` via `lookup_refresh_token_row` (Arc 4 §3.1).
+        // The used/grace + mint logic below is otherwise unchanged; the
+        // mark-used UPDATE gains its previously-missing WHERE-id bind (Arc 4
+        // M9 / #191) so rotated tokens actually transition to used=true.
+        let row = self.lookup_refresh_token_row(refresh_token).await?;
 
-        let _token_id: String = row.get("id");
+        let token_id: String = row.get("id");
         let did: String = row.get("did");
-        let expires_at: DateTime<Utc> = parse_timestamp(&row.get::<String, _>("expires_at"))?;
         let used: bool = crate::db::read_bool(&row, "used")?;
         let next_id: Option<String> = row.get("next_id");
-
-        // Check expiration
-        if now > expires_at {
-            return Err(PdsError::Authentication(
-                "Refresh token expired".to_string(),
-            ));
-        }
 
         // If token was already used but has a next_id (grace period scenario)
         if used {
@@ -456,7 +533,9 @@ impl AccountManager {
         .await
         .map_err(PdsError::Database)?;
 
-        // Update old refresh token: mark as used, set next_id, and shorten expiration to 2 hours
+        // Update old refresh token: mark as used, set next_id, and shorten expiration to 2 hours.
+        // Arc 4 M9 / #191: the WHERE-id bind ($4) was missing, so this UPDATE
+        // matched 0 rows and rotated tokens never became used=true. Bind it.
         let grace_period_expires = now + Duration::hours(2);
         sqlx::query(
             "UPDATE refresh_token SET used = TRUE, used_at = $1, next_id = $2, expires_at = $3 WHERE id = $4"
@@ -464,6 +543,7 @@ impl AccountManager {
         .bind(now.to_rfc3339())
         .bind(&new_token_id)
         .bind(grace_period_expires.to_rfc3339())
+        .bind(&token_id)
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -557,8 +637,32 @@ impl AccountManager {
         })
     }
 
-    /// Find account by handle or email (public for password reset)
+    /// Find account by DID, handle, or email (public for password reset).
     pub async fn get_account_by_identifier(&self, identifier: &str) -> PdsResult<ActorAccount> {
+        // v0.8 arc 3 (#184) — DID-form identifier. atproto's createSession
+        // identifier accepts a DID; route it straight to the by-DID lookup
+        // (`get_account`). The `did:` prefix is unambiguous — handles and
+        // emails can never start `did:` (the handle charset rule and the
+        // email `:`-reject forbid it; M4/M5) — so this is DID-lookup-only
+        // with NO handle/email fallback after a miss: a `did:`-prefixed miss
+        // is a real miss.
+        if identifier.starts_with("did:") {
+            let result = self.get_account(identifier).await;
+            if matches!(&result, Err(PdsError::NotFound(_))) {
+                // Forensic anchor — a DID identifier that misses means the
+                // DID genuinely has no local account (vs. a typo'd handle).
+                // debug-level: silent under the default `aurora_locus=info`
+                // filter; visible with RUST_LOG=aurora_locus::auth=debug.
+                tracing::debug!(
+                    target: "aurora_locus::auth",
+                    event = "login_did_identifier_miss",
+                    did = %identifier,
+                    "DID identifier did not resolve to a local account",
+                );
+            }
+            return result;
+        }
+
         // Try handle first
         if let Ok(account) = self.get_account_by_handle(identifier).await {
             return Ok(account);
@@ -2151,29 +2255,62 @@ impl AccountManager {
         Ok(passwords)
     }
 
-    /// Revoke (delete) an app password
+    /// Revoke (delete) an app password, atomically revoking its refresh tokens.
+    ///
+    /// Arc 4 Q9 (design §3.6 / §9 M8): wraps the previously-non-transactional
+    /// method in a transaction and adds a paired `refresh_token` revoke so
+    /// app-password revocation actually revokes (the app's refresh tokens no
+    /// longer mint via `refresh_session`).
+    ///
+    /// Two load-bearing details. First, ordering: the `refresh_token` subquery
+    /// reads the app-password's `session` rows, so it must run before the
+    /// session DELETE; otherwise it reads zero rows and silently no-ops, leaving
+    /// the orphan. Second, the not-found guard is preserved — when no
+    /// `app_password` row matches, the early-return drops `tx` (rollback; the
+    /// 0-row DELETE was a no-op).
+    ///
+    /// The subquery scopes by `did` + `app_password_name`, so primary-credential
+    /// refresh tokens of the same DID are untouched (`refresh_token` has no
+    /// `app_password_name` column to target directly).
     pub async fn revoke_app_password(&self, did: &str, name: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+
         let result = sqlx::query("DELETE FROM app_password WHERE did = $1 AND name = $2")
             .bind(did)
             .bind(name)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
 
         if result.rows_affected() == 0 {
+            // `tx` drops here → rollback; the 0-row DELETE above was a no-op.
             return Err(PdsError::NotFound(format!(
                 "App password '{}' not found",
                 name
             )));
         }
 
+        // Revoke the app-password's refresh tokens BEFORE deleting its sessions
+        // (the subquery reads the session rows).
+        sqlx::query(
+            "DELETE FROM refresh_token WHERE token IN \
+             (SELECT refresh_token FROM session WHERE did = $1 AND app_password_name = $2)",
+        )
+        .bind(did)
+        .bind(name)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdsError::Database)?;
+
         // Delete all sessions created with this app password
         sqlx::query("DELETE FROM session WHERE did = $1 AND app_password_name = $2")
             .bind(did)
             .bind(name)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(PdsError::Database)?;
+
+        tx.commit().await.map_err(PdsError::Database)?;
 
         tracing::info!("Revoked app password '{}' for DID: {}", name, did);
 
@@ -2276,6 +2413,18 @@ impl AccountManager {
 
     /// Validate email format
     fn validate_email(&self, email: &str) -> PdsResult<()> {
+        // v0.8 arc 3 (#184) — reject ':' in the email. Keeps the login
+        // resolver's DID branch a clean DID-only lookup: a 'did:'-leading
+        // email can no longer be created, so a 'did:'-prefixed login
+        // identifier is unambiguously a DID. General charset rule, not a
+        // did:-special-case (a bare ':' outside a quoted local-part is
+        // non-RFC5321-compliant in any case).
+        if email.contains(':') {
+            return Err(PdsError::Validation(
+                "Email address must not contain ':'".to_string(),
+            ));
+        }
+
         // Basic email validation
         if !email.contains('@') {
             return Err(PdsError::Validation("Invalid email format".to_string()));
@@ -3034,6 +3183,7 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            bind_audit_orphan_marker: Default::default(),
             blob_metadata: Default::default(),
             entryway: None,
             lexicon: crate::config::LexiconConfig::default(),
@@ -3041,6 +3191,126 @@ mod tests {
         });
 
         AccountManager::new(db, config)
+    }
+
+    /// v0.8 arc 3 (#184) — Gate 1 of the email `:`-reject. A `did:`-leading
+    /// email can no longer be created, so the login resolver's `did:`-prefix
+    /// branch is unambiguously a DID (M4/M5 no-fallback invariant). Asserts
+    /// the charset-specific message fires, fires *before* the `@` check
+    /// (ordering / message uniformity, M-5), and that ordinary emails pass.
+    #[tokio::test]
+    async fn validate_email_rejects_colon_local_part() {
+        let manager = create_test_manager().await;
+
+        match manager.validate_email("did:foo@example.com").unwrap_err() {
+            PdsError::Validation(msg) => {
+                assert_eq!(msg, "Email address must not contain ':'")
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // ':' is rejected before the '@' check: "did:foo" has a ':' and no
+        // '@', and must still surface the charset message (not "Invalid
+        // email format") — proving the guard ordering.
+        match manager.validate_email("did:foo").unwrap_err() {
+            PdsError::Validation(msg) => {
+                assert_eq!(msg, "Email address must not contain ':'")
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // No regression: ordinary emails still validate.
+        assert!(manager.validate_email("alice@example.com").is_ok());
+    }
+
+    /// v0.8 arc 3 (#184) §6.1/§6.2/§6.3 — the DID-identifier resolver branch.
+    /// Positive: a DID identifier resolves the local account. Negative +
+    /// malformed: a `did:`-prefixed miss is a real miss (no syntax check,
+    /// no handle/email fallback), surfacing `get_account`'s NotFound.
+    #[tokio::test]
+    async fn get_account_by_identifier_routes_did_to_by_did_lookup() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "s8user".to_string(),
+                Some("s8@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // §6.1 positive — DID identifier resolves the account.
+        let by_did = manager
+            .get_account_by_identifier(&account.did)
+            .await
+            .unwrap();
+        assert_eq!(by_did.did, account.did);
+        assert_eq!(by_did.handle, account.handle);
+
+        // §6.2 negative + malformed — all `did:`-prefixed misses are real
+        // misses (prefix-only detection, no syntax validation).
+        for miss in ["did:plc:doesnotexist", "did:", "did:%@!"] {
+            match manager.get_account_by_identifier(miss).await {
+                Err(PdsError::NotFound(msg)) => {
+                    // §6.3 — it is `get_account`'s NotFound ("Account not
+                    // found"), i.e. the DID branch did not fall through to
+                    // the handle/email lookups.
+                    assert_eq!(msg, "Account not found", "miss: {miss}");
+                }
+                other => panic!("expected NotFound for {miss}, got {other:?}"),
+            }
+        }
+    }
+
+    /// v0.8 arc 3 (#184) §6.4 — per-caller DID smoke tripwires. The DID
+    /// identifier must carry through all three callers of
+    /// `get_account_by_identifier` to *past* the resolver (an `Authentication`
+    /// / `Ok`, never a `NotFound`/404) — proving the funnel, not just the
+    /// resolver in isolation.
+    #[tokio::test]
+    async fn did_identifier_funnels_through_all_three_callers() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "s8funnel".to_string(),
+                Some("s8funnel@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // login: DID resolves → password check fails → Authentication
+        // (got past the resolver; did NOT 404).
+        match manager.login(&account.did, "wrong-password").await {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("login(did, wrong): expected Authentication, got {other:?}"),
+        }
+
+        // login_with_app_password: DID resolves → no app password matches →
+        // Authentication (not NotFound).
+        match manager
+            .login_with_app_password(&account.did, "wrong-app-password")
+            .await
+        {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!(
+                "login_with_app_password(did, wrong): expected Authentication, got {other:?}"
+            ),
+        }
+
+        // generate_password_reset_token: DID resolves → account has an email
+        // → Ok (past the resolver).
+        assert!(
+            manager
+                .generate_password_reset_token(&account.did)
+                .await
+                .is_ok(),
+            "generate_password_reset_token(did) must resolve a local account with an email",
+        );
     }
 
     #[tokio::test]
@@ -3154,6 +3424,223 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refresh_count, 1, "Valid refresh token should remain");
+    }
+
+    // ---- Arc 4 (§6) — lookup_refresh_token_row extraction / refresh_session refactor ----
+
+    /// §6 test #5 — refresh_session post-extraction still rotates (M4
+    /// byte-identical at the function level after composing the shared
+    /// `lookup_refresh_token_row` helper). The `validate_refresh_token` path
+    /// and its tests #1–4 land in commit 2 alongside their handler consumer.
+    #[tokio::test]
+    async fn test_refresh_session_post_extraction_rotates() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        // refresh_session composes the extracted lookup helper and still rotates.
+        let refreshed = manager
+            .refresh_session(&session.refresh_token)
+            .await
+            .unwrap();
+        assert_ne!(refreshed.refresh_token, session.refresh_token);
+        assert_ne!(refreshed.access_token, session.access_token);
+        assert_eq!(refreshed.did, account.did);
+
+        // The not-found path still fail-closes through the helper.
+        let missing = manager.refresh_session("no-such-token").await;
+        assert!(matches!(missing, Err(PdsError::Authentication(_))));
+    }
+
+    // ---- Arc 4 (§6) — validate_refresh_token + deleteSession (Q8) ----
+
+    /// §6 test #1 — validate_refresh_token positive → right {did, session_id, token_id}.
+    #[tokio::test]
+    async fn test_validate_refresh_token_positive() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        let identity = manager
+            .validate_refresh_token(&session.refresh_token)
+            .await
+            .unwrap();
+        assert_eq!(identity.did, account.did);
+        assert_eq!(identity.session_id, session.id);
+        assert!(!identity.token_id.is_empty());
+    }
+
+    /// §6 test #2 — validate_refresh_token expired → Authentication.
+    #[tokio::test]
+    async fn test_validate_refresh_token_expired() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        sqlx::query("UPDATE refresh_token SET expires_at = $1 WHERE token = $2")
+            .bind((Utc::now() - Duration::days(1)).to_rfc3339())
+            .bind(&session.refresh_token)
+            .execute(&manager.db)
+            .await
+            .unwrap();
+
+        let result = manager.validate_refresh_token(&session.refresh_token).await;
+        assert!(matches!(result, Err(PdsError::Authentication(_))));
+    }
+
+    /// §6 test #3 — validate_refresh_token not-found → Authentication. This is
+    /// also the deleteSession-with-an-access-token negative (#9): an access
+    /// token is not a `refresh_token` row, so validation misses → handler 401.
+    #[tokio::test]
+    async fn test_validate_refresh_token_not_found() {
+        let manager = create_test_manager().await;
+        let result = manager.validate_refresh_token("no-such-token").await;
+        assert!(matches!(result, Err(PdsError::Authentication(_))));
+    }
+
+    /// §6 test #4 — validate_refresh_token rotated-out / no-live-session →
+    /// Authentication("refresh token not bound to a live session") (prompt 3).
+    #[tokio::test]
+    async fn test_validate_refresh_token_rotated_out_no_live_session() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        // Delete the session row but leave the (unexpired) refresh_token row:
+        // the lookup succeeds, the session resolve finds nothing → fail-closed.
+        sqlx::query("DELETE FROM session WHERE id = $1")
+            .bind(&session.id)
+            .execute(&manager.db)
+            .await
+            .unwrap();
+
+        match manager.validate_refresh_token(&session.refresh_token).await {
+            Err(PdsError::Authentication(msg)) => {
+                assert!(msg.contains("not bound to a live session"), "got: {msg}");
+            }
+            other => panic!("expected Authentication(no-live-session), got {other:?}"),
+        }
+    }
+
+    /// §6 tests #8/#10/#11 — deleteSession via the validated session id: the
+    /// session row is gone, its access token no longer validates (#10), and its
+    /// refresh token cannot mint (#11 — the Q8 chokepoint revoked the row).
+    #[tokio::test]
+    async fn test_delete_session_revokes_access_and_refresh() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        let identity = manager
+            .validate_refresh_token(&session.refresh_token)
+            .await
+            .unwrap();
+        manager.delete_session(&identity.session_id).await.unwrap();
+
+        // #10 — access token death (session-row lookup miss).
+        assert!(matches!(
+            manager.validate_access_token(&session.access_token).await,
+            Err(PdsError::Authentication(_))
+        ));
+        // #11 — refresh token revoked: cannot mint (Q8 deleted the row).
+        assert!(matches!(
+            manager.refresh_session(&session.refresh_token).await,
+            Err(PdsError::Authentication(_))
+        ));
+        // #8 — the session row is gone.
+        let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session WHERE id = $1")
+            .bind(&identity.session_id)
+            .fetch_one(&manager.db)
+            .await
+            .unwrap();
+        assert_eq!(cnt, 0);
+        // The refresh_token row is gone too (chokepoint).
+        let tok: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token WHERE token = $1")
+            .bind(&session.refresh_token)
+            .fetch_one(&manager.db)
+            .await
+            .unwrap();
+        assert_eq!(tok, 0);
+    }
+
+    /// §6 test #12 — rotated-out-chain replay revoked after deleteSession
+    /// (single rotation T1 → T2). Replaying the predecessor T1 hits the grace
+    /// path, whose JOIN to the (now-deleted) successor session is 0 rows →
+    /// fail-closed (addendum-3 Focus F.4).
+    #[tokio::test]
+    async fn test_rotated_out_chain_replay_revoked_after_delete() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "testuser".to_string(),
+                Some("test@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let s1 = manager.create_session(&account.did, None).await.unwrap();
+        // Rotate T1 → T2 (mints a new token + session).
+        let s2 = manager.refresh_session(&s1.refresh_token).await.unwrap();
+
+        // Log out of the live (T2) session — Q8 deletes T2's session + token.
+        let identity = manager
+            .validate_refresh_token(&s2.refresh_token)
+            .await
+            .unwrap();
+        manager.delete_session(&identity.session_id).await.unwrap();
+
+        // Replay the predecessor T1: grace path, successor session gone → 401.
+        match manager.refresh_session(&s1.refresh_token).await {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3386,11 +3873,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Create session with app password
-        manager
+        // Create session with app password (capture for the Q9 assertion)
+        let (_, app_session, _) = manager
             .login_with_app_password("testuser", &app_password)
             .await
             .unwrap();
+
+        // Also mint a primary-credential session (no app_password_name) — the
+        // negative control for Q9's subquery scoping (§6 test #13b).
+        let primary_session = manager.create_session(&account.did, None).await.unwrap();
 
         // Verify session exists
         let count: i64 = sqlx::query_scalar(
@@ -3423,6 +3914,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 0);
+
+        // §6 test #13a — the app-password's refresh token is revoked (Q9): it
+        // can no longer mint a session.
+        assert!(
+            matches!(
+                manager.refresh_session(&app_session.refresh_token).await,
+                Err(PdsError::Authentication(_))
+            ),
+            "app-password refresh token must be revoked by Q9"
+        );
+
+        // §6 test #13b — the primary-credential refresh token of the SAME DID
+        // survives (the subquery scopes by app_password_name; no leakage).
+        assert!(
+            manager
+                .refresh_session(&primary_session.refresh_token)
+                .await
+                .is_ok(),
+            "primary-credential refresh token must survive app-password revocation"
+        );
     }
 
     #[tokio::test]

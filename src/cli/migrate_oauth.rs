@@ -93,13 +93,33 @@ async fn count_user_sessions(ctx: &AppContext, did: &str) -> PdsResult<usize> {
     Ok(count as usize)
 }
 
-/// Revoke all active sessions for a user
+/// Revoke all active sessions for a user.
+///
+/// chainlink #190: deletes the paired `refresh_token` rows alongside the
+/// `session` rows in one transaction, mirroring the Q8/Q9 paired-revoke
+/// chokepoint from Arc 4. The `refresh_token` subquery reads the session rows,
+/// so it must run BEFORE the session DELETE (otherwise it reads zero rows and
+/// silently no-ops, orphaning the refresh tokens). Returns the count of
+/// sessions revoked (unchanged semantics). `$N` placeholders per this file's
+/// cross-backend convention.
 async fn revoke_all_sessions(ctx: &AppContext, did: &str) -> PdsResult<usize> {
-    let result = sqlx::query("DELETE FROM session WHERE did = ?")
+    let mut tx = ctx.account_db.begin().await.map_err(PdsError::Database)?;
+
+    sqlx::query(
+        "DELETE FROM refresh_token WHERE token IN (SELECT refresh_token FROM session WHERE did = $1)",
+    )
+    .bind(did)
+    .execute(&mut *tx)
+    .await
+    .map_err(PdsError::Database)?;
+
+    let result = sqlx::query("DELETE FROM session WHERE did = $1")
         .bind(did)
-        .execute(&ctx.account_db)
+        .execute(&mut *tx)
         .await
         .map_err(PdsError::Database)?;
+
+    tx.commit().await.map_err(PdsError::Database)?;
 
     Ok(result.rows_affected() as usize)
 }

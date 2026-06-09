@@ -5,6 +5,7 @@
 
 pub mod car;
 pub mod models;
+pub mod orphan_reconcile;
 pub mod repo_storage;
 pub mod repository;
 pub mod store;

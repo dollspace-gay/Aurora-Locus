@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.8.0] - 2026-06-08
+
+### Added
+
+- `bind_audit_orphan_marker` persistent forensic table replacing v0.7's tracing-only orphan emit. State lifecycle (`unresolved → confirmed_orphan | record_present`), `(state, id)` keyset index for sweep pagination, RFC3339 TEXT timestamps for dual-backend compatibility. Migrations 0013 (SQLite) and 0014 (Postgres).
+- `bind_audit_orphan_reconcile` background job — 5-second default tick (env override `PDS_BIND_AUDIT_ORPHAN_RECONCILE_INTERVAL_SECS`), `MissedTickBehavior::Skip`, keyset pagination for cycle bounded-work guarantees. Conditional spawn on `bind_audit_orphan_marker.enabled` (default `true`). Per-cycle structured tracing emits `examined / marked_confirmed_orphan / marked_record_present / left_unresolved_for_retry / pages_scanned / duration_seconds`.
+- `AURORA_DEBUG_FORCE_ACTOR_COMMIT_FAILURE` and `AURORA_DEBUG_FORCE_SHARED_COMMIT_FAILURE` env-var gates for Phase B Scenario 6 verification. Debug-build-only via `#[cfg(debug_assertions)]`; not compiled into release builds. First-trigger warn-log via `aurora_debug_force_actor_commit_failure_active` / `aurora_debug_force_shared_commit_failure_active` events.
+- End-to-end Phase B coverage of the orphan-marker forensic emit — the hardening-cycle deliverable v0.7 deferred. Positive path (gated actor failure → marker landed `unresolved` → sweep transitions to `confirmed_orphan` with `resolution_detail="actor store reports record absent"`) and negative path (gated shared failure → no marker, no audit row — audit-first ordering invariant holds) both verified on SQLite and Postgres.
+- Write-path recovery mode (`AURORA_RECOVERY_MODE=true`): `validate_write` now synthesizes a `RecoveryBypass` authorization for unauthorized `tools.kryphocron.*` writes that would otherwise be denied, routing them through `bind_pipeline` with full bypass within the kryphocron-prefix branch (no lexicon validation, no closed-namespace deny, no dedicated-endpoint requirement). Recovery mode does NOT override the kryphocron master switch (`PDS_KRYPHOCRON_ENABLED=false`), authentication, takedowns, or any deny mechanism upstream of that branch.
+- `RecoveryBypass` arm of `bind_pipeline` upgraded from tracing-only to a persistent emit: every recovery write lands a `kryphocron_recovery_write` `moderation_event` row (the v0.7-deferred audit event type now has its production emit site), carrying `{subject_uri, requester_did, nsid, action, cascade_source}`. Queryable via `tools.aurora.moderator.queryEvents`.
+- Recovery writes participate in the `bind_audit_orphan_marker` reconciliation sweep: a recovery write whose paired actor commit fails materializes an orphan marker joining back to the recovery audit row (`moderation_event_id`), swept to `confirmed_orphan` like any other orphan-able emit. Cross-arc invariant upheld — `subject_uri` is always populated (`at://<did>/<collection>/<rkey>`), never NULL.
+- `AURORA_RECOVERY_MODE` parse semantics are fail-closed: only `"true"` and `"1"` enable recovery mode; everything else (`"TRUE"`, `" 1"`, `"true "`, `"True\n"`, `""`, unset, any other value) is OFF. First synthesis per process fires a `aurora_recovery_mode_write_active` warn log once.
+- `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
+
+### Changed
+
+- `validate_write` and `bind_pipeline` thread an `&mut Vec<i64>` for moderation event-id capture into `commit_with_orphan_recovery`, populating the new orphan marker row's `moderation_event_id` foreign-key reference.
+- `bind_pipeline` signature gains `recovery_override: Option<KryphocronWriteAuthorization>` with override-first auth precedence. Production cannot reach the both-`Some` state — synthesis only fires when `write_op.kryphocron_authorization.is_none()` — so the override never masks a real per-write authorization.
+- **atproto wire-shape compliance for session endpoints** (#185). `com.atproto.server.refreshSession` now reads the refresh token from `Authorization: Bearer <jwt>` instead of a JSON body; the legacy `{"refreshJwt": …}` body shape is no longer accepted (HTTP 401). `com.atproto.server.deleteSession` now authenticates with the refresh token from `Authorization: Bearer <jwt>` instead of an access token; access-token auth is no longer accepted (HTTP 401). Logout now atomically revokes the refresh token alongside the session — no replay-mint after logout. `com.atproto.server.revokeAppPassword` extended symmetrically: it now revokes the app password's refresh tokens alongside its sessions, closing a pre-existing orphan. The internal `test_endpoints.sh` harness is updated in the same change. **Breaking change** for any client using the legacy body shape on `refreshSession` or the access-token credential on `deleteSession`. This change also fixes a pre-existing bug where `refreshSession`'s rotation never marked rotated tokens `used` (the mark-used `UPDATE` was missing its `WHERE id` bind, so it matched 0 rows), leaving rotated tokens `used=false` and replayable through the mint path (#191); the "logout fully revokes" guarantee now holds on disk.
+
+### Fixed
+
+- Identifier-login endpoints (createSession, app-password login, requestPasswordReset) now accept DIDs for locally-created accounts (#184). Email addresses may no longer contain ':'.
+- gc_sweep startup log severity raised from debug to warn so operators see "orphan-recovery is off" without filter tuning (#112).
+- migrate_oauth CLI `revoke_all_sessions` now deletes paired refresh_token rows alongside session rows in a single transaction, matching the Q8/Q9 paired-revoke chokepoint pattern from Arc 4 (#190).
+- `restore_account` and the `updateSubjectStatus` reverse-takedown path now emit `AccountEvent{active:true}` to the sequencer/firehose after restore, symmetrizing with the takedown direction's emit. Previously the takedown event landed but the restoration didn't, leaving downstream subscribers (firehose, AppView indexers) in stale-takedown state (#179).
+- Oversized-commit WARN now fires at 25KB threshold in the sequencer commit-event path, giving operators a signal when client write paths produce unusually large commits (#90).
+- Bind-audit reconcile job disabled-startup log raised debug→warn (adjacent to #112's gc_sweep + row_sweep fixes from commit `af05ed1`; same operator-blindness class).
+- applyWrites now accepts both the atproto-spec discriminated `$type`-tagged shape (`com.atproto.repo.applyWrites#{create,update,delete}`) AND the existing flat `{action, collection, rkey, value}` shape via a serde-untagged enum. Standard bsky-PDS-shaped POSTs no longer 422; existing internal consumers using the flat shape continue working. No deprecation planned (#110).
+
 ## [0.7.0] - 2026-06-02
 
 ### Added

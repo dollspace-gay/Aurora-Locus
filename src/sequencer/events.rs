@@ -4,6 +4,14 @@ use proto_blue::lex_data::Cid;
 use proto_blue::repo::{BlockMap, CommitData, blocks_to_car};
 use serde::{Deserialize, Serialize};
 
+/// §8.6.5 oversized-commit observability threshold (chainlink #90). Commits
+/// whose serialized commit block exceeds this size emit a WARN. Typical
+/// commits are sub-KB to low single-digit KB; 25 KiB is clearly atypical
+/// without firing on legitimate large `applyWrites` batches or multi-embed
+/// posts. Pure observability — the commit still processes normally. Tunable
+/// down (15/10 KiB) if production load shows it's too quiet.
+const OVERSIZED_COMMIT_WARN_BYTES: usize = 25 * 1024;
+
 /// Commit event - emitted when repository data changes.
 ///
 /// Arc 14 §7.3.2: `prev_data` is the prior commit's MST root CID
@@ -239,6 +247,20 @@ pub fn sync_evt_data_from_commit(commit_data: &CommitData) -> PdsResult<SyncEvtD
             ))
         })?
         .to_vec();
+
+    // §8.6.5 / chainlink #90: WARN on atypically-large commits (observability
+    // only; the commit still emits normally). Measured before `commit_bytes`
+    // is moved into `minimal` below.
+    if commit_bytes.len() > OVERSIZED_COMMIT_WARN_BYTES {
+        tracing::warn!(
+            size_bytes = commit_bytes.len(),
+            threshold_bytes = OVERSIZED_COMMIT_WARN_BYTES,
+            did = %commit_data.commit.did,
+            commit_cid = %commit_data.commit_cid,
+            "oversized commit"
+        );
+    }
+
     minimal.set(commit_data.commit_cid.clone(), commit_bytes);
 
     let mst_root = commit_data.commit.data.clone();

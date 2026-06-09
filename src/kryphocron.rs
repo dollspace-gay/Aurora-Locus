@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::actor_store::repository::WriteOpAction;
@@ -374,7 +375,19 @@ pub enum KryphocronWriteAuthorization {
 /// the suffix the variants collide semantically with other domain
 /// concepts (e.g., `Block` vs. block-cascade); the clippy lint is
 /// suppressed here for that reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **Infallibility invariant (v0.8 arc 2 / #183).** Every variant
+/// carries forensic identifiers only (at-URI `String`s), and every
+/// variant MUST remain infallibly JSON-serializable — `serde_json::to_value`
+/// must never return `Err` for any `CascadeSource`. The recovery-write
+/// forensic-emit path in `bind_pipeline`'s `RecoveryBypass` arm serializes
+/// `cascade_source` with `.expect("infallible")`; a future variant whose
+/// `Serialize` impl could fail would panic in the audit-emit path rather
+/// than silently corrupt the forensic record. The invariant is
+/// structurally enforced by the compile-forced exhaustive test
+/// `cascade_source_serialize_is_infallible_for_all_variants` (a new
+/// variant without a match arm there fails to compile).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[allow(dead_code, clippy::enum_variant_names)]
 pub enum CascadeSource {
     /// Bsky-side delete cascading to kryphocron companion delete (per
@@ -757,29 +770,47 @@ pub async fn bind_pipeline(
     shared_tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     cascade_context: Option<&mut CascadeContext>,
     did: &str,
+    // v0.8 arc 1 (#180) — when an audit row is emitted onto
+    // `shared_tx`, its `moderation_event.id` is pushed here so the
+    // caller can persist an orphan marker if the paired actor commit
+    // later fails. Empty when this write emits no audit row.
+    emitted_event_ids: &mut Vec<i64>,
+    // v0.8 arc 2 (#183) — when `validate_write` synthesizes a
+    // `RecoveryBypass` under `AURORA_RECOVERY_MODE`, the auth can't be set
+    // on the immutable, non-`Clone` `&WriteOp`, so it's threaded here.
+    // `Some(_)` takes precedence over `write_op.kryphocron_authorization`
+    // (M7); all non-recovery callers pass `None` (behavior-preserving).
+    recovery_override: Option<KryphocronWriteAuthorization>,
 ) -> Result<(), PdsError> {
     // The `tx` parameter is reserved for step 7's audit-emit
     // inserts. Step 4 ships only the routing + tracing framework,
     // so the parameter is silenced here.
     let _ = &shared_tx;
 
-    let auth = write_op
-        .kryphocron_authorization
-        .as_ref()
-        .ok_or_else(|| {
-            // Programmer error: the dispatcher only calls
-            // bind_pipeline when authorization is Some(_).
-            tracing::warn!(
-                target: "aurora_locus::kryphocron",
-                event = "kryphocron_bind_pipeline_denied",
-                did = %did,
-                nsid = %write_op.collection,
-                reason = "no_authorization",
-            );
-            PdsError::Internal(
-                "bind_pipeline invoked without kryphocron_authorization".to_string(),
-            )
-        })?;
+    // v0.8 arc 2 (#183) — `recovery_override` takes precedence (M7). When
+    // present it IS the auth (a synthesized `RecoveryBypass`); otherwise read
+    // the write's own authorization. `KryphocronWriteAuthorization` is
+    // `Debug`-only (non-`Clone`), so both arms yield a borrow via `.as_ref()`.
+    let auth = match recovery_override.as_ref() {
+        Some(a) => a,
+        None => write_op
+            .kryphocron_authorization
+            .as_ref()
+            .ok_or_else(|| {
+                // Programmer error: the dispatcher only calls bind_pipeline
+                // when authorization is Some(_) or a recovery_override is set.
+                tracing::warn!(
+                    target: "aurora_locus::kryphocron",
+                    event = "kryphocron_bind_pipeline_denied",
+                    did = %did,
+                    nsid = %write_op.collection,
+                    reason = "no_authorization",
+                );
+                PdsError::Internal(
+                    "bind_pipeline invoked without kryphocron_authorization".to_string(),
+                )
+            })?,
+    };
 
     match auth {
         KryphocronWriteAuthorization::DedicatedEndpoint { capability_class } => {
@@ -886,12 +917,18 @@ pub async fn bind_pipeline(
                     cascade_progress: None,
                 };
 
-                crate::kryphocron_audit::emit_audience_updated_in_tx(
+                // v0.8 arc 1 (#180) — capture the new
+                // moderation_event.id so the relay-race caller can
+                // persist a `bind_audit_orphan_marker` row keyed off
+                // it if the paired actor commit fails after this audit
+                // row commits on `shared_tx`.
+                let event_id = crate::kryphocron_audit::emit_audience_updated_in_tx(
                     shared_tx,
                     did,
                     payload,
                 )
                 .await?;
+                emitted_event_ids.push(event_id);
             }
 
             Ok(())
@@ -980,15 +1017,46 @@ pub async fn bind_pipeline(
                 variant = "RecoveryBypass",
                 cascade_source = ?cascade_source,
             );
-            // Per v07_DESIGN.md §5 lines 2160-2181: the
-            // RecoveryBypass arm emits the recovery-bypass audit
-            // event (no bind-pipeline run) and returns Ok. R3
-            // deferral applies — no production constructor exists
-            // in arc 2 ship state; the arm is dead code per the
-            // arc 2 recon resolution supplement, kept for
-            // exhaustive match coverage and forward-compat with
-            // the post-arc-2 cycle that wires the real recovery-
-            // mode write path.
+            // v0.8 arc 2 (#183) — emit a persistent `KryphocronRecoveryWrite`
+            // row on the lent `shared_tx` (M1 audit-first ordering) and push
+            // its `moderation_event.id` into `emitted_event_ids` so a paired
+            // actor-commit failure is swept by the arc 1 orphan reconcile
+            // (M2 participation). The bind pipeline proper does NOT run —
+            // recovery mode trusts the operator (Q5 full bypass); the emit IS
+            // the forensic record. Production construction is env-gated in
+            // `validate_write` under `AURORA_RECOVERY_MODE` (Q3).
+            let action = match &write_op.action {
+                WriteOpAction::Create => "create",
+                WriteOpAction::Update => "update",
+                WriteOpAction::Delete => "delete",
+            }
+            .to_string();
+            // cascade_source bridge with an infallibility guard (M8): `.expect`
+            // makes a future fallible-`Serialize` `CascadeSource` variant PANIC
+            // here rather than silently drop forensic data via `.ok()`. Always
+            // `None` in arc 2 ship state; the `Some` branch is forward-compat.
+            let cascade_source_json = cascade_source.as_ref().map(|cs| {
+                serde_json::to_value(cs).expect(
+                    "CascadeSource must be infallibly JSON-serializable; if you \
+                     added a variant with a fallible Serialize, fix it before \
+                     populating cascade_source. See the CascadeSource rustdoc invariant.",
+                )
+            });
+            let payload = crate::kryphocron_audit::RecoveryWritePayload {
+                subject_uri: format!(
+                    "at://{}/{}/{}",
+                    did, write_op.collection, write_op.rkey
+                ),
+                requester_did: did.to_string(),
+                nsid: write_op.collection.clone(),
+                action,
+                cascade_source: cascade_source_json,
+            };
+            let event_id = crate::kryphocron_audit::emit_recovery_write_in_tx(
+                shared_tx, did, &payload,
+            )
+            .await?;
+            emitted_event_ids.push(event_id);
             Ok(())
         }
         KryphocronWriteAuthorization::SystemCleanup { origin } => {
@@ -1183,6 +1251,66 @@ mod bind_pipeline_tests {
             .expect("shared pool")
     }
 
+    /// Shared pool with the `moderation_event` table (migration 0001
+    /// columns) so the `RecoveryBypass` arm's `emit_recovery_write_in_tx`
+    /// INSERT can land. Mirrors the manual-CREATE pattern Arc 1's
+    /// `step_3_5_t8` uses for the bind-audit tables. Pinned to a single
+    /// connection: each `sqlite::memory:` connection is its own database, so
+    /// the CREATE TABLE and the later `begin()` must share one connection.
+    async fn fresh_shared_pool_with_moderation_event() -> AnyPool {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("shared pool");
+        sqlx::query(
+            "CREATE TABLE moderation_event (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 event_type TEXT NOT NULL, \
+                 actor_did TEXT NOT NULL, \
+                 subject_did TEXT, \
+                 subject_uri TEXT, \
+                 subject_cid TEXT, \
+                 details TEXT NOT NULL, \
+                 created_at TEXT NOT NULL, \
+                 meta TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create moderation_event");
+        // insert_moderation_event_in_tx dual-writes mod_event_seq (0006).
+        sqlx::query(
+            "CREATE TABLE mod_event_seq (\
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 moderation_event_id INTEGER NOT NULL, \
+                 actor_did TEXT NOT NULL, \
+                 action TEXT NOT NULL, \
+                 subject_did TEXT, \
+                 subject_uri TEXT, \
+                 subject_cid TEXT, \
+                 detail TEXT, \
+                 created_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create mod_event_seq");
+        pool
+    }
+
+    /// Build a `WriteOp` carrying an explicit `WriteOpAction` (the
+    /// `make_write` helper hardcodes `Create`; the action-mapping test
+    /// needs Update/Delete too).
+    fn make_write_with_action(
+        nsid: &str,
+        action: WriteOpAction,
+        auth: KryphocronWriteAuthorization,
+    ) -> WriteOp {
+        let mut w = make_write(nsid, auth);
+        w.action = action;
+        w
+    }
+
     fn make_write(nsid: &str, auth: KryphocronWriteAuthorization) -> WriteOp {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
@@ -1222,7 +1350,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        bind_pipeline(&write, &mut tx, None, "did:plc:bp1")
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp1", &mut Vec::new(), None)
             .await
             .expect("DedicatedEndpoint arm must succeed");
 
@@ -1258,7 +1386,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp2")
+        bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp2", &mut Vec::new(), None)
             .await
             .expect("Cascade with valid token must succeed");
 
@@ -1299,7 +1427,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        let result = bind_pipeline(&write, &mut tx, None, "did:plc:bp3").await;
+        let result = bind_pipeline(&write, &mut tx, None, "did:plc:bp3", &mut Vec::new(), None).await;
         assert!(
             matches!(result, Err(PdsError::KryphocronCascadeTokenInvalid(_))),
             "must reject Cascade with no active context: {result:?}",
@@ -1340,7 +1468,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        let result = bind_pipeline(&write, &mut tx, Some(&mut ctx_b), "did:plc:bp4").await;
+        let result = bind_pipeline(&write, &mut tx, Some(&mut ctx_b), "did:plc:bp4", &mut Vec::new(), None).await;
         assert!(
             matches!(result, Err(PdsError::KryphocronCascadeTokenInvalid(_))),
             "ctx_b must reject a token minted by ctx_a: {result:?}",
@@ -1371,7 +1499,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        let result = bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp5").await;
+        let result = bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp5", &mut Vec::new(), None).await;
         assert!(
             matches!(result, Err(PdsError::KryphocronCascadeTokenInvalid(_))),
             "source mismatch must reject: {result:?}",
@@ -1398,7 +1526,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        bind_pipeline(&write, &mut tx, None, "did:plc:bp6")
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp6", &mut Vec::new(), None)
             .await
             .expect("AccountSetup arm must succeed");
 
@@ -1409,22 +1537,154 @@ mod bind_pipeline_tests {
     /// RecoveryBypass arm → authorized event, returns Ok. R3-
     /// deferred per arc 2 supplement; arm exists for exhaustive
     /// coverage of the design's authorization surface.
+    ///
+    /// v0.8 arc 2 (#183, §6.1 + §6.9) — extended from "asserts tracing only"
+    /// to also assert the persistent `kryphocron_recovery_write`
+    /// `moderation_event` row lands AND the event id is pushed into
+    /// `emitted_event_ids`. The push assertion is the M2 wiring tripwire: a
+    /// row could land via the INSERT without the push happening, which would
+    /// make the recovery write unsweepable by the arc 1 orphan reconcile.
     #[tokio::test(flavor = "multi_thread")]
     #[tracing_test::traced_test]
     async fn recovery_bypass_emits_authorized() {
-        let pool = fresh_shared_pool().await;
+        use sqlx::Row as _;
+        let pool = fresh_shared_pool_with_moderation_event().await;
         let mut tx = pool.begin().await.expect("begin shared tx");
         let write = make_write(
             "tools.kryphocron.feed.postPrivate",
             KryphocronWriteAuthorization::RecoveryBypass { cascade_source: None },
         );
+        let mut emitted: Vec<i64> = Vec::new();
 
-        bind_pipeline(&write, &mut tx, None, "did:plc:bp7")
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp7", &mut emitted, None)
             .await
             .expect("RecoveryBypass arm must succeed");
 
         assert!(logs_contain("kryphocron_bind_pipeline_authorized"));
         assert!(logs_contain("RecoveryBypass"));
+
+        // Persistent forensic row landed on the lent tx (M1).
+        let row = sqlx::query(
+            "SELECT id, event_type, actor_did, subject_uri FROM moderation_event",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("exactly one moderation_event row");
+        let event_id: i64 = row.try_get("id").expect("id");
+        let event_type: String = row.try_get("event_type").expect("event_type");
+        let actor_did: String = row.try_get("actor_did").expect("actor_did");
+        let subject_uri: String = row.try_get("subject_uri").expect("subject_uri");
+        assert_eq!(event_type, "kryphocron_recovery_write");
+        assert_eq!(actor_did, "did:plc:bp7");
+        assert_eq!(
+            subject_uri,
+            format!("at://did:plc:bp7/tools.kryphocron.feed.postPrivate/{}", write.rkey),
+            "subject_uri = at://<did>/<collection>/<rkey>; non-NULL (cross-arc orphan invariant)",
+        );
+
+        // M2 tripwire — the event id was pushed, not just inserted.
+        assert_eq!(emitted, vec![event_id], "M2: emitted_event_ids must hold the row id");
+    }
+
+    /// v0.8 arc 2 (#183, §6.2) — a `RecoveryBypass` carrying a
+    /// `cascade_source` serializes it into the persisted payload's JSON
+    /// `cascade_source` field. Exercises the `CascadeSource` `Serialize`
+    /// derive end-to-end through the arm. (Forward-compat: production only
+    /// ever constructs `cascade_source: None` in arc 2, M8.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_bypass_serializes_cascade_source() {
+        use sqlx::Row as _;
+        let pool = fresh_shared_pool_with_moderation_event().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let write = make_write(
+            "tools.kryphocron.feed.postPrivate",
+            KryphocronWriteAuthorization::RecoveryBypass {
+                cascade_source: Some(CascadeSource::AudienceDeleteCascade {
+                    audience_uri: "at://did:plc:x/tools.kryphocron.policy.audience/aud".to_string(),
+                }),
+            },
+        );
+        let mut emitted: Vec<i64> = Vec::new();
+
+        bind_pipeline(&write, &mut tx, None, "did:plc:cs", &mut emitted, None)
+            .await
+            .expect("RecoveryBypass arm must succeed");
+
+        let details: String =
+            sqlx::query("SELECT details FROM moderation_event")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("row")
+                .try_get("details")
+                .expect("details");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&details).expect("details is valid JSON");
+        let expected = serde_json::to_value(CascadeSource::AudienceDeleteCascade {
+            audience_uri: "at://did:plc:x/tools.kryphocron.policy.audience/aud".to_string(),
+        })
+        .unwrap();
+        assert_eq!(parsed["cascade_source"], expected);
+    }
+
+    /// v0.8 arc 2 (#183, §6.3) — `WriteOpAction::{Create, Update, Delete}`
+    /// maps to payload `action` `"create" / "update" / "delete"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_bypass_action_mapping() {
+        use sqlx::Row as _;
+        for (op, expected) in [
+            (WriteOpAction::Create, "create"),
+            (WriteOpAction::Update, "update"),
+            (WriteOpAction::Delete, "delete"),
+        ] {
+            let pool = fresh_shared_pool_with_moderation_event().await;
+            let mut tx = pool.begin().await.expect("begin shared tx");
+            let write = make_write_with_action(
+                "tools.kryphocron.feed.postPrivate",
+                op,
+                KryphocronWriteAuthorization::RecoveryBypass { cascade_source: None },
+            );
+            let mut emitted: Vec<i64> = Vec::new();
+            bind_pipeline(&write, &mut tx, None, "did:plc:act", &mut emitted, None)
+                .await
+                .expect("RecoveryBypass arm must succeed");
+            let details: String = sqlx::query("SELECT details FROM moderation_event")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("row")
+                .try_get("details")
+                .expect("details");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&details).expect("valid JSON");
+            assert_eq!(parsed["action"], expected, "action map for {op:?}");
+        }
+    }
+
+    /// v0.8 arc 2 (#183, §6.7 / LB3 layer 2) — every shipping `CascadeSource`
+    /// variant is infallibly JSON-serializable, AND the exhaustive `match`
+    /// (no `_` arm) compile-forces a future variant into this coverage: a new
+    /// `CascadeSource` variant without an arm here fails to compile, which is
+    /// the structural enforcement of the §3.1 rustdoc infallibility invariant
+    /// the arm's `.expect()` relies on.
+    #[test]
+    fn cascade_source_serialize_is_infallible_for_all_variants() {
+        fn assert_infallible(cs: &CascadeSource) {
+            serde_json::to_value(cs)
+                .expect("CascadeSource must be infallibly JSON-serializable; see rustdoc invariant");
+        }
+        let variants = vec![
+            CascadeSource::BskyDeleteCascade { bsky_uri: "at://test/x/y".into() },
+            CascadeSource::BlockCascade { block_uri: "at://test/x/y".into() },
+            CascadeSource::ThreadgateCascade { post_uri: "at://test/x/y".into() },
+            CascadeSource::AudienceDeleteCascade { audience_uri: "at://test/x/y".into() },
+        ];
+        for v in &variants {
+            match v {
+                CascadeSource::BskyDeleteCascade { .. }
+                | CascadeSource::BlockCascade { .. }
+                | CascadeSource::ThreadgateCascade { .. }
+                | CascadeSource::AudienceDeleteCascade { .. } => assert_infallible(v),
+            }
+        }
     }
 
     /// SystemCleanup arm → authorized event, returns Ok.
@@ -1440,7 +1700,7 @@ mod bind_pipeline_tests {
             },
         );
 
-        bind_pipeline(&write, &mut tx, None, "did:plc:bp8")
+        bind_pipeline(&write, &mut tx, None, "did:plc:bp8", &mut Vec::new(), None)
             .await
             .expect("SystemCleanup arm must succeed");
 

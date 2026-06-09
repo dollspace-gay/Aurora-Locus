@@ -1350,6 +1350,16 @@ async fn update_account_email(
     let canonical_did =
         resolve_account_or_did(&ctx, req.account.as_deref(), req.did.as_deref()).await?;
 
+    // v0.8 arc 3 (#184) — reject ':' in the email (see
+    // AccountManager::validate_email). Separate guard before the existing
+    // check so the charset-specific message fires (M-5).
+    if req.email.contains(':') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Email address must not contain ':'".to_string(),
+        ));
+    }
+
     if !req.email.contains('@') || req.email.len() < 5 {
         return Err((StatusCode::BAD_REQUEST, "Invalid email format".to_string()));
     }
@@ -1979,7 +1989,7 @@ async fn takedown_account(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Arc 15 §8.3.6: emit Takendown #account event (Pattern B).
-    // Reverse-takedown deferred to v0.6+ per §8.1.2.
+    // Reverse-takedown deferred to a future cycle per §8.1.2.
     let acc_post = ctx
         .account_manager
         .get_account(&req.did)
@@ -2144,6 +2154,26 @@ async fn restore_account(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // chainlink #179: emit #account (active=true) after restore, symmetrizing
+    // with the takedown direction's emit. Runs post-commit on the durable
+    // post-restore row state (Pattern B). restore_account only succeeds on a
+    // real moderation reversal (reverse_action_in_tx errors NotFound otherwise),
+    // so there is no spurious emit on a no-op restore.
+    let acc_post = ctx
+        .account_manager
+        .get_account(&req.did)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let (active, status) = crate::api::sync_helpers::get_account_status(&acc_post);
+    ctx.sequencer
+        .sequence_account(crate::sequencer::events::AccountEvent {
+            did: req.did.clone(),
+            active,
+            status,
+        })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -3946,10 +3976,32 @@ async fn update_subject_status(
                         );
                     }
                 }
+            } else {
+                // chainlink #179: reverse-takedown (takedown.applied = false)
+                // now emits #account (active=true post-restore), symmetrizing
+                // with the takedown-apply emit above. Previously a §8.1.2 v0.5
+                // deferral that left downstream subscribers in stale-takedown
+                // state after a restore.
+                if let Some(ref acc_post) = acc_post_opt {
+                    let (active, status) =
+                        crate::api::sync_helpers::get_account_status(acc_post);
+                    if let Err(e) = ctx
+                        .sequencer
+                        .sequence_account(crate::sequencer::events::AccountEvent {
+                            did: did.clone(),
+                            active,
+                            status,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "updateSubjectStatus: reverse-takedown emit failed (state mutated OK)"
+                        );
+                    }
+                }
             }
-            // else: takedown.applied = false → reverse-takedown,
-            // §8.1.2 v0.5 deferral; no #account emit fires.
-            // v0.6 work tracked separately.
         }
 
         // Deactivate / reactivate path.
@@ -6634,6 +6686,7 @@ mod tests {
             distributed_state_mode: Default::default(),
             maintenance_pool: Default::default(),
             gc_sweep: Default::default(),
+            bind_audit_orphan_marker: Default::default(),
             blob_metadata: Default::default(),
             entryway: None,
             lexicon: crate::config::LexiconConfig::default(),
@@ -7792,7 +7845,7 @@ mod tests {
             r#"},"#,
             // ---- implementation, version (literals) ----
             r#""implementation":"aurora-locus","#,
-            r#""version":"0.7.0""#,
+            r#""version":"0.8.0""#,
             r#"}"#,
         );
         assert_eq!(
@@ -7857,7 +7910,7 @@ mod tests {
         // version comes from CARGO_PKG_VERSION; pinned to the
         // current cycle release per CR-4 / chainlink #117. Bump in
         // lockstep with Cargo.toml when the cycle increments.
-        assert_eq!(resp.version, "0.7.0");
+        assert_eq!(resp.version, "0.8.0");
 
         // Families object must include the four Aurora namespaces, each
         // a JSON array (possibly empty for namespaces that haven't
@@ -8587,6 +8640,27 @@ mod tests {
         );
     }
 
+    /// v0.8 arc 3 (#184) — Gate 3 of the email `:`-reject (admin
+    /// update-email). A `did:`-leading email is rejected with the
+    /// charset-specific message before the existing `@`/length check
+    /// (M-5 message uniformity), matching Gate 1 (`validate_email`) and
+    /// Gate 2 (updateEmail handler).
+    #[tokio::test]
+    async fn update_account_email_rejects_colon_email() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:colontest", "ct.test", Some("a@b.com")).await;
+        let req = UpdateAccountEmailRequest {
+            account: None,
+            did: Some("did:plc:colontest".to_string()),
+            email: "did:foo@example.com".to_string(),
+        };
+        let err = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "Email address must not contain ':'");
+    }
+
     // LB-1 / chainlink #128: pin the atomicity invariant for
     // update_account_email. The handler runs the email UPDATE and
     // the chain append in one transaction; if anything inside the
@@ -9102,6 +9176,76 @@ mod tests {
         assert!(!td.applied);
         assert!(td.ref_field.is_none());
         assert!(account_takedown_ref(&ctx, "did:plc:revived").await.is_none());
+    }
+
+    /// chainlink #179: the reverse-takedown path of updateSubjectStatus
+    /// (takedown.applied = false) must emit an `#account` event so downstream
+    /// subscribers see the restore, symmetrizing with the takedown-apply emit.
+    /// Previously the §8.1.2 v0.5 deferral left no emit on restore.
+    #[tokio::test]
+    async fn test_update_subject_status_reverse_takedown_emits_account_event() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:revrestore", "revrestore.test", None).await;
+
+        // Take the account down via updateSubjectStatus (emits one #account).
+        let takedown_req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::RepoRef {
+                did: "did:plc:revrestore".to_string(),
+            },
+            takedown: Some(StatusAttr {
+                applied: true,
+                ref_field: Some("t-1".to_string()),
+            }),
+            deactivated: None,
+            legacy_record_uri_used: false,
+        };
+        let _ = update_subject_status(
+            State(ctx.clone()),
+            admin_test_auth(),
+            crate::api::extractors::AuroraJson(takedown_req),
+        )
+        .await
+        .unwrap();
+
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repo_seq WHERE event_type = 'account' AND invalidated = 0",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+
+        // Reverse-takedown via updateSubjectStatus (applied = false).
+        let restore_req = UpdateSubjectStatusRequest {
+            subject: SubjectUnion::RepoRef {
+                did: "did:plc:revrestore".to_string(),
+            },
+            takedown: Some(StatusAttr {
+                applied: false,
+                ref_field: None,
+            }),
+            deactivated: None,
+            legacy_record_uri_used: false,
+        };
+        let _ = update_subject_status(
+            State(ctx.clone()),
+            admin_test_auth(),
+            crate::api::extractors::AuroraJson(restore_req),
+        )
+        .await
+        .unwrap();
+
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repo_seq WHERE event_type = 'account' AND invalidated = 0",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            after,
+            before + 1,
+            "reverse-takedown must emit exactly one #account event (chainlink #179)"
+        );
     }
 
     #[tokio::test]

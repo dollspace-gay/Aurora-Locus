@@ -381,6 +381,43 @@ pub async fn emit_audience_check_denied_in_tx(
     Ok(event_id)
 }
 
+/// Emit a `KryphocronRecoveryWrite` row on the supplied tx (v0.8 arc 2 /
+/// #183). Called by `bind_pipeline`'s `RecoveryBypass` arm when a
+/// `tools.kryphocron.*` write lands via the generic path under
+/// `AURORA_RECOVERY_MODE=true`. Mirrors `emit_audience_updated_in_tx`:
+/// the row commits on the lent `shared_tx` (audit-first relay-race
+/// ordering), and the returned `moderation_event.id` is pushed into the
+/// caller's `emitted_event_ids` so a paired actor-commit failure is swept
+/// by the arc 1 orphan-marker reconcile (M2 participation).
+///
+/// `subject_uri` is unconditionally populated from `payload.subject_uri`
+/// (the `at://<did>/<collection>/<rkey>` of the recovery write) — this
+/// upholds the cross-arc `bind_audit_orphan_marker.subject_uri NOT NULL`
+/// invariant that arc 1 anchored for the first orphan-able emit type.
+pub async fn emit_recovery_write_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    actor_did: &str,
+    payload: &RecoveryWritePayload,
+) -> PdsResult<i64> {
+    let details = serde_json::to_string(payload)
+        .map_err(|e| crate::error::PdsError::Internal(e.to_string()))?;
+    let created_at = Utc::now().to_rfc3339();
+    let event_id = insert_moderation_event_in_tx(
+        tx,
+        ModerationEventType::KryphocronRecoveryWrite.as_str(),
+        actor_did,
+        Some(actor_did), // owner-as-subject (recovery writes are self-authored)
+        Some(&payload.subject_uri),
+        None, // subject_cid
+        &details,
+        &created_at,
+        None, // meta_json
+    )
+    .await
+    .map_err(crate::error::PdsError::Database)?;
+    Ok(event_id)
+}
+
 /// Synthesize a trace ID for host-emitted events (categories B
 /// and C). Substrate-emitted events (category A) carry their own
 /// trace_id; this helper applies only to host-side events that

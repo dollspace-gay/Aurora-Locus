@@ -300,7 +300,38 @@ pub(crate) async fn commit_with_orphan_recovery(
     actor_tx: sqlx::Transaction<'static, sqlx::Sqlite>,
     shared_tx: sqlx::Transaction<'static, sqlx::Any>,
     did: &str,
+    // v0.8 arc 1 (#180) — moderation_event.id(s) committed onto
+    // `shared_tx` during the bind pipeline. Empty unless an audit row
+    // was emitted. Keys the persistent orphan marker on the
+    // actor-commit-failure path.
+    emitted_event_ids: Vec<i64>,
+    // v0.8 arc 1 (#180) — the orphan-marker INSERT must run AFTER
+    // `shared_tx.commit()` consumes `shared_tx`, so it opens its own
+    // short tx on this pool.
+    shared_pool: &sqlx::AnyPool,
 ) -> Result<(), PdsError> {
+    // v0.8 arc 1 (#180) debug injection — force the shared-commit
+    // failure (clean-failure path) before either side commits. Gated
+    // to debug builds (inert in release); Phase B Scenario 6 Block 6.3
+    // drives this. Observable end state matches a real shared-commit
+    // failure: neither side committed, no audit row, no orphan marker.
+    if debug_force_shared_commit_failure(did) {
+        let _ = shared_tx.rollback().await;
+        if let Err(rb_err) = actor_tx.rollback().await {
+            tracing::warn!(
+                target: "aurora_locus::repo_storage",
+                event = "actor_tx_rollback_failed_after_shared_commit_failure",
+                did = %did,
+                rollback_error = %rb_err,
+                "actor tx rollback failed after debug-forced shared-commit failure",
+            );
+        }
+        return Err(PdsError::Database(sqlx::Error::Protocol(
+            "AURORA_DEBUG_FORCE_SHARED_COMMIT_FAILURE (debug-build test affordance)"
+                .to_string(),
+        )));
+    }
+
     // Step 1: shared tx (audit emit) first.
     if let Err(shared_err) = shared_tx.commit().await {
         // Roll back the actor tx — record commit must not land
@@ -321,13 +352,193 @@ pub(crate) async fn commit_with_orphan_recovery(
         return Err(PdsError::Database(shared_err));
     }
 
+    // v0.8 arc 1 (#180) debug injection — force the actor-commit
+    // failure AFTER the shared commit succeeded (the orphan path).
+    // Gated to debug builds (inert in release); Phase B Scenario 6
+    // Blocks 6.1/6.2 drive this. The shared audit row has already
+    // landed, so this produces a genuine orphan for the sweep.
+    if debug_force_actor_commit_failure(did) {
+        let _ = actor_tx.rollback().await;
+        let actor_err = sqlx::Error::Protocol(
+            "AURORA_DEBUG_FORCE_ACTOR_COMMIT_FAILURE (debug-build test affordance)"
+                .to_string(),
+        );
+        record_orphan_marker(did, &actor_err, &emitted_event_ids, shared_pool).await;
+        return Err(PdsError::Database(actor_err));
+    }
+
     // Step 2: actor tx second.
     if let Err(actor_err) = actor_tx.commit().await {
-        emit_bind_audit_orphan_marker(did, &actor_err);
+        record_orphan_marker(did, &actor_err, &emitted_event_ids, shared_pool).await;
         return Err(PdsError::Database(actor_err));
     }
 
     Ok(())
+}
+
+/// v0.8 arc 1 (#180) — sibling-emit ordering for the orphan path,
+/// factored so the real-failure branch and the debug-injection branch
+/// share one definition. Per §3.5: **tracing emit first** (the
+/// sync, can't-fail forensic safety net), **persistent INSERT second**
+/// (async, returns `()`, can't fail the caller). The caller propagates
+/// the ORIGINAL `actor_err` — never a marker-INSERT error.
+async fn record_orphan_marker(
+    did: &str,
+    actor_err: &(dyn std::fmt::Display + Sync),
+    emitted_event_ids: &[i64],
+    shared_pool: &sqlx::AnyPool,
+) {
+    // SIBLING EMIT — TRACING FIRST (forensic-detail safety net).
+    emit_bind_audit_orphan_marker(did, actor_err);
+    // SIBLING EMIT — INSERT SECOND (persistent, sweep target).
+    insert_persistent_orphan_marker(
+        shared_pool,
+        did,
+        &actor_err.to_string(),
+        emitted_event_ids,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .await;
+}
+
+/// v0.8 arc 1 (#180) — persistent sibling of
+/// [`emit_bind_audit_orphan_marker`]. Inserts one
+/// `bind_audit_orphan_marker` row per `moderation_event_id` in
+/// `emitted_event_ids`, joining each id back to its committed
+/// `moderation_event` row for the `subject_uri`. `ON CONFLICT
+/// (moderation_event_id) DO NOTHING` keeps the `UNIQUE` constraint
+/// idempotent under retried/duplicate failures.
+///
+/// **Cannot fail the caller** — returns `()`. Internal errors are
+/// logged via `tracing::warn!` and swallowed; the sibling
+/// `tracing::error!` emit (already fired by
+/// [`emit_bind_audit_orphan_marker`]) retains the forensic detail even
+/// when the INSERT can't land. This is the sibling-emit invariant
+/// (§3.5): a marker-INSERT error must never replace the `actor_err` the
+/// caller propagates.
+pub(crate) async fn insert_persistent_orphan_marker(
+    shared_pool: &sqlx::AnyPool,
+    did: &str,
+    actor_err_string: &str,
+    emitted_event_ids: &[i64],
+    now_rfc3339: &str,
+) {
+    // Internal try-block: `?` for early exit on the first sqlx error;
+    // the outer wrapper below catches it.
+    let result: Result<(), sqlx::Error> = async {
+        let mut tx = shared_pool.begin().await?;
+        for event_id in emitted_event_ids {
+            // subject_uri is read as String (NOT Option<String>): the
+            // v0.7 orphan-able emit set unconditionally populates it
+            // (round-1 L2). A future emit type that lands a NULL
+            // subject_uri before the migration lifts NOT NULL would
+            // surface here as sqlx::Error::ColumnDecode — the outer
+            // wrapper catches it, the row doesn't land, the tracing
+            // sibling already fired.
+            let subject_uri: String = sqlx::query_scalar(
+                "SELECT subject_uri FROM moderation_event WHERE id = $1",
+            )
+            .bind(event_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO bind_audit_orphan_marker \
+                 (moderation_event_id, actor_did, subject_uri, actor_commit_error, \
+                  state, created_at, resolved_at, resolution_detail) \
+                 VALUES ($1, $2, $3, $4, 'unresolved', $5, NULL, NULL) \
+                 ON CONFLICT (moderation_event_id) DO NOTHING",
+            )
+            .bind(event_id)
+            .bind(did)
+            .bind(&subject_uri)
+            .bind(actor_err_string)
+            .bind(now_rfc3339)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "aurora_locus::repo_storage",
+            event = "bind_audit_orphan_marker_persistent_insert_failed",
+            did = %did,
+            error = %e,
+            "persistent orphan marker insert failed; tracing emit \
+             retained the forensic detail (sibling-emit invariant). \
+             Operator can grep bind_audit_orphan_marker tracing events \
+             for the missing-marker context."
+        );
+    }
+}
+
+/// v0.8 arc 1 (#180) debug injection — returns `true` when
+/// `AURORA_DEBUG_FORCE_ACTOR_COMMIT_FAILURE` is set to `did`, so
+/// `commit_with_orphan_recovery` can simulate an actor-commit failure
+/// (the orphan path) for Phase B Scenario 6. Debug builds only; the
+/// release stub below compiles the env read out entirely. First trigger
+/// per process emits a `warn!` so an accidental debug-build-with-env-set
+/// is diagnosable from logs.
+#[cfg(debug_assertions)]
+fn debug_force_actor_commit_failure(did: &str) -> bool {
+    match std::env::var("AURORA_DEBUG_FORCE_ACTOR_COMMIT_FAILURE") {
+        Ok(target) if target == did => {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    target: "aurora_locus::repo_storage",
+                    event = "aurora_debug_force_actor_commit_failure_active",
+                    did = %did,
+                    "AURORA_DEBUG_FORCE_ACTOR_COMMIT_FAILURE is active for this DID; \
+                     this is a debug-build-only test affordance (Phase B Scenario 6)",
+                );
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Release stub — the env var is inert; the read is compiled out.
+#[cfg(not(debug_assertions))]
+#[inline]
+fn debug_force_actor_commit_failure(_did: &str) -> bool {
+    false
+}
+
+/// v0.8 arc 1 (#180) debug injection — returns `true` when
+/// `AURORA_DEBUG_FORCE_SHARED_COMMIT_FAILURE` is set to `did`, so
+/// `commit_with_orphan_recovery` can simulate a shared-commit failure
+/// (the clean-failure path) for Phase B Scenario 6 Block 6.3. Debug
+/// builds only; the release stub below compiles the env read out.
+#[cfg(debug_assertions)]
+fn debug_force_shared_commit_failure(did: &str) -> bool {
+    match std::env::var("AURORA_DEBUG_FORCE_SHARED_COMMIT_FAILURE") {
+        Ok(target) if target == did => {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    target: "aurora_locus::repo_storage",
+                    event = "aurora_debug_force_shared_commit_failure_active",
+                    did = %did,
+                    "AURORA_DEBUG_FORCE_SHARED_COMMIT_FAILURE is active for this DID; \
+                     this is a debug-build-only test affordance (Phase B Scenario 6)",
+                );
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Release stub — the env var is inert; the read is compiled out.
+#[cfg(not(debug_assertions))]
+#[inline]
+fn debug_force_shared_commit_failure(_did: &str) -> bool {
+    false
 }
 
 impl RepoStorage for SqliteRepoStorage {
@@ -903,6 +1114,139 @@ mod step_3_5_tests {
             "orphan marker must NOT fire on the shared-commit-failure path; \
              the clean-failure invariant from the arc 2 step 3.5 addendum is \
              'neither side committed, no half-state to mark'",
+        );
+    }
+
+    // -----------------------------------------------------------
+    // #8 — v0.8 arc 1 (#180): insert_persistent_orphan_marker
+    //      round-trips. (1) a successful invocation lands exactly one
+    //      marker row with the expected shape; (2) ON CONFLICT DO
+    //      NOTHING keeps it idempotent under a repeat with the same
+    //      moderation_event_id; (3) a closed pool drives the
+    //      warn-fallback (sibling-emit invariant) — the helper returns
+    //      () and emits the warn rather than failing the caller.
+    //
+    //      The shared pool is file-backed (not sqlite::memory:) so the
+    //      helper's own pool.begin() connection sees the schema + seed
+    //      set up here — an in-memory Any pool gives each connection a
+    //      distinct DB.
+    // -----------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn step_3_5_t8_insert_persistent_orphan_marker_round_trips() {
+        use sqlx::Row;
+
+        sqlx::any::install_default_drivers();
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("shared.sqlite");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let shared_pool = AnyPool::connect(&url).await.expect("shared pool");
+
+        // Minimal shared-DB schema the helper touches: it reads
+        // subject_uri from moderation_event and inserts into
+        // bind_audit_orphan_marker (full Arc 1 schema, migration 0013).
+        sqlx::query(
+            "CREATE TABLE moderation_event (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 subject_uri TEXT)",
+        )
+        .execute(&shared_pool)
+        .await
+        .expect("create moderation_event");
+        sqlx::query(
+            "CREATE TABLE bind_audit_orphan_marker (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 moderation_event_id INTEGER NOT NULL, \
+                 actor_did TEXT NOT NULL, \
+                 subject_uri TEXT NOT NULL, \
+                 actor_commit_error TEXT NOT NULL, \
+                 state TEXT NOT NULL DEFAULT 'unresolved', \
+                 created_at TEXT NOT NULL, \
+                 resolved_at TEXT, \
+                 resolution_detail TEXT, \
+                 UNIQUE (moderation_event_id))",
+        )
+        .execute(&shared_pool)
+        .await
+        .expect("create bind_audit_orphan_marker");
+
+        let did = "did:plc:step35t8";
+        let subject_uri = "at://did:plc:step35t8/tools.kryphocron.policy.audience/self";
+        sqlx::query("INSERT INTO moderation_event (subject_uri) VALUES ($1)")
+            .bind(subject_uri)
+            .execute(&shared_pool)
+            .await
+            .expect("seed moderation_event");
+        let event_id: i64 = sqlx::query_scalar("SELECT id FROM moderation_event LIMIT 1")
+            .fetch_one(&shared_pool)
+            .await
+            .expect("read seeded id");
+
+        // (1) Successful round-trip — one row, expected shape.
+        insert_persistent_orphan_marker(
+            &shared_pool,
+            did,
+            "simulated actor commit failure",
+            &[event_id],
+            "2026-06-03T00:00:00+00:00",
+        )
+        .await;
+
+        let row = sqlx::query(
+            "SELECT moderation_event_id, actor_did, subject_uri, \
+                    actor_commit_error, state, created_at \
+             FROM bind_audit_orphan_marker WHERE moderation_event_id = $1",
+        )
+        .bind(event_id)
+        .fetch_one(&shared_pool)
+        .await
+        .expect("marker row present after insert");
+        assert_eq!(row.try_get::<i64, _>("moderation_event_id").unwrap(), event_id);
+        assert_eq!(row.try_get::<String, _>("actor_did").unwrap(), did);
+        assert_eq!(row.try_get::<String, _>("subject_uri").unwrap(), subject_uri);
+        assert_eq!(
+            row.try_get::<String, _>("actor_commit_error").unwrap(),
+            "simulated actor commit failure"
+        );
+        assert_eq!(row.try_get::<String, _>("state").unwrap(), "unresolved");
+        assert_eq!(
+            row.try_get::<String, _>("created_at").unwrap(),
+            "2026-06-03T00:00:00+00:00"
+        );
+
+        // (2) ON CONFLICT DO NOTHING idempotency — a repeat with the
+        //     same event_id leaves exactly one row.
+        insert_persistent_orphan_marker(
+            &shared_pool,
+            did,
+            "second observation of the same failure",
+            &[event_id],
+            "2026-06-03T01:00:00+00:00",
+        )
+        .await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bind_audit_orphan_marker")
+            .fetch_one(&shared_pool)
+            .await
+            .expect("count markers");
+        assert_eq!(count, 1, "ON CONFLICT DO NOTHING must keep a single row");
+
+        // (3) Warn-fallback — close the pool BEFORE invoking (no tx
+        //     outstanding) so begin() returns PoolClosed deterministically.
+        //     Closing while a tx is held would deadlock (step_3_5_t7
+        //     rustdoc). The helper must return () + emit the warn.
+        shared_pool.close().await;
+        insert_persistent_orphan_marker(
+            &shared_pool,
+            did,
+            "pool is closed",
+            &[event_id],
+            "2026-06-03T02:00:00+00:00",
+        )
+        .await;
+        assert!(
+            logs_contain("bind_audit_orphan_marker_persistent_insert_failed"),
+            "closed-pool insert must emit the warn-fallback event \
+             (sibling-emit invariant), not fail the caller",
         );
     }
 

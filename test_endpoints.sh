@@ -82,14 +82,14 @@ echo ""
 # Test 6: Refresh Session
 echo "Test 6: Refresh Session Tokens"
 echo "POST $BASE_URL/xrpc/com.atproto.server.refreshSession"
+# Arc 4 (#185): refreshSession authenticates with the refresh token in the
+# Authorization header (atproto wire shape), not a JSON body.
 REFRESH_RESPONSE=$(curl -s -X POST "$BASE_URL/xrpc/com.atproto.server.refreshSession" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"refreshJwt\": \"$NEW_REFRESH_JWT\"
-  }")
+  -H "Authorization: Bearer $NEW_REFRESH_JWT")
 echo "$REFRESH_RESPONSE" | jq '.'
 
 REFRESHED_ACCESS_JWT=$(echo "$REFRESH_RESPONSE" | jq -r '.accessJwt // .access_jwt')
+REFRESHED_REFRESH_JWT=$(echo "$REFRESH_RESPONSE" | jq -r '.refreshJwt // .refresh_jwt')
 
 echo ""
 echo "Refreshed access token: ${REFRESHED_ACCESS_JWT:0:50}..."
@@ -97,10 +97,12 @@ echo ""
 echo ""
 
 # Test 7: Logout (Delete Session)
+# Arc 4 (#185): deleteSession authenticates with the REFRESH token (atproto
+# wire shape), not the access token; logout also revokes the refresh token.
 echo "Test 7: Logout (Delete Session)"
 echo "POST $BASE_URL/xrpc/com.atproto.server.deleteSession"
 curl -s -X POST "$BASE_URL/xrpc/com.atproto.server.deleteSession" \
-  -H "Authorization: Bearer $REFRESHED_ACCESS_JWT" | jq '.'
+  -H "Authorization: Bearer $REFRESHED_REFRESH_JWT" | jq '.'
 echo ""
 echo ""
 

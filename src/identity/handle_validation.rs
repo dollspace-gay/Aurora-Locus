@@ -215,6 +215,11 @@ mod tests {
         assert!(validate_handle("alice@bob", &test_domains()).is_err());
         assert!(validate_handle("alice bob", &test_domains()).is_err());
         assert!(validate_handle("alice_bob", &test_domains()).is_err());
+        // v0.8 arc 3 (#184) tripwire — the charset rule must reject ':' so a
+        // `did:`-leading handle cannot be created (login DID-branch invariant,
+        // M4/M5). Already covered by the alphanumeric/-/. charset rule; this
+        // pins it as a regression guard against a future charset relaxation.
+        assert!(validate_handle("did:foo", &test_domains()).is_err());
 
         // Leading/trailing hyphens
         assert!(validate_handle("-alice", &test_domains()).is_err());

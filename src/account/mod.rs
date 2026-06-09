@@ -64,19 +64,26 @@ pub struct SessionInfo {
     pub email_confirmed: Option<bool>,
 }
 
-/// Token refresh request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RefreshSessionRequest {
-    pub refresh_jwt: String,
-}
-
 /// Validated session from bearer token
 #[derive(Debug, Clone)]
 pub struct ValidatedSession {
     pub did: String,
     pub session_id: String,
     pub is_app_password: bool,
+}
+
+/// Identity resolved from a refresh token by side-effect-free validation.
+///
+/// Returned by [`AccountManager::validate_refresh_token`]. Carries only the
+/// identity needed to act on the token's session — `used`/`next_id` are
+/// deliberately omitted (Arc 4 design §3.1, round-1 M-3): `delete_session`
+/// honors user intent and does not branch on grace-period state, and
+/// `refresh_session` reads those fields from its own row-read.
+#[derive(Debug, Clone)]
+pub struct RefreshTokenIdentity {
+    pub did: String,
+    pub session_id: String,
+    pub token_id: String,
 }
 
 /// App password info (without the actual password)

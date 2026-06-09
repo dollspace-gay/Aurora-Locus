@@ -66,6 +66,7 @@ pub async fn require_auth(
         Ok(session) => {
             info!(
                 did = %session.did,
+                session_id = %session.session_id,
                 is_app_password = session.is_app_password,
                 "authentication_successful"
             );
