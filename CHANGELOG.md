@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-08
+
 ### Added
 
 - `bind_audit_orphan_marker` persistent forensic table replacing v0.7's tracing-only orphan emit. State lifecycle (`unresolved → confirmed_orphan | record_present`), `(state, id)` keyset index for sweep pagination, RFC3339 TEXT timestamps for dual-backend compatibility. Migrations 0013 (SQLite) and 0014 (Postgres).
