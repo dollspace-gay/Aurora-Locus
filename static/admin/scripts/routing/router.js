@@ -97,6 +97,20 @@
         return;
       }
     }
+    // §5.7.4 mode gate — a route whose top-level domain is hidden by the
+    // current moderation-mode is unreachable even by deep link (e.g. any
+    // non-Configuration route in `disabled` mode, or Moderation in
+    // `reduced`). This is the MODE dimension only; the route's own
+    // `requires` above is the authoritative role gate, so Moderator-level
+    // routes that sit under an Admin+ sidebar group stay reachable.
+    if (global.AuroraRoutes && global.AuroraRoutes.domainModeAllowed) {
+      const mode = global.AuroraSettings ? global.AuroraSettings.getModerationMode() : 'full';
+      const domain = global.AuroraRoutes.domainForPattern(match.route.pattern);
+      if (!global.AuroraRoutes.domainModeAllowed(domain, mode)) {
+        mountModeUnavailable(match.route, mode);
+        return;
+      }
+    }
     const page = pages.get(match.route.page);
     if (!page || typeof page.mount !== 'function') {
       mountNotFound(hashPath, 'Page not implemented: ' + match.route.page);
@@ -199,6 +213,30 @@
   function mountError(err) {
     const message = err && err.message ? String(err.message) : String(err);
     renderMessage('Page error', [message]);
+  }
+
+  // §5.7.4 / §5.5 — a route whose domain is hidden in the current
+  // moderation mode. In disabled mode the deployment may configure a
+  // landing redirect; we honour it but only as an INTERNAL hash target
+  // (stripping any leading '#') so a runtime-setting string can't become
+  // an open redirect to an arbitrary origin. Otherwise we explain and
+  // point at Configuration, which is always reachable.
+  function mountModeUnavailable(route, mode) {
+    if (mode === 'disabled' && global.AuroraSettings && global.AuroraSettings.getModerationModeRedirect) {
+      const redirect = String(global.AuroraSettings.getModerationModeRedirect() || '');
+      const target = redirect.replace(/^#\/?/, '');
+      if (target && target !== (route.pattern || '')) {
+        window.location.replace('#' + target);
+        return;
+      }
+    }
+    renderMessage('Unavailable in this mode', [
+      'This area is not available while moderation mode is ',
+      { tag: 'strong', text: mode || 'reduced' },
+      '. Open ',
+      { tag: 'code', text: '#configuration/general' },
+      ' to change the mode, or continue in an available area.',
+    ]);
   }
 
   function updateSidebarActive(hashPath) {

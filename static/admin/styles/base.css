@@ -114,6 +114,29 @@ body {
   font-weight: var(--font-weight-semibold);
 }
 
+/* Clickable group label (§5.8.2) — e.g. the Moderation label links to the
+   Queue and hosts the combined open-reports + pending-appeals bell badge. */
+.nav-section-link {
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.nav-section-link:hover {
+  color: var(--sidebar-text);
+}
+
+.nav-section-link .badge {
+  margin-left: auto;
+  background: var(--danger-color);
+  color: white;
+  padding: 0.125rem var(--space-2);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+}
+
 .sidebar-footer {
   padding: var(--space-6);
   border-top: 1px solid rgba(255, 255, 255, 0.1);

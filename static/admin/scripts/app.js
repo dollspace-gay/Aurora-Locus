@@ -47,8 +47,26 @@
       return;
     }
 
-    mountSidebar();
-    mountSidebarFooter();
+    // Load the deployment moderation-mode before the first sidebar paint —
+    // sidebar domain visibility (§5.7.4) depends on it. If the fetch fails
+    // the cached default ('full') stands.
+    await loadModerationMode();
+
+    renderSidebar();
+
+    // §5.8.4 — rebuild the sidebar when moderation-mode changes (e.g. an
+    // operator switches it on Configuration → UI & modes, which calls
+    // setModerationModeCache → AuroraSettings.notify). Only modMode
+    // transitions matter here; theme/language changes are ignored.
+    if (global.AuroraSettings) {
+      let lastMode = global.AuroraSettings.getModerationMode();
+      global.AuroraSettings.subscribe((s) => {
+        if (s && s.modMode !== lastMode) {
+          lastMode = s.modMode;
+          renderSidebar();
+        }
+      });
+    }
 
     // Wire router to the main mount point.
     const main = document.getElementById('content');
@@ -79,8 +97,19 @@
   function mountSidebar() {
     const aside = document.getElementById('sidebar');
     if (!aside) return;
-    const sidebar = global.AuroraRoutes ? global.AuroraRoutes.sidebar : [];
+    const routes = global.AuroraRoutes;
+    const sidebar = routes ? routes.sidebar : [];
     const session = global.AuroraSession;
+    const role = session ? session.role() : 'moderator';
+    const mode = global.AuroraSettings ? global.AuroraSettings.getModerationMode() : 'full';
+
+    function domainVisible(domain) {
+      return (routes && routes.domainVisible) ? routes.domainVisible(domain, role, mode) : true;
+    }
+    function itemAllowed(item) {
+      return !(item.requires && session && !session.hasRole(item.requires));
+    }
+
     let html = '';
     html += '<div class="logo">' +
             '  <h1>Aurora Locus</h1>' +
@@ -89,22 +118,42 @@
     html += '<nav class="nav-menu" aria-label="Primary navigation">';
     for (const node of sidebar) {
       if (node.heading) {
-        // Skip whole sections the operator can't see at all.
-        if (node.requires && session && !session.hasRole(node.requires)) continue;
+        // §5.7.4 — skip a domain the operator can't see in this role/mode.
+        const domain = node.heading.toLowerCase();
+        if (!domainVisible(domain)) continue;
+        // Per-item role gate realises the "limited" cells of the matrix.
+        const visibleItems = (node.items || []).filter(itemAllowed);
+        // §5.8.3 — render the group label only when it has ≥1 visible item.
+        if (visibleItems.length === 0) continue;
         html += '<div class="nav-section">';
-        html += '<span class="nav-section-label">' + escHtml(node.heading) + '</span>';
-        for (const item of node.items || []) {
-          if (item.requires && session && !session.hasRole(item.requires)) continue;
-          html += navItem(item);
-        }
+        html += navSectionLabel(node);
+        for (const item of visibleItems) html += navItem(item);
         html += '</div>';
       } else if (node.route) {
+        const domain = (routes && routes.domainForPattern) ? routes.domainForPattern(node.route) : 'dashboard';
+        if (!domainVisible(domain) || !itemAllowed(node)) continue;
         html += navItem(node);
       }
     }
     html += '</nav>';
     html += '<div class="sidebar-footer" id="sidebar-footer"></div>';
     aside.innerHTML = html;
+  }
+
+  // A group label. When the node carries a `route` the label is a link
+  // (§5.8.2: clicking the Moderation label or its bell badge goes to the
+  // Queue); the optional badge renders inside it, hidden until a non-zero
+  // count arrives via refreshBadge().
+  function navSectionLabel(node) {
+    const badge = node.badgeId
+      ? '<span class="badge" id="' + node.badgeId + '" style="display:none">0</span>'
+      : '';
+    const label = escHtml(node.heading);
+    if (node.route) {
+      return '<a class="nav-section-label nav-section-link" href="#' + node.route + '" data-route="' + node.route + '">' +
+             label + badge + '</a>';
+    }
+    return '<span class="nav-section-label">' + label + badge + '</span>';
   }
 
   function navItem(item) {
@@ -141,21 +190,60 @@
     return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s);
   }
 
+  // Fetch the deployment moderation-mode (and its redirect URL) into the
+  // AuroraSettings cache. Mirrors ConfigUiModes.loadModerationMode; runs
+  // once at boot and is harmless to call again.
+  async function loadModerationMode() {
+    if (!global.AuroraEndpoints || !global.AuroraSettings) return;
+    try {
+      const data = await global.AuroraEndpoints.admin.getRuntimeSetting('moderation-mode');
+      const mode = (data && typeof data.value === 'string') ? data.value : 'full';
+      let redirect;
+      try {
+        const r = await global.AuroraEndpoints.admin.getRuntimeSetting('moderation-mode-redirect-url');
+        redirect = (r && typeof r.value === 'string') ? r.value : '';
+      } catch (e) { /* redirect is optional */ }
+      global.AuroraSettings.setModerationModeCache(mode, redirect);
+    } catch (e) { /* cached default ('full') stands */ }
+  }
+
+  // Rebuild the whole sidebar (nav + footer) and re-apply the active
+  // highlight and bell badge. Called at boot and on every mode change.
+  function renderSidebar() {
+    mountSidebar();
+    mountSidebarFooter();
+    refreshBadge();
+    markActive((window.location.hash || '').replace(/^#\/?/, ''));
+  }
+
+  // Mark the nav entry (item or group label) matching the current hash.
+  // Mirrors the router's own updateSidebarActive so a mode-driven
+  // re-render without navigation doesn't drop the highlight.
+  function markActive(hashPath) {
+    document.querySelectorAll('.sidebar [data-route]').forEach((el) => {
+      const r = el.dataset.route;
+      const active = (r === hashPath) || (r && hashPath.indexOf(r + '/') === 0);
+      el.classList.toggle('active', active);
+    });
+  }
+
   // ----- Bell badge polling -----
   let pollHandle = null;
 
   async function refreshBadge() {
     if (!global.AuroraEndpoints) return;
+    // The badge exists only when the Moderation domain is visible
+    // (Moderator+ in full mode), so its absence is the mode/role gate.
+    const badge = document.getElementById('mod-attention-count');
+    if (!badge) return;
     try {
       const stats = await global.AuroraEndpoints.admin.getQueueStats();
       if (!stats) return;
-      const badge = document.getElementById('mod-queue-count');
-      if (badge) {
-        badge.textContent = String(stats.queueAttentionTotal || 0);
-        badge.classList.toggle('badge-attention', (stats.queueAttentionTotal || 0) > 0);
-      }
-      const reports = document.getElementById('reports-count');
-      if (reports) reports.textContent = String(stats.openReports || 0);
+      // §5.8.2 — combined count of open reports + pending appeals.
+      const count = (stats.openReports || 0) + (stats.pendingAppeals || stats.openAppeals || 0);
+      badge.textContent = String(count);
+      badge.classList.toggle('badge-attention', count > 0);
+      badge.style.display = count > 0 ? '' : 'none';
     } catch (e) {
       // network/auth — leave badge unchanged
     }

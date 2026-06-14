@@ -103,11 +103,16 @@
       icon: 'layout-dashboard',
     },
     {
+      // The bell badge lives on the group label (§5.8.2): combined count
+      // of open reports + pending appeals, and the label itself links to
+      // the Queue. Visibility (Moderator+ in full mode only) follows from
+      // the domain gate — the Moderation domain renders only in full mode.
       heading: 'Moderation',
-      requires: 'moderator',
+      route: 'mod/queue',
+      badgeId: 'mod-attention-count',
       items: [
-        { label: 'Queue', route: 'mod/queue', icon: 'gavel', badgeId: 'mod-queue-count' },
-        { label: 'Reports', route: 'mod/reports', icon: 'file-text', badgeId: 'reports-count' },
+        { label: 'Queue', route: 'mod/queue', icon: 'gavel' },
+        { label: 'Reports', route: 'mod/reports', icon: 'file-text' },
         { label: 'Appeals', route: 'mod/appeals', icon: 'scale' },
         { label: 'Events', route: 'mod/events', icon: 'shield-alert' },
         { label: 'Audit', route: 'mod/audit', icon: 'archive' },
@@ -148,16 +153,83 @@
       // wired in the A-mode-gating pass; here the group is role-gated to
       // Moderator+ (the lowest tier that sees Kryphocron once Arc D lands).
       heading: 'Kryphocron',
-      requires: 'moderator',
       items: [
         { label: 'Overview', route: 'kryphocron', icon: 'eye-off' },
       ],
     },
   ];
 
+  // --- Domain visibility: the §5.7.4 role × moderation-mode matrix ---
+  //
+  // Single source of truth for which top-level domains are reachable for
+  // a given (role, mode), consumed by both the sidebar (app.js) and the
+  // router dispatch gate (router.js). Encodes this matrix exactly:
+  //
+  //   role \ mode    full                              reduced                      disabled
+  //   Moderator      Dash, Mod, Config, Kryph          Dash, Config, Kryph          Config
+  //   Admin          Dash, Mod, Ops, Config, Kryph     Dash, Ops, Config, Kryph     Config
+  //   SuperAdmin     all five                          all except Mod               Config
+  //
+  // Configuration is always visible (it holds the mode toggle). Within a
+  // visible domain, per-item `requires` still applies — that realises the
+  // "Configuration (limited)" cells (a Moderator sees UI & modes / Roles /
+  // Capabilities but not the SuperAdmin policy pages).
+  const ROLE_ORDER = { moderator: 1, admin: 2, superadmin: 3 };
+
+  // Map a route pattern (or page-less hash prefix) to its top-level domain.
+  function domainForPattern(pattern) {
+    const p = String(pattern || '');
+    if (p === '' || p === 'dashboard' || p === 'ops/dashboard') return 'dashboard';
+    if (p === 'mod' || p.indexOf('mod/') === 0) return 'moderation';
+    if (p === 'ops' || p.indexOf('ops/') === 0) return 'operations';
+    if (p === 'configuration' || p.indexOf('configuration/') === 0) return 'configuration';
+    if (p === 'kryphocron' || p.indexOf('kryphocron/') === 0) return 'kryphocron';
+    return 'dashboard';
+  }
+
+  // Minimum role tier that can see `domain` in `mode`, or null if the
+  // domain is hidden in that mode for every role.
+  function domainMinRole(domain, mode) {
+    switch (domain) {
+      case 'configuration':
+        return 'moderator'; // always visible
+      case 'dashboard':
+        return (mode === 'disabled') ? null : 'moderator';
+      case 'moderation':
+        return (mode === 'full') ? 'moderator' : null;
+      case 'operations':
+        return (mode === 'disabled') ? null : 'admin';
+      case 'kryphocron':
+        return (mode === 'disabled') ? null : 'moderator';
+      default:
+        return 'moderator';
+    }
+  }
+
+  // Sidebar visibility: applies BOTH the mode rule and the domain's role
+  // tier — e.g. a Moderator never sees the (Admin+) Operations group.
+  function domainVisible(domain, role, mode) {
+    const min = domainMinRole(domain, mode);
+    if (!min) return false;
+    return (ROLE_ORDER[role] || 0) >= (ROLE_ORDER[min] || 0);
+  }
+
+  // Router reachability: applies ONLY the mode rule, not the domain's
+  // sidebar role tier. A route's own `requires` is the authoritative role
+  // gate, and some routes sit below their domain's sidebar tier — e.g.
+  // ops/accounts is Moderator-reachable (via the command palette / report
+  // pivots) even though the Operations *group* is Admin+ in the sidebar.
+  // Gating route dispatch on the sidebar tier would wrongly 404 those.
+  function domainModeAllowed(domain, mode) {
+    return domainMinRole(domain, mode) !== null;
+  }
+
   global.AuroraRoutes = {
     routes: ROUTES,
     legacyRedirects: LEGACY_REDIRECTS,
     sidebar: SIDEBAR,
+    domainForPattern: domainForPattern,
+    domainVisible: domainVisible,
+    domainModeAllowed: domainModeAllowed,
   };
 })(window);
