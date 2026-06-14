@@ -29,7 +29,12 @@
 
   function parseHash() {
     const hash = (window.location.hash || '').replace(/^#\/?/, '');
-    return hash;
+    // Strip any filter-state query string (§5.7.5) — a route pattern
+    // never contains '?', so route matching, legacy redirects, and the
+    // active-nav highlight all operate on the path alone. Pages read the
+    // query via AuroraUrlState.read().
+    const q = hash.indexOf('?');
+    return q >= 0 ? hash.slice(0, q) : hash;
   }
 
   // Match a hash path against the route table. Returns
