@@ -161,7 +161,7 @@
   // innerHTML template literal — a textbook XSS sink because the hash
   // and any error message might originate in attacker-controlled URLs.
   // A successful XSS in the admin UI hands the attacker the operator's
-  // localStorage.adminToken and from there every admin XRPC the
+  // localStorage 'aurora-admin-token' and from there every admin XRPC the
   // operator has scope for. Treat all inputs here as hostile.
   function renderMessage(headingText, bodyParts) {
     if (!mainEl) return;

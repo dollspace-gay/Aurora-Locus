@@ -2,14 +2,33 @@
 // authentication and current-operator state moved from script.js
 // globals into an explicit state module with a small subscribe API.
 //
-// localStorage key: 'adminToken' (preserved from current build for
-// backward compat per §12.8); future migration to 'aurora-admin-token'
-// happens at app load time.
+// localStorage key: 'aurora-admin-token' (renamed from the legacy
+// 'adminToken' per §8.1.1 / recon §4.6). A one-time boot migration below
+// moves an existing legacy token to the new key so a session created
+// before the rename survives the upgrade. adminDid / adminRole are
+// separate keys and out of scope for this rename.
 
 (function (global) {
   'use strict';
 
-  const TOKEN_KEY = 'adminToken';
+  const TOKEN_KEY = 'aurora-admin-token';
+  const LEGACY_TOKEN_KEY = 'adminToken';
+
+  // One-time token-key migration (§8.1.1). Runs at module load, before any
+  // consumer reads token() — session.js loads ahead of client.js,
+  // capabilities.js, and app.js in index.html. Read the legacy key, write
+  // it under the new key if the new key isn't already set, then drop the
+  // legacy key so the rename completes in a single visit.
+  (function migrateLegacyToken() {
+    try {
+      const legacy = localStorage.getItem(LEGACY_TOKEN_KEY);
+      if (legacy && !localStorage.getItem(TOKEN_KEY)) {
+        localStorage.setItem(TOKEN_KEY, legacy);
+      }
+      if (legacy != null) localStorage.removeItem(LEGACY_TOKEN_KEY);
+    } catch (e) { /* localStorage unavailable — nothing to migrate */ }
+  })();
+
   let currentUser = null;
   const subscribers = new Set();
 

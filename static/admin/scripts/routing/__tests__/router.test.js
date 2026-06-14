@@ -5,7 +5,7 @@
 // (window.location.hash) into innerHTML in three places — the not-
 // found, forbidden, and error fallback pages. A successful XSS in
 // the admin UI hands the attacker the operator's
-// localStorage.adminToken and from there every admin XRPC the
+// localStorage 'aurora-admin-token' and from there every admin XRPC the
 // operator has scope for, so this is privilege escalation, not
 // defacement.
 //

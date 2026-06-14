@@ -168,7 +168,7 @@ test('refreshCapabilities infers caps from families list', async () => {
 
 test('callEndpoint sends POST with auth headers and JSON body', async () => {
   const w = makeWindow();
-  w.localStorage.setItem('adminToken', 'test-token-xyz');
+  w.localStorage.setItem('aurora-admin-token', 'test-token-xyz');
   w.localStorage.setItem(
     'aurora.capabilities',
     JSON.stringify({

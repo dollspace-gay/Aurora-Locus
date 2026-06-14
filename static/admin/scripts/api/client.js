@@ -12,7 +12,7 @@
 
   function authHeaders(extra) {
     const headers = Object.assign({}, extra || {});
-    const token = global.AuroraSession ? global.AuroraSession.token() : localStorage.getItem('adminToken');
+    const token = global.AuroraSession ? global.AuroraSession.token() : localStorage.getItem('aurora-admin-token');
     if (token) headers.Authorization = 'Bearer ' + token;
     return headers;
   }

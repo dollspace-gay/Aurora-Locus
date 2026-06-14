@@ -17,8 +17,9 @@
     else document.addEventListener('DOMContentLoaded', fn);
   }
 
-  // localStorage key migration per §12.8: future v0.3 will move
-  // 'adminToken' → 'aurora-admin-token'. v0.2 preserves the old key.
+  // The admin token lives in localStorage under 'aurora-admin-token'
+  // (renamed from the legacy 'adminToken' per §8.1.1; session.js runs the
+  // one-time migration at module load).
 
   async function bootstrap() {
     // Auth check first — bare fetch since AuroraSession is a thin

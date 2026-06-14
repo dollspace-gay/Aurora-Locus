@@ -135,8 +135,14 @@
     }
   }
 
+  // §8.1.4 — read the token from AuroraSession (the single source of
+  // truth) rather than reaching into localStorage directly, so this
+  // helper no longer diverges from client.js's. Falls back to the new
+  // localStorage key only if AuroraSession somehow isn't loaded.
   function authHeaders() {
-    const token = localStorage.getItem('adminToken');
+    const token = global.AuroraSession
+      ? global.AuroraSession.token()
+      : localStorage.getItem('aurora-admin-token');
     const headers = { 'Content-Type': 'application/json' };
     if (token) headers.Authorization = 'Bearer ' + token;
     return headers;

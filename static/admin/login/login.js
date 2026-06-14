@@ -1,7 +1,22 @@
 // Admin Login Page JavaScript - OAuth Flow
 
+// One-time token-key migration (§8.1.1): move a legacy 'adminToken' to
+// 'aurora-admin-token'. The main app (session.js) runs the same
+// migration, but login.html doesn't load session.js, so it's inlined
+// here too — a pre-rename operator landing on the login page still
+// migrates and gets redirected into the app.
+(function () {
+    try {
+        const legacy = localStorage.getItem('adminToken');
+        if (legacy && !localStorage.getItem('aurora-admin-token')) {
+            localStorage.setItem('aurora-admin-token', legacy);
+        }
+        if (legacy != null) localStorage.removeItem('adminToken');
+    } catch (e) { /* localStorage unavailable */ }
+})();
+
 // Check if already logged in
-if (localStorage.getItem('adminToken')) {
+if (localStorage.getItem('aurora-admin-token')) {
     window.location.href = '/admin/index.html';
 }
 
@@ -45,7 +60,7 @@ async function handleOAuthCallback(code, state) {
         // we just discard it client-side until the consumer exists.
         // Storing without consuming would expand the localStorage
         // attack surface for zero current value.
-        localStorage.setItem('adminToken', data.access_token);
+        localStorage.setItem('aurora-admin-token', data.access_token);
         localStorage.setItem('adminDid', data.did);
         localStorage.setItem('adminRole', data.role || 'admin');
 
