@@ -88,10 +88,16 @@
   <script src="/admin/scripts/pages/RateLimits.js"></script>
   <script src="/admin/scripts/pages/SystemHealth.js"></script>
   <script src="/admin/scripts/pages/Capabilities.js"></script>
-  <script src="/admin/scripts/pages/SettingsGeneral.js"></script>
-  <script src="/admin/scripts/pages/SettingsUiModes.js"></script>
-  <script src="/admin/scripts/pages/SettingsRoles.js"></script>
-  <script src="/admin/scripts/pages/SettingsRolesMembers.js"></script>
+  <!-- Configuration domain (was Settings; renamed v0.9 §5.5) -->
+  <script src="/admin/scripts/pages/ConfigGeneral.js"></script>
+  <script src="/admin/scripts/pages/ConfigUiModes.js"></script>
+  <script src="/admin/scripts/pages/ConfigRoles.js"></script>
+  <script src="/admin/scripts/pages/ConfigRolesMembers.js"></script>
+  <!-- Stub pages for routes whose bodies ship in Arc B/D/G. register()
+       is last-wins, so when an owning arc lands its real page it must
+       delete that key's row from ConfigStubs.js (contract documented in
+       that file's header) — load order alone is not the guard. -->
+  <script src="/admin/scripts/pages/ConfigStubs.js"></script>
 
   <!-- App entry point — runs after all pages have registered -->
   <script src="/admin/scripts/app.js"></script>

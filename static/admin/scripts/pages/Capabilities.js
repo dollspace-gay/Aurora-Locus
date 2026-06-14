@@ -1,4 +1,4 @@
-// Capabilities page (route: #settings/capabilities) — hosts capabilities
+// Capabilities page (route: #configuration/capabilities) — hosts capabilities
 // probe + version info. Per docs/AURORA_ADMIN_UI_DESIGN.md §5.4.6.6.
 
 (function (global) {
@@ -6,9 +6,9 @@
 
   async function mount({ container }) {
     container.innerHTML =
-      '<nav class="breadcrumb"><a href="#dashboard">Operations</a> <span class="breadcrumb-sep">›</span> Server</nav>' +
+      '<nav class="breadcrumb"><a href="#configuration/general">Configuration</a> <span class="breadcrumb-sep">›</span> Capabilities</nav>' +
       '<header class="page-header">' +
-      '  <div><h2>Server</h2><p class="page-subtitle">Capabilities and build information</p></div>' +
+      '  <div><h2>Capabilities</h2><p class="page-subtitle">Capabilities and build information</p></div>' +
       '  <div class="header-actions">' +
       '    <button class="btn-secondary" id="srv-refresh">Refresh</button>' +
       '    <button class="btn-secondary" id="srv-copy">Copy raw JSON</button>' +
@@ -93,6 +93,6 @@
 
   function esc(s) { return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s); }
   if (global.AuroraRouter) {
-    global.AuroraRouter.register('settingsCapabilities', { mount: mount });
+    global.AuroraRouter.register('configCapabilities', { mount: mount });
   }
 })(window);

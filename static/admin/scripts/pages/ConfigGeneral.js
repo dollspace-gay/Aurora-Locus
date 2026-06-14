@@ -1,4 +1,4 @@
-// Settings → General page (route: #settings/general).
+// Configuration → General page (route: #configuration/general).
 // Per docs/AURORA_ADMIN_UI_DESIGN.md §5.5.1.
 
 (function (global) {
@@ -29,7 +29,7 @@
     const session = global.AuroraSession;
     const writable = session && session.hasRole('superadmin');
     container.innerHTML =
-      '<nav class="breadcrumb"><a href="#settings/general">Settings</a> <span class="breadcrumb-sep">›</span> General</nav>' +
+      '<nav class="breadcrumb"><a href="#configuration/general">Configuration</a> <span class="breadcrumb-sep">›</span> General</nav>' +
       '<header class="page-header"><div><h2>General settings</h2><p class="page-subtitle">Server identity and basic configuration</p></div></header>' +
       '<div class="settings-grid">' +
       '  <div class="settings-card">' +
@@ -148,5 +148,5 @@
     }
   }
 
-  if (global.AuroraRouter) global.AuroraRouter.register('settingsGeneral', { mount: mount });
+  if (global.AuroraRouter) global.AuroraRouter.register('configGeneral', { mount: mount });
 })(window);

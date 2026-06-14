@@ -1,4 +1,4 @@
-// Settings → Roles members list (route: #settings/roles/:role).
+// Configuration → Roles members list (route: #configuration/roles/:role).
 // Per docs/AURORA_ADMIN_UI_DESIGN.md §5.5.4.
 
 (function (global) {
@@ -31,7 +31,7 @@
     const session = global.AuroraSession;
     const isSuper = session && session.hasRole('superadmin');
     container.innerHTML =
-      '<nav class="breadcrumb"><a href="#settings/roles">Settings</a> <span class="breadcrumb-sep">›</span> <a href="#settings/roles">Roles</a> <span class="breadcrumb-sep">›</span> ' + esc(role) + '</nav>' +
+      '<nav class="breadcrumb"><a href="#configuration/roles">Configuration</a> <span class="breadcrumb-sep">›</span> <a href="#configuration/roles">Roles</a> <span class="breadcrumb-sep">›</span> ' + esc(role) + '</nav>' +
       '<header class="page-header">' +
       '  <div><h2>' + esc(role) + ' members</h2></div>' +
       (isSuper ? '<div class="header-actions"><button class="btn-primary" id="rmm-grant">Grant role</button></div>' : '') +
@@ -178,5 +178,5 @@
 
   function normalize(s) { return String(s || '').toLowerCase().replace(/s$/, ''); }
   function esc(s) { return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s); }
-  if (global.AuroraRouter) global.AuroraRouter.register('settingsRolesMembers', { mount: mount });
+  if (global.AuroraRouter) global.AuroraRouter.register('configRolesMembers', { mount: mount });
 })(window);

@@ -1,4 +1,4 @@
-// Settings → Roles page (route: #settings/roles).
+// Configuration → Roles page (route: #configuration/roles).
 // Per docs/AURORA_ADMIN_UI_DESIGN.md §5.5.3.
 
 (function (global) {
@@ -36,7 +36,7 @@
     const session = global.AuroraSession;
     const isSuper = session && session.hasRole('superadmin');
     container.innerHTML =
-      '<nav class="breadcrumb"><a href="#settings/roles">Settings</a> <span class="breadcrumb-sep">›</span> Roles</nav>' +
+      '<nav class="breadcrumb"><a href="#configuration/roles">Configuration</a> <span class="breadcrumb-sep">›</span> Roles</nav>' +
       '<header class="page-header"><div><h2>Roles</h2><p class="page-subtitle">Authority tiers and current members</p></div></header>' +
       '<div id="roles-list"><p class="empty-state">Loading…</p></div>';
     try {
@@ -93,7 +93,7 @@
               members.slice(0, 12).map((m) => renderMemberRow(m, memberSlug, isSuper, operatorDid)).join(' ')) +
              '</div>' +
              '<div class="action-panel-buttons" style="justify-content: flex-start; gap: 0.5rem;">' +
-             (members.length > 12 ? '<a class="btn-sm btn-secondary" href="#settings/roles/' + encodeURIComponent(memberSlug) + '">View all</a>' : '') +
+             (members.length > 12 ? '<a class="btn-sm btn-secondary" href="#configuration/roles/' + encodeURIComponent(memberSlug) + '">View all</a>' : '') +
              (isSuper ? '<button class="btn-sm btn-primary" data-grant="' + esc(memberSlug) + '">Grant role</button>' : '') +
              '</div>' +
              '</div>';
@@ -232,5 +232,5 @@
   }
 
   function esc(s) { return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s); }
-  if (global.AuroraRouter) global.AuroraRouter.register('settingsRoles', { mount: mount });
+  if (global.AuroraRouter) global.AuroraRouter.register('configRoles', { mount: mount });
 })(window);

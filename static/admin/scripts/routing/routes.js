@@ -49,13 +49,28 @@
     { pattern: 'ops/rate-limits', page: 'opsRateLimits', requires: 'admin' },
     { pattern: 'ops/system-health', page: 'opsSystemHealth', requires: 'admin' },
 
-    // Settings domain
-    { pattern: 'settings', page: 'settingsGeneral' }, // default settings view
-    { pattern: 'settings/general', page: 'settingsGeneral', requires: 'admin' },
-    { pattern: 'settings/ui-modes', page: 'settingsUiModes' },
-    { pattern: 'settings/roles', page: 'settingsRoles', requires: 'moderator' },
-    { pattern: 'settings/roles/:role', page: 'settingsRolesMembers', requires: 'moderator' },
-    { pattern: 'settings/capabilities', page: 'settingsCapabilities' },
+    // Configuration domain (was Settings — renamed in v0.9 per §5.5/§5.7.2).
+    // The six policy/observability pages carry placeholder content from
+    // Arc G until their backends land; Themes is owned by Arc B. Arc A
+    // owns only the route definitions here.
+    { pattern: 'configuration', page: 'configGeneral', requires: 'admin' }, // default configuration view
+    { pattern: 'configuration/general', page: 'configGeneral', requires: 'admin' },
+    { pattern: 'configuration/themes', page: 'configThemes', requires: 'admin' },
+    { pattern: 'configuration/ui-modes', page: 'configUiModes' },
+    { pattern: 'configuration/federation-policy', page: 'configFederationPolicy', requires: 'superadmin' },
+    { pattern: 'configuration/registration-policy', page: 'configRegistrationPolicy', requires: 'superadmin' },
+    { pattern: 'configuration/moderation-policy', page: 'configModerationPolicy', requires: 'superadmin' },
+    { pattern: 'configuration/kryphocron-policy', page: 'configKryphocronPolicy', requires: 'superadmin' },
+    { pattern: 'configuration/integration-hooks', page: 'configIntegrationHooks', requires: 'superadmin' },
+    { pattern: 'configuration/observability', page: 'configObservability', requires: 'superadmin' },
+    { pattern: 'configuration/roles', page: 'configRoles', requires: 'moderator' },
+    { pattern: 'configuration/roles/:role', page: 'configRolesMembers', requires: 'moderator' },
+    { pattern: 'configuration/capabilities', page: 'configCapabilities' },
+
+    // Kryphocron domain — full pages ship in Arc D (0.9.1). 0.9.0 carries
+    // the group label plus a single stub child so the IA shape is stable
+    // from 0.9.0 forward (§5.7.4 / kickoff item 1 default).
+    { pattern: 'kryphocron', page: 'kryphocronStub', requires: 'moderator' },
   ];
 
   // Legacy hash redirects per §12.8. Operators with bookmarks pointing
@@ -65,10 +80,18 @@
     'moderation': 'mod/queue',
     'reports': 'mod/reports',
     'invites': 'ops/invites',
-    'settings': 'settings/general',
     'events': 'mod/events',
     'appeals': 'mod/appeals',
     'audit': 'mod/audit',
+    // v0.9 settings → configuration rename. Operators with v0.2-era
+    // bookmarks at any settings.* hash land on the configuration
+    // equivalent. applyLegacyRedirect (router.js) matches the full hash
+    // path, so the multi-segment keys below resolve exactly.
+    'settings': 'configuration/general',
+    'settings/general': 'configuration/general',
+    'settings/ui-modes': 'configuration/ui-modes',
+    'settings/roles': 'configuration/roles',
+    'settings/capabilities': 'configuration/capabilities',
   };
 
   // Sidebar nav structure per §4.1.
@@ -103,12 +126,31 @@
       ],
     },
     {
-      heading: 'Settings',
+      heading: 'Configuration',
       items: [
-        { label: 'General', route: 'settings/general', icon: 'settings', requires: 'admin' },
-        { label: 'UI & modes', route: 'settings/ui-modes', icon: 'sliders' },
-        { label: 'Roles', route: 'settings/roles', icon: 'key', requires: 'moderator' },
-        { label: 'Capabilities', route: 'settings/capabilities', icon: 'plug' },
+        { label: 'General', route: 'configuration/general', icon: 'settings', requires: 'admin' },
+        { label: 'Themes', route: 'configuration/themes', icon: 'monitor', requires: 'admin' },
+        { label: 'UI & modes', route: 'configuration/ui-modes', icon: 'sliders' },
+        { label: 'Federation policy', route: 'configuration/federation-policy', icon: 'network', requires: 'superadmin' },
+        { label: 'Registration policy', route: 'configuration/registration-policy', icon: 'inbox', requires: 'superadmin' },
+        { label: 'Moderation policy', route: 'configuration/moderation-policy', icon: 'shield-check', requires: 'superadmin' },
+        { label: 'Kryphocron policy', route: 'configuration/kryphocron-policy', icon: 'eye-off', requires: 'superadmin' },
+        { label: 'Integration hooks', route: 'configuration/integration-hooks', icon: 'external-link', requires: 'superadmin' },
+        { label: 'Observability', route: 'configuration/observability', icon: 'eye', requires: 'superadmin' },
+        { label: 'Roles', route: 'configuration/roles', icon: 'key', requires: 'moderator' },
+        { label: 'Capabilities', route: 'configuration/capabilities', icon: 'plug' },
+      ],
+    },
+    {
+      // Kryphocron domain pages ship in Arc D (0.9.1). 0.9.0 renders the
+      // group label plus one "Available in 0.9.1" stub child so the IA
+      // shape is stable from 0.9.0. Mode-aware visibility per §5.7.4 is
+      // wired in the A-mode-gating pass; here the group is role-gated to
+      // Moderator+ (the lowest tier that sees Kryphocron once Arc D lands).
+      heading: 'Kryphocron',
+      requires: 'moderator',
+      items: [
+        { label: 'Overview', route: 'kryphocron', icon: 'eye-off' },
       ],
     },
   ];

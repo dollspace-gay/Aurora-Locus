@@ -1,4 +1,4 @@
-// Settings → UI & modes page (route: #settings/ui-modes).
+// Configuration → UI & modes page (route: #configuration/ui-modes).
 // Per docs/AURORA_ADMIN_UI_DESIGN.md §5.5.2.
 
 (function (global) {
@@ -29,7 +29,7 @@
     const session = global.AuroraSession;
     const isSuper = session && session.hasRole('superadmin');
     container.innerHTML =
-      '<nav class="breadcrumb"><a href="#settings/ui-modes">Settings</a> <span class="breadcrumb-sep">›</span> UI & modes</nav>' +
+      '<nav class="breadcrumb"><a href="#configuration/ui-modes">Configuration</a> <span class="breadcrumb-sep">›</span> UI & modes</nav>' +
       '<header class="page-header"><div><h2>UI & modes</h2><p class="page-subtitle">Theme, language, deployment moderation mode</p></div></header>' +
       '<div class="settings-grid">' +
       '  <div class="settings-card">' +
@@ -135,5 +135,5 @@
     }
   }
 
-  if (global.AuroraRouter) global.AuroraRouter.register('settingsUiModes', { mount: mount });
+  if (global.AuroraRouter) global.AuroraRouter.register('configUiModes', { mount: mount });
 })(window);
