@@ -9,6 +9,33 @@
   let lastFilters = {};
   let subscription = null;
 
+  // url-state wiring (§5.7.5) — see Reports.js for the shared shape.
+  // verifiedOnly is a boolean filter (applied client-side post-fetch).
+  const SCALAR_KEYS = ['actor', 'subject', 'subjectCid', 'action'];
+  const BOOL_KEYS = ['verifiedOnly'];
+
+  function readFilters(defaults) {
+    const u = global.AuroraUrlState ? global.AuroraUrlState.read() : {};
+    const f = Object.assign({}, defaults || {});
+    for (const k of SCALAR_KEYS) { if (u[k]) f[k] = u[k]; }
+    for (const k of BOOL_KEYS) { if (u[k]) f[k] = true; }
+    if (u.since || u.until) {
+      f.when = { start: u.since ? new Date(u.since) : null, end: u.until ? new Date(u.until) : null };
+    }
+    return f;
+  }
+
+  function applyFilters(vals) {
+    const when = (vals && vals.when) || (lastFilters && lastFilters.when) || null;
+    const u = {};
+    for (const k of SCALAR_KEYS) { if (vals[k]) u[k] = vals[k]; }
+    for (const k of BOOL_KEYS) { if (vals[k]) u[k] = '1'; }
+    if (when && when.start) u.since = when.start.toISOString();
+    if (when && when.end) u.until = when.end.toISOString();
+    if (global.AuroraUrlState) global.AuroraUrlState.write(u);
+    else { lastFilters = vals; cursorStack = []; nextCursor = null; refresh(null); }
+  }
+
   async function mount({ container }) {
     container.innerHTML =
       '<header class="page-header">' +
@@ -20,11 +47,12 @@
       '</header>' +
       '<div id="audit-chain-detail" class="chain-indicator-detail" hidden></div>' +
       '<div id="audit-filter"></div>' +
+      '<p class="filter-url-hint">Filters appear in your URL — copy the address to share or bookmark this view.</p>' +
       '<div id="audit-table-container"></div>' +
       '<div id="audit-pagination"></div>';
     cursorStack = [];
     nextCursor = null;
-    lastFilters = {};
+    lastFilters = readFilters({});
     if (global.AuroraFilterStrip) {
       global.AuroraFilterStrip.build({
         container: document.getElementById('audit-filter'),
@@ -36,7 +64,8 @@
           { type: 'checkbox', id: 'verifiedOnly', label: 'Verified only' },
           { type: 'dateRange', id: 'when', label: 'Date range' },
         ],
-        onApply: (vals) => { lastFilters = vals; cursorStack = []; nextCursor = null; refresh(null); },
+        initial: lastFilters,
+        onApply: applyFilters,
       });
     }
     await refresh(null);

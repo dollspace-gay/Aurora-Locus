@@ -1051,6 +1051,14 @@ input[type="checkbox"][disabled] {
   flex-wrap: wrap;
 }
 
+/* "Filters appear in your URL" hint (§5.7.5) — sets the expectation that
+   the filtered view is shareable via the address bar. */
+.filter-url-hint {
+  margin-block: calc(-1 * var(--space-2)) var(--space-4);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
 .filter-bar input[type="text"],
 .filter-bar select {
   flex: 1;

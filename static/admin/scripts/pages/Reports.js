@@ -9,18 +9,50 @@
   let nextCursor = null;
   let lastFilters = {};
 
+  // url-state wiring (§5.7.5). Scalar filters round-trip through the hash
+  // query; the dateRange `when` round-trips as since/until ISO scalars
+  // (FilterStrip can't restore the date *chip* from initial, but the
+  // filter still applies and is preserved across applies). applyFilters
+  // writes the query, which remounts the page → readFilters re-seeds.
+  const SCALAR_KEYS = ['status', 'reporter', 'subject'];
+  const BOOL_KEYS = [];
+
+  function readFilters(defaults) {
+    const u = global.AuroraUrlState ? global.AuroraUrlState.read() : {};
+    const f = Object.assign({}, defaults || {});
+    for (const k of SCALAR_KEYS) { if (u[k]) f[k] = u[k]; }
+    for (const k of BOOL_KEYS) { if (u[k]) f[k] = true; }
+    if (u.since || u.until) {
+      f.when = { start: u.since ? new Date(u.since) : null, end: u.until ? new Date(u.until) : null };
+    }
+    return f;
+  }
+
+  function applyFilters(vals) {
+    const when = (vals && vals.when) || (lastFilters && lastFilters.when) || null;
+    const u = {};
+    for (const k of SCALAR_KEYS) { if (vals[k]) u[k] = vals[k]; }
+    for (const k of BOOL_KEYS) { if (vals[k]) u[k] = '1'; }
+    if (when && when.start) u.since = when.start.toISOString();
+    if (when && when.end) u.until = when.end.toISOString();
+    if (global.AuroraUrlState) global.AuroraUrlState.write(u);
+    else { lastFilters = vals; cursorStack = []; nextCursor = null; refresh(null); }
+  }
+
   async function mount({ container }) {
     container.innerHTML =
       '<header class="page-header">' +
       '  <div><h2>Reports</h2><p class="page-subtitle">Content reports</p></div>' +
       '</header>' +
       '<div id="reports-filter"></div>' +
+      '<p class="filter-url-hint">Filters appear in your URL — copy the address to share or bookmark this view.</p>' +
       '<div id="reports-bulk-bar"></div>' +
       '<div class="reports-list" id="reports-items"></div>' +
       '<div id="reports-pagination"></div>';
     bulkSelected = new Set();
     cursorStack = [];
     nextCursor = null;
+    lastFilters = readFilters({ status: 'open' });
     if (global.AuroraFilterStrip) {
       global.AuroraFilterStrip.build({
         container: document.getElementById('reports-filter'),
@@ -34,11 +66,10 @@
           { type: 'text', id: 'subject', placeholder: 'Subject DID' },
           { type: 'dateRange', id: 'when', label: 'Date range' },
         ],
-        initial: { status: 'open' },
-        onApply: (vals) => { lastFilters = vals; cursorStack = []; nextCursor = null; refresh(null); },
+        initial: lastFilters,
+        onApply: applyFilters,
       });
     }
-    lastFilters = { status: 'open' };
     await refresh(null);
     return { unmount: () => { bulkSelected = new Set(); } };
   }
