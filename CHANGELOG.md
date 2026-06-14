@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- A-debt-auth — §8.1.1 token rename + §8.1.4 authHeaders + §8.1.5 endpoints fold-in (#202)
 - A-urlstate — url-state.js substrate + list-page consumers + tooltip (item 9) (#200)
 - A-dashboard — de-tab → role-tiered composition + §10.1.3/§10.1.5 (item 6) (#199)
 - A-phaseb — construct Arc A Phase B harness (docs/internal/v09-phase-b/arc-a.md) (#206)
