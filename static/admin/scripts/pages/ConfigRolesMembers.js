@@ -38,7 +38,7 @@
       '</header>' +
       '<div class="table-card">' +
       '  <table class="data-table">' +
-      '    <thead><tr><th>Handle</th><th>DID</th><th>Granted</th><th>Granted by</th><th>Actions</th></tr></thead>' +
+      '    <thead><tr><th>Account</th><th>DID</th><th>Granted</th><th>Granted by</th><th>Actions</th></tr></thead>' +
       '    <tbody id="rmm-table"><tr><td colspan="5"><p class="empty-state">Loading…</p></td></tr></tbody>' +
       '  </table>' +
       '</div>';
@@ -52,12 +52,27 @@
   async function refresh(role, isSuper) {
     const ep = global.AuroraEndpoints;
     if (!ep) return;
+    // Operator's own DID — drives the self-revoke guard (§9.1). Falls back
+    // to '' (no match) until the session hydrates; the server-side check is
+    // the authoritative guardrail, this is a UX nudge. Mirrors the inline
+    // guard in ConfigRoles.renderMemberRow (duplicated per the codebase's
+    // anti-restructuring convention, like tierToRoleString above, rather
+    // than a shared helper).
+    const session = global.AuroraSession;
+    const operatorDid = (session && session.user() && session.user().did) || '';
+    const tbody = document.getElementById('rmm-table');
     try {
+      // Canonical wire shape (§9.1): com.atproto.admin.listRoles returns a
+      // FLAT list of active assignments — {roles: [{did, role, granted_by,
+      // granted_at, ...}]} in snake_case (src/admin/roles.rs AdminRole),
+      // with NO per-row handle and NO nested members. The handler also
+      // ignores the `role` query param (it gates only on `did`), so filter
+      // by tier here, client-side. ConfigRoles reads the same flat shape.
+      // Backend gaps (handle enrichment, honoring the role filter) are
+      // tracked as separate backend tickets — see #203.
       const data = await ep.atproto.listRoles({ role: role, limit: 100 });
       const allRoles = (data && data.roles) || [];
-      const target = allRoles.find((r) => normalize(r.name || r.role) === normalize(role));
-      const members = target ? (target.members || []) : (data && data.members) || [];
-      const tbody = document.getElementById('rmm-table');
+      const members = allRoles.filter((r) => normalize(r.role) === normalize(role));
       if (members.length === 0) {
         tbody.innerHTML = '<tr><td colspan="5">' +
           (global.AuroraEmptyState ? global.AuroraEmptyState.render({ icon: 'users', primary: 'No members yet.' }) :
@@ -65,22 +80,27 @@
         return;
       }
       const fmt = global.AuroraFormat;
-      tbody.innerHTML = members.map((m) =>
-        '<tr>' +
-        '<td>' + (global.AuroraEntityRef ? global.AuroraEntityRef.account(m.did, m.handle) : '@' + esc(m.handle || m.did)) + '</td>' +
-        '<td><code>' + esc(global.AuroraEntityRef ? global.AuroraEntityRef.shortDid(m.did) : m.did) + '</code></td>' +
-        '<td>' + esc(fmt && m.grantedAt ? fmt.date(m.grantedAt, 'short') : '—') + '</td>' +
-        '<td>' + (m.grantedBy ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(m.grantedBy) : esc(m.grantedBy)) : '—') + '</td>' +
-        '<td>' + (isSuper ? '<button class="btn-sm btn-danger" data-revoke="' + esc(m.did) + '">Revoke</button>' : '—') + '</td>' +
-        '</tr>'
-      ).join('');
+      const ref = global.AuroraEntityRef;
+      tbody.innerHTML = members.map((m) => {
+        const isSelf = operatorDid && m.did === operatorDid;
+        return '<tr>' +
+          '<td>' + (ref ? ref.account(m.did) : '@' + esc(m.did)) + '</td>' +
+          '<td><code>' + esc(ref ? ref.shortDid(m.did) : m.did) + '</code></td>' +
+          '<td>' + esc(fmt && m.granted_at ? fmt.date(m.granted_at, 'short') : '—') + '</td>' +
+          '<td>' + (m.granted_by ? (ref ? ref.account(m.granted_by) : esc(m.granted_by)) : '—') + '</td>' +
+          '<td>' + (isSuper
+            ? '<button class="btn-sm btn-danger" data-revoke="' + esc(m.did) + '"' +
+              (isSelf ? ' disabled title="You cannot revoke your own role"' : '') + '>Revoke</button>'
+            : '—') + '</td>' +
+          '</tr>';
+      }).join('');
       if (isSuper) {
         tbody.querySelectorAll('[data-revoke]').forEach((btn) => {
+          if (btn.disabled) return;
           btn.addEventListener('click', () => revoke(role, btn.dataset.revoke));
         });
       }
     } catch (e) {
-      const tbody = document.getElementById('rmm-table');
       if (tbody) tbody.innerHTML = '<tr><td colspan="5"><p class="empty-state">Could not load members: ' + esc(e && e.message) + '</p></td></tr>';
     }
   }
