@@ -87,5 +87,24 @@
     window.location.hash = target;
   }
 
-  global.AuroraUrlState = { read: read, write: write, clear: clear };
+  // Like write(), but updates the URL via history.replaceState — no
+  // hashchange fires, so the page does NOT remount. For live-search
+  // consumers (e.g. Accounts) where the remount write() triggers would
+  // destroy the focused input mid-typing. Trade-off: no per-change history
+  // entry, so back/forward won't step through incremental search states —
+  // which is the right behaviour for as-you-type search.
+  function replace(filters) {
+    const target = targetFor(filters);
+    const current = '#' + rawHash().replace(/^#\/?/, '');
+    if (current === target) return;
+    try {
+      window.history.replaceState(null, '', target);
+    } catch (e) {
+      // Older browsers without replaceState — fall back to a hash set
+      // (this does remount, but it's a rare path).
+      window.location.hash = target.slice(1);
+    }
+  }
+
+  global.AuroraUrlState = { read: read, write: write, replace: replace, clear: clear };
 })(window);

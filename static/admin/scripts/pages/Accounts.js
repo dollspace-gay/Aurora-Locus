@@ -14,6 +14,10 @@
     container.innerHTML = renderShell();
     bulkSelected = new Set();
     const search = container.querySelector('#account-search');
+    // url-state (§5.7.5): seed the search box from the hash query so a
+    // pasted/bookmarked #ops/accounts?q=… restores the filtered view.
+    const urlF = global.AuroraUrlState ? global.AuroraUrlState.read() : {};
+    if (search && urlF.q) search.value = urlF.q;
     if (search) search.addEventListener('input', debounce(refresh, 400));
     await refresh();
 
@@ -30,6 +34,7 @@
            '    <input type="text" class="search-input" id="account-search" placeholder="Search by handle, DID, or email">' +
            '  </div>' +
            '</header>' +
+           '<p class="filter-url-hint">Your search appears in the URL — copy the address to share or bookmark this view.</p>' +
            '<div id="accounts-bulk-bar"></div>' +
            '<div class="table-card">' +
            '  <table class="data-table">' +
@@ -49,6 +54,10 @@
     if (!tbody) return;
     const search = document.getElementById('account-search');
     const q = search && search.value.trim();
+    // Sync the query into the URL without a remount (replaceState) — a
+    // remount would drop focus mid-typing in this live-search box. This is
+    // why Accounts uses replace() rather than the FilterStrip pages' write().
+    if (global.AuroraUrlState) global.AuroraUrlState.replace(q ? { q: q } : {});
     let accounts = [];
     try {
       const data = q
