@@ -25,15 +25,17 @@
 // Chart.js instances, which retires the v0.8 "charts don't repaint"
 // debt (§10.1.3) and the synthetic user-growth series by construction.
 //
-// i18n: operator strings here are English literals, consistent with the
-// rest of the page substrate; routing the new v0.9 pages through t() is
-// the dedicated A-i18n-readiness pass (#205), not this composition pass.
+// i18n (§10.3.2): operator-facing strings route through t() against the
+// dashboard.* keys in i18n/en.json. English ships now; future locales are
+// a routing exercise, not a per-string retrofit.
 
 (function (global) {
   'use strict';
 
   let pollHandle = null;
   let metricsTimeRange = 'last_30d';
+
+  function T(key, params) { return global.t ? global.t(key, params) : key; }
 
   function metricsGranularityFor(preset) {
     switch (preset) {
@@ -64,6 +66,11 @@
   function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = String(v); }
   function setHtml(id, html) { const el = document.getElementById(id); if (el) el.innerHTML = html; }
   function fmt() { return global.AuroraFormat; }
+  function loadingState() {
+    return global.AuroraEmptyState
+      ? global.AuroraEmptyState.render({ icon: 'inbox', primary: T('dashboard.loading') })
+      : esc(T('dashboard.loading'));
+  }
 
   // --- The block registry. Each block: visible(c) gate, html() initial
   //     markup, refresh(ep) data pull. mount() renders visible blocks
@@ -92,7 +99,7 @@
         try {
           const v = await ep.ops.getVersionInfo();
           const ver = (v && (v.version || v.aurora_locus_version || v.serviceVersion)) || '';
-          if (ver) setText('dash-version', 'Aurora-Locus ' + ver);
+          if (ver) setText('dash-version', T('dashboard.version_prefix', { version: ver }));
         } catch (e) { /* leave version blank */ }
       },
     },
@@ -101,10 +108,8 @@
       visible: () => true,
       html: () =>
         '<section class="dash-block activity-card" id="dash-recent">' +
-        '  <h3>Recent activity</h3>' +
-        '  <div class="activity-list" id="dash-recent-list">' +
-        (global.AuroraEmptyState ? global.AuroraEmptyState.render({ icon: 'inbox', primary: 'Loading…' }) : 'Loading…') +
-        '  </div>' +
+        '  <h3>' + esc(T('dashboard.recent_activity')) + '</h3>' +
+        '  <div class="activity-list" id="dash-recent-list">' + loadingState() + '</div>' +
         '</section>',
       refresh: async (ep, c) => {
         let rows = [];
@@ -121,8 +126,8 @@
         if (!el) return;
         if (!rows.length) {
           el.innerHTML = global.AuroraEmptyState
-            ? global.AuroraEmptyState.render({ icon: 'inbox', primary: 'No recent activity' })
-            : '<p class="empty-state">No recent activity.</p>';
+            ? global.AuroraEmptyState.render({ icon: 'inbox', primary: T('dashboard.no_recent_activity') })
+            : '<p class="empty-state">' + esc(T('dashboard.no_recent_activity')) + '</p>';
           return;
         }
         const f = fmt();
@@ -147,12 +152,12 @@
       visible: (c) => c.isMod && c.full,
       html: () =>
         '<section class="dash-block" id="dash-modwork">' +
-        '  <h3>Moderation work</h3>' +
+        '  <h3>' + esc(T('dashboard.modwork_title')) + '</h3>' +
         '  <div class="stats-grid">' +
-        statCard('inbox', 'Open reports', 'dash-open-reports', '0', '#mod/reports') +
-        statCard('scale', 'Pending appeals', 'dash-pending-appeals', '0', '#mod/appeals') +
-        statCard('clock', 'Oldest open report', 'dash-oldest-age', '—', '#mod/queue') +
-        statCard('gauge', 'Avg time to resolve', 'dash-avg-age', '—', '#mod/queue') +
+        statCard('inbox', T('dashboard.stat_open_reports'), 'dash-open-reports', '0', '#mod/reports') +
+        statCard('scale', T('dashboard.stat_pending_appeals'), 'dash-pending-appeals', '0', '#mod/appeals') +
+        statCard('clock', T('dashboard.stat_oldest_report'), 'dash-oldest-age', '—', '#mod/queue') +
+        statCard('gauge', T('dashboard.stat_avg_resolve'), 'dash-avg-age', '—', '#mod/queue') +
         '  </div>' +
         '</section>',
       refresh: async (ep) => {
@@ -173,19 +178,17 @@
       html: () =>
         '<section class="dash-block activity-card" id="dash-modmetrics">' +
         '  <div class="metrics-header">' +
-        '    <h3>Moderation activity</h3>' +
-        '    <label class="metrics-range-label" for="dash-metrics-range">Time range' +
+        '    <h3>' + esc(T('dashboard.modactivity_title')) + '</h3>' +
+        '    <label class="metrics-range-label" for="dash-metrics-range">' + esc(T('dashboard.time_range')) +
         '      <select id="dash-metrics-range" class="metrics-range-select">' +
-        '        <option value="last_hour">Last hour</option>' +
-        '        <option value="last_24h">Last 24 hours</option>' +
-        '        <option value="last_7d">Last 7 days</option>' +
-        '        <option value="last_30d" selected>Last 30 days</option>' +
+        '        <option value="last_hour">' + esc(T('dashboard.range_last_hour')) + '</option>' +
+        '        <option value="last_24h">' + esc(T('dashboard.range_last_24h')) + '</option>' +
+        '        <option value="last_7d">' + esc(T('dashboard.range_last_7d')) + '</option>' +
+        '        <option value="last_30d" selected>' + esc(T('dashboard.range_last_30d')) + '</option>' +
         '      </select>' +
         '    </label>' +
         '  </div>' +
-        '  <div id="dash-metrics-body">' +
-        (global.AuroraEmptyState ? global.AuroraEmptyState.render({ icon: 'inbox', primary: 'Loading…' }) : 'Loading…') +
-        '  </div>' +
+        '  <div id="dash-metrics-body">' + loadingState() + '</div>' +
         '</section>',
       refresh: async (ep) => {
         wireMetricsRange();
@@ -208,12 +211,12 @@
       visible: (c) => c.isAdmin && c.notDisabled,
       html: () =>
         '<section class="dash-block" id="dash-overview">' +
-        '  <h3>Deployment overview</h3>' +
+        '  <h3>' + esc(T('dashboard.overview_title')) + '</h3>' +
         '  <div class="stats-grid">' +
-        statCard('users', 'Accounts', 'dash-ov-accounts', '0', '#ops/accounts') +
-        statCard('file-text', 'Records', 'dash-ov-records', '0', null) +
-        statCard('image', 'Storage', 'dash-ov-storage', '0 GB', '#ops/blob-ops') +
-        statCard('shield-alert', 'Open reports', 'dash-ov-reports', '0', '#mod/reports') +
+        statCard('users', T('dashboard.stat_accounts'), 'dash-ov-accounts', '0', '#ops/accounts') +
+        statCard('file-text', T('dashboard.stat_records'), 'dash-ov-records', '0', null) +
+        statCard('image', T('dashboard.stat_storage'), 'dash-ov-storage', '0 GB', '#ops/blob-ops') +
+        statCard('shield-alert', T('dashboard.stat_open_reports'), 'dash-ov-reports', '0', '#mod/reports') +
         '  </div>' +
         '</section>',
       refresh: async (ep) => {
@@ -241,19 +244,18 @@
       html: () =>
         '<section class="dash-block" id="dash-health">' +
         '  <div class="metrics-header">' +
-        '    <h3>System health</h3>' +
-        '    <a class="btn-sm btn-secondary" href="#ops/system-health">Details</a>' +
+        '    <h3>' + esc(T('dashboard.health_title')) + '</h3>' +
+        '    <a class="btn-sm btn-secondary" href="#ops/system-health">' + esc(T('dashboard.health_details')) + '</a>' +
         '  </div>' +
-        '  <div id="dash-health-body"><p class="empty-state">Loading…</p></div>' +
+        '  <div id="dash-health-body"><p class="empty-state">' + esc(T('dashboard.loading')) + '</p></div>' +
         '</section>',
       refresh: async (ep) => {
         try {
           const h = await ep.ops.getSystemHealth();
           const overall = (h && (h.status || h.overall || h.overallStatus)) || 'unknown';
           const badge = global.AuroraStatusBadge ? global.AuroraStatusBadge.render(overall) : esc(overall);
-          // Surface any subsystem map defensively (name → status).
           const subs = (h && (h.subsystems || h.components)) || null;
-          let body = '<p>Overall: ' + badge + '</p>';
+          let body = '<p>' + esc(T('dashboard.health_overall')) + ': ' + badge + '</p>';
           if (subs && typeof subs === 'object') {
             const items = Array.isArray(subs)
               ? subs.map((s) => [s.name || s.subsystem || '?', s.status || '?'])
@@ -265,7 +267,8 @@
           }
           setHtml('dash-health-body', body);
         } catch (e) {
-          setHtml('dash-health-body', '<p class="empty-state">Health data unavailable. <a href="#ops/system-health">Open System health</a>.</p>');
+          setHtml('dash-health-body', '<p class="empty-state">' + esc(T('dashboard.health_unavailable')) +
+            ' <a href="#ops/system-health">' + esc(T('dashboard.health_open')) + '</a></p>');
         }
       },
     },
@@ -274,10 +277,10 @@
       visible: (c) => c.isAdmin && c.notDisabled,
       html: () =>
         '<section class="dash-block" id="dash-kryphocron">' +
-        '  <h3>Kryphocron</h3>' +
+        '  <h3>' + esc(T('dashboard.kryphocron_title')) + '</h3>' +
         '  <div class="empty-state" role="status">' +
-        '    <p>The Kryphocron summary arrives with the Kryphocron domain in 0.9.1. ' +
-        '       <a href="#kryphocron">Preview</a>.</p>' +
+        '    <p>' + esc(T('dashboard.kryphocron_blurb')) +
+        '       <a href="#kryphocron">' + esc(T('dashboard.kryphocron_preview')) + '</a></p>' +
         '  </div>' +
         '</section>',
       refresh: async () => { /* Arc D wires the summary endpoints (§6.9). */ },
@@ -288,11 +291,11 @@
       html: () =>
         '<section class="dash-block activity-card" id="dash-adminactions">' +
         '  <div class="metrics-header">' +
-        '    <h3>Recent administrative actions</h3>' +
-        '    <a class="btn-sm btn-secondary" href="#mod/audit">Audit trail</a>' +
+        '    <h3>' + esc(T('dashboard.adminactions_title')) + '</h3>' +
+        '    <a class="btn-sm btn-secondary" href="#mod/audit">' + esc(T('dashboard.audit_trail')) + '</a>' +
         '  </div>' +
         '  <div class="activity-list" id="dash-adminactions-list">' +
-        '    <p class="empty-state">Loading…</p>' +
+        '    <p class="empty-state">' + esc(T('dashboard.loading')) + '</p>' +
         '  </div>' +
         '</section>',
       refresh: async (ep) => {
@@ -303,8 +306,8 @@
           if (!el) return;
           if (!rows.length) {
             el.innerHTML = global.AuroraEmptyState
-              ? global.AuroraEmptyState.render({ icon: 'inbox', primary: 'No recent administrative actions' })
-              : '<p class="empty-state">None.</p>';
+              ? global.AuroraEmptyState.render({ icon: 'inbox', primary: T('dashboard.no_admin_actions') })
+              : '<p class="empty-state">' + esc(T('dashboard.no_admin_actions')) + '</p>';
             return;
           }
           const f = fmt();
@@ -323,7 +326,7 @@
               : '<div class="activity-item">' + inner + '</div>';
           }).join('');
         } catch (e) {
-          setHtml('dash-adminactions-list', '<p class="empty-state">Audit data unavailable.</p>');
+          setHtml('dash-adminactions-list', '<p class="empty-state">' + esc(T('dashboard.audit_unavailable')) + '</p>');
         }
       },
     },
@@ -332,8 +335,8 @@
       visible: (c) => c.isSuper && c.notDisabled,
       html: () =>
         '<section class="dash-block" id="dash-drift">' +
-        '  <h3>Configuration posture</h3>' +
-        '  <div id="dash-drift-body"><p class="empty-state">Loading…</p></div>' +
+        '  <h3>' + esc(T('dashboard.drift_title')) + '</h3>' +
+        '  <div id="dash-drift-body"><p class="empty-state">' + esc(T('dashboard.loading')) + '</p></div>' +
         '</section>',
       refresh: async (ep) => {
         // Best-effort drift signal: surface high-impact runtime settings
@@ -346,15 +349,13 @@
           const source = (d && d.source) || 'Default';
           const overridden = source && source !== 'Default';
           setHtml('dash-drift-body',
-            '<p>Moderation mode: <strong>' + esc(value) + '</strong> ' +
-            '<span class="dash-source-tag">(' + esc(source) + ')</span></p>' +
+            '<p>' + esc(T('dashboard.drift_mode', { value: value })) + ' ' +
+            '<span class="dash-source-tag">' + esc(T('dashboard.drift_source', { source: source })) + '</span></p>' +
             '<p class="page-subtitle">' +
-            (overridden
-              ? 'This deployment is running a non-default value for a high-impact setting.'
-              : 'High-impact settings are at their defaults.') +
-            ' <a href="#configuration/general">Review configuration</a>.</p>');
+            esc(overridden ? T('dashboard.drift_overridden') : T('dashboard.drift_default')) +
+            ' <a href="#configuration/general">' + esc(T('dashboard.review_config')) + '</a></p>');
         } catch (e) {
-          setHtml('dash-drift-body', '<p class="empty-state">Configuration posture unavailable.</p>');
+          setHtml('dash-drift-body', '<p class="empty-state">' + esc(T('dashboard.posture_unavailable')) + '</p>');
         }
       },
     },
@@ -367,8 +368,8 @@
     activeBlocks = BLOCKS.filter((b) => b.visible(c));
     container.innerHTML =
       '<header class="page-header"><div>' +
-      '  <h2>Dashboard</h2>' +
-      '  <p class="page-subtitle">Overview of your deployment</p>' +
+      '  <h2>' + esc(T('dashboard.title')) + '</h2>' +
+      '  <p class="page-subtitle">' + esc(T('dashboard.subtitle')) + '</p>' +
       '</div></header>' +
       '<div class="dash-grid">' + activeBlocks.map((b) => b.html()).join('') + '</div>';
 
@@ -417,12 +418,15 @@
     if (!c) return;
     if (!data || !data.series || data.series.length === 0) {
       c.innerHTML = global.AuroraEmptyState
-        ? global.AuroraEmptyState.render({ icon: 'inbox', primary: 'No metrics available for this range.' })
-        : '<p class="empty-state">No metrics available.</p>';
+        ? global.AuroraEmptyState.render({ icon: 'inbox', primary: T('dashboard.metrics_none') })
+        : '<p class="empty-state">' + esc(T('dashboard.metrics_none')) + '</p>';
       return;
     }
     let html = '<table class="data-table"><thead><tr>' +
-               '<th>Metric</th><th>This period</th><th>Previous</th><th>Change</th></tr></thead><tbody>';
+               '<th>' + esc(T('dashboard.metric_col_metric')) + '</th>' +
+               '<th>' + esc(T('dashboard.metric_col_period')) + '</th>' +
+               '<th>' + esc(T('dashboard.metric_col_previous')) + '</th>' +
+               '<th>' + esc(T('dashboard.metric_col_change')) + '</th></tr></thead><tbody>';
     for (const s of data.series) {
       const aggregate = (s.aggregate || 0).toFixed(1);
       const prev = s.delta ? (s.delta.previousAggregate || 0).toFixed(1) : '—';
