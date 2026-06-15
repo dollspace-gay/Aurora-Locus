@@ -77,7 +77,7 @@
       const rationale = document.getElementById('apd-rationale').value.trim();
       if (!rationale) { global.AuroraToast.warning('Rationale is required.'); return; }
       try {
-        await global.AuroraClient.post('tools.aurora.moderator.resolveAppeal', {
+        await global.AuroraEndpoints.moderator.resolveAppeal({
           id: id, status: status, rationale: rationale,
         });
         global.AuroraToast.success('Appeal resolved.');

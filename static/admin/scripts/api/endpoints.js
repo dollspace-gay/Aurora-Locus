@@ -25,6 +25,7 @@
     disableInviteCodes: (body) => C().post('com.atproto.admin.disableInviteCodes', body),
     listRecentEvents: (params) => C().get('com.atproto.admin.listRecentEvents', params || { limit: 20 }),
     getRecord: (params) => C().get('com.atproto.repo.getRecord', params),
+    getReport: (params) => C().get('com.atproto.admin.getReport', params || {}),
     getSession: () => C().get('com.atproto.server.getSession'),
   };
 
@@ -49,6 +50,7 @@
     getAppeal: (id) => C().get('tools.aurora.moderator.getAppeal', { id: id }),
     getSubjectContext: (params) => C().get('tools.aurora.moderator.getSubjectContext', params || {}),
     getSubjectHistory: (params) => C().get('tools.aurora.moderator.getSubjectHistory', params || {}),
+    resolveAppeal: (body) => C().post('tools.aurora.moderator.resolveAppeal', body),
   };
 
   // -------- tools.aurora.ops.* --------
@@ -70,6 +72,18 @@
     listBackgroundJobs: () => C().get('tools.aurora.ops.listBackgroundJobs'),
     getNonceStoreStatus: () => C().get('tools.aurora.ops.getNonceStoreStatus'),
     getValidationFailures: (params) => C().get('tools.aurora.ops.getValidationFailures', params || {}),
+    // Control POSTs (§8.1.5 fold-in — were stringly-typed AuroraClient.post
+    // calls in the ops pages; registered here so every NSID has a named
+    // wrapper). All take an empty body today.
+    runBlobGC: () => C().post('tools.aurora.ops.runBlobGC', {}),
+    pauseSequencer: () => C().post('tools.aurora.ops.pauseSequencer', {}),
+    resumeSequencer: () => C().post('tools.aurora.ops.resumeSequencer', {}),
+    resetSequencerCursor: () => C().post('tools.aurora.ops.resetSequencerCursor', {}),
+    rebuildSequencer: () => C().post('tools.aurora.ops.rebuildSequencer', {}),
+    triggerPdsDiscovery: () => C().post('tools.aurora.ops.triggerPdsDiscovery', {}),
+    cleanupRateLimitState: () => C().post('tools.aurora.ops.cleanupRateLimitState', {}),
+    runHealthChecks: () => C().post('tools.aurora.ops.runHealthChecks', {}),
+    cleanupNonceStores: () => C().post('tools.aurora.ops.cleanupNonceStores', {}),
   };
 
   // -------- tools.aurora.superadmin.* --------

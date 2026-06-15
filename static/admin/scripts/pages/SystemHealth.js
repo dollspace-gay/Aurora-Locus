@@ -26,7 +26,7 @@
       '  </div>' +
       '</div>';
     document.getElementById('sh-checks').addEventListener('click', async () => {
-      try { await global.AuroraClient.post('tools.aurora.ops.runHealthChecks', {});
+      try { await global.AuroraEndpoints.ops.runHealthChecks();
             global.AuroraToast.success('Health checks scheduled.'); await refresh(); }
       catch (e) { global.AuroraToast.danger('Run failed: ' + (e && e.message)); }
     });
@@ -38,7 +38,7 @@
         submitLabel: 'Clean up',
       });
       if (!result.submitted) return;
-      try { await global.AuroraClient.post('tools.aurora.ops.cleanupNonceStores', {});
+      try { await global.AuroraEndpoints.ops.cleanupNonceStores();
             global.AuroraToast.success('Cleanup complete.'); await refresh(); }
       catch (e) { global.AuroraToast.danger('Cleanup failed: ' + (e && e.message)); }
     });

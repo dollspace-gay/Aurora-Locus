@@ -82,7 +82,7 @@
     });
     if (!result.confirmed) return;
     try {
-      await global.AuroraClient.post('tools.aurora.ops.' + nsidLeaf, {});
+      await global.AuroraEndpoints.ops[nsidLeaf]();
       global.AuroraToast.success('Action complete: ' + nsidLeaf);
       await refresh();
     } catch (e) {

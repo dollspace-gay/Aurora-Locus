@@ -12,7 +12,7 @@
       '<div id="rd-body"><p class="empty-state">Loading…</p></div>';
 
     try {
-      const data = await global.AuroraClient.get('com.atproto.admin.getReport', { id: id });
+      const data = await global.AuroraEndpoints.atproto.getReport({ id: id });
       renderBody(data);
     } catch (e) {
       document.getElementById('rd-body').innerHTML =

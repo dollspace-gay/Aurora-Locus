@@ -69,7 +69,7 @@
     });
     if (!result.submitted) return;
     try {
-      await global.AuroraClient.post('tools.aurora.ops.runBlobGC', {});
+      await global.AuroraEndpoints.ops.runBlobGC();
       global.AuroraToast.success('Blob GC started.');
       await refresh();
     } catch (e) {

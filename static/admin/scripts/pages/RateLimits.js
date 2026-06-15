@@ -25,7 +25,7 @@
       });
       if (!result.submitted) return;
       try {
-        await global.AuroraClient.post('tools.aurora.ops.cleanupRateLimitState', {});
+        await global.AuroraEndpoints.ops.cleanupRateLimitState();
         global.AuroraToast.success('Rate-limit state cleaned.');
         await refresh();
       } catch (e) {

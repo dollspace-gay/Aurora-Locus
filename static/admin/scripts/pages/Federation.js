@@ -65,7 +65,7 @@
 
   async function triggerDiscovery() {
     try {
-      await global.AuroraClient.post('tools.aurora.ops.triggerPdsDiscovery', {});
+      await global.AuroraEndpoints.ops.triggerPdsDiscovery();
       global.AuroraToast.success('Discovery triggered.');
       await refresh();
     } catch (e) {
