@@ -13,6 +13,7 @@
 //! (#214); step 10 (extension-point declarations) with the extension-point
 //! system (0.9.1). Each is appended to `validate` by its arc.
 
+pub mod contrast;
 pub mod manifest;
 
 use manifest::{ThemeManifest, SUBSTRATE_VERSION};
@@ -314,13 +315,26 @@ fn validate(theme: &DiscoveredTheme, by_id: &HashMap<String, DiscoveredTheme>) -
 
     // Step 7 — required-token completeness (own + inherited). Only meaningful
     // when the chain is sane (otherwise inheritance can't be resolved).
+    let mut required_complete = false;
     if chain_ok {
         let declared = collect_declared_tokens(&m.theme_id, by_id);
+        let before = errors.len();
         for tok in REQUIRED_TOKENS {
             if !declared.contains(*tok) {
                 errors.push(format!("theme.tokens.required.missing: {tok}"));
             }
         }
+        required_complete = errors.len() == before;
+    }
+
+    // Step 9 — WCAG 2.2 AA contrast (§11.10.3). Resolve the contrast-requiring
+    // token pairs to concrete colors through the chain and verify each meets
+    // its threshold (fail-closed). Skipped unless the chain resolves and every
+    // required token is present, since the resolved map would otherwise be
+    // incomplete and produce noise on top of the step-7 failures.
+    if chain_ok && required_complete {
+        let values = collect_declared_token_values(&m.theme_id, by_id);
+        errors.extend(contrast::verify(&values));
     }
 
     errors
@@ -391,6 +405,49 @@ fn collect_declared_tokens(start: &str, by_id: &HashMap<String, DiscoveredTheme>
     tokens
 }
 
+/// Collect every custom-property declaration's resolved *value* across a
+/// theme's chain (leaf-wins), for contrast verification. Within a single file
+/// the last declaration wins (CSS cascade); across the chain the leaf overrides
+/// its ancestors. Captures `--name: value` up to the next `;` or `}`; not a
+/// full CSS parse.
+fn collect_declared_token_values(
+    start: &str,
+    by_id: &HashMap<String, DiscoveredTheme>,
+) -> HashMap<String, String> {
+    let re = regex::Regex::new(r"(--[A-Za-z0-9_-]+)\s*:\s*([^;}]+)")
+        .expect("static token-decl regex compiles");
+    let mut values: HashMap<String, String> = HashMap::new();
+    let mut current = start.to_string();
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > MAX_CHAIN_DEPTH + 2 {
+            break;
+        }
+        let theme = match by_id.get(&current) {
+            Some(t) => t,
+            None => break,
+        };
+        let path = theme.dir.join(&theme.manifest.files.tokens);
+        if let Ok(css) = std::fs::read_to_string(&path) {
+            // Per-file last-wins, then merge into the accumulator without
+            // overwriting (leaf processed first → leaf wins across files).
+            let mut file_map: HashMap<String, String> = HashMap::new();
+            for cap in re.captures_iter(&css) {
+                file_map.insert(cap[1].to_string(), cap[2].trim().to_string());
+            }
+            for (k, v) in file_map {
+                values.entry(k).or_insert(v);
+            }
+        }
+        match &theme.manifest.extends {
+            Some(parent) => current = parent.clone(),
+            None => break,
+        }
+    }
+    values
+}
+
 /// Compare two `major.minor` version strings; `true` iff `a > b`. Unparseable
 /// components are treated as 0 (lenient — semver enforcement isn't the job).
 fn version_gt(a: &str, b: &str) -> bool {
@@ -425,10 +482,24 @@ mod tests {
         std::fs::write(dir.join("tokens.css"), tokens).unwrap();
     }
 
+    /// A contrast-passing palette covering all required tokens: backgrounds
+    /// (surfaces + accent-primary, which is the `text-inverted` backdrop) are
+    /// white, every color foreground is black (21:1), and non-color tokens get
+    /// a placeholder. Keeps validation fixtures valid under step 9.
     fn all_required_css() -> String {
         REQUIRED_TOKENS
             .iter()
-            .map(|t| format!("{t}: #000;"))
+            .map(|t| {
+                let val = match *t {
+                    "--color-surface-primary"
+                    | "--color-surface-secondary"
+                    | "--color-surface-tertiary"
+                    | "--color-accent-primary" => "#ffffff",
+                    x if x.starts_with("--color-") => "#000000",
+                    _ => "0",
+                };
+                format!("{t}: {val};")
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -507,6 +578,41 @@ mod tests {
         assert_eq!(reg.summary(), (0, 0));
         assert!(reg.resolve_token_css("aurora-default").is_none());
         assert!(reg.list().is_empty());
+    }
+
+    #[test]
+    fn low_contrast_theme_fails_validation() {
+        let bundled = tmp("lowcontrast");
+        // Start from the passing palette, then override text/surface to a
+        // near-isoluminant grey pair (well below the 7:1 requirement).
+        let mut css = all_required_css();
+        css.push_str("\n--color-text-primary: #999999;\n--color-surface-primary: #888888;");
+        write_theme(&bundled, ROOT_THEME_ID, None, &css);
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        assert_eq!(
+            reg.summary().1,
+            0,
+            "text/surface below WCAG AA fails step 9 (fail-closed)"
+        );
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    #[test]
+    fn contrast_resolves_through_var_inheritance() {
+        let bundled = tmp("varinherit");
+        // Root carries the passing palette. Child re-points text-primary at a
+        // var() that resolves (through the child's own declaration) to a color
+        // still meeting contrast against the inherited white surface.
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        write_theme(
+            &bundled,
+            "child",
+            Some(ROOT_THEME_ID),
+            "--ink: #111111;\n--color-text-primary: var(--ink);",
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        assert_eq!(reg.summary().1, 2, "var()-routed text resolves and passes");
+        let _ = std::fs::remove_dir_all(&bundled);
     }
 
     #[test]
