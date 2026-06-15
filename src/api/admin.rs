@@ -615,6 +615,12 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(crate::api::aurora_admin::set_runtime_setting),
             CapsBuilder::new(Family::Admin),
         )
+        // ---- v0.9 Arc B theming substrate (§11.10.2) ----
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.themes.listInstalled",
+            get(crate::api::aurora_admin::list_installed_themes),
+            CapsBuilder::new(Family::Admin).extensions(["themes-v1"]),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design

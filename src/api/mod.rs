@@ -58,6 +58,13 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
         .merge(blob::routes())
         .merge(identity::routes())
         .merge(admin_router)
+        // v0.9 Arc B — resolved active-theme token CSS (§11). Unauthenticated
+        // (loaded by the admin UI via a <link> tag); State<AppContext> for the
+        // theme registry.
+        .route(
+            "/theme/active.css",
+            axum::routing::get(crate::api::aurora_admin::serve_active_theme_css),
+        )
         .merge(sync::routes())
         .merge(firehose::routes())
         .merge(labels::routes())

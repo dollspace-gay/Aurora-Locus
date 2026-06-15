@@ -42,6 +42,9 @@ pub struct AppContext {
     pub label_manager: Arc<LabelManager>,
     pub invite_manager: Arc<InviteCodeManager>,
     pub report_manager: Arc<ReportManager>,
+    /// v0.9 Arc B (§11) — installed-theme registry, enumerated + validated
+    /// at startup; serves the active theme's resolved token CSS to the UI.
+    pub theme_registry: Arc<crate::themes::ThemeRegistry>,
     // OAuth server components (for third-party app authorization)
     #[allow(dead_code)] // Future OAuth client management
     pub oauth_client_manager: Arc<ClientManager>,
@@ -906,6 +909,19 @@ impl AppContext {
             None
         };
 
+        // v0.9 Arc B — enumerate + validate installed themes at startup.
+        // Bundled themes ship read-only under static/admin/themes/; operator
+        // themes under <data-dir>/themes/. The registry serves the active
+        // theme's inheritance-resolved token CSS to the admin UI (§11).
+        let theme_registry = {
+            let bundled_root = std::path::Path::new("static/admin/themes");
+            let operator_root = config.storage.data_directory.join("themes");
+            let reg = crate::themes::ThemeRegistry::build(bundled_root, &operator_root);
+            let (total, valid) = reg.summary();
+            tracing::info!(total_themes = total, valid_themes = valid, "theme registry built");
+            Arc::new(reg)
+        };
+
         Ok(Self {
             config: Arc::new(config),
             account_db,
@@ -918,6 +934,7 @@ impl AppContext {
             label_manager,
             invite_manager,
             report_manager,
+            theme_registry,
             oauth_client_manager,
             oauth_device_manager,
             sequencer,
@@ -976,6 +993,15 @@ impl AppContext {
                     PdsError::Internal(format!("Failed to create directory {:?}: {}", dir, e))
                 })?;
             }
+        }
+
+        // v0.9 Arc B — operator theme directory (<data-dir>/themes/), where
+        // operators drop custom themes. Bundled themes live in the repo tree.
+        let themes_dir = config.storage.data_directory.join("themes");
+        if !themes_dir.exists() {
+            tokio::fs::create_dir_all(&themes_dir).await.map_err(|e| {
+                PdsError::Internal(format!("Failed to create themes directory {:?}: {}", themes_dir, e))
+            })?;
         }
 
         // Create blob storage directories if using disk storage

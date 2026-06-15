@@ -34,6 +34,7 @@ mod repository;
 mod sequencer;
 mod server;
 mod service_auth;
+mod themes;
 mod validation;
 
 use clap::Parser;

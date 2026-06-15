@@ -3658,6 +3658,66 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
     }
 }
 
+/// `tools.aurora.ops.themes.listInstalled` output (§11.10.2).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListInstalledThemesOutput {
+    pub themes: Vec<crate::themes::ThemeMetadata>,
+}
+
+/// §11.10.2 — list installed themes (valid + invalid, both roots) for the
+/// Configuration → Themes page. Admin+ read; the page itself is
+/// SuperAdmin-route-gated, and setting the deployment default stays
+/// SuperAdmin via `setRuntimeSetting`.
+pub async fn list_installed_themes(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<ListInstalledThemesOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::Admin) {
+        return Err(forbidden(&format!(
+            "themes.listInstalled requires Admin+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+    Ok(Json(ListInstalledThemesOutput {
+        themes: ctx.theme_registry.list(),
+    }))
+}
+
+/// Query for the resolved-theme CSS route.
+#[derive(serde::Deserialize)]
+pub struct ActiveThemeParams {
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+/// Serve the active theme's inheritance-resolved token CSS (§11). Walks the
+/// requested theme's `extends` chain and emits one stylesheet. Unauthenticated
+/// by design — it's loaded via a `<link>` (which can't carry auth headers)
+/// and theme colors aren't secret. `?id=` selects a theme; absent, the
+/// inheritance root `aurora-default` is served. (Deployment-default-aware
+/// selection from the runtime setting lands with the Themes page,
+/// B-themes-page.) Returns an empty 200 when no theme is installed yet, so
+/// the admin UI keeps using its static tokens.css.
+pub async fn serve_active_theme_css(
+    State(ctx): State<AppContext>,
+    axum::extract::Query(params): axum::extract::Query<ActiveThemeParams>,
+) -> impl axum::response::IntoResponse {
+    let id = params
+        .id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| crate::themes::ROOT_THEME_ID.to_string());
+    let css = ctx.theme_registry.resolve_token_css(&id).unwrap_or_default();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/css; charset=utf-8",
+        )],
+        css,
+    )
+}
+
 /// Load file-tier runtime settings from the YAML at `path`.
 ///
 /// Per Arc 5 §9.4.2 / chainlink #124:

@@ -34,6 +34,7 @@ pub mod read_after_write; // Must come before actor_store (actor_store uses its 
 pub mod repository;
 pub mod sequencer;
 pub mod service_auth;
+pub mod themes;
 pub mod validation;
 
 // Re-export commonly used types for easier testing
