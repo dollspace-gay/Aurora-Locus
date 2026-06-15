@@ -4,6 +4,8 @@
 (function (global) {
   'use strict';
 
+  function T(key, params) { return global.t ? global.t(key, params) : key; }
+
   // Map UI tier slugs (plural; derived from role.name in
   // SettingsRoles.groupRoles and embedded in route URLs like
   // #settings/roles/moderators, which this page reads as
@@ -31,15 +33,15 @@
     const session = global.AuroraSession;
     const isSuper = session && session.hasRole('superadmin');
     container.innerHTML =
-      '<nav class="breadcrumb"><a href="#configuration/roles">Configuration</a> <span class="breadcrumb-sep">›</span> <a href="#configuration/roles">Roles</a> <span class="breadcrumb-sep">›</span> ' + esc(role) + '</nav>' +
+      '<nav class="breadcrumb"><a href="#configuration/roles">' + esc(T('settings.roles.crumb')) + '</a> <span class="breadcrumb-sep">›</span> <a href="#configuration/roles">' + esc(T('settings.roles.title')) + '</a> <span class="breadcrumb-sep">›</span> ' + esc(role) + '</nav>' +
       '<header class="page-header">' +
-      '  <div><h2>' + esc(role) + ' members</h2></div>' +
-      (isSuper ? '<div class="header-actions"><button class="btn-primary" id="rmm-grant">Grant role</button></div>' : '') +
+      '  <div><h2>' + esc(T('settings.roles.members_title', { role: role })) + '</h2></div>' +
+      (isSuper ? '<div class="header-actions"><button class="btn-primary" id="rmm-grant">' + esc(T('settings.roles.grant')) + '</button></div>' : '') +
       '</header>' +
       '<div class="table-card">' +
       '  <table class="data-table">' +
-      '    <thead><tr><th>Account</th><th>DID</th><th>Granted</th><th>Granted by</th><th>Actions</th></tr></thead>' +
-      '    <tbody id="rmm-table"><tr><td colspan="5"><p class="empty-state">Loading…</p></td></tr></tbody>' +
+      '    <thead><tr><th>' + esc(T('settings.roles.col_account')) + '</th><th>' + esc(T('settings.roles.col_did')) + '</th><th>' + esc(T('settings.roles.col_granted')) + '</th><th>' + esc(T('settings.roles.col_granted_by')) + '</th><th>' + esc(T('settings.roles.col_actions')) + '</th></tr></thead>' +
+      '    <tbody id="rmm-table"><tr><td colspan="5"><p class="empty-state">' + esc(T('common.loading')) + '</p></td></tr></tbody>' +
       '  </table>' +
       '</div>';
     if (isSuper) {
@@ -80,8 +82,8 @@
       const members = allRoles.filter((r) => String(r.role).toLowerCase() === wantRole);
       if (members.length === 0) {
         tbody.innerHTML = '<tr><td colspan="5">' +
-          (global.AuroraEmptyState ? global.AuroraEmptyState.render({ icon: 'users', primary: 'No members yet.' }) :
-           '<p class="empty-state">No members.</p>') + '</td></tr>';
+          (global.AuroraEmptyState ? global.AuroraEmptyState.render({ icon: 'users', primary: T('settings.roles.no_members_yet') }) :
+           '<p class="empty-state">' + esc(T('settings.roles.no_members_yet')) + '</p>') + '</td></tr>';
         return;
       }
       const fmt = global.AuroraFormat;
@@ -95,7 +97,7 @@
           '<td>' + (m.granted_by ? (ref ? ref.account(m.granted_by) : esc(m.granted_by)) : '—') + '</td>' +
           '<td>' + (isSuper
             ? '<button class="btn-sm btn-danger" data-revoke="' + esc(m.did) + '"' +
-              (isSelf ? ' disabled title="You cannot revoke your own role"' : '') + '>Revoke</button>'
+              (isSelf ? ' disabled title="' + esc(T('settings.roles.self_revoke_tooltip')) + '"' : '') + '>' + esc(T('settings.roles.revoke')) + '</button>'
             : '—') + '</td>' +
           '</tr>';
       }).join('');
@@ -106,7 +108,7 @@
         });
       }
     } catch (e) {
-      if (tbody) tbody.innerHTML = '<tr><td colspan="5"><p class="empty-state">Could not load members: ' + esc(e && e.message) + '</p></td></tr>';
+      if (tbody) tbody.innerHTML = '<tr><td colspan="5"><p class="empty-state">' + esc(T('settings.roles.could_not_load_members', { message: (e && e.message) || '' })) + '</p></td></tr>';
     }
   }
 
@@ -116,11 +118,11 @@
     // surfaced in the heading; the operator types REVOKE to unlock
     // submit and supplies the rationale that lands in the audit log.
     const result = await global.AuroraModal.destructiveConfirm({
-      heading: 'Revoke ' + role + ' role from ' + did,
-      body: 'This action will be recorded in the audit trail.',
+      heading: T('settings.roles.revoke_heading', { role: role, did: did }),
+      body: T('settings.roles.revoke_body'),
       typedConfirmGate: 'REVOKE',
       rationaleRequired: true,
-      confirmLabel: 'Revoke role',
+      confirmLabel: T('settings.roles.revoke_confirm'),
     });
     if (!result.confirmed) return;
     // Map the route's plural tier slug to the canonical Role enum
@@ -130,9 +132,9 @@
     try {
       const res = await global.AuroraEndpoints.superadmin.revokeRole({ did: did, role: wireRole, rationale: result.rationale });
       const auditEntryId = res && res.auditEntryId;
-      global.AuroraToast.success('Role revoked.', auditEntryId ? {
+      global.AuroraToast.success(T('settings.roles.revoke_success'), auditEntryId ? {
         action: {
-          label: 'View audit entry',
+          label: T('settings.roles.view_audit'),
           href: '#mod/audit/' + encodeURIComponent(auditEntryId),
         },
       } : undefined);
@@ -142,7 +144,7 @@
       // (or the fallback 'HTTP <status>: <msg>' rendering) shows
       // through. The prior 'Revoke failed: <msg>' hand-prefix
       // shadowed the translated prose for recognized error codes.
-      global.AuroraToast.danger(e && e.message ? e.message : 'Revoke failed.');
+      global.AuroraToast.danger(e && e.message ? e.message : T('settings.roles.revoke_failed'));
     }
   }
 
@@ -153,30 +155,30 @@
     // contract { did, role, rationale }. See V04_DESIGN §5.4.5
     // and the cross-page comment in SettingsRoles.js.
     const result = await global.AuroraModal.form({
-      heading: 'Grant ' + role + ' role',
-      body: 'Grant this role to a member by DID. The grant lands as one audit-chain entry.',
+      heading: T('settings.roles.grant_heading', { role: role }),
+      body: T('settings.roles.grant_body'),
       fields: [
         {
           name: 'did',
-          label: 'DID',
+          label: T('settings.roles.field_did'),
           type: 'text',
           required: true,
-          placeholder: 'did:plc:…',
+          placeholder: T('settings.roles.did_placeholder'),
           validate: (value) => {
             if (!value || !value.startsWith('did:')) {
-              return 'DID must start with "did:" (e.g., did:plc:…).';
+              return T('settings.roles.did_invalid');
             }
             return null;
           },
         },
         {
           name: 'rationale',
-          label: 'Rationale (recorded in audit log)',
+          label: T('settings.roles.field_rationale'),
           type: 'textarea',
           required: true,
         },
       ],
-      submitLabel: 'Grant role',
+      submitLabel: T('settings.roles.grant_submit'),
     });
     if (!result.submitted) return;
     // Map the route's plural tier slug to the canonical Role enum
@@ -189,15 +191,15 @@
         rationale: result.values.rationale,
       });
       const auditEntryId = res && res.auditEntryId;
-      global.AuroraToast.success('Granted ' + role + ' role to ' + result.values.did + '.', auditEntryId ? {
+      global.AuroraToast.success(T('settings.roles.grant_success', { role: role, did: result.values.did }), auditEntryId ? {
         action: {
-          label: 'View audit entry',
+          label: T('settings.roles.view_audit'),
           href: '#mod/audit/' + encodeURIComponent(auditEntryId),
         },
       } : undefined);
       if (global.AuroraRouter) global.AuroraRouter.dispatch();
     } catch (e) {
-      global.AuroraToast.danger(e && e.message ? e.message : 'Grant failed.');
+      global.AuroraToast.danger(e && e.message ? e.message : T('settings.roles.grant_failed'));
     }
   }
 
