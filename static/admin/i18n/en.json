@@ -1,4 +1,7 @@
 {
+  "_test": {
+    "plural": { "one": "1 thing", "other": "{count} things" }
+  },
   "common": {
     "save": "Save",
     "cancel": "Cancel",

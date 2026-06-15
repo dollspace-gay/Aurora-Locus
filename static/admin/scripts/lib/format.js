@@ -112,6 +112,21 @@
     }
   }
 
+  // Locale-aware plural category (§10.3.4 / §16 D3) — wraps
+  // Intl.PluralRules and returns the CLDR category ('one' | 'other' for
+  // English; the full range — 'zero'/'two'/'few'/'many'/'other' — for
+  // locales that need it). Mirrors formatList: locale defaults to the
+  // current resolved locale, with an English fallback if the API is
+  // unavailable. i18n.js's t() consumes this for sub-key plural keys.
+  function resolvePlural(count, locale) {
+    const n = Number(count);
+    try {
+      return new Intl.PluralRules(locale || activeLocale()).select(n);
+    } catch (e) {
+      return n === 1 ? 'one' : 'other';
+    }
+  }
+
   global.AuroraFormat = {
     date: formatDate,
     number: formatNumber,
@@ -119,6 +134,7 @@
     durationCompact: formatDurationCompact,
     bytes: formatBytes,
     list: formatList,
+    resolvePlural: resolvePlural,
     firstDayOfWeek: firstDayOfWeek,
   };
 })(window);
