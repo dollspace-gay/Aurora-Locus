@@ -3604,6 +3604,13 @@ impl Serialize for SettingSource {
 
 const MODERATION_MODE_KEY: &str = "moderation-mode";
 const MODERATION_MODE_REDIRECT_KEY: &str = "moderation-mode-redirect-url";
+/// v0.9 Arc B (§11.10.2): the deployment-default theme id — what fresh
+/// sessions and operators without a personal preference render. Set is
+/// SuperAdmin-only (via `setRuntimeSetting` + rationale); read is allowed at
+/// any role since every operator's UI applies it at boot. The value is a
+/// theme id, validated here only as a non-empty string — existence/validity
+/// is resolved at theme-apply time, falling back to `aurora-default`.
+const THEME_DEPLOYMENT_DEFAULT_KEY: &str = "theme.deployment-default";
 
 /// Allowlist of runtime-setting keys this build accepts. Per CR-2 /
 /// chainlink #119, `setRuntimeSetting` rejects any other key with
@@ -3618,6 +3625,7 @@ const MODERATION_MODE_REDIRECT_KEY: &str = "moderation-mode-redirect-url";
 pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     MODERATION_MODE_KEY,
     MODERATION_MODE_REDIRECT_KEY,
+    THEME_DEPLOYMENT_DEFAULT_KEY,
 ];
 const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
@@ -3629,6 +3637,7 @@ fn default_for_key(key: &str) -> serde_json::Value {
     match key {
         MODERATION_MODE_KEY => serde_json::Value::String("full".to_string()),
         MODERATION_MODE_REDIRECT_KEY => serde_json::Value::String(String::new()),
+        THEME_DEPLOYMENT_DEFAULT_KEY => serde_json::Value::String("aurora-default".to_string()),
         _ => serde_json::Value::Null,
     }
 }
@@ -3644,6 +3653,7 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
             .as_str()
             .is_some_and(|s| matches!(s, "full" | "reduced" | "disabled")),
         MODERATION_MODE_REDIRECT_KEY => value.as_str().is_some(),
+        THEME_DEPLOYMENT_DEFAULT_KEY => value.as_str().is_some_and(|s| !s.trim().is_empty()),
         _ => true,
     }
 }
@@ -3753,8 +3763,12 @@ pub async fn get_runtime_setting(
     use crate::admin::roles::Role;
     // Per §8.16: most settings require Admin+, but moderation-mode
     // is readable at any role since every operator needs to know
-    // what mode they're in.
-    if params.key != MODERATION_MODE_KEY && !auth.role.can_act_as(Role::Admin) {
+    // what mode they're in. theme.deployment-default (§11.10.2) is
+    // likewise any-role-readable — every operator's UI applies it at boot.
+    if params.key != MODERATION_MODE_KEY
+        && params.key != THEME_DEPLOYMENT_DEFAULT_KEY
+        && !auth.role.can_act_as(Role::Admin)
+    {
         return Err(forbidden(&format!(
             "key '{}' requires Admin+ role; caller has {:?}",
             params.key, auth.role
