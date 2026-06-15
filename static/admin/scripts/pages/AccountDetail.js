@@ -11,7 +11,6 @@
 
   let currentDid = null;
   let currentAccount = null;
-  let currentRoleCheck = null;
 
   async function mount({ params, container }) {
     const did = params && params.did;
@@ -494,31 +493,6 @@
     });
   }
 
-  function promptRationaleAndConfirmation(title, warning, ackLabel) {
-    return new Promise((resolve) => {
-      const div = document.createElement('div');
-      div.innerHTML = '<div class="action-panel-high-impact">' + esc(warning) + '</div>' +
-                      '<label style="margin-top: 0.75rem;">Rationale (required)</label>' +
-                      '<textarea id="prc-r" rows="3" style="width:100%;"></textarea>' +
-                      '<label style="display:block; margin-top: 0.5rem;">' +
-                      '  <input type="checkbox" id="prc-ack"> ' + esc(ackLabel) +
-                      '</label>' +
-                      '<div class="action-panel-buttons" style="margin-top: 0.75rem;">' +
-                      '  <button class="btn-secondary" id="prc-cancel">Cancel</button>' +
-                      '  <button class="btn-danger" id="prc-confirm">Confirm</button>' +
-                      '</div>';
-      const handle = global.AuroraModal.open({ title: title, body: div, onClose: () => resolve(null) });
-      div.querySelector('#prc-cancel').addEventListener('click', () => { handle.close(); });
-      div.querySelector('#prc-confirm').addEventListener('click', () => {
-        const v = div.querySelector('#prc-r').value.trim();
-        const ack = div.querySelector('#prc-ack').checked;
-        if (!v) { global.AuroraToast.warning('Rationale is required.'); return; }
-        if (!ack) { global.AuroraToast.warning('You must acknowledge the warning.'); return; }
-        handle.close();
-        resolve(v);
-      });
-    });
-  }
 
   // ---------- Rail panels ----------
 

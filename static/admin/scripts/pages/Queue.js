@@ -47,6 +47,9 @@
         const subjDid = item.subjectDid || (item.subject && item.subject.did) || '';
         const checked = bulkSelected.has(subjDid) ? 'checked' : '';
         const cbDisabled = subjDid ? '' : 'disabled aria-label="No subject DID for this item"';
+        // Real per-item status (queue items are reports; status is "open"
+        // for everything the queue returns) — not a hardcoded 'pending'.
+        const itemStatus = item.status || 'open';
         return '<div class="mod-item">' +
                '  <div class="mod-header">' +
                '    <input type="checkbox" class="bulk-select-mod" data-did="' + esc(subjDid) +
@@ -56,7 +59,7 @@
                '      <strong>' + esc(item.reasonType || 'Unknown') + '</strong>' +
                '      <p>By: ' + (subjDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(subjDid, item.reportedBy) : esc(subjDid)) : esc(item.reportedBy || '')) + '</p>' +
                '    </div>' +
-               '    ' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render('pending', 'Pending') : '<span class="status-badge status-pending">Pending</span>') +
+               '    ' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(itemStatus) : '<span class="status-badge status-' + esc(itemStatus) + '">' + esc(itemStatus) + '</span>') +
                '  </div>' +
                '  <div class="mod-content">' + esc(item.content || 'No content preview available') + '</div>' +
                '  <div class="mod-actions">' +
