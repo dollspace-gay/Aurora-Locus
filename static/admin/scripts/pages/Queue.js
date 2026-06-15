@@ -10,18 +10,14 @@
     container.innerHTML =
       '<header class="page-header">' +
       '  <div><h2>Queue</h2><p class="page-subtitle">Items needing attention</p></div>' +
-      '  <div class="header-actions">' +
-      '    <select class="filter-select" id="queue-filter">' +
-      '      <option value="all">All Items</option>' +
-      '      <option value="pending">Pending</option>' +
-      '      <option value="reviewed">Reviewed</option>' +
-      '    </select>' +
-      '  </div>' +
       '</header>' +
       '<div id="queue-bulk-bar"></div>' +
       '<div class="moderation-queue" id="queue-items"></div>';
     bulkSelected = new Set();
-    document.getElementById('queue-filter').addEventListener('change', refresh);
+    // §10.1.1: the prior header filter select (all/pending/reviewed) was
+    // never wired — get_moderation_queue is hardcoded to open reports and
+    // accepts no status filter — so it's removed rather than left decorative.
+    // Backend support for queue filtering is tracked separately (#209).
     await refresh();
     return { unmount: () => { bulkSelected = new Set(); } };
   }
@@ -32,7 +28,10 @@
     if (!c || !ep) return;
     try {
       const data = await ep.atproto.getModerationQueue({ limit: 50 });
-      const items = (data && data.items) || [];
+      // Canonical key is `queue` (get_moderation_queue returns {queue, count});
+      // tolerate `items` defensively. Reading only `items` left the list
+      // permanently empty.
+      const items = (data && (data.queue || data.items)) || [];
       if (items.length === 0) {
         c.innerHTML = global.AuroraEmptyState
           ? global.AuroraEmptyState.render({ icon: 'inbox', primary: 'Nothing in the queue.', secondary: 'Things will appear here as reports and appeals come in.' })
