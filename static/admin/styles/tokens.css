@@ -1,29 +1,111 @@
 /* Aurora Locus admin — design tokens
  *
- * Per docs/AURORA_ADMIN_UI_DESIGN.md §7. Light mode is the :root default;
- * dark mode overrides via [data-theme="dark"]. Every component refers to
- * these tokens rather than hardcoded values.
+ * v0.9 Arc B theming substrate (§11). This file is the in-repo
+ * `aurora-default` baseline: the 28 REQUIRED design tokens (§11.5.1, the
+ * theme contract every bundled/custom theme must satisfy) plus the
+ * substrate-optional tokens the admin UI also uses.
+ *
+ * ALIAS LAYER (recon §4.1 decision A): the 28 `--color-*`/`--font-family-*`/
+ * `--space-unit`/`--motion-*` tokens are canonical and carry concrete
+ * values; the legacy token names that 405+ component rules already consume
+ * are re-pointed to them (`--primary-color: var(--color-accent-primary)`),
+ * so a theme overriding a required token propagates to existing components
+ * without a flag-day rename. New/touched components use the canonical names;
+ * existing ones migrate incrementally (§10.4.4).
+ *
+ * Values here preserve the current v0.8 appearance exactly (each canonical
+ * token takes the legacy token's prior value; dark overrides move to the
+ * canonical token and the legacy alias follows). The accessibility-reviewed
+ * `aurora-default` palette + the other bundled themes land in B-bundled-themes,
+ * gated by the §11.10 contrast verifier.
+ *
+ * Light mode is the :root default; dark mode overrides via [data-theme="dark"].
  */
 
 :root {
-  /* Primary */
-  --primary-color: #3b82f6;
+  /* ============================================================
+   * §11.5.1 — the 28 REQUIRED design tokens (theme contract)
+   * ============================================================ */
+
+  /* Surfaces (4) */
+  --color-surface-primary: #f8fafc;    /* main page background */
+  --color-surface-secondary: #ffffff;  /* cards, panels, drawers */
+  --color-surface-tertiary: #ffffff;   /* nested cards, sub-panels */
+  --color-surface-overlay: rgba(0, 0, 0, 0.5); /* modal/dialog backdrop */
+
+  /* Text (4) */
+  --color-text-primary: #0f172a;       /* primary text */
+  --color-text-secondary: #475569;     /* secondary / de-emphasized */
+  --color-text-tertiary: #94a3b8;      /* tertiary, placeholders, captions */
+  --color-text-inverted: #ffffff;      /* text on accent-filled surfaces */
+
+  /* Accent (4) */
+  --color-accent-primary: #3b82f6;     /* primary interactive */
+  --color-accent-primary-hover: #2563eb;
+  --color-accent-primary-active: #1d4ed8;
+  --color-accent-secondary: #64748b;   /* secondary interactive */
+
+  /* Status (4) */
+  --color-status-success: #10b981;
+  --color-status-warning: #f59e0b;
+  --color-status-danger: #ef4444;
+  --color-status-info: #3b82f6;
+
+  /* Borders (3) */
+  --color-border-primary: #e2e8f0;     /* between cards/sections */
+  --color-border-secondary: #f1f5f9;   /* subtle within-card dividers */
+  --color-border-focus: #3b82f6;       /* focus ring */
+
+  /* Typography (3) */
+  --font-family-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+                      'Helvetica Neue', Arial, system-ui, sans-serif;
+  --font-family-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+                      'Courier New', monospace;
+  --font-family-display: var(--font-family-sans);
+
+  /* Sizing (2) — --font-size-base is shared with the legacy scale below */
+  --font-size-base: 1rem;
+  --space-unit: 0.25rem;
+
+  /* Motion (4) */
+  --motion-duration-fast: 100ms;
+  --motion-duration-medium: 200ms;
+  --motion-duration-slow: 400ms;
+  --motion-easing-standard: ease;
+
+  /* ============================================================
+   * Legacy aliases — re-pointed to the canonical tokens above so
+   * existing components are untouched yet theme-overridable.
+   * ============================================================ */
+  --primary-color: var(--color-accent-primary);
+  --background: var(--color-surface-primary);
+  --surface: var(--color-surface-secondary);
+  --surface-elevated: var(--color-surface-tertiary);
+  --text-primary: var(--color-text-primary);
+  --text-secondary: var(--color-text-secondary);
+  --text-tertiary: var(--color-text-tertiary);
+  --text-on-primary: var(--color-text-inverted);
+  --border-color: var(--color-border-primary);
+  --success-color: var(--color-status-success);
+  --warning-color: var(--color-status-warning);
+  --danger-color: var(--color-status-danger);
+  --attention-color: var(--color-status-warning);
+  --font-sans: var(--font-family-sans);
+  --font-mono: var(--font-family-mono);
+  --transition-fast: var(--motion-duration-fast) var(--motion-easing-standard);
+  --transition-normal: var(--motion-duration-medium) var(--motion-easing-standard);
+  --transition-slow: var(--motion-duration-slow) var(--motion-easing-standard);
+
+  /* ============================================================
+   * Substrate-OPTIONAL tokens (admin-specific; not part of the 28
+   * required contract — themes may override but aren't required to).
+   * ============================================================ */
+
+  /* Primary shade variants */
   --primary-dark: #2563eb;
   --primary-light: #60a5fa;
 
-  /* Surfaces */
-  --background: #f8fafc;
-  --surface: #ffffff;
-  --surface-elevated: #ffffff;
-
-  /* Text */
-  --text-primary: #0f172a;
-  --text-secondary: #475569;
-  --text-tertiary: #94a3b8;
-  --text-on-primary: #ffffff;
-
-  /* Borders */
-  --border-color: #e2e8f0;
+  /* Stronger border (distinct from the required border tokens) */
   --border-color-strong: #cbd5e1;
 
   /* Sidebar */
@@ -31,12 +113,6 @@
   --sidebar-text: #cbd5e1;
   --sidebar-active: #3b82f6;
   --sidebar-hover: #334155;
-
-  /* Semantic colors */
-  --success-color: #10b981;
-  --warning-color: #f59e0b;
-  --danger-color: #ef4444;
-  --attention-color: #f59e0b;
 
   /* Status badge backgrounds (soft tints) */
   --status-active-bg: #dcfce7;
@@ -54,15 +130,9 @@
   --status-pre-chain-bg: #fef3c7;
   --status-pre-chain-fg: #78350f;
 
-  /* Typography */
-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-               'Helvetica Neue', Arial, system-ui, sans-serif;
-  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
-               'Courier New', monospace;
-
+  /* Typography scale */
   --font-size-xs: 0.75rem;
   --font-size-sm: 0.875rem;
-  --font-size-base: 1rem;
   --font-size-lg: 1.125rem;
   --font-size-xl: 1.25rem;
   --font-size-2xl: 1.5rem;
@@ -76,7 +146,7 @@
   --line-height-normal: 1.5;
   --line-height-relaxed: 1.625;
 
-  /* Spacing */
+  /* Spacing scale */
   --space-0: 0;
   --space-1: 0.25rem;
   --space-2: 0.5rem;
@@ -102,11 +172,6 @@
                0 4px 6px -4px rgba(0, 0, 0, 0.05);
   --shadow-focus: 0 0 0 3px rgba(59, 130, 246, 0.4);
 
-  /* Motion */
-  --transition-fast: 100ms ease;
-  --transition-normal: 200ms ease;
-  --transition-slow: 400ms ease;
-
   /* Layout */
   --sidebar-width: 260px;
   --content-max-width: 1400px;
@@ -121,39 +186,48 @@
 }
 
 [data-theme="dark"] {
-  /* Primary - lightened for dark backgrounds */
-  --primary-color: #60a5fa;
+  /* Required-token dark overrides — legacy aliases (defined in :root as
+   * var() of these) follow automatically, so they aren't repeated here. */
+
+  /* Surfaces */
+  --color-surface-primary: #0a0e14;
+  --color-surface-secondary: #151b23;
+  --color-surface-tertiary: #1c242e;
+  --color-surface-overlay: rgba(0, 0, 0, 0.6);
+
+  /* Text */
+  --color-text-primary: #e6edf3;
+  --color-text-secondary: #9ba8b8;
+  --color-text-tertiary: #6e7681;
+  --color-text-inverted: #0a0e14;
+
+  /* Accent */
+  --color-accent-primary: #60a5fa;
+  --color-accent-primary-hover: #3b82f6;
+  --color-accent-primary-active: #2563eb;
+  --color-accent-secondary: #94a3b8;
+
+  /* Status */
+  --color-status-success: #34d399;
+  --color-status-warning: #fbbf24;
+  --color-status-danger: #f87171;
+  --color-status-info: #60a5fa;
+
+  /* Borders */
+  --color-border-primary: #2d3748;
+  --color-border-secondary: #1f2937;
+  --color-border-focus: #60a5fa;
+
+  /* ---- Optional-token dark overrides ---- */
   --primary-dark: #3b82f6;
   --primary-light: #93c5fd;
-
-  /* Surfaces - dark grays, not pure black */
-  --background: #0a0e14;
-  --surface: #151b23;
-  --surface-elevated: #1c242e;
-
-  /* Text - off-white, not pure white */
-  --text-primary: #e6edf3;
-  --text-secondary: #9ba8b8;
-  --text-tertiary: #6e7681;
-  --text-on-primary: #0a0e14;
-
-  /* Borders - subtle in dark mode */
-  --border-color: #2d3748;
   --border-color-strong: #475569;
 
-  /* Sidebar - even darker than surface */
   --sidebar-bg: #0a0e14;
   --sidebar-text: #cbd5e1;
   --sidebar-active: #3b82f6;
   --sidebar-hover: #1c242e;
 
-  /* Semantic colors - lightened slightly for contrast */
-  --success-color: #34d399;
-  --warning-color: #fbbf24;
-  --danger-color: #f87171;
-  --attention-color: #fbbf24;
-
-  /* Status badge backgrounds - dark tinted */
   --status-active-bg: #064e3b;
   --status-active-fg: #6ee7b7;
   --status-suspended-bg: #78350f;
