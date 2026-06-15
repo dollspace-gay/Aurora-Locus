@@ -3718,6 +3718,30 @@ pub async fn serve_active_theme_css(
     )
 }
 
+/// Serve the active theme's inheritance-resolved effect-class CSS (§11.6).
+/// Parallel to [`serve_active_theme_css`]: walks the requested theme's
+/// `extends` chain and concatenates each theme's `effects.css` so the leaf's
+/// redefinitions of a class win. Unauthenticated for the same reason (loaded
+/// via `<link>`). Returns an empty 200 when no theme is installed yet, so the
+/// admin UI keeps using its static `effects.css` baseline.
+pub async fn serve_active_theme_effects_css(
+    State(ctx): State<AppContext>,
+    axum::extract::Query(params): axum::extract::Query<ActiveThemeParams>,
+) -> impl axum::response::IntoResponse {
+    let id = params
+        .id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| crate::themes::ROOT_THEME_ID.to_string());
+    let css = ctx.theme_registry.resolve_effect_css(&id).unwrap_or_default();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/css; charset=utf-8",
+        )],
+        css,
+    )
+}
+
 /// Load file-tier runtime settings from the YAML at `path`.
 ///
 /// Per Arc 5 §9.4.2 / chainlink #124:

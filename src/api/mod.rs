@@ -65,6 +65,12 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
             "/theme/active.css",
             axum::routing::get(crate::api::aurora_admin::serve_active_theme_css),
         )
+        // v0.9 Arc B §215 — resolved active-theme effect-class CSS (§11.6).
+        // Sibling of active.css; same unauthenticated <link>-loaded contract.
+        .route(
+            "/theme/active-effects.css",
+            axum::routing::get(crate::api::aurora_admin::serve_active_theme_effects_css),
+        )
         .merge(sync::routes())
         .merge(firehose::routes())
         .merge(labels::routes())

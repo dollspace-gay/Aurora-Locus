@@ -54,6 +54,17 @@ pub const REQUIRED_TOKENS: &[&str] = &[
     "--motion-easing-standard",
 ];
 
+/// Effect classes every theme must provide directly or by inheritance
+/// (§11.6.5): a visible focus indicator (accessibility) and the three
+/// structural surface elevations the substrate uses for cards/panels/drawers.
+/// A theme missing these renders inaccessible focus or collapsed surfaces.
+pub const REQUIRED_EFFECT_CLASSES: &[&str] = &[
+    "effect-focus-ring",
+    "effect-surface-elevation-1",
+    "effect-surface-elevation-2",
+    "effect-surface-elevation-3",
+];
+
 /// The inheritance root every chain must terminate at (§11.9).
 pub const ROOT_THEME_ID: &str = "aurora-default";
 
@@ -189,6 +200,25 @@ impl ThemeRegistry {
     /// (no bundled themes installed yet — the admin UI then keeps using its
     /// static `tokens.css`).
     pub fn resolve_token_css(&self, id: &str) -> Option<String> {
+        self.resolve_chain_css(id, |files| Some(files.tokens.as_str()))
+    }
+
+    /// Resolve the active theme's effect-class CSS (§11.6): same chain walk as
+    /// [`resolve_token_css`], over each theme's optional `effects.css` so a
+    /// leaf's redefinition of an effect class overrides its ancestors'. Themes
+    /// without an `effects.css` contribute nothing (they inherit). Returns
+    /// `None` only if even the root is absent.
+    pub fn resolve_effect_css(&self, id: &str) -> Option<String> {
+        self.resolve_chain_css(id, |files| files.effects.as_deref())
+    }
+
+    /// Shared chain walk for resolved CSS: locate the requested valid theme
+    /// (or the root), build its `extends` chain root→leaf, and concatenate the
+    /// file selected by `file_of` from each theme so later (leaf) source wins.
+    fn resolve_chain_css<F>(&self, id: &str, file_of: F) -> Option<String>
+    where
+        F: Fn(&manifest::ThemeFiles) -> Option<&str>,
+    {
         let find_valid = |want: &str| {
             self.records
                 .iter()
@@ -221,10 +251,12 @@ impl ThemeRegistry {
 
         let mut css = String::new();
         for rec in chain {
-            let path = rec.discovered.dir.join(&rec.discovered.manifest.files.tokens);
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                css.push_str(&content);
-                css.push('\n');
+            if let Some(file) = file_of(&rec.discovered.manifest.files) {
+                let path = rec.discovered.dir.join(file);
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    css.push_str(&content);
+                    css.push('\n');
+                }
             }
         }
         Some(css)
@@ -263,8 +295,9 @@ fn enumerate_root(root: &Path, source: ThemeSource) -> Vec<DiscoveredTheme> {
     out
 }
 
-/// Validation contract (§11.10.1), steps 1–7 + chain. Returns the list of
-/// failures (empty = valid). Steps 8/9/10 are appended by their arcs.
+/// Validation contract (§11.10.1), steps 1–9 + chain. Returns the list of
+/// failures (empty = valid). Step 10 (extension-point declaration validation)
+/// is deferred to 0.9.1 with the extension-point system (recon §4.4).
 fn validate(theme: &DiscoveredTheme, by_id: &HashMap<String, DiscoveredTheme>) -> Vec<String> {
     let mut errors = Vec::new();
     let m = &theme.manifest;
@@ -325,6 +358,19 @@ fn validate(theme: &DiscoveredTheme, by_id: &HashMap<String, DiscoveredTheme>) -
             }
         }
         required_complete = errors.len() == before;
+    }
+
+    // Step 8 — required effect-class completeness (§11.6.5). The substrate
+    // uses these classes for focus indication and surface elevation; a theme
+    // missing them (own or inherited) produces inaccessible focus or collapsed
+    // surfaces. Fail-closed; gated on a sane chain so inheritance resolves.
+    if chain_ok {
+        let declared = collect_declared_effect_classes(&m.theme_id, by_id);
+        for class in REQUIRED_EFFECT_CLASSES {
+            if !declared.contains(*class) {
+                errors.push(format!("theme.effects.required.missing: {class}"));
+            }
+        }
     }
 
     // Step 9 — WCAG 2.2 AA contrast (§11.10.3). Resolve the contrast-requiring
@@ -405,6 +451,44 @@ fn collect_declared_tokens(start: &str, by_id: &HashMap<String, DiscoveredTheme>
     tokens
 }
 
+/// Collect every effect-class name (`.effect-*` selector) declared across a
+/// theme's chain (root→leaf), for the required-effect-class completeness check
+/// (§11.6.5). Themes without an `effects.css` contribute nothing (they inherit
+/// from the parent). Matches class selectors; not a full CSS parse.
+fn collect_declared_effect_classes(
+    start: &str,
+    by_id: &HashMap<String, DiscoveredTheme>,
+) -> HashSet<String> {
+    let re = regex::Regex::new(r"\.(effect-[A-Za-z0-9_-]+)")
+        .expect("static effect-class regex compiles");
+    let mut classes = HashSet::new();
+    let mut current = start.to_string();
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > MAX_CHAIN_DEPTH + 2 {
+            break;
+        }
+        let theme = match by_id.get(&current) {
+            Some(t) => t,
+            None => break,
+        };
+        if let Some(effects_file) = &theme.manifest.files.effects {
+            let path = theme.dir.join(effects_file);
+            if let Ok(css) = std::fs::read_to_string(&path) {
+                for cap in re.captures_iter(&css) {
+                    classes.insert(cap[1].to_string());
+                }
+            }
+        }
+        match &theme.manifest.extends {
+            Some(parent) => current = parent.clone(),
+            None => break,
+        }
+    }
+    classes
+}
+
 /// Collect every custom-property declaration's resolved *value* across a
 /// theme's chain (leaf-wins), for contrast verification. Within a single file
 /// the last declaration wins (CSS cascade); across the chain the leaf overrides
@@ -464,22 +548,53 @@ fn version_gt(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Build a theme dir with a manifest + tokens.css under `root`.
+    /// Build a theme dir with a manifest + tokens.css + a complete effects.css
+    /// under `root`. The effects.css carries every required effect class so the
+    /// fixture passes step 8; tests that need an effect gap override it.
     fn write_theme(root: &Path, id: &str, extends: Option<&str>, tokens: &str) {
+        write_theme_full(root, id, extends, tokens, Some(&all_required_effects()));
+    }
+
+    /// Like [`write_theme`] but with explicit control over `effects.css`:
+    /// `None` omits the file and its manifest entry (the theme inherits effects
+    /// from its parent).
+    fn write_theme_full(
+        root: &Path,
+        id: &str,
+        extends: Option<&str>,
+        tokens: &str,
+        effects: Option<&str>,
+    ) {
         let dir = root.join(id);
         std::fs::create_dir_all(&dir).unwrap();
         let ext = match extends {
             Some(e) => format!("\"extends\": \"{e}\",\n"),
             None => String::new(),
         };
+        let files = match effects {
+            Some(_) => r#""files":{"tokens":"tokens.css","effects":"effects.css"}"#,
+            None => r#""files":{"tokens":"tokens.css"}"#,
+        };
         std::fs::write(
             dir.join("manifest.json"),
             format!(
-                r#"{{"schemaVersion":"1.0","themeId":"{id}","themeName":"{id}","substrateVersion":"1.0",{ext}"files":{{"tokens":"tokens.css"}}}}"#
+                r#"{{"schemaVersion":"1.0","themeId":"{id}","themeName":"{id}","substrateVersion":"1.0",{ext}{files}}}"#
             ),
         )
         .unwrap();
         std::fs::write(dir.join("tokens.css"), tokens).unwrap();
+        if let Some(css) = effects {
+            std::fs::write(dir.join("effects.css"), css).unwrap();
+        }
+    }
+
+    /// An effects.css declaring every required effect class (§11.6.5).
+    fn all_required_effects() -> String {
+        REQUIRED_EFFECT_CLASSES
+            .iter()
+            .map(|c| format!(".{c} {{ outline: 0; }}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// A contrast-passing palette covering all required tokens: backgrounds
@@ -612,6 +727,53 @@ mod tests {
         );
         let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
         assert_eq!(reg.summary().1, 2, "var()-routed text resolves and passes");
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    #[test]
+    fn missing_required_effect_class_fails() {
+        let bundled = tmp("missingeffect");
+        // All tokens present + an effects.css that omits effect-surface-elevation-3.
+        let partial_effects = ".effect-focus-ring { outline: 2px solid red; }\n\
+             .effect-surface-elevation-1 { box-shadow: 0 1px 2px #000; }\n\
+             .effect-surface-elevation-2 { box-shadow: 0 2px 4px #000; }";
+        write_theme_full(
+            &bundled,
+            ROOT_THEME_ID,
+            None,
+            &all_required_css(),
+            Some(partial_effects),
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        assert_eq!(
+            reg.summary().1,
+            0,
+            "missing effect-surface-elevation-3 fails step 8 (fail-closed)"
+        );
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    #[test]
+    fn child_inherits_required_effects_from_parent() {
+        let bundled = tmp("inheriteffects");
+        // Root carries the full effect library; child has no effects.css and
+        // inherits all four required classes through the chain.
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        // Override a token outside the contrast pairs so this test isolates
+        // effect inheritance from the (separately-tested) contrast gate.
+        write_theme_full(
+            &bundled,
+            "child",
+            Some(ROOT_THEME_ID),
+            "--color-accent-secondary: #2563eb;",
+            None,
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        assert_eq!(reg.summary().1, 2, "child inherits required effect classes");
+
+        // resolve_effect_css emits the root's effects for the child too.
+        let css = reg.resolve_effect_css("child").expect("resolves");
+        assert!(css.contains(".effect-focus-ring"));
         let _ = std::fs::remove_dir_all(&bundled);
     }
 
