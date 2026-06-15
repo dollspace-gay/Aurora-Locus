@@ -98,12 +98,27 @@
     return activeLocale().startsWith('en-US') ? 0 : 1;
   }
 
+  // Locale-aware list joiner (§10.3.4 / §16 D3) — "A, B, and C" / "… or C".
+  // Wraps Intl.ListFormat with an English comma+conjunction fallback so a
+  // missing-API environment still reads naturally.
+  function formatList(items, type) {
+    const arr = Array.isArray(items) ? items.map((x) => String(x == null ? '' : x)) : [];
+    try {
+      return new Intl.ListFormat(activeLocale(), { style: 'long', type: type || 'conjunction' }).format(arr);
+    } catch (e) {
+      if (arr.length <= 1) return arr.join('');
+      const conj = (type === 'disjunction') ? 'or' : 'and';
+      return arr.slice(0, -1).join(', ') + (arr.length > 2 ? ',' : '') + ' ' + conj + ' ' + arr[arr.length - 1];
+    }
+  }
+
   global.AuroraFormat = {
     date: formatDate,
     number: formatNumber,
     relativeTime: formatRelativeTime,
     durationCompact: formatDurationCompact,
     bytes: formatBytes,
+    list: formatList,
     firstDayOfWeek: firstDayOfWeek,
   };
 })(window);

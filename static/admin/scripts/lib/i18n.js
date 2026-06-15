@@ -90,12 +90,19 @@
       return '';
     }
     const n = Number(count);
-    // Try =N first, then one (when n === 1), then other.
+    // Try the exact-match =N arm first.
     const exact = matchArm(body, '=' + n);
     if (exact != null) return exact.replace(/#/g, String(n));
-    if (n === 1) {
-      const one = matchArm(body, 'one');
-      if (one != null) return one.replace(/#/g, String(n));
+    // Then the locale's plural category via Intl.PluralRules (§10.3.4) —
+    // English maps 1→'one', everything else→'other', but other locales get
+    // their correct category (few/many/…) once their locale file supplies
+    // those arms. Falls back to the prior n===1→'one' rule if unavailable.
+    let category;
+    try { category = new Intl.PluralRules(activeLocale).select(n); }
+    catch (e) { category = (n === 1 ? 'one' : 'other'); }
+    if (category && category !== 'other') {
+      const arm = matchArm(body, category);
+      if (arm != null) return arm.replace(/#/g, String(n));
     }
     const other = matchArm(body, 'other');
     if (other != null) return other.replace(/#/g, String(n));

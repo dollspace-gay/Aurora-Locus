@@ -128,7 +128,7 @@ body {
 }
 
 .nav-section-link .badge {
-  margin-left: auto;
+  margin-inline-start: auto;
   background: var(--danger-color);
   color: white;
   padding: 0.125rem var(--space-2);
