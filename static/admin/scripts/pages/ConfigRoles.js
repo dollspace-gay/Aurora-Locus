@@ -93,7 +93,11 @@
               members.slice(0, 12).map((m) => renderMemberRow(m, memberSlug, isSuper, operatorDid)).join(' ')) +
              '</div>' +
              '<div class="action-panel-buttons" style="justify-content: flex-start; gap: 0.5rem;">' +
-             (members.length > 12 ? '<a class="btn-sm btn-secondary" href="#configuration/roles/' + encodeURIComponent(memberSlug) + '">View all</a>' : '') +
+             // Always offer list→detail navigation (touch-up A): the detail
+             // page is the only place the full member table + grant/revoke
+             // affordances live, so every tier links there regardless of
+             // member count. (Was previously shown only for >12 members.)
+             '<a class="btn-sm btn-secondary" href="#configuration/roles/' + encodeURIComponent(memberSlug) + '">View members</a>' +
              (isSuper ? '<button class="btn-sm btn-primary" data-grant="' + esc(memberSlug) + '">Grant role</button>' : '') +
              '</div>' +
              '</div>';

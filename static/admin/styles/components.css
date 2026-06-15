@@ -304,6 +304,18 @@ a.activity-item {
   font-size: 0.8125rem;
 }
 
+/* Disabled state for the shared button classes — the visual affordance
+   must match the functional `disabled` attribute (e.g. the self-row Revoke
+   guard on the roles pages, §9.1). Mirrors .action-panel-card's treatment. */
+.btn-primary[disabled],
+.btn-secondary[disabled],
+.btn-danger[disabled],
+.btn-success[disabled],
+.btn-sm[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* ==================== Status badges ==================== */
 
 .status-badge {

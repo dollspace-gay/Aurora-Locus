@@ -72,7 +72,12 @@
       // tracked as separate backend tickets — see #203.
       const data = await ep.atproto.listRoles({ role: role, limit: 100 });
       const allRoles = (data && data.roles) || [];
-      const members = allRoles.filter((r) => normalize(r.role) === normalize(role));
+      // Map the plural tier slug from the route / the list page's "View
+      // members" link (moderators / administrators / superadmins) to the
+      // canonical Role string, then match. tierToRoleString handles
+      // "administrators" → "admin"; a trailing-s strip would not.
+      const wantRole = String(tierToRoleString(role)).toLowerCase();
+      const members = allRoles.filter((r) => String(r.role).toLowerCase() === wantRole);
       if (members.length === 0) {
         tbody.innerHTML = '<tr><td colspan="5">' +
           (global.AuroraEmptyState ? global.AuroraEmptyState.render({ icon: 'users', primary: 'No members yet.' }) :
@@ -196,7 +201,6 @@
     }
   }
 
-  function normalize(s) { return String(s || '').toLowerCase().replace(/s$/, ''); }
   function esc(s) { return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s); }
   if (global.AuroraRouter) global.AuroraRouter.register('configRolesMembers', { mount: mount });
 })(window);
