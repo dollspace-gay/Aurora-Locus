@@ -47,7 +47,7 @@
       '</header>' +
       '<div id="audit-chain-detail" class="chain-indicator-detail" hidden></div>' +
       '<div id="audit-filter"></div>' +
-      '<p class="filter-url-hint">Filters appear in your URL — copy the address to share or bookmark this view.</p>' +
+      '<p class="filter-url-hint">' + (global.t ? global.t('common.filters_in_url') : '') + '</p>' +
       '<div id="audit-table-container"></div>' +
       '<div id="audit-pagination"></div>';
     cursorStack = [];

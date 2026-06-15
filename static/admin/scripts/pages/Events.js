@@ -42,7 +42,7 @@
       '  <div id="events-rt-indicator" class="rt-indicator-slot"></div>' +
       '</header>' +
       '<div id="events-filter"></div>' +
-      '<p class="filter-url-hint">Filters appear in your URL — copy the address to share or bookmark this view.</p>' +
+      '<p class="filter-url-hint">' + (global.t ? global.t('common.filters_in_url') : '') + '</p>' +
       '<div id="events-table-container"></div>' +
       '<div id="events-pagination"></div>';
     cursorStack = [];

@@ -42,7 +42,7 @@
       '  <div><h2>Appeals</h2><p class="page-subtitle">Cross-instance appeals via tools.aurora.moderator.listAppeals</p></div>' +
       '</header>' +
       '<div id="appeals-filter"></div>' +
-      '<p class="filter-url-hint">Filters appear in your URL — copy the address to share or bookmark this view.</p>' +
+      '<p class="filter-url-hint">' + (global.t ? global.t('common.filters_in_url') : '') + '</p>' +
       '<div id="appeals-table-container"></div>' +
       '<div id="appeals-pagination"></div>';
     cursorStack = [];

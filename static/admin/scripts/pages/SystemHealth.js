@@ -65,7 +65,7 @@
           ? ' · lag ' + esc(global.AuroraFormat.durationCompact(seq.lagSeconds)) : '';
         const badge = global.AuroraStatusBadge ? global.AuroraStatusBadge.render(state, state) : esc(state);
         return '<p><strong>sequencer:</strong> ' + badge + lag +
-               ' <a href="#ops/sequencer">Open Sequencer →</a></p>';
+               ' <a href="#ops/sequencer">' + (global.t ? global.t('ops.systemHealth.open_sequencer') : 'Open Sequencer →') + '</a></p>';
       }
       const rows = [];
       let sawSeq = false;

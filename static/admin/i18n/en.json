@@ -18,7 +18,9 @@
     "actions": "Actions",
     "subject": "Subject",
     "rationale": "Rationale (required)",
-    "rationale_optional": "Rationale (optional)"
+    "rationale_optional": "Rationale (optional)",
+    "filters_in_url": "Filters appear in your URL — copy the address to share or bookmark this view.",
+    "search_in_url": "Your search appears in the URL — copy the address to share or bookmark this view."
   },
   "navigation": {
     "dashboard": "Dashboard",
@@ -138,6 +140,14 @@
     "search_placeholder": "Search by handle, DID, or email"
   },
   "accountDetail": {
+    "roles": {
+      "title": "Account roles",
+      "none": "No admin role assigned.",
+      "manage": "Manage roles →",
+      "role_label": "Role: {role}",
+      "open_mgmt": "Open role management →",
+      "error": "Could not load roles."
+    },
     "drawers": {
       "overview": "Account overview",
       "moderation": "Moderation actions",
@@ -170,7 +180,7 @@
     "federation": { "title": "Federation", "subtitle": "Relays, peers, federation activity" },
     "blobOps": { "title": "Blob ops", "subtitle": "Storage and blob lifecycle" },
     "rateLimits": { "title": "Rate limits", "subtitle": "Per-endpoint configuration and current state" },
-    "systemHealth": { "title": "System health", "subtitle": "Subsystem status, jobs, validation" }
+    "systemHealth": { "title": "System health", "subtitle": "Subsystem status, jobs, validation", "open_sequencer": "Open Sequencer →" }
   },
   "settings": {
     "title": "Settings",

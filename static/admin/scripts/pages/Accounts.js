@@ -34,7 +34,7 @@
            '    <input type="text" class="search-input" id="account-search" placeholder="Search by handle, DID, or email">' +
            '  </div>' +
            '</header>' +
-           '<p class="filter-url-hint">Your search appears in the URL — copy the address to share or bookmark this view.</p>' +
+           '<p class="filter-url-hint">' + (global.t ? global.t('common.search_in_url') : '') + '</p>' +
            '<div id="accounts-bulk-bar"></div>' +
            '<div class="table-card">' +
            '  <table class="data-table">' +

@@ -45,7 +45,7 @@
       '  <div><h2>Reports</h2><p class="page-subtitle">Content reports</p></div>' +
       '</header>' +
       '<div id="reports-filter"></div>' +
-      '<p class="filter-url-hint">Filters appear in your URL — copy the address to share or bookmark this view.</p>' +
+      '<p class="filter-url-hint">' + (global.t ? global.t('common.filters_in_url') : '') + '</p>' +
       '<div id="reports-bulk-bar"></div>' +
       '<div class="reports-list" id="reports-items"></div>' +
       '<div id="reports-pagination"></div>';

@@ -9,6 +9,8 @@
 (function (global) {
   'use strict';
 
+  function T(key, params) { return global.t ? global.t(key, params) : key; }
+
   let currentDid = null;
   let currentAccount = null;
 
@@ -507,7 +509,7 @@
       '<p class="empty-state">Loading…</p>'));
     rail.insertAdjacentHTML('beforeend', railCard('invite-lineage', 'Invite lineage',
       '<p class="empty-state">Loading…</p>'));
-    rail.insertAdjacentHTML('beforeend', railCard('account-roles', 'Account roles',
+    rail.insertAdjacentHTML('beforeend', railCard('account-roles', T('accountDetail.roles.title'),
       '<p class="empty-state">Loading…</p>'));
 
     try {
@@ -635,17 +637,17 @@
       const roleName = (typeof roleRec === 'string') ? roleRec : (roleRec && roleRec.role);
       if (!roleName) {
         setRailBody('account-roles',
-          '<p class="empty-state">No admin role assigned.</p>' +
-          '<p><a href="#configuration/roles">Manage roles →</a></p>');
+          '<p class="empty-state">' + esc(T('accountDetail.roles.none')) + '</p>' +
+          '<p><a href="#configuration/roles">' + esc(T('accountDetail.roles.manage')) + '</a></p>');
         return;
       }
-      const badge = global.AuroraStatusBadge ? global.AuroraStatusBadge.render(roleName, roleName) : esc(roleName);
       setRailBody('account-roles',
-        '<p>Role: ' + badge + '</p>' +
-        '<p><a href="#configuration/roles">Open role management →</a></p>');
+        '<p>' + esc(T('accountDetail.roles.role_label', { role: roleName })) + '</p>' +
+        '<p><a href="#configuration/roles">' + esc(T('accountDetail.roles.open_mgmt')) + '</a></p>');
     } catch (e) {
       setRailBody('account-roles',
-        '<p class="empty-state">Could not load roles. <a href="#configuration/roles">Manage roles →</a></p>');
+        '<p class="empty-state">' + esc(T('accountDetail.roles.error')) +
+        ' <a href="#configuration/roles">' + esc(T('accountDetail.roles.manage')) + '</a></p>');
     }
   }
 
