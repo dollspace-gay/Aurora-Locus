@@ -52,11 +52,31 @@
     if (!ep) return;
     safeRender('sh-overall', '<h3>Overall</h3>', async () => {
       const h = await ep.ops.getSystemHealth();
-      return Object.entries(h.subsystems || {}).map(([k, v]) =>
-        '<p><strong>' + esc(k) + ':</strong> ' +
-        (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(v.status, v.status) : esc(v.status)) +
-        ' ' + esc(v.message || '') + '</p>'
-      ).join('') || 'No subsystem data.';
+      const subs = h.subsystems || {};
+      // §9.6: System Health is the rollup, the Sequencer page is the
+      // detail. The sequencer indicator here shows state + tail-lag + a
+      // click-through to #ops/sequencer (cursor/controls/raw metrics live
+      // there). Pull the lag from getSequencerStatus.
+      let seq = null;
+      try { seq = await ep.ops.getSequencerStatus(); } catch (e) { /* lag optional */ }
+      function seqRollup(statusFallback) {
+        const state = (seq && seq.state) || statusFallback || 'unknown';
+        const lag = (seq && seq.lagSeconds != null && global.AuroraFormat)
+          ? ' · lag ' + esc(global.AuroraFormat.durationCompact(seq.lagSeconds)) : '';
+        const badge = global.AuroraStatusBadge ? global.AuroraStatusBadge.render(state, state) : esc(state);
+        return '<p><strong>sequencer:</strong> ' + badge + lag +
+               ' <a href="#ops/sequencer">Open Sequencer →</a></p>';
+      }
+      const rows = [];
+      let sawSeq = false;
+      for (const [k, v] of Object.entries(subs)) {
+        if (k === 'sequencer') { sawSeq = true; rows.push(seqRollup(v && v.status)); continue; }
+        rows.push('<p><strong>' + esc(k) + ':</strong> ' +
+          (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(v.status, v.status) : esc(v.status)) +
+          ' ' + esc(v.message || '') + '</p>');
+      }
+      if (!sawSeq && seq) rows.push(seqRollup());
+      return rows.join('') || 'No subsystem data.';
     });
     safeRender('sh-resources', '<h3>Resource usage</h3>', async () => {
       const r = await ep.ops.getResourceUsage();
