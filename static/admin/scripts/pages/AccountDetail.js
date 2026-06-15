@@ -27,6 +27,7 @@
       loadRecords(),
       loadBlobs(),
       loadInvites(),
+      loadRoles(),
     ]);
     return { unmount: () => { currentDid = null; currentAccount = null; } };
   }
@@ -146,7 +147,6 @@
       panel.mount(modPanelHost);
     }
     wireManagementHandlers();
-    // Pivot links wiring (Roles panel — render to rail when data available)
   }
 
   function overviewHtml(info) {
@@ -507,6 +507,8 @@
       '<p class="empty-state">Loading…</p>'));
     rail.insertAdjacentHTML('beforeend', railCard('invite-lineage', 'Invite lineage',
       '<p class="empty-state">Loading…</p>'));
+    rail.insertAdjacentHTML('beforeend', railCard('account-roles', 'Account roles',
+      '<p class="empty-state">Loading…</p>'));
 
     try {
       const ctx = await global.AuroraEndpoints.moderator.getSubjectContext({ subjectDid: currentDid });
@@ -620,6 +622,32 @@
   }
 
   // ---------- Rail helpers ----------
+
+  // §10.2.4 Roles panel: surface this account's admin role (if any) in the
+  // rail with a navigation-only pivot to Configuration → Roles. list_roles
+  // with ?did returns { did, role } where role is the role string (or the
+  // AdminRole object, or null for a non-operator account). Rationale-wiring
+  // of management actions stays Arc F; this is read + navigate only.
+  async function loadRoles() {
+    try {
+      const data = await global.AuroraEndpoints.atproto.listRoles({ did: currentDid });
+      const roleRec = data && data.role;
+      const roleName = (typeof roleRec === 'string') ? roleRec : (roleRec && roleRec.role);
+      if (!roleName) {
+        setRailBody('account-roles',
+          '<p class="empty-state">No admin role assigned.</p>' +
+          '<p><a href="#configuration/roles">Manage roles →</a></p>');
+        return;
+      }
+      const badge = global.AuroraStatusBadge ? global.AuroraStatusBadge.render(roleName, roleName) : esc(roleName);
+      setRailBody('account-roles',
+        '<p>Role: ' + badge + '</p>' +
+        '<p><a href="#configuration/roles">Open role management →</a></p>');
+    } catch (e) {
+      setRailBody('account-roles',
+        '<p class="empty-state">Could not load roles. <a href="#configuration/roles">Manage roles →</a></p>');
+    }
+  }
 
   function railCard(id, title, body) {
     return '<div class="rail-card" data-rail-id="' + id + '">' +
