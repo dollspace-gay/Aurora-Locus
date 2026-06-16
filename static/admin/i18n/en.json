@@ -405,6 +405,17 @@
       "col_rewritten": "Re-encoded",
       "col_outcome": "Outcome",
       "col_duration": "Duration"
+    },
+    "drawer": {
+      "title": "Kryphocron audience visibility",
+      "audiences_title": "Audiences owned",
+      "audiences_empty": "This account owns no audiences.",
+      "audiences_error": "Could not load audiences.",
+      "members": "{count, plural, one {# member} other {# members}}",
+      "cascade_title": "Block-cascade impact",
+      "cascade_count": "{count, plural, =0 {No cascade-driven audience removals} one {# cascade-driven audience removal} other {# cascade-driven audience removals}}",
+      "cascade_pending": "Block-cascade bookkeeping is not yet recorded on this deployment.",
+      "cascade_error": "Could not load block-cascade impact."
     }
   },
   "actions": {

@@ -131,8 +131,22 @@
         bodyHtml: '<div id="ad-history-body"><p class="empty-state">Loading…</p></div>',
       });
     }
+    // Kryphocron audience visibility (Mod+, §6.5) — read-only.
+    if (isMod) {
+      html += drawer.render({
+        id: 'kryphocron-' + currentDid,
+        summary: '<strong>' + esc(T('kryphocron.drawer.title')) + '</strong>',
+        roleTag: 'Moderator+',
+        bodyHtml: '<div id="ad-kryphocron-body"><p class="empty-state">' +
+          esc(T('common.loading')) + '</p></div>',
+      });
+    }
     primary.innerHTML = html;
     drawer.attach(primary);
+
+    // Kryphocron drawer content (audiences owned + block-cascade impact),
+    // loaded async from the #225 per-account read endpoints.
+    if (isMod) loadKryphocronDrawer(currentDid);
 
     // Mount Pattern B (moderation) ActionPanel.
     const modPanelHost = document.getElementById('ad-mod-action-panel');
@@ -149,6 +163,52 @@
       panel.mount(modPanelHost);
     }
     wireManagementHandlers();
+  }
+
+  // Kryphocron audience-visibility drawer (§6.5): audiences owned (read-only,
+  // never the members contents) + block-cascade impact. Default-audience and
+  // per-account cadence are omitted (not host-exposed yet — §6.5 "surface if
+  // exposed; otherwise omit"). Reads the #225 per-account endpoints.
+  async function loadKryphocronDrawer(did) {
+    const K = global.AuroraEndpoints && global.AuroraEndpoints.ops && global.AuroraEndpoints.ops.kryphocron;
+    const host = document.getElementById('ad-kryphocron-body');
+    if (!host || !K) return;
+    const [audRes, casRes] = await Promise.all([
+      K.listAudiences(did).catch((e) => ({ __err: e })),
+      K.getBlockCascadeImpact(did).catch((e) => ({ __err: e })),
+    ]);
+    // Bail if the operator navigated to another account meanwhile.
+    if (currentDid !== did) return;
+
+    let html = '<h4 class="drawer-subhead">' + esc(T('kryphocron.drawer.audiences_title')) + '</h4>';
+    if (audRes && audRes.__err) {
+      html += '<p class="empty-state">' + esc(T('kryphocron.drawer.audiences_error')) + '</p>';
+    } else {
+      const audiences = (audRes && audRes.audiences) || [];
+      if (!audiences.length) {
+        html += '<p class="empty-state">' + esc(T('kryphocron.drawer.audiences_empty')) + '</p>';
+      } else {
+        html += '<ul class="ad-audience-list">' + audiences.map(function (a) {
+          const mode = a.mode ? T('kryphocron.audiences.mode_' + a.mode) : T('kryphocron.audiences.mode_unset');
+          const members = (a.mode === 'list' && a.memberCount != null)
+            ? ' · ' + esc(T('kryphocron.drawer.members', { count: a.memberCount }))
+            : '';
+          return '<li><strong>' + esc(a.name || a.rkey || '—') + '</strong> ' +
+            '<span class="badge">' + esc(mode) + '</span>' + members + '</li>';
+        }).join('') + '</ul>';
+      }
+    }
+
+    html += '<h4 class="drawer-subhead">' + esc(T('kryphocron.drawer.cascade_title')) + '</h4>';
+    if (casRes && casRes.__err) {
+      html += '<p class="empty-state">' + esc(T('kryphocron.drawer.cascade_error')) + '</p>';
+    } else if (casRes && casRes.available) {
+      html += '<p>' + esc(T('kryphocron.drawer.cascade_count', { count: casRes.cascadeRemovals || 0 })) + '</p>';
+    } else {
+      html += '<p class="empty-state">' + esc(T('kryphocron.drawer.cascade_pending')) + '</p>';
+    }
+
+    host.innerHTML = html;
   }
 
   function overviewHtml(info) {
