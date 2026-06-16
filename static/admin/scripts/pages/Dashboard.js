@@ -277,13 +277,44 @@
       visible: (c) => c.isAdmin && c.notDisabled,
       html: () =>
         '<section class="dash-block" id="dash-kryphocron">' +
-        '  <h3>' + esc(T('dashboard.kryphocron_title')) + '</h3>' +
-        '  <div class="empty-state" role="status">' +
-        '    <p>' + esc(T('dashboard.kryphocron_blurb')) +
-        '       <a href="#kryphocron">' + esc(T('dashboard.kryphocron_preview')) + '</a></p>' +
+        '  <div class="metrics-header">' +
+        '    <h3>' + esc(T('kryphocron.dashboard-block.title')) + '</h3>' +
+        '    <a class="btn-sm btn-secondary" href="#kryphocron">' +
+             esc(T('kryphocron.dashboard-block.open')) + '</a>' +
         '  </div>' +
+        '  <div id="dash-kryphocron-body"><p class="empty-state">' +
+             esc(T('dashboard.loading')) + '</p></div>' +
         '</section>',
-      refresh: async () => { /* Arc D wires the summary endpoints (§6.9). */ },
+      // §6.9 — slice of the Overview's substrate identity + aggregate counts,
+      // with click-through to the Kryphocron domain.
+      refresh: async (ep) => {
+        const body = document.getElementById('dash-kryphocron-body');
+        if (!body) return;
+        const stat = (n, labelKey) =>
+          '<div class="stat"><div class="stat-value">' + esc(String(n == null ? '—' : n)) +
+          '</div><div class="stat-label">' + esc(T(labelKey)) + '</div></div>';
+        try {
+          const K = ep.ops.kryphocron;
+          const [info, tiers] = await Promise.all([
+            K.getSubstrateInfo(),
+            K.getTierStats().catch(() => null),
+          ]);
+          const counts = (info && info.aggregateCounts) || {};
+          const tot = (tiers && tiers.tierTotals) || {};
+          body.innerHTML =
+            '<div class="stat-row">' +
+            stat(counts.privatePostRecords, 'kryphocron.dashboard-block.private_posts') +
+            stat(counts.audienceRecords, 'kryphocron.dashboard-block.audiences') +
+            stat(tot.public, 'kryphocron.dashboard-block.public_tier') +
+            '</div>' +
+            '<p class="settings-help">' +
+            esc(T('kryphocron.dashboard-block.codec', { codec: (info && info.codecId) || '—' })) + '</p>';
+        } catch (e) {
+          body.innerHTML = '<p class="empty-state">' +
+            esc(T('kryphocron.dashboard-block.unavailable')) +
+            ' <a href="#kryphocron">' + esc(T('kryphocron.dashboard-block.open')) + '</a></p>';
+        }
+      },
     },
     {
       id: 'adminactions',

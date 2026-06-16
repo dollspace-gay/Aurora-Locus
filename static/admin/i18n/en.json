@@ -406,6 +406,15 @@
       "col_outcome": "Outcome",
       "col_duration": "Duration"
     },
+    "dashboard-block": {
+      "title": "Kryphocron",
+      "open": "Open Kryphocron →",
+      "private_posts": "Private posts",
+      "audiences": "Audiences",
+      "public_tier": "Public-tier records",
+      "codec": "Active codec: {codec}",
+      "unavailable": "Kryphocron summary unavailable."
+    },
     "drawer": {
       "title": "Kryphocron audience visibility",
       "audiences_title": "Audiences owned",
