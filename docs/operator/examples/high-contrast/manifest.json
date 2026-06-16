@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "high-contrast",
+  "themeName": "High Contrast",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "aurora-default",
+  "themeAuthor": "Aurora-Locus examples",
+  "themeDescription": "A near-black/white palette tuned for AAA contrast across the board. Useful as an accessibility reference.",
+  "files": {
+    "tokens": "tokens.css"
+  }
+}

@@ -1,0 +1,54 @@
+/*
+ * full-token-redefinition — every required token, declared explicitly.
+ *
+ * Still extends aurora-default (every chain must root there), but redefines all
+ * 28 required tokens rather than inheriting any. A light palette; effect classes
+ * are inherited from aurora-default. Every contrast-bearing pair clears its WCAG
+ * threshold.
+ */
+
+:root {
+  /* Surfaces */
+  --color-surface-primary: #fbfbfc;
+  --color-surface-secondary: #f3f3f5;
+  --color-surface-tertiary: #ebebed;
+  --color-surface-overlay: rgba(0, 0, 0, 0.4);
+
+  /* Text */
+  --color-text-primary: #1a1a1c;
+  --color-text-secondary: #46464a;
+  --color-text-tertiary: #6a6a6e;
+  --color-text-inverted: #fbfbfc;
+
+  /* Accent */
+  --color-accent-primary: #2563eb;
+  --color-accent-primary-hover: #1d4ed8;
+  --color-accent-primary-active: #1e40af;
+  --color-accent-secondary: #5b5b60;
+
+  /* Status */
+  --color-status-success: #15803d;
+  --color-status-warning: #b45309;
+  --color-status-danger: #c81e1e;
+  --color-status-info: #1d4ed8;
+
+  /* Borders */
+  --color-border-primary: rgba(0, 0, 0, 0.10);
+  --color-border-secondary: rgba(0, 0, 0, 0.05);
+  --color-border-focus: var(--color-accent-primary);
+
+  /* Typography */
+  --font-family-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
+  --font-family-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --font-family-display: var(--font-family-sans);
+
+  /* Sizing */
+  --font-size-base: 14px;
+  --space-unit: 4px;
+
+  /* Motion */
+  --motion-duration-fast: 120ms;
+  --motion-duration-medium: 220ms;
+  --motion-duration-slow: 380ms;
+  --motion-easing-standard: cubic-bezier(0.16, 1, 0.3, 1);
+}

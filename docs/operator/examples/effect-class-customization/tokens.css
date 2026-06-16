@@ -1,0 +1,9 @@
+/*
+ * effect-class-customization — tokens.
+ *
+ * This example is about effects, not palette: it declares no tokens and inherits
+ * all 28 (plus the optional structural set) from aurora-default unchanged. The
+ * file exists because `files.tokens` is required in the manifest; an empty
+ * declaration block is valid and contributes nothing to the cascade. The
+ * customization lives in effects.css.
+ */

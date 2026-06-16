@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "effect-class-customization",
+  "themeName": "Effect Class Customization",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "aurora-default",
+  "themeAuthor": "Aurora-Locus examples",
+  "themeDescription": "Inherits aurora-default's tokens unchanged and overrides several effect classes (frosted glass, hover glow, aurora glow).",
+  "files": {
+    "tokens": "tokens.css",
+    "effects": "effects.css"
+  }
+}
