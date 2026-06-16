@@ -287,7 +287,7 @@
 
   async function doPasswordReset() {
     const rationale = await promptRationale('Send password reset email?',
-      'Subject: ' + (currentAccount.handle || currentDid));
+      'Subject: ' + (currentAccount.handle || currentDid), 'Send reset email');
     if (rationale == null) return;
     try {
       const res = await global.AuroraCapabilities.callEndpoint('trigger-password-reset', {
@@ -353,7 +353,7 @@
   async function updateEmail() {
     const newEmail = document.getElementById('ad-mgmt-email').value.trim();
     if (!newEmail) return global.AuroraToast.warning('Email cannot be empty.');
-    const rationale = await promptRationale('Update email to ' + newEmail + '?');
+    const rationale = await promptRationale('Update email to ' + newEmail + '?', null, 'Update email');
     if (rationale == null) return;
     try {
       await global.AuroraClient.post('com.atproto.admin.updateAccountEmail', {
@@ -369,7 +369,7 @@
   async function updateHandle() {
     const newHandle = document.getElementById('ad-mgmt-handle').value.trim();
     if (!newHandle) return global.AuroraToast.warning('Handle cannot be empty.');
-    const rationale = await promptRationale('Update handle to @' + newHandle + '?');
+    const rationale = await promptRationale('Update handle to @' + newHandle + '?', null, 'Update handle');
     if (rationale == null) return;
     try {
       await global.AuroraClient.post('com.atproto.admin.updateAccountHandle', {
@@ -531,8 +531,10 @@
     }
   }
 
-  // Inline rationale prompt — uses a modal to ensure proper a11y.
-  function promptRationale(title, subtext) {
+  // Inline rationale prompt — uses a modal to ensure proper a11y. The
+  // confirm button takes a descriptive, action-naming label (§8.2.3 — not a
+  // generic "Confirm"); the caller passes the verb that matches `title`.
+  function promptRationale(title, subtext, confirmLabel) {
     return new Promise((resolve) => {
       const div = document.createElement('div');
       div.innerHTML = (subtext ? '<p>' + esc(subtext) + '</p>' : '') +
@@ -540,7 +542,8 @@
                       '<textarea id="pr-r" rows="3" style="width:100%;"></textarea>' +
                       '<div class="action-panel-buttons" style="margin-top: 0.75rem;">' +
                       '  <button class="btn-secondary" id="pr-cancel">Cancel</button>' +
-                      '  <button class="btn-primary" id="pr-confirm">Confirm</button>' +
+                      '  <button class="btn-primary" id="pr-confirm">' +
+                        esc(confirmLabel || 'Submit') + '</button>' +
                       '</div>';
       const handle = global.AuroraModal.open({ title: title, body: div, onClose: () => resolve(null) });
       div.querySelector('#pr-cancel').addEventListener('click', () => { handle.close(); });
