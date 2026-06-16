@@ -544,6 +544,27 @@ pub enum PdsError {
     #[error("kryphocron bind pipeline reached without an active apply_writes scope")]
     #[allow(dead_code)] // reachable only via programmer error
     KryphocronBindPipelineOutsideScope,
+
+    /// v0.9 Arc D (#237a) — a private-tier record was stored under a
+    /// kryphocron `CodecId` that does not match the codec currently
+    /// installed in this deployment (cross-peer / cross-version codec
+    /// skew, per kryphocron 0.3 §6.2). The record's bytes are valid, but
+    /// this deployment has no codec to decode them, so an authorized
+    /// reader's decode-on-read cannot produce plaintext. Mapped to HTTP
+    /// 410 Gone with a clear codec-mismatch message rather than a generic
+    /// 500: the condition is a deployment/codec-version state, not a
+    /// server fault. The encoded form is still returnable to consumers
+    /// that don't decode (federation, non-authorized readers); only the
+    /// decode path fails closed.
+    #[error(
+        "record encoded under codec {stored} but this deployment has codec {installed} installed"
+    )]
+    KryphocronCodecUnavailable {
+        /// The `CodecId` the record was stored under.
+        stored: String,
+        /// The `CodecId` currently installed in this deployment.
+        installed: String,
+    },
 }
 
 /// Manual PartialEq implementation for PdsError
@@ -1041,6 +1062,13 @@ impl IntoResponse for PdsError {
             PdsError::KryphocronBindPipelineOutsideScope => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "KryphocronBindPipelineOutsideScope",
+                self.to_string(),
+            ),
+            // v0.9 Arc D (#237a) — codec skew on an authorized decode-on-read.
+            // 410 Gone (not 500): the record is valid but undecodable here.
+            PdsError::KryphocronCodecUnavailable { .. } => (
+                StatusCode::GONE,
+                "KryphocronCodecUnavailable",
                 self.to_string(),
             ),
             _ => (

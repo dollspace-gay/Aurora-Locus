@@ -648,6 +648,7 @@ async fn delete_record(
 /// Get a record
 async fn get_record(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(query): Query<GetRecordQuery>,
 ) -> PdsResult<Json<GetRecordResponse>> {
     // Get the DID (could be handle resolution in the future)
@@ -673,10 +674,51 @@ async fn get_record(
                 .unwrap_or("unknown")
                 .to_string();
 
-            let record_value = value
+            let mut record_value = value
                 .get("value")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+
+            // v0.9 Arc D (#237a) — decode-on-read for private-tier records.
+            // `feed.postPrivate` content is encoded at rest (#236); an
+            // authorized reader fetching it here gets decoded plaintext, a
+            // non-authorized/anonymous reader gets the encoded form unchanged
+            // (transparent — atproto's getRecord-is-public contract + the
+            // friction model are both preserved). Aurora-Locus owns the
+            // authorization decision (architecture (Y)); the substrate codec is
+            // the at-rest layer only. Other NSIDs (public records, audience/
+            // block/mute structural records) pass through untouched.
+            if query.collection == crate::api::kryphocron_endpoints::NSID_POST_PRIVATE {
+                // Optional reader auth: a valid session identifies the reader;
+                // no/invalid credentials -> anonymous (treated as non-member).
+                let reader_did = middleware::require_auth_unified(State(ctx.clone()), headers)
+                    .await
+                    .ok()
+                    .map(|auth| auth.did().to_string());
+                if matches!(
+                    crate::kryphocron_content::authorize_private_read(
+                        &ctx,
+                        reader_did.as_deref(),
+                        did,
+                        &record_value,
+                    )
+                    .await,
+                    crate::kryphocron_content::ReadAuthz::Authorized
+                ) {
+                    // Decode in place. Codec skew surfaces as 410 (the record is
+                    // valid but undecodable here); other decode failures surface
+                    // as 500. A non-encoded (legacy `text`) record is a no-op.
+                    crate::kryphocron_content::decode_private_content(
+                        &ctx,
+                        did,
+                        &query.collection,
+                        &query.rkey,
+                        &mut record_value,
+                    )
+                    .await?;
+                }
+                // Non-authorized: leave the encoded form as stored.
+            }
 
             // Fetch labels for this record
             let labels = ctx

@@ -591,8 +591,9 @@ fn build_denied_payload(
 
 /// Extract the owner DID from an `at://<did>/<collection>/<rkey>`
 /// URI. Returns `None` if the URI doesn't match the expected
-/// shape.
-fn parse_at_uri_did(uri: &str) -> Option<String> {
+/// shape. `pub(crate)` so the read-side authorization resolver
+/// ([`crate::kryphocron_content`]) can reuse it (#237a).
+pub(crate) fn parse_at_uri_did(uri: &str) -> Option<String> {
     let after_scheme = uri.strip_prefix("at://")?;
     let did = after_scheme.split('/').next()?;
     if did.starts_with("did:") {
