@@ -377,6 +377,20 @@
       "cadence_weekly": "Weekly",
       "cadence_manual": "Manual only"
     },
+    "tier-activity": {
+      "title": "Tier activity",
+      "subtitle": "Kryphocron record write counts by tier and NSID. Counts and metadata only — no record content.",
+      "tier_public": "Public-tier records",
+      "tier_private": "Private-tier records",
+      "window_note": "Trends cover the last {days} days.",
+      "public_block": "Public tier",
+      "private_block": "Private tier",
+      "col_nsid": "NSID",
+      "col_total": "Total",
+      "col_trend": "30-day trend",
+      "col_distribution": "Accounts (by record count)",
+      "empty": "No kryphocron records on this deployment yet."
+    },
     "history": {
       "title": "Rotation history",
       "subtitle": "Operator-triggered rewrites and cadence-organic slug rotations.",
