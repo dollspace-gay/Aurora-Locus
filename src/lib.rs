@@ -27,6 +27,7 @@ pub mod jobs;
 pub mod kryphocron;
 pub mod kryphocron_audit;
 pub mod kryphocron_content;
+pub mod kryphocron_rewrite;
 pub mod kryphocron_rotation;
 pub mod mailer;
 pub mod metrics;

@@ -204,6 +204,17 @@ pub struct AppContext {
     /// the same oracle held in `kryphocron_rotation_oracle`.
     pub kryphocron_at_rest_hooks:
         Option<Arc<dyn kryphocron::encryption::AtRestHooks>>,
+
+    /// v0.9 Arc D (#224) — the deployment's single rewrite-on-rotate job
+    /// (host-side; kryphocron 0.3 ships no rewrite driver). `Some` when
+    /// `config.kryphocron.enabled`; `None` otherwise. Holds the single-flight
+    /// guard + cancel hook + observable progress: `triggerRotation`
+    /// (`force_rotation` + spawn the corpus walk) starts it, the #225
+    /// `getRotationProgress` / `cancelRotation` XRPCs read/cancel it. Re-encodes
+    /// every account's private-tier records under the post-rotation generation
+    /// via the #237a decode + #236 encode primitives.
+    pub kryphocron_rewrite_job:
+        Option<Arc<crate::kryphocron_rewrite::RewriteJob>>,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -920,7 +931,12 @@ impl AppContext {
         // `kryphocron::KRYPHOCRON_LEXICON_REGISTRY`. When the switch is
         // off, both are skipped: the registry stays uninitialised and
         // `kryphocron_deny_map` stays `None`.
-        let (kryphocron_deny_map, kryphocron_rotation_oracle, kryphocron_at_rest_hooks) = if config.kryphocron.enabled {
+        let (
+            kryphocron_deny_map,
+            kryphocron_rotation_oracle,
+            kryphocron_at_rest_hooks,
+            kryphocron_rewrite_job,
+        ) = if config.kryphocron.enabled {
             crate::kryphocron::warm_lexicons();
             let map = crate::kryphocron::build_deny_map();
             tracing::info!(
@@ -999,9 +1015,16 @@ impl AppContext {
             // record write.
             let hooks: Arc<dyn kryphocron::encryption::AtRestHooks> = Arc::new(hooks);
 
-            (Some(Arc::new(map)), Some(oracle), Some(hooks))
+            // #224 — the rewrite-on-rotate job (host-side; reads its own
+            // bookkeeping under <data-dir>/aurora-locus/). Independent of the
+            // oracle/hooks Arcs — it resolves them from AppContext at run time.
+            let rewrite_job = Arc::new(crate::kryphocron_rewrite::RewriteJob::new(
+                config.storage.data_directory.clone(),
+            ));
+
+            (Some(Arc::new(map)), Some(oracle), Some(hooks), Some(rewrite_job))
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         // v0.9 Arc B — enumerate + validate installed themes at startup.
@@ -1065,6 +1088,8 @@ impl AppContext {
             // v0.9 Arc D (#236) — persisted at-rest hooks for the
             // encode-on-write seam.
             kryphocron_at_rest_hooks,
+            // v0.9 Arc D (#224) — rewrite-on-rotate job.
+            kryphocron_rewrite_job,
         })
     }
 

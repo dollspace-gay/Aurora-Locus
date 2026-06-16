@@ -3783,24 +3783,40 @@ pub async fn serve_active_theme_effects_css(
 }
 
 /// `tools.aurora.ops.kryphocron.triggerRotation` — force a Laquna rotation
-/// ahead of cadence (§6.4.2). Admin+ (via [`AdminAuthContext`]). Invokes the
-/// `aurora-locus-standard` rotation oracle's `force_rotation()` hook so the
-/// next encode yields a fresh generation. This is the minimal form: it marks
-/// the current generation expired. The `rewrite-on-rotate` background job
-/// (re-encoding existing records) and the "rotation already in progress"
-/// guard land in #224; for now the trigger only flips the generation.
+/// ahead of cadence (§6.4.2). Admin+ (via [`AdminAuthContext`]). Single-flight:
+/// the rewrite job's [`try_start`](crate::kryphocron_rewrite::RewriteJob::try_start)
+/// rotates the slug (`force_rotation()`) **and** spawns the rewrite-on-rotate
+/// background job that re-encodes existing private-tier records under the new
+/// generation — both under the running-guard, so a concurrent trigger while a
+/// rewrite is in progress is rejected with HTTP 409 "rotation already in
+/// progress" (§6.4.2 verification gate) and does NOT rotate the generation.
+/// In-progress visibility (`getRotationProgress`) and cancellation
+/// (`cancelRotation`) are the #225 XRPCs reading/calling this job.
 pub async fn trigger_rotation(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match &ctx.kryphocron_rotation_oracle {
-        Some(oracle) => {
-            oracle.force_rotation();
-            tracing::info!("kryphocron Laquna rotation triggered (triggerRotation XRPC)");
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "status": "rotation-triggered" })),
-            )
+    match &ctx.kryphocron_rewrite_job {
+        Some(job) => {
+            if job.try_start(ctx.clone()) {
+                tracing::info!(
+                    "kryphocron Laquna rotation triggered (triggerRotation XRPC); \
+                     rewrite-on-rotate job started",
+                );
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "status": "rotation-triggered" })),
+                )
+            } else {
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "RotationInProgress",
+                        "message": "a rewrite-on-rotate job is already in progress; \
+                                    cancel it before triggering a new rotation",
+                    })),
+                )
+            }
         }
         None => (
             StatusCode::BAD_REQUEST,
