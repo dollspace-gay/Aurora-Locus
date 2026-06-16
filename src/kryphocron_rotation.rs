@@ -114,6 +114,13 @@ struct RotationState {
 struct PersistRequest {
     slug: [u8; 32],
     generated_at: SystemTime,
+    /// Whether this rotation was cadence-organic (the cadence boundary
+    /// elapsed) rather than operator-forced (`force_rotation`). Cadence-organic
+    /// rotations also append a `rotation-history.log` record (#238, the §6.4.2.1
+    /// cadence-organic track); operator-forced rotations are recorded by the
+    /// rewrite-on-rotate job's `rewrite-history.log` instead (#224), so they do
+    /// not double-write here.
+    cadence_organic: bool,
 }
 
 /// Aurora-Locus's standard single-process rotation oracle
@@ -172,6 +179,12 @@ impl AuroraLocusStandardRotationOracle {
         // resume handles a crash mid-write. Exits when the oracle drops.
         let (persist_tx, persist_rx) = mpsc::channel::<PersistRequest>();
         let worker_path = path;
+        // The cadence-organic rotation-history log sits beside rotation.state
+        // under <data-dir>/aurora-locus/ (§7.2.4). Derived once so the worker
+        // does no path work per request.
+        let history_path_buf = worker_path
+            .parent()
+            .map(|p| p.join("rotation-history.log"));
         std::thread::spawn(move || {
             while let Ok(req) = persist_rx.recv() {
                 let _ = write_state_file(
@@ -181,6 +194,14 @@ impl AuroraLocusStandardRotationOracle {
                         generated_at: req.generated_at,
                     },
                 );
+                // #238 — append the cadence-organic track record off the hot
+                // path. Best-effort: a history-log write failure never affects
+                // the rotation (the slug + state.state already persisted above).
+                if req.cadence_organic {
+                    if let Some(hp) = &history_path_buf {
+                        append_rotation_history(hp, req.generated_at, &req.slug);
+                    }
+                }
             }
         });
 
@@ -267,6 +288,9 @@ impl RotationOracle for AuroraLocusStandardRotationOracle {
                 let _ = self.persist_tx.send(PersistRequest {
                     slug,
                     generated_at: now,
+                    // Cadence-organic iff this rotation was not operator-forced
+                    // (forced rotations are tracked by #224's rewrite-history.log).
+                    cadence_organic: !was_forced,
                 });
             }
         }
@@ -332,6 +356,47 @@ fn read_state_file(path: &Path) -> Option<RotationState> {
         current_slug: slug,
         generated_at: UNIX_EPOCH + Duration::from_secs(secs),
     })
+}
+
+/// Append one cadence-organic rotation record to `rotation-history.log`
+/// (#238, §6.4.2.1). JSONL, one record per line, in the exact shape the #225
+/// `listRotations` reader (`read_rotation_history`) parses:
+/// `{"at": <unix_millis>, "generation": "<mark>"}`. Append-only (never
+/// rewrites or truncates), best-effort: a failure is logged and swallowed so
+/// the rotation hot path is never affected. The mark is rebuilt from the slug
+/// + `generated_at` exactly as `format_mark` produces it.
+fn append_rotation_history(path: &Path, generated_at: SystemTime, slug: &[u8; 32]) {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let at_ms = generated_at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mark = format_mark(generated_at, slug);
+    let line = format!(
+        "{}\n",
+        serde_json::json!({ "at": at_ms, "generation": mark.to_string() })
+    );
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::warn!(
+                    target: "aurora_locus::kryphocron",
+                    path = %path.display(),
+                    error = %e,
+                    "cadence-organic rotation: failed to append rotation-history.log",
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            target: "aurora_locus::kryphocron",
+            path = %path.display(),
+            error = %e,
+            "cadence-organic rotation: failed to open rotation-history.log",
+        ),
+    }
 }
 
 /// Persist as `<unix_secs>\n<hex_slug>\n`, creating the parent dir if needed.
@@ -478,6 +543,77 @@ mod tests {
         o.set_cadence(Cadence::ManualOnly);
         let b = o.current_generation(&RotationContext::for_install_probe()).unwrap();
         assert_eq!(mark_str(&a), mark_str(&b), "cadence update consulted live");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- #238 cadence-organic rotation-history.log writer ----
+
+    /// Parse a rotation-history.log line exactly as the #225 `listRotations`
+    /// reader (`read_rotation_history`) does, so the round-trip test asserts
+    /// the writer conforms to the locked reader contract by construction.
+    fn parse_history_line(line: &str) -> Option<(u64, String)> {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        let at = v.get("at").and_then(|a| a.as_u64())?;
+        let gen = v.get("generation").and_then(|g| g.as_str())?.to_string();
+        Some((at, gen))
+    }
+
+    #[test]
+    fn rotation_history_append_round_trips_reader_format() {
+        let dir = tmp_dir("rot-history");
+        let path = dir.join("rotation-history.log");
+        let g1 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let g2 = UNIX_EPOCH + Duration::from_secs(1_700_003_600);
+        append_rotation_history(&path, g1, &[1u8; 32]);
+        append_rotation_history(&path, g2, &[2u8; 32]);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2, "append-only: two records, second did not overwrite");
+
+        let parsed: Vec<(u64, String)> = lines.iter().filter_map(|l| parse_history_line(l)).collect();
+        assert_eq!(parsed.len(), 2, "both records parse via the reader's contract");
+        assert_eq!(parsed[0].0, 1_700_000_000_000, "at is unix millis");
+        assert_eq!(parsed[1].0, 1_700_003_600_000);
+        assert!(parsed[0].1.starts_with("laquna/"), "generation is a laquna mark");
+        assert_ne!(parsed[0].1, parsed[1].1, "distinct slugs ⇒ distinct marks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_history_append_is_fail_soft_on_bad_path() {
+        // Point the "file" at a directory: OpenOptions::append fails to open it,
+        // and the writer must swallow the error (best-effort) rather than panic
+        // — the rotation hot path never blocks on history persistence.
+        let dir = tmp_dir("rot-history-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        append_rotation_history(&dir, SystemTime::now(), &[3u8; 32]);
+        // Reaching here without panicking proves fail-soft.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_history_reader_skips_malformed_and_empty_lines() {
+        // The reader tolerates a corrupt-on-disk line (mirrors rotation.state
+        // corrupt-state recovery): a malformed line is skipped, valid records
+        // around it still parse.
+        let dir = tmp_dir("rot-history-corrupt");
+        let path = dir.join("rotation-history.log");
+        append_rotation_history(&path, UNIX_EPOCH + Duration::from_secs(1_700_000_000), &[7u8; 32]);
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"not json\n\n").unwrap();
+        }
+        append_rotation_history(&path, UNIX_EPOCH + Duration::from_secs(1_700_007_200), &[8u8; 32]);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: Vec<(u64, String)> = contents
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(parse_history_line)
+            .collect();
+        assert_eq!(parsed.len(), 2, "malformed + empty lines skipped; valid records survive");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
