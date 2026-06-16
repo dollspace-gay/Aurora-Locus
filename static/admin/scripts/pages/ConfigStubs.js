@@ -78,14 +78,11 @@
       blurb: 'Available when the observability backend ships. This page will ' +
              'manage metrics, logging, and telemetry posture.',
     },
-    {
-      key: 'kryphocronStub',
-      domain: 'Kryphocron',
-      domainRoute: 'kryphocron',
-      title: 'Overview',
-      blurb: 'The Kryphocron domain ships in Aurora-Locus 0.9.1. Overview, ' +
-             'Audience aggregate, and Tier activity pages will appear here.',
-    },
+    // The `kryphocronStub` Overview placeholder was retired in #226 (D-routes):
+    // the Kryphocron domain's real routes (overview / laquna / laquna-history /
+    // audiences / tier-activity) ship across #228–#231 + #229. The
+    // `configKryphocronPolicy` stub below stays until #227 (D-policy-page)
+    // registers the real page and deletes its row.
   ];
 
   function makeMount(stub) {

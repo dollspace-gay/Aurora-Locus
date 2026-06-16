@@ -67,10 +67,21 @@
     { pattern: 'configuration/roles/:role', page: 'configRolesMembers', requires: 'moderator' },
     { pattern: 'configuration/capabilities', page: 'configCapabilities' },
 
-    // Kryphocron domain — full pages ship in Arc D (0.9.1). 0.9.0 carries
-    // the group label plus a single stub child so the IA shape is stable
-    // from 0.9.0 forward (§5.7.4 / kickoff item 1 default).
-    { pattern: 'kryphocron', page: 'kryphocronStub', requires: 'moderator' },
+    // Kryphocron domain (Arc D / 0.9.1) — the four domain pages (§6.4) plus
+    // the Laquna rotation-history sub-page (§6.4.2.1). Bare `kryphocron`
+    // resolves to Overview (§6.4.1's "bare #kryphocron redirects to
+    // overview"). Overview / Audiences / Tier activity are Moderator+
+    // (observability); Laquna + its history sub-page are Admin+ (the
+    // rotation operator action). The kryphocron *domain* visibility (the
+    // §5.7.4 role × moderation-mode matrix in domainMinRole below) was
+    // already wired Moderator+ in Arc A; these per-route `requires` realise
+    // the in-domain Admin+ gate on the Laquna surfaces.
+    { pattern: 'kryphocron', page: 'kryphocronOverview', requires: 'moderator' },
+    { pattern: 'kryphocron/overview', page: 'kryphocronOverview', requires: 'moderator' },
+    { pattern: 'kryphocron/laquna', page: 'kryphocronLaquna', requires: 'admin' },
+    { pattern: 'kryphocron/laquna/history', page: 'kryphocronLaqunaHistory', requires: 'admin' },
+    { pattern: 'kryphocron/audiences', page: 'kryphocronAudiences', requires: 'moderator' },
+    { pattern: 'kryphocron/tier-activity', page: 'kryphocronTierActivity', requires: 'moderator' },
   ];
 
   // Legacy hash redirects per §12.8. Operators with bookmarks pointing
@@ -147,14 +158,19 @@
       ],
     },
     {
-      // Kryphocron domain pages ship in Arc D (0.9.1). 0.9.0 renders the
-      // group label plus one "Available in 0.9.1" stub child so the IA
-      // shape is stable from 0.9.0. Mode-aware visibility per §5.7.4 is
-      // wired in the A-mode-gating pass; here the group is role-gated to
-      // Moderator+ (the lowest tier that sees Kryphocron once Arc D lands).
+      // Kryphocron domain (Arc D / 0.9.1) — the four §6.4 domain pages.
+      // Mode-aware visibility per §5.7.4 comes from the domain gate
+      // (domainMinRole('kryphocron') = Moderator+ in full/reduced, hidden
+      // in disabled). Per-item `requires` realises the in-domain Admin+
+      // gate: a Moderator sees Overview / Audience aggregate / Tier
+      // activity but not Laquna. The rotation-history sub-page is reached
+      // from the Laquna page, not the sidebar.
       heading: 'Kryphocron',
       items: [
-        { label: 'Overview', route: 'kryphocron', icon: 'eye-off' },
+        { label: 'Overview', route: 'kryphocron/overview', icon: 'eye-off' },
+        { label: 'Laquna', route: 'kryphocron/laquna', icon: 'refresh-cw', requires: 'admin' },
+        { label: 'Audience aggregate', route: 'kryphocron/audiences', icon: 'users' },
+        { label: 'Tier activity', route: 'kryphocron/tier-activity', icon: 'bar-chart-2' },
       ],
     },
   ];
