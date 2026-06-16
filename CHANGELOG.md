@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- I-modal-discipline — §8.2.3 confirmation-modal audit (labels / typed-confirm / rationale / a11y) (#245)
+- I-color-drift — §10.4.4 color-usage drift: tokenize hardcoded colors in component CSS (#244)
 - I-timestamp — §10.4.3 time-format consistency: AuroraTimestamp primitive + migrate ad-hoc formatters (#242)
 - I-naming — §10.4.5 'Admin UI' naming audit: resolve to canonical 'Aurora-Locus admin' (#241)
 - D-rotation-history-log — oracle write-side for the cadence-organic rotation track (#238)
