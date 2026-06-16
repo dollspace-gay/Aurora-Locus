@@ -40,10 +40,9 @@
     } catch (e) { return dflt; }
   }
 
-  function fmtTime(s) {
-    if (!s) return '—';
-    try { const d = new Date(s); return isNaN(d.getTime()) ? String(s) : d.toLocaleString(); }
-    catch (_) { return String(s); }
+  // §10.4.3 — canonical timestamp rendering (returns a <time> element).
+  function ts(value, context) {
+    return global.AuroraTimestamp.render({ value: value, context: context });
   }
 
   async function mount({ container }) {
@@ -85,10 +84,10 @@
       '<div class="kv-row"><dt>' + esc(t('kryphocron.laquna.generation')) +
         '</dt><dd><code>' + esc(r.generationMark || '—') + '</code></dd></div>' +
       '<div class="kv-row"><dt>' + esc(t('kryphocron.laquna.last_slug')) +
-        '</dt><dd>' + esc(fmtTime(r.lastSlugRotation)) + '</dd></div>' +
+        '</dt><dd>' + ts(r.lastSlugRotation, 'detail') + '</dd></div>' +
       '<div class="kv-row"><dt>' + esc(t('kryphocron.laquna.last_rewrite')) +
-        '</dt><dd>' + esc(r.lastRecordRewriteCompleted ? fmtTime(r.lastRecordRewriteCompleted)
-          : t('kryphocron.laquna.never')) + '</dd></div>' +
+        '</dt><dd>' + (r.lastRecordRewriteCompleted ? ts(r.lastRecordRewriteCompleted, 'detail')
+          : esc(t('kryphocron.laquna.never'))) + '</dd></div>' +
       '<div class="kv-row"><dt>' + esc(t('kryphocron.laquna.cadence_current')) +
         '</dt><dd>' + esc(r.cadence || '—') + '</dd></div>' +
       '</dl>';
@@ -168,7 +167,7 @@
       '<div class="kv-row"><dt>' + esc(t('kryphocron.laquna.records_rewritten')) +
         '</dt><dd>' + esc(String(p.recordsRewritten != null ? p.recordsRewritten : 0)) + '</dd></div>' +
       '<div class="kv-row"><dt>' + esc(t('kryphocron.laquna.started_at')) +
-        '</dt><dd>' + esc(fmtTime(p.startedAt)) + '</dd></div>' +
+        '</dt><dd>' + ts(p.startedAt, 'detail') + '</dd></div>' +
       '</dl>' +
       (p.cancelRequested
         ? '<p class="settings-help">' + esc(t('kryphocron.laquna.cancel_pending')) + '</p>'

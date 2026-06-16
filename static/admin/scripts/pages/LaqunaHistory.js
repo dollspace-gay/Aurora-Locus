@@ -17,10 +17,9 @@
   }
   const t = (k, p) => (global.t ? global.t(k, p) : k);
 
-  function fmtTime(s) {
-    if (!s) return '—';
-    try { const d = new Date(s); return isNaN(d.getTime()) ? String(s) : d.toLocaleString(); }
-    catch (_) { return String(s); }
+  // §10.4.3 — canonical timestamp rendering (returns a <time> element).
+  function ts(value, context) {
+    return global.AuroraTimestamp.render({ value: value, context: context });
   }
 
   async function mount({ container }) {
@@ -75,7 +74,7 @@
   function operatorTable(rows) {
     const body = rows.map((r) =>
       '<tr>' +
-      '<td>' + esc(fmtTime(r.at)) + '</td>' +
+      '<td>' + ts(r.at, 'detail') + '</td>' +
       '<td><code>' + esc(r.generationMark || '—') + '</code></td>' +
       '<td>' + esc(String(r.recordsRewritten != null ? r.recordsRewritten : '—')) + '</td>' +
       '<td>' + esc(r.outcome || '—') + '</td>' +
@@ -92,7 +91,7 @@
 
   function organicList(rows) {
     return '<ul class="activity-list">' + rows.map((r) =>
-      '<li class="activity-item"><span class="activity-time">' + esc(fmtTime(r.at)) +
+      '<li class="activity-item"><span class="activity-time">' + ts(r.at, 'activity') +
       '</span> <code class="activity-subject">' + esc(r.generationMark || '—') + '</code></li>'
     ).join('') + '</ul>';
   }

@@ -124,9 +124,9 @@
         '<h3>' + esc(t('kryphocron.overview.rotation_title')) + '</h3>' +
         '<dl class="kv-list">' +
         kv(t('kryphocron.overview.generation'), '<code>' + esc(r.generationMark || '—') + '</code>') +
-        kv(t('kryphocron.overview.last_slug_rotation'), esc(fmtTime(r.lastSlugRotation))) +
+        kv(t('kryphocron.overview.last_slug_rotation'), ts(r.lastSlugRotation, 'detail')) +
         kv(t('kryphocron.overview.next_rotation'),
-           esc(r.nextScheduledSlugRotation ? fmtTime(r.nextScheduledSlugRotation) : t('kryphocron.overview.next_manual'))) +
+           (r.nextScheduledSlugRotation ? ts(r.nextScheduledSlugRotation, 'detail') : esc(t('kryphocron.overview.next_manual')))) +
         kv(t('kryphocron.overview.rewrite_in_progress'),
            esc(r.rewriteInProgress ? t('kryphocron.overview.yes') : t('kryphocron.overview.no'))) +
         '</dl>' +
@@ -186,7 +186,7 @@
       '<li class="activity-item">' +
       '<span class="activity-action">' + esc(action) + '</span> ' +
       (subject ? '<code class="activity-subject">' + esc(subject) + '</code> ' : '') +
-      '<span class="activity-time">' + esc(fmtTime(when)) + '</span>' +
+      '<span class="activity-time">' + ts(when, 'activity') + '</span>' +
       '</li>'
     );
   }
@@ -203,13 +203,10 @@
     return '<h3>' + esc(title) + '</h3><div class="banner banner-error" role="alert">' +
       esc(t('common.error', { message: (e && e.message) || '' })) + '</div>';
   }
-  function fmtTime(s) {
-    if (!s) return '—';
-    try {
-      const d = new Date(s);
-      if (isNaN(d.getTime())) return String(s);
-      return d.toLocaleString();
-    } catch (_) { return String(s); }
+  // §10.4.3 — canonical timestamp rendering via the AuroraTimestamp primitive
+  // (returns a <time> element; do not wrap in esc()).
+  function ts(value, context) {
+    return global.AuroraTimestamp.render({ value: value, context: context });
   }
 
   if (global.AuroraRouter) {
