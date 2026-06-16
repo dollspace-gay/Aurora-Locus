@@ -904,6 +904,41 @@ impl AppContext {
                 deny_map_entries = map.len(),
                 "kryphocron enabled; lexicons warmed and deny-error map built",
             );
+
+            // v0.9 Arc D (#222) — install + validate the kryphocron 0.3 at-rest
+            // baseline against the data dir, fail-closed. `DefaultAtRestHooks::
+            // for_data_dir` installs the Laquna codec + `DefaultRotationOracle`
+            // (the encoding-at-default floor, AtRestHooks §8.3); construction
+            // performs the install-time write check at
+            // `<data-dir>/kryphocron/rotation.state`, and `validate_at_rest_install`
+            // confirms the codec's rotation requirement is satisfiable. We
+            // validate the baseline at startup and drop it — the *persistent*
+            // rotation oracle (aurora-locus-standard, its own state file) lands
+            // in #223, and the encode-on-write seam (`encode_record_content`)
+            // in the D-encode-seam ticket. Validate-only keeps the dep-upgrade
+            // ticket decoupled from the write-path wiring (Arc D §6).
+            use kryphocron::encryption::AtRestHooks as _;
+            let at_rest_hooks = kryphocron::encryption::DefaultAtRestHooks::for_data_dir(
+                config.storage.data_directory.clone(),
+            )
+            .map_err(|e| {
+                PdsError::Internal(format!(
+                    "kryphocron at-rest baseline construction failed: {e}"
+                ))
+            })?;
+            kryphocron::at_rest::validate_at_rest_install(&at_rest_hooks).map_err(|e| {
+                PdsError::Internal(format!(
+                    "kryphocron at-rest install validation failed (fail-closed): {e}"
+                ))
+            })?;
+            tracing::info!(
+                codec = %at_rest_hooks.content_codec().codec_id(),
+                rotation_oracle = at_rest_hooks.rotation_oracle().is_some(),
+                "kryphocron at-rest baseline validated (encoding-at-default floor); \
+                 persistent oracle + encode seam land in later Arc D tickets",
+            );
+            drop(at_rest_hooks); // validate-only; not persisted (see comment above)
+
             Some(Arc::new(map))
         } else {
             None

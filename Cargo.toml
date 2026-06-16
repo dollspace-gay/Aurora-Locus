@@ -10,12 +10,14 @@ license = "MIT OR Apache-2.0"
 # AT Protocol SDK (published crate, replaces the previously vendored ./Rust-Atproto-SDK)
 proto-blue = "0.3.1"
 
-# kryphocron substrate (v0.7 integration). v0.2.0 of both crates is
-# published on crates.io; kryphocron-lexicons is brought in
-# transitively via kryphocron but is also declared directly so we can
-# refer to the registry and tier vocabulary by name.
-kryphocron = "0.2"
-kryphocron-lexicons = "0.2"
+# kryphocron substrate. v0.9 Arc D (#222) upgrades 0.2 → 0.3: the 0.3
+# at-rest seam (AtRestHooks / ContentCodec / RotationOracle, Laquna as the
+# default codec) + the lexicons 0.3 shape changes (postPrivate.audienceList
+# object→string). kryphocron-lexicons is brought in transitively via
+# kryphocron but is also declared directly so we can refer to the registry
+# and tier vocabulary by name.
+kryphocron = "0.3"
+kryphocron-lexicons = "0.3"
 
 # Argon2id password hashing (vendored from the old SDK's server_auth module)
 argon2 = { version = "0.5", features = ["std"] }
