@@ -16,7 +16,10 @@ proto-blue = "0.3.1"
 # object→string). kryphocron-lexicons is brought in transitively via
 # kryphocron but is also declared directly so we can refer to the registry
 # and tier vocabulary by name.
-kryphocron = "0.3"
+# v0.9 Arc D (#237a) bumps to 0.3.1: host-constructible at-rest decode
+# inputs (EncodedRecord::new / DecodeContext::new) + kryphocron::VERSION +
+# audit::AUDIT_EVENT_TYPES. Purely additive; #[non_exhaustive] preserved.
+kryphocron = "0.3.1"
 kryphocron-lexicons = "0.3"
 
 # Argon2id password hashing (vendored from the old SDK's server_auth module)
