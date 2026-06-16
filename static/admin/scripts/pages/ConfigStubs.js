@@ -54,14 +54,8 @@
       blurb: 'Available when the moderation-policy backend ships. This page ' +
              'will manage configurable moderation defaults.',
     },
-    {
-      key: 'configKryphocronPolicy',
-      domain: 'Configuration',
-      domainRoute: 'configuration/general',
-      title: 'Kryphocron policy',
-      blurb: 'Available when the Kryphocron domain ships in 0.9.1. This page ' +
-             'will manage deployment-wide Kryphocron policy.',
-    },
+    // configKryphocronPolicy retired in #227 (D-policy-page) — the real
+    // page (ConfigKryphocronPolicy.js) registers that key now.
     {
       key: 'configIntegrationHooks',
       domain: 'Configuration',

@@ -88,6 +88,26 @@
     cleanupNonceStores: () => C().post('tools.aurora.ops.cleanupNonceStores', {}),
   };
 
+  // -------- tools.aurora.ops.kryphocron.* (v0.9 Arc D, #225 backend) --------
+  // The ten operator read XRPC backing the Kryphocron domain pages (§6.4,
+  // §6.5). `triggerRotation` (#223) + the read cohort (#225). listAudiences /
+  // getBlockCascadeImpact are per-account-filtered (the §6.5 drawer).
+  opsTools.kryphocron = {
+    getSubstrateInfo: () => C().get('tools.aurora.ops.kryphocron.getSubstrateInfo'),
+    getTierStats: () => C().get('tools.aurora.ops.kryphocron.getTierStats'),
+    getOracleActivity: () => C().get('tools.aurora.ops.kryphocron.getOracleActivity'),
+    getRotationStatus: () => C().get('tools.aurora.ops.kryphocron.getRotationStatus'),
+    getRotationProgress: () => C().get('tools.aurora.ops.kryphocron.getRotationProgress'),
+    triggerRotation: () => C().post('tools.aurora.ops.kryphocron.triggerRotation', {}),
+    cancelRotation: () => C().post('tools.aurora.ops.kryphocron.cancelRotation', {}),
+    listRotations: () => C().get('tools.aurora.ops.kryphocron.listRotations'),
+    getAudienceAggregate: () => C().get('tools.aurora.ops.kryphocron.getAudienceAggregate'),
+    listAudiences: (account) =>
+      C().get('tools.aurora.ops.kryphocron.listAudiences', { account: account }),
+    getBlockCascadeImpact: (account) =>
+      C().get('tools.aurora.ops.kryphocron.getBlockCascadeImpact', { account: account }),
+  };
+
   // -------- tools.aurora.superadmin.* --------
   const superadminTools = {
     grantRole: (body) => C().post('tools.aurora.superadmin.grantRole', body),
