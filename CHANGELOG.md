@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- D-rotation-oracle — aurora-locus-standard RotationOracle (peer single-process; own state file; runtime-cadence; force_rotation) (#223)
 - D-crate-upgrade — kryphocron/lexicons 0.2->0.3 (audienceList object->string + at-rest seam); arc entry point (#222)
 - Arc B regression: themes-v1 / listInstalled missing from wire-extension order + describeCapabilities snapshot (latent from #213) (#235)
 - B-debt — §10.4.4 color-usage drift → CSS variables (incremental) (#219)
