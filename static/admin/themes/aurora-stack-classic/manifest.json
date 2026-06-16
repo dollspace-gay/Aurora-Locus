@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "aurora-stack-classic",
+  "themeName": "Aurora Stack Classic",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "aurora-default",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "The classic Aurora-Stack aesthetic re-platformed onto the v0.9 substrate. Google Fonts (Inter + JetBrains Mono), a blue/violet aurora palette, the gradient wordmark, and the full effect library lit up. The 'show me what's possible' demo theme. Extension points land in 0.9.1.",
+  "files": {
+    "tokens": "tokens.css",
+    "effects": "effects.css"
+  }
+}

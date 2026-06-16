@@ -1,0 +1,47 @@
+/*
+ * aurora-stack-classic — token overrides (design §11.11.3).
+ *
+ * The classic Aurora-Stack identity translated onto the v0.9 substrate (the
+ * named source artifact aurora_prism_theme_extraction.md is not in-tree; this
+ * is an authored translation of the design's stated cues — recorded in
+ * docs/internal/recon/v09_arc_b_recon.md). Deep blue-black surfaces, a
+ * periwinkle/violet aurora accent, Inter + JetBrains Mono. Status colors,
+ * sizing, and motion are inherited from aurora-default. Contrast verified by
+ * the substrate gate.
+ *
+ * The @import is valid at the head of this standalone file; when the registry
+ * concatenates the resolved chain (B-themes-page / serving), @import hoisting
+ * is handled there.
+ */
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
+:root {
+  /* Surfaces — deep blue-black */
+  --color-surface-primary: #0e1018;
+  --color-surface-secondary: #161a26;
+  --color-surface-tertiary: #1e2336;
+  --color-surface-overlay: rgba(5, 6, 12, 0.7);
+
+  /* Text — cool off-whites */
+  --color-text-primary: #e9ecf5;   /* very high contrast on surface-primary */
+  --color-text-secondary: #aab2c8; /* ~8:1 on surface-secondary — AAA-normal */
+  --color-text-tertiary: #828ba6;  /* ~5.6:1 on surface-primary — AA-normal */
+  --color-text-inverted: #0e1018;  /* ~5.3:1 on accent-primary — AA-normal */
+
+  /* Accent — periwinkle/violet aurora */
+  --color-accent-primary: #6c7cff;
+  --color-accent-primary-hover: #8290ff;
+  --color-accent-primary-active: #5a6af0;
+  --color-accent-secondary: #828ba6;
+
+  /* Typography — Google Fonts */
+  --font-family-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-family-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-family-display: "Inter", sans-serif;
+
+  /* Borders */
+  --color-border-primary: rgba(255, 255, 255, 0.10);
+  --color-border-secondary: rgba(255, 255, 255, 0.05);
+  --color-border-focus: var(--color-accent-primary);
+}

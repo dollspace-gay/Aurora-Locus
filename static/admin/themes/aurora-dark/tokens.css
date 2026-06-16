@@ -1,0 +1,22 @@
+/*
+ * aurora-dark — token overrides (design §11.11.2).
+ *
+ * A richer dark theme: the same structure as aurora-default with deeper
+ * surfaces and a more vibrant accent. Deepening surfaces only increases
+ * contrast against the inherited light text, and the brighter accent keeps
+ * inverted text legible; the substrate gate verifies. Everything else —
+ * text, status, typography, motion — is inherited from aurora-default. The
+ * richness lives in effects.css.
+ */
+
+:root {
+  /* Deeper surfaces for more depth */
+  --color-surface-primary: #161618;
+  --color-surface-secondary: #1f1f22;
+  --color-surface-tertiary: #28282b;
+
+  /* A more vibrant accent (brighter than aurora-default's calm blue) */
+  --color-accent-primary: #6691f2;
+  --color-accent-primary-hover: #7aa0f5;
+  --color-accent-primary-active: #5880e0;
+}

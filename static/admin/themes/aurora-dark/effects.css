@@ -1,0 +1,41 @@
+/*
+ * aurora-dark — effect overrides (design §11.11.2).
+ *
+ * Redefines the effect classes aurora-default leaves trivial or minimal with
+ * subtle gradients and glows. Required classes (focus-ring, surface-elevation)
+ * and all other effects are inherited from aurora-default. Every value derives
+ * from the inherited token contract, so the override stays theme-portable.
+ */
+
+/* Richer accent gradient — a more present accent wash. */
+.effect-gradient-accent {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--color-surface-secondary) 82%, var(--color-accent-primary) 18%),
+    color-mix(in srgb, var(--color-surface-secondary) 92%, var(--color-accent-primary) 8%)
+  );
+}
+
+/* Pronounced glass — a faint accent tint under the blur. */
+.effect-frosted-glass {
+  background: color-mix(in srgb, var(--color-surface-secondary) 94%, var(--color-accent-primary) 6%);
+  backdrop-filter: blur(10px) saturate(1.1);
+  -webkit-backdrop-filter: blur(10px) saturate(1.1);
+}
+
+/* Stronger glow border. */
+.effect-border-glow {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--color-accent-primary) 55%, transparent),
+    0 0 12px color-mix(in srgb, var(--color-accent-primary) 30%, transparent);
+}
+
+/* Stronger hover glow. */
+.effect-hover-glow:hover {
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-accent-primary) 35%, transparent);
+}
+
+/* A subtle visible aurora glow — aurora-default leaves this off. */
+.effect-aurora-glow {
+  box-shadow: 0 0 24px color-mix(in srgb, var(--color-accent-primary) 22%, transparent);
+}

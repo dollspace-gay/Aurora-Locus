@@ -112,8 +112,11 @@
     }
 
     let html = '';
+    // §11.11.3 / §4.6 — the wordmark carries .heading-aurora so a theme can
+    // paint it as a gradient logo (aurora-stack-classic does); the sober themes
+    // leave it plain. Dormant until a theme styling it is served (B-themes-page).
     html += '<div class="logo">' +
-            '  <h1>Aurora Locus</h1>' +
+            '  <h1 class="heading-aurora">Aurora Locus</h1>' +
             '  <p class="subtitle">Admin Panel</p>' +
             '</div>';
     html += '<nav class="nav-menu" aria-label="Primary navigation">';

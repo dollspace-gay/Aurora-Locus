@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "aurora-light",
+  "themeName": "Aurora Light",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "aurora-default",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "The light-mode counterpart to aurora-default. Same sober, minimal structure with inverted lightness; inherits aurora-default's effect library, typography, and motion.",
+  "files": {
+    "tokens": "tokens.css"
+  }
+}

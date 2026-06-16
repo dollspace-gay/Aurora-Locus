@@ -778,6 +778,31 @@ mod tests {
     }
 
     #[test]
+    fn bundled_themes_all_validate() {
+        // The four shipped themes must enumerate and pass the full validation
+        // contract (steps 1–9) against the real on-disk files — this is the
+        // accessibility/structure guard for the bundled palettes.
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
+        let reg = ThemeRegistry::build(&bundled, Path::new("/nonexistent/operator"));
+        let (total, valid) = reg.summary();
+        assert_eq!(total, 4, "four bundled themes enumerate");
+        let invalid: Vec<_> = reg
+            .list()
+            .into_iter()
+            .filter(|m| !m.valid)
+            .map(|m| format!("{}: {:?}", m.theme_id, m.validation_errors))
+            .collect();
+        assert_eq!(valid, 4, "all bundled themes valid; failures: {invalid:?}");
+
+        // The classic theme's gradient wordmark + resolved chain are present.
+        let classic = reg
+            .resolve_effect_css("aurora-stack-classic")
+            .expect("classic effects resolve");
+        assert!(classic.contains(".heading-aurora"));
+        assert!(classic.contains(".effect-focus-ring"), "inherits required focus-ring");
+    }
+
+    #[test]
     fn version_gt_basics() {
         assert!(version_gt("1.1", "1.0"));
         assert!(version_gt("2.0", "1.9"));

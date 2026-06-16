@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "aurora-dark",
+  "themeName": "Aurora Dark",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "aurora-default",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "A slightly-richer dark theme. Deeper surfaces and a more vibrant accent, with effect classes that aurora-default leaves trivial (gradient-accent, border-glow, hover-glow, aurora-glow) implemented as subtle gradients and glows.",
+  "files": {
+    "tokens": "tokens.css",
+    "effects": "effects.css"
+  }
+}

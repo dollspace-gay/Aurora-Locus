@@ -1,0 +1,41 @@
+/*
+ * aurora-light — token overrides (design §11.11.1).
+ *
+ * The light-mode counterpart to aurora-default: the same sober structure with
+ * lightness inverted (dark-on-light). Only the palette tokens are overridden;
+ * typography, sizing, motion, and the entire effect library are inherited from
+ * aurora-default. Accents are darkened relative to aurora-default so inverted
+ * (white) button text clears AA on accent fills, and status colors are deepened
+ * for legibility on light surfaces. Contrast is verified by the substrate gate.
+ */
+
+:root {
+  /* Surfaces — warm-tinted near-whites */
+  --color-surface-primary: #fbfbfc;
+  --color-surface-secondary: #f3f3f5;
+  --color-surface-tertiary: #ebebed;
+  --color-surface-overlay: rgba(0, 0, 0, 0.4);
+
+  /* Text — dark on light */
+  --color-text-primary: #1a1a1c;   /* ~14:1 on surface-primary — AAA */
+  --color-text-secondary: #46464a; /* ~8:1 — AAA-normal */
+  --color-text-tertiary: #6a6a6e;  /* ~4.8:1 — AA-normal */
+  --color-text-inverted: #fbfbfc;  /* ~5:1 on accent-primary — AA-normal */
+
+  /* Accent — darker blue so white inverted text stays legible on fills */
+  --color-accent-primary: #2563eb;
+  --color-accent-primary-hover: #1d4ed8;
+  --color-accent-primary-active: #1e40af;
+  --color-accent-secondary: #5b5b60;
+
+  /* Status — deepened for contrast on light surfaces */
+  --color-status-success: #15803d;
+  --color-status-warning: #b45309;
+  --color-status-danger: #c81e1e;
+  --color-status-info: #1d4ed8;
+
+  /* Borders — dark translucent hairlines */
+  --color-border-primary: rgba(0, 0, 0, 0.10);
+  --color-border-secondary: rgba(0, 0, 0, 0.05);
+  --color-border-focus: var(--color-accent-primary);
+}

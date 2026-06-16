@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "aurora-default",
+  "themeName": "Aurora Default",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "The sober, accessibility-flawless deployment-default theme and inheritance root. A slightly-warm-tinted neutral dark palette tuned for AAA contrast.",
+  "files": {
+    "tokens": "tokens.css",
+    "effects": "effects.css"
+  }
+}

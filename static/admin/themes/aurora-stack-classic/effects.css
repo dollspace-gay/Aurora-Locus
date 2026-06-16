@@ -1,0 +1,73 @@
+/*
+ * aurora-stack-classic — effect overrides + the gradient wordmark (§11.11.3).
+ *
+ * The full Aurora effect library lit up: a visible aurora-glow, the pronounced
+ * gradient-plus-blur frosted glass (§11.6.3), real decorative textures, and the
+ * signature gradient wordmark (.heading-aurora — a theme-specific class the
+ * sidebar applies, no-op under the sober themes). Required classes (focus-ring,
+ * surface-elevation) are inherited from aurora-default.
+ */
+
+/* The signature gradient wordmark. The sidebar <h1> carries .heading-aurora;
+ * only this theme paints it (aurora-default/-light/-dark leave it plain). */
+.heading-aurora {
+  background: linear-gradient(135deg, #6c7cff 0%, #a06cff 50%, #4cc9f0 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+/* Pronounced frosted glass — gradient + saturated blur (§11.6.3 classic). */
+.effect-frosted-glass {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--color-surface-secondary) 95%, var(--color-accent-primary) 5%),
+    color-mix(in srgb, var(--color-surface-secondary) 90%, var(--color-accent-primary) 10%)
+  );
+  backdrop-filter: blur(12px) saturate(1.2);
+  -webkit-backdrop-filter: blur(12px) saturate(1.2);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 10%, transparent);
+}
+
+/* The signature aurora glow — a visible multi-hue backdrop halo. */
+.effect-aurora-glow {
+  box-shadow:
+    0 0 40px color-mix(in srgb, var(--color-accent-primary) 30%, transparent),
+    0 0 80px color-mix(in srgb, #a06cff 18%, transparent);
+}
+
+/* Richer accent gradient. */
+.effect-gradient-accent {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--color-surface-secondary) 80%, var(--color-accent-primary) 20%),
+    color-mix(in srgb, var(--color-surface-secondary) 88%, #a06cff 12%)
+  );
+}
+
+/* Stronger glow border. */
+.effect-border-glow {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--color-accent-primary) 60%, transparent),
+    0 0 16px color-mix(in srgb, var(--color-accent-primary) 35%, transparent);
+}
+
+/* Decorative noise — a faint diagonal texture. */
+.effect-decorative-noise {
+  background-image: repeating-linear-gradient(
+    45deg,
+    color-mix(in srgb, var(--color-text-primary) 3%, transparent) 0,
+    color-mix(in srgb, var(--color-text-primary) 3%, transparent) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+}
+
+/* Decorative pattern — a light geometric grid. */
+.effect-decorative-pattern-subtle {
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--color-accent-primary) 6%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--color-accent-primary) 6%, transparent) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
