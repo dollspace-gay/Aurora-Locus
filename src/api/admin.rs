@@ -627,6 +627,60 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(crate::api::aurora_admin::trigger_rotation),
             CapsBuilder::new(Family::Ops).extensions(["kryphocron-rotation-v1"]),
         )
+        // ---- v0.9 Arc D Kryphocron (#225) — operator read cohort (§6.4, §6.5) ----
+        // Ten read XRPC backing the Kryphocron domain pages. All attribute the
+        // single `kryphocron-read-v1` cohort capability; role floor (Moderator+
+        // vs Admin+) is enforced in-handler per design §6.4.x.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getSubstrateInfo",
+            get(crate::api::aurora_kryphocron_ops::get_substrate_info),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getTierStats",
+            get(crate::api::aurora_kryphocron_ops::get_tier_stats),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getOracleActivity",
+            get(crate::api::aurora_kryphocron_ops::get_oracle_activity),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getRotationStatus",
+            get(crate::api::aurora_kryphocron_ops::get_rotation_status),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getRotationProgress",
+            get(crate::api::aurora_kryphocron_ops::get_rotation_progress),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.cancelRotation",
+            post(crate::api::aurora_kryphocron_ops::cancel_rotation),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.listRotations",
+            get(crate::api::aurora_kryphocron_ops::list_rotations),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getAudienceAggregate",
+            get(crate::api::aurora_kryphocron_ops::get_audience_aggregate),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.listAudiences",
+            get(crate::api::aurora_kryphocron_ops::list_audiences),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getBlockCascadeImpact",
+            get(crate::api::aurora_kryphocron_ops::get_block_cascade_impact),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -7010,6 +7064,20 @@ mod tests {
         }
     }
 
+    /// Moderator auth fixture — for asserting Admin+ gates reject a Moderator
+    /// (v0.9 Arc D #225 kryphocron-ops role-gate tests).
+    fn moderator_test_auth() -> AdminAuthContext {
+        AdminAuthContext {
+            did: "did:plc:moderator".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:moderator".to_string(),
+                session_id: "test_session_moderator".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Moderator,
+        }
+    }
+
     /// SuperAdmin auth fixture for tests of tools.aurora.superadmin.*
     /// endpoints (Phase 3.6 / chainlink #103). Same shape as
     /// admin_test_auth, role bumped to SuperAdmin so the handler-level
@@ -7726,11 +7794,12 @@ mod tests {
     /// - Top-level field set (`extensions`, `families`,
     ///   `implementation`, `version`) and ordering (alphabetical via
     ///   canonical-JSON).
-    /// - All 14 capability extension strings (the advertised set
-    ///   per Arc 2 Step 0 recon Q2; two further §8.15 vocabulary
-    ///   entries — `invite-lineage-v1` and `reporter-context-v1` —
-    ///   remain intentionally omitted because their endpoints aren't
-    ///   shipped).
+    /// - All 17 advertised capability extension strings (the Arc 2
+    ///   Step 0 recon Q2 set plus the v0.9 Arc B/D additions —
+    ///   `themes-v1`, `kryphocron-rotation-v1`, `kryphocron-read-v1`;
+    ///   two further §8.15 vocabulary entries — `invite-lineage-v1`
+    ///   and `reporter-context-v1` — remain intentionally omitted
+    ///   because their endpoints aren't shipped).
     /// - The four namespace keys (`tools.aurora.admin`, `.moderator`,
     ///   `.ops`, `.superadmin`) and every endpoint within each.
     /// - `implementation` literal "aurora-locus" and the pinned
@@ -7767,7 +7836,7 @@ mod tests {
         let actual = canonical_json(&resp);
         let expected = concat!(
             r#"{"#,
-            // ---- extensions: 16 strings in Vec declaration order ----
+            // ---- extensions: 17 strings in Vec declaration order ----
             r#""extensions":["#,
             r#"{"name":"subject-context-v1"},"#,
             r#"{"name":"moderator-activity-v1"},"#,
@@ -7784,7 +7853,8 @@ mod tests {
             r#"{"name":"mod-events-stream-v1"},"#,
             r#"{"name":"runtime-settings-v1"},"#,
             r#"{"name":"themes-v1"},"#,
-            r#"{"name":"kryphocron-rotation-v1"}"#,
+            r#"{"name":"kryphocron-rotation-v1"},"#,
+            r#"{"name":"kryphocron-read-v1"}"#,
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
@@ -7817,7 +7887,7 @@ mod tests {
             r#""listAppeals","#,
             r#""getAppeal""#,
             r#"],"#,
-            // tools.aurora.ops (33 endpoints)
+            // tools.aurora.ops (43 endpoints)
             r#""tools.aurora.ops":["#,
             r#""getStats","#,
             r#""listAccounts","#,
@@ -7851,7 +7921,18 @@ mod tests {
             r#""getRelayConfig","#,
             r#""listKnownInstances","#,
             r#""triggerPdsDiscovery","#,
-            r#""triggerRotation""#,
+            r#""triggerRotation","#,
+            // v0.9 Arc D (#225) — kryphocron operator read cohort.
+            r#""getSubstrateInfo","#,
+            r#""getTierStats","#,
+            r#""getOracleActivity","#,
+            r#""getRotationStatus","#,
+            r#""getRotationProgress","#,
+            r#""cancelRotation","#,
+            r#""listRotations","#,
+            r#""getAudienceAggregate","#,
+            r#""listAudiences","#,
+            r#""getBlockCascadeImpact""#,
             r#"],"#,
             // tools.aurora.superadmin (2 endpoints)
             r#""tools.aurora.superadmin":["#,
@@ -7911,6 +7992,111 @@ mod tests {
              RouteRegistry::advertised_extensions catches this in \
              dev/test builds) or the present-set filter is missing \
              an extension that should be advertised"
+        );
+    }
+
+    // ---- v0.9 Arc D (#225) — kryphocron operator read cohort ----
+    //
+    // `create_test_context()` builds a kryphocron-disabled deployment (no
+    // at-rest hooks / oracle / rewrite job), so these exercise the handlers'
+    // entry paths: the `KryphocronDisabled` 400 every endpoint returns when the
+    // substrate is absent, and the Admin+ role gate the Laquna-control reads
+    // enforce before that. The endpoints' computational core (tier walks,
+    // audience tally, cascade parsing, rewrite-job state machine, oracle
+    // accessors) is unit-tested in `aurora_kryphocron_ops`, `kryphocron_rewrite`
+    // and `kryphocron_rotation`; the dispatchability of all ten is pinned by the
+    // describeCapabilities snapshot above.
+
+    /// Status of an `ApiErr`-returning kryphocron-ops handler result.
+    fn err_status<T>(r: Result<T, (StatusCode, Json<serde_json::Value>)>) -> StatusCode {
+        match r {
+            Ok(_) => panic!("expected an error result on a kryphocron-disabled context"),
+            Err((status, _)) => status,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_kryphocron_ops_disabled_returns_400() {
+        use crate::api::aurora_kryphocron_ops as k;
+        let ctx = create_test_context().await;
+        let acct = || {
+            axum::extract::Query(k::AccountFilter {
+                account: "did:plc:test".to_string(),
+            })
+        };
+
+        // Moderator+ reads: disabled substrate ⇒ 400 (no role gate).
+        assert_eq!(
+            err_status(k::get_substrate_info(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::get_tier_stats(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::get_oracle_activity(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::get_rotation_status(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::get_audience_aggregate(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::list_audiences(State(ctx.clone()), admin_test_auth(), acct()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(
+                k::get_block_cascade_impact(State(ctx.clone()), admin_test_auth(), acct()).await
+            ),
+            StatusCode::BAD_REQUEST,
+        );
+
+        // Admin+ reads with an Admin caller: role gate passes, disabled ⇒ 400.
+        assert_eq!(
+            err_status(k::get_rotation_progress(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::cancel_rotation(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::list_rotations(State(ctx), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kryphocron_ops_admin_gate_denies_moderator() {
+        use crate::api::aurora_kryphocron_ops as k;
+        let ctx = create_test_context().await;
+
+        // The three Laquna-control reads gate at Admin+ (§6.4.2 / §6.4.2.1):
+        // a Moderator is rejected with 403 BEFORE the disabled check.
+        assert_eq!(
+            err_status(k::get_rotation_progress(State(ctx.clone()), moderator_test_auth()).await),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            err_status(k::cancel_rotation(State(ctx.clone()), moderator_test_auth()).await),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            err_status(k::list_rotations(State(ctx.clone()), moderator_test_auth()).await),
+            StatusCode::FORBIDDEN,
+        );
+
+        // A Moderator+ observability read is NOT Admin-gated: it reaches the
+        // disabled check and returns 400, not 403.
+        assert_eq!(
+            err_status(k::get_substrate_info(State(ctx), moderator_test_auth()).await),
+            StatusCode::BAD_REQUEST,
         );
     }
 

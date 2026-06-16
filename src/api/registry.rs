@@ -159,6 +159,9 @@ pub const WIRE_EXTENSION_ORDER: &[&str] = &[
     "themes-v1",
     // v0.9 Arc D — Kryphocron Laquna rotation; ops.kryphocron.triggerRotation (§6.4.2).
     "kryphocron-rotation-v1",
+    // v0.9 Arc D (#225) — Kryphocron operator read cohort; the ten
+    // ops.kryphocron.* read XRPC backing the Kryphocron domain pages (§6.4, §6.5).
+    "kryphocron-read-v1",
 ];
 
 /// Typed family identifier — enum so typos are compile errors;

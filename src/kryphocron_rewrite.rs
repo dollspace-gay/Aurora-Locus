@@ -30,9 +30,15 @@
 //! its own generation and decodes correctly regardless, so the pass is
 //! best-effort and retryable (design §7.2.3 "operators retry").
 //!
-//! Mid-walk **cancellation** is deferred to #225, where it lands together with
-//! its only trigger — the `cancelRotation` XRPC — rather than shipping an
-//! unused cancel hook here (the codebase's lib/bin dead-code discipline).
+//! Mid-walk **cancellation** lands in #225 together with its only trigger —
+//! the `cancelRotation` XRPC. An [`AtomicBool`] cancel flag is set by
+//! [`RewriteJob::request_cancel`]; the walk observes it at each account /
+//! batch boundary in [`RewriteJob::run`] and terminates cleanly with
+//! [`RewriteOutcome::Aborted`] (the host-vocabulary peer of the substrate's
+//! `RewriteOnRotateOutcome::Aborted`), flushing no further batches. A
+//! mid-batch cancel still completes the in-flight `apply_writes` so the
+//! firehose stays contiguous; cancellation is a clean stop, never a torn
+//! commit.
 //!
 //! ## Host-vocabulary bookkeeping (§16 D1)
 //!
@@ -49,6 +55,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
@@ -81,6 +88,11 @@ pub enum RewriteOutcome {
     /// The walk failed (e.g. account enumeration error); a partial rewrite may
     /// have committed. Safe to retry.
     Failed,
+    /// The walk stopped early in response to a `cancelRotation` request (the
+    /// cancel flag was observed at an account / batch boundary). A partial
+    /// rewrite may have committed; records carry their own generation and
+    /// decode regardless, so a cancelled pass is safe and re-triggerable.
+    Aborted,
 }
 
 impl RewriteOutcome {
@@ -88,8 +100,51 @@ impl RewriteOutcome {
         match self {
             RewriteOutcome::Completed => "completed",
             RewriteOutcome::Failed => "failed",
+            RewriteOutcome::Aborted => "aborted",
         }
     }
+}
+
+/// A live snapshot of the rewrite job's state for `getRotationProgress` —
+/// the read side of #224's per-run counters. `running == false` with all-zero
+/// counters means no rewrite has run since process start (the bookkeeping
+/// files carry cross-restart history; this is in-process live state only).
+#[derive(Debug, Clone)]
+pub struct RewriteProgress {
+    /// Whether a rewrite-on-rotate walk is currently in flight.
+    pub running: bool,
+    /// Records visited so far this run (encoded + skipped).
+    pub processed: u64,
+    /// Records re-encoded + re-stored so far this run.
+    pub rewritten: u64,
+    /// The post-`force_rotation` generation mark this run encodes under.
+    pub generation_mark: Option<String>,
+    /// When the current (or most recent) run started.
+    pub started_at: Option<SystemTime>,
+    /// Whether a cancellation has been requested for the in-flight run.
+    pub cancel_requested: bool,
+}
+
+/// One parsed line of `rewrite-history.log` — the operator-triggered track
+/// `listRotations` reconstructs (§6.4.2.1). Mirrors [`append_history`]'s
+/// JSONL shape; `outcome` / `duration_ms` are present only on `terminated`
+/// lines.
+#[derive(Debug, Clone)]
+pub struct RewriteHistoryEntry {
+    /// Event time, unix milliseconds.
+    pub at_ms: u128,
+    /// `"started"` | `"terminated"`.
+    pub kind: String,
+    /// The generation mark this run encodes under (opaque).
+    pub generation: Option<String>,
+    /// Records visited (final count on `terminated` lines).
+    pub processed: u64,
+    /// Records re-encoded (final count on `terminated` lines).
+    pub rewritten: u64,
+    /// `"completed"` | `"failed"` | `"aborted"` (terminated lines only).
+    pub outcome: Option<String>,
+    /// Wall-clock run duration in milliseconds (terminated lines only).
+    pub duration_ms: Option<u64>,
 }
 
 /// Live state of the rewrite job. The single-flight `running` flag + the
@@ -110,6 +165,10 @@ struct State {
 /// single-flight guard. Held in [`AppContext`].
 pub struct RewriteJob {
     state: RwLock<State>,
+    /// Cancellation flag — set by [`Self::request_cancel`], observed by the
+    /// walk at each account / batch boundary. Separate from `state` so the
+    /// walk can poll it without contending the state write-lock.
+    cancel: AtomicBool,
     data_dir: PathBuf,
 }
 
@@ -124,8 +183,53 @@ impl RewriteJob {
                 generation_mark: None,
                 started_at: None,
             }),
+            cancel: AtomicBool::new(false),
             data_dir,
         }
+    }
+
+    /// A live snapshot of the run's state — the `getRotationProgress` read
+    /// side over #224's per-run counters.
+    pub fn progress(&self) -> RewriteProgress {
+        let st = self.state.read().expect("rewrite state lock not poisoned");
+        RewriteProgress {
+            running: st.running,
+            processed: st.processed,
+            rewritten: st.rewritten,
+            generation_mark: st.generation_mark.clone(),
+            started_at: st.started_at,
+            cancel_requested: self.cancel.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Request cancellation of the in-flight walk. Returns `true` if a rewrite
+    /// was running (the flag is now set; the walk stops at its next account /
+    /// batch boundary), `false` if no rewrite was in flight to cancel — the
+    /// `cancelRotation` XRPC maps the latter to a 409. Idempotent while a run
+    /// is in flight.
+    pub fn request_cancel(&self) -> bool {
+        let running = self.state.read().expect("rewrite state lock not poisoned").running;
+        if running {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+        running
+    }
+
+    /// Read the persisted completion timestamp (unix millis) from
+    /// `last-rewrite-completed.state`, or `None` if no rewrite has ever
+    /// completed on this deployment. The cross-restart read side of #224's
+    /// `write_last_completed`, surfaced by `getRotationStatus`.
+    pub fn last_completed_ms(&self) -> Option<u128> {
+        read_last_completed(&self.data_dir)
+    }
+
+    /// Parse `rewrite-history.log` into its entries (oldest first) — the
+    /// operator-triggered track `listRotations` reconstructs. A missing log
+    /// (no rewrite ever triggered) yields an empty vec; malformed lines are
+    /// skipped (best-effort, mirroring the best-effort append on the write
+    /// side).
+    pub fn history(&self) -> Vec<RewriteHistoryEntry> {
+        read_history(&self.data_dir)
     }
 
     /// The single-flight guard: mark the job running under the state lock and
@@ -143,6 +247,8 @@ impl RewriteJob {
         st.started_at = Some(SystemTime::now());
         st.generation_mark = generation_mark.clone();
         drop(st);
+        // Clear any cancel flag left from a prior run so this run starts clean.
+        self.cancel.store(false, Ordering::Relaxed);
         append_history(&self.data_dir, "started", generation_mark.as_deref(), 0, 0, None);
         true
     }
@@ -198,6 +304,15 @@ impl RewriteJob {
 
         let mut account_cursor: Option<String> = None;
         loop {
+            // Cancel boundary (page level): a cancelRotation request observed
+            // here stops the walk before fetching the next account page.
+            if self.cancel.load(Ordering::Relaxed) {
+                tracing::info!(
+                    target: "aurora_locus::kryphocron",
+                    "rewrite-on-rotate: cancellation observed; stopping walk",
+                );
+                return RewriteOutcome::Aborted;
+            }
             let accounts = match ctx
                 .account_manager
                 .list_accounts(account_cursor.as_deref(), ACCOUNT_PAGE)
@@ -220,6 +335,16 @@ impl RewriteJob {
             let next_cursor = accounts.last().map(|a| a.did.clone());
 
             for account in &accounts {
+                // Cancel boundary (account level): stop between accounts so a
+                // cancel lands within one account's rewrite rather than a full
+                // page of accounts.
+                if self.cancel.load(Ordering::Relaxed) {
+                    tracing::info!(
+                        target: "aurora_locus::kryphocron",
+                        "rewrite-on-rotate: cancellation observed mid-page; stopping walk",
+                    );
+                    return RewriteOutcome::Aborted;
+                }
                 if let Err(e) = self
                     .rewrite_account(ctx, hooks.as_ref(), &sink, &account.did)
                     .await
@@ -430,6 +555,46 @@ fn history_path(data_dir: &Path) -> PathBuf {
     data_dir.join("aurora-locus").join("rewrite-history.log")
 }
 
+/// Read the persisted completion timestamp (unix millis) — the read side of
+/// [`write_last_completed`]. `None` if the file is absent (no rewrite has ever
+/// completed) or unparseable.
+fn read_last_completed(data_dir: &Path) -> Option<u128> {
+    let path = last_completed_path(data_dir);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u128>().ok())
+}
+
+/// Read + parse `rewrite-history.log` into its entries (oldest first) — the
+/// read side of [`append_history`]. A missing log yields an empty vec;
+/// malformed lines are skipped (best-effort, mirroring the best-effort write).
+fn read_history(data_dir: &Path) -> Vec<RewriteHistoryEntry> {
+    let path = history_path(data_dir);
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            let kind = v.get("kind")?.as_str()?.to_string();
+            Some(RewriteHistoryEntry {
+                at_ms: v.get("at").and_then(|a| a.as_u64()).unwrap_or(0) as u128,
+                kind,
+                generation: v
+                    .get("generation")
+                    .and_then(|g| g.as_str())
+                    .map(str::to_string),
+                processed: v.get("processed").and_then(|p| p.as_u64()).unwrap_or(0),
+                rewritten: v.get("rewritten").and_then(|r| r.as_u64()).unwrap_or(0),
+                outcome: v.get("outcome").and_then(|o| o.as_str()).map(str::to_string),
+                duration_ms: v.get("durationMs").and_then(|d| d.as_u64()),
+            })
+        })
+        .collect()
+}
+
 /// Persist the completion timestamp (unix millis). Best-effort host bookkeeping.
 fn write_last_completed(data_dir: &Path, at: SystemTime) {
     let path = last_completed_path(data_dir);
@@ -610,6 +775,65 @@ mod tests {
             job.state.read().unwrap().generation_mark.as_deref(),
             Some("laquna/1/aa")
         );
+    }
+
+    #[test]
+    fn request_cancel_sets_flag_only_while_running() {
+        let _g = DirGuard(tmp_dir("cancel"));
+        let job = RewriteJob::new(tmp_dir("cancel"));
+        // No run in flight ⇒ cancel is a no-op the XRPC maps to 409.
+        assert!(!job.request_cancel(), "cancel with no run in flight returns false");
+        assert!(!job.progress().cancel_requested);
+
+        assert!(job.begin(Some("laquna/3/ef".into())));
+        assert!(job.request_cancel(), "cancel while running returns true");
+        assert!(job.progress().cancel_requested, "flag is observable via progress()");
+
+        // begin() for a fresh run clears the stale cancel flag.
+        job.finish(RewriteOutcome::Aborted);
+        assert!(job.begin(Some("laquna/4/ab".into())));
+        assert!(!job.progress().cancel_requested, "a fresh run starts uncancelled");
+    }
+
+    #[test]
+    fn progress_reflects_live_state() {
+        let _g = DirGuard(tmp_dir("progress"));
+        let job = RewriteJob::new(tmp_dir("progress"));
+        let p0 = job.progress();
+        assert!(!p0.running);
+        assert_eq!(p0.processed, 0);
+        assert_eq!(p0.rewritten, 0);
+        assert!(p0.started_at.is_none());
+
+        assert!(job.begin(Some("laquna/5/cd".into())));
+        let p1 = job.progress();
+        assert!(p1.running);
+        assert_eq!(p1.generation_mark.as_deref(), Some("laquna/5/cd"));
+        assert!(p1.started_at.is_some());
+    }
+
+    #[test]
+    fn readers_round_trip_bookkeeping() {
+        let dir = tmp_dir("readers");
+        let _g = DirGuard(dir.clone());
+        let job = RewriteJob::new(dir.clone());
+        // No bookkeeping yet ⇒ empty reads (fresh deployment).
+        assert!(job.last_completed_ms().is_none());
+        assert!(job.history().is_empty());
+
+        assert!(job.begin(Some("laquna/6/ff".into())));
+        job.finish(RewriteOutcome::Completed);
+
+        // last-rewrite-completed.state now parses back.
+        assert!(job.last_completed_ms().is_some());
+
+        // rewrite-history.log parses into started + terminated entries.
+        let hist = job.history();
+        assert_eq!(hist.len(), 2, "one started + one terminated record");
+        assert_eq!(hist[0].kind, "started");
+        assert_eq!(hist[1].kind, "terminated");
+        assert_eq!(hist[1].outcome.as_deref(), Some("completed"));
+        assert_eq!(hist[1].generation.as_deref(), Some("laquna/6/ff"));
     }
 
     #[test]

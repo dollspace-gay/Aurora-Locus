@@ -56,13 +56,34 @@ impl Cadence {
         }
     }
 
-    fn as_secs(self) -> u64 {
+    /// Cadence as a seconds interval. `ManualOnly` maps to a sentinel
+    /// (`u64::MAX`-class) — there is no finite "next scheduled rotation" under
+    /// manual-only, which `getRotationStatus` surfaces as a null next-rotation.
+    pub fn as_secs(self) -> u64 {
         match self {
             Cadence::Hourly => 3_600,
             Cadence::Daily => DAILY_SECS,
             Cadence::Weekly => 604_800,
             Cadence::ManualOnly => MANUAL_ONLY_SECS,
         }
+    }
+
+    /// The canonical runtime-setting string for this cadence — the inverse of
+    /// [`Cadence::from_setting`], for echoing the active policy in
+    /// `getRotationStatus`.
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Cadence::Hourly => "hourly",
+            Cadence::Daily => "daily",
+            Cadence::Weekly => "weekly",
+            Cadence::ManualOnly => "manual-only",
+        }
+    }
+
+    /// Whether this cadence schedules organic rotations (i.e. not
+    /// `manual-only`).
+    pub fn is_scheduled(self) -> bool {
+        !matches!(self, Cadence::ManualOnly)
     }
 }
 
@@ -183,6 +204,28 @@ impl AuroraLocusStandardRotationOracle {
     /// `triggerRotation` XRPC invokes. Idempotent.
     pub fn force_rotation(&self) {
         self.force_pending.store(true, Ordering::Relaxed);
+    }
+
+    /// Read-only snapshot of the active generation mark — for the
+    /// `getRotationStatus` status surface (§6.4.2). Unlike
+    /// [`RotationOracle::current_generation`], this **never rotates**: it
+    /// formats the current slug + `generated_at` without consulting cadence or
+    /// the force flag, so a status read can't trigger an organic rotation as a
+    /// side effect.
+    pub fn current_mark(&self) -> RotationGenerationMark {
+        let st = self.state.read().expect("rotation state lock not poisoned");
+        format_mark(st.generated_at, &st.current_slug)
+    }
+
+    /// When the current slug was generated (most recent slug rotation, organic
+    /// or forced) — the "Last slug rotation" timestamp `getRotationStatus`
+    /// surfaces, and the base for the "Next scheduled slug rotation"
+    /// computation (`generated_at + cadence`).
+    pub fn last_rotation_at(&self) -> SystemTime {
+        self.state
+            .read()
+            .expect("rotation state lock not poisoned")
+            .generated_at
     }
 }
 
@@ -371,6 +414,31 @@ mod tests {
         // and clears: the next call is stable again
         let c = o.current_generation(&RotationContext::for_install_probe()).unwrap();
         assert_eq!(mark_str(&b), mark_str(&c), "force flag cleared after one rotation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_mark_is_read_only_and_matches_generation() {
+        let dir = tmp_dir("readonly");
+        // Force-pending is set but NOT yet observed: current_mark must serve the
+        // existing generation without consuming the force flag (no side-effect
+        // rotation), so a subsequent current_generation still performs the
+        // pending rotation.
+        let o = AuroraLocusStandardRotationOracle::for_data_dir(&dir, Cadence::Daily).unwrap();
+        let live = o.current_generation(&RotationContext::for_install_probe()).unwrap();
+        let read = o.current_mark().to_string();
+        assert_eq!(mark_str(&live), read, "read-only mark matches the live one");
+
+        o.force_rotation();
+        // A read does not rotate...
+        let read_after_force = o.current_mark().to_string();
+        assert_eq!(read, read_after_force, "current_mark never rotates");
+        // ...so the pending force is still honored by current_generation.
+        let rotated = o.current_generation(&RotationContext::for_install_probe()).unwrap();
+        assert_ne!(mark_str(&rotated), read, "force survives a read-only peek");
+
+        // last_rotation_at advances across the rotation.
+        assert!(o.last_rotation_at() >= UNIX_EPOCH);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

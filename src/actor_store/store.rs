@@ -493,6 +493,30 @@ impl ActorStore {
         Ok(count)
     }
 
+    /// `indexed_at` timestamps of a collection's records written on or after
+    /// `since` — the bounded input for `getTierStats`'s 30-day per-NSID time
+    /// series (§6.4.4). Returns timestamps only (not full records) and is
+    /// filtered to the recent window so the operator-aggregate walk doesn't
+    /// scan a deployment's full historical corpus. DB-agnostic: the
+    /// `indexed_at >= ?` comparison binds a `DateTime<Utc>` on both the SQLite
+    /// and Postgres `Any` backends; day-bucketing happens host-side.
+    pub async fn list_record_indexed_at_since(
+        &self,
+        did: &str,
+        collection: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> PdsResult<Vec<chrono::DateTime<chrono::Utc>>> {
+        let pool = self.open_db(did).await?;
+        let rows: Vec<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT indexed_at FROM record WHERE collection = ?1 AND indexed_at >= ?2",
+        )
+        .bind(collection)
+        .bind(since)
+        .fetch_all(&pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Store a block in the repository
     pub async fn put_block(&self, did: &str, cid: &str, content: &[u8]) -> PdsResult<()> {
         let pool = self.open_db(did).await?;
