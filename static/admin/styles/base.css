@@ -13,9 +13,9 @@
 }
 
 body {
-  font-family: var(--font-sans);
-  background: var(--background);
-  color: var(--text-primary);
+  font-family: var(--font-family-sans);
+  background: var(--color-surface-primary);
+  color: var(--color-text-primary);
   line-height: var(--line-height-normal);
 }
 
@@ -70,7 +70,7 @@ body {
   font-weight: var(--font-weight-semibold);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--text-tertiary);
+  color: var(--color-text-tertiary);
 }
 
 .nav-item {
@@ -89,7 +89,7 @@ body {
 }
 
 .nav-item.active {
-  background: var(--primary-color);
+  background: var(--color-accent-primary);
   color: white;
 }
 
@@ -106,7 +106,7 @@ body {
 
 .nav-item .badge {
   margin-left: auto;
-  background: var(--danger-color);
+  background: var(--color-status-danger);
   color: white;
   padding: 0.125rem var(--space-2);
   border-radius: var(--radius-full);
@@ -129,7 +129,7 @@ body {
 
 .nav-section-link .badge {
   margin-inline-start: auto;
-  background: var(--danger-color);
+  background: var(--color-status-danger);
   color: white;
   padding: 0.125rem var(--space-2);
   border-radius: var(--radius-full);
@@ -200,11 +200,11 @@ body {
 .page-header h2 {
   font-size: var(--font-size-2xl);
   font-weight: var(--font-weight-bold);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 .page-subtitle {
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   margin-top: var(--space-2);
 }
 
@@ -216,23 +216,23 @@ body {
 /* Breadcrumb (per §4.5) */
 .breadcrumb {
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   margin-bottom: var(--space-3);
 }
 
 .breadcrumb a {
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   text-decoration: none;
 }
 
 .breadcrumb a:hover {
-  color: var(--primary-color);
+  color: var(--color-accent-primary);
   text-decoration: underline;
 }
 
 .breadcrumb-sep {
   margin: 0 var(--space-2);
-  color: var(--text-tertiary);
+  color: var(--color-text-tertiary);
 }
 
 /* Accessibility utilities */
@@ -253,7 +253,7 @@ body {
   position: absolute;
   top: -40px;
   left: 0;
-  background: var(--primary-color);
+  background: var(--color-accent-primary);
   color: white;
   padding: var(--space-2) var(--space-4);
   z-index: var(--z-toast);
@@ -266,7 +266,7 @@ body {
 
 /* Universal focus visibility per §7.9 */
 *:focus-visible {
-  outline: 2px solid var(--primary-color);
+  outline: 2px solid var(--color-accent-primary);
   outline-offset: 2px;
 }
 
@@ -281,7 +281,7 @@ textarea:focus-visible {
 .empty-state {
   padding: var(--space-6);
   text-align: center;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
 }
 

@@ -45,7 +45,7 @@
       (usedBy.length === 0 ? '<p class="empty-state">No redemptions yet.</p>' :
        '<ul style="list-style:none; padding:0;">' + usedBy.map((u) =>
          '<li style="padding: 0.25rem 0;">' + (global.AuroraEntityRef ? global.AuroraEntityRef.account(u.usedBy || u.did, u.handle) : esc(u.usedBy || u.did || u)) +
-         (u.usedAt ? ' <span style="color: var(--text-tertiary);">— ' + esc(fmt ? fmt.relativeTime(u.usedAt) : u.usedAt) + '</span>' : '') +
+         (u.usedAt ? ' <span style="color: var(--color-text-tertiary);">— ' + esc(fmt ? fmt.relativeTime(u.usedAt) : u.usedAt) + '</span>' : '') +
          '</li>').join('') + '</ul>') +
       '  </div>' +
       '</div>' +

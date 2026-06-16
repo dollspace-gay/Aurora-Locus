@@ -93,7 +93,7 @@
       const displayName = role.key ? T('settings.roles.tier_' + role.key) : (role.name || role.role || 'Role');
       const displayDesc = role.key ? T('settings.roles.desc_' + role.key) : role.description;
       return '<div class="role-card">' +
-             '  <h3>' + esc(displayName) + ' <small style="font-weight:normal; color: var(--text-secondary);">[' + esc(T('settings.roles.member_count', { count: memberCount })) + ']</small></h3>' +
+             '  <h3>' + esc(displayName) + ' <small style="font-weight:normal; color: var(--color-text-secondary);">[' + esc(T('settings.roles.member_count', { count: memberCount })) + ']</small></h3>' +
              (displayDesc ? '<p class="settings-help">' + esc(displayDesc) + '</p>' : '') +
              '<div class="role-members">' +
              (members.length === 0 ? '<p class="settings-help">' + esc(T('settings.roles.no_members')) + '</p>' :

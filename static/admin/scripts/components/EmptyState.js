@@ -18,9 +18,9 @@
     const safe2 = global.AuroraDom ? global.AuroraDom.esc(secondary) : String(secondary);
     const iconSvg = global.AuroraIcons ? global.AuroraIcons.render(icon, 36) : '';
     return '<div class="empty-state" role="status" aria-live="polite">' +
-           '  <div style="margin-bottom: 0.5rem; color: var(--text-tertiary);">' + iconSvg + '</div>' +
+           '  <div style="margin-bottom: 0.5rem; color: var(--color-text-tertiary);">' + iconSvg + '</div>' +
            '  <p>' + safe1 + '</p>' +
-           (safe2 ? '  <p style="font-size: 0.8125rem; color: var(--text-tertiary); margin-top: 0.25rem;">' + safe2 + '</p>' : '') +
+           (safe2 ? '  <p style="font-size: 0.8125rem; color: var(--color-text-tertiary); margin-top: 0.25rem;">' + safe2 + '</p>' : '') +
            '</div>';
   }
 

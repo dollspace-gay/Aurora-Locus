@@ -6,12 +6,13 @@
  * substrate-optional tokens the admin UI also uses.
  *
  * ALIAS LAYER (recon §4.1 decision A): the 28 `--color-*`/`--font-family-*`/
- * `--space-unit`/`--motion-*` tokens are canonical and carry concrete
- * values; the legacy token names that 405+ component rules already consume
- * are re-pointed to them (`--primary-color: var(--color-accent-primary)`),
- * so a theme overriding a required token propagates to existing components
- * without a flag-day rename. New/touched components use the canonical names;
- * existing ones migrate incrementally (§10.4.4).
+ * `--space-unit`/`--motion-*` tokens are canonical and carry concrete values.
+ * The alias layer let existing components keep working through the rename: a
+ * legacy name (`--primary-color`) re-pointed to a canonical one
+ * (`var(--color-accent-primary)`). The §10.4.4 migration (#219) completed that
+ * rename for the colour/font names — components now read the canonical
+ * `--color-*` / `--font-family-*` names directly, and those aliases are
+ * retired. Only the compound `--transition-*` shorthands remain aliased below.
  *
  * Values here preserve the current v0.8 appearance exactly (each canonical
  * token takes the legacy token's prior value; dark overrides move to the
@@ -74,24 +75,13 @@
   --motion-easing-standard: ease;
 
   /* ============================================================
-   * Legacy aliases — re-pointed to the canonical tokens above so
-   * existing components are untouched yet theme-overridable.
+   * Legacy compound aliases — convenience transition shorthands
+   * composed from the canonical motion tokens (so they stay
+   * theme-overridable transitively). The legacy colour/font *name*
+   * aliases (--text-primary, --surface, --primary-color, …) were
+   * retired in the §10.4.4 token migration (#219); components now read
+   * the canonical --color-* / --font-family-* names directly.
    * ============================================================ */
-  --primary-color: var(--color-accent-primary);
-  --background: var(--color-surface-primary);
-  --surface: var(--color-surface-secondary);
-  --surface-elevated: var(--color-surface-tertiary);
-  --text-primary: var(--color-text-primary);
-  --text-secondary: var(--color-text-secondary);
-  --text-tertiary: var(--color-text-tertiary);
-  --text-on-primary: var(--color-text-inverted);
-  --border-color: var(--color-border-primary);
-  --success-color: var(--color-status-success);
-  --warning-color: var(--color-status-warning);
-  --danger-color: var(--color-status-danger);
-  --attention-color: var(--color-status-warning);
-  --font-sans: var(--font-family-sans);
-  --font-mono: var(--font-family-mono);
   --transition-fast: var(--motion-duration-fast) var(--motion-easing-standard);
   --transition-normal: var(--motion-duration-medium) var(--motion-easing-standard);
   --transition-slow: var(--motion-duration-slow) var(--motion-easing-standard);

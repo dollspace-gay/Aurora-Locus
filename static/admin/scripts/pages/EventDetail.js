@@ -40,7 +40,7 @@
       '</div>' +
       '<div class="settings-card" style="margin-top: 1rem;">' +
       '  <h3>Raw event payload</h3>' +
-      '  <pre style="white-space: pre-wrap; padding: 1rem; background: var(--background); border-radius: 6px; max-height: 400px; overflow-y: auto;">' +
+      '  <pre style="white-space: pre-wrap; padding: 1rem; background: var(--color-surface-primary); border-radius: 6px; max-height: 400px; overflow-y: auto;">' +
       esc(JSON.stringify(e, null, 2)) + '</pre>' +
       '</div>';
   }

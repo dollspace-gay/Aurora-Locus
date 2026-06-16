@@ -165,8 +165,8 @@
   }
 
   function defItem(label, value) {
-    return '<div style="display:flex; justify-content:space-between; padding: 0.25rem 0; border-bottom: 1px solid var(--border-color);">' +
-           '<dt style="color: var(--text-secondary);">' + esc(label) + '</dt>' +
+    return '<div style="display:flex; justify-content:space-between; padding: 0.25rem 0; border-bottom: 1px solid var(--color-border-primary);">' +
+           '<dt style="color: var(--color-text-secondary);">' + esc(label) + '</dt>' +
            '<dd>' + value + '</dd></div>';
   }
 
@@ -552,7 +552,7 @@
       }
       const fmt = global.AuroraFormat;
       host.innerHTML = '<ul style="list-style:none; padding:0;">' + items.map((it) =>
-        '<li style="padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">' +
+        '<li style="padding: 0.5rem 0; border-bottom: 1px solid var(--color-border-primary);">' +
         '<strong>' + esc(it.eventType || it.action || '') + '</strong>' +
         ' by ' + (global.AuroraEntityRef ? global.AuroraEntityRef.account(it.actorDid) : esc(it.actorDid)) +
         ' — ' + (fmt ? esc(fmt.relativeTime(it.createdAt || it.timestamp)) : esc(it.createdAt || '')) +
@@ -596,7 +596,7 @@
         '<ul style="list-style:none; padding:0;">' + blobs.map((b) =>
           '<li style="padding: 0.25rem 0;">' +
           (global.AuroraEntityRef ? global.AuroraEntityRef.blob(b.cid) : '<code>' + esc(b.cid) + '</code>') +
-          (b.size ? ' <span style="color: var(--text-tertiary);">' +
+          (b.size ? ' <span style="color: var(--color-text-tertiary);">' +
                     (global.AuroraFormat ? global.AuroraFormat.bytes(b.size) : '') + '</span>' : '') +
           '</li>').join('') + '</ul>');
     } catch (e) {
@@ -616,7 +616,7 @@
         '<ul style="list-style:none; padding:0;">' + codes.slice(0, 10).map((c) =>
           '<li style="padding: 0.25rem 0;">' +
           (global.AuroraEntityRef ? global.AuroraEntityRef.invite(c.code) : '<code>' + esc(c.code) + '</code>') +
-          ' <span style="color: var(--text-tertiary);">(' + (c.uses || 0) + '/' + (c.available || 1) + ')</span>' +
+          ' <span style="color: var(--color-text-tertiary);">(' + (c.uses || 0) + '/' + (c.available || 1) + ')</span>' +
           '</li>').join('') + '</ul>');
     } catch (e) {
       setRailBody('invite-lineage', '<p class="empty-state">Could not load invites.</p>');
@@ -667,12 +667,12 @@
 
   function sectionTitle(t) {
     return '<h5 style="margin: 0.75rem 0 0.25rem 0; font-size: 0.75rem; ' +
-           'text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-tertiary);">' +
+           'text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-tertiary);">' +
            esc(t) + '</h5>';
   }
 
   function listOrEmpty(items) {
-    if (!items || items.length === 0) return '<p style="color: var(--text-tertiary); font-size: 0.8125rem;">None</p>';
+    if (!items || items.length === 0) return '<p style="color: var(--color-text-tertiary); font-size: 0.8125rem;">None</p>';
     return '<ul style="list-style:none; padding:0; font-size: 0.875rem;">' + items.join('') + '</ul>';
   }
 
