@@ -3612,6 +3612,13 @@ const MODERATION_MODE_REDIRECT_KEY: &str = "moderation-mode-redirect-url";
 /// is resolved at theme-apply time, falling back to `aurora-default`.
 const THEME_DEPLOYMENT_DEFAULT_KEY: &str = "theme.deployment-default";
 
+/// v0.9 Arc D (#223) — deployment Laquna rotation cadence (§6.4.2). One of
+/// `hourly` / `daily` / `weekly` / `manual-only`; consulted live by the
+/// `aurora-locus-standard` rotation oracle (a `setRuntimeSetting` write
+/// propagates to the oracle's in-memory cadence cell, so the change takes
+/// effect on the next encode without a restart).
+const LAQUNA_ROTATION_CADENCE_KEY: &str = "kryphocron.laquna.rotation-cadence";
+
 /// Allowlist of runtime-setting keys this build accepts. Per CR-2 /
 /// chainlink #119, `setRuntimeSetting` rejects any other key with
 /// 400 — the inventory's "validates known keys" framing
@@ -3626,6 +3633,7 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     MODERATION_MODE_KEY,
     MODERATION_MODE_REDIRECT_KEY,
     THEME_DEPLOYMENT_DEFAULT_KEY,
+    LAQUNA_ROTATION_CADENCE_KEY,
 ];
 const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
@@ -3638,6 +3646,7 @@ fn default_for_key(key: &str) -> serde_json::Value {
         MODERATION_MODE_KEY => serde_json::Value::String("full".to_string()),
         MODERATION_MODE_REDIRECT_KEY => serde_json::Value::String(String::new()),
         THEME_DEPLOYMENT_DEFAULT_KEY => serde_json::Value::String("aurora-default".to_string()),
+        LAQUNA_ROTATION_CADENCE_KEY => serde_json::Value::String("daily".to_string()),
         _ => serde_json::Value::Null,
     }
 }
@@ -3654,6 +3663,9 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
             .is_some_and(|s| matches!(s, "full" | "reduced" | "disabled")),
         MODERATION_MODE_REDIRECT_KEY => value.as_str().is_some(),
         THEME_DEPLOYMENT_DEFAULT_KEY => value.as_str().is_some_and(|s| !s.trim().is_empty()),
+        LAQUNA_ROTATION_CADENCE_KEY => value
+            .as_str()
+            .is_some_and(|s| matches!(s, "hourly" | "daily" | "weekly" | "manual-only")),
         _ => true,
     }
 }
@@ -3768,6 +3780,36 @@ pub async fn serve_active_theme_effects_css(
         )],
         css,
     )
+}
+
+/// `tools.aurora.ops.kryphocron.triggerRotation` — force a Laquna rotation
+/// ahead of cadence (§6.4.2). Admin+ (via [`AdminAuthContext`]). Invokes the
+/// `aurora-locus-standard` rotation oracle's `force_rotation()` hook so the
+/// next encode yields a fresh generation. This is the minimal form: it marks
+/// the current generation expired. The `rewrite-on-rotate` background job
+/// (re-encoding existing records) and the "rotation already in progress"
+/// guard land in #224; for now the trigger only flips the generation.
+pub async fn trigger_rotation(
+    State(ctx): State<AppContext>,
+    _auth: AdminAuthContext,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match &ctx.kryphocron_rotation_oracle {
+        Some(oracle) => {
+            oracle.force_rotation();
+            tracing::info!("kryphocron Laquna rotation triggered (triggerRotation XRPC)");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "rotation-triggered" })),
+            )
+        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "KryphocronDisabled",
+                "message": "kryphocron is not enabled on this deployment",
+            })),
+        ),
+    }
 }
 
 /// Load file-tier runtime settings from the YAML at `path`.
@@ -3992,6 +4034,15 @@ pub async fn set_runtime_setting(
             return Err(validation("moderation-mode must be one of: full, reduced, disabled"));
         }
     }
+    // v0.9 Arc D (#223) — validate the Laquna rotation cadence value.
+    if input.key == LAQUNA_ROTATION_CADENCE_KEY {
+        let s = input.value.as_str().unwrap_or("");
+        if !["hourly", "daily", "weekly", "manual-only"].contains(&s) {
+            return Err(validation(
+                "kryphocron.laquna.rotation-cadence must be one of: hourly, daily, weekly, manual-only",
+            ));
+        }
+    }
     // Read previous value for the diff returned in output.
     let prev_row = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
         .bind(&input.key)
@@ -4048,6 +4099,19 @@ pub async fn set_runtime_setting(
     .await
     .map_err(internal_pds)?;
     tx.commit().await.map_err(internal)?;
+
+    // v0.9 Arc D (#223) — propagate a cadence change to the live
+    // aurora-locus-standard rotation oracle, so it takes effect on the next
+    // encode without a restart (§6.4.2). In-memory atomic store; the next
+    // current_generation() consults the new cadence.
+    if input.key == LAQUNA_ROTATION_CADENCE_KEY {
+        if let (Some(oracle), Some(s)) =
+            (&ctx.kryphocron_rotation_oracle, input.value.as_str())
+        {
+            oracle.set_cadence(crate::kryphocron_rotation::Cadence::from_setting(s));
+        }
+    }
+
     Ok(Json(SetRuntimeSettingOutput {
         key: input.key,
         previous_value,

@@ -621,6 +621,12 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(crate::api::aurora_admin::list_installed_themes),
             CapsBuilder::new(Family::Admin).extensions(["themes-v1"]),
         )
+        // ---- v0.9 Arc D Kryphocron (§6.4.2) — Laquna rotation ----
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.triggerRotation",
+            post(crate::api::aurora_admin::trigger_rotation),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-rotation-v1"]),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -7761,7 +7767,7 @@ mod tests {
         let actual = canonical_json(&resp);
         let expected = concat!(
             r#"{"#,
-            // ---- extensions: 15 strings in Vec declaration order ----
+            // ---- extensions: 16 strings in Vec declaration order ----
             r#""extensions":["#,
             r#"{"name":"subject-context-v1"},"#,
             r#"{"name":"moderator-activity-v1"},"#,
@@ -7777,7 +7783,8 @@ mod tests {
             r#"{"name":"forensic-export-v1"},"#,
             r#"{"name":"mod-events-stream-v1"},"#,
             r#"{"name":"runtime-settings-v1"},"#,
-            r#"{"name":"themes-v1"}"#,
+            r#"{"name":"themes-v1"},"#,
+            r#"{"name":"kryphocron-rotation-v1"}"#,
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
@@ -7810,7 +7817,7 @@ mod tests {
             r#""listAppeals","#,
             r#""getAppeal""#,
             r#"],"#,
-            // tools.aurora.ops (32 endpoints)
+            // tools.aurora.ops (33 endpoints)
             r#""tools.aurora.ops":["#,
             r#""getStats","#,
             r#""listAccounts","#,
@@ -7843,7 +7850,8 @@ mod tests {
             r#""getFederationStatus","#,
             r#""getRelayConfig","#,
             r#""listKnownInstances","#,
-            r#""triggerPdsDiscovery""#,
+            r#""triggerPdsDiscovery","#,
+            r#""triggerRotation""#,
             r#"],"#,
             // tools.aurora.superadmin (2 endpoints)
             r#""tools.aurora.superadmin":["#,
