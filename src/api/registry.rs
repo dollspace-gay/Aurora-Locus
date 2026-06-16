@@ -155,6 +155,8 @@ pub const WIRE_EXTENSION_ORDER: &[&str] = &[
     "mod-events-stream-v1",
     // Phase 3.10 — runtime settings read/write.
     "runtime-settings-v1",
+    // v0.9 Arc B — theming substrate; themes.listInstalled (§11.10.2).
+    "themes-v1",
 ];
 
 /// Typed family identifier — enum so typos are compile errors;

@@ -7761,7 +7761,7 @@ mod tests {
         let actual = canonical_json(&resp);
         let expected = concat!(
             r#"{"#,
-            // ---- extensions: 14 strings in Vec declaration order ----
+            // ---- extensions: 15 strings in Vec declaration order ----
             r#""extensions":["#,
             r#"{"name":"subject-context-v1"},"#,
             r#"{"name":"moderator-activity-v1"},"#,
@@ -7776,11 +7776,12 @@ mod tests {
             r#"{"name":"audit-trail-v1"},"#,
             r#"{"name":"forensic-export-v1"},"#,
             r#"{"name":"mod-events-stream-v1"},"#,
-            r#"{"name":"runtime-settings-v1"}"#,
+            r#"{"name":"runtime-settings-v1"},"#,
+            r#"{"name":"themes-v1"}"#,
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
-            // tools.aurora.admin (15 endpoints)
+            // tools.aurora.admin (16 endpoints)
             r#""tools.aurora.admin":["#,
             r#""emitEvent","#,
             r#""batchTakedownAccounts","#,
@@ -7796,7 +7797,8 @@ mod tests {
             r#""exportAccountForensic","#,
             r#""subscribeModEvents","#,
             r#""getRuntimeSetting","#,
-            r#""setRuntimeSetting""#,
+            r#""setRuntimeSetting","#,
+            r#""listInstalled""#,
             r#"],"#,
             // tools.aurora.moderator (7 endpoints)
             r#""tools.aurora.moderator":["#,
