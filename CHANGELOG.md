@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- B-docs — docs/operator/authoring-themes.md (0.9.0 chapters 1-5,7-9 + 4 examples) (§12) (#218)
 - B-themes-page — Configuration → Themes page (replace stub) + UI & modes theme picker (§11.10.2/§5.5) (#217)
 - B-bundled-themes — aurora-default/-light/-dark/-stack-classic dirs (manifest+tokens+effects; classic adds fonts + .heading-aurora + gradient logo) (§11.11) (#216)
 - B-effects — effect-class library + the 4 required classes (CSS, §11.6) (#215)
