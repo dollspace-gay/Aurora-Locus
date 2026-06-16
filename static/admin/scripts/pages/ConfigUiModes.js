@@ -35,7 +35,7 @@
       '  <div class="settings-card">' +
       '    <h3>Theme</h3>' +
       '    <div id="ui-theme-toggle"></div>' +
-      '    <p class="settings-help">System uses your operating system preference.</p>' +
+      '    <p class="settings-help">Choose an installed theme, or follow the deployment default.</p>' +
       '  </div>' +
       '  <div class="settings-card">' +
       '    <h3>Language</h3>' +

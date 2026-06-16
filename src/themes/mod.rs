@@ -259,8 +259,40 @@ impl ThemeRegistry {
                 }
             }
         }
-        Some(css)
+        Some(hoist_imports(&css))
     }
+}
+
+/// Hoist `@import` statements to the top of a concatenated stylesheet. A
+/// theme's `tokens.css` may carry an `@import` (aurora-stack-classic loads
+/// Google Fonts), but the chain concatenates leaf-last, so a leaf's `@import`
+/// lands mid-file where browsers ignore it (CSS requires `@import` before all
+/// other rules). This moves every line-leading `@import` to the front in source
+/// order. Line-based (the bundled themes keep each `@import` on its own line).
+fn hoist_imports(css: &str) -> String {
+    if !css.contains("@import") {
+        return css.to_string();
+    }
+    let mut imports = Vec::new();
+    let mut rest = String::new();
+    for line in css.lines() {
+        if line.trim_start().starts_with("@import") {
+            imports.push(line.trim());
+        } else {
+            rest.push_str(line);
+            rest.push('\n');
+        }
+    }
+    if imports.is_empty() {
+        return css.to_string();
+    }
+    let mut out = String::new();
+    for imp in imports {
+        out.push_str(imp);
+        out.push('\n');
+    }
+    out.push_str(&rest);
+    out
 }
 
 /// Scan a root for `<root>/<id>/manifest.json`. A missing root yields an
@@ -800,6 +832,28 @@ mod tests {
             .expect("classic effects resolve");
         assert!(classic.contains(".heading-aurora"));
         assert!(classic.contains(".effect-focus-ring"), "inherits required focus-ring");
+    }
+
+    #[test]
+    fn classic_tokens_hoist_import_to_top() {
+        // aurora-stack-classic's @import is in its (leaf) tokens.css, so the
+        // root→leaf concatenation puts it mid-file; hoisting must lift it back
+        // to the top where browsers honor it.
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
+        let reg = ThemeRegistry::build(&bundled, Path::new("/nonexistent/operator"));
+        let css = reg
+            .resolve_token_css("aurora-stack-classic")
+            .expect("classic resolves");
+        // The Google Fonts @import (the only `@import url(...)`; the header
+        // comment mentions the word in prose) must lead the stylesheet and
+        // precede the first :root.
+        assert!(
+            css.trim_start().starts_with("@import url"),
+            "@import hoisted to the top"
+        );
+        let import_pos = css.find("@import url").expect("has the fonts import");
+        let root_pos = css.find(":root").expect("has a :root block");
+        assert!(import_pos < root_pos, "@import precedes the first :root rule");
     }
 
     #[test]

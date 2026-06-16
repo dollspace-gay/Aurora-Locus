@@ -6,6 +6,12 @@
   <title>Aurora Locus admin</title>
   <link rel="stylesheet" href="/admin/styles/tokens.css">
   <link rel="stylesheet" href="/admin/styles/effects.css">
+  <!-- Active named theme (§11): server-resolved token + effect CSS. No ?id ⇒
+       the server serves the deployment-default theme; settings.js re-points
+       these to ?id=<theme> for a per-operator preference. Loaded after the
+       static substrate so a theme's :root tokens override the baseline. -->
+  <link id="theme-tokens" rel="stylesheet" href="/theme/active.css">
+  <link id="theme-effects" rel="stylesheet" href="/theme/active-effects.css">
   <link rel="stylesheet" href="/admin/styles/base.css">
   <link rel="stylesheet" href="/admin/styles/components.css">
   <link rel="stylesheet" href="/admin/styles/pages.css">
@@ -93,6 +99,7 @@
   <!-- Configuration domain (was Settings; renamed v0.9 §5.5) -->
   <script src="/admin/scripts/pages/ConfigGeneral.js"></script>
   <script src="/admin/scripts/pages/ConfigUiModes.js"></script>
+  <script src="/admin/scripts/pages/ConfigThemes.js"></script>
   <script src="/admin/scripts/pages/ConfigRoles.js"></script>
   <script src="/admin/scripts/pages/ConfigRolesMembers.js"></script>
   <!-- Stub pages for routes whose bodies ship in Arc B/D/G. register()

@@ -72,6 +72,8 @@
     listBackgroundJobs: () => C().get('tools.aurora.ops.listBackgroundJobs'),
     getNonceStoreStatus: () => C().get('tools.aurora.ops.getNonceStoreStatus'),
     getValidationFailures: (params) => C().get('tools.aurora.ops.getValidationFailures', params || {}),
+    // §11.10.2 — installed themes + their validation status (B-themes-page).
+    listInstalledThemes: () => C().get('tools.aurora.ops.themes.listInstalled'),
     // Control POSTs (§8.1.5 fold-in — were stringly-typed AuroraClient.post
     // calls in the ops pages; registered here so every NSID has a named
     // wrapper). All take an empty body today.

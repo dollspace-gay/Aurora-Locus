@@ -53,6 +53,11 @@
     // the cached default ('full') stands.
     await loadModerationMode();
 
+    // Load the theme registry (installed themes + deployment-default) into the
+    // AuroraSettings cache so the theme picker is populated and a 'follow
+    // default' preference resolves correctly. Non-blocking for layout.
+    loadThemeRegistry();
+
     renderSidebar();
 
     // §5.8.4 — rebuild the sidebar when moderation-mode changes (e.g. an
@@ -209,6 +214,27 @@
       } catch (e) { /* redirect is optional */ }
       global.AuroraSettings.setModerationModeCache(mode, redirect);
     } catch (e) { /* cached default ('full') stands */ }
+  }
+
+  // Fetch the installed-theme list and deployment-default theme into the
+  // AuroraSettings cache. Populates the theme picker and lets a 'follow
+  // default' preference resolve to the deployment-default. Best-effort: on
+  // failure the picker shows only 'Follow deployment default' and the cached
+  // default ('aurora-default') stands.
+  async function loadThemeRegistry() {
+    if (!global.AuroraEndpoints || !global.AuroraSettings) return;
+    try {
+      const data = await global.AuroraEndpoints.ops.listInstalledThemes();
+      if (data && Array.isArray(data.themes)) {
+        global.AuroraSettings.setInstalledThemesCache(data.themes);
+      }
+    } catch (e) { /* picker falls back to follow-default only */ }
+    try {
+      const d = await global.AuroraEndpoints.admin.getRuntimeSetting('theme.deployment-default');
+      if (d && typeof d.value === 'string' && d.value.trim()) {
+        global.AuroraSettings.setDeploymentDefaultCache(d.value.trim());
+      }
+    } catch (e) { /* cached default ('aurora-default') stands */ }
   }
 
   // Rebuild the whole sidebar (nav + footer) and re-apply the active

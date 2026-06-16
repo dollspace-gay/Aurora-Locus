@@ -205,3 +205,17 @@
 .metrics-range-select {
   font-size: var(--font-size-sm);
 }
+
+/* Configuration → Themes (§11.10.2 / B-themes-page) — card-grid actions and
+ * the validation-errors modal list. Cards reuse .settings-card. */
+.theme-card-actions {
+  margin-block-start: var(--space-3);
+}
+.theme-validation-errors {
+  margin: 0;
+  padding-inline-start: var(--space-5);
+}
+.theme-validation-errors li {
+  color: var(--color-status-danger);
+  margin-block: var(--space-1);
+}

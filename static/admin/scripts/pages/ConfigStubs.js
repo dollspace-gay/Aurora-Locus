@@ -2,7 +2,6 @@
 // ships in a later arc. Arc A owns only the route *definitions* (§5.7.2)
 // and these stub mounts; the page bodies are owned elsewhere:
 //
-//   configThemes               → Arc B (theming substrate, 0.9.0)
 //   configFederationPolicy     → Arc G (placeholder content, 0.9.0;
 //   configRegistrationPolicy        activates per-page as backends land
 //   configModerationPolicy          across 0.9.x — §13.4)
@@ -31,15 +30,6 @@
 
   // { key, domain, title, blurb } — `domain` drives the breadcrumb prefix.
   const STUBS = [
-    {
-      key: 'configThemes',
-      domain: 'Configuration',
-      domainRoute: 'configuration/general',
-      title: 'Themes',
-      blurb: 'Theme management arrives with the v0.9.0 theming substrate. ' +
-             'You will be able to review the bundled themes and set the ' +
-             'deployment default here.',
-    },
     {
       key: 'configFederationPolicy',
       domain: 'Configuration',

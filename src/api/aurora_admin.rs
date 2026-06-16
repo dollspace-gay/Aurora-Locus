@@ -3696,18 +3696,16 @@ pub struct ActiveThemeParams {
 /// requested theme's `extends` chain and emits one stylesheet. Unauthenticated
 /// by design — it's loaded via a `<link>` (which can't carry auth headers)
 /// and theme colors aren't secret. `?id=` selects a theme; absent, the
-/// inheritance root `aurora-default` is served. (Deployment-default-aware
-/// selection from the runtime setting lands with the Themes page,
-/// B-themes-page.) Returns an empty 200 when no theme is installed yet, so
-/// the admin UI keeps using its static tokens.css.
+/// deployment-default theme (the `theme.deployment-default` runtime setting,
+/// §11.10.2) is resolved and served — so a fresh boot's static `<link>` paints
+/// the deployment's chosen theme without a client round-trip. Returns an empty
+/// 200 when no theme is installed yet, so the admin UI keeps using its static
+/// tokens.css.
 pub async fn serve_active_theme_css(
     State(ctx): State<AppContext>,
     axum::extract::Query(params): axum::extract::Query<ActiveThemeParams>,
 ) -> impl axum::response::IntoResponse {
-    let id = params
-        .id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| crate::themes::ROOT_THEME_ID.to_string());
+    let id = resolve_active_theme_id(&ctx, &params).await;
     let css = ctx.theme_registry.resolve_token_css(&id).unwrap_or_default();
     (
         [(
@@ -3716,6 +3714,39 @@ pub async fn serve_active_theme_css(
         )],
         css,
     )
+}
+
+/// Read the deployment-default theme id from the runtime-settings tiers
+/// (runtime row → file tier → compiled default `aurora-default`). Used by the
+/// unauthenticated active-theme serve routes when no `?id` is given; never
+/// errors — falls back to the inheritance root on any DB error.
+async fn deployment_default_theme(ctx: &AppContext) -> String {
+    use sqlx::Row as _;
+    let from_runtime = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(THEME_DEPLOYMENT_DEFAULT_KEY)
+        .fetch_optional(&ctx.account_db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("value").ok())
+        .map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s)));
+    let tiered = from_runtime.or_else(|| ctx.file_tier_settings.get(THEME_DEPLOYMENT_DEFAULT_KEY).cloned());
+    tiered
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::themes::ROOT_THEME_ID.to_string())
+}
+
+/// Resolve the theme id a serve route should render: an explicit non-empty
+/// `?id=`, else the deployment-default.
+async fn resolve_active_theme_id(ctx: &AppContext, params: &ActiveThemeParams) -> String {
+    match params.id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(id) => id.to_string(),
+        None => deployment_default_theme(ctx).await,
+    }
 }
 
 /// Serve the active theme's inheritance-resolved effect-class CSS (§11.6).
@@ -3728,10 +3759,7 @@ pub async fn serve_active_theme_effects_css(
     State(ctx): State<AppContext>,
     axum::extract::Query(params): axum::extract::Query<ActiveThemeParams>,
 ) -> impl axum::response::IntoResponse {
-    let id = params
-        .id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| crate::themes::ROOT_THEME_ID.to_string());
+    let id = resolve_active_theme_id(&ctx, &params).await;
     let css = ctx.theme_registry.resolve_effect_css(&id).unwrap_or_default();
     (
         [(
