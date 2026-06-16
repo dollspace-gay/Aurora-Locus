@@ -319,6 +319,17 @@
       "save_success": "Kryphocron policy saved."
     },
     "audiences": {
+      "title": "Audience aggregate",
+      "subtitle": "Deployment-wide audience statistics. Read-only — account holders manage their own audiences.",
+      "counts_title": "Aggregate counts",
+      "total": "Audience records",
+      "accounts_with": "Accounts with audiences",
+      "avg": "Avg per account",
+      "mode_dist_title": "Mode distribution",
+      "size_hist_title": "List-mode size distribution",
+      "size_hist_help": "Member counts for list-mode audiences; other modes contribute zero.",
+      "no_list_audiences": "No list-mode audiences yet.",
+      "empty": "No audiences exist on this deployment yet. Audiences are created at account setup; this surface populates as accounts are created.",
       "mode_list": "List",
       "mode_everyone": "Everyone",
       "mode_followers": "Followers",
