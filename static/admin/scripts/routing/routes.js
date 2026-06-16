@@ -1,4 +1,4 @@
-// Route table for the Aurora Locus admin UI.
+// Route table for the Aurora-Locus admin.
 //
 // Per docs/AURORA_ADMIN_UI_DESIGN.md §4.3. Hash-based routing keeps
 // no-build-step constraint; deep-linking works because the hash is

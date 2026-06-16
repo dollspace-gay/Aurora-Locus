@@ -1,7 +1,7 @@
 # Authoring Aurora-Locus themes
 
 This guide is for **theme authors** — operators who want to restyle the
-Aurora-Locus admin UI by forking a bundled theme, building a theme from scratch,
+Aurora-Locus admin by forking a bundled theme, building a theme from scratch,
 or tuning one for accessibility. It assumes you have Aurora-Locus running and
 know basic CSS. It does *not* cover substrate internals (see the v0.9 design
 doc) or general CSS (see [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS)).

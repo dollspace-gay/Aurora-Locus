@@ -321,7 +321,7 @@ For the per-key value formats accepted by runtime settings, see
 
 | Variable | Default | Accepted values | Purpose |
 |---|---|---|---|
-| `PDS_ENABLE_DEBUG_PAGES` | `false` | `true` / `1` to enable | Opt-in debug pages in the admin UI. **The debug pages render the bearer token visibly in the DOM — local-development only.** When disabled (default), the pages 404 on any non-localhost binding. |
+| `PDS_ENABLE_DEBUG_PAGES` | `false` | `true` / `1` to enable | Opt-in debug pages in the Aurora-Locus admin. **The debug pages render the bearer token visibly in the DOM — local-development only.** When disabled (default), the pages 404 on any non-localhost binding. |
 
 ## 23. Wire Deprecation & Moderation Retention
 

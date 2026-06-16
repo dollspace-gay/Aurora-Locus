@@ -67,7 +67,7 @@ async function handleOAuthCallback(code, state) {
         // Clear URL parameters
         window.history.replaceState({}, document.title, '/admin/login.html');
 
-        // Redirect to admin panel
+        // Redirect to the Aurora-Locus admin
         window.location.href = '/admin/index.html';
     } catch (error) {
         console.error('OAuth callback error:', error);

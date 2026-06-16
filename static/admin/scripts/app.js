@@ -122,7 +122,7 @@
     // leave it plain. Dormant until a theme styling it is served (B-themes-page).
     html += '<div class="logo">' +
             '  <h1 class="heading-aurora">Aurora Locus</h1>' +
-            '  <p class="subtitle">Admin Panel</p>' +
+            '  <p class="subtitle">Aurora-Locus admin</p>' +
             '</div>';
     html += '<nav class="nav-menu" aria-label="Primary navigation">';
     for (const node of sidebar) {
