@@ -208,12 +208,28 @@ async fn create_post_private(
 ) -> PdsResult<Json<WriteResponse>> {
     let auth_did =
         authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoCreate).await?;
+
+    // #236 — encode-on-write floor. Fix the rkey up-front (so the
+    // at-rest content context's rkey matches the stored record), then
+    // run the record's `text` through the installed codec before it
+    // reaches the write path. No-op when kryphocron is disabled.
+    let rkey = req.rkey.unwrap_or_else(|| next_tid(None).to_string());
+    let mut record = req.record;
+    crate::kryphocron_content::encode_private_content(
+        &ctx,
+        &auth_did,
+        NSID_POST_PRIVATE,
+        &rkey,
+        &mut record,
+    )
+    .await?;
+
     let resp = apply_single_create(
         &ctx,
         &auth_did,
         NSID_POST_PRIVATE,
-        req.rkey,
-        req.record,
+        Some(rkey),
+        record,
         req.validate,
     )
     .await?;
@@ -349,12 +365,25 @@ async fn participate_private(
         }
     }
 
+    // #236 — encode-on-write floor (same seam as create_post_private),
+    // applied after the audience pre-check passes and before the write.
+    let rkey = req.rkey.unwrap_or_else(|| next_tid(None).to_string());
+    let mut record = req.record;
+    crate::kryphocron_content::encode_private_content(
+        &ctx,
+        &auth_did,
+        NSID_POST_PRIVATE,
+        &rkey,
+        &mut record,
+    )
+    .await?;
+
     let resp = apply_single_create(
         &ctx,
         &auth_did,
         NSID_POST_PRIVATE,
-        req.rkey,
-        req.record,
+        Some(rkey),
+        record,
         req.validate,
     )
     .await?;

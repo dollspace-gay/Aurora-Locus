@@ -190,6 +190,20 @@ pub struct AppContext {
     /// `kryphocron.laquna.rotation-cadence` and updated live thereafter.
     pub kryphocron_rotation_oracle:
         Option<Arc<crate::kryphocron_rotation::AuroraLocusStandardRotationOracle>>,
+
+    /// v0.9 Arc D (#236) — the persisted kryphocron at-rest hooks
+    /// (Laquna `ContentCodec` baseline + the #223
+    /// `aurora-locus-standard` rotation oracle). `Some` when
+    /// `config.kryphocron.enabled`; `None` otherwise. #222 built
+    /// these at boot, validated the install fail-closed, then dropped
+    /// them; #236 holds them so the encode-on-write seam
+    /// ([`crate::kryphocron_content::encode_private_content`]) can run
+    /// every private-tier record's content through
+    /// `kryphocron::encode_record_content` — the constitutional
+    /// encoding-at-default floor (kryphocron 0.3 §1.1). Built around
+    /// the same oracle held in `kryphocron_rotation_oracle`.
+    pub kryphocron_at_rest_hooks:
+        Option<Arc<dyn kryphocron::encryption::AtRestHooks>>,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -906,7 +920,7 @@ impl AppContext {
         // `kryphocron::KRYPHOCRON_LEXICON_REGISTRY`. When the switch is
         // off, both are skipped: the registry stays uninitialised and
         // `kryphocron_deny_map` stays `None`.
-        let (kryphocron_deny_map, kryphocron_rotation_oracle) = if config.kryphocron.enabled {
+        let (kryphocron_deny_map, kryphocron_rotation_oracle, kryphocron_at_rest_hooks) = if config.kryphocron.enabled {
             crate::kryphocron::warm_lexicons();
             let map = crate::kryphocron::build_deny_map();
             tracing::info!(
@@ -922,10 +936,11 @@ impl AppContext {
             // from the `kryphocron.laquna.rotation-cadence` runtime setting
             // (unset → daily). We build the at-rest hooks around it (Laquna
             // codec by default) and run `validate_at_rest_install` (the §11.10
-            // fail-closed install check), then drop the hooks — the encode-on-
-            // write seam rebuilds them around this same persisted oracle (#236).
-            // The oracle itself is held in `AppContext` so the `triggerRotation`
-            // XRPC can invoke `force_rotation()`.
+            // fail-closed install check). v0.9 Arc D (#236) — the hooks are now
+            // HELD in `AppContext` (no longer dropped post-validation): the
+            // encode-on-write seam runs every private-tier record's content
+            // through them. The oracle is also held separately so the
+            // `triggerRotation` XRPC can invoke `force_rotation()`.
             use kryphocron::encryption::{AtRestHooks as _, RotationOracle};
 
             // Seed cadence from the runtime setting (in-memory read thereafter).
@@ -976,13 +991,17 @@ impl AppContext {
                     crate::kryphocron_rotation::AuroraLocusStandardRotationOracle::IDENTIFIER,
                 cadence = ?cadence,
                 "kryphocron at-rest baseline validated; aurora-locus-standard rotation oracle \
-                 installed (encode-on-write seam wires this oracle in #236)",
+                 installed; encode-on-write seam holds these hooks (#236)",
             );
-            drop(hooks); // rebuilt around `oracle` at the encode seam (#236)
 
-            (Some(Arc::new(map)), Some(oracle))
+            // #236 — hold the hooks (was `drop(hooks)` in #222). The
+            // encode-on-write seam consumes them at every private-tier
+            // record write.
+            let hooks: Arc<dyn kryphocron::encryption::AtRestHooks> = Arc::new(hooks);
+
+            (Some(Arc::new(map)), Some(oracle), Some(hooks))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // v0.9 Arc B — enumerate + validate installed themes at startup.
@@ -1043,6 +1062,9 @@ impl AppContext {
             kryphocron_deny_map,
             // v0.9 Arc D (#223) — aurora-locus-standard rotation oracle.
             kryphocron_rotation_oracle,
+            // v0.9 Arc D (#236) — persisted at-rest hooks for the
+            // encode-on-write seam.
+            kryphocron_at_rest_hooks,
         })
     }
 
