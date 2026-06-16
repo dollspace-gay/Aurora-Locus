@@ -28,7 +28,13 @@
  * ------------------------------------------------------------------ */
 
 /* Progressively-elevated surfaces (§11.9.2). Shadow-based so elevation
- * composes cleanly with background-based effects like frosted-glass. */
+ * composes cleanly with background-based effects like frosted-glass.
+ *
+ * §10.4.4 allowlist: the box-shadow black-alpha is theme-invariant decorative
+ * depth (shadows read dark under every theme), not a themeable surface/text/
+ * accent color — so it's a legitimate exception to the no-hardcoded-color rule
+ * (which targets hex theme colors). These are a distinct §11.9.2 effect scale
+ * with their own geometry, deliberately separate from the --shadow-* tokens. */
 .effect-surface-elevation-1 {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
 }

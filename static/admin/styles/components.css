@@ -137,7 +137,7 @@
   height: 40px;
   border-radius: var(--radius-full);
   background: var(--color-accent-primary);
-  color: white;
+  color: var(--color-text-inverted);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -291,12 +291,12 @@ a.activity-item {
 
 .btn-danger {
   background: var(--color-status-danger);
-  color: white;
+  color: var(--color-text-inverted);
 }
 
 .btn-success {
   background: var(--color-status-success);
-  color: white;
+  color: var(--color-text-inverted);
 }
 
 .btn-sm {
@@ -433,8 +433,8 @@ a.activity-item {
   max-height: 400px;
   overflow-y: auto;
   padding: var(--space-3);
-  background: #1a1a1a;
-  color: #e6e6e6;
+  background: var(--color-surface-tertiary);
+  color: var(--color-text-primary);
   border-radius: var(--radius-sm);
   font-family: var(--font-family-mono);
   font-size: var(--font-size-xs);
@@ -486,7 +486,7 @@ a.activity-item {
 .modal-overlay {
   position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: var(--color-surface-overlay);
   display: none;
   z-index: 999;
 }
@@ -684,7 +684,7 @@ a.activity-item {
 }
 
 .action-panel-high-impact {
-  background: rgba(245, 158, 11, 0.08);
+  background: color-mix(in srgb, var(--color-status-warning) 8%, transparent);
   border-left: 3px solid var(--color-status-warning);
   padding: var(--space-3);
   border-radius: var(--radius-sm);
@@ -748,7 +748,7 @@ a.activity-item {
 .bulk-cap-warning {
   margin: var(--space-3) 0;
   padding: 0.625rem 0.875rem;
-  background: rgba(245, 158, 11, 0.12);
+  background: color-mix(in srgb, var(--color-status-warning) 12%, transparent);
   border-left: 3px solid var(--color-status-warning);
   border-radius: 4px;
   font-size: 0.8125rem;
@@ -763,7 +763,7 @@ a.activity-item {
   gap: var(--space-2);
   padding: 0.625rem var(--space-4);
   margin-bottom: var(--space-3);
-  background: rgba(59, 130, 246, 0.08);
+  background: color-mix(in srgb, var(--color-accent-primary) 8%, transparent);
   border-left: 3px solid var(--color-accent-primary);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
@@ -847,7 +847,7 @@ input[type="checkbox"][disabled] {
 
 .badge.badge-attention {
   background: var(--color-status-danger);
-  color: white;
+  color: var(--color-text-inverted);
 }
 
 /* ==================== Real-time indicator (§6.19) ==================== */
@@ -913,7 +913,7 @@ input[type="checkbox"][disabled] {
 }
 
 @keyframes rt-fadein {
-  0%   { background: rgba(16, 185, 129, 0.18); }
+  0%   { background: color-mix(in srgb, var(--color-status-success) 18%, transparent); }
   100% { background: transparent; }
 }
 

@@ -39,11 +39,11 @@ body {
 
 .logo {
   padding: var(--space-8) var(--space-6);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  border-bottom: 1px solid color-mix(in srgb, var(--sidebar-text) 10%, transparent);
 }
 
 .logo h1 {
-  color: white;
+  color: var(--sidebar-text);
   font-size: var(--font-size-2xl);
   font-weight: var(--font-weight-bold);
   margin-bottom: var(--space-1);
@@ -85,12 +85,12 @@ body {
 
 .nav-item:hover {
   background: var(--sidebar-hover);
-  color: white;
+  color: var(--sidebar-text);
 }
 
 .nav-item.active {
   background: var(--color-accent-primary);
-  color: white;
+  color: var(--color-text-inverted);
 }
 
 .nav-item .icon {
@@ -107,7 +107,7 @@ body {
 .nav-item .badge {
   margin-left: auto;
   background: var(--color-status-danger);
-  color: white;
+  color: var(--color-text-inverted);
   padding: 0.125rem var(--space-2);
   border-radius: var(--radius-full);
   font-size: var(--font-size-xs);
@@ -130,7 +130,7 @@ body {
 .nav-section-link .badge {
   margin-inline-start: auto;
   background: var(--color-status-danger);
-  color: white;
+  color: var(--color-text-inverted);
   padding: 0.125rem var(--space-2);
   border-radius: var(--radius-full);
   font-size: var(--font-size-xs);
@@ -139,7 +139,7 @@ body {
 
 .sidebar-footer {
   padding: var(--space-6);
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  border-top: 1px solid color-mix(in srgb, var(--sidebar-text) 10%, transparent);
 }
 
 .admin-info {
@@ -147,7 +147,7 @@ body {
 }
 
 .admin-name {
-  color: white;
+  color: var(--sidebar-text);
   font-weight: var(--font-weight-semibold);
   margin-bottom: var(--space-1);
 }
@@ -160,16 +160,16 @@ body {
 .btn-logout {
   width: 100%;
   padding: var(--space-2);
-  background: rgba(255, 255, 255, 0.1);
-  color: white;
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: color-mix(in srgb, var(--sidebar-text) 10%, transparent);
+  color: var(--sidebar-text);
+  border: 1px solid color-mix(in srgb, var(--sidebar-text) 20%, transparent);
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all var(--transition-normal);
 }
 
 .btn-logout:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: color-mix(in srgb, var(--sidebar-text) 15%, transparent);
 }
 
 /* Main Content */
@@ -254,7 +254,7 @@ body {
   top: -40px;
   left: 0;
   background: var(--color-accent-primary);
-  color: white;
+  color: var(--color-text-inverted);
   padding: var(--space-2) var(--space-4);
   z-index: var(--z-toast);
   text-decoration: none;
