@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- D-rotation-history-log — oracle write-side for the cadence-organic rotation track (#238)
 - D-i18n — kryphocron.* / kryphocron.laquna.* key trees (#234)
 - D-dashboard-block — wire Dashboard kryphocron summary block to real aggregates (#233)
 - D-account-drawer — Account detail Kryphocron drawer (audiences owned/default/cadence/block-cascade; read-only) (#232)
