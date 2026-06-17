@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- NonceStore Clock-injection sweep (#266 follow-up): adopt identity::clock::Clock so TTL/expiry is test-injectable; convert sleep-based nonce tests to MockClock (#269)
 - UX-policy decision (#254): toast stays canonical for save/action success; failures stay inline (AuroraInlineError). The errors-inline/successes-toast asymmetry is intentional — recorded in §8.2.4. Audit-only, no code change.
 - I-audit-subject-pivot — add 'View audit chain' subject pivot to Account detail (#mod/audit filtered to DID) per §9.8 (#264)
 - §8.1.2 refresh-token flow first wave (0.9.1): admin /admin-oauth/refresh endpoint + frontend silent refresh-on-401 (localStorage, no rotation) (#268)
