@@ -182,11 +182,15 @@
     const session = global.AuroraSession;
     const handle = (session && session.user() && session.user().handle) || 'Admin';
     const role = (session && session.role()) || 'Operator';
+    const sessionsLabel = global.t ? global.t('sessions.menu') : 'Sessions';
     footer.innerHTML =
       '<div class="admin-info">' +
       '  <p class="admin-name" id="admin-name">' + escHtml(handle) + '</p>' +
       '  <p class="admin-role" id="admin-role">' + escHtml(role) + '</p>' +
       '</div>' +
+      // Operator self-service session management (§8.1.7 / #274) — the
+      // "user menu" entry, beside the operator identity + logout.
+      '<a class="btn-logout" id="sessions-link" href="#configuration/sessions">' + escHtml(sessionsLabel) + '</a>' +
       '<button class="btn-logout" id="sidebar-theme-toggle" type="button"></button>' +
       '<button class="btn-logout" id="logout-btn" type="button">Log out</button>';
     if (global.AuroraThemeToggle) {

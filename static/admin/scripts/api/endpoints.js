@@ -40,6 +40,11 @@
     getRuntimeSetting: (key) => C().get('tools.aurora.admin.getRuntimeSetting', { key: key }),
     setRuntimeSetting: (body) => C().post('tools.aurora.admin.setRuntimeSetting', body),
     emitEvent: (body) => C().post('tools.aurora.admin.emitEvent', body),
+    // Per-operator session management (§8.1.7 / #273). listSessions: own
+    // sessions (self-service) or, for SuperAdmin, a `did` for one operator
+    // / omitted for all. revokeSession: force-logout a single sid.
+    listSessions: (params) => C().get('tools.aurora.admin.listSessions', params || { limit: 25 }),
+    revokeSession: (body) => C().post('tools.aurora.admin.revokeSession', body),
   };
 
   // -------- tools.aurora.moderator.* --------

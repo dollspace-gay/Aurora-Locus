@@ -66,6 +66,13 @@
     { pattern: 'configuration/roles', page: 'configRoles', requires: 'moderator' },
     { pattern: 'configuration/roles/:role', page: 'configRolesMembers', requires: 'moderator' },
     { pattern: 'configuration/capabilities', page: 'configCapabilities' },
+    // Per-operator session management (§8.1.7 / Arc E 0.9.3). `moderator`
+    // = any authenticated operator: the page is self-service (your own
+    // sessions); the SuperAdmin all-operators overview is gated inside the
+    // page + the listSessions handler. Lives under Configuration (always
+    // mode-visible) so self-service works in every moderation mode; the
+    // primary entry point is the sidebar-footer "Sessions" link.
+    { pattern: 'configuration/sessions', page: 'configSessions', requires: 'moderator' },
 
     // Kryphocron domain (Arc D / 0.9.1) — the four domain pages (§6.4) plus
     // the Laquna rotation-history sub-page (§6.4.2.1). Bare `kryphocron`
