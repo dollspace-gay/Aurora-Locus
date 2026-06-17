@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- Arc E 0.9.3 — per-operator session management (§8.1.7) (#270)
+- piece 4: frontend Sessions page (SuperAdmin overview + operator self-service) + user-menu entry + endpoints + i18n (#274)
 - per-operator session XRPC (#273): tools.aurora.admin.listSessions (operator self-service + SuperAdmin all-operators overview, keyset-paginated, isCurrent flag) + revokeSession (single sid; owner self-service or SuperAdmin force-logout, rationale-required cross-operator, audited session.revoke/session.revoke_self). Activates #271's per-request gate → force-logout reauthenticates on next request. New capability session-management-v1. (Bulk-revoke-by-operator deferred.)
 - refresh-token rotation-on-use (#272): each refresh rotates the refresh-token id (current/prev_refresh_id) within a STABLE operator session; compare-and-swap makes concurrent refreshes first-wins; the immediately-prior token is honoured for a 60s grace (dropped-response retry); past grace it is dead. Adds refresh_rotated_at column (migrations 0015/0016)
 - piece 1: operator_session table + OperatorSessionStore substrate; create-at-login + sid claim + per-request lookup/touch/revocation-check in admin_auth_from_token (#271)
