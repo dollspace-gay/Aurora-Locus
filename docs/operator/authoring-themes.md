@@ -399,14 +399,154 @@ rules — normal CSS cascade applies. Design classes that compose cleanly: use
 
 ## Chapter 6 — Extension points
 
-> **Ships in Aurora-Locus 0.9.1.** Extension points let a theme light up opt-in
-> surfaces beyond the substrate's defaults (declared via
-> `providedExtensionPoints` in the manifest and defined in `extensions.css`,
-> consumed by surfaces through the extension-point runtime). The runtime and
-> this chapter's worked examples land with 0.9.1; the
-> `examples/extension-point-author/` reference theme ships then. In 0.9.0,
-> `providedExtensionPoints` and `files.extensions` are accepted in the manifest
-> but not yet executed.
+### 6.1 What they are, and when to use them
+
+An extension point is a theme-specific surface treatment a theme *declares it
+provides* — something beyond the substrate's required and optional tokens and
+its baseline effect classes. A theme that wants to introduce a treatment the
+substrate's vocabulary doesn't cover (a cosmic hero background, an emphasis
+glow, a custom nav indicator) declares it as an extension point; a surface that
+wants that treatment opts in *only when the active theme provides it*, and falls
+back to a default otherwise.
+
+The difference from effect classes (Chapter 5) is who decides:
+
+- **Effect classes** are universal-with-overrides. The substrate's surfaces
+  *always* apply `effect-focus-ring`, `effect-surface-elevation-1`, and the
+  rest; a theme overrides the *implementation* but the class names are part of
+  every theme's contract.
+- **Extension points** are opt-in-by-theme. A surface checks
+  `themeProvidesExtension()` and applies the treatment only when the active
+  theme declares it. Themes that don't declare it produce the default; themes
+  that do produce the enhancement. Both are valid — it's the theme author's
+  choice.
+
+Use an extension point when the treatment is *yours* (not something every theme
+should provide) and a surface should light it up conditionally. Use an effect
+class when the treatment is universal and every theme should supply it.
+
+### 6.2 Declaring an extension point
+
+Two steps: name it in the manifest, define it in `extensions.css`.
+
+Declare the names in `providedExtensionPoints` and point `files.extensions` at
+your stylesheet:
+
+```json
+{
+  "extends": "aurora-default",
+  "providedExtensionPoints": ["hero-treatment-cosmic", "accent-emphasis-glow"],
+  "files": {
+    "tokens": "tokens.css",
+    "extensions": "extensions.css"
+  }
+}
+```
+
+Define each one in `extensions.css` as a class named `.extension-<name>`:
+
+```css
+.extension-hero-treatment-cosmic {
+  background: linear-gradient(180deg, #000018, var(--color-surface-primary));
+  position: relative;
+}
+
+.extension-accent-emphasis-glow {
+  box-shadow: 0 0 32px color-mix(in srgb, var(--color-accent-primary) 35%, transparent);
+}
+```
+
+Compose from the inherited token contract (`var(--color-*)`, `color-mix(...)`)
+so your extension points stay portable across the palette.
+
+The substrate validates the pairing at theme-load: every name in
+`providedExtensionPoints` must have a matching `.extension-<name>` rule, in this
+theme's `extensions.css` **or an inherited one** (extension points are additive
+across the `extends` chain — see §6.2's note below). A declared name with no
+definition fails with `theme.extensions.declared.undefined: <name>`; a name
+listed twice fails with `theme.extensions.declared.duplicate: <name>`. A theme
+that fails validation is listed but not activatable, same as any other
+validation failure (Chapter 8).
+
+**Inheritance is additive.** Unlike tokens and effect classes (where a child
+overrides its parent), a child theme's extension points *add to* its parent's —
+the parent's remain available unless the child redefines the same
+`.extension-<name>` rule. The substrate serves the chain-concatenated result at
+`/theme/active-extensions.css` (root first, so a child's redefinition wins),
+loaded alongside `active.css` and `active-effects.css`.
+
+### 6.3 How surfaces opt into extension points
+
+A surface asks the runtime whether the active theme provides a point, and
+applies the class only when it does:
+
+```js
+if (AuroraThemeRuntime.themeProvidesExtension('hero-treatment-cosmic')) {
+  heroEl.classList.add('extension-hero-treatment-cosmic');
+}
+// else: the surface keeps its default treatment
+```
+
+`AuroraThemeRuntime.themeProvidesExtension(name)` returns a boolean. A few
+properties worth knowing as a theme author:
+
+- **It's a global, not an import.** The admin UI is a no-build, no-bundler
+  vanilla-JS app, so the runtime is the `AuroraThemeRuntime` global rather than
+  an `import { … } from '@aurora-locus/theme-runtime'` module. (If you read the
+  substrate design notes, that import form is illustrative pseudocode; the
+  shipped surface is the global.)
+- **It's synchronous and cached.** The runtime loads the active theme's
+  *effective* extension points (yours plus everything you inherit) once at
+  theme-load, from the `/theme/active-extension-points` endpoint, and refreshes
+  the cache when the operator switches themes. Surfaces call it freely; there's
+  no per-call request.
+- **It's fail-soft.** If the list hasn't loaded yet, or the name isn't provided,
+  the call returns `false` — the surface renders its default. An extension-point
+  lookup never throws and never blocks a render.
+
+This is the whole contract: declare it, define it, and a surface that knows
+about it lights it up when your theme is active.
+
+### 6.4 Naming conventions
+
+Extension-point names are a shared namespace across every installed theme, so
+name them so two themes' points don't collide and a surface author can tell what
+a point *is* from its name:
+
+- **Be semantic, not decorative-adjective.** `hero-treatment-cosmic`, not
+  `cosmic`; `accent-emphasis-glow`, not `glow`. The name should read as *what
+  surface it treats* + *how*, so a surface author searching for "hero" finds it.
+- **Lead with the surface or concept.** Group related points by prefix
+  (`hero-…`, `nav-…`, `accent-…`) so they sort together in the theme picker and
+  read as a family.
+- **Don't shadow substrate vocabulary.** Don't name an extension point after a
+  required token or an `effect-*` class; the `.extension-` prefix keeps the CSS
+  selectors distinct, but a *name* that mirrors a substrate concept misleads
+  surface authors about what it is.
+- **Lowercase, hyphen-separated** (matching token and effect-class style):
+  `[a-z0-9-]`.
+
+### 6.5 When to recommend surface authors integrate
+
+An extension point only does something if a surface opts into it, so a treatment
+you want to *guarantee* shows up isn't an extension point — it's a token or an
+effect-class override (which surfaces already apply). Extension points are the
+right tool when you and a surface author coordinate: you provide a treatment,
+they add the conditional `themeProvidesExtension()` check.
+
+Make that coordination easy:
+
+- **Document your extension points** — what each one treats, what it expects of
+  the element it's applied to (a positioned container? a full-bleed section?),
+  and the class name. The `examples/extension-point-author/` reference theme's
+  README is the model: one short paragraph per point plus the consuming snippet.
+- **Operators can already see them.** The theme picker (Configuration → Themes)
+  surfaces each theme's `providedExtensionPoints`, so an operator evaluating
+  your theme sees what it adds beyond the baseline without reading its CSS.
+- **Treat the names as stable.** Once a surface author integrates against
+  `hero-treatment-cosmic`, renaming it silently drops the treatment (the
+  surface's check just starts returning `false`). Rename like any public API:
+  keep the old name defined during a transition, or coordinate the change.
 
 ---
 
