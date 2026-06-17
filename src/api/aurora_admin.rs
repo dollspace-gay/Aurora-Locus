@@ -3782,6 +3782,43 @@ pub async fn serve_active_theme_effects_css(
     )
 }
 
+/// Serve the active theme's inheritance-resolved extension-point CSS (§11.7,
+/// #285). Parallel to [`serve_active_theme_effects_css`] over each theme's
+/// optional `extensions.css`; extension points are additive across the chain.
+/// Unauthenticated (loaded via `<link>`). Empty 200 when no theme is installed.
+pub async fn serve_active_theme_extensions_css(
+    State(ctx): State<AppContext>,
+    axum::extract::Query(params): axum::extract::Query<ActiveThemeParams>,
+) -> impl axum::response::IntoResponse {
+    let id = resolve_active_theme_id(&ctx, &params).await;
+    let css = ctx
+        .theme_registry
+        .resolve_extension_css(&id)
+        .unwrap_or_default();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/css; charset=utf-8",
+        )],
+        css,
+    )
+}
+
+/// `GET /theme/active-extension-points` — the active theme's effective
+/// extension points (own + inherited, deduped) as JSON (§11.7, #285). The
+/// frontend runtime (`AuroraThemeRuntime.themeProvidesExtension`) fetches this
+/// once at theme-load and caches it for synchronous membership checks.
+/// Unauthenticated, same id-or-deployment-default contract as the serve-CSS
+/// routes; always 200 (empty array when no theme / none declared).
+pub async fn serve_active_theme_extension_points(
+    State(ctx): State<AppContext>,
+    axum::extract::Query(params): axum::extract::Query<ActiveThemeParams>,
+) -> Json<serde_json::Value> {
+    let id = resolve_active_theme_id(&ctx, &params).await;
+    let points = ctx.theme_registry.resolve_extension_points(&id);
+    Json(serde_json::json!({ "extensionPoints": points }))
+}
+
 /// `tools.aurora.ops.kryphocron.triggerRotation` — force a Laquna rotation
 /// ahead of cadence (§6.4.2). Admin+ (via [`AdminAuthContext`]). Single-flight:
 /// the rewrite job's [`try_start`](crate::kryphocron_rewrite::RewriteJob::try_start)

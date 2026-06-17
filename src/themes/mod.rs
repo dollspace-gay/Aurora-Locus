@@ -109,6 +109,11 @@ pub struct ThemeMetadata {
     pub source: ThemeSource,
     pub valid: bool,
     pub validation_errors: Vec<String>,
+    /// Extension points this theme declares (§11.7 / #285). The theme picker
+    /// surfaces these so operators see what a theme adds beyond the baseline
+    /// (§11.7.3 discovery). Own declarations only — the effective (inherited)
+    /// set for the *active* theme is served by `/theme/active-extension-points`.
+    pub provided_extension_points: Vec<String>,
     pub metadata: serde_json::Value,
 }
 
@@ -181,6 +186,7 @@ impl ThemeRegistry {
                     source: r.discovered.source,
                     valid: r.valid,
                     validation_errors: r.errors.clone(),
+                    provided_extension_points: m.provided_extension_points.clone(),
                     metadata: m.metadata.clone(),
                 }
             })
@@ -210,6 +216,64 @@ impl ThemeRegistry {
     /// `None` only if even the root is absent.
     pub fn resolve_effect_css(&self, id: &str) -> Option<String> {
         self.resolve_chain_css(id, |files| files.effects.as_deref())
+    }
+
+    /// Resolve the active theme's extension-point CSS (§11.7): same chain walk
+    /// as [`resolve_effect_css`], over each theme's optional `extensions.css`.
+    /// Extension points are **additive** (§11.7) — the chain concatenates
+    /// root→leaf so an inherited `.extension-*` rule survives unless a leaf
+    /// redefines it. Returns `None` only if even the root is absent.
+    pub fn resolve_extension_css(&self, id: &str) -> Option<String> {
+        self.resolve_chain_css(id, |files| files.extensions.as_deref())
+    }
+
+    /// The active theme's **effective** extension points — its own
+    /// `providedExtensionPoints` plus every ancestor's, deduped, root→leaf
+    /// order (§11.7 additive semantics). This is what the frontend runtime's
+    /// `themeProvidesExtension(name)` resolves membership against. Returns an
+    /// empty list when the theme (or root fallback) is absent or declares none.
+    pub fn resolve_extension_points(&self, id: &str) -> Vec<String> {
+        let find_valid = |want: &str| {
+            self.records
+                .iter()
+                .find(|r| r.valid && r.discovered.manifest.theme_id == want)
+        };
+        let Some(target) = find_valid(id).or_else(|| find_valid(ROOT_THEME_ID)) else {
+            return Vec::new();
+        };
+        let by_id: HashMap<&str, &ThemeRecord> = self
+            .records
+            .iter()
+            .map(|r| (r.discovered.manifest.theme_id.as_str(), r))
+            .collect();
+
+        // Walk leaf→root collecting declarations, then emit root→leaf deduped.
+        let mut chain: Vec<&ThemeRecord> = Vec::new();
+        let mut cursor: Option<&ThemeRecord> = Some(target);
+        let mut guard = 0;
+        while let Some(rec) = cursor {
+            guard += 1;
+            if guard > MAX_CHAIN_DEPTH + 2 {
+                break;
+            }
+            chain.push(rec);
+            cursor = match &rec.discovered.manifest.extends {
+                Some(parent) => by_id.get(parent.as_str()).copied(),
+                None => None,
+            };
+        }
+        chain.reverse();
+
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for rec in chain {
+            for name in &rec.discovered.manifest.provided_extension_points {
+                if seen.insert(name.clone()) {
+                    out.push(name.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Shared chain walk for resolved CSS: locate the requested valid theme
@@ -327,9 +391,9 @@ fn enumerate_root(root: &Path, source: ThemeSource) -> Vec<DiscoveredTheme> {
     out
 }
 
-/// Validation contract (§11.10.1), steps 1–9 + chain. Returns the list of
+/// Validation contract (§11.10.1), steps 1–10 + chain. Returns the list of
 /// failures (empty = valid). Step 10 (extension-point declaration validation)
-/// is deferred to 0.9.1 with the extension-point system (recon §4.4).
+/// landed with the 0.9.1 extension-point system (#285).
 fn validate(theme: &DiscoveredTheme, by_id: &HashMap<String, DiscoveredTheme>) -> Vec<String> {
     let mut errors = Vec::new();
     let m = &theme.manifest;
@@ -413,6 +477,29 @@ fn validate(theme: &DiscoveredTheme, by_id: &HashMap<String, DiscoveredTheme>) -
     if chain_ok && required_complete {
         let values = collect_declared_token_values(&m.theme_id, by_id);
         errors.extend(contrast::verify(&values));
+    }
+
+    // Step 10 — extension-point declaration validation (§11.7, #285). Every
+    // name in `providedExtensionPoints` must be defined as `.extension-<name>`
+    // in the theme's own or inherited `extensions.css` (extension points are
+    // additive across the chain); a declared-but-undefined point fails. A
+    // duplicate declaration in the list fails. Gated on a sane chain so the
+    // inherited `extensions.css` files resolve.
+    if chain_ok {
+        let mut seen = HashSet::new();
+        for name in &m.provided_extension_points {
+            if !seen.insert(name.as_str()) {
+                errors.push(format!("theme.extensions.declared.duplicate: {name}"));
+            }
+        }
+        if !m.provided_extension_points.is_empty() {
+            let defined = collect_declared_extension_points(&m.theme_id, by_id);
+            for name in &m.provided_extension_points {
+                if !defined.contains(&format!("extension-{name}")) {
+                    errors.push(format!("theme.extensions.declared.undefined: {name}"));
+                }
+            }
+        }
     }
 
     errors
@@ -507,6 +594,49 @@ fn collect_declared_effect_classes(
         };
         if let Some(effects_file) = &theme.manifest.files.effects {
             let path = theme.dir.join(effects_file);
+            if let Ok(css) = std::fs::read_to_string(&path) {
+                for cap in re.captures_iter(&css) {
+                    classes.insert(cap[1].to_string());
+                }
+            }
+        }
+        match &theme.manifest.extends {
+            Some(parent) => current = parent.clone(),
+            None => break,
+        }
+    }
+    classes
+}
+
+/// Collect every extension-point class declared in a theme's chain
+/// (`.extension-<name>` rules in each `extensions.css`), for step-10
+/// declaration validation (§11.7). Mirrors `collect_declared_effect_classes`,
+/// reading `files.extensions` instead of `files.effects`. Extension points
+/// are additive across the chain (§11.7 / design §11.6's additive note), so a
+/// child's declarations satisfy via either its own or an inherited
+/// `extensions.css`. Returns the class names (the `extension-` prefix
+/// included), so a `providedExtensionPoints` entry `foo` is checked as
+/// `extension-foo`.
+fn collect_declared_extension_points(
+    start: &str,
+    by_id: &HashMap<String, DiscoveredTheme>,
+) -> HashSet<String> {
+    let re = regex::Regex::new(r"\.(extension-[A-Za-z0-9_-]+)")
+        .expect("static extension-point regex compiles");
+    let mut classes = HashSet::new();
+    let mut current = start.to_string();
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > MAX_CHAIN_DEPTH + 2 {
+            break;
+        }
+        let theme = match by_id.get(&current) {
+            Some(t) => t,
+            None => break,
+        };
+        if let Some(extensions_file) = &theme.manifest.files.extensions {
+            let path = theme.dir.join(extensions_file);
             if let Ok(css) = std::fs::read_to_string(&path) {
                 for cap in re.captures_iter(&css) {
                     classes.insert(cap[1].to_string());
@@ -862,5 +992,199 @@ mod tests {
         assert!(version_gt("2.0", "1.9"));
         assert!(!version_gt("1.0", "1.0"));
         assert!(!version_gt("1.0", "1.1"));
+    }
+
+    // ---------- §11.7 step-10 extension-point declaration validation (#285) ----------
+
+    /// Write a complete valid theme that also declares `providedExtensionPoints`
+    /// plus a `files.extensions` `extensions.css` with the given body. Tokens
+    /// and effects are the complete contrast-passing fixtures, so only step 10
+    /// is exercised.
+    fn write_theme_with_extensions(
+        root: &Path,
+        id: &str,
+        extends: Option<&str>,
+        provided: &[&str],
+        extensions_css: &str,
+    ) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ext = match extends {
+            Some(e) => format!("\"extends\":\"{e}\","),
+            None => String::new(),
+        };
+        let provided_json = provided
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"{{"schemaVersion":"1.0","themeId":"{id}","themeName":"{id}","substrateVersion":"1.0",{ext}"providedExtensionPoints":[{provided_json}],"files":{{"tokens":"tokens.css","effects":"effects.css","extensions":"extensions.css"}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("tokens.css"), all_required_css()).unwrap();
+        std::fs::write(dir.join("effects.css"), all_required_effects()).unwrap();
+        std::fs::write(dir.join("extensions.css"), extensions_css).unwrap();
+    }
+
+    /// Validation errors for one theme id in a freshly-built registry.
+    fn errors_for(reg: &ThemeRegistry, id: &str) -> Vec<String> {
+        reg.list()
+            .into_iter()
+            .find(|t| t.theme_id == id)
+            .map(|t| t.validation_errors)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn extension_point_declared_and_defined_validates() {
+        let bundled = tmp("extok");
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        write_theme_with_extensions(
+            &bundled,
+            "exttheme",
+            Some(ROOT_THEME_ID),
+            &["hero-treatment-cosmic", "aurora-glow-accent"],
+            ".extension-hero-treatment-cosmic { opacity: 1; }\n.extension-aurora-glow-accent { opacity: 1; }",
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        assert!(
+            errors_for(&reg, "exttheme").is_empty(),
+            "declared + defined extension points validate: {:?}",
+            errors_for(&reg, "exttheme")
+        );
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    #[test]
+    fn extension_point_declared_but_undefined_fails() {
+        let bundled = tmp("extundef");
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        // declares two; defines only one.
+        write_theme_with_extensions(
+            &bundled,
+            "exttheme",
+            Some(ROOT_THEME_ID),
+            &["defined-one", "missing-two"],
+            ".extension-defined-one { opacity: 1; }",
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        let errs = errors_for(&reg, "exttheme");
+        assert!(
+            errs.iter().any(|e| e == "theme.extensions.declared.undefined: missing-two"),
+            "undefined extension point must fail: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("defined-one")),
+            "the defined one must not fail: {errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    #[test]
+    fn extension_point_duplicate_declaration_fails() {
+        let bundled = tmp("extdup");
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        write_theme_with_extensions(
+            &bundled,
+            "exttheme",
+            Some(ROOT_THEME_ID),
+            &["dup", "dup"],
+            ".extension-dup { opacity: 1; }",
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        let errs = errors_for(&reg, "exttheme");
+        assert!(
+            errs.iter().any(|e| e == "theme.extensions.declared.duplicate: dup"),
+            "duplicate declaration must fail: {errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    #[test]
+    fn extension_point_satisfied_by_inherited_definition() {
+        let bundled = tmp("extinherit");
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        // Parent defines `.extension-foo`; child declares `foo` but its own
+        // extensions.css doesn't define it — additive inheritance satisfies it.
+        write_theme_with_extensions(
+            &bundled,
+            "parentext",
+            Some(ROOT_THEME_ID),
+            &[],
+            ".extension-foo { opacity: 1; }",
+        );
+        write_theme_with_extensions(
+            &bundled,
+            "childext",
+            Some("parentext"),
+            &["foo"],
+            "/* child adds no extension definitions of its own */",
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        assert!(
+            errors_for(&reg, "childext").is_empty(),
+            "inherited extension definition satisfies the child's declaration: {:?}",
+            errors_for(&reg, "childext")
+        );
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    #[test]
+    fn resolve_extension_css_concatenates_chain_additively() {
+        let bundled = tmp("extcss");
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        write_theme_with_extensions(
+            &bundled,
+            "parentext",
+            Some(ROOT_THEME_ID),
+            &[],
+            ".extension-parent-fx { opacity: 0.1; }",
+        );
+        write_theme_with_extensions(
+            &bundled,
+            "childext",
+            Some("parentext"),
+            &[],
+            ".extension-child-fx { opacity: 0.9; }",
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        let css = reg.resolve_extension_css("childext").expect("resolves");
+        assert!(css.contains(".extension-parent-fx"), "inherited rule present: {css}");
+        assert!(css.contains(".extension-child-fx"), "own rule present: {css}");
+        // Root emitted first → parent's rule precedes the child's.
+        assert!(
+            css.find(".extension-parent-fx") < css.find(".extension-child-fx"),
+            "additive chain order is root→leaf"
+        );
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    #[test]
+    fn resolve_extension_points_unions_chain_deduped() {
+        let bundled = tmp("extpts");
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        write_theme_with_extensions(
+            &bundled,
+            "parentext",
+            Some(ROOT_THEME_ID),
+            &["bar"],
+            ".extension-bar { opacity: 0.1; }",
+        );
+        write_theme_with_extensions(
+            &bundled,
+            "childext",
+            Some("parentext"),
+            &["foo"],
+            ".extension-foo { opacity: 0.9; }",
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        let points = reg.resolve_extension_points("childext");
+        // Root→leaf order: parent's `bar` before child's `foo`.
+        assert_eq!(points, vec!["bar".to_string(), "foo".to_string()]);
+        let _ = std::fs::remove_dir_all(&bundled);
     }
 }

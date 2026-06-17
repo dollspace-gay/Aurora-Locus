@@ -72,6 +72,17 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
             "/theme/active-effects.css",
             axum::routing::get(crate::api::aurora_admin::serve_active_theme_effects_css),
         )
+        // v0.9 Arc C §11.7 / #285 — resolved active-theme extension-point CSS
+        // + the effective extension-point list (JSON) the runtime caches.
+        // Same unauthenticated <link>/fetch contract as the siblings above.
+        .route(
+            "/theme/active-extensions.css",
+            axum::routing::get(crate::api::aurora_admin::serve_active_theme_extensions_css),
+        )
+        .route(
+            "/theme/active-extension-points",
+            axum::routing::get(crate::api::aurora_admin::serve_active_theme_extension_points),
+        )
         .merge(sync::routes())
         .merge(firehose::routes())
         .merge(labels::routes())
