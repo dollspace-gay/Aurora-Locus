@@ -9,6 +9,7 @@
   'use strict';
 
   const API_BASE = '/xrpc';
+  const REFRESH_URL = '/admin-oauth/refresh';
 
   function authHeaders(extra) {
     const headers = Object.assign({}, extra || {});
@@ -17,30 +18,94 @@
     return headers;
   }
 
+  // Silent refresh-on-401 (§8.1.2 / #268). When a request 401s on an
+  // expired access token, exchange the stored refresh token for a fresh
+  // access token and retry once — the operator never sees an interactive
+  // re-auth unless the refresh itself fails (refresh token expired/revoked
+  // or no refresh token present), in which case the 401 reaches handle()
+  // and bounces to login as before. Reactive-on-401 only; proactive
+  // near-expiry refresh is deferred (the 0.9.3 session-management pass).
+  let refreshInFlight = null;
+
+  function storedRefreshToken() {
+    return global.AuroraSession ? global.AuroraSession.refreshToken()
+      : localStorage.getItem('aurora-admin-refresh-token');
+  }
+
+  function applyRefreshed(data) {
+    if (global.AuroraSession) {
+      global.AuroraSession.setToken(data.access_token);
+      if (data.refresh_token) global.AuroraSession.setRefreshToken(data.refresh_token);
+    } else {
+      localStorage.setItem('aurora-admin-token', data.access_token);
+      if (data.refresh_token) localStorage.setItem('aurora-admin-refresh-token', data.refresh_token);
+    }
+  }
+
+  // Single-flight: concurrent 401s share one in-flight refresh so we never
+  // fire N parallel refresh calls (which, with rotation, would invalidate
+  // each other). Resolves true on success, false otherwise.
+  function refreshAccessToken() {
+    if (refreshInFlight) return refreshInFlight;
+    const rt = storedRefreshToken();
+    if (!rt) return Promise.resolve(false);
+    refreshInFlight = (async function () {
+      try {
+        const res = await fetch(REFRESH_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: rt }),
+        });
+        if (!res.ok) return false;
+        const data = await res.json();
+        if (!data || !data.access_token) return false;
+        applyRefreshed(data);
+        return true;
+      } catch (e) {
+        return false;
+      } finally {
+        refreshInFlight = null;
+      }
+    })();
+    return refreshInFlight;
+  }
+
+  // Run a fetch thunk; on a 401, attempt one silent refresh + retry. The
+  // thunk rebuilds auth headers each call, so the retry picks up the new
+  // token. A still-401 (or non-401) response is returned as-is to handle().
+  async function withRefresh(doFetch) {
+    let res = await doFetch();
+    if (res.status === 401) {
+      const refreshed = await refreshAccessToken();
+      if (refreshed) res = await doFetch();
+    }
+    return res;
+  }
+
   // GET <nsid>?<params>. Returns parsed JSON or throws.
   async function get(nsid, params) {
     const qs = params ? '?' + new URLSearchParams(params).toString() : '';
-    const res = await fetch(API_BASE + '/' + nsid + qs, { headers: authHeaders() });
+    const res = await withRefresh(() => fetch(API_BASE + '/' + nsid + qs, { headers: authHeaders() }));
     return await handle(res);
   }
 
   // POST <nsid> with JSON body.
   async function post(nsid, body, extraHeaders) {
-    const res = await fetch(API_BASE + '/' + nsid, {
+    const res = await withRefresh(() => fetch(API_BASE + '/' + nsid, {
       method: 'POST',
       headers: authHeaders(Object.assign({ 'Content-Type': 'application/json' }, extraHeaders || {})),
       body: body == null ? undefined : JSON.stringify(body),
-    });
+    }));
     return await handle(res);
   }
 
   // POST returning the raw Response (for downloads, header inspection).
   async function postRaw(nsid, body, extraHeaders) {
-    return await fetch(API_BASE + '/' + nsid, {
+    return await withRefresh(() => fetch(API_BASE + '/' + nsid, {
       method: 'POST',
       headers: authHeaders(Object.assign({ 'Content-Type': 'application/json' }, extraHeaders || {})),
       body: body == null ? undefined : JSON.stringify(body),
-    });
+    }));
   }
 
   async function handle(res) {

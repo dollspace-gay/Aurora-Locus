@@ -13,6 +13,12 @@
 
   const TOKEN_KEY = 'aurora-admin-token';
   const LEGACY_TOKEN_KEY = 'adminToken';
+  // Refresh-token store (§8.1.2 / #268). localStorage was the chosen
+  // strategy (see §8.1.2 doc note): same XSS-exfil surface the access
+  // token already has, documented as the accepted threat model, no
+  // httpOnly-cookie/backend-coordination cost. Consumed by
+  // api/client.js's silent refresh-on-401.
+  const REFRESH_KEY = 'aurora-admin-refresh-token';
 
   // One-time token-key migration (§8.1.1). Runs at module load, before any
   // consumer reads token() — session.js loads ahead of client.js,
@@ -26,6 +32,15 @@
         localStorage.setItem(TOKEN_KEY, legacy);
       }
       if (legacy != null) localStorage.removeItem(LEGACY_TOKEN_KEY);
+      // Same migration for the refresh token (§8.1.2 / #268): an operator
+      // who logged in via the legacy OAuth-callback page before the rename
+      // has a lingering 'adminRefreshToken'; move it to the canonical key
+      // so the new refresh-on-401 consumer finds it.
+      const legacyRefresh = localStorage.getItem('adminRefreshToken');
+      if (legacyRefresh && !localStorage.getItem(REFRESH_KEY)) {
+        localStorage.setItem(REFRESH_KEY, legacyRefresh);
+      }
+      if (legacyRefresh != null) localStorage.removeItem('adminRefreshToken');
     } catch (e) { /* localStorage unavailable — nothing to migrate */ }
   })();
 
@@ -40,6 +55,15 @@
     if (t) localStorage.setItem(TOKEN_KEY, t);
     else localStorage.removeItem(TOKEN_KEY);
     notify();
+  }
+
+  function refreshToken() {
+    return localStorage.getItem(REFRESH_KEY) || '';
+  }
+
+  function setRefreshToken(t) {
+    if (t) localStorage.setItem(REFRESH_KEY, t);
+    else localStorage.removeItem(REFRESH_KEY);
   }
 
   function user() {
@@ -85,6 +109,7 @@
 
   function logout() {
     setToken('');
+    setRefreshToken('');
     setUser(null);
     window.location.href = '/admin/login.html';
   }
@@ -92,6 +117,8 @@
   global.AuroraSession = {
     token: token,
     setToken: setToken,
+    refreshToken: refreshToken,
+    setRefreshToken: setRefreshToken,
     user: user,
     setUser: setUser,
     role: role,

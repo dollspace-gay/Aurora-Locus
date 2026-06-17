@@ -53,14 +53,15 @@ async function handleOAuthCallback(code, state) {
 
         // Store tokens in localStorage.
         //
-        // adminRefreshToken is intentionally NOT stored: a real
-        // refresh-token flow is planned for v0.3's token-lifecycle
-        // design pass (see admin UI audit findings #2, #4, #12). The
-        // server may still emit `refresh_token` in the response —
-        // we just discard it client-side until the consumer exists.
-        // Storing without consuming would expand the localStorage
-        // attack surface for zero current value.
+        // The refresh token is now stored (§8.1.2 / #268): api/client.js's
+        // silent refresh-on-401 is the consumer that previously did not
+        // exist. localStorage is the chosen store (same XSS-exfil surface
+        // as the access token, documented as the accepted threat model).
+        // The server omits refresh_token only if it minted none, so guard.
         localStorage.setItem('aurora-admin-token', data.access_token);
+        if (data.refresh_token) {
+            localStorage.setItem('aurora-admin-refresh-token', data.refresh_token);
+        }
         localStorage.setItem('adminDid', data.did);
         localStorage.setItem('adminRole', data.role || 'admin');
 
