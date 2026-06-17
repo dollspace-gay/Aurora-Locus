@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- I-audit-pivots — §9.8 audit cross-pivot link convention audit (#263)
+- I-dashboard-data — §9.7 dashboard-widget vs domain-page data alignment audit (#262)
 - I-overfetch — §10.5.1 over-fetching audit + AuroraLazySection affordance (#260)
 - I-subscription-leak — §10.5.2 subscription-leakage audit (#259)
 - I-component-boundary — §8.2.6 component-vs-page boundary audit + tierToRoleString extraction (#256)
