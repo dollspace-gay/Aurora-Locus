@@ -6,11 +6,20 @@
 //! Tracks JWT nonces (jti claims) to prevent replay attacks on service auth tokens.
 //! Since service auth JWTs have <60 second lifetime, we only need to track nonces
 //! for a short duration.
+//!
+//! Time comes from an injected [`Clock`] (#269, the #266 follow-up): production
+//! wires [`SystemClock`]; tests wire `MockClock` and `advance()` past the
+//! retention window instead of sleeping against the real wall clock. The store
+//! moved from monotonic `Instant` to wall-clock `DateTime<Utc>` to adopt the
+//! shared `identity::clock::Clock` primitive — consistent with `DidCache`'s
+//! TTLs, and acceptable here because the JWT `exp` these nonces shadow is itself
+//! wall-clock-validated over the same ~120s horizon.
 
 use crate::error::PdsResult;
+use crate::identity::clock::{Clock, SystemClock};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -18,8 +27,8 @@ use tracing::{debug, warn};
 #[derive(Debug, Clone)]
 struct NonceEntry {
     #[allow(dead_code)] // Kept for debugging, only expires_at is checked
-    recorded_at: Instant,
-    expires_at: Instant,
+    recorded_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
 }
 
 /// In-memory nonce store for tracking used JWTs
@@ -31,7 +40,10 @@ pub struct NonceStore {
     nonces: Arc<RwLock<HashMap<String, NonceEntry>>>,
 
     /// How long to keep nonces (default: 120 seconds)
-    retention_duration: Duration,
+    retention: Duration,
+
+    /// Time source. `SystemClock` in production; tests inject `MockClock`.
+    clock: Arc<dyn Clock>,
 }
 
 impl NonceStore {
@@ -39,7 +51,8 @@ impl NonceStore {
     pub fn new() -> Self {
         Self {
             nonces: Arc::new(RwLock::new(HashMap::new())),
-            retention_duration: Duration::from_secs(120), // 2x max JWT lifetime
+            retention: Duration::seconds(120), // 2x max JWT lifetime
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -47,8 +60,17 @@ impl NonceStore {
     pub fn with_retention(retention_seconds: u64) -> Self {
         Self {
             nonces: Arc::new(RwLock::new(HashMap::new())),
-            retention_duration: Duration::from_secs(retention_seconds),
+            retention: Duration::seconds(retention_seconds as i64),
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// Override the time source. Production never calls this (it keeps the
+    /// `SystemClock` default); tests pass a `MockClock` to drive expiry
+    /// deterministically. Mirrors `DidCache::with_clock`.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Check if a nonce has been used and record it
@@ -58,10 +80,11 @@ impl NonceStore {
     /// Returns `Err` if there's an internal error
     pub async fn check_and_record(&self, nonce: &str) -> PdsResult<bool> {
         let mut nonces = self.nonces.write().await;
+        let now = self.clock.now();
 
         // Check if nonce exists and is not expired
         if let Some(entry) = nonces.get(nonce) {
-            if Instant::now() < entry.expires_at {
+            if now < entry.expires_at {
                 warn!("Replay attack detected: nonce {} already used", nonce);
                 return Ok(false); // Nonce already used - replay attack!
             } else {
@@ -71,10 +94,9 @@ impl NonceStore {
         }
 
         // Record the nonce
-        let now = Instant::now();
         let entry = NonceEntry {
             recorded_at: now,
-            expires_at: now + self.retention_duration,
+            expires_at: now + self.retention,
         };
 
         nonces.insert(nonce.to_string(), entry);
@@ -90,7 +112,7 @@ impl NonceStore {
     pub async fn cleanup_expired(&self) -> PdsResult<usize> {
         let mut nonces = self.nonces.write().await;
 
-        let now = Instant::now();
+        let now = self.clock.now();
         let initial_count = nonces.len();
 
         // Remove expired entries
@@ -126,7 +148,15 @@ impl Default for NonceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::sleep;
+    use crate::identity::clock::MockClock;
+
+    // Fixed anchor so test "time" is fully deterministic; advance the
+    // MockClock instead of sleeping against the real wall clock (#269).
+    fn anchor() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2020-06-15T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
 
     #[tokio::test]
     async fn test_nonce_check_and_record() {
@@ -147,20 +177,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_nonce_expiration() {
-        let store = NonceStore::with_retention(1); // 1 second retention
+        let clock = Arc::new(MockClock::new(anchor()));
+        let store = NonceStore::with_retention(1).with_clock(clock.clone()); // 1s retention
 
         // Record a nonce
         let is_new = store.check_and_record("expiring-nonce").await.unwrap();
         assert!(is_new);
 
-        // Wait for expiration
-        sleep(Duration::from_secs(2)).await;
+        // Advance past the retention window (was a real 2s sleep).
+        clock.advance(Duration::seconds(2));
 
         // Cleanup expired nonces
         let removed = store.cleanup_expired().await.unwrap();
         assert_eq!(removed, 1);
 
-        // Nonce can be reused after expiration (though shouldn't happen with UUIDs)
+        // Nonce can be reused after expiration (though shouldn't happen with unique UUIDs)
         let is_new_again = store.check_and_record("expiring-nonce").await.unwrap();
         assert!(is_new_again);
     }
@@ -184,18 +215,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_removes_only_expired() {
-        // 4-second retention. Spacing nonce-1 and nonce-2 by 3 seconds
-        // and waiting another 2 seconds before cleanup leaves nonce-1 at
-        // age ~5s (expired) and nonce-2 at age ~2s (well under retention).
-        // The previous values (2s retention, 0.5s gap, 2s wait) put both
-        // nonces past the boundary on slower CI machines.
-        let store = NonceStore::with_retention(4);
+        // 4s retention. nonce-1 recorded at t0, nonce-2 at t0+3s, cleanup at
+        // t0+5s: nonce-1 age 5s (expired), nonce-2 age 2s (kept). With the
+        // MockClock these ages are exact — the old real-sleep version could
+        // dilate its 2s wait past the 4s boundary under load and wrongly
+        // remove nonce-2 too (the #266 follow-up this closes).
+        let clock = Arc::new(MockClock::new(anchor()));
+        let store = NonceStore::with_retention(4).with_clock(clock.clone());
 
         store.check_and_record("nonce-1").await.unwrap();
-        sleep(Duration::from_secs(3)).await;
+        clock.advance(Duration::seconds(3));
         store.check_and_record("nonce-2").await.unwrap();
 
-        sleep(Duration::from_secs(2)).await;
+        clock.advance(Duration::seconds(2));
 
         let removed = store.cleanup_expired().await.unwrap();
         assert_eq!(removed, 1);
