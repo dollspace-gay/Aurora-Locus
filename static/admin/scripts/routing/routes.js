@@ -73,6 +73,12 @@
     // mode-visible) so self-service works in every moderation mode; the
     // primary entry point is the sidebar-footer "Sessions" link.
     { pattern: 'configuration/sessions', page: 'configSessions', requires: 'moderator' },
+    // Recovery mode status (Arc H / §7.3.2). SuperAdmin; read-only status +
+    // documented env+restart enter/exit procedure (the substrate's recovery
+    // entry is startup-scoped by design — no runtime controls). Under
+    // Configuration so it stays reachable in every moderation mode
+    // (recovery is operationally important even in disabled mode).
+    { pattern: 'configuration/recovery-mode', page: 'configRecoveryMode', requires: 'superadmin' },
 
     // Kryphocron domain (Arc D / 0.9.1) — the four domain pages (§6.4) plus
     // the Laquna rotation-history sub-page (§6.4.2.1). Bare `kryphocron`
@@ -154,6 +160,7 @@
         { label: 'General', route: 'configuration/general', icon: 'settings', requires: 'admin' },
         { label: 'Themes', route: 'configuration/themes', icon: 'monitor', requires: 'admin' },
         { label: 'UI & modes', route: 'configuration/ui-modes', icon: 'sliders' },
+        { label: 'Recovery mode', route: 'configuration/recovery-mode', icon: 'life-buoy', requires: 'superadmin' },
         { label: 'Federation policy', route: 'configuration/federation-policy', icon: 'network', requires: 'superadmin' },
         { label: 'Registration policy', route: 'configuration/registration-policy', icon: 'inbox', requires: 'superadmin' },
         { label: 'Moderation policy', route: 'configuration/moderation-policy', icon: 'shield-check', requires: 'superadmin' },
