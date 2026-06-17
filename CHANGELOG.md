@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- refresh-token rotation-on-use (#272): each refresh rotates the refresh-token id (current/prev_refresh_id) within a STABLE operator session; compare-and-swap makes concurrent refreshes first-wins; the immediately-prior token is honoured for a 60s grace (dropped-response retry); past grace it is dead. Adds refresh_rotated_at column (migrations 0015/0016)
 - piece 1: operator_session table + OperatorSessionStore substrate; create-at-login + sid claim + per-request lookup/touch/revocation-check in admin_auth_from_token (#271)
 - NonceStore Clock-injection sweep (#266 follow-up): adopt identity::clock::Clock so TTL/expiry is test-injectable; convert sleep-based nonce tests to MockClock (#269)
 - UX-policy decision (#254): toast stays canonical for save/action success; failures stay inline (AuroraInlineError). The errors-inline/successes-toast asymmetry is intentional — recorded in §8.2.4. Audit-only, no code change.
