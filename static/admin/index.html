@@ -12,6 +12,7 @@
        static substrate so a theme's :root tokens override the baseline. -->
   <link id="theme-tokens" rel="stylesheet" href="/theme/active.css">
   <link id="theme-effects" rel="stylesheet" href="/theme/active-effects.css">
+  <link id="theme-extensions" rel="stylesheet" href="/theme/active-extensions.css">
   <link rel="stylesheet" href="/admin/styles/base.css">
   <link rel="stylesheet" href="/admin/styles/components.css">
   <link rel="stylesheet" href="/admin/styles/pages.css">
@@ -45,6 +46,9 @@
   <script src="/admin/scripts/lib/a11y.js"></script>
   <script src="/admin/scripts/lib/roles.js"></script>
   <script src="/admin/scripts/state/session.js"></script>
+  <!-- theme-runtime before settings: settings.applyTheme() drives the runtime's
+       cache at boot, so the runtime global must already be defined (#285). -->
+  <script src="/admin/scripts/state/theme-runtime.js"></script>
   <script src="/admin/scripts/state/settings.js"></script>
 
   <!-- API substrate -->

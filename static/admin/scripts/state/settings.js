@@ -63,10 +63,17 @@
   function applyTheme(pref) {
     const tokensLink = document.getElementById('theme-tokens');
     const effectsLink = document.getElementById('theme-effects');
+    const extensionsLink = document.getElementById('theme-extensions');
     if (tokensLink) tokensLink.setAttribute('href', themeHref('/theme/active.css', pref));
     if (effectsLink) effectsLink.setAttribute('href', themeHref('/theme/active-effects.css', pref));
+    if (extensionsLink) extensionsLink.setAttribute('href', themeHref('/theme/active-extensions.css', pref));
     // data-theme carries the resolved id for any [data-theme="…"]-scoped hooks.
     document.documentElement.setAttribute('data-theme', resolvedThemeId());
+    // Refresh the extension-point runtime cache to match the now-active theme
+    // (§11.7 / #285) so themeProvidesExtension() reflects the switch. Fail-soft.
+    if (global.AuroraThemeRuntime) {
+      try { global.AuroraThemeRuntime.reload(pref); } catch (e) { /* non-fatal */ }
+    }
   }
 
   function getDeploymentDefault() {

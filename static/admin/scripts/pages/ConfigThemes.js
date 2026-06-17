@@ -75,11 +75,18 @@
     } else {
       actions = '<p class="settings-help">SuperAdmin sets the deployment default.</p>';
     }
+    // §11.7.3 discovery — surface what extension points the theme adds beyond
+    // the baseline, so operators (and surface authors) can see them (#285).
+    const points = Array.isArray(t.providedExtensionPoints) ? t.providedExtensionPoints : [];
+    const extensions = points.length
+      ? '<p class="settings-help">Extension points: ' + points.map(esc).join(', ') + '</p>'
+      : '';
     return '<div class="settings-card theme-card">'
       + '<h3>' + esc(t.themeName || t.themeId) + ' ' + status + defaultBadge + '</h3>'
       + '<p class="settings-help">' + meta + '</p>'
       + (t.themeDescription ? '<p>' + esc(t.themeDescription) + '</p>' : '')
       + (t.themeAuthor ? '<p class="settings-help">by ' + esc(t.themeAuthor) + '</p>' : '')
+      + extensions
       + '<div class="theme-card-actions">' + actions + '</div>'
       + '</div>';
   }
