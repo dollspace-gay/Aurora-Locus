@@ -850,6 +850,28 @@ input[type="checkbox"][disabled] {
   color: var(--color-text-inverted);
 }
 
+/* ==================== Source-tier indicator (§8.2.1) ==================== */
+/* The AuroraSourceTier.badge() chip on settings cards — a muted annotation of
+ * where a setting's value comes from (Default / File / Recovery override;
+ * Runtime renders no badge). Token-only colors per §10.4.4. */
+.source-tier {
+  display: inline-block;
+  margin-left: var(--space-2);
+  padding: 0.0625rem 0.4rem;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-tertiary);
+  color: var(--color-text-tertiary);
+  border: 1px solid var(--color-border-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-normal);
+  vertical-align: middle;
+}
+.source-tier-recoverymode {
+  background: color-mix(in srgb, var(--color-status-warning) 14%, transparent);
+  color: var(--color-status-warning);
+  border-color: color-mix(in srgb, var(--color-status-warning) 40%, transparent);
+}
+
 /* ==================== Real-time indicator (§6.19) ==================== */
 
 .rt-indicator {

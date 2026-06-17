@@ -52,7 +52,8 @@
   function liveCard(opts) {
     return (
       '<div class="settings-card" data-card="' + esc(opts.key) + '">' +
-      '  <h3>' + esc(opts.title) + '</h3>' +
+      '  <h3>' + esc(opts.title) +
+          (opts.source ? ' ' + global.AuroraSourceTier.badge(opts.source) : '') + '</h3>' +
       '  <p class="settings-help">' + esc(opts.help) + '</p>' +
       '  <div class="form-row">' +
       '    <label for="' + esc(opts.selectId) + '">' + esc(opts.label) + '</label>' +
@@ -76,16 +77,20 @@
     );
   }
 
-  // Resolve a runtime setting to its string value, tolerating the
-  // {value, source} shape and a bare value; falls back to `dflt`.
+  // Resolve a runtime setting to its { value, source } pair (§8.2.1 — the
+  // source tier drives the per-card indicator), tolerating the {value, source}
+  // shape and a bare value; falls back to `dflt` at the Default tier.
   async function readSetting(key, dflt) {
     try {
       const out = await global.AuroraEndpoints.admin.getRuntimeSetting(key);
       const v = out && (out.value !== undefined ? out.value : out);
-      if (v === undefined || v === null || v === '') return dflt;
-      return String(v);
+      const source = out && out.source;
+      if (v === undefined || v === null || v === '') {
+        return { value: dflt, source: source || 'Default' };
+      }
+      return { value: String(v), source: source || 'Runtime' };
     } catch (e) {
-      return dflt;
+      return { value: dflt, source: 'Default' };
     }
   }
 
@@ -150,7 +155,7 @@
         title: t('kryphocron.policy.access_title'),
         help: t('kryphocron.policy.access_help'),
         label: t('kryphocron.policy.access_label'),
-        current: access,
+        current: access.value, source: access.source,
         options: [
           { value: 'immediate', label: t('kryphocron.policy.access_immediate') },
           { value: 'delayed', label: t('kryphocron.policy.access_delayed') },
@@ -160,7 +165,7 @@
           '<div class="form-row"><label for="kp-access-delay">' +
           esc(t('kryphocron.policy.access_delay_label')) + '</label>' +
           '<input type="number" id="kp-access-delay" class="form-input" min="1" value="' +
-          esc(delay) + '"></div>',
+          esc(delay.value) + '"></div>',
       }) +
 
       liveCard({
@@ -168,7 +173,7 @@
         title: t('kryphocron.policy.default_audience_title'),
         help: t('kryphocron.policy.default_audience_help'),
         label: t('kryphocron.policy.default_audience_label'),
-        current: defAud,
+        current: defAud.value, source: defAud.source,
         options: [
           { value: 'nobody', label: t('kryphocron.audiences.mode_nobody') },
           { value: 'list', label: t('kryphocron.audiences.mode_list') },
@@ -183,7 +188,7 @@
         title: t('kryphocron.policy.cadence_title'),
         help: t('kryphocron.policy.cadence_help'),
         label: t('kryphocron.policy.cadence_label'),
-        current: cadence,
+        current: cadence.value, source: cadence.source,
         options: [
           { value: 'hourly', label: t('kryphocron.laquna.cadence_hourly') },
           { value: 'daily', label: t('kryphocron.laquna.cadence_daily') },
@@ -197,7 +202,7 @@
             { value: 'weekly-to-daily', label: t('kryphocron.policy.range_weekly_daily') },
             { value: 'weekly-to-hourly', label: t('kryphocron.policy.range_weekly_hourly') },
             { value: 'no-override', label: t('kryphocron.policy.range_none') },
-          ], range) +
+          ], range.value) +
           '<button class="btn btn-secondary" data-save="' + esc(KEY_CADENCE_RANGE) +
           '" data-select="kp-range">' + esc(t('kryphocron.policy.save_range')) + '</button></div>',
       }) +
@@ -207,7 +212,7 @@
         title: t('kryphocron.policy.shape_title'),
         help: t('kryphocron.policy.shape_help'),
         label: t('kryphocron.policy.shape_label'),
-        current: shape,
+        current: shape.value, source: shape.source,
         options: [
           { value: 'single-process', label: t('kryphocron.policy.shape_single') },
           { value: 'multi-process', label: t('kryphocron.policy.shape_multi') },
@@ -253,6 +258,8 @@
           ? { action: { label: t('settings.roles.view_audit'), href: '#mod/audit/' + encodeURIComponent(lastAudit) } }
           : undefined,
       );
+      // Refresh so the saved card's source-tier badge flips Default → Runtime (§8.2.1).
+      await load(container);
     } catch (e) {
       global.AuroraToast.danger(t('common.error', { message: (e && e.message) || '' }));
     }
