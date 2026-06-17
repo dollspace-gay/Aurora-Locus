@@ -16,7 +16,8 @@
       '  <h3>Controls</h3>' +
       '  <button class="btn-secondary" id="rl-cleanup">Cleanup state</button>' +
       '</div>';
-    document.getElementById('rl-cleanup').addEventListener('click', async () => {
+    document.getElementById('rl-cleanup').addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
       const result = await global.AuroraModal.form({
         heading: 'Clean up rate-limit state?',
         body: 'Remove expired rate-limit entries.',
@@ -25,7 +26,7 @@
       });
       if (!result.submitted) return;
       try {
-        await global.AuroraEndpoints.ops.cleanupRateLimitState();
+        await global.AuroraSpinner.busy(btn, () => global.AuroraEndpoints.ops.cleanupRateLimitState());
         global.AuroraToast.success('Rate-limit state cleaned.');
         await refresh();
       } catch (e) {

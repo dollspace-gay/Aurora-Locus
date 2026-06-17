@@ -17,7 +17,7 @@
       '  <h3>Controls</h3>' +
       '  <button class="btn-secondary" id="fed-discover">Trigger discovery</button>' +
       '</div>';
-    document.getElementById('fed-discover').addEventListener('click', triggerDiscovery);
+    document.getElementById('fed-discover').addEventListener('click', (e) => triggerDiscovery(e.currentTarget));
     await refresh();
     pollHandle = setInterval(refresh, 60_000);
     return { unmount: () => { if (pollHandle) clearInterval(pollHandle); pollHandle = null; } };
@@ -63,9 +63,9 @@
     }
   }
 
-  async function triggerDiscovery() {
+  async function triggerDiscovery(btn) {
     try {
-      await global.AuroraEndpoints.ops.triggerPdsDiscovery();
+      await global.AuroraSpinner.busy(btn, () => global.AuroraEndpoints.ops.triggerPdsDiscovery());
       global.AuroraToast.success('Discovery triggered.');
       await refresh();
     } catch (e) {

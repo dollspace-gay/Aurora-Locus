@@ -7,6 +7,12 @@
 //       size:  pixel diameter (default 16). label: accessible label
 //       (default localized "Loading…"); rendered as aria-label + visually-
 //       hidden text so screen readers announce the in-flight state.
+//   AuroraSpinner.busy(buttonEl, asyncFn)  → Promise (asyncFn's result)
+//       Runs asyncFn while the button is disabled and shows an inline spinner
+//       beside its label; ALWAYS restores the button (label + disabled state)
+//       in a finally, even on error. The action runs regardless of spinner
+//       rendering, so this is purely additive in-flight feedback — it can't
+//       change whether the action succeeds.
 
 (function (global) {
   'use strict';
@@ -27,5 +33,20 @@
     );
   }
 
-  global.AuroraSpinner = { render: render };
+  function busy(btn, asyncFn) {
+    if (typeof asyncFn !== 'function') return Promise.resolve();
+    if (!btn) return Promise.resolve().then(asyncFn);
+    const prevHtml = btn.innerHTML;
+    const prevDisabled = btn.disabled;
+    btn.disabled = true;
+    btn.innerHTML = render({ size: 13 }) + ' ' + prevHtml;
+    return Promise.resolve()
+      .then(asyncFn)
+      .finally(function () {
+        btn.innerHTML = prevHtml;
+        btn.disabled = prevDisabled;
+      });
+  }
+
+  global.AuroraSpinner = { render: render, busy: busy };
 })(window);

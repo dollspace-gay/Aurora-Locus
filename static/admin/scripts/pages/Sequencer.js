@@ -21,10 +21,10 @@
       '</div>' +
       '<div class="ops-section" id="seq-recent"><h3>Recent events</h3>' + global.AuroraSkeleton.lines(3) + '</div>';
 
-    document.getElementById('seq-pause').addEventListener('click', () => doAction('pauseSequencer', 'Pause sequencer?'));
-    document.getElementById('seq-resume').addEventListener('click', () => doAction('resumeSequencer', 'Resume sequencer?'));
-    document.getElementById('seq-reset').addEventListener('click', () => doAction('resetSequencerCursor', 'Reset sequencer cursor? This is high-impact.'));
-    document.getElementById('seq-rebuild').addEventListener('click', () => doAction('rebuildSequencer', 'Rebuild the entire sequencer? This is very high-impact.'));
+    document.getElementById('seq-pause').addEventListener('click', (e) => doAction('pauseSequencer', 'Pause sequencer?', e.currentTarget));
+    document.getElementById('seq-resume').addEventListener('click', (e) => doAction('resumeSequencer', 'Resume sequencer?', e.currentTarget));
+    document.getElementById('seq-reset').addEventListener('click', (e) => doAction('resetSequencerCursor', 'Reset sequencer cursor? This is high-impact.', e.currentTarget));
+    document.getElementById('seq-rebuild').addEventListener('click', (e) => doAction('rebuildSequencer', 'Rebuild the entire sequencer? This is very high-impact.', e.currentTarget));
 
     await refresh();
     pollHandle = setInterval(refresh, 30_000);
@@ -68,7 +68,7 @@
     }
   }
 
-  async function doAction(nsidLeaf, prompt) {
+  async function doAction(nsidLeaf, prompt, btn) {
     // Per V04_DESIGN §5.3.3's Sequencer decision: sequencer ops are
     // almost universally destructive (cursor adjustments, event
     // replay, restart), so the dispatcher uses destructiveConfirm
@@ -82,7 +82,7 @@
     });
     if (!result.confirmed) return;
     try {
-      await global.AuroraEndpoints.ops[nsidLeaf]();
+      await global.AuroraSpinner.busy(btn, () => global.AuroraEndpoints.ops[nsidLeaf]());
       global.AuroraToast.success('Action complete: ' + nsidLeaf);
       await refresh();
     } catch (e) {

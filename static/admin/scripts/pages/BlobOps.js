@@ -16,7 +16,7 @@
       '  <h3>Controls</h3>' +
       '  <button class="btn-secondary" id="bo-gc">Run GC</button>' +
       '</div>';
-    document.getElementById('bo-gc').addEventListener('click', runGC);
+    document.getElementById('bo-gc').addEventListener('click', (e) => runGC(e.currentTarget));
     await refresh();
     pollHandle = setInterval(refresh, 60_000);
     return { unmount: () => { if (pollHandle) clearInterval(pollHandle); pollHandle = null; } };
@@ -60,7 +60,7 @@
     }
   }
 
-  async function runGC() {
+  async function runGC(btn) {
     const result = await global.AuroraModal.form({
       heading: 'Run blob garbage collection?',
       body: 'This may take a few minutes. The operation is safe to interrupt.',
@@ -69,7 +69,7 @@
     });
     if (!result.submitted) return;
     try {
-      await global.AuroraEndpoints.ops.runBlobGC();
+      await global.AuroraSpinner.busy(btn, () => global.AuroraEndpoints.ops.runBlobGC());
       global.AuroraToast.success('Blob GC started.');
       await refresh();
     } catch (e) {
