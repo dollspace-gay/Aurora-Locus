@@ -226,43 +226,23 @@
   async function save(key, selectId, container) {
     const el = document.getElementById(selectId);
     if (!el) return;
-    let value = el.value;
-    // The access-policy card also persists the delay-days companion field.
-    const res = await global.AuroraModal.destructiveConfirm({
-      heading: t('kryphocron.policy.save_heading'),
-      body: t('kryphocron.policy.save_body', { key: key, value: value }),
-      rationaleRequired: true,
-      confirmLabel: t('common.save'),
-    });
-    if (!res.confirmed) return;
-    try {
-      let lastAudit = null;
-      const out = await global.AuroraEndpoints.admin.setRuntimeSetting({
-        key: key, value: value, rationale: res.rationale || '',
-      });
-      if (out && out.auditEntryId) lastAudit = out.auditEntryId;
-      // Persist the delay-days companion when saving the access policy.
-      if (key === KEY_ACCESS) {
-        const delayEl = document.getElementById('kp-access-delay');
-        if (delayEl && delayEl.value) {
-          const d = await global.AuroraEndpoints.admin.setRuntimeSetting({
-            key: KEY_ACCESS_DELAY, value: parseInt(delayEl.value, 10) || 7,
-            rationale: res.rationale || '',
-          });
-          if (d && d.auditEntryId) lastAudit = d.auditEntryId;
-        }
+    // One rationale covers the card's setting(s); the access-policy card also
+    // persists its delay-days companion under the same audited save.
+    const settings = [{ key: key, value: el.value }];
+    if (key === KEY_ACCESS) {
+      const delayEl = document.getElementById('kp-access-delay');
+      if (delayEl && delayEl.value) {
+        settings.push({ key: KEY_ACCESS_DELAY, value: parseInt(delayEl.value, 10) || 7 });
       }
-      global.AuroraToast.success(
-        t('kryphocron.policy.save_success'),
-        lastAudit
-          ? { action: { label: t('settings.roles.view_audit'), href: '#mod/audit/' + encodeURIComponent(lastAudit) } }
-          : undefined,
-      );
-      // Refresh so the saved card's source-tier badge flips Default → Runtime (§8.2.1).
-      await load(container);
-    } catch (e) {
-      global.AuroraToast.danger(t('common.error', { message: (e && e.message) || '' }));
     }
+    const r = await global.AuroraAuditedSave.run({
+      heading: t('kryphocron.policy.save_heading'),
+      body: t('kryphocron.policy.save_body', { key: key, value: el.value }),
+      settings: settings,
+      successMessage: t('kryphocron.policy.save_success'),
+    });
+    // Refresh so the saved card's source-tier badge flips Default → Runtime (§8.2.1).
+    if (r.saved) await load(container);
   }
 
   if (global.AuroraRouter) {

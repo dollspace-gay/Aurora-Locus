@@ -245,29 +245,15 @@
   async function saveCadence() {
     const cadence = document.getElementById('lq-cadence-sel');
     const range = document.getElementById('lq-range-sel');
-    const res = await global.AuroraModal.destructiveConfirm({
+    await global.AuroraAuditedSave.run({
       heading: t('kryphocron.laquna.cadence_save_heading'),
       body: t('kryphocron.laquna.cadence_save_body'),
-      rationaleRequired: true,
-      confirmLabel: t('common.save'),
+      settings: [
+        { key: KEY_CADENCE, value: cadence.value },
+        { key: KEY_RANGE, value: range.value },
+      ],
+      successMessage: t('kryphocron.laquna.cadence_saved'),
     });
-    if (!res.confirmed) return;
-    try {
-      let lastAudit = null;
-      const a = await global.AuroraEndpoints.admin.setRuntimeSetting({
-        key: KEY_CADENCE, value: cadence.value, rationale: res.rationale || '',
-      });
-      if (a && a.auditEntryId) lastAudit = a.auditEntryId;
-      const b = await global.AuroraEndpoints.admin.setRuntimeSetting({
-        key: KEY_RANGE, value: range.value, rationale: res.rationale || '',
-      });
-      if (b && b.auditEntryId) lastAudit = b.auditEntryId;
-      global.AuroraToast.success(t('kryphocron.laquna.cadence_saved'),
-        lastAudit ? { action: { label: t('settings.roles.view_audit'),
-          href: '#mod/audit/' + encodeURIComponent(lastAudit) } } : undefined);
-    } catch (e) {
-      global.AuroraToast.danger(t('common.error', { message: (e && e.message) || '' }));
-    }
   }
 
   if (global.AuroraRouter) {

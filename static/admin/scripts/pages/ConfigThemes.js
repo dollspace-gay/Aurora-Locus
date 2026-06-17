@@ -105,27 +105,14 @@
   }
 
   async function setDefault(themeId, isSuper) {
-    const res = await global.AuroraModal.destructiveConfirm({
+    const r = await global.AuroraAuditedSave.run({
       heading: 'Set deployment-default theme',
       body: 'Make "' + themeId + '" the deployment-default theme? Every operator who has not set a personal preference will see it.',
-      rationaleRequired: true,
       confirmLabel: 'Set as default',
+      settings: [{ key: 'theme.deployment-default', value: themeId }],
+      successMessage: 'Deployment-default theme set to ' + themeId + '.',
     });
-    if (!res.confirmed) return;
-    try {
-      const out = await global.AuroraEndpoints.admin.setRuntimeSetting({
-        key: 'theme.deployment-default',
-        value: themeId,
-        rationale: res.rationale || '',
-      });
-      const auditEntryId = out && out.auditEntryId;
-      global.AuroraToast.success('Deployment-default theme set to ' + themeId + '.', auditEntryId ? {
-        action: { label: 'View audit entry', href: '#mod/audit/' + encodeURIComponent(auditEntryId) },
-      } : undefined);
-      await load(isSuper);
-    } catch (e) {
-      global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));
-    }
+    if (r.saved) await load(isSuper);
   }
 
   if (global.AuroraRouter) global.AuroraRouter.register('configThemes', { mount: mount });
