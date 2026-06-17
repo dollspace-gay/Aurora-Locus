@@ -84,8 +84,11 @@
     let s;
     try { s = await global.AuroraEndpoints.ops.kryphocron.getTierStats(); }
     catch (e) {
-      grid.innerHTML = '<div class="settings-card"><div class="banner banner-error" role="alert">' +
-        esc(t('common.error', { message: (e && e.message) || '' })) + '</div></div>';
+      grid.innerHTML = '<div class="settings-card" id="kt-err"></div>';
+      global.AuroraInlineError.mount(document.getElementById('kt-err'), {
+        message: t('common.error', { message: (e && e.message) || '' }),
+        onRetry: refresh,
+      });
       return;
     }
     const nsids = (s && s.nsids) || [];

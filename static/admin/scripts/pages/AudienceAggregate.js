@@ -46,8 +46,11 @@
     let a;
     try { a = await global.AuroraEndpoints.ops.kryphocron.getAudienceAggregate(); }
     catch (e) {
-      grid.innerHTML = '<div class="settings-card"><div class="banner banner-error" role="alert">' +
-        esc(t('common.error', { message: (e && e.message) || '' })) + '</div></div>';
+      grid.innerHTML = '<div class="settings-card" id="ka-err"></div>';
+      global.AuroraInlineError.mount(document.getElementById('ka-err'), {
+        message: t('common.error', { message: (e && e.message) || '' }),
+        onRetry: refresh,
+      });
       return;
     }
 

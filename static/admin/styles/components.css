@@ -872,6 +872,39 @@ input[type="checkbox"][disabled] {
   border-color: color-mix(in srgb, var(--color-status-warning) 40%, transparent);
 }
 
+/* ==================== Error primitives (§8.2.4) ==================== */
+/* AuroraInlineError — contextual error + retry, in place. Token-only colors. */
+.inline-error {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-status-danger) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-status-danger) 35%, transparent);
+  color: var(--color-text-primary);
+}
+.inline-error-icon { color: var(--color-status-danger); display: inline-flex; }
+.inline-error-msg { flex: 1; }
+.inline-error-retry { flex: none; }
+
+/* AuroraErrorBoundary — render-blocking fallback; takes over the region. */
+.error-boundary {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--space-2);
+  padding: var(--space-8) var(--space-6);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-border-secondary);
+}
+.error-boundary-icon { color: var(--color-status-danger); }
+.error-boundary-title { margin: 0; }
+.error-boundary-msg { color: var(--color-text-secondary); margin: 0; }
+.error-boundary-detail { margin-top: var(--space-2); max-width: 100%; overflow-x: auto; }
+
 /* ==================== Real-time indicator (§6.19) ==================== */
 
 .rt-indicator {

@@ -199,9 +199,11 @@
     return '<div class="stat"><div class="stat-value">' + esc(String(n == null ? '—' : n)) +
       '</div><div class="stat-label">' + esc(label) + '</div></div>';
   }
+  // Per-card error (§8.2.4 inline tier). No explicit retry button — the page
+  // polls every 30s, so a transient card error self-heals on the next cycle.
   function errorCard(title, e) {
-    return '<h3>' + esc(title) + '</h3><div class="banner banner-error" role="alert">' +
-      esc(t('common.error', { message: (e && e.message) || '' })) + '</div>';
+    return '<h3>' + esc(title) + '</h3>' +
+      global.AuroraInlineError.render({ message: t('common.error', { message: (e && e.message) || '' }) });
   }
   // §10.4.3 — canonical timestamp rendering via the AuroraTimestamp primitive
   // (returns a <time> element; do not wrap in esc()).

@@ -36,39 +36,45 @@
       '  <div class="settings-card"><p>' + esc(t('common.loading')) + '</p></div>' +
       '</div>';
 
+    await load(container);
+    return {};
+  }
+
+  // Fetch + render the two tracks; the inline-error retry re-runs this (§8.2.4).
+  async function load(container) {
+    const grid = container.querySelector('#lh-grid');
     let rotations = [];
     try {
       const out = await global.AuroraEndpoints.ops.kryphocron.listRotations();
       rotations = (out && out.rotations) || [];
     } catch (e) {
-      const grid = container.querySelector('#lh-grid');
-      if (grid) grid.innerHTML = '<div class="settings-card"><div class="banner banner-error" ' +
-        'role="alert">' + esc(t('common.error', { message: (e && e.message) || '' })) + '</div></div>';
-      return {};
+      if (grid) {
+        global.AuroraInlineError.mount(grid, {
+          message: t('common.error', { message: (e && e.message) || '' }),
+          onRetry: function () { load(container); },
+        });
+      }
+      return;
     }
 
     const operator = rotations.filter((r) => r.kind === 'operator-triggered');
     const organic = rotations.filter((r) => r.kind === 'cadence-organic');
-
-    const grid = container.querySelector('#lh-grid');
-    if (grid) {
-      grid.innerHTML =
-        '<div class="settings-card">' +
-        '  <h3>' + esc(t('kryphocron.history.operator_title')) + '</h3>' +
-        '  <p class="settings-help">' + esc(t('kryphocron.history.operator_subtitle')) + '</p>' +
-        (operator.length ? operatorTable(operator)
-          : '<div class="empty-state" role="status"><p>' +
-            esc(t('kryphocron.history.operator_empty')) + '</p></div>') +
-        '</div>' +
-        '<div class="settings-card">' +
-        '  <h3>' + esc(t('kryphocron.history.organic_title')) + '</h3>' +
-        '  <p class="settings-help">' + esc(t('kryphocron.history.organic_subtitle')) + '</p>' +
-        (organic.length ? organicList(organic)
-          : '<div class="empty-state" role="status"><p>' +
-            esc(t('kryphocron.history.organic_pending')) + '</p></div>') +
-        '</div>';
-    }
-    return {};
+    if (!grid) return;
+    grid.innerHTML =
+      '<div class="settings-card">' +
+      '  <h3>' + esc(t('kryphocron.history.operator_title')) + '</h3>' +
+      '  <p class="settings-help">' + esc(t('kryphocron.history.operator_subtitle')) + '</p>' +
+      (operator.length ? operatorTable(operator)
+        : '<div class="empty-state" role="status"><p>' +
+          esc(t('kryphocron.history.operator_empty')) + '</p></div>') +
+      '</div>' +
+      '<div class="settings-card">' +
+      '  <h3>' + esc(t('kryphocron.history.organic_title')) + '</h3>' +
+      '  <p class="settings-help">' + esc(t('kryphocron.history.organic_subtitle')) + '</p>' +
+      (organic.length ? organicList(organic)
+        : '<div class="empty-state" role="status"><p>' +
+          esc(t('kryphocron.history.organic_pending')) + '</p></div>') +
+      '</div>';
   }
 
   function operatorTable(rows) {

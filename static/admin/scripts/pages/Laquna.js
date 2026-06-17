@@ -74,8 +74,11 @@
     try { r = await K().getRotationStatus(); }
     catch (e) {
       stateCard.innerHTML = '<h3>' + esc(t('kryphocron.laquna.state_title')) + '</h3>' +
-        '<div class="banner banner-error" role="alert">' +
-        esc(t('common.error', { message: (e && e.message) || '' })) + '</div>';
+        '<div id="lq-state-err"></div>';
+      global.AuroraInlineError.mount(stateCard.querySelector('#lq-state-err'), {
+        message: t('common.error', { message: (e && e.message) || '' }),
+        onRetry: renderState,
+      });
       return;
     }
     stateCard.innerHTML =
