@@ -65,8 +65,12 @@
         : await ep.atproto.listAccounts({ limit: 100 });
       accounts = (data && (data.accounts || data.users)) || [];
     } catch (e) {
-      tbody.innerHTML = '<tr><td colspan="7"><p class="empty-state">Failed to load accounts: ' +
-                       (e && e.message ? e.message : 'unknown') + '</p></td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7"><div data-accounts-error></div></td></tr>';
+      const cell = tbody.querySelector('[data-accounts-error]');
+      global.AuroraErrorBoundary.mount(cell, {
+        message: 'Failed to load accounts: ' + ((e && e.message) || 'unknown'),
+        onRetry: refresh,
+      });
       return;
     }
 

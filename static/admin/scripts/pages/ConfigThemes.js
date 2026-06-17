@@ -35,7 +35,10 @@
       const data = await global.AuroraEndpoints.ops.listInstalledThemes();
       themes = (data && Array.isArray(data.themes)) ? data.themes : [];
     } catch (e) {
-      grid.innerHTML = '<p>Could not load themes: ' + esc(e && e.message ? e.message : 'request failed') + '</p>';
+      global.AuroraErrorBoundary.mount(grid, {
+        message: 'Could not load themes: ' + ((e && e.message) || 'request failed'),
+        onRetry: function () { load(isSuper); },
+      });
       return;
     }
     try {

@@ -121,7 +121,10 @@
       c.innerHTML = html;
       renderPagination();
     } catch (e) {
-      c.innerHTML = '<p class="empty-state">Could not load appeals: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(c, {
+        message: 'Could not load appeals: ' + ((e && e.message) || ''),
+        onRetry: function () { refresh(cursor); },
+      });
     }
   }
 

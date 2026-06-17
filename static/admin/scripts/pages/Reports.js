@@ -136,7 +136,10 @@
       renderBulkBar();
       renderPagination();
     } catch (e) {
-      c.innerHTML = '<p class="empty-state">Could not load reports: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(c, {
+        message: 'Could not load reports: ' + ((e && e.message) || ''),
+        onRetry: function () { refresh(cursor); },
+      });
     }
   }
 

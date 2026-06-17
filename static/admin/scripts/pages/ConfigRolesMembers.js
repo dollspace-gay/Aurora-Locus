@@ -108,7 +108,14 @@
         });
       }
     } catch (e) {
-      if (tbody) tbody.innerHTML = '<tr><td colspan="5"><p class="empty-state">' + esc(T('settings.roles.could_not_load_members', { message: (e && e.message) || '' })) + '</p></td></tr>';
+      if (tbody) {
+        tbody.innerHTML = '<tr><td colspan="5"><div data-members-error></div></td></tr>';
+        const cell = tbody.querySelector('[data-members-error]');
+        global.AuroraInlineError.mount(cell, {
+          message: T('settings.roles.could_not_load_members', { message: (e && e.message) || '' }),
+          onRetry: function () { refresh(role, isSuper); },
+        });
+      }
     }
   }
 

@@ -138,7 +138,10 @@
       c.innerHTML = html;
       renderPagination();
     } catch (e) {
-      c.innerHTML = '<p class="empty-state">Could not load audit: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(c, {
+        message: 'Could not load audit: ' + ((e && e.message) || ''),
+        onRetry: function () { refresh(cursor); },
+      });
     }
   }
 

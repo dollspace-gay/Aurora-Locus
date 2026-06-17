@@ -77,7 +77,10 @@
       });
       renderBulkBar();
     } catch (e) {
-      c.innerHTML = '<p class="empty-state">Could not load queue: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(c, {
+        message: 'Could not load queue: ' + ((e && e.message) || ''),
+        onRetry: refresh,
+      });
     }
   }
 

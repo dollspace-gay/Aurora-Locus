@@ -41,14 +41,23 @@
       '<nav class="breadcrumb"><a href="#configuration/roles">' + esc(T('settings.roles.crumb')) + '</a> <span class="breadcrumb-sep">›</span> ' + esc(T('settings.roles.title')) + '</nav>' +
       '<header class="page-header"><div><h2>' + esc(T('settings.roles.title')) + '</h2><p class="page-subtitle">' + esc(T('settings.roles.subtitle')) + '</p></div></header>' +
       '<div id="roles-list">' + global.AuroraSkeleton.lines(4) + '</div>';
+    await loadRoles(isSuper);
+    return {};
+  }
+
+  async function loadRoles(isSuper) {
+    const list = document.getElementById('roles-list');
+    if (!list) return;
+    list.innerHTML = global.AuroraSkeleton.lines(4);
     try {
       const data = await global.AuroraEndpoints.atproto.listRoles();
       renderRoles(groupRoles(data), isSuper);
     } catch (e) {
-      document.getElementById('roles-list').innerHTML =
-        '<p class="empty-state">' + esc(T('settings.roles.could_not_load', { message: (e && e.message) || '' })) + '</p>';
+      global.AuroraErrorBoundary.mount(list, {
+        message: T('settings.roles.could_not_load', { message: (e && e.message) || '' }),
+        onRetry: function () { loadRoles(isSuper); },
+      });
     }
-    return {};
   }
 
   // The com.atproto.admin.listRoles handler returns a flat array of

@@ -64,8 +64,10 @@
       }
     } catch (e) {
       const primary = document.getElementById('ad-primary');
-      if (primary) primary.innerHTML = '<p class="empty-state">Could not load account: ' +
-                                       (e && e.message ? esc(e.message) : 'unknown') + '</p>';
+      if (primary) global.AuroraErrorBoundary.mount(primary, {
+        message: 'Could not load account: ' + ((e && e.message) || 'unknown'),
+        onRetry: loadAccount,
+      });
       return;
     }
     currentAccount = info || {};
@@ -578,7 +580,11 @@
       const ctx = await global.AuroraEndpoints.moderator.getSubjectContext({ subjectDid: currentDid });
       renderSubjectContext(ctx);
     } catch (e) {
-      setRailBody('subject-context', '<p class="empty-state">Could not load context.</p>');
+      const body = railBodyEl('subject-context');
+      if (body) global.AuroraInlineError.mount(body, {
+        message: 'Could not load context: ' + ((e && e.message) || ''),
+        onRetry: loadSubjectContext,
+      });
     }
   }
 
@@ -621,7 +627,10 @@
         (it.id != null ? ' · ' + (global.AuroraEntityRef ? global.AuroraEntityRef.event(it.id) : '#' + esc(it.id)) : '') +
         '</li>').join('') + '</ul>';
     } catch (e) {
-      host.innerHTML = '<p class="empty-state">Could not load history.</p>';
+      global.AuroraInlineError.mount(host, {
+        message: 'Could not load history: ' + ((e && e.message) || ''),
+        onRetry: loadSubjectHistory,
+      });
     }
   }
 
@@ -642,7 +651,11 @@
           (global.AuroraEntityRef ? global.AuroraEntityRef.record(r.uri) : '<code>' + esc(r.uri) + '</code>') +
           '</li>').join('') + '</ul>');
     } catch (e) {
-      setRailBody('records-authored', '<p class="empty-state">Could not load records.</p>');
+      const body = railBodyEl('records-authored');
+      if (body) global.AuroraInlineError.mount(body, {
+        message: 'Could not load records: ' + ((e && e.message) || ''),
+        onRetry: loadRecords,
+      });
     }
   }
 
@@ -662,7 +675,11 @@
                     (global.AuroraFormat ? global.AuroraFormat.bytes(b.size) : '') + '</span>' : '') +
           '</li>').join('') + '</ul>');
     } catch (e) {
-      setRailBody('blob-inventory', '<p class="empty-state">Could not load blobs.</p>');
+      const body = railBodyEl('blob-inventory');
+      if (body) global.AuroraInlineError.mount(body, {
+        message: 'Could not load blobs: ' + ((e && e.message) || ''),
+        onRetry: loadBlobs,
+      });
     }
   }
 
@@ -681,7 +698,11 @@
           ' <span style="color: var(--color-text-tertiary);">(' + (c.uses || 0) + '/' + (c.available || 1) + ')</span>' +
           '</li>').join('') + '</ul>');
     } catch (e) {
-      setRailBody('invite-lineage', '<p class="empty-state">Could not load invites.</p>');
+      const body = railBodyEl('invite-lineage');
+      if (body) global.AuroraInlineError.mount(body, {
+        message: 'Could not load invites: ' + ((e && e.message) || ''),
+        onRetry: loadInvites,
+      });
     }
   }
 
@@ -707,9 +728,11 @@
         '<p>' + esc(T('accountDetail.roles.role_label', { role: roleName })) + '</p>' +
         '<p><a href="#configuration/roles">' + esc(T('accountDetail.roles.open_mgmt')) + '</a></p>');
     } catch (e) {
-      setRailBody('account-roles',
-        '<p class="empty-state">' + esc(T('accountDetail.roles.error')) +
-        ' <a href="#configuration/roles">' + esc(T('accountDetail.roles.manage')) + '</a></p>');
+      const body = railBodyEl('account-roles');
+      if (body) global.AuroraInlineError.mount(body, {
+        message: T('accountDetail.roles.error'),
+        onRetry: loadRoles,
+      });
     }
   }
 
@@ -721,10 +744,16 @@
   }
 
   function setRailBody(id, html) {
-    const card = document.querySelector('[data-rail-id="' + id + '"]');
-    if (!card) return;
-    const body = card.querySelector('[data-rail-body]');
+    const body = railBodyEl(id);
     if (body) body.innerHTML = html;
+  }
+
+  // Resolve the inner body element of a rail card so error primitives can
+  // mount() onto it (mount() takes a DOM element, not an HTML string).
+  function railBodyEl(id) {
+    const card = document.querySelector('[data-rail-id="' + id + '"]');
+    if (!card) return null;
+    return card.querySelector('[data-rail-body]');
   }
 
   function sectionTitle(t) {

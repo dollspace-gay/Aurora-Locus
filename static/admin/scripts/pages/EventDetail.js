@@ -10,14 +10,23 @@
       '<nav class="breadcrumb"><a href="#mod/events">Moderation</a> <span class="breadcrumb-sep">›</span> <a href="#mod/events">Events</a> <span class="breadcrumb-sep">›</span> #' + esc(id) + '</nav>' +
       '<header class="page-header"><div><h2>Event #' + esc(id) + '</h2></div></header>' +
       '<div id="ed-body">' + global.AuroraSkeleton.lines(4) + '</div>';
+    await loadEvent(id);
+    return {};
+  }
+
+  async function loadEvent(id) {
+    const body = document.getElementById('ed-body');
+    if (!body) return;
+    body.innerHTML = global.AuroraSkeleton.lines(4);
     try {
       const data = await global.AuroraEndpoints.moderator.getEvent(id);
       renderBody(data);
     } catch (e) {
-      document.getElementById('ed-body').innerHTML =
-        '<p class="empty-state">Could not load event: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(body, {
+        message: 'Could not load event: ' + ((e && e.message) || ''),
+        onRetry: function () { loadEvent(id); },
+      });
     }
-    return {};
   }
 
   function renderBody(e) {

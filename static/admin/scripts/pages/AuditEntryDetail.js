@@ -13,22 +13,29 @@
 
     const cached = (window._auditCache || {})[id];
     if (cached) renderBody(cached);
-    else {
-      try {
-        // Server-side getAuditEntry would ideally exist; fall back to
-        // listing first 25 with the id filter and matching client-side.
-        const data = await global.AuroraEndpoints.admin.getAuditTrail({ limit: 100 });
-        const items = (data && data.items) || [];
-        const entry = items.find((e) => String(e.id) === String(id));
-        if (entry) renderBody(entry);
-        else document.getElementById('aed-body').innerHTML =
-          '<p class="empty-state">Entry not in current page. Use Audit page filters to narrow.</p>';
-      } catch (e) {
-        document.getElementById('aed-body').innerHTML =
-          '<p class="empty-state">Could not load entry: ' + esc(e && e.message) + '</p>';
-      }
-    }
+    else await loadEntry(id);
     return {};
+  }
+
+  async function loadEntry(id) {
+    const body = document.getElementById('aed-body');
+    if (!body) return;
+    body.innerHTML = global.AuroraSkeleton.lines(4);
+    try {
+      // Server-side getAuditEntry would ideally exist; fall back to
+      // listing first 25 with the id filter and matching client-side.
+      const data = await global.AuroraEndpoints.admin.getAuditTrail({ limit: 100 });
+      const items = (data && data.items) || [];
+      const entry = items.find((e) => String(e.id) === String(id));
+      if (entry) renderBody(entry);
+      else body.innerHTML =
+        '<p class="empty-state">Entry not in current page. Use Audit page filters to narrow.</p>';
+    } catch (e) {
+      global.AuroraErrorBoundary.mount(body, {
+        message: 'Could not load entry: ' + ((e && e.message) || ''),
+        onRetry: function () { loadEntry(id); },
+      });
+    }
   }
 
   function renderBody(e) {

@@ -143,7 +143,10 @@
       c.innerHTML = html;
       renderPagination();
     } catch (e) {
-      c.innerHTML = '<p class="empty-state">Could not load events: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(c, {
+        message: 'Could not load events: ' + ((e && e.message) || ''),
+        onRetry: function () { refresh(cursor); },
+      });
     }
   }
 

@@ -10,14 +10,23 @@
       '<nav class="breadcrumb"><a href="#mod/appeals">Moderation</a> <span class="breadcrumb-sep">›</span> <a href="#mod/appeals">Appeals</a> <span class="breadcrumb-sep">›</span> #' + esc(id) + '</nav>' +
       '<header class="page-header"><div><h2>Appeal #' + esc(id) + '</h2></div></header>' +
       '<div id="apd-body">' + global.AuroraSkeleton.lines(4) + '</div>';
+    await loadAppeal(id);
+    return {};
+  }
+
+  async function loadAppeal(id) {
+    const body = document.getElementById('apd-body');
+    if (!body) return;
+    body.innerHTML = global.AuroraSkeleton.lines(4);
     try {
       const data = await global.AuroraEndpoints.moderator.getAppeal(id);
       renderBody(data);
     } catch (e) {
-      document.getElementById('apd-body').innerHTML =
-        '<p class="empty-state">Could not load appeal: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(body, {
+        message: 'Could not load appeal: ' + ((e && e.message) || ''),
+        onRetry: function () { loadAppeal(id); },
+      });
     }
-    return {};
   }
 
   function renderBody(a) {

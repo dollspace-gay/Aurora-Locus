@@ -19,23 +19,32 @@
       '    <div class="rail-card"><h4>References</h4><div id="bd-references">' + global.AuroraSkeleton.lines(2) + '</div></div>' +
       '  </aside>' +
       '</div>';
+    await loadBlob(cid);
+    return {};
+  }
+
+  async function loadBlob(cid) {
+    const primary = document.getElementById('bd-primary');
+    if (!primary) return;
+    primary.innerHTML = global.AuroraSkeleton.lines(4);
     try {
       const data = await global.AuroraEndpoints.ops.listBlobs({ cid: cid, limit: 1 });
       const blobs = (data && data.blobs) || [];
       const blob = blobs[0];
       if (!blob) {
-        document.getElementById('bd-primary').innerHTML = '<p class="empty-state">Blob not found on this PDS.</p>';
-        return {};
+        primary.innerHTML = '<p class="empty-state">Blob not found on this PDS.</p>';
+        return;
       }
       renderPrimary(blob, cid);
       renderOwner(blob.did);
       document.getElementById('bd-references').textContent =
         (blob.referenceCount != null ? String(blob.referenceCount) + ' references' : 'Reference count unavailable.');
     } catch (e) {
-      document.getElementById('bd-primary').innerHTML =
-        '<p class="empty-state">Could not load blob: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(primary, {
+        message: 'Could not load blob: ' + ((e && e.message) || ''),
+        onRetry: function () { loadBlob(cid); },
+      });
     }
-    return {};
   }
 
   function renderPrimary(blob, cid) {
