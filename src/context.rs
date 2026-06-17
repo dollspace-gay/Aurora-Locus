@@ -222,6 +222,12 @@ pub struct AppContext {
     /// via the #237a decode + #236 encode primitives.
     pub kryphocron_rewrite_job:
         Option<Arc<crate::kryphocron_rewrite::RewriteJob>>,
+
+    /// Arc H §7.4.1 (#290) — registry of repository-rebuild jobs.
+    /// `rebuildRepo` starts one (per-DID single-flight); `getRebuildProgress` /
+    /// `cancelRebuild` read/cancel it by job-id. Reconstructs an account's repo
+    /// from its sequencer history in memory and atomically swaps it in.
+    pub rebuild_registry: Arc<crate::rebuild::RebuildRegistry>,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -1100,6 +1106,8 @@ impl AppContext {
             kryphocron_at_rest_hooks,
             // v0.9 Arc D (#224) — rewrite-on-rotate job.
             kryphocron_rewrite_job,
+            // v0.9 Arc H (#290) — repository-rebuild job registry.
+            rebuild_registry: Arc::new(crate::rebuild::RebuildRegistry::new()),
         })
     }
 

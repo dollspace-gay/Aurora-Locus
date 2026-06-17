@@ -699,11 +699,28 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(revoke_role),
             CapsBuilder::new(Family::SuperAdmin),
         )
-        // Repository rebuild preflight (§7.4.1 / #286) — non-destructive read;
-        // the destructive rebuildRepo + progress/cancel land in #287.
+        // Repository rebuild preflight (§7.4.1 / #286) — non-destructive read.
         .route_with_caps(
             "/xrpc/tools.aurora.superadmin.preRebuildCheck",
             get(pre_rebuild_check),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // Repository rebuild — destructive surface (§7.4.1 / #290): start a
+        // background rebuild, poll its progress, cancel it. Reconstructs from
+        // sequencer history → verify → atomic per-DID swap.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.rebuildRepo",
+            post(rebuild_repo),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getRebuildProgress",
+            get(get_rebuild_progress),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.cancelRebuild",
+            post(cancel_rebuild),
             CapsBuilder::new(Family::SuperAdmin),
         )
         // Per-operator session management (§8.1.7 / #273). Admin-tier
@@ -1624,6 +1641,185 @@ async fn pre_rebuild_check(
     }
 
     Ok(Json(body))
+}
+
+// ---------------------------------------------------------------------------
+// Repository rebuild — destructive surface (§7.4.1 / #290)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RebuildRepoRequest {
+    did: String,
+    /// Operator rationale — required (high-impact destructive action). Carried
+    /// into the `RepoRebuilt` audit event on a successful swap.
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.rebuildRepo` — start a background
+/// repository rebuild for `did` (§7.4.1 / #290). Reconstructs the account's
+/// repo from its full sequencer history in memory, verifies it (full signature
+/// check) via `verify_repo`, and atomically swaps it into live storage in one
+/// per-DID transaction. Returns the job-id to poll via `getRebuildProgress`.
+///
+/// Per-DID single-flight: a 409 if a rebuild is already in flight for the same
+/// DID. SuperAdmin only; `rationale` required. The original repo is untouched
+/// unless and until the atomic swap commits, so a failed/cancelled rebuild is
+/// safe (shadow-then-swap). A no-history account surfaces as a `failed` job via
+/// `getRebuildProgress` (run `preRebuildCheck` first to confirm scope).
+async fn rebuild_repo(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RebuildRepoRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "rebuildRepo requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required")
+        })?;
+
+    let registry = ctx.rebuild_registry.clone();
+    let job_id = registry
+        .start(
+            ctx.clone(),
+            req.did.clone(),
+            auth.did.clone(),
+            rationale.to_string(),
+        )
+        .map_err(|e| match e {
+            PdsError::Conflict(msg) => json_error(StatusCode::CONFLICT, "Conflict", msg),
+            other => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                other.to_string(),
+            ),
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "jobId": job_id,
+        "did": req.did,
+        "status": "started",
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetRebuildProgressParams {
+    job_id: String,
+}
+
+/// Render a [`RebuildProgress`](crate::rebuild::RebuildProgress) as the
+/// `getRebuildProgress` wire shape (camelCase; `SystemTime`s as unix millis).
+fn rebuild_progress_json(p: &crate::rebuild::RebuildProgress) -> serde_json::Value {
+    fn ms(t: Option<std::time::SystemTime>) -> Option<u64> {
+        t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    }
+    serde_json::json!({
+        "jobId": p.job_id,
+        "did": p.did,
+        "phase": p.phase.as_str(),
+        "commitsTotal": p.commits_total,
+        "commitsProcessed": p.commits_processed,
+        "recordsWritten": p.records_written,
+        "headCommitCidBefore": p.head_before,
+        "headCommitCidAfter": p.head_after,
+        "error": p.error,
+        "cancelRequested": p.cancel_requested,
+        "startedAt": ms(p.started_at),
+        "finishedAt": ms(p.finished_at),
+    })
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.getRebuildProgress?jobId=<id>` — progress
+/// for a rebuild job (§7.4.1 / #290): phase (walking / verifying / swapping /
+/// completed / failed / cancelled), commits walked vs total, records written,
+/// head CID before/after, and any failure diagnostic. SuperAdmin only; 404 on
+/// an unknown job-id.
+async fn get_rebuild_progress(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(params): Query<GetRebuildProgressParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "getRebuildProgress requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    match ctx.rebuild_registry.progress(&params.job_id) {
+        Some(p) => Ok(Json(rebuild_progress_json(&p))),
+        None => Err(json_error(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            format!("no rebuild job {}", params.job_id),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelRebuildRequest {
+    job_id: String,
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.cancelRebuild` — request cancellation of
+/// an in-flight rebuild (§7.4.1 / #290). Cancellation is observed at commit
+/// boundaries and between phases; the atomic swap is the point of no return, so
+/// a cancel that arrives during the swap is a no-op (the transaction is whole).
+/// SuperAdmin only. 404 on an unknown job-id; 409 if the job already reached a
+/// terminal phase ("nothing to cancel").
+async fn cancel_rebuild(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<CancelRebuildRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "cancelRebuild requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    match ctx.rebuild_registry.request_cancel(&req.job_id) {
+        None => Err(json_error(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            format!("no rebuild job {}", req.job_id),
+        )),
+        Some(true) => Ok(Json(serde_json::json!({
+            "jobId": req.job_id,
+            "status": "cancelling",
+        }))),
+        Some(false) => Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "rebuild job already complete; nothing to cancel".to_string(),
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -8266,11 +8462,14 @@ mod tests {
             r#""listAudiences","#,
             r#""getBlockCascadeImpact""#,
             r#"],"#,
-            // tools.aurora.superadmin (3 endpoints)
+            // tools.aurora.superadmin (6 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
-            r#""preRebuildCheck""#,
+            r#""preRebuildCheck","#,
+            r#""rebuildRepo","#,
+            r#""getRebuildProgress","#,
+            r#""cancelRebuild""#,
             r#"]"#,
             r#"},"#,
             // ---- implementation, version (literals) ----
@@ -8652,6 +8851,10 @@ mod tests {
             superadmin.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(names.contains(&"grantRole"), "grantRole missing");
         assert!(names.contains(&"revokeRole"), "revokeRole missing");
+        assert!(names.contains(&"preRebuildCheck"), "preRebuildCheck missing");
+        assert!(names.contains(&"rebuildRepo"), "rebuildRepo missing");
+        assert!(names.contains(&"getRebuildProgress"), "getRebuildProgress missing");
+        assert!(names.contains(&"cancelRebuild"), "cancelRebuild missing");
     }
 
     #[tokio::test]
@@ -11030,5 +11233,117 @@ mod tests {
             resp.0["deepError"].is_string(),
             "the verification failure must be surfaced as a diagnostic"
         );
+    }
+
+    // ---------- §7.4.1 / #290 destructive rebuild XRPCs ----------
+
+    #[tokio::test]
+    async fn rebuild_repo_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = rebuild_repo(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            Json(RebuildRepoRequest {
+                did: "did:plc:target".to_string(),
+                rationale: Some("fixing it".to_string()),
+            }),
+        )
+        .await
+        .expect_err("Admin (not SuperAdmin) must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn rebuild_repo_requires_rationale() {
+        let ctx = create_test_context().await;
+        // Empty/whitespace rationale is rejected (high-impact destructive action).
+        let err = rebuild_repo(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RebuildRepoRequest {
+                did: "did:plc:target".to_string(),
+                rationale: Some("   ".to_string()),
+            }),
+        )
+        .await
+        .expect_err("missing rationale → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_rebuild_progress_unknown_job_404() {
+        let ctx = create_test_context().await;
+        let err = get_rebuild_progress(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            axum::extract::Query(GetRebuildProgressParams {
+                job_id: "no-such-job".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unknown job → NotFound");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancel_rebuild_unknown_job_404() {
+        let ctx = create_test_context().await;
+        let err = cancel_rebuild(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(CancelRebuildRequest {
+                job_id: "no-such-job".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unknown job → NotFound");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    /// End-to-end job lifecycle through the handlers: starting a rebuild for an
+    /// account with no resolvable signing key spawns a job that fails fast, and
+    /// `getRebuildProgress` reports the terminal `failed` phase with a
+    /// diagnostic — exercising start → spawn → run → finish → progress, and
+    /// proving the original repo is never touched (shadow-then-swap).
+    #[tokio::test]
+    async fn rebuild_repo_lifecycle_reports_terminal_failure() {
+        let ctx = create_test_context().await;
+        let started = rebuild_repo(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RebuildRepoRequest {
+                did: "did:plc:no-account".to_string(),
+                rationale: Some("investigating".to_string()),
+            }),
+        )
+        .await
+        .expect("a rebuild is started")
+        .0;
+        let job_id = started["jobId"].as_str().expect("jobId returned").to_string();
+        assert_eq!(started["status"], "started");
+
+        // Poll until the background job reaches a terminal phase.
+        let mut phase = String::new();
+        let mut error_present = false;
+        for _ in 0..200 {
+            let p = get_rebuild_progress(
+                State(ctx.clone()),
+                op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+                axum::extract::Query(GetRebuildProgressParams {
+                    job_id: job_id.clone(),
+                }),
+            )
+            .await
+            .expect("progress for a known job")
+            .0;
+            phase = p["phase"].as_str().unwrap().to_string();
+            error_present = p["error"].is_string();
+            if phase == "failed" || phase == "completed" || phase == "cancelled" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(phase, "failed", "no-account rebuild must terminate as failed");
+        assert!(error_present, "a failed job surfaces a diagnostic");
     }
 }

@@ -189,6 +189,18 @@ pub enum ModerationEventType {
     /// initiating handler + orphan-sweep infrastructure that
     /// triggers this event is post-arc-2 work.
     KryphocronSystemCleanup,
+
+    /// Arc H §7.4.1 — a SuperAdmin rebuilt an account's repository from
+    /// its sequencer history via `tools.aurora.superadmin.rebuildRepo`.
+    /// Host vocabulary (§16 D1): a high-impact destructive operator
+    /// action, audited in the host event log on the successful atomic
+    /// swap. `actor_did` is the triggering operator, `subject_did` the
+    /// rebuilt account, `subject_cid` the post-swap head commit CID;
+    /// `details` carries `rebuiltCommitCount` / `headCommitCidBefore` /
+    /// `headCommitCidAfter` / `rationale`. Emitted in its own short
+    /// transaction after the swap commits (Category C — the rebuild is
+    /// not itself a record-write, so there is no shared tx to join).
+    RepoRebuilt,
 }
 
 impl ModerationEventType {
@@ -221,6 +233,7 @@ impl ModerationEventType {
             ModerationEventType::KryphocronFallback => "kryphocron_fallback",
             ModerationEventType::KryphocronRecoveryWrite => "kryphocron_recovery_write",
             ModerationEventType::KryphocronSystemCleanup => "kryphocron_system_cleanup",
+            ModerationEventType::RepoRebuilt => "repo_rebuilt",
         }
     }
 }
@@ -259,6 +272,7 @@ impl FromStr for ModerationEventType {
             "kryphocron_fallback" => Ok(ModerationEventType::KryphocronFallback),
             "kryphocron_recovery_write" => Ok(ModerationEventType::KryphocronRecoveryWrite),
             "kryphocron_system_cleanup" => Ok(ModerationEventType::KryphocronSystemCleanup),
+            "repo_rebuilt" => Ok(ModerationEventType::RepoRebuilt),
             _ => Err(PdsError::Validation(format!("Invalid event type: {}", s))),
         }
     }
