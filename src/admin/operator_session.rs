@@ -39,6 +39,10 @@ pub struct OperatorSession {
     pub user_agent: Option<String>,
     pub current_refresh_id: Option<String>,
     pub prev_refresh_id: Option<String>,
+    /// When `current_refresh_id` last advanced — bounds the grace window in
+    /// which `prev_refresh_id` is still honoured (#272). `None` until the
+    /// session's first rotation.
+    pub refresh_rotated_at: Option<DateTime<Utc>>,
     pub revoked: bool,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revoked_by: Option<String>,
@@ -50,6 +54,10 @@ pub struct OperatorSession {
 pub struct OperatorSessionStore {
     db: AnyPool,
     clock: Arc<dyn Clock>,
+    /// Window after a rotation during which the immediately-prior refresh
+    /// token (`prev_refresh_id`) is still accepted, to survive a client that
+    /// refreshed but lost the response and retried (#272). Short by design.
+    refresh_grace: Duration,
 }
 
 impl OperatorSessionStore {
@@ -58,6 +66,7 @@ impl OperatorSessionStore {
         Self {
             db,
             clock: Arc::new(SystemClock),
+            refresh_grace: Duration::seconds(60),
         }
     }
 
@@ -106,7 +115,8 @@ impl OperatorSessionStore {
     pub async fn get(&self, sid: &str) -> PdsResult<Option<OperatorSession>> {
         let row = sqlx::query(
             "SELECT id, did, created_at, last_active_at, expires_at, source_ip, user_agent, \
-                    current_refresh_id, prev_refresh_id, revoked, revoked_at, revoked_by \
+                    current_refresh_id, prev_refresh_id, refresh_rotated_at, \
+                    revoked, revoked_at, revoked_by \
              FROM operator_session WHERE id = $1",
         )
         .bind(sid)
@@ -144,6 +154,85 @@ impl OperatorSessionStore {
         Ok(true)
     }
 
+    /// Rotate the refresh token of a live session (#272, rotation-on-use).
+    /// `presented_rid` is the `rid` claim from the refresh token the client
+    /// presented. Returns the `rid` the caller should embed in the freshly
+    /// issued access + refresh tokens, or `None` to reject the refresh (the
+    /// client falls back to interactive re-login).
+    ///
+    /// Three outcomes:
+    ///   * `presented_rid` is the current head → rotate (new rid; advance
+    ///     current→prev, stamp `refresh_rotated_at`) and return the new rid.
+    ///     The advance is a compare-and-swap `UPDATE ... WHERE
+    ///     current_refresh_id = presented_rid`, so of two concurrent
+    ///     refreshes only one wins the rotation — atomic without a tx.
+    ///   * `presented_rid` is the immediately-prior head and the rotation is
+    ///     within the grace window (a dropped-response retry, or the loser of
+    ///     the CAS race) → return the *current* rid without re-rotating.
+    ///   * anything else (stale token, past grace, revoked/expired/missing
+    ///     session) → `None`.
+    pub async fn rotate(&self, sid: &str, presented_rid: &str) -> PdsResult<Option<String>> {
+        let now = self.clock.now();
+        let Some(session) = self.get(sid).await? else {
+            return Ok(None); // unknown session
+        };
+        if session.revoked || session.expires_at <= now {
+            return Ok(None); // force-logged-out or lifetime elapsed
+        }
+
+        // Rotate: only when the presented token is the current head.
+        if session.current_refresh_id.as_deref() == Some(presented_rid) {
+            let new_rid = Uuid::new_v4().to_string();
+            let affected = sqlx::query(
+                "UPDATE operator_session \
+                 SET prev_refresh_id = current_refresh_id, current_refresh_id = $1, \
+                     refresh_rotated_at = $2, last_active_at = $2 \
+                 WHERE id = $3 AND current_refresh_id = $4",
+            )
+            .bind(&new_rid)
+            .bind(now.to_rfc3339())
+            .bind(sid)
+            .bind(presented_rid)
+            .execute(&self.db)
+            .await?
+            .rows_affected();
+            if affected == 1 {
+                return Ok(Some(new_rid)); // won the rotation
+            }
+            // Lost the CAS to a concurrent refresh — re-read and fall to the
+            // grace path (the winner set prev = presented_rid).
+            let Some(session) = self.get(sid).await? else {
+                return Ok(None);
+            };
+            if session.revoked || session.expires_at <= now {
+                return Ok(None);
+            }
+            return Ok(self.grace_current(&session, presented_rid, now));
+        }
+
+        // Not the current head: grace, or reject.
+        Ok(self.grace_current(&session, presented_rid, now))
+    }
+
+    /// Grace check: if `presented_rid` is the session's immediately-prior
+    /// head and the last rotation is within the grace window, hand back the
+    /// *current* rid (reissue without re-rotating). Otherwise `None`.
+    fn grace_current(
+        &self,
+        session: &OperatorSession,
+        presented_rid: &str,
+        now: DateTime<Utc>,
+    ) -> Option<String> {
+        if session.prev_refresh_id.as_deref() == Some(presented_rid) {
+            if let Some(rotated_at) = session.refresh_rotated_at {
+                if now <= rotated_at + self.refresh_grace {
+                    return session.current_refresh_id.clone();
+                }
+            }
+        }
+        None
+    }
+
     fn row_to_session(row: &sqlx::any::AnyRow) -> PdsResult<OperatorSession> {
         let parse = |s: &str| -> PdsResult<DateTime<Utc>> {
             DateTime::parse_from_rfc3339(s)
@@ -158,7 +247,14 @@ impl OperatorSessionStore {
         let created_at: String = row.get("created_at");
         let last_active_at: String = row.get("last_active_at");
         let expires_at: String = row.get("expires_at");
+        let refresh_rotated_at: Option<String> = row.get("refresh_rotated_at");
         let revoked_at: Option<String> = row.get("revoked_at");
+        let parse_opt = |o: Option<String>| -> PdsResult<Option<DateTime<Utc>>> {
+            match o {
+                Some(s) => Ok(Some(parse(&s)?)),
+                None => Ok(None),
+            }
+        };
         Ok(OperatorSession {
             id: row.get("id"),
             did: row.get("did"),
@@ -169,11 +265,9 @@ impl OperatorSessionStore {
             user_agent: row.get("user_agent"),
             current_refresh_id: row.get("current_refresh_id"),
             prev_refresh_id: row.get("prev_refresh_id"),
+            refresh_rotated_at: parse_opt(refresh_rotated_at)?,
             revoked: crate::db::read_bool(row, "revoked")?,
-            revoked_at: match revoked_at {
-                Some(s) => Some(parse(&s)?),
-                None => None,
-            },
+            revoked_at: parse_opt(revoked_at)?,
             revoked_by: row.get("revoked_by"),
         })
     }
@@ -198,6 +292,7 @@ mod tests {
                 id TEXT PRIMARY KEY, did TEXT NOT NULL, created_at TEXT NOT NULL, \
                 last_active_at TEXT NOT NULL, expires_at TEXT NOT NULL, source_ip TEXT, \
                 user_agent TEXT, current_refresh_id TEXT, prev_refresh_id TEXT, \
+                refresh_rotated_at TEXT, \
                 revoked INTEGER NOT NULL DEFAULT 0, revoked_at TEXT, revoked_by TEXT, \
                 revoke_reason TEXT)",
         )
@@ -285,5 +380,87 @@ mod tests {
             !store.validate_and_touch(&sid).await.unwrap(),
             "revoked session must fail the per-request gate immediately"
         );
+    }
+
+    // ---------- #272 rotation-on-use ----------
+
+    #[tokio::test]
+    async fn rotate_advances_chain_and_grace_then_invalidates_old() {
+        let clock = Arc::new(MockClock::new(anchor()));
+        let store = OperatorSessionStore::new(open_test_pool().await).with_clock(clock.clone());
+        let sid = store
+            .create("did:plc:op", None, None, "r1", Duration::days(30))
+            .await
+            .unwrap();
+
+        // Present the current head → rotate to a fresh rid.
+        let r2 = store.rotate(&sid, "r1").await.unwrap().expect("rotated");
+        assert_ne!(r2, "r1", "rotation issues a new rid");
+        let s = store.get(&sid).await.unwrap().unwrap();
+        assert_eq!(s.current_refresh_id.as_deref(), Some(r2.as_str()));
+        assert_eq!(s.prev_refresh_id.as_deref(), Some("r1"));
+        assert_eq!(s.refresh_rotated_at, Some(anchor()));
+
+        // The old token within grace (dropped-response retry / CAS loser):
+        // hand back the current rid, do NOT re-rotate.
+        clock.advance(Duration::seconds(30));
+        let graced = store.rotate(&sid, "r1").await.unwrap().expect("grace");
+        assert_eq!(graced, r2, "grace returns current head, no re-rotation");
+        let s = store.get(&sid).await.unwrap().unwrap();
+        assert_eq!(s.current_refresh_id.as_deref(), Some(r2.as_str()), "not re-rotated");
+
+        // Past the grace window the old token is dead.
+        clock.advance(Duration::seconds(31)); // 61s total since rotation
+        assert!(store.rotate(&sid, "r1").await.unwrap().is_none(), "old token dead past grace");
+
+        // The current head still rotates normally.
+        let r3 = store.rotate(&sid, &r2).await.unwrap().expect("rotate current");
+        assert_ne!(r3, r2);
+    }
+
+    #[tokio::test]
+    async fn rotate_rejects_unknown_rid() {
+        let store = OperatorSessionStore::new(open_test_pool().await);
+        let sid = store
+            .create("did:plc:op", None, None, "r1", Duration::days(30))
+            .await
+            .unwrap();
+        assert!(store.rotate(&sid, "never-issued").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rotate_rejects_unknown_session() {
+        let store = OperatorSessionStore::new(open_test_pool().await);
+        assert!(store.rotate("no-such-sid", "r1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rotate_rejects_revoked_session() {
+        let store = OperatorSessionStore::new(open_test_pool().await);
+        let sid = store
+            .create("did:plc:op", None, None, "r1", Duration::days(30))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE operator_session SET revoked = TRUE WHERE id = $1")
+            .bind(&sid)
+            .execute(&store.db)
+            .await
+            .unwrap();
+        assert!(
+            store.rotate(&sid, "r1").await.unwrap().is_none(),
+            "a revoked session cannot rotate"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_rejects_expired_session() {
+        let clock = Arc::new(MockClock::new(anchor()));
+        let store = OperatorSessionStore::new(open_test_pool().await).with_clock(clock.clone());
+        let sid = store
+            .create("did:plc:op", None, None, "r1", Duration::days(30))
+            .await
+            .unwrap();
+        clock.advance(Duration::days(31));
+        assert!(store.rotate(&sid, "r1").await.unwrap().is_none());
     }
 }

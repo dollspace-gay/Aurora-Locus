@@ -124,6 +124,37 @@ fn mint_admin_access_jwt(
     )
 }
 
+/// Mint an HS256 `scope=refresh` JWT carrying the operator-session id `sid`
+/// and rotation-chain id `rid` (#271/#272). `exp` is the absolute expiry
+/// (unix seconds): a rotated refresh token keeps the *original* session's
+/// expiry rather than sliding it forward, so a refresh token can never
+/// outlive its operator_session row. Shared by login and the rotation path.
+fn mint_admin_refresh_jwt(
+    jwt_secret: &str,
+    did: &str,
+    sid: &str,
+    rid: &str,
+    exp: i64,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::json;
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = json!({
+        "sub": did,
+        "iat": now,
+        "exp": exp,
+        "scope": "refresh",
+        "sid": sid,
+        "rid": rid,
+    });
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(jwt_secret.as_bytes()),
+    )
+}
+
 /// Request body for `POST /admin-oauth/refresh`.
 #[derive(Deserialize)]
 struct RefreshRequest {
@@ -194,11 +225,61 @@ async fn handle_refresh(
                         "refresh token missing 'sub' claim",
                     )
                 })?;
-            // Preserve the session id across refresh so the per-request
-            // session lookup stays continuous (#271). Rotation of the
-            // refresh token itself lands in #272; here we only reissue the
-            // access token bound to the same `sid`.
             let sid = claims.get("sid").and_then(|v| v.as_str());
+            let rid = claims.get("rid").and_then(|v| v.as_str());
+
+            // Post-#271 tokens carry both `sid` and `rid`: rotate-on-use
+            // (#272). The presented refresh token is validated against, and
+            // its `rid` rotated within, the live operator session; the old
+            // refresh token becomes unusable (past the grace window). A
+            // rejected rotation (revoked/expired session, stale/replayed
+            // token past grace) bounces the client to interactive re-login.
+            if let (Some(sid), Some(rid)) = (sid, rid) {
+                let new_rid = match ctx.operator_session_store.rotate(sid, rid).await {
+                    Ok(Some(new_rid)) => new_rid,
+                    Ok(None) => {
+                        return Err(refresh_error(
+                            StatusCode::UNAUTHORIZED,
+                            "InvalidToken",
+                            "refresh token is no longer valid",
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::error!("operator-session rotation failed: {}", e);
+                        return Err(refresh_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "RotateFailed",
+                            "failed to rotate session",
+                        ));
+                    }
+                };
+                let secret = &ctx.config.authentication.jwt_secret;
+                let mint_err = |e: jsonwebtoken::errors::Error, what: &str| {
+                    tracing::error!("failed to mint {} on refresh: {}", what, e);
+                    refresh_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "MintFailed",
+                        "failed to mint tokens",
+                    )
+                };
+                let access_token = mint_admin_access_jwt(secret, did, Some(sid))
+                    .map_err(|e| mint_err(e, "access token"))?;
+                // Keep the session's original expiry — never slide it.
+                let exp = claims
+                    .get("exp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp() + 2592000);
+                let refresh_token = mint_admin_refresh_jwt(secret, did, sid, &new_rid, exp)
+                    .map_err(|e| mint_err(e, "refresh token"))?;
+                tracing::debug!(did = %did, "admin tokens rotated (AS-only path)");
+                return Ok(Json(RefreshResponse {
+                    access_token,
+                    refresh_token: Some(refresh_token),
+                }));
+            }
+
+            // Legacy (pre-#271) refresh token: no rotation chain to advance.
+            // Reissue a stateless access token, preserving any `sid`.
             let access_token =
                 mint_admin_access_jwt(&ctx.config.authentication.jwt_secret, did, sid).map_err(
                     |e| {
@@ -210,7 +291,7 @@ async fn handle_refresh(
                         )
                     },
                 )?;
-            tracing::debug!(did = %did, "admin access token refreshed (AS-only path)");
+            tracing::debug!(did = %did, "admin access token refreshed (legacy AS-only path)");
             return Ok(Json(RefreshResponse {
                 access_token,
                 refresh_token: None,
@@ -455,8 +536,6 @@ async fn handle_oauth_callback(
 
         (session.access_token, session.refresh_token)
     } else {
-        use jsonwebtoken::{encode, EncodingKey, Header};
-        use serde_json::json;
 
         // Record a server-side operator session (§8.1.7 / #271). It outlives
         // the 24h access token, so tie its lifetime to the 30d refresh
@@ -502,19 +581,12 @@ async fn handle_oauth_callback(
                 },
             )?;
 
-        let refresh_claims = json!({
-            "sub": did,
-            "iat": now,
-            "exp": now + 2592000, // 30 days
-            "scope": "refresh",
-            "sid": sid,
-            "rid": refresh_id,
-        });
-
-        let refresh_token = encode(
-            &Header::default(),
-            &refresh_claims,
-            &EncodingKey::from_secret(ctx.config.authentication.jwt_secret.as_bytes()),
+        let refresh_token = mint_admin_refresh_jwt(
+            &ctx.config.authentication.jwt_secret,
+            &did,
+            &sid,
+            &refresh_id,
+            now + 2592000, // 30 days
         )
         .map_err(|e| {
             tracing::error!("Failed to create refresh token: {}", e);
@@ -849,6 +921,64 @@ mod tests {
         )
         .await
         .expect_err("garbage must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// #272 rotation-on-use end to end via the endpoint: a sid+rid refresh
+    /// token rotates (returns a NEW refresh token), the new one rotates
+    /// again (the chain advances), and a token whose `rid` was never the
+    /// session's current head is rejected.
+    #[tokio::test]
+    async fn refresh_rotates_chain_and_rejects_stale_rid() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:rotateop";
+        let exp = chrono::Utc::now().timestamp() + 2_592_000;
+        let sid = ctx
+            .operator_session_store
+            .create(did, None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+
+        let refresh_r1 = encode_jwt(serde_json::json!({
+            "sub": did, "exp": exp, "scope": "refresh", "sid": sid, "rid": "r1",
+        }));
+        let resp1 = handle_refresh(
+            State(ctx.clone()),
+            Json(RefreshRequest {
+                refresh_token: refresh_r1.clone(),
+            }),
+        )
+        .await
+        .expect("rotation succeeds")
+        .0;
+        let new_refresh = resp1.refresh_token.expect("rotation returns a new refresh token");
+        assert_ne!(new_refresh, refresh_r1, "a new refresh token is issued");
+
+        // The newly issued refresh token rotates again — the chain advances.
+        let resp2 = handle_refresh(
+            State(ctx.clone()),
+            Json(RefreshRequest {
+                refresh_token: new_refresh.clone(),
+            }),
+        )
+        .await
+        .expect("second rotation succeeds")
+        .0;
+        let new_refresh2 = resp2.refresh_token.expect("second rotation returns a token");
+        assert_ne!(new_refresh2, new_refresh, "chain advanced again");
+
+        // A token whose rid was never this session's head is rejected.
+        let bogus = encode_jwt(serde_json::json!({
+            "sub": did, "exp": exp, "scope": "refresh", "sid": sid, "rid": "never-current",
+        }));
+        let err = handle_refresh(
+            State(ctx),
+            Json(RefreshRequest {
+                refresh_token: bogus,
+            }),
+        )
+        .await
+        .expect_err("stale rid must be rejected");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 }
