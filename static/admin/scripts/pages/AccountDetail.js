@@ -35,6 +35,17 @@
   }
 
   function renderShell(did) {
+    // Subject-context pivot to the Audit page pre-filtered to this DID
+    // (§6.5 + §9.8 audit cross-pivot convention, #264). The Audit route is
+    // Moderator+ (routes.js), so the affordance only renders for operators
+    // who can actually follow it — a gated dead link is worse than none.
+    // The filter rides the canonical `#mod/audit?subject=<did>` URL-state
+    // form (router splits path?query; Audit.mount reads `subject`).
+    const session = global.AuroraSession;
+    const auditPivot = (session && session.hasRole('moderator'))
+      ? '  <p class="detail-header-pivots"><a href="#mod/audit?subject=' +
+        encodeURIComponent(did) + '">' + esc(T('accountDetail.viewAuditChain')) + '</a></p>'
+      : '';
     return '<nav class="breadcrumb" aria-label="Breadcrumb">' +
            '  <a href="#ops/accounts">Operations</a>' +
            '  <span class="breadcrumb-sep">›</span>' +
@@ -45,6 +56,7 @@
            '<header class="detail-header">' +
            '  <h2 id="ad-handle">Loading…</h2>' +
            '  <p class="meta" id="ad-meta"><code>' + esc(did) + '</code></p>' +
+           auditPivot +
            '</header>' +
            '<div class="detail-layout">' +
            '  <div class="detail-primary" id="ad-primary"></div>' +

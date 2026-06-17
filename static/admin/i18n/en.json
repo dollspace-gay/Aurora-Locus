@@ -143,6 +143,7 @@
     "search_placeholder": "Search by handle, DID, or email"
   },
   "accountDetail": {
+    "viewAuditChain": "View audit chain →",
     "roles": {
       "title": "Account roles",
       "none": "No admin role assigned.",
