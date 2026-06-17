@@ -162,6 +162,9 @@ pub const WIRE_EXTENSION_ORDER: &[&str] = &[
     // v0.9 Arc D (#225) — Kryphocron operator read cohort; the ten
     // ops.kryphocron.* read XRPC backing the Kryphocron domain pages (§6.4, §6.5).
     "kryphocron-read-v1",
+    // v0.9 Arc E 0.9.3 (#273) — per-operator session management (§8.1.7);
+    // admin.listSessions + admin.revokeSession.
+    "session-management-v1",
 ];
 
 /// Typed family identifier — enum so typos are compile errors;

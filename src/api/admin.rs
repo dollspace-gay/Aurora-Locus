@@ -3,8 +3,9 @@
 use crate::{
     admin::{
         audit_chain::{self, AppendEntryParams},
-        defs::Subject,
-        InviteCode,
+        defs::{PaginationParams, Subject},
+        operator_session::SessionCursor,
+        InviteCode, OperatorSessionStore,
     },
     api::registry::{aurora_route_builder, CapsBuilder, Family, RouteRegistry},
     auth::AdminAuthContext,
@@ -698,6 +699,21 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(revoke_role),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // Per-operator session management (§8.1.7 / #273). Admin-tier
+        // namespace; the handlers gate finer: any operator lists/revokes
+        // their OWN sessions (self-service), SuperAdmin lists all and
+        // force-logs-out any. The "session-management-v1" capability is
+        // introduced on listSessions (the canonical introducer).
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.listSessions",
+            get(list_sessions),
+            CapsBuilder::new(Family::Admin).extensions(["session-management-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.revokeSession",
+            post(revoke_session),
+            CapsBuilder::new(Family::Admin),
+        )
         .build()
 }
 
@@ -1293,6 +1309,210 @@ async fn revoke_role(
     Ok(Json(RevokeRoleOutput {
         success: true,
         did: req.did,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Per-operator session management (§8.1.7 / #273)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ListSessionsQuery {
+    /// SuperAdmin only: scope the listing to one operator. Omitted by a
+    /// SuperAdmin lists ALL operators' sessions; supplied (or any value) by
+    /// a non-SuperAdmin is forced to their own did.
+    did: Option<String>,
+    #[serde(flatten)]
+    pagination: PaginationParams,
+}
+
+/// `GET /xrpc/tools.aurora.admin.listSessions` — active operator sessions
+/// (#273). Self-service for any operator (their own logins); SuperAdmin
+/// overview across all operators. Returns newest-first, keyset-paginated;
+/// each row flags `isCurrent` by matching the caller's own session id.
+async fn list_sessions(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(q): Query<ListSessionsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+
+    let is_superadmin = auth.role.can_act_as(Role::SuperAdmin);
+    let limit = q.pagination.effective_limit();
+    let cursor = match &q.pagination.cursor {
+        Some(s) => Some(SessionCursor::decode(s).map_err(|_| {
+            json_error(StatusCode::BAD_REQUEST, "OutdatedCursor", "invalid cursor")
+        })?),
+        None => None,
+    };
+
+    // Authorization + listing scope:
+    //   SuperAdmin + no did → all operators; SuperAdmin + did → that operator;
+    //   non-SuperAdmin → own sessions only (a foreign did is forbidden).
+    let result = if is_superadmin {
+        match &q.did {
+            Some(d) => ctx.operator_session_store.list_by_did(d, limit, cursor).await,
+            None => ctx.operator_session_store.list_all(limit, cursor).await,
+        }
+    } else {
+        if let Some(d) = &q.did {
+            if d != &auth.did {
+                return Err(json_error(
+                    StatusCode::FORBIDDEN,
+                    "Forbidden",
+                    "listing another operator's sessions requires SuperAdmin",
+                ));
+            }
+        }
+        ctx.operator_session_store
+            .list_by_did(&auth.did, limit, cursor)
+            .await
+    };
+    let (sessions, next) = result.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+
+    let current_sid = &auth.session.session_id;
+    let items: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "sid": s.id,
+                "did": s.did,
+                "createdAt": s.created_at.to_rfc3339(),
+                "lastActiveAt": s.last_active_at.to_rfc3339(),
+                "expiresAt": s.expires_at.to_rfc3339(),
+                "sourceIp": s.source_ip,
+                "userAgent": s.user_agent,
+                "isCurrent": &s.id == current_sid,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "sessions": items, "cursor": next })))
+}
+
+#[derive(Deserialize)]
+struct RevokeSessionRequest {
+    /// The session id (`sid`) to force-logout.
+    sid: String,
+    /// Required when revoking ANOTHER operator's session (a security event);
+    /// optional for self-service logout.
+    rationale: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct RevokeSessionOutput {
+    success: bool,
+    sid: String,
+    #[serde(rename = "auditEntryId")]
+    audit_entry_id: String,
+}
+
+/// `POST /xrpc/tools.aurora.admin.revokeSession` — force-logout a session
+/// (#273). Any operator may revoke their OWN session; SuperAdmin may revoke
+/// any. The #271 per-request gate rejects the revoked session on its next
+/// request, so the operator reauthenticates. Emits an audit-chain entry
+/// (`session.revoke` for a cross-operator force-logout, `session.revoke_self`
+/// for self-service) in the same transaction as the flag flip.
+async fn revoke_session(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RevokeSessionRequest>,
+) -> Result<Json<RevokeSessionOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+
+    // Resolve the target's owner to authorize + audit before mutating.
+    let target = ctx
+        .operator_session_store
+        .get(&req.sid)
+        .await
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "NotFound", "session not found"))?;
+
+    let is_self = target.did == auth.did;
+    if !is_self && !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "revoking another operator's session requires SuperAdmin",
+        ));
+    }
+
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    // A cross-operator force-logout is a security event — require a reason.
+    if !is_self && rationale.is_none() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "rationale-required",
+        ));
+    }
+    let action = if is_self {
+        "session.revoke_self"
+    } else {
+        "session.revoke"
+    };
+    let audit_rationale = format!(
+        "{} (session {})",
+        rationale.unwrap_or("operator self-service session revocation"),
+        req.sid
+    );
+    let subject = Subject::Repo {
+        did: target.did.clone(),
+    };
+    let now = chrono::Utc::now();
+
+    // Flip + audit atomically (LB-1 pattern; mirrors revoke_role).
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    OperatorSessionStore::revoke_in_tx(&mut tx, &req.sid, &auth.did, rationale, now)
+        .await
+        .map_err(|e| match e {
+            PdsError::NotFound(_) => json_error(
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                "session not found or already revoked",
+            ),
+            other => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                other.to_string(),
+            ),
+        })?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action,
+            subject: Some(&subject),
+            rationale: &audit_rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    tx.commit().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+
+    Ok(Json(RevokeSessionOutput {
+        success: true,
+        sid: req.sid,
         audit_entry_id: audit_entry_id.to_string(),
     }))
 }
@@ -7836,7 +8056,7 @@ mod tests {
         let actual = canonical_json(&resp);
         let expected = concat!(
             r#"{"#,
-            // ---- extensions: 17 strings in Vec declaration order ----
+            // ---- extensions: 18 strings in Vec declaration order ----
             r#""extensions":["#,
             r#"{"name":"subject-context-v1"},"#,
             r#"{"name":"moderator-activity-v1"},"#,
@@ -7854,11 +8074,12 @@ mod tests {
             r#"{"name":"runtime-settings-v1"},"#,
             r#"{"name":"themes-v1"},"#,
             r#"{"name":"kryphocron-rotation-v1"},"#,
-            r#"{"name":"kryphocron-read-v1"}"#,
+            r#"{"name":"kryphocron-read-v1"},"#,
+            r#"{"name":"session-management-v1"}"#,
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
-            // tools.aurora.admin (16 endpoints)
+            // tools.aurora.admin (18 endpoints)
             r#""tools.aurora.admin":["#,
             r#""emitEvent","#,
             r#""batchTakedownAccounts","#,
@@ -7875,7 +8096,9 @@ mod tests {
             r#""subscribeModEvents","#,
             r#""getRuntimeSetting","#,
             r#""setRuntimeSetting","#,
-            r#""listInstalled""#,
+            r#""listInstalled","#,
+            r#""listSessions","#,
+            r#""revokeSession""#,
             r#"],"#,
             // tools.aurora.moderator (7 endpoints)
             r#""tools.aurora.moderator":["#,
@@ -10368,5 +10591,252 @@ mod tests {
         }"#;
         let req: UpdateSubjectStatusRequest = serde_json::from_str(strong_ref_json).unwrap();
         assert!(!req.legacy_record_uri_used);
+    }
+
+    // ---------- §8.1.7 / #273 — listSessions + revokeSession ----------
+
+    fn op_auth(did: &str, role: Role, sid: &str) -> AdminAuthContext {
+        AdminAuthContext {
+            did: did.to_string(),
+            session: ValidatedSession {
+                did: did.to_string(),
+                session_id: sid.to_string(),
+                is_app_password: false,
+            },
+            role,
+        }
+    }
+
+    fn list_query(did: Option<&str>) -> axum::extract::Query<ListSessionsQuery> {
+        axum::extract::Query(ListSessionsQuery {
+            did: did.map(|s| s.to_string()),
+            pagination: PaginationParams::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn list_sessions_self_service_returns_own_with_current_flag() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:selfop";
+        let sid1 = ctx
+            .operator_session_store
+            .create(did, Some("203.0.113.1"), None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+        let _sid2 = ctx
+            .operator_session_store
+            .create(did, None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+
+        let resp = list_sessions(
+            State(ctx.clone()),
+            op_auth(did, Role::Moderator, &sid1),
+            list_query(None),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        let sessions = resp["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2, "both of the operator's sessions");
+        let current: Vec<_> = sessions.iter().filter(|s| s["isCurrent"] == true).collect();
+        assert_eq!(current.len(), 1, "exactly the caller's own session is current");
+        assert_eq!(current[0]["sid"], sid1);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_superadmin_lists_all_operators() {
+        let ctx = create_test_context().await;
+        ctx.operator_session_store
+            .create("did:plc:opA", None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+        ctx.operator_session_store
+            .create("did:plc:opB", None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+
+        let resp = list_sessions(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "super-sid"),
+            list_query(None),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        let dids: Vec<&str> = resp["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["did"].as_str().unwrap())
+            .collect();
+        assert!(dids.contains(&"did:plc:opA") && dids.contains(&"did:plc:opB"));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_non_superadmin_foreign_did_forbidden() {
+        let ctx = create_test_context().await;
+        let err = list_sessions(
+            State(ctx),
+            op_auth("did:plc:me", Role::Admin, "my-sid"),
+            list_query(Some("did:plc:someone-else")),
+        )
+        .await
+        .expect_err("foreign did without SuperAdmin must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn revoke_session_self_service_fires_the_gate() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:selfrevoke";
+        let sid = ctx
+            .operator_session_store
+            .create(did, None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+        // Self-service revoke needs no rationale.
+        let out = revoke_session(
+            State(ctx.clone()),
+            op_auth(did, Role::Moderator, &sid),
+            axum::Json(RevokeSessionRequest {
+                sid: sid.clone(),
+                rationale: None,
+            }),
+        )
+        .await
+        .expect("self-service revoke succeeds")
+        .0;
+        assert!(out.success);
+        assert!(
+            !ctx.operator_session_store
+                .validate_and_touch(&sid)
+                .await
+                .unwrap(),
+            "self-revoked session fails the per-request gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_session_superadmin_force_logout_gate_and_rationale() {
+        let ctx = create_test_context().await;
+        let victim = "did:plc:victim";
+        let sid = ctx
+            .operator_session_store
+            .create(victim, None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+        let super_auth = || op_auth("did:plc:super", Role::SuperAdmin, "super-sid");
+
+        // Cross-operator force-logout requires a rationale.
+        let err = revoke_session(
+            State(ctx.clone()),
+            super_auth(),
+            axum::Json(RevokeSessionRequest {
+                sid: sid.clone(),
+                rationale: None,
+            }),
+        )
+        .await
+        .expect_err("cross-operator revoke without rationale is rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // With a rationale it succeeds and the gate fires.
+        let out = revoke_session(
+            State(ctx.clone()),
+            super_auth(),
+            axum::Json(RevokeSessionRequest {
+                sid: sid.clone(),
+                rationale: Some("suspected credential compromise".to_string()),
+            }),
+        )
+        .await
+        .expect("superadmin force-logout succeeds")
+        .0;
+        assert!(out.success);
+        assert!(
+            !ctx.operator_session_store
+                .validate_and_touch(&sid)
+                .await
+                .unwrap(),
+            "force-logged-out session fails the per-request gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_session_moderator_cannot_revoke_other() {
+        let ctx = create_test_context().await;
+        let sid = ctx
+            .operator_session_store
+            .create("did:plc:other", None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+        let err = revoke_session(
+            State(ctx),
+            op_auth("did:plc:mod", Role::Moderator, "mod-sid"),
+            axum::Json(RevokeSessionRequest {
+                sid,
+                rationale: Some("nope".to_string()),
+            }),
+        )
+        .await
+        .expect_err("non-SuperAdmin revoking another's session is forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    /// The full §8.1.7 verification gate, end to end through both surfaces:
+    /// SuperAdmin force-logs-out a specific operator session via the XRPC,
+    /// and that operator's next request (a real admin token bearing the
+    /// session's `sid`) reauthenticates — admin_auth_from_token now rejects.
+    #[tokio::test]
+    async fn force_logout_makes_operators_next_request_reauthenticate() {
+        let ctx = create_test_context().await;
+        let victim = "did:plc:gatevictim";
+        ctx.admin_role_manager
+            .grant_role(victim, Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .unwrap();
+        let sid = ctx
+            .operator_session_store
+            .create(victim, None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+
+        // A real admin token bearing the session sid.
+        let secret = &ctx.config.authentication.jwt_secret;
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &serde_json::json!({
+                "sub": victim,
+                "scope": "admin",
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "sid": sid,
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+
+        // Live before revoke.
+        crate::auth::admin_auth_from_token(&ctx, &token)
+            .await
+            .expect("token authenticates before force-logout");
+
+        // SuperAdmin force-logs-out the session.
+        let _ = revoke_session(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "super-sid"),
+            axum::Json(RevokeSessionRequest {
+                sid: sid.clone(),
+                rationale: Some("compromised laptop".to_string()),
+            }),
+        )
+        .await
+        .expect("force-logout succeeds");
+
+        // Next request reauthenticates: the same token is now rejected.
+        match crate::auth::admin_auth_from_token(&ctx, &token).await {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401) after force-logout, got {:?}", other),
+        }
     }
 }

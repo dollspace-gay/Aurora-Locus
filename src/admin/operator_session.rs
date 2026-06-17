@@ -20,12 +20,39 @@
 //! advances `current_refresh_id`/`prev_refresh_id` (#272); `revoke` + the
 //! listing/force-logout XRPC surface land in #273.
 
-use crate::error::PdsResult;
+use crate::error::{PdsError, PdsResult};
 use crate::identity::clock::{Clock, SystemClock};
+use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::{AnyPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Opaque keyset cursor for session listing (#273). The shared
+/// `CursorPosition` keys on an `i64` id; `operator_session.id` is a UUID
+/// string, so this is its string-id sibling — same base64-JSON envelope,
+/// same `(created_at DESC, id DESC)` ordering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCursor {
+    pub created_at: String,
+    pub id: String,
+}
+
+impl SessionCursor {
+    fn encode(&self) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(self).expect("SessionCursor serialize"))
+    }
+
+    pub(crate) fn decode(s: &str) -> PdsResult<Self> {
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s.as_bytes())
+            .map_err(|_| PdsError::Validation("invalid session cursor".to_string()))?;
+        serde_json::from_slice(&raw)
+            .map_err(|_| PdsError::Validation("invalid session cursor".to_string()))
+    }
+}
 
 /// A persisted operator session row.
 #[derive(Debug, Clone)]
@@ -231,6 +258,135 @@ impl OperatorSessionStore {
             }
         }
         None
+    }
+
+    /// Revoke (force-logout) a session inside an existing transaction so the
+    /// flip composes atomically with the audit-chain append (#273, mirroring
+    /// `AdminRoleManager::revoke_role_in_tx`). The per-request gate in
+    /// `admin_auth_from_token` (#271) already rejects `revoked = true`, so
+    /// the operator's next request reauthenticates. Returns the session's
+    /// owner `did` (for the audit subject) on success; `NotFound` when no
+    /// matching live session exists (unknown sid, or already revoked).
+    pub async fn revoke_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        sid: &str,
+        revoked_by: &str,
+        reason: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> PdsResult<String> {
+        // Read the owner did within the tx so the caller can authorize +
+        // audit against it; the UPDATE's `NOT revoked` guard makes the flip
+        // idempotent-safe under a concurrent revoke.
+        let did: Option<String> =
+            sqlx::query_scalar("SELECT did FROM operator_session WHERE id = $1 AND NOT revoked")
+                .bind(sid)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let Some(did) = did else {
+            return Err(PdsError::NotFound(format!("no active session {}", sid)));
+        };
+        sqlx::query(
+            "UPDATE operator_session \
+             SET revoked = TRUE, revoked_at = $1, revoked_by = $2, revoke_reason = $3 \
+             WHERE id = $4 AND NOT revoked",
+        )
+        .bind(now.to_rfc3339())
+        .bind(revoked_by)
+        .bind(reason)
+        .bind(sid)
+        .execute(&mut **tx)
+        .await?;
+        Ok(did)
+    }
+
+    /// List a single operator's active sessions (self-service), newest
+    /// first, keyset-paginated. "Active" excludes revoked and expired.
+    pub async fn list_by_did(
+        &self,
+        did: &str,
+        limit: u32,
+        cursor: Option<SessionCursor>,
+    ) -> PdsResult<(Vec<OperatorSession>, Option<String>)> {
+        self.list_sessions(Some(did), limit, cursor).await
+    }
+
+    /// List active sessions across all operators (SuperAdmin overview),
+    /// newest first, keyset-paginated.
+    pub async fn list_all(
+        &self,
+        limit: u32,
+        cursor: Option<SessionCursor>,
+    ) -> PdsResult<(Vec<OperatorSession>, Option<String>)> {
+        self.list_sessions(None, limit, cursor).await
+    }
+
+    async fn list_sessions(
+        &self,
+        did: Option<&str>,
+        limit: u32,
+        cursor: Option<SessionCursor>,
+    ) -> PdsResult<(Vec<OperatorSession>, Option<String>)> {
+        let now = self.clock.now().to_rfc3339();
+        let lim = limit.clamp(1, 100) as i64;
+
+        // Active-only: not revoked, not past expiry. $1 = now.
+        let mut binds: Vec<String> = vec![now];
+        let mut where_parts: Vec<String> =
+            vec!["revoked = FALSE".to_string(), "expires_at > $1".to_string()];
+        if let Some(d) = did {
+            binds.push(d.to_string());
+            where_parts.push(format!("did = ${}", binds.len()));
+        }
+        if let Some(c) = &cursor {
+            // Three placeholders (created_at bound twice, then id) — mirrors
+            // get_audit_trail's keyset, which doesn't reuse a placeholder
+            // across backends.
+            binds.push(c.created_at.clone());
+            let a = binds.len();
+            binds.push(c.created_at.clone());
+            let b = binds.len();
+            binds.push(c.id.clone());
+            let cc = binds.len();
+            where_parts.push(format!(
+                "(created_at < ${} OR (created_at = ${} AND id < ${}))",
+                a, b, cc
+            ));
+        }
+        let limit_ph = binds.len() + 1;
+        let sql = format!(
+            "SELECT id, did, created_at, last_active_at, expires_at, source_ip, user_agent, \
+                    current_refresh_id, prev_refresh_id, refresh_rotated_at, \
+                    revoked, revoked_at, revoked_by \
+             FROM operator_session WHERE {} \
+             ORDER BY created_at DESC, id DESC LIMIT ${}",
+            where_parts.join(" AND "),
+            limit_ph
+        );
+
+        let mut q = sqlx::query(&sql);
+        for b in &binds {
+            q = q.bind(b);
+        }
+        q = q.bind(lim + 1); // fetch one extra to detect a further page
+        let rows = q.fetch_all(&self.db).await?;
+
+        let mut sessions: Vec<OperatorSession> = rows
+            .iter()
+            .map(Self::row_to_session)
+            .collect::<PdsResult<Vec<_>>>()?;
+        let next = if sessions.len() as i64 > lim {
+            sessions.truncate(lim as usize);
+            sessions.last().map(|s| {
+                SessionCursor {
+                    created_at: s.created_at.to_rfc3339(),
+                    id: s.id.clone(),
+                }
+                .encode()
+            })
+        } else {
+            None
+        };
+        Ok((sessions, next))
     }
 
     fn row_to_session(row: &sqlx::any::AnyRow) -> PdsResult<OperatorSession> {
