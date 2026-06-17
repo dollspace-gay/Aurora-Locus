@@ -60,7 +60,7 @@
         '<tbody>' + items.map((e) =>
           '<tr><td>' + esc(e.sequence || e.seq) + '</td>' +
           '<td>' + esc(e.eventType || e.kind) + '</td>' +
-          '<td>' + esc(fmt ? fmt.date(e.createdAt || e.timestamp, 'short') : '') + '</td>' +
+          '<td>' + global.AuroraTimestamp.render({ value: e.createdAt || e.timestamp, context: 'detail' }) + '</td>' +
           '<td>' + (e.did ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(e.did) : '<code>' + esc(e.did) + '</code>') : '—') + '</td></tr>'
         ).join('') + '</tbody></table>';
     } catch (e) {

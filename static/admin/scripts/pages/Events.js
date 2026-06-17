@@ -92,7 +92,7 @@
     if (event.subjectDid) subj = global.AuroraEntityRef ? global.AuroraEntityRef.account(event.subjectDid) : 'repo: ' + event.subjectDid;
     else if (event.subjectUri) subj = global.AuroraEntityRef ? global.AuroraEntityRef.record(event.subjectUri) : 'record: ' + event.subjectUri;
     tr.innerHTML =
-      '<td>' + esc(fmt ? fmt.date(event.createdAt, 'short') : event.createdAt) + '</td>' +
+      '<td>' + global.AuroraTimestamp.render({ value: event.createdAt, context: 'detail' }) + '</td>' +
       '<td>' + esc(event.eventType) + '</td>' +
       '<td>' + (actor ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(actor) : esc(actor)) : '—') + '</td>' +
       '<td>' + subj + '</td>' +
@@ -132,7 +132,7 @@
         let subj = '—';
         if (e.subject) subj = global.AuroraEntityRef ? global.AuroraEntityRef.fromSubject(e.subject) : esc(JSON.stringify(e.subject));
         html += '<tr>' +
-                '<td>' + esc(fmt ? fmt.date(e.createdAt, 'short') : e.createdAt) + '</td>' +
+                '<td>' + global.AuroraTimestamp.render({ value: e.createdAt, context: 'detail' }) + '</td>' +
                 '<td>' + esc(e.eventType) + '</td>' +
                 '<td>' + (actor ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(actor, e.actorHandle) : esc(actor)) : '—') + '</td>' +
                 '<td>' + subj + '</td>' +

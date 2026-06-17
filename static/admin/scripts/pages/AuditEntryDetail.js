@@ -46,7 +46,7 @@
       '  <h3>Entry detail</h3>' +
       '  <dl style="font-size: 0.875rem;">' +
       '    <dt>Sequence</dt><dd>' + esc(e.sequence) + '</dd>' +
-      '    <dt>Timestamp</dt><dd>' + esc(fmt ? fmt.date(e.timestamp, 'medium') : e.timestamp) + '</dd>' +
+      '    <dt>Timestamp</dt><dd>' + global.AuroraTimestamp.render({ value: e.timestamp, context: 'forensic' }) + '</dd>' +
       '    <dt>Actor DID</dt><dd>' + (e.actorDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(e.actorDid) : '<code>' + esc(e.actorDid) + '</code>') : '—') + '</dd>' +
       '    <dt>Action</dt><dd>' + esc(e.action) + '</dd>' +
       '    <dt>Rationale</dt><dd>' + esc(e.rationale) + '</dd>' +

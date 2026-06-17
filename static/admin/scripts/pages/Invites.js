@@ -67,7 +67,7 @@
         '<td>' + (global.AuroraEntityRef ? global.AuroraEntityRef.invite(c.code) : '<code>' + esc(c.code) + '</code>') + '</td>' +
         '<td>' + (c.uses || 0) + ' / ' + (c.available || 1) + '</td>' +
         '<td>' + (c.created_by ? '@' + esc(c.created_by) : 'system') + '</td>' +
-        '<td>' + esc(fmt ? fmt.date(c.created_at, 'short') : c.created_at) + '</td>' +
+        '<td>' + global.AuroraTimestamp.render({ value: c.created_at, context: 'detail' }) + '</td>' +
         '<td>' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(c.disabled ? 'suspended' : 'active', c.disabled ? 'Disabled' : 'Active') : '') + '</td>' +
         '<td><button class="btn-sm btn-danger" data-disable="' + esc(c.code) + '"' +
             (c.disabled ? ' disabled' : '') + '>Disable</button></td>' +

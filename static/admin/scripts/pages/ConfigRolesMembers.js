@@ -93,7 +93,7 @@
         return '<tr>' +
           '<td>' + (ref ? ref.account(m.did) : '@' + esc(m.did)) + '</td>' +
           '<td><code>' + esc(ref ? ref.shortDid(m.did) : m.did) + '</code></td>' +
-          '<td>' + esc(fmt && m.granted_at ? fmt.date(m.granted_at, 'short') : '—') + '</td>' +
+          '<td>' + global.AuroraTimestamp.render({ value: m.granted_at, context: 'detail' }) + '</td>' +
           '<td>' + (m.granted_by ? (ref ? ref.account(m.granted_by) : esc(m.granted_by)) : '—') + '</td>' +
           '<td>' + (isSuper
             ? '<button class="btn-sm btn-danger" data-revoke="' + esc(m.did) + '"' +

@@ -126,7 +126,7 @@
           : '<span class="status-badge status-suspended" title="Hash does not match — possibly tampered or pre-chain">✗ unverified</span>';
         html += '<tr>' +
                 '<td>' + esc(e.sequence) + '</td>' +
-                '<td>' + esc(fmt ? fmt.date(e.timestamp, 'short') : e.timestamp) + '</td>' +
+                '<td>' + global.AuroraTimestamp.render({ value: e.timestamp, context: 'forensic' }) + '</td>' +
                 '<td>' + (e.actorDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(e.actorDid) : '<code>' + esc(e.actorDid) + '</code>') : '—') + '</td>' +
                 '<td>' + esc(e.action) + '</td>' +
                 '<td><code>' + esc(subj) + '</code></td>' +

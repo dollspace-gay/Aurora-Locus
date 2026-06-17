@@ -51,7 +51,7 @@
       '  <p><strong>CID:</strong> <code>' + esc(cid) + '</code></p>' +
       '  <p><strong>Mime:</strong> ' + esc(blob.mimeType || 'unknown') + '</p>' +
       '  <p><strong>Size:</strong> ' + esc(fmt ? fmt.bytes(blob.size) : (blob.size || '')) + '</p>' +
-      '  <p><strong>Created:</strong> ' + esc(fmt ? fmt.date(blob.createdAt, 'medium') : blob.createdAt || '') + '</p>' +
+      '  <p><strong>Created:</strong> ' + global.AuroraTimestamp.render({ value: blob.createdAt, context: 'detail' }) + '</p>' +
       '</div>' +
       (previewSrc ? '<div class="settings-card" style="margin-top: 1rem;">' +
         '<h3>Preview</h3>' +

@@ -81,9 +81,9 @@
     }
     if (bcEl) bcEl.textContent = '@' + handle;
     if (metaEl) {
-      const created = global.AuroraFormat ? global.AuroraFormat.date(info.createdAt, 'medium') : '';
+      const created = global.AuroraTimestamp.render({ value: info.createdAt, context: 'detail' });
       metaEl.innerHTML = '<code>' + esc(currentDid) + '</code>' +
-                        (created ? ' · Member since ' + esc(created) : '');
+                        (created ? ' · Member since ' + created : '');
     }
     renderDrawers(info);
   }
@@ -217,7 +217,7 @@
            defItem('Handle', '@' + esc(info.handle || '—')) +
            defItem('DID', '<code>' + esc(currentDid) + '</code>') +
            defItem('Email', esc(info.email || 'N/A')) +
-           defItem('Created', fmt ? esc(fmt.date(info.createdAt, 'medium')) : esc(info.createdAt || '')) +
+           defItem('Created', global.AuroraTimestamp.render({ value: info.createdAt, context: 'detail' })) +
            defItem('Posts', String(info.postsCount || 0)) +
            defItem('Followers', String(info.followersCount || 0)) +
            defItem('Following', String(info.followingCount || 0)) +
@@ -618,7 +618,7 @@
         '<li style="padding: 0.5rem 0; border-bottom: 1px solid var(--color-border-primary);">' +
         '<strong>' + esc(it.eventType || it.action || '') + '</strong>' +
         ' by ' + (global.AuroraEntityRef ? global.AuroraEntityRef.account(it.actorDid) : esc(it.actorDid)) +
-        ' — ' + (fmt ? esc(fmt.relativeTime(it.createdAt || it.timestamp)) : esc(it.createdAt || '')) +
+        ' — ' + global.AuroraTimestamp.render({ value: it.createdAt || it.timestamp, context: 'activity' }) +
         (it.id != null ? ' · ' + (global.AuroraEntityRef ? global.AuroraEntityRef.event(it.id) : '#' + esc(it.id)) : '') +
         '</li>').join('') + '</ul>';
     } catch (e) {

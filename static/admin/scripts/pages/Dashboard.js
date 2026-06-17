@@ -133,13 +133,13 @@
         const f = fmt();
         el.innerHTML = rows.slice(0, 20).map((e) => {
           const label = esc(e.eventType || e.kind || e.action || e.type || 'event');
-          const when = f ? f.relativeTime(e.createdAt || e.timestamp || e.created_at) : '';
+          const when = global.AuroraTimestamp.render({ value: e.createdAt || e.timestamp || e.created_at, context: 'activity' });
           const href = e.id ? '#mod/events/' + encodeURIComponent(e.id) : null;
           const inner =
             '<div class="activity-icon">' + icon('shield-alert', 18) + '</div>' +
             '<div class="activity-content">' +
             '  <div class="activity-text">' + label + '</div>' +
-            '  <div class="activity-time">' + esc(when) + '</div>' +
+            '  <div class="activity-time">' + when + '</div>' +
             '</div>';
           return href
             ? '<a class="activity-item" href="' + href + '">' + inner + '</a>'
@@ -344,13 +344,13 @@
           const f = fmt();
           el.innerHTML = rows.slice(0, 10).map((e) => {
             const label = esc(e.action || e.eventType || e.kind || 'action');
-            const when = f ? f.relativeTime(e.createdAt || e.timestamp || e.created_at) : '';
+            const when = global.AuroraTimestamp.render({ value: e.createdAt || e.timestamp || e.created_at, context: 'activity' });
             const href = e.id ? '#mod/audit/' + encodeURIComponent(e.id) : null;
             const inner =
               '<div class="activity-icon">' + icon('archive', 18) + '</div>' +
               '<div class="activity-content">' +
               '  <div class="activity-text">' + label + '</div>' +
-              '  <div class="activity-time">' + esc(when) + '</div>' +
+              '  <div class="activity-time">' + when + '</div>' +
               '</div>';
             return href
               ? '<a class="activity-item" href="' + href + '">' + inner + '</a>'

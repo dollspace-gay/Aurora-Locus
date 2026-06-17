@@ -97,7 +97,7 @@
         const fmt = global.AuroraFormat;
         card.innerHTML = '<h4>Subject history</h4><ul style="list-style:none; padding:0;">' + items.map((it) =>
           '<li style="padding: 0.25rem 0;">' + esc(it.eventType || it.action || '') + ' — ' +
-          (fmt ? esc(fmt.relativeTime(it.createdAt || it.timestamp)) : esc(it.createdAt || '')) +
+          global.AuroraTimestamp.render({ value: it.createdAt || it.timestamp, context: 'activity' }) +
           '</li>').join('') + '</ul>';
       }
     } catch (e) { /* ignore */ }

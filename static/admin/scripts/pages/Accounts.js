@@ -82,7 +82,7 @@
 
     tbody.innerHTML = accounts.map((u) => {
       const status = u.status || 'active';
-      const created = global.AuroraFormat ? global.AuroraFormat.date(u.createdAt, 'short') : '';
+      const created = global.AuroraTimestamp.render({ value: u.createdAt, context: 'detail' });
       return '<tr>' +
              '<td><input type="checkbox" class="bulk-select-account" data-did="' + esc(u.did) +
              '"' + (bulkSelected.has(u.did) ? ' checked' : '') +
@@ -90,7 +90,7 @@
              '<td><a href="#ops/accounts/' + encodeURIComponent(u.did) + '">@' + esc(u.handle || 'unknown') + '</a></td>' +
              '<td><code>' + esc(global.AuroraEntityRef ? global.AuroraEntityRef.shortDid(u.did) : u.did) + '</code></td>' +
              '<td>' + esc(u.email || 'N/A') + '</td>' +
-             '<td>' + esc(created) + '</td>' +
+             '<td>' + created + '</td>' +
              '<td>' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(status, status) : status) + '</td>' +
              '<td><a class="btn-sm btn-primary" href="#ops/accounts/' + encodeURIComponent(u.did) + '">View</a></td>' +
              '</tr>';

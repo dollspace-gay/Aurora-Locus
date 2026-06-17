@@ -37,7 +37,7 @@
       document.getElementById('fed-status').innerHTML = '<h3>Federation status</h3>' +
         '<p><strong>Peer count:</strong> ' + esc(status.peerCount || 0) + '</p>' +
         '<p><strong>Recent events:</strong> ' + esc(status.recentEventCount || 0) + '</p>' +
-        '<p><strong>Last activity:</strong> ' + esc(status.lastActivityAt ? (global.AuroraFormat ? global.AuroraFormat.relativeTime(status.lastActivityAt) : status.lastActivityAt) : '—') + '</p>';
+        '<p><strong>Last activity:</strong> ' + global.AuroraTimestamp.render({ value: status.lastActivityAt, context: 'activity' }) + '</p>';
     } catch (e) {
       document.getElementById('fed-status').innerHTML = '<h3>Federation status</h3><p class="empty-state">Unavailable.</p>';
     }
@@ -54,7 +54,7 @@
         '<table class="data-table"><thead><tr><th>Hostname</th><th>Last seen</th><th>Status</th></tr></thead><tbody>' +
         items.map((i) => '<tr>' +
           '<td>' + esc(i.hostname || i.url) + '</td>' +
-          '<td>' + esc(i.lastSeenAt ? (fmt ? fmt.relativeTime(i.lastSeenAt) : i.lastSeenAt) : '—') + '</td>' +
+          '<td>' + global.AuroraTimestamp.render({ value: i.lastSeenAt, context: 'activity' }) + '</td>' +
           '<td>' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(i.status || 'active', i.status || 'active') : '') + '</td>' +
           '</tr>').join('') +
         '</tbody></table>';

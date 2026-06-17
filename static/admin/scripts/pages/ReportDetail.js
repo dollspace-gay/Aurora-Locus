@@ -31,7 +31,7 @@
       '  <div class="settings-card">' +
       '    <h3>Report metadata</h3>' +
       '    <p><strong>Reason:</strong> ' + esc(r.reasonType || 'Unknown') + '</p>' +
-      '    <p><strong>Reported:</strong> ' + esc(fmt ? fmt.date(r.reportedAt || r.createdAt, 'medium') : '') + '</p>' +
+      '    <p><strong>Reported:</strong> ' + global.AuroraTimestamp.render({ value: r.reportedAt || r.createdAt, context: 'detail' }) + '</p>' +
       '    <p><strong>Reporter:</strong> ' + (reporter ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(reporter) : esc(reporter)) : '—') + '</p>' +
       '    <p><strong>Subject:</strong> ' + (subjDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(subjDid) : esc(subjDid)) : esc(r.subject || '')) + '</p>' +
       '    <p><strong>Status:</strong> ' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(r.status || 'open', r.status || 'open') : '') + '</p>' +

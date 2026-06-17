@@ -43,7 +43,7 @@
         '<dl class="capability-meta">' +
         '  <p><strong>Version:</strong> ' + esc(v.version || '—') + '</p>' +
         '  <p><strong>Commit:</strong> <code>' + esc(v.commit || '—') + '</code></p>' +
-        '  <p><strong>Built:</strong> ' + esc(fmt ? fmt.date(v.builtAt, 'medium') : v.builtAt || '—') + '</p>' +
+        '  <p><strong>Built:</strong> ' + global.AuroraTimestamp.render({ value: v.builtAt, context: 'detail' }) + '</p>' +
         '  <p><strong>Rust:</strong> ' + esc(v.rustVersion || '—') + '</p>' +
         '</dl>';
     } catch (e) {

@@ -31,7 +31,7 @@
       '<div class="settings-grid">' +
       '  <div class="settings-card">' +
       '    <h3>Appeal metadata</h3>' +
-      '    <p><strong>Submitted:</strong> ' + esc(fmt ? fmt.date(a.submittedAt, 'medium') : a.submittedAt) + '</p>' +
+      '    <p><strong>Submitted:</strong> ' + global.AuroraTimestamp.render({ value: a.submittedAt, context: 'detail' }) + '</p>' +
       '    <p><strong>Status:</strong> ' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(a.status, a.status) : esc(a.status)) + '</p>' +
       '    <p><strong>Appellant:</strong> ' + (a.submitterDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(a.submitterDid, a.submitterHandle) : esc(a.submitterDid)) : '—') + '</p>' +
       '    <p><strong>Subject:</strong> ' + subj + '</p>' +

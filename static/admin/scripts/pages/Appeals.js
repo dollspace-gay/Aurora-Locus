@@ -108,7 +108,7 @@
              (a.originalActionSummary.summary || ''))
           : '—';
         html += '<tr>' +
-                '<td>' + esc(fmt ? fmt.date(a.submittedAt, 'short') : a.submittedAt || '') + '</td>' +
+                '<td>' + global.AuroraTimestamp.render({ value: a.submittedAt, context: 'detail' }) + '</td>' +
                 '<td>' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(a.status, a.status) : esc(a.status)) + '</td>' +
                 '<td>' + (a.submitterDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(a.submitterDid, a.submitterHandle) : esc(a.submitterDid)) : '—') + '</td>' +
                 '<td>' + subjStr + '</td>' +

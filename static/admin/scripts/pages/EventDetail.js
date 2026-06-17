@@ -29,7 +29,7 @@
       '  <div class="settings-card">' +
       '    <h3>Event metadata</h3>' +
       '    <p><strong>Type:</strong> ' + esc(e.eventType) + '</p>' +
-      '    <p><strong>When:</strong> ' + esc(fmt ? fmt.date(e.createdAt, 'medium') : e.createdAt) + '</p>' +
+      '    <p><strong>When:</strong> ' + global.AuroraTimestamp.render({ value: e.createdAt, context: 'detail' }) + '</p>' +
       '    <p><strong>Actor:</strong> ' + (e.actorDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(e.actorDid, e.actorHandle) : esc(e.actorDid)) : '—') + '</p>' +
       '    <p><strong>Subject:</strong> ' + subj + '</p>' +
       '  </div>' +
