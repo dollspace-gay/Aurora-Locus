@@ -55,9 +55,9 @@
       '<header class="page-header"><h2>' + esc(t('kryphocron.laquna.title')) + '</h2>' +
       '  <p class="page-subtitle">' + esc(t('kryphocron.laquna.subtitle')) + '</p></header>' +
       '<div class="settings-grid">' +
-      '  <div class="settings-card" id="lq-state"><p>' + esc(t('common.loading')) + '</p></div>' +
-      '  <div class="settings-card" id="lq-action"><p>' + esc(t('common.loading')) + '</p></div>' +
-      '  <div class="settings-card" id="lq-cadence"><p>' + esc(t('common.loading')) + '</p></div>' +
+      '  <div class="settings-card" id="lq-state">' + global.AuroraSkeleton.lines(4) + '</div>' +
+      '  <div class="settings-card" id="lq-action">' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="lq-cadence">' + global.AuroraSkeleton.lines(3) + '</div>' +
       '</div>';
 
     await renderState();

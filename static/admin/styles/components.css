@@ -1430,8 +1430,35 @@ input[type="checkbox"][disabled] {
   100% { background-position: -100% 0; }
 }
 
+/* AuroraSkeleton element shapes (§8.2.5) — composed by the primitive. */
+.skeleton-line {
+  height: 0.85em;
+  margin: var(--space-2) 0;
+}
+.skeleton-title {
+  height: 1.1em;
+  width: 40%;
+  margin-bottom: var(--space-3);
+}
+.skeleton-card .skeleton-line:last-child { margin-bottom: 0; }
+
+/* ==================== Spinner (§8.2.5 action-in-flight) ==================== */
+.spinner {
+  display: inline-block;
+  vertical-align: middle;
+  border: 2px solid color-mix(in srgb, var(--color-text-tertiary) 40%, transparent);
+  border-top-color: var(--color-accent-primary);
+  border-radius: var(--radius-full);
+  animation: spinner-rotate 0.7s linear infinite;
+}
+
+@keyframes spinner-rotate {
+  to { transform: rotate(360deg); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .skeleton { animation: none; }
+  .spinner { animation-duration: 1.6s; }
 }
 
 /* ==================== Utility helpers (#108D legacy) ==================== */

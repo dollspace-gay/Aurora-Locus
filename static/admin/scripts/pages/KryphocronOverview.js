@@ -38,11 +38,11 @@
       '<header class="page-header"><h2>' + esc(t('kryphocron.overview.title')) + '</h2>' +
       '  <p class="page-subtitle">' + esc(t('kryphocron.overview.subtitle')) + '</p></header>' +
       '<div class="settings-grid">' +
-      '  <div class="settings-card" id="ko-identity"><p>' + esc(t('common.loading')) + '</p></div>' +
-      '  <div class="settings-card" id="ko-counts"><p>' + esc(t('common.loading')) + '</p></div>' +
-      '  <div class="settings-card" id="ko-rotation"><p>' + esc(t('common.loading')) + '</p></div>' +
-      '  <div class="settings-card" id="ko-oracle"><p>' + esc(t('common.loading')) + '</p></div>' +
-      '  <div class="settings-card" id="ko-activity"><p>' + esc(t('common.loading')) + '</p></div>' +
+      '  <div class="settings-card" id="ko-identity">' + global.AuroraSkeleton.lines(5) + '</div>' +
+      '  <div class="settings-card" id="ko-counts">' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="ko-rotation">' + global.AuroraSkeleton.lines(4) + '</div>' +
+      '  <div class="settings-card" id="ko-oracle">' + global.AuroraSkeleton.lines(2) + '</div>' +
+      '  <div class="settings-card" id="ko-activity">' + global.AuroraSkeleton.lines(4) + '</div>' +
       '</div>';
 
     await refresh();

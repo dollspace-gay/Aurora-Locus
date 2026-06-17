@@ -33,7 +33,7 @@
       '<header class="page-header"><h2>' + esc(t('kryphocron.history.title')) + '</h2>' +
       '  <p class="page-subtitle">' + esc(t('kryphocron.history.subtitle')) + '</p></header>' +
       '<div class="two-col-grid" id="lh-grid">' +
-      '  <div class="settings-card"><p>' + esc(t('common.loading')) + '</p></div>' +
+      global.AuroraSkeleton.cards(2) +
       '</div>';
 
     await load(container);

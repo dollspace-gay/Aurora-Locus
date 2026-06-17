@@ -112,7 +112,7 @@
       '<header class="page-header"><h2>' + esc(t('kryphocron.policy.title')) + '</h2>' +
       '  <p class="page-subtitle">' + esc(t('kryphocron.policy.subtitle')) + '</p></header>' +
       '<div class="settings-grid" id="kpolicy-grid">' +
-      '  <div class="settings-card"><p>' + esc(t('common.loading')) + '</p></div>' +
+      global.AuroraSkeleton.cards(6) +
       '</div>';
 
     await load(container);

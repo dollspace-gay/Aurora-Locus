@@ -33,7 +33,7 @@
       '<header class="page-header"><h2>' + esc(t('kryphocron.audiences.title')) + '</h2>' +
       '  <p class="page-subtitle">' + esc(t('kryphocron.audiences.subtitle')) + '</p></header>' +
       '<div class="settings-grid" id="ka-grid">' +
-      '  <div class="settings-card"><p>' + esc(t('common.loading')) + '</p></div>' +
+      global.AuroraSkeleton.cards(3) +
       '</div>';
     await refresh();
     pollHandle = setInterval(refresh, 30000);
