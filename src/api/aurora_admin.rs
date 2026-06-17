@@ -5724,9 +5724,22 @@ mod tests {
     #[tokio::test]
     async fn get_moderation_metrics_returns_series_with_buckets() {
         let ctx = create_test_context().await;
-        // Seed 3 reports today.
+        // Fixed anchor for both seeds and the query window so they can't drift
+        // (#265). compute_metric buckets a row at idx = (ts - start)/bucket_secs
+        // and drops it when idx >= bucket_count; with Day granularity a ~1-day
+        // window yields bucket_count == 1, so a report landing exactly on the
+        // 86400s boundary (idx == 1) is silently excluded. The old now()-based
+        // fixture put report i=0 at exactly `now` with `start = now - 1day`,
+        // i.e. precisely on that boundary, and passed only because `start` was
+        // sampled microseconds *after* the seed — a backward wall-clock step
+        // under load (WSL2) flipped secs_since to >= 86400 and dropped it
+        // (aggregate 2.0, not 3.0). Anchoring `start` 3h before the newest
+        // report keeps all three strictly interior to bucket 0, deterministically.
+        let anchor = chrono::DateTime::parse_from_rfc3339("2020-06-15T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         for i in 0..3 {
-            let when = (chrono::Utc::now() - chrono::Duration::hours(i)).to_rfc3339();
+            let when = (anchor - chrono::Duration::hours(i)).to_rfc3339();
             sqlx::query(
                 "INSERT INTO report (subject_did, reason_type, reported_by, reported_at, status) \
                  VALUES ('did:plc:s', 'spam', 'did:plc:r', $1, 'open')",
@@ -5736,8 +5749,8 @@ mod tests {
             .await
             .unwrap();
         }
-        let start = chrono::Utc::now() - chrono::Duration::days(1);
-        let end = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let start = anchor - chrono::Duration::hours(3);
+        let end = anchor + chrono::Duration::seconds(60);
         use axum_extra::extract::Query as ExtraQuery;
         let resp = get_moderation_metrics(
             State(ctx),
@@ -5759,7 +5772,14 @@ mod tests {
     #[tokio::test]
     async fn get_moderation_metrics_delta_compares_previous_range() {
         let ctx = create_test_context().await;
-        let now = chrono::Utc::now();
+        // Fixed anchor (see the buckets test, #265) to drop the now()-drift
+        // anti-pattern. These reports sit at now-1h / now-30h — interior to
+        // their buckets, not on the 86400s boundary — so this test wasn't the
+        // observed flake; pinning `now` still forecloses the same class and
+        // keeps current-vs-previous-window bucketing fully deterministic.
+        let now = chrono::DateTime::parse_from_rfc3339("2020-06-15T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         // 2 reports in current 1-day window
         for _ in 0..2 {
             sqlx::query(
@@ -6395,9 +6415,9 @@ mod tests {
         let timestamps: Vec<String> = (0..5)
             .map(|i| format!("2020-01-01T0{}:00:00+00:00", i))
             .collect();
-        for i in 0..5usize {
+        for (i, ts) in timestamps.iter().enumerate() {
             sqlx::query("UPDATE audit_chain_entry SET created_at = $1 WHERE sequence = $2")
-                .bind(&timestamps[i])
+                .bind(ts)
                 .bind((i + 1) as i64)
                 .execute(&ctx.account_db)
                 .await

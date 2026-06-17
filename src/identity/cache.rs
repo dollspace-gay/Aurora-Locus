@@ -556,6 +556,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_preserves_stale_entries() {
+        use crate::identity::clock::MockClock;
+
         let db = open_any_memory_pool().await;
 
         // `cleanup_expired` deletes from BOTH `did_doc` and `did_handle`,
@@ -580,9 +582,16 @@ mod tests {
         .await
         .unwrap();
 
-        // Create cache: stale=1s, max=10s
-        let cache =
-            DidCache::new(db).with_did_doc_ttls(Duration::seconds(1), Duration::seconds(10));
+        // Test-controlled clock — replaces a `tokio::time::sleep(2s)` against
+        // the real wall clock that this test was left with when its sibling
+        // (test_stale_handle_detection) was hardened. A real 2s sleep can
+        // dilate past the 10s max TTL under full-suite load, so cleanup would
+        // delete the entry and the is_some() assertion would flake (#266).
+        // Cache: stale=1s, max=10s.
+        let mock_clock = Arc::new(MockClock::new(Utc::now()));
+        let cache = DidCache::new(db)
+            .with_did_doc_ttls(Duration::seconds(1), Duration::seconds(10))
+            .with_clock(mock_clock.clone());
 
         let did = "did:plc:cleanuptest";
         let doc = r#"{"id":"did:plc:cleanuptest"}"#;
@@ -590,8 +599,8 @@ mod tests {
         // Cache document
         cache.cache_did_doc(did, doc).await.unwrap();
 
-        // Wait for stale TTL
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        // Advance past stale TTL (1s) but within max TTL (10s).
+        mock_clock.advance(Duration::seconds(2));
 
         // Run cleanup - should NOT delete stale entries
         cache.cleanup_expired().await.unwrap();
