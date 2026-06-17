@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- I-error-apply — apply §8.2.4 hierarchy to remaining pages (AuroraErrorBoundary on detail/render-blocking; inline-error on non-Arc-D saves) (#251)
+- I-loading-apply — apply §8.2.5 hierarchy to remaining pages (skeletons on content pages; AuroraSpinner on in-flight actions) (#252)
+- I-timestamp-remaining — §10.4.3 migrate remaining existing pages to AuroraTimestamp (#243)
 - I-loading-audit — §8.2.5 loading-state existing-page audit (#248)
 - I-error-audit — §8.2.4 error-handling existing-page audit (#247)
 - I-loading-primitives — build AuroraSkeleton + AuroraSpinner + apply per §8.2.5 hierarchy (#250)
