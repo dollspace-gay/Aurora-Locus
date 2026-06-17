@@ -89,23 +89,34 @@ pub fn routes(state_store: OAuthStateStore) -> Router<AppContext> {
         .route("/oauth/client-metadata.json", get(client_metadata))
 }
 
-/// Mint a 24h HS256 `scope=admin` access JWT for `did`. Shared by the
-/// OAuth callback (AS-only admin login) and `/admin-oauth/refresh` so both
-/// paths emit a byte-identical access-token shape.
+/// Mint a 24h HS256 `scope=admin` access JWT for `did`, carrying the
+/// operator-session id `sid` (§8.1.7 / #271). Shared by the OAuth callback
+/// (AS-only admin login) and `/admin-oauth/refresh` so both paths emit a
+/// byte-identical access-token shape — and so a refreshed token preserves
+/// the session's `sid`, keeping the per-request session lookup continuous
+/// across refreshes. The auth path treats the `sid` as optional: tokens
+/// minted before #271 simply have none and take the legacy stateless path.
 fn mint_admin_access_jwt(
     jwt_secret: &str,
     did: &str,
+    sid: Option<&str>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::json;
 
     let now = chrono::Utc::now().timestamp();
-    let claims = json!({
+    let mut claims = json!({
         "sub": did,
         "iat": now,
         "exp": now + 86400, // 24 hours
         "scope": "admin",
     });
+    // Only stamp `sid` when there's a session to bind to. A legacy refresh
+    // token minted before #271 has none; its refreshed access token stays
+    // sid-less and takes the auth path's legacy stateless branch.
+    if let Some(sid) = sid {
+        claims["sid"] = serde_json::Value::String(sid.to_string());
+    }
     encode(
         &Header::default(),
         &claims,
@@ -183,15 +194,22 @@ async fn handle_refresh(
                         "refresh token missing 'sub' claim",
                     )
                 })?;
+            // Preserve the session id across refresh so the per-request
+            // session lookup stays continuous (#271). Rotation of the
+            // refresh token itself lands in #272; here we only reissue the
+            // access token bound to the same `sid`.
+            let sid = claims.get("sid").and_then(|v| v.as_str());
             let access_token =
-                mint_admin_access_jwt(&ctx.config.authentication.jwt_secret, did).map_err(|e| {
-                    tracing::error!("failed to mint admin access token on refresh: {}", e);
-                    refresh_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "MintFailed",
-                        "failed to mint access token",
-                    )
-                })?;
+                mint_admin_access_jwt(&ctx.config.authentication.jwt_secret, did, sid).map_err(
+                    |e| {
+                        tracing::error!("failed to mint admin access token on refresh: {}", e);
+                        refresh_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "MintFailed",
+                            "failed to mint access token",
+                        )
+                    },
+                )?;
             tracing::debug!(did = %did, "admin access token refreshed (AS-only path)");
             return Ok(Json(RefreshResponse {
                 access_token,
@@ -330,6 +348,7 @@ struct OAuthLoginResponse {
 async fn handle_oauth_callback(
     State(ctx): State<AppContext>,
     axum::Extension(state_store): axum::Extension<OAuthStateStore>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<OAuthCallbackParams>,
 ) -> Result<axum::response::Html<String>, (StatusCode, String)> {
     tracing::info!("Handling OAuth callback");
@@ -439,22 +458,57 @@ async fn handle_oauth_callback(
         use jsonwebtoken::{encode, EncodingKey, Header};
         use serde_json::json;
 
-        let now = chrono::Utc::now().timestamp();
-
-        let access_token = mint_admin_access_jwt(&ctx.config.authentication.jwt_secret, &did)
+        // Record a server-side operator session (§8.1.7 / #271). It outlives
+        // the 24h access token, so tie its lifetime to the 30d refresh
+        // window. `refresh_id` is the rotation-chain head (#272). Both the
+        // access and refresh tokens carry the resulting `sid` so the auth
+        // path can validate/touch/revoke this session per request.
+        let refresh_id = uuid::Uuid::new_v4().to_string();
+        let source_ip =
+            crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
+                .map(|ip| ip.to_string());
+        let user_agent = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let sid = ctx
+            .operator_session_store
+            .create(
+                &did,
+                source_ip.as_deref(),
+                user_agent.as_deref(),
+                &refresh_id,
+                chrono::Duration::days(30),
+            )
+            .await
             .map_err(|e| {
-                tracing::error!("Failed to create JWT: {}", e);
+                tracing::error!("Failed to create operator session: {}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to create token".to_string(),
+                    "Failed to create session".to_string(),
                 )
             })?;
+
+        let now = chrono::Utc::now().timestamp();
+
+        let access_token =
+            mint_admin_access_jwt(&ctx.config.authentication.jwt_secret, &did, Some(&sid))
+                .map_err(|e| {
+                    tracing::error!("Failed to create JWT: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to create token".to_string(),
+                    )
+                },
+            )?;
 
         let refresh_claims = json!({
             "sub": did,
             "iat": now,
             "exp": now + 2592000, // 30 days
             "scope": "refresh",
+            "sid": sid,
+            "rid": refresh_id,
         });
 
         let refresh_token = encode(
@@ -690,7 +744,7 @@ mod tests {
     /// The shared mint helper produces a valid 24h `scope=admin` JWT.
     #[test]
     fn mint_admin_access_jwt_produces_valid_admin_token() {
-        let token = mint_admin_access_jwt(TEST_SECRET, "did:plc:minttest").unwrap();
+        let token = mint_admin_access_jwt(TEST_SECRET, "did:plc:minttest", None).unwrap();
         let td = crate::auth::verify_jwt_token(&token, TEST_SECRET).expect("verifies");
         assert_eq!(
             td.claims.get("scope").and_then(|v| v.as_str()),
@@ -771,7 +825,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_rejects_access_token_presented_as_refresh() {
         let ctx = create_test_context().await;
-        let access = mint_admin_access_jwt(TEST_SECRET, "did:plc:x").unwrap();
+        let access = mint_admin_access_jwt(TEST_SECRET, "did:plc:x", None).unwrap();
         let err = handle_refresh(
             State(ctx),
             Json(RefreshRequest {

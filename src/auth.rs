@@ -299,9 +299,31 @@ pub(crate) async fn admin_auth_from_token(
                     "HS256 token does not have admin scope".to_string(),
                 ));
             }
+            // §8.1.7 / #271: tokens minted once the operator-session store
+            // landed carry a `sid`. When present, the session must be live —
+            // not revoked, not expired — on EVERY request; this is what makes
+            // a SuperAdmin force-logout (#273) take effect on the operator's
+            // very next request, and bumps the session's last-active stamp.
+            // Tokens without a `sid` (minted before #271) take the legacy
+            // stateless path unchanged, so a deploy doesn't bounce live
+            // sessions.
+            let sid = claims
+                .get("sid")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            if let Some(sid) = sid {
+                if !state.operator_session_store.validate_and_touch(sid).await? {
+                    tracing::debug!(reason = "session-invalid", "HS256 admin token rejected");
+                    return Err(PdsError::Authentication(
+                        "operator session is no longer valid".to_string(),
+                    ));
+                }
+            }
             let session = ValidatedSession {
                 did: did.clone(),
-                session_id: format!("jwt-{}", Uuid::new_v4()),
+                session_id: sid
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("jwt-{}", Uuid::new_v4())),
                 is_app_password: false,
             };
             return finalize_admin_role(state, did, session).await;
@@ -1976,6 +1998,106 @@ mod admin_auth_third_path_tests {
         match admin_auth_from_token(&ctx, &token).await {
             Err(PdsError::Authorization(_)) => {}
             other => panic!("expected Authorization (403) after revoke, got {:?}", other),
+        }
+    }
+
+    // ---------- §8.1.7 operator-session enforcement in the auth path (#271) ----------
+
+    /// Mint an HS256 admin token carrying a `sid` claim, for the
+    /// operator-session enforcement tests below.
+    fn admin_token_with_sid(secret: &str, did: &str, sid: &str) -> String {
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let claims = serde_json::json!({
+            "sub": did,
+            "scope": "admin",
+            "exp": chrono::Utc::now().timestamp() + 3600,
+            "sid": sid,
+        });
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    /// A token bound to a live operator session authenticates, and the
+    /// per-request lookup bumps the session's last-active stamp.
+    #[traced_test]
+    #[tokio::test]
+    async fn admin_token_with_live_session_is_accepted() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let did = "did:plc:liveop";
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .expect("grant_role");
+        let sid = ctx
+            .operator_session_store
+            .create(did, Some("203.0.113.9"), None, "rid-1", chrono::Duration::days(30))
+            .await
+            .expect("create session");
+
+        let token = admin_token_with_sid(&ctx.config.authentication.jwt_secret, did, &sid);
+        let auth = admin_auth_from_token(&ctx, &token).await.expect("live session");
+        assert_eq!(auth.role, Role::Admin);
+        assert_eq!(auth.session.session_id, sid, "session_id reflects the sid");
+    }
+
+    /// The gate that backs SuperAdmin force-logout (#273): once a session is
+    /// revoked, a token bound to it is rejected on the very next request even
+    /// though its signature, scope, and role are all still valid.
+    #[traced_test]
+    #[tokio::test]
+    async fn admin_token_with_revoked_session_is_rejected() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let did = "did:plc:revokedop";
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .expect("grant_role");
+        let sid = ctx
+            .operator_session_store
+            .create(did, None, None, "rid-1", chrono::Duration::days(30))
+            .await
+            .expect("create session");
+        let token = admin_token_with_sid(&ctx.config.authentication.jwt_secret, did, &sid);
+
+        // Live first.
+        admin_auth_from_token(&ctx, &token).await.expect("live before revoke");
+
+        // Simulate the #273 force-logout writer.
+        sqlx::query("UPDATE operator_session SET revoked = TRUE WHERE id = $1")
+            .bind(&sid)
+            .execute(&ctx.account_db)
+            .await
+            .expect("revoke");
+
+        match admin_auth_from_token(&ctx, &token).await {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401) after revoke, got {:?}", other),
+        }
+    }
+
+    /// A token whose `sid` names no session row (stale/forged) is rejected —
+    /// the store returns false for an unknown id.
+    #[traced_test]
+    #[tokio::test]
+    async fn admin_token_with_unknown_session_is_rejected() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let did = "did:plc:ghostop";
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .expect("grant_role");
+        let token = admin_token_with_sid(
+            &ctx.config.authentication.jwt_secret,
+            did,
+            "00000000-0000-0000-0000-000000000000",
+        );
+        match admin_auth_from_token(&ctx, &token).await {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401) for unknown sid, got {:?}", other),
         }
     }
 }

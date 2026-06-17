@@ -2,7 +2,10 @@
 use crate::{
     account::AccountManager,
     actor_store::{ActorStore, ActorStoreConfig},
-    admin::{AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager, ReportManager},
+    admin::{
+        AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager,
+        OperatorSessionStore, ReportManager,
+    },
     blob_store::{BlobBackendType, BlobStorageConfig, BlobStore, BlobStoreConfig},
     config::{BlobstoreConfig, DatabaseConfig, DistributedStateMode, ServerConfig},
     db,
@@ -38,6 +41,10 @@ pub struct AppContext {
     pub identity_resolver: Arc<dyn IdentityResolverApi>,
     // Admin & Moderation
     pub admin_role_manager: Arc<AdminRoleManager>,
+    /// Per-operator session store (§8.1.7 / #271): backs admin session
+    /// listing, force-logout, and refresh rotation. Keyed by the `sid`
+    /// claim carried in admin access/refresh tokens.
+    pub operator_session_store: Arc<OperatorSessionStore>,
     pub moderation_manager: Arc<ModerationManager>,
     pub label_manager: Arc<LabelManager>,
     pub invite_manager: Arc<InviteCodeManager>,
@@ -247,6 +254,7 @@ impl std::fmt::Debug for AppContext {
             .field("blob_store", &"<BlobStore>")
             .field("identity_resolver", &"<dyn IdentityResolverApi>")
             .field("admin_role_manager", &"<AdminRoleManager>")
+            .field("operator_session_store", &"<OperatorSessionStore>")
             .field("moderation_manager", &"<ModerationManager>")
             .field("label_manager", &"<LabelManager>")
             .field("invite_manager", &"<InviteCodeManager>")
@@ -504,6 +512,7 @@ impl AppContext {
 
         // Initialize admin & moderation managers
         let admin_role_manager = Arc::new(AdminRoleManager::new(account_db.clone()));
+        let operator_session_store = Arc::new(OperatorSessionStore::new(account_db.clone()));
         let moderation_manager = Arc::new(ModerationManager::new(
             account_db.clone(),
             account_manager.clone(),
@@ -1048,6 +1057,7 @@ impl AppContext {
             blob_store,
             identity_resolver,
             admin_role_manager,
+            operator_session_store,
             moderation_manager,
             label_manager,
             invite_manager,
