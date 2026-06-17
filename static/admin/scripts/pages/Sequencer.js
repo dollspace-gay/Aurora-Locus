@@ -10,7 +10,7 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#dashboard">Operations</a> <span class="breadcrumb-sep">›</span> Sequencer</nav>' +
       '<header class="page-header"><div><h2>Sequencer</h2><p class="page-subtitle">Position, lag, recent events</p></div></header>' +
-      '<div class="ops-section" id="seq-status"><h3>Status</h3><p class="empty-state">Loading…</p></div>' +
+      '<div class="ops-section" id="seq-status"><h3>Status</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '<div class="ops-section" id="seq-controls"><h3>Controls</h3>' +
       '  <div class="action-panel-buttons" style="justify-content:flex-start; gap: 0.5rem; flex-wrap: wrap;">' +
       '    <button class="btn-secondary" id="seq-pause">Pause</button>' +
@@ -19,7 +19,7 @@
       '    <button class="btn-danger" id="seq-rebuild">Rebuild</button>' +
       '  </div>' +
       '</div>' +
-      '<div class="ops-section" id="seq-recent"><h3>Recent events</h3><p class="empty-state">Loading…</p></div>';
+      '<div class="ops-section" id="seq-recent"><h3>Recent events</h3>' + global.AuroraSkeleton.lines(3) + '</div>';
 
     document.getElementById('seq-pause').addEventListener('click', () => doAction('pauseSequencer', 'Pause sequencer?'));
     document.getElementById('seq-resume').addEventListener('click', () => doAction('resumeSequencer', 'Resume sequencer?'));

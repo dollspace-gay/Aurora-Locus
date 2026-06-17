@@ -22,13 +22,13 @@
       '  <p class="meta"><code>' + esc(uri) + '</code></p>' +
       '</header>' +
       '<div class="detail-layout">' +
-      '  <div class="detail-primary" id="rd-primary"><p class="empty-state">Loading…</p></div>' +
+      '  <div class="detail-primary" id="rd-primary">' + global.AuroraSkeleton.lines(4) + '</div>' +
       '  <aside class="detail-rail" aria-label="Context">' +
       '    <div class="rail-card"><h4>Owning account</h4><div id="rd-owner">' +
       (global.AuroraEntityRef ? global.AuroraEntityRef.account(ownerDid) : '<code>' + esc(ownerDid) + '</code>') +
       '</div></div>' +
-      '    <div class="rail-card" id="rd-context"><h4>Subject context</h4><p class="empty-state">Loading…</p></div>' +
-      '    <div class="rail-card" id="rd-history"><h4>Subject history</h4><p class="empty-state">Loading…</p></div>' +
+      '    <div class="rail-card" id="rd-context"><h4>Subject context</h4>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '    <div class="rail-card" id="rd-history"><h4>Subject history</h4>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '  </aside>' +
       '</div>';
 

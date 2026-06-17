@@ -9,7 +9,7 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#mod/reports">Moderation</a> <span class="breadcrumb-sep">›</span> <a href="#mod/reports">Reports</a> <span class="breadcrumb-sep">›</span> #' + esc(id) + '</nav>' +
       '<header class="page-header"><div><h2>Report #' + esc(id) + '</h2></div></header>' +
-      '<div id="rd-body"><p class="empty-state">Loading…</p></div>';
+      '<div id="rd-body">' + global.AuroraSkeleton.lines(4) + '</div>';
 
     try {
       const data = await global.AuroraEndpoints.atproto.getReport({ id: id });

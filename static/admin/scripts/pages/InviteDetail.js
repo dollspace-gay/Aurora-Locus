@@ -9,7 +9,7 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#ops/invites">Operations</a> <span class="breadcrumb-sep">›</span> <a href="#ops/invites">Invites</a> <span class="breadcrumb-sep">›</span> <code>' + esc(code) + '</code></nav>' +
       '<header class="page-header"><div><h2>Invite <code>' + esc(code) + '</code></h2></div></header>' +
-      '<div id="id-body"><p class="empty-state">Loading…</p></div>';
+      '<div id="id-body">' + global.AuroraSkeleton.lines(4) + '</div>';
     try {
       const data = await global.AuroraEndpoints.atproto.getInviteCodes({ codes: [code] });
       const codes = (data && (data.codes || data.inviteCodes)) || [];

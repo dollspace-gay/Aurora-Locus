@@ -40,7 +40,7 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#configuration/roles">' + esc(T('settings.roles.crumb')) + '</a> <span class="breadcrumb-sep">›</span> ' + esc(T('settings.roles.title')) + '</nav>' +
       '<header class="page-header"><div><h2>' + esc(T('settings.roles.title')) + '</h2><p class="page-subtitle">' + esc(T('settings.roles.subtitle')) + '</p></div></header>' +
-      '<div id="roles-list"><p class="empty-state">' + esc(T('common.loading')) + '</p></div>';
+      '<div id="roles-list">' + global.AuroraSkeleton.lines(4) + '</div>';
     try {
       const data = await global.AuroraEndpoints.atproto.listRoles();
       renderRoles(groupRoles(data), isSuper);

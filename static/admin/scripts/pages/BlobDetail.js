@@ -13,10 +13,10 @@
       '  <p class="meta"><code>' + esc(cid) + '</code></p>' +
       '</header>' +
       '<div class="detail-layout">' +
-      '  <div class="detail-primary" id="bd-primary"><p class="empty-state">Loading…</p></div>' +
+      '  <div class="detail-primary" id="bd-primary">' + global.AuroraSkeleton.lines(4) + '</div>' +
       '  <aside class="detail-rail" aria-label="Context">' +
-      '    <div class="rail-card" id="bd-owner"><h4>Owning account</h4><p class="empty-state">Loading…</p></div>' +
-      '    <div class="rail-card"><h4>References</h4><p class="empty-state" id="bd-references">Loading…</p></div>' +
+      '    <div class="rail-card" id="bd-owner"><h4>Owning account</h4>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '    <div class="rail-card"><h4>References</h4><div id="bd-references">' + global.AuroraSkeleton.lines(2) + '</div></div>' +
       '  </aside>' +
       '</div>';
     try {

@@ -84,7 +84,7 @@
     if (lastFilters.when && lastFilters.when.start) params.since = lastFilters.when.start.toISOString();
     if (lastFilters.when && lastFilters.when.end) params.until = lastFilters.when.end.toISOString();
 
-    c.innerHTML = '<p class="empty-state">Loading…</p>';
+    c.innerHTML = global.AuroraSkeleton.cards(3);
     try {
       const data = await ep.moderator.listAppeals(params);
       const items = (data && data.items) || [];

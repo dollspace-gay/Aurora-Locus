@@ -67,9 +67,7 @@
   function setHtml(id, html) { const el = document.getElementById(id); if (el) el.innerHTML = html; }
   function fmt() { return global.AuroraFormat; }
   function loadingState() {
-    return global.AuroraEmptyState
-      ? global.AuroraEmptyState.render({ icon: 'inbox', primary: T('dashboard.loading') })
-      : esc(T('dashboard.loading'));
+    return global.AuroraSkeleton.lines(3);
   }
 
   // --- The block registry. Each block: visible(c) gate, html() initial
@@ -247,7 +245,7 @@
         '    <h3>' + esc(T('dashboard.health_title')) + '</h3>' +
         '    <a class="btn-sm btn-secondary" href="#ops/system-health">' + esc(T('dashboard.health_details')) + '</a>' +
         '  </div>' +
-        '  <div id="dash-health-body"><p class="empty-state">' + esc(T('dashboard.loading')) + '</p></div>' +
+        '  <div id="dash-health-body">' + global.AuroraSkeleton.lines(3) + '</div>' +
         '</section>',
       refresh: async (ep) => {
         try {
@@ -282,8 +280,7 @@
         '    <a class="btn-sm btn-secondary" href="#kryphocron">' +
              esc(T('kryphocron.dashboard-block.open')) + '</a>' +
         '  </div>' +
-        '  <div id="dash-kryphocron-body"><p class="empty-state">' +
-             esc(T('dashboard.loading')) + '</p></div>' +
+        '  <div id="dash-kryphocron-body">' + global.AuroraSkeleton.lines(3) + '</div>' +
         '</section>',
       // §6.9 — slice of the Overview's substrate identity + aggregate counts,
       // with click-through to the Kryphocron domain.
@@ -326,7 +323,7 @@
         '    <a class="btn-sm btn-secondary" href="#mod/audit">' + esc(T('dashboard.audit_trail')) + '</a>' +
         '  </div>' +
         '  <div class="activity-list" id="dash-adminactions-list">' +
-        '    <p class="empty-state">' + esc(T('dashboard.loading')) + '</p>' +
+        global.AuroraSkeleton.lines(3) +
         '  </div>' +
         '</section>',
       refresh: async (ep) => {
@@ -367,7 +364,7 @@
       html: () =>
         '<section class="dash-block" id="dash-drift">' +
         '  <h3>' + esc(T('dashboard.drift_title')) + '</h3>' +
-        '  <div id="dash-drift-body"><p class="empty-state">' + esc(T('dashboard.loading')) + '</p></div>' +
+        '  <div id="dash-drift-body">' + global.AuroraSkeleton.lines(3) + '</div>' +
         '</section>',
       refresh: async (ep) => {
         // Best-effort drift signal: surface high-impact runtime settings

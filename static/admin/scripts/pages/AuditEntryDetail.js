@@ -9,7 +9,7 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#mod/audit">Moderation</a> <span class="breadcrumb-sep">›</span> <a href="#mod/audit">Audit</a> <span class="breadcrumb-sep">›</span> #' + esc(id) + '</nav>' +
       '<header class="page-header"><div><h2>Audit entry #' + esc(id) + '</h2></div></header>' +
-      '<div id="aed-body"><p class="empty-state">Loading…</p></div>';
+      '<div id="aed-body">' + global.AuroraSkeleton.lines(4) + '</div>';
 
     const cached = (window._auditCache || {})[id];
     if (cached) renderBody(cached);

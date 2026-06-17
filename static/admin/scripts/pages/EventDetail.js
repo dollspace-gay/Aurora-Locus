@@ -9,7 +9,7 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#mod/events">Moderation</a> <span class="breadcrumb-sep">›</span> <a href="#mod/events">Events</a> <span class="breadcrumb-sep">›</span> #' + esc(id) + '</nav>' +
       '<header class="page-header"><div><h2>Event #' + esc(id) + '</h2></div></header>' +
-      '<div id="ed-body"><p class="empty-state">Loading…</p></div>';
+      '<div id="ed-body">' + global.AuroraSkeleton.lines(4) + '</div>';
     try {
       const data = await global.AuroraEndpoints.moderator.getEvent(id);
       renderBody(data);

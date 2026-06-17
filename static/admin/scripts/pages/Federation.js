@@ -10,9 +10,9 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#dashboard">Operations</a> <span class="breadcrumb-sep">›</span> Federation</nav>' +
       '<header class="page-header"><div><h2>Federation</h2><p class="page-subtitle">Relays, peers, federation activity</p></div></header>' +
-      '<div class="ops-section" id="fed-relay"><h3>Relay configuration</h3><p class="empty-state">Loading…</p></div>' +
-      '<div class="ops-section" id="fed-status"><h3>Federation status</h3><p class="empty-state">Loading…</p></div>' +
-      '<div class="ops-section" id="fed-peers"><h3>Known instances</h3><p class="empty-state">Loading…</p></div>' +
+      '<div class="ops-section" id="fed-relay"><h3>Relay configuration</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '<div class="ops-section" id="fed-status"><h3>Federation status</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '<div class="ops-section" id="fed-peers"><h3>Known instances</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '<div class="ops-section">' +
       '  <h3>Controls</h3>' +
       '  <button class="btn-secondary" id="fed-discover">Trigger discovery</button>' +

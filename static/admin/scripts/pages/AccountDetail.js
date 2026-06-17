@@ -128,7 +128,7 @@
         id: 'history-' + currentDid,
         summary: '<strong>Subject history</strong>',
         roleTag: 'Moderator+',
-        bodyHtml: '<div id="ad-history-body"><p class="empty-state">Loading…</p></div>',
+        bodyHtml: '<div id="ad-history-body">' + global.AuroraSkeleton.lines(3) + '</div>',
       });
     }
     // Kryphocron audience visibility (Mod+, §6.5) — read-only.
@@ -137,8 +137,7 @@
         id: 'kryphocron-' + currentDid,
         summary: '<strong>' + esc(T('kryphocron.drawer.title')) + '</strong>',
         roleTag: 'Moderator+',
-        bodyHtml: '<div id="ad-kryphocron-body"><p class="empty-state">' +
-          esc(T('common.loading')) + '</p></div>',
+        bodyHtml: '<div id="ad-kryphocron-body">' + global.AuroraSkeleton.lines(3) + '</div>',
       });
     }
     primary.innerHTML = html;
@@ -565,15 +564,15 @@
     const rail = document.getElementById('ad-rail');
     if (!rail) return;
     rail.insertAdjacentHTML('beforeend', railCard('subject-context', 'Subject context',
-      '<p class="empty-state">Loading…</p>'));
+      global.AuroraSkeleton.lines(3)));
     rail.insertAdjacentHTML('beforeend', railCard('records-authored', 'Records authored',
-      '<p class="empty-state">Loading…</p>'));
+      global.AuroraSkeleton.lines(3)));
     rail.insertAdjacentHTML('beforeend', railCard('blob-inventory', 'Blob inventory',
-      '<p class="empty-state">Loading…</p>'));
+      global.AuroraSkeleton.lines(3)));
     rail.insertAdjacentHTML('beforeend', railCard('invite-lineage', 'Invite lineage',
-      '<p class="empty-state">Loading…</p>'));
+      global.AuroraSkeleton.lines(3)));
     rail.insertAdjacentHTML('beforeend', railCard('account-roles', T('accountDetail.roles.title'),
-      '<p class="empty-state">Loading…</p>'));
+      global.AuroraSkeleton.lines(3)));
 
     try {
       const ctx = await global.AuroraEndpoints.moderator.getSubjectContext({ subjectDid: currentDid });

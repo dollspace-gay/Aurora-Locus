@@ -22,7 +22,7 @@
     container.innerHTML =
       '<nav class="breadcrumb" aria-label="Breadcrumb"><a href="#configuration/general">Configuration</a> <span class="breadcrumb-sep">›</span> Themes</nav>' +
       '<header class="page-header"><div><h2>Themes</h2><p class="page-subtitle">Installed themes, validation status, and the deployment-default selection</p></div></header>' +
-      '<div id="themes-grid" class="settings-grid"><p>Loading…</p></div>';
+      '<div id="themes-grid" class="settings-grid">' + global.AuroraSkeleton.cards(3) + '</div>';
     await load(isSuper);
     return {};
   }

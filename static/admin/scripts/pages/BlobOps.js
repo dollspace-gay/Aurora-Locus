@@ -10,8 +10,8 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#dashboard">Operations</a> <span class="breadcrumb-sep">›</span> Blob ops</nav>' +
       '<header class="page-header"><div><h2>Blob ops</h2><p class="page-subtitle">Storage and blob lifecycle</p></div></header>' +
-      '<div class="ops-section" id="bo-stats"><h3>Storage statistics</h3><p class="empty-state">Loading…</p></div>' +
-      '<div class="ops-section" id="bo-recent"><h3>Recent blobs</h3><p class="empty-state">Loading…</p></div>' +
+      '<div class="ops-section" id="bo-stats"><h3>Storage statistics</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '<div class="ops-section" id="bo-recent"><h3>Recent blobs</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '<div class="ops-section">' +
       '  <h3>Controls</h3>' +
       '  <button class="btn-secondary" id="bo-gc">Run GC</button>' +

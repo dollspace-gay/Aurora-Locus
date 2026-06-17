@@ -10,8 +10,8 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#dashboard">Operations</a> <span class="breadcrumb-sep">›</span> Rate limits</nav>' +
       '<header class="page-header"><div><h2>Rate limits</h2><p class="page-subtitle">Per-endpoint configuration and current state</p></div></header>' +
-      '<div class="ops-section" id="rl-config"><h3>Configuration</h3><p class="empty-state">Loading…</p></div>' +
-      '<div class="ops-section" id="rl-status"><h3>Status</h3><p class="empty-state">Loading…</p></div>' +
+      '<div class="ops-section" id="rl-config"><h3>Configuration</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '<div class="ops-section" id="rl-status"><h3>Status</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '<div class="ops-section">' +
       '  <h3>Controls</h3>' +
       '  <button class="btn-secondary" id="rl-cleanup">Cleanup state</button>' +

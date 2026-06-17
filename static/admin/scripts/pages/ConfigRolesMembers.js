@@ -41,7 +41,7 @@
       '<div class="table-card">' +
       '  <table class="data-table">' +
       '    <thead><tr><th>' + esc(T('settings.roles.col_account')) + '</th><th>' + esc(T('settings.roles.col_did')) + '</th><th>' + esc(T('settings.roles.col_granted')) + '</th><th>' + esc(T('settings.roles.col_granted_by')) + '</th><th>' + esc(T('settings.roles.col_actions')) + '</th></tr></thead>' +
-      '    <tbody id="rmm-table"><tr><td colspan="5"><p class="empty-state">' + esc(T('common.loading')) + '</p></td></tr></tbody>' +
+      '    <tbody id="rmm-table"><tr><td colspan="5">' + global.AuroraSkeleton.lines(3) + '</td></tr></tbody>' +
       '  </table>' +
       '</div>';
     if (isSuper) {

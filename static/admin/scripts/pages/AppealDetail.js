@@ -9,7 +9,7 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#mod/appeals">Moderation</a> <span class="breadcrumb-sep">›</span> <a href="#mod/appeals">Appeals</a> <span class="breadcrumb-sep">›</span> #' + esc(id) + '</nav>' +
       '<header class="page-header"><div><h2>Appeal #' + esc(id) + '</h2></div></header>' +
-      '<div id="apd-body"><p class="empty-state">Loading…</p></div>';
+      '<div id="apd-body">' + global.AuroraSkeleton.lines(4) + '</div>';
     try {
       const data = await global.AuroraEndpoints.moderator.getAppeal(id);
       renderBody(data);

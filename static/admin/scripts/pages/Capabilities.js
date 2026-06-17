@@ -14,8 +14,8 @@
       '    <button class="btn-secondary" id="srv-copy">Copy raw JSON</button>' +
       '  </div>' +
       '</header>' +
-      '<div class="settings-card" id="srv-caps"><h3>Capabilities</h3><p class="empty-state">Loading…</p></div>' +
-      '<div class="settings-card" id="srv-build" style="margin-top: 1rem;"><h3>Build information</h3><p class="empty-state">Loading…</p></div>';
+      '<div class="settings-card" id="srv-caps"><h3>Capabilities</h3>' + global.AuroraSkeleton.lines(4) + '</div>' +
+      '<div class="settings-card" id="srv-build" style="margin-top: 1rem;"><h3>Build information</h3>' + global.AuroraSkeleton.lines(3) + '</div>';
     document.getElementById('srv-refresh').addEventListener('click', refresh);
     document.getElementById('srv-copy').addEventListener('click', copyRaw);
     await refresh();

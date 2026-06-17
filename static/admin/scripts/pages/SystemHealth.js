@@ -11,12 +11,12 @@
       '<nav class="breadcrumb"><a href="#dashboard">Operations</a> <span class="breadcrumb-sep">›</span> System health</nav>' +
       '<header class="page-header"><div><h2>System health</h2><p class="page-subtitle">Subsystem status, jobs, validation</p></div></header>' +
       '<div class="settings-grid">' +
-      '  <div class="settings-card" id="sh-overall"><h3>Overall</h3><p class="empty-state">Loading…</p></div>' +
-      '  <div class="settings-card" id="sh-resources"><h3>Resource usage</h3><p class="empty-state">Loading…</p></div>' +
-      '  <div class="settings-card" id="sh-database"><h3>Database</h3><p class="empty-state">Loading…</p></div>' +
-      '  <div class="settings-card" id="sh-jobs"><h3>Background jobs</h3><p class="empty-state">Loading…</p></div>' +
-      '  <div class="settings-card" id="sh-nonce"><h3>Nonce store</h3><p class="empty-state">Loading…</p></div>' +
-      '  <div class="settings-card" id="sh-validation"><h3>Validation failures</h3><p class="empty-state">Loading…</p></div>' +
+      '  <div class="settings-card" id="sh-overall"><h3>Overall</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="sh-resources"><h3>Resource usage</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="sh-database"><h3>Database</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="sh-jobs"><h3>Background jobs</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="sh-nonce"><h3>Nonce store</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="sh-validation"><h3>Validation failures</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '</div>' +
       '<div class="ops-section">' +
       '  <h3>Controls</h3>' +
