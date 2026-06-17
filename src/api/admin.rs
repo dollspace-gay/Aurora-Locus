@@ -699,6 +699,13 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(revoke_role),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // Repository rebuild preflight (§7.4.1 / #286) — non-destructive read;
+        // the destructive rebuildRepo + progress/cancel land in #287.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.preRebuildCheck",
+            get(pre_rebuild_check),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // Per-operator session management (§8.1.7 / #273). Admin-tier
         // namespace; the handlers gate finer: any operator lists/revokes
         // their OWN sessions (self-service), SuperAdmin lists all and
@@ -1515,6 +1522,61 @@ async fn revoke_session(
         sid: req.sid,
         audit_entry_id: audit_entry_id.to_string(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Repository rebuild — preflight (§7.4.1 / #286)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PreRebuildCheckParams {
+    did: String,
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.preRebuildCheck?did=<did>` — non-destructive
+/// repo-rebuild preflight (§7.4.1 / #286). Walks the account's full commit
+/// history and reports what a rebuild would reconstruct (commit count, net live
+/// record count, the rev range, the head commit CID) so a SuperAdmin can
+/// confirm scope before triggering the destructive rebuild (#287). Read-only —
+/// touches no repo state.
+async fn pre_rebuild_check(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(params): Query<PreRebuildCheckParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "preRebuildCheck requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    match ctx.sequencer.rebuild_preflight(&params.did).await {
+        Ok(Some(pf)) => Ok(Json(serde_json::json!({
+            "did": params.did,
+            "commitCount": pf.commit_count,
+            "recordCount": pf.record_count,
+            "creates": pf.creates,
+            "deletes": pf.deletes,
+            "headCommitCid": pf.head_commit_cid,
+            "headRev": pf.head_rev,
+            "firstRev": pf.first_rev,
+        }))),
+        Ok(None) => Err(json_error(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            format!("no sequencer history for {} — nothing to rebuild", params.did),
+        )),
+        Err(e) => Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            e.to_string(),
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -8157,10 +8219,11 @@ mod tests {
             r#""listAudiences","#,
             r#""getBlockCascadeImpact""#,
             r#"],"#,
-            // tools.aurora.superadmin (2 endpoints)
+            // tools.aurora.superadmin (3 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
-            r#""revokeRole""#,
+            r#""revokeRole","#,
+            r#""preRebuildCheck""#,
             r#"]"#,
             r#"},"#,
             // ---- implementation, version (literals) ----
@@ -10838,5 +10901,41 @@ mod tests {
             Err(PdsError::Authentication(_)) => {}
             other => panic!("expected Authentication (401) after force-logout, got {:?}", other),
         }
+    }
+
+    // ---------- §7.4.1 / #286 preRebuildCheck ----------
+
+    #[tokio::test]
+    async fn pre_rebuild_check_requires_superadmin() {
+        let ctx = create_test_context().await;
+        let err = pre_rebuild_check(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            axum::extract::Query(PreRebuildCheckParams {
+                did: "did:plc:target".to_string(),
+            }),
+        )
+        .await
+        .expect_err("Admin (not SuperAdmin) must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn pre_rebuild_check_404_when_no_history() {
+        let ctx = create_test_context().await;
+        // A fresh context's sequencer has no commit events for this DID, so the
+        // preflight returns None → 404 (nothing to rebuild). Exercises the
+        // handler's None path + SuperAdmin gate; the aggregation itself is
+        // covered by the sequencer-level rebuild_preflight tests.
+        let err = pre_rebuild_check(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            axum::extract::Query(PreRebuildCheckParams {
+                did: "did:plc:no-history".to_string(),
+            }),
+        )
+        .await
+        .expect_err("no history → NotFound");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 }

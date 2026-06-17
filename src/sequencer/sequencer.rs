@@ -3,7 +3,7 @@ use crate::{
     error::{PdsError, PdsResult},
     federation::RelayClient,
     sequencer::{
-        events::{AccountEvent, CommitEvent, IdentityEvent, SyncEvent},
+        events::{AccountEvent, CommitEvent, IdentityEvent, OpAction, SyncEvent},
         EventType, SeqEvent, SeqRow,
     },
 };
@@ -556,6 +556,96 @@ impl Sequencer {
 
         Ok(events)
     }
+
+    /// Rebuild preflight summary (§7.4.1 / #286): walk the account's FULL commit
+    /// history ascending and aggregate what a rebuild would reconstruct, without
+    /// touching repo state. Non-destructive — the `preRebuildCheck` operator
+    /// sanity-check reads this before a rebuild is triggered.
+    ///
+    /// Pages internally by `seq` (the per-DID history can exceed
+    /// `max_query_limit`, so a single `get_events_for_did` won't cover it). The
+    /// net record count is `Σ create − Σ delete` over every commit op — the live
+    /// record count a faithful replay would land, derived from event metadata
+    /// alone (no block/MST reconstruction; that's #287's job, where it's
+    /// consumed by the swap). Returns `None` when the account has no
+    /// (non-invalidated) commit events — nothing to rebuild.
+    pub async fn rebuild_preflight(&self, did: &str) -> PdsResult<Option<RebuildPreflight>> {
+        let mut cursor = 0i64;
+        let mut commit_count: u64 = 0;
+        let mut creates: u64 = 0;
+        let mut deletes: u64 = 0;
+        let mut head_commit_cid = String::new();
+        let mut head_rev = String::new();
+        let mut first_rev: Option<String> = None;
+
+        loop {
+            let rows = sqlx::query(
+                r#"
+                SELECT seq, did, event_type, event, invalidated, sequenced_at
+                FROM repo_seq
+                WHERE did = $1 AND seq > $2 AND NOT invalidated
+                ORDER BY seq ASC
+                LIMIT $3
+                "#,
+            )
+            .bind(did)
+            .bind(cursor)
+            .bind(self.config.max_query_limit)
+            .fetch_all(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let seq_row = self.row_to_seq_row(row)?;
+                cursor = seq_row.seq;
+                if let Some(SeqEvent::Commit { evt, .. }) = self.decode_event(seq_row)? {
+                    commit_count += 1;
+                    if first_rev.is_none() {
+                        first_rev = Some(evt.rev.clone());
+                    }
+                    head_commit_cid = evt.commit.clone();
+                    head_rev = evt.rev.clone();
+                    for op in &evt.ops {
+                        match op.action {
+                            OpAction::Create => creates += 1,
+                            OpAction::Delete => deletes += 1,
+                            OpAction::Update => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        if commit_count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(RebuildPreflight {
+            commit_count,
+            record_count: creates.saturating_sub(deletes),
+            creates,
+            deletes,
+            head_commit_cid,
+            head_rev,
+            first_rev: first_rev.unwrap_or_default(),
+        }))
+    }
+}
+
+/// Aggregate a repo rebuild would reconstruct, computed from commit-event
+/// metadata without touching repo state (§7.4.1 / #286). `record_count` is the
+/// net live count (`creates − deletes`); the rev range bounds the history.
+#[derive(Debug, Clone)]
+pub struct RebuildPreflight {
+    pub commit_count: u64,
+    pub record_count: u64,
+    pub creates: u64,
+    pub deletes: u64,
+    pub head_commit_cid: String,
+    pub head_rev: String,
+    pub first_rev: String,
 }
 
 #[cfg(test)]
@@ -794,5 +884,78 @@ mod tests {
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
         let result = sequencer.earliest_after_time(past).await.unwrap();
         assert_eq!(result, Some(1));
+    }
+
+    // ---------- §7.4.1 / #286 rebuild preflight ----------
+
+    fn op(action: OpAction, path: &str, cid: Option<&str>) -> crate::sequencer::events::CommitOp {
+        crate::sequencer::events::CommitOp {
+            action,
+            path: path.to_string(),
+            cid: cid.map(String::from),
+            prev: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_preflight_aggregates_commit_history() {
+        let seq = create_test_sequencer().await;
+        let did = "did:plc:rebuildme";
+        // commit 1: two creates.
+        seq.sequence_commit(CommitEvent::new(
+            did.to_string(), "commit1".to_string(), "rev1".to_string(), None, None, vec![],
+            vec![
+                op(OpAction::Create, "app.bsky.feed.post/a", Some("cidA")),
+                op(OpAction::Create, "app.bsky.feed.post/b", Some("cidB")),
+            ],
+        )).await.unwrap();
+        // commit 2: one create, one delete (net 0 for this commit).
+        seq.sequence_commit(CommitEvent::new(
+            did.to_string(), "commit2".to_string(), "rev2".to_string(), Some("commit1".to_string()), None, vec![],
+            vec![
+                op(OpAction::Create, "app.bsky.feed.post/c", Some("cidC")),
+                op(OpAction::Delete, "app.bsky.feed.post/a", None),
+            ],
+        )).await.unwrap();
+        // a different account's commit — must NOT be counted.
+        seq.sequence_commit(CommitEvent::new(
+            "did:plc:other".to_string(), "ox".to_string(), "rx".to_string(), None, None, vec![],
+            vec![op(OpAction::Create, "x/y", Some("z"))],
+        )).await.unwrap();
+
+        let pf = seq.rebuild_preflight(did).await.unwrap().expect("history present");
+        assert_eq!(pf.commit_count, 2, "only this DID's commits");
+        assert_eq!(pf.creates, 3);
+        assert_eq!(pf.deletes, 1);
+        assert_eq!(pf.record_count, 2, "net live = creates - deletes");
+        assert_eq!(pf.head_commit_cid, "commit2", "head = highest-seq commit");
+        assert_eq!(pf.head_rev, "rev2");
+        assert_eq!(pf.first_rev, "rev1", "first = lowest-seq commit");
+    }
+
+    #[tokio::test]
+    async fn rebuild_preflight_none_for_unknown_account() {
+        let seq = create_test_sequencer().await;
+        assert!(seq.rebuild_preflight("did:plc:nobody").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_preflight_skips_invalidated_events() {
+        let seq = create_test_sequencer().await;
+        let did = "did:plc:inval";
+        seq.sequence_commit(CommitEvent::new(
+            did.to_string(), "c1".to_string(), "r1".to_string(), None, None, vec![],
+            vec![op(OpAction::Create, "a/b", Some("c"))],
+        )).await.unwrap();
+        // Invalidate it (the WHERE NOT invalidated filter must exclude it).
+        sqlx::query("UPDATE repo_seq SET invalidated = 1 WHERE did = $1")
+            .bind(did)
+            .execute(&seq.db)
+            .await
+            .unwrap();
+        assert!(
+            seq.rebuild_preflight(did).await.unwrap().is_none(),
+            "invalidated events are excluded"
+        );
     }
 }
