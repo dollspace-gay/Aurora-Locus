@@ -1904,4 +1904,78 @@ mod admin_auth_third_path_tests {
             "layer 2 success must not reach the identity resolver"
         );
     }
+
+    // ---------- §8.1.6 role-change invalidation (satisfied-by-architecture) ----------
+
+    /// Verification gate for design §8.1.6 (Arc E first wave, #267): a
+    /// mid-session role change takes effect on the operator's *next
+    /// request* with no operator action and no token re-issuance.
+    ///
+    /// The design assumed roles were embedded in the session token, so it
+    /// specified a `401 token-stale` -> `refresh-required` -> transparent-
+    /// refresh dance to pick up new claims. Aurora-Locus never embeds the
+    /// role: `finalize_admin_role` resolves it live from `admin_role_manager
+    /// .get_role(did)` on every request (the token only carries `scope`).
+    /// So the gate is met structurally — there is no stale claim to
+    /// invalidate. This test mints ONE token and reuses it across an
+    /// upgrade-equivalent change and a full revoke, asserting each takes
+    /// effect immediately on the very next `admin_auth_from_token` call.
+    #[traced_test]
+    #[tokio::test]
+    async fn role_change_takes_effect_on_next_request_without_reauth() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let did = "did:plc:rolechange";
+
+        ctx.admin_role_manager
+            .grant_role(did, Role::Moderator, "did:plc:bootstrap", None)
+            .await
+            .expect("initial grant");
+
+        // One token for the whole "session" — never re-minted below.
+        let secret = &ctx.config.authentication.jwt_secret;
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let claims = serde_json::json!({ "sub": did, "scope": "admin", "exp": exp });
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+
+        // Baseline: the session resolves to the granted role.
+        let auth = admin_auth_from_token(&ctx, &token).await.expect("baseline");
+        assert_eq!(auth.role, Role::Moderator);
+
+        // SuperAdmin changes the role mid-session (revoke + re-grant is the
+        // role-change path — a second grant on an active role conflicts).
+        ctx.admin_role_manager
+            .revoke_role(did, "did:plc:superadmin", None)
+            .await
+            .expect("revoke for change");
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "did:plc:superadmin", None)
+            .await
+            .expect("re-grant elevated");
+
+        // Same token, next request: the new role is in effect immediately.
+        let auth = admin_auth_from_token(&ctx, &token)
+            .await
+            .expect("post-change");
+        assert_eq!(
+            auth.role,
+            Role::Admin,
+            "role change must take effect on next request without re-auth"
+        );
+
+        // Full revocation also takes effect immediately: next request 403s.
+        ctx.admin_role_manager
+            .revoke_role(did, "did:plc:superadmin", None)
+            .await
+            .expect("full revoke");
+        match admin_auth_from_token(&ctx, &token).await {
+            Err(PdsError::Authorization(_)) => {}
+            other => panic!("expected Authorization (403) after revoke, got {:?}", other),
+        }
+    }
 }
