@@ -9781,11 +9781,21 @@ mod tests {
                 .create_invite("did:plc:creator", 5, None, Some(format!("seed {i}")), None)
                 .await
                 .unwrap();
+            // #258: create_invite stamps created_at with Utc::now(); under a
+            // coarse OS clock (e.g. WSL2 ~15ms) plus parallel-test load, the
+            // rapid inserts can collide same-millisecond, making the `recent`
+            // (created_at DESC) ordering + cursor boundary ambiguous. Stamp a
+            // deterministic, strictly-increasing created_at (one minute apart,
+            // same RFC3339 form Utc::now().to_rfc3339() produces) so the order
+            // is timing-independent: codes[i] is always older than codes[i+1].
+            let created_at = format!("2020-01-01T00:{:02}:00+00:00", i);
+            sqlx::query("UPDATE invite_code SET created_at = $1 WHERE code = $2")
+                .bind(&created_at)
+                .bind(&c.code)
+                .execute(&ctx.account_db)
+                .await
+                .unwrap();
             codes.push(c);
-            // SQLite chrono RFC3339 strings are millisecond-resolution; a
-            // tiny sleep keeps timestamps strictly distinct so the cursor
-            // tuple boundary doesn't get ambiguous in tests.
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         codes
     }

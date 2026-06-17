@@ -6365,11 +6365,15 @@ mod tests {
     async fn get_audit_trail_time_range_window_filters_strictly() {
         let ctx = create_test_context().await;
         seed_actor(&ctx, "did:plc:victim", "victim.test").await;
-        // Append 5 entries; record their actual stored timestamps.
-        // insert_chain_entry_pool uses Utc::now() so entries land at the
-        // wall-clock instant of insertion. Stagger by sleeps to make
-        // the timestamps distinguishable at sub-millisecond resolution.
-        let mut timestamps: Vec<String> = Vec::new();
+        // Append 5 entries, then stamp each with a deterministic, well-
+        // separated created_at. insert_chain_entry_pool uses Utc::now()
+        // internally, and under a coarse OS clock (e.g. WSL2 ~15ms) plus
+        // parallel-test load the rapid inserts can collide same-millisecond —
+        // making the strict [t1, t3] window boundary ambiguous (#258). Stamping
+        // fixed RFC3339 values one hour apart (the same form Utc::now()
+        // .to_rfc3339() produces; created_at is a TEXT column the handler
+        // compares with `created_at >= ?` / `<= ?`) makes the window
+        // timing-independent.
         for i in 0..5 {
             crate::admin::audit_chain::insert_chain_entry_pool(
                 &ctx.account_db,
@@ -6387,15 +6391,17 @@ mod tests {
             )
             .await
             .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            // Read the just-inserted row's timestamp.
-            use sqlx::Row as _;
-            let r = sqlx::query("SELECT created_at FROM audit_chain_entry WHERE sequence = $1")
+        }
+        let timestamps: Vec<String> = (0..5)
+            .map(|i| format!("2020-01-01T0{}:00:00+00:00", i))
+            .collect();
+        for i in 0..5usize {
+            sqlx::query("UPDATE audit_chain_entry SET created_at = $1 WHERE sequence = $2")
+                .bind(&timestamps[i])
                 .bind((i + 1) as i64)
-                .fetch_one(&ctx.account_db)
+                .execute(&ctx.account_db)
                 .await
                 .unwrap();
-            timestamps.push(r.try_get("created_at").unwrap());
         }
         // Window = [timestamp[1], timestamp[3]] (inclusive both ends
         // per the handler's `>=` / `<=` semantics). Should return
