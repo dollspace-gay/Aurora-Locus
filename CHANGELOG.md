@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CascadeSource` now derives `Serialize` with an explicit rustdoc infallibility invariant (all variants must be infallibly JSON-serializable); the `RecoveryBypass` arm bridges `Option<CascadeSource>` → `Option<serde_json::Value>` via `serde_json::to_value(...).expect("infallible")`. `cascade_source` is always `None`/null in this cycle — non-null payloads land when cascade-initiating handlers are wired in a later arc.
 
 ### Changed
+- flaky-test hardening sweep: real-time sleep-vs-TTL races under full-suite load (identity cache + audit siblings) (#266)
+- deterministic-fixture flakes in get_moderation_metrics tests: anchored now()-based seeds+window to a fixed instant; a row on the exact day-bucket boundary (idx == bucket_count) was dropped when a backward wall-clock step under load pushed it over (#265)
 - I-spinner-apply — apply AuroraSpinner to in-flight action buttons (§8.2.5 spinner tier) (#253)
 - test-flake — time/ordering-sensitive lib tests fail intermittently under full-suite load (#258)
 - I-audit-pivots — §9.8 audit cross-pivot link convention audit (#263)
