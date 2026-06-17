@@ -557,6 +557,52 @@ impl Sequencer {
         Ok(events)
     }
 
+    /// Ascending page of a DID's commit events after `after_seq` (exclusive),
+    /// for the rebuild reconstruction walk (#289). Returns the decoded commit
+    /// events plus the highest `seq` EXAMINED in the page (commit or not) — the
+    /// caller advances its cursor by that so a page consisting only of
+    /// non-commit events (account/identity/sync) doesn't stall the walk.
+    /// `last_seq == None` means the page was empty (end of history). Skips
+    /// invalidated events. `limit` defaults to (and is capped at)
+    /// `max_query_limit`.
+    pub async fn commit_events_after(
+        &self,
+        did: &str,
+        after_seq: i64,
+        limit: Option<i64>,
+    ) -> PdsResult<(Vec<(i64, CommitEvent)>, Option<i64>)> {
+        let limit = limit
+            .unwrap_or(self.config.max_query_limit)
+            .min(self.config.max_query_limit);
+        let rows = sqlx::query(
+            r#"
+            SELECT seq, did, event_type, event, invalidated, sequenced_at
+            FROM repo_seq
+            WHERE did = $1 AND seq > $2 AND NOT invalidated
+            ORDER BY seq ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(did)
+        .bind(after_seq)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        let mut out = Vec::new();
+        let mut last_seq = None;
+        for row in rows {
+            let seq_row = self.row_to_seq_row(row)?;
+            let seq = seq_row.seq;
+            last_seq = Some(seq);
+            if let Some(SeqEvent::Commit { evt, .. }) = self.decode_event(seq_row)? {
+                out.push((seq, evt));
+            }
+        }
+        Ok((out, last_seq))
+    }
+
     /// Rebuild preflight summary (§7.4.1 / #286): walk the account's FULL commit
     /// history ascending and aggregate what a rebuild would reconstruct, without
     /// touching repo state. Non-destructive — the `preRebuildCheck` operator

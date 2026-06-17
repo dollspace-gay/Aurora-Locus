@@ -33,6 +33,7 @@ mod metrics;
 mod oauth;
 mod rate_limit;
 mod read_after_write;
+mod rebuild;
 mod repository;
 mod sequencer;
 mod server;

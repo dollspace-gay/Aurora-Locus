@@ -1531,14 +1531,24 @@ async fn revoke_session(
 #[derive(Deserialize)]
 struct PreRebuildCheckParams {
     did: String,
+    /// When `true`, additionally reconstruct the repo in memory from the full
+    /// sequencer history and run it through proto-blue's `verify_repo`, reporting
+    /// whether replay yields a coherent repo (`deepVerified`). Structural-only
+    /// (no signature check) — that, plus the destructive swap, is #290. Off by
+    /// default because reconstruction reads and decodes every commit's CAR slice.
+    #[serde(default)]
+    deep: bool,
 }
 
-/// `GET /xrpc/tools.aurora.superadmin.preRebuildCheck?did=<did>` — non-destructive
-/// repo-rebuild preflight (§7.4.1 / #286). Walks the account's full commit
-/// history and reports what a rebuild would reconstruct (commit count, net live
-/// record count, the rev range, the head commit CID) so a SuperAdmin can
-/// confirm scope before triggering the destructive rebuild (#287). Read-only —
-/// touches no repo state.
+/// `GET /xrpc/tools.aurora.superadmin.preRebuildCheck?did=<did>[&deep=true]` —
+/// non-destructive repo-rebuild preflight (§7.4.1 / #286, #289). Walks the
+/// account's full commit history and reports what a rebuild would reconstruct
+/// (commit count, net live record count, the rev range, the head commit CID) so
+/// a SuperAdmin can confirm scope before triggering the destructive rebuild
+/// (#290). With `deep=true` it goes further: it reconstructs the repo in memory
+/// and verifies it resolves via `verify_repo` — the same correctness gate the
+/// destructive rebuild will use — so a failed reconstruction is surfaced as a
+/// diagnostic *before* any swap. Read-only either way; touches no repo state.
 async fn pre_rebuild_check(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
@@ -1555,28 +1565,65 @@ async fn pre_rebuild_check(
             ),
         ));
     }
-    match ctx.sequencer.rebuild_preflight(&params.did).await {
-        Ok(Some(pf)) => Ok(Json(serde_json::json!({
-            "did": params.did,
-            "commitCount": pf.commit_count,
-            "recordCount": pf.record_count,
-            "creates": pf.creates,
-            "deletes": pf.deletes,
-            "headCommitCid": pf.head_commit_cid,
-            "headRev": pf.head_rev,
-            "firstRev": pf.first_rev,
-        }))),
-        Ok(None) => Err(json_error(
-            StatusCode::NOT_FOUND,
-            "NotFound",
-            format!("no sequencer history for {} — nothing to rebuild", params.did),
-        )),
-        Err(e) => Err(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalServerError",
-            e.to_string(),
-        )),
+    let pf = match ctx.sequencer.rebuild_preflight(&params.did).await {
+        Ok(Some(pf)) => pf,
+        Ok(None) => {
+            return Err(json_error(
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                format!("no sequencer history for {} — nothing to rebuild", params.did),
+            ))
+        }
+        Err(e) => {
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                e.to_string(),
+            ))
+        }
+    };
+
+    let mut body = serde_json::json!({
+        "did": params.did,
+        "commitCount": pf.commit_count,
+        "recordCount": pf.record_count,
+        "creates": pf.creates,
+        "deletes": pf.deletes,
+        "headCommitCid": pf.head_commit_cid,
+        "headRev": pf.head_rev,
+        "firstRev": pf.first_rev,
+    });
+
+    if params.deep {
+        let obj = body.as_object_mut().expect("json! built a map above");
+        // Structural-only (signing_did_key = None); full signature verification
+        // is part of the destructive rebuild (#290).
+        match crate::rebuild::reconstruct_and_verify(&ctx.sequencer, &params.did, None).await {
+            Ok(Some(vr)) => {
+                obj.insert("deepVerified".into(), serde_json::Value::Bool(true));
+                obj.insert(
+                    "reconstructedHeadCid".into(),
+                    serde_json::Value::String(vr.commit_cid.to_string()),
+                );
+                obj.insert(
+                    "reconstructedRev".into(),
+                    serde_json::Value::String(vr.rev().to_string()),
+                );
+            }
+            // No history despite a preflight: treat as not-verifiable rather than 500.
+            Ok(None) => {
+                obj.insert("deepVerified".into(), serde_json::Value::Bool(false));
+            }
+            // Reconstruction failed verification — a real diagnostic, not a server
+            // fault: replay would NOT produce a coherent repo. Report, don't 500.
+            Err(e) => {
+                obj.insert("deepVerified".into(), serde_json::Value::Bool(false));
+                obj.insert("deepError".into(), serde_json::Value::String(e.to_string()));
+            }
+        }
     }
+
+    Ok(Json(body))
 }
 
 #[derive(Deserialize)]
@@ -10913,6 +10960,7 @@ mod tests {
             op_auth("did:plc:admin", Role::Admin, "sid"),
             axum::extract::Query(PreRebuildCheckParams {
                 did: "did:plc:target".to_string(),
+                deep: false,
             }),
         )
         .await
@@ -10932,10 +10980,55 @@ mod tests {
             op_auth("did:plc:super", Role::SuperAdmin, "sid"),
             axum::extract::Query(PreRebuildCheckParams {
                 did: "did:plc:no-history".to_string(),
+                deep: false,
             }),
         )
         .await
         .expect_err("no history → NotFound");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pre_rebuild_check_deep_surfaces_unverifiable_history() {
+        use crate::sequencer::events::CommitEvent;
+        use proto_blue::lex_cbor::cid_for_lex;
+        use proto_blue::lex_data::LexValue;
+        use proto_blue::repo::{blocks_to_car, BlockMap};
+
+        let ctx = create_test_context().await;
+        let did = "did:plc:deep-broken";
+        // Seed one commit whose head block is absent from its (empty) CAR. The
+        // metadata preflight still succeeds (commit exists), but deep
+        // reconstruction can't resolve the repo → verify_repo errors.
+        let absent = cid_for_lex(&LexValue::String("absent".to_string())).unwrap();
+        ctx.sequencer
+            .sequence_commit(CommitEvent::new(
+                did.to_string(),
+                absent.to_string(),
+                "3jzfcijpj2z2a".to_string(),
+                None,
+                None,
+                blocks_to_car(None, &BlockMap::new()).unwrap(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let resp = pre_rebuild_check(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            axum::extract::Query(PreRebuildCheckParams {
+                did: did.to_string(),
+                deep: true,
+            }),
+        )
+        .await
+        .expect("unverifiable history is a 200 diagnostic, not a 500");
+        // Wiring assertion: deep=true actually ran reconstruction and reported it.
+        assert_eq!(resp.0["deepVerified"], serde_json::Value::Bool(false));
+        assert!(
+            resp.0["deepError"].is_string(),
+            "the verification failure must be surfaced as a diagnostic"
+        );
     }
 }

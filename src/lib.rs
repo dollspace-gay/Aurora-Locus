@@ -34,6 +34,7 @@ pub mod metrics;
 pub mod oauth;
 pub mod rate_limit;
 pub mod read_after_write; // Must come before actor_store (actor_store uses its types)
+pub mod rebuild;
 pub mod repository;
 pub mod sequencer;
 pub mod service_auth;
