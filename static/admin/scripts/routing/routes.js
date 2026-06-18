@@ -55,6 +55,9 @@
     // account. full+reduced visibility follows the Operations domain gate.
     { pattern: 'ops/repo-rebuild', page: 'opsRepoRebuild', requires: 'superadmin' },
     { pattern: 'ops/repo-rebuild/:did', page: 'opsRepoRebuild', requires: 'superadmin' },
+    // Bulk repository repair (Arc H §7.4.3 / #293). SuperAdmin; across-accounts
+    // scan-then-repair. Scan controls + findings panel + repair actions.
+    { pattern: 'ops/repo-repair', page: 'opsRepoRepair', requires: 'superadmin' },
 
     // Configuration domain (was Settings — renamed in v0.9 per §5.5/§5.7.2).
     // The six policy/observability pages carry placeholder content from
@@ -160,6 +163,7 @@
         { label: 'Rate limits', route: 'ops/rate-limits', icon: 'gauge', requires: 'admin' },
         { label: 'System health', route: 'ops/system-health', icon: 'heart-pulse', requires: 'admin' },
         { label: 'Repository rebuild', route: 'ops/repo-rebuild', icon: 'server', requires: 'superadmin' },
+        { label: 'Repository repair', route: 'ops/repo-repair', icon: 'shield-check', requires: 'superadmin' },
       ],
     },
     {

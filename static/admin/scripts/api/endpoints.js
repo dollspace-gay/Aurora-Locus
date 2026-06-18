@@ -127,6 +127,18 @@
       C().get('tools.aurora.superadmin.getRebuildProgress', { jobId: jobId }),
     cancelRebuild: (jobId) =>
       C().post('tools.aurora.superadmin.cancelRebuild', { jobId: jobId }),
+    // Bulk repository repair (§7.4.3 / #291 scan + #292 repair). scan*: start /
+    // poll / cancel the across-accounts inconsistency scan + read findings.
+    // repair*: start / poll / cancel the bulk repair over the findings.
+    scanReposForInconsistencies: () =>
+      C().post('tools.aurora.superadmin.scanReposForInconsistencies', {}),
+    getScanProgress: () => C().get('tools.aurora.superadmin.getScanProgress'),
+    cancelScan: () => C().post('tools.aurora.superadmin.cancelScan', {}),
+    getRepoScanResults: (params) =>
+      C().get('tools.aurora.superadmin.getRepoScanResults', params || {}),
+    repairRepos: (body) => C().post('tools.aurora.superadmin.repairRepos', body),
+    getBulkRepairProgress: () => C().get('tools.aurora.superadmin.getBulkRepairProgress'),
+    cancelBulkRepair: () => C().post('tools.aurora.superadmin.cancelBulkRepair', {}),
   };
 
   global.AuroraEndpoints = {
