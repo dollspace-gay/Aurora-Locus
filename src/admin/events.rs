@@ -210,6 +210,15 @@ pub enum ModerationEventType {
     /// `findingsTotal`). Emitted by the scan job in its own short transaction on
     /// completion (Category C — the scan is read-only, no record write to join).
     ScanCompleted,
+
+    /// Arc H §7.4.3 — a SuperAdmin started a bulk repository repair
+    /// (`tools.aurora.superadmin.repairRepos`). The envelope event for a batch:
+    /// `actor_did` is the triggering operator; `details` carries `batchId` /
+    /// `targetCount` / the `targetDids` list / `rationale`. Per-account repairs
+    /// emit standalone [`RepoRebuilt`](Self::RepoRebuilt) events (correlate by
+    /// the `targetDids` list); this envelope is not threaded into them. Emitted
+    /// at batch start in its own short transaction (Category C).
+    BulkRepairInitiated,
 }
 
 impl ModerationEventType {
@@ -244,6 +253,7 @@ impl ModerationEventType {
             ModerationEventType::KryphocronSystemCleanup => "kryphocron_system_cleanup",
             ModerationEventType::RepoRebuilt => "repo_rebuilt",
             ModerationEventType::ScanCompleted => "scan_completed",
+            ModerationEventType::BulkRepairInitiated => "bulk_repair_initiated",
         }
     }
 }
@@ -284,6 +294,7 @@ impl FromStr for ModerationEventType {
             "kryphocron_system_cleanup" => Ok(ModerationEventType::KryphocronSystemCleanup),
             "repo_rebuilt" => Ok(ModerationEventType::RepoRebuilt),
             "scan_completed" => Ok(ModerationEventType::ScanCompleted),
+            "bulk_repair_initiated" => Ok(ModerationEventType::BulkRepairInitiated),
             _ => Err(PdsError::Validation(format!("Invalid event type: {}", s))),
         }
     }

@@ -239,6 +239,11 @@ pub struct AppContext {
     /// Walks all accounts, structurally reconstructs each, and persists
     /// inconsistencies as findings.
     pub repo_scan_job: Arc<crate::repo_scan::ScanJob>,
+
+    /// Arc H §7.4.3 (#292) — the deployment's single bulk repository-repair job
+    /// (`repairRepos` / `getBulkRepairProgress` / `cancelBulkRepair`). Iterates
+    /// target DIDs and fires per-account rebuilds through `rebuild_registry`.
+    pub bulk_repair_job: Arc<crate::repo_scan::BulkRepairJob>,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -534,6 +539,7 @@ impl AppContext {
         let scan_findings_store =
             Arc::new(crate::repo_scan::ScanFindingsStore::new(account_db.clone()));
         let repo_scan_job = Arc::new(crate::repo_scan::ScanJob::new());
+        let bulk_repair_job = Arc::new(crate::repo_scan::BulkRepairJob::new());
         let moderation_manager = Arc::new(ModerationManager::new(
             account_db.clone(),
             account_manager.clone(),
@@ -1126,6 +1132,8 @@ impl AppContext {
             // v0.9 Arc H (#291) — bulk repository-repair scan substrate.
             scan_findings_store,
             repo_scan_job,
+            // v0.9 Arc H (#292) — bulk repository-repair job.
+            bulk_repair_job,
         })
     }
 

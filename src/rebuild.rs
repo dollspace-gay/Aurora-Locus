@@ -678,23 +678,47 @@ impl RebuildRegistry {
         triggered_by: String,
         rationale: String,
     ) -> PdsResult<String> {
-        let job = self.try_register(did.clone(), triggered_by, rationale)?;
+        let job = self.try_register(did, triggered_by, rationale)?;
         let job_id = job.job_id.clone();
 
         let registry = Arc::clone(self);
         tokio::spawn(async move {
-            let outcome = job.run(&ctx).await;
-            job.finish(outcome);
-            // Free the DID so a subsequent rebuild can start; the job stays in
-            // `by_id` so getRebuildProgress can still report its terminal state.
-            registry
-                .inner
-                .lock()
-                .expect("rebuild registry lock not poisoned")
-                .active_did
-                .remove(&did);
+            registry.drive(job, &ctx).await;
         });
         Ok(job_id)
+    }
+
+    /// Run a registered job to its terminal state, then free its DID so a
+    /// subsequent rebuild can start (the job stays in `by_id` for progress
+    /// reads). Shared by [`Self::start`] (spawned) and [`Self::run_one`]
+    /// (awaited inline).
+    async fn drive(&self, job: Arc<RebuildJob>, ctx: &AppContext) {
+        let did = job.did.clone();
+        let outcome = job.run(ctx).await;
+        job.finish(outcome);
+        self.inner
+            .lock()
+            .expect("rebuild registry lock not poisoned")
+            .active_did
+            .remove(&did);
+    }
+
+    /// Register + run a rebuild to completion inline (awaited, not spawned),
+    /// returning its terminal progress. Per-DID single-flight — returns
+    /// [`PdsError::Conflict`] if a rebuild is already in flight for the same
+    /// DID. The bulk-repair job (#292) drives per-account rebuilds through this
+    /// so each runs under the same single-flight lock as an operator-triggered
+    /// `rebuildRepo`, without polling.
+    pub async fn run_one(
+        self: &Arc<Self>,
+        ctx: &AppContext,
+        did: String,
+        triggered_by: String,
+        rationale: String,
+    ) -> PdsResult<RebuildProgress> {
+        let job = self.try_register(did, triggered_by, rationale)?;
+        self.drive(Arc::clone(&job), ctx).await;
+        Ok(job.progress())
     }
 
     /// Look up a job's live progress by id, or `None` if the id is unknown.

@@ -746,6 +746,25 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(get_repo_scan_results),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // Bulk repository repair — repair substrate (§7.4.3 / #292): start a
+        // bulk repair over the scan findings (or a subset), poll its bulk
+        // progress, cancel it. Each account is rebuilt via the per-account
+        // machinery.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.repairRepos",
+            post(repair_repos),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getBulkRepairProgress",
+            get(get_bulk_repair_progress),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.cancelBulkRepair",
+            post(cancel_bulk_repair),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // Per-operator session management (§8.1.7 / #273). Admin-tier
         // namespace; the handlers gate finer: any operator lists/revokes
         // their OWN sessions (self-service), SuperAdmin lists all and
@@ -2022,6 +2041,153 @@ async fn get_repo_scan_results(
         },
         "cursor": next_cursor,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Bulk repository repair — repair substrate (§7.4.3 / #292)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RepairReposRequest {
+    /// Explicit target DID subset. Ignored when `all` is true.
+    #[serde(default)]
+    dids: Vec<String>,
+    /// Repair every account in the current scan findings.
+    #[serde(default)]
+    all: bool,
+    /// Operator rationale — required (high-impact destructive action); carried
+    /// into the BulkRepairInitiated envelope and each per-account RepoRebuilt.
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.repairRepos` — start a bulk repair over
+/// a set of accounts (§7.4.3 / #292): `all` = every account in the current scan
+/// findings, or an explicit `dids` subset. Each target is rebuilt via the same
+/// per-account machinery as `rebuildRepo` (single-flight, RepoRebuilt audit); a
+/// per-account failure or conflict is skipped, not fatal. Deployment
+/// single-flight (409 if a bulk repair is already running). SuperAdmin;
+/// rationale required.
+async fn repair_repos(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RepairReposRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("repairRepos requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required"))?;
+
+    // Resolve the target DID set: `all` = every current finding, else the
+    // explicit subset.
+    let targets = if req.all {
+        ctx.scan_findings_store.all_dids().await.map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?
+    } else {
+        req.dids.clone()
+    };
+    if targets.is_empty() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "no repair targets — pass `dids` or `all:true` with a non-empty findings set".to_string(),
+        ));
+    }
+
+    let job = ctx.bulk_repair_job.clone();
+    let target_count = targets.len();
+    match job.try_start(ctx.clone(), targets, auth.did.clone(), rationale.to_string()) {
+        Some(batch_id) => Ok(Json(serde_json::json!({
+            "batchId": batch_id,
+            "targetCount": target_count,
+            "status": "started",
+        }))),
+        None => Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "a bulk repository repair is already in progress".to_string(),
+        )),
+    }
+}
+
+/// Render a [`BulkRepairProgress`](crate::repo_scan::BulkRepairProgress) as the
+/// `getBulkRepairProgress` wire shape.
+fn bulk_repair_progress_json(p: &crate::repo_scan::BulkRepairProgress) -> serde_json::Value {
+    fn ms(t: Option<std::time::SystemTime>) -> Option<u64> {
+        t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    }
+    serde_json::json!({
+        "running": p.running,
+        "batchId": p.batch_id,
+        "targetsTotal": p.targets_total,
+        "processed": p.processed,
+        "repaired": p.repaired,
+        "skipped": p.skipped,
+        "failed": p.failed,
+        "currentDid": p.current_did,
+        "startedAt": ms(p.started_at),
+        "finishedAt": ms(p.finished_at),
+        "cancelRequested": p.cancel_requested,
+        "lastOutcome": p.last_outcome,
+    })
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.getBulkRepairProgress` — live progress of
+/// the bulk repair (§7.4.3 / #292): targets total, processed, the
+/// repaired/skipped/failed tally, the current account, and the last outcome.
+/// SuperAdmin.
+async fn get_bulk_repair_progress(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("getBulkRepairProgress requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    Ok(Json(bulk_repair_progress_json(&ctx.bulk_repair_job.progress())))
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.cancelBulkRepair` — request cancellation
+/// of the in-flight bulk repair (§7.4.3 / #292); the loop stops before the next
+/// account. A per-account rebuild already in flight finishes atomically.
+/// SuperAdmin. 409 if no bulk repair is in progress.
+async fn cancel_bulk_repair(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("cancelBulkRepair requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    if ctx.bulk_repair_job.request_cancel() {
+        Ok(Json(serde_json::json!({ "status": "cancelling" })))
+    } else {
+        Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "no bulk repository repair is in progress".to_string(),
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -8664,7 +8830,7 @@ mod tests {
             r#""listAudiences","#,
             r#""getBlockCascadeImpact""#,
             r#"],"#,
-            // tools.aurora.superadmin (10 endpoints)
+            // tools.aurora.superadmin (13 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
@@ -8675,7 +8841,10 @@ mod tests {
             r#""scanReposForInconsistencies","#,
             r#""getScanProgress","#,
             r#""cancelScan","#,
-            r#""getRepoScanResults""#,
+            r#""getRepoScanResults","#,
+            r#""repairRepos","#,
+            r#""getBulkRepairProgress","#,
+            r#""cancelBulkRepair""#,
             r#"]"#,
             r#"},"#,
             // ---- implementation, version (literals) ----
@@ -9065,6 +9234,9 @@ mod tests {
         assert!(names.contains(&"getScanProgress"), "getScanProgress missing");
         assert!(names.contains(&"cancelScan"), "cancelScan missing");
         assert!(names.contains(&"getRepoScanResults"), "getRepoScanResults missing");
+        assert!(names.contains(&"repairRepos"), "repairRepos missing");
+        assert!(names.contains(&"getBulkRepairProgress"), "getBulkRepairProgress missing");
+        assert!(names.contains(&"cancelBulkRepair"), "cancelBulkRepair missing");
     }
 
     #[tokio::test]
@@ -11639,5 +11811,103 @@ mod tests {
         .0;
         assert_eq!(results["findings"].as_array().unwrap().len(), 0);
         assert_eq!(results["counts"]["total"], 0);
+    }
+
+    // ---------- §7.4.3 / #292 bulk-repair XRPCs ----------
+
+    #[tokio::test]
+    async fn repair_repos_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = repair_repos(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            Json(RepairReposRequest { dids: vec!["did:plc:x".into()], all: false, rationale: Some("fix".into()) }),
+        )
+        .await
+        .expect_err("Admin must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn repair_repos_requires_rationale() {
+        let ctx = create_test_context().await;
+        let err = repair_repos(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RepairReposRequest { dids: vec!["did:plc:x".into()], all: false, rationale: None }),
+        )
+        .await
+        .expect_err("missing rationale → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn repair_repos_empty_targets_400() {
+        let ctx = create_test_context().await;
+        // all=true but no findings → empty target set → 400.
+        let err = repair_repos(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RepairReposRequest { dids: vec![], all: true, rationale: Some("fix".into()) }),
+        )
+        .await
+        .expect_err("no targets → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cancel_bulk_repair_with_none_running_is_409() {
+        let ctx = create_test_context().await;
+        let err = cancel_bulk_repair(State(ctx), op_auth("did:plc:super", Role::SuperAdmin, "sid"))
+            .await
+            .expect_err("no bulk repair → Conflict");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    /// End-to-end bulk-repair lifecycle through the handlers: a bogus target
+    /// DID (no account → its per-account rebuild fails) drives the loop to a
+    /// completed batch with failed=1 — exercising start → run_one per target →
+    /// tally → finish (+ BulkRepairInitiated envelope) → progress.
+    #[tokio::test]
+    async fn bulk_repair_lifecycle_tallies_per_account_failure() {
+        let ctx = create_test_context().await;
+        let started = repair_repos(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RepairReposRequest {
+                dids: vec!["did:plc:no-account".into()],
+                all: false,
+                rationale: Some("investigating".into()),
+            }),
+        )
+        .await
+        .expect("bulk repair starts")
+        .0;
+        assert_eq!(started["status"], "started");
+        assert_eq!(started["targetCount"], 1);
+
+        let mut done = false;
+        let mut progress = serde_json::Value::Null;
+        for _ in 0..200 {
+            progress = get_bulk_repair_progress(
+                State(ctx.clone()),
+                op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            )
+            .await
+            .expect("progress")
+            .0;
+            if progress["running"] == serde_json::Value::Bool(false)
+                && progress["lastOutcome"].is_string()
+            {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done, "bulk repair reached a terminal state");
+        assert_eq!(progress["lastOutcome"], "completed");
+        assert_eq!(progress["processed"], 1);
+        assert_eq!(progress["failed"], 1, "the no-account target fails its rebuild");
+        assert_eq!(progress["repaired"], 0);
     }
 }

@@ -174,6 +174,16 @@ impl ScanFindingsStore {
         Ok(())
     }
 
+    /// All distinct DIDs in the current finding set — the "repair all" target
+    /// list (§7.4.3 / #292). Ordered by did for determinism.
+    pub async fn all_dids(&self) -> PdsResult<Vec<String>> {
+        let rows = sqlx::query("SELECT DISTINCT did FROM repo_scan_finding ORDER BY did")
+            .fetch_all(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        Ok(rows.into_iter().map(|r| r.get::<String, _>("did")).collect())
+    }
+
     /// Severity tallies across all current findings.
     pub async fn counts(&self) -> PdsResult<SeverityCounts> {
         let rows = sqlx::query("SELECT severity, COUNT(*) AS n FROM repo_scan_finding GROUP BY severity")
@@ -592,6 +602,276 @@ impl ScanJob {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bulk repair job (deployment single-flight) — §7.4.3 / #292
+// ---------------------------------------------------------------------------
+
+/// Terminal outcome of a bulk-repair run. Per-account failures are tallied,
+/// not fatal — the run completes unless explicitly cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkOutcome {
+    Completed,
+    Cancelled,
+}
+
+impl BulkOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            BulkOutcome::Completed => "completed",
+            BulkOutcome::Cancelled => "cancelled",
+        }
+    }
+}
+
+struct BulkRepairState {
+    running: bool,
+    batch_id: Option<String>,
+    targets_total: u64,
+    processed: u64,
+    repaired: u64,
+    skipped: u64,
+    failed: u64,
+    current_did: Option<String>,
+    started_at: Option<SystemTime>,
+    finished_at: Option<SystemTime>,
+    last_outcome: Option<BulkOutcome>,
+}
+
+/// A live snapshot of the bulk-repair job for `getBulkRepairProgress`.
+#[derive(Debug, Clone)]
+pub struct BulkRepairProgress {
+    pub running: bool,
+    pub batch_id: Option<String>,
+    pub targets_total: u64,
+    pub processed: u64,
+    pub repaired: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub current_did: Option<String>,
+    pub started_at: Option<SystemTime>,
+    pub finished_at: Option<SystemTime>,
+    pub cancel_requested: bool,
+    pub last_outcome: Option<&'static str>,
+}
+
+/// The deployment's single bulk repository-repair job. Iterates a set of target
+/// DIDs and fires a per-account rebuild for each through the
+/// [`RebuildRegistry`](crate::rebuild::RebuildRegistry) — so every repair runs
+/// under the same per-DID single-flight + emits the same `RepoRebuilt` audit as
+/// an operator-triggered `rebuildRepo`. A per-account failure or single-flight
+/// conflict is tallied and skipped, never fatal to the batch. Held in
+/// [`AppContext`].
+pub struct BulkRepairJob {
+    state: RwLock<BulkRepairState>,
+    cancel: AtomicBool,
+}
+
+impl Default for BulkRepairJob {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BulkRepairJob {
+    pub fn new() -> Self {
+        BulkRepairJob {
+            state: RwLock::new(BulkRepairState {
+                running: false,
+                batch_id: None,
+                targets_total: 0,
+                processed: 0,
+                repaired: 0,
+                skipped: 0,
+                failed: 0,
+                current_did: None,
+                started_at: None,
+                finished_at: None,
+                last_outcome: None,
+            }),
+            cancel: AtomicBool::new(false),
+        }
+    }
+
+    pub fn progress(&self) -> BulkRepairProgress {
+        let st = self.state.read().expect("bulk-repair state lock not poisoned");
+        BulkRepairProgress {
+            running: st.running,
+            batch_id: st.batch_id.clone(),
+            targets_total: st.targets_total,
+            processed: st.processed,
+            repaired: st.repaired,
+            skipped: st.skipped,
+            failed: st.failed,
+            current_did: st.current_did.clone(),
+            started_at: st.started_at,
+            finished_at: st.finished_at,
+            cancel_requested: self.cancel.load(Ordering::Relaxed),
+            last_outcome: st.last_outcome.map(BulkOutcome::as_str),
+        }
+    }
+
+    /// Request cancellation of the in-flight bulk repair. Returns `true` if one
+    /// was running (the flag is set; the loop stops before the next account —
+    /// any per-account rebuild already in flight finishes atomically), `false`
+    /// if none was in flight.
+    pub fn request_cancel(&self) -> bool {
+        let running = self.state.read().expect("bulk-repair state lock not poisoned").running;
+        if running {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+        running
+    }
+
+    /// Single-flight guard: mark running + stamp a fresh batch_id. Returns the
+    /// batch_id, or `None` if a bulk repair is already in flight.
+    fn begin(&self, targets_total: u64) -> Option<String> {
+        let mut st = self.state.write().expect("bulk-repair state lock not poisoned");
+        if st.running {
+            return None;
+        }
+        let batch_id = Uuid::new_v4().to_string();
+        st.running = true;
+        st.batch_id = Some(batch_id.clone());
+        st.targets_total = targets_total;
+        st.processed = 0;
+        st.repaired = 0;
+        st.skipped = 0;
+        st.failed = 0;
+        st.current_did = None;
+        st.started_at = Some(SystemTime::now());
+        st.finished_at = None;
+        st.last_outcome = None;
+        drop(st);
+        self.cancel.store(false, Ordering::Relaxed);
+        Some(batch_id)
+    }
+
+    /// Start a bulk repair over `targets`. Deployment single-flight — returns
+    /// the new batch_id, or `None` if a bulk repair is already running (the
+    /// XRPC maps that to a 409). Spawns the work on a background task.
+    pub fn try_start(
+        self: &Arc<Self>,
+        ctx: AppContext,
+        targets: Vec<String>,
+        triggered_by: String,
+        rationale: String,
+    ) -> Option<String> {
+        let batch_id = self.begin(targets.len() as u64)?;
+        let job = Arc::clone(self);
+        let bid = batch_id.clone();
+        tokio::spawn(async move {
+            let outcome = job.run(&ctx, &bid, targets, &triggered_by, &rationale).await;
+            job.finish(outcome);
+        });
+        Some(batch_id)
+    }
+
+    /// The bulk-repair loop: emit the `BulkRepairInitiated` envelope, then drive
+    /// a per-account rebuild for each target through the rebuild registry.
+    async fn run(
+        &self,
+        ctx: &AppContext,
+        batch_id: &str,
+        targets: Vec<String>,
+        triggered_by: &str,
+        rationale: &str,
+    ) -> BulkOutcome {
+        // Envelope audit at start (§16 D1, Category C): batch-id + the target
+        // DID list + rationale. Per-account RepoRebuilt events stay standalone
+        // (emitted by the rebuild path); correlate via this DID list.
+        emit_bulk_repair_initiated(ctx, batch_id, &targets, triggered_by, rationale).await;
+
+        // The rationale carried into each per-account RepoRebuilt audit ties it
+        // back to this batch.
+        let per_account_rationale = format!("bulk repair {batch_id}: {rationale}");
+
+        for did in targets {
+            if self.cancel.load(Ordering::Relaxed) {
+                return BulkOutcome::Cancelled;
+            }
+            self.state.write().expect("bulk-repair state lock not poisoned").current_did =
+                Some(did.clone());
+
+            let result = ctx
+                .rebuild_registry
+                .run_one(
+                    ctx,
+                    did.clone(),
+                    triggered_by.to_string(),
+                    per_account_rationale.clone(),
+                )
+                .await;
+
+            {
+                let mut st = self.state.write().expect("bulk-repair state lock not poisoned");
+                match result {
+                    Ok(prog) if prog.phase == crate::rebuild::RebuildPhase::Completed => {
+                        st.repaired += 1;
+                    }
+                    // A per-account rebuild that failed or was cancelled.
+                    Ok(_) => st.failed += 1,
+                    // Single-flight: that DID already has a rebuild in flight.
+                    Err(PdsError::Conflict(_)) => st.skipped += 1,
+                    // Any other error (e.g. the DID couldn't even be registered).
+                    Err(_) => st.failed += 1,
+                }
+                st.processed += 1;
+            }
+        }
+        BulkOutcome::Completed
+    }
+
+    fn finish(&self, outcome: BulkOutcome) {
+        let mut st = self.state.write().expect("bulk-repair state lock not poisoned");
+        st.running = false;
+        st.finished_at = Some(SystemTime::now());
+        st.current_did = None;
+        st.last_outcome = Some(outcome);
+        tracing::info!(
+            target: "aurora_locus::repo_scan",
+            event = "bulk_repair_finished",
+            outcome = outcome.as_str(),
+            processed = st.processed,
+            repaired = st.repaired,
+            skipped = st.skipped,
+            failed = st.failed,
+            "bulk repository repair finished",
+        );
+    }
+}
+
+/// Emit the `BulkRepairInitiated` envelope audit event (§7.4.3 / #292):
+/// batch-id + target DID list + rationale + count. Best-effort.
+async fn emit_bulk_repair_initiated(
+    ctx: &AppContext,
+    batch_id: &str,
+    targets: &[String],
+    triggered_by: &str,
+    rationale: &str,
+) {
+    let logger = ModerationEventLogger::new(ctx.account_db.clone());
+    let details = serde_json::json!({
+        "batchId": batch_id,
+        "targetCount": targets.len(),
+        "targetDids": targets,
+        "rationale": rationale,
+    });
+    if let Err(e) = logger
+        .log_event(LogEventParams {
+            event_type: ModerationEventType::BulkRepairInitiated,
+            actor_did: triggered_by,
+            subject_did: None,
+            subject_uri: None,
+            subject_cid: None,
+            details,
+            meta: None,
+        })
+        .await
+    {
+        tracing::error!(target: "aurora_locus::repo_scan", error = %e, "BulkRepairInitiated audit emit failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,5 +1006,35 @@ mod tests {
 
         assert!(job.request_cancel(), "cancel while running returns true");
         assert!(job.progress().cancel_requested);
+    }
+
+    #[test]
+    fn bulk_repair_job_single_flight_and_cancel() {
+        let job = BulkRepairJob::new();
+        assert!(!job.progress().running);
+        assert!(!job.request_cancel(), "cancel with no repair in flight is a no-op");
+
+        let bid = job.begin(3).expect("first begin starts");
+        let p = job.progress();
+        assert!(p.running);
+        assert_eq!(p.batch_id.as_deref(), Some(bid.as_str()));
+        assert_eq!(p.targets_total, 3);
+        assert!(job.begin(5).is_none(), "second begin rejected (single-flight)");
+
+        assert!(job.request_cancel(), "cancel while running returns true");
+        assert!(job.progress().cancel_requested);
+
+        job.finish(BulkOutcome::Cancelled);
+        assert!(!job.progress().running);
+        assert_eq!(job.progress().last_outcome, Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn store_all_dids_returns_distinct_targets() {
+        let store = ScanFindingsStore::new(mem_pool().await);
+        store.insert(&finding("s1", "did:plc:b", Severity::Medium)).await.unwrap();
+        store.insert(&finding("s1", "did:plc:a", Severity::High)).await.unwrap();
+        let dids = store.all_dids().await.unwrap();
+        assert_eq!(dids, vec!["did:plc:a".to_string(), "did:plc:b".to_string()]);
     }
 }
