@@ -197,12 +197,23 @@ pub enum AudienceOrigin {
     AccountSetup,
     Backfill,
     LazyCreate,
+    /// #282 (§4.4 F5) — the audience row was written by a block cascade, not an
+    /// operator-direct `manageAudience` edit. Lets forensic readers distinguish
+    /// cascade-driven removals (correlated to a `KryphocronBlockChanged` via
+    /// `cascade_id`) from direct edits — the §7.2.4 "distinguish the cause" need.
+    Cascade,
 }
 
 /// `KryphocronBlockChanged` payload (per design §4 lines
-/// 1237-1259). Ships in arc 2 step 7 without emit wiring — the
-/// block-create / block-delete dedicated endpoints are post-arc-2
-/// work.
+/// 1237-1259). Emitted by the block handler as a Category-C event (own short
+/// tx, like `RepoRebuilt`) — #282 wires the emit.
+///
+/// **Pre/post pair (rev3 H-4).** The createBlock cascade emits this **twice**,
+/// keyed by the same `cascade_id`: a `phase: "pending"` event before the
+/// audience walk (with `audiences_total`) and a `phase: "completed"` event
+/// after (with `removed`/`failed`). A `pending` with no matching `completed`
+/// is the recovery-tooling signal that a cascade was interrupted mid-pass.
+/// `deleteBlock` emits a single `completed` with `removed: Some(0)`.
 #[derive(Debug, Clone, Serialize)]
 pub struct BlockChangedPayload {
     pub block_uri: String,
@@ -210,6 +221,16 @@ pub struct BlockChangedPayload {
     pub subject_did: String,
     pub operation: BlockMuteOperation,
     pub cascade_id: Option<String>,
+    /// `"pending"` (pre-pass) or `"completed"` (post-pass) — the H-4 pair key.
+    pub phase: String,
+    /// Audiences the pre-pass walk will examine (pre-pass only; `None` post).
+    pub audiences_total: Option<i64>,
+    /// Audiences the subject was *successfully committed* removed from
+    /// (post-pass only; `None` pre).
+    pub removed: Option<i64>,
+    /// Audiences that matched but whose cascade write hit a swap/transient miss
+    /// (post-pass only; `None` pre) — so a partial cascade is visible.
+    pub failed: Option<i64>,
 }
 
 /// `KryphocronMuteChanged` payload (same shape as block-changed

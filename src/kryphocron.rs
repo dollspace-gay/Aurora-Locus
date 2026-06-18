@@ -486,6 +486,39 @@ pub enum SystemCleanupOrigin {
 /// 2 recon resolution supplement's R3 deferral applies to
 /// `RecoveryBypass`; the deferral note on `AccountSetup` from
 /// step 2 also applies here.
+/// Extract the authority (DID) of an `at://<authority>/<collection>/<rkey>`
+/// URI — the segment between `at://` and the first `/`. Used by the Cascade
+/// arm's originator predicate (§2.4.1 P1). Returns `None` if the URI has no
+/// `at://` prefix.
+fn at_uri_authority(uri: &str) -> Option<&str> {
+    uri.strip_prefix("at://")
+        .map(|rest| rest.split('/').next().unwrap_or(rest))
+}
+
+/// Build the loud `denied` tracing + the typed shape-reject error for a
+/// `Cascade` write that failed a §2.4.1 shape predicate. The handler routes
+/// [`PdsError::KryphocronCascadeWriteRejected`] to **abort the whole cascade
+/// pass** (§3.2 P-1) — a correctly-built cascade can't trip these, so this is
+/// a bug or an attack, never a routine miss.
+fn reject_cascade_write(
+    did: &str,
+    write_op: &crate::actor_store::repository::WriteOp,
+    reason: &str,
+) -> PdsError {
+    tracing::warn!(
+        target: "aurora_locus::kryphocron",
+        event = "kryphocron_bind_pipeline_denied",
+        did = %did,
+        nsid = %write_op.collection,
+        variant = "Cascade",
+        reason = %reason,
+    );
+    PdsError::KryphocronCascadeWriteRejected(format!(
+        "{}/{}: {}",
+        write_op.collection, write_op.rkey, reason
+    ))
+}
+
 #[allow(dead_code)] // reached at arc 2 step 5 and onward
 pub async fn bind_pipeline(
     write_op: &crate::actor_store::repository::WriteOp,
@@ -679,37 +712,147 @@ pub async fn bind_pipeline(
                     ));
                 }
             };
-            match ctx.verify_token(token, source) {
-                Ok(()) => {
+            // (1) Authenticate the token — single-use, context-bound,
+            // source-matched (consumes the token on success).
+            if let Err(e) = ctx.verify_token(token, source) {
+                tracing::warn!(
+                    target: "aurora_locus::kryphocron",
+                    event = "kryphocron_cascade_token_invalid",
+                    did = %did,
+                    nsid = %write_op.collection,
+                    verify_error = %e,
+                );
+                tracing::warn!(
+                    target: "aurora_locus::kryphocron",
+                    event = "kryphocron_bind_pipeline_denied",
+                    did = %did,
+                    nsid = %write_op.collection,
+                    variant = "Cascade",
+                    verify_error = %e,
+                );
+                return Err(PdsError::KryphocronCascadeTokenInvalid(e.to_string()));
+            }
+
+            // (2) Per-source shape stage (§2.4.1), matched EXHAUSTIVELY with no
+            // wildcard (§2.4.3 / F4): `CascadeSource` is not `#[non_exhaustive]`,
+            // so a future variant added without an arm here is a build break,
+            // never a silent authorization hole.
+            match source {
+                CascadeSource::BlockCascade { block_uri } => {
+                    // P1 — originator == repo owner. The block_uri authority DID
+                    // must be the bind's `did` (ST-6: bind's `did` IS the
+                    // actor-store DID by construction).
+                    if at_uri_authority(block_uri) != Some(did) {
+                        return Err(reject_cascade_write(
+                            did,
+                            write_op,
+                            "BlockCascade block_uri originator is not the repo owner",
+                        ));
+                    }
+                    // P2 — target collection is the audience collection.
+                    if write_op.collection != "tools.kryphocron.policy.audience" {
+                        return Err(reject_cascade_write(
+                            did,
+                            write_op,
+                            "BlockCascade target collection is not policy.audience",
+                        ));
+                    }
+                    // P3 — operation is Update (never Create/Delete).
+                    if !matches!(
+                        write_op.action,
+                        crate::actor_store::repository::WriteOpAction::Update
+                    ) {
+                        return Err(reject_cascade_write(
+                            did,
+                            write_op,
+                            "BlockCascade write is not an Update",
+                        ));
+                    }
+                    // P4 — swap_cid PRESENCE guard (rev4 M-9). The bind arm only
+                    // checks the pin exists; the CID-equality CAS is enforced by
+                    // apply_writes (it can't read the actor record — ST-2).
+                    if write_op.swap_cid.is_none() {
+                        return Err(reject_cascade_write(
+                            did,
+                            write_op,
+                            "BlockCascade Update carries no swap_cid pin",
+                        ));
+                    }
+
+                    // Shape OK. Collect the forensic bits off the context BEFORE
+                    // building the payload (ends the `ctx` borrow cleanly).
+                    let cascade_id = ctx.id().to_string();
+                    let members_removed = ctx
+                        .block_subject()
+                        .map(|s| vec![s.to_string()])
+                        .unwrap_or_default();
+
                     tracing::info!(
                         target: "aurora_locus::kryphocron",
                         event = "kryphocron_bind_pipeline_authorized",
                         did = %did,
                         nsid = %write_op.collection,
                         variant = "Cascade",
-                        source = ?source,
+                        source = "BlockCascade",
+                        cascade_id = %cascade_id,
                     );
-                    // TODO step 7: per-source cascade bind stages
+
+                    // (3) Cascade-arm audience audit (§4.4). The DedicatedEndpoint
+                    // arm's emit is collection-gated and never fires for the
+                    // Cascade path, so we wire a parallel emit here (§4.4's
+                    // verified-feasible fallback): same `write_op` + `shared_tx` +
+                    // `did`, but `origin: Cascade`, the `cascade_id` correlation
+                    // key, and `members_removed: vec![subject]` (the subject is
+                    // carried on the context per §16 — bind has no actor read).
+                    let value = write_op.value.as_ref();
+                    let payload = crate::kryphocron_audit::AudienceUpdatedPayload {
+                        audience_uri: format!(
+                            "at://{}/{}/{}",
+                            did, write_op.collection, write_op.rkey
+                        ),
+                        owner_did: did.to_string(),
+                        operation: crate::kryphocron_audit::AudienceOperation::Updated,
+                        members_added: vec![],
+                        members_removed,
+                        members_total_after: value
+                            .and_then(|v| v.get("members"))
+                            .and_then(|m| m.as_array())
+                            .map(|a| a.len() as i64)
+                            .unwrap_or(0),
+                        mode_before: None,
+                        mode_after: value
+                            .and_then(|v| v.get("mode"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("list")
+                            .to_string(),
+                        name: value
+                            .and_then(|v| v.get("name"))
+                            .and_then(|m| m.as_str())
+                            .map(String::from),
+                        origin: crate::kryphocron_audit::AudienceOrigin::Cascade,
+                        cascade_id: Some(cascade_id),
+                        cascade_reassigned_to: None,
+                        cascade_post_count: None,
+                        cascade_progress: None,
+                    };
+                    let event_id = crate::kryphocron_audit::emit_audience_updated_in_tx(
+                        shared_tx, did, payload,
+                    )
+                    .await?;
+                    emitted_event_ids.push(event_id);
                     Ok(())
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "aurora_locus::kryphocron",
-                        event = "kryphocron_cascade_token_invalid",
-                        did = %did,
-                        nsid = %write_op.collection,
-                        verify_error = %e,
-                    );
-                    tracing::warn!(
-                        target: "aurora_locus::kryphocron",
-                        event = "kryphocron_bind_pipeline_denied",
-                        did = %did,
-                        nsid = %write_op.collection,
-                        variant = "Cascade",
-                        verify_error = %e,
-                    );
-                    Err(PdsError::KryphocronCascadeTokenInvalid(e.to_string()))
-                }
+                // §2.4.3 — every non-BlockCascade source is a hard reject on the
+                // audience write path: #280 wires BlockCascade only. Explicit
+                // arms (no wildcard) so a newly-wired cascade type must be added
+                // here deliberately.
+                CascadeSource::BskyDeleteCascade { .. }
+                | CascadeSource::ThreadgateCascade { .. }
+                | CascadeSource::AudienceDeleteCascade { .. } => Err(reject_cascade_write(
+                    did,
+                    write_op,
+                    "cascade source is not wired in #280 (BlockCascade only)",
+                )),
             }
         }
         KryphocronWriteAuthorization::AccountSetup { origin } => {
@@ -943,11 +1086,16 @@ mod bind_pipeline_tests {
         );
     }
 
-    /// Cascade arm with a valid token + matching CascadeContext →
-    /// authorized event, returns Ok, token marked spent.
+    /// Cascade arm with a valid token but a source #280 does NOT wire
+    /// (`BskyDeleteCascade`). Pre-#282 the arm was a stub that authorized any
+    /// validly-token'd write; #282 added the per-source shape stage (§2.4.3),
+    /// so the token still *authenticates* (no `cascade_token_invalid`) but the
+    /// write is shape-**rejected** because only `BlockCascade` is wired. (The
+    /// `BlockCascade` happy path is covered by
+    /// `cascade_blockcascade_valid_shape_authorizes_and_emits`.)
     #[tokio::test(flavor = "multi_thread")]
     #[tracing_test::traced_test]
-    async fn cascade_with_valid_token_emits_authorized() {
+    async fn cascade_valid_token_unwired_source_is_shape_rejected() {
         let pool = fresh_shared_pool().await;
         let mut tx = pool.begin().await.expect("begin shared tx");
         let mut ctx = CascadeContext::new(bsky_source());
@@ -961,17 +1109,14 @@ mod bind_pipeline_tests {
             },
         );
 
-        bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp2", &mut Vec::new(), None)
-            .await
-            .expect("Cascade with valid token must succeed");
-
+        let res = bind_pipeline(&write, &mut tx, Some(&mut ctx), "did:plc:bp2", &mut Vec::new(), None).await;
         assert!(
-            logs_contain("kryphocron_bind_pipeline_authorized"),
-            "authorized event must fire",
+            matches!(res, Err(PdsError::KryphocronCascadeWriteRejected(_))),
+            "a valid token on an unwired cascade source must be shape-rejected: {res:?}",
         );
         assert!(
             !logs_contain("kryphocron_cascade_token_invalid"),
-            "no invalid event for the valid-token path",
+            "the token authenticated; the rejection is a shape reject, not a token-invalid",
         );
     }
 
@@ -1281,6 +1426,175 @@ mod bind_pipeline_tests {
 
         assert!(logs_contain("kryphocron_bind_pipeline_authorized"));
         assert!(logs_contain("SystemCleanup"));
+    }
+
+    // ---- #282 BlockCascade arm: §2.4.1 shape predicates + §2.4.3 exhaustive ----
+
+    const BLK_DID: &str = "did:plc:blocker";
+    const BLK_URI: &str = "at://did:plc:blocker/tools.kryphocron.graph.block/blk1";
+    const SUBJ: &str = "did:plc:subject";
+    const AUD_COLL: &str = "tools.kryphocron.policy.audience";
+
+    fn block_src() -> CascadeSource {
+        CascadeSource::BlockCascade {
+            block_uri: BLK_URI.to_string(),
+        }
+    }
+
+    fn cascade_audience_write(
+        collection: &str,
+        action: WriteOpAction,
+        swap: Option<&str>,
+        source: CascadeSource,
+        token: CascadeToken,
+    ) -> WriteOp {
+        WriteOp {
+            action,
+            collection: collection.to_string(),
+            rkey: "aud1".to_string(),
+            value: Some(serde_json::json!({
+                "$type": "tools.kryphocron.policy.audience",
+                "mode": "list",
+                "members": [SUBJ, "did:plc:keep"],
+            })),
+            validate: None,
+            swap_cid: swap.map(String::from),
+            kryphocron_authorization: Some(KryphocronWriteAuthorization::Cascade { source, token }),
+        }
+    }
+
+    /// Valid BlockCascade shape (P1–P4 hold) + valid token → authorized, and the
+    /// Cascade-arm audience audit row is emitted (origin Cascade).
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn cascade_blockcascade_valid_shape_authorizes_and_emits() {
+        let pool = fresh_shared_pool_with_moderation_event().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let mut ctx = CascadeContext::new_block_cascade(BLK_URI.to_string(), SUBJ.to_string());
+        let token = ctx.mint_token_for_test(block_src());
+        let write = cascade_audience_write(
+            AUD_COLL,
+            WriteOpAction::Update,
+            Some("bafyreigtest"),
+            block_src(),
+            token,
+        );
+        let mut ids = Vec::new();
+
+        bind_pipeline(&write, &mut tx, Some(&mut ctx), BLK_DID, &mut ids, None)
+            .await
+            .expect("valid BlockCascade must authorize");
+
+        assert!(logs_contain("kryphocron_bind_pipeline_authorized"));
+        assert_eq!(ids.len(), 1, "exactly one cascade audience-audit row emitted");
+    }
+
+    /// P1 — block_uri originator is a different DID than the repo owner → reject.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn cascade_blockcascade_foreign_originator_rejected() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let foreign_uri = "at://did:plc:someoneelse/tools.kryphocron.graph.block/x";
+        let foreign_src = CascadeSource::BlockCascade {
+            block_uri: foreign_uri.to_string(),
+        };
+        let mut ctx = CascadeContext::new_block_cascade(foreign_uri.to_string(), SUBJ.to_string());
+        let token = ctx.mint_token_for_test(foreign_src.clone());
+        let write = cascade_audience_write(
+            AUD_COLL,
+            WriteOpAction::Update,
+            Some("bafytest"),
+            foreign_src,
+            token,
+        );
+
+        let res = bind_pipeline(&write, &mut tx, Some(&mut ctx), BLK_DID, &mut Vec::new(), None).await;
+        assert!(
+            matches!(res, Err(PdsError::KryphocronCascadeWriteRejected(_))),
+            "foreign originator must be shape-rejected: {res:?}",
+        );
+        assert!(logs_contain("kryphocron_bind_pipeline_denied"));
+    }
+
+    /// P2 — BlockCascade token used on a non-audience collection → reject.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn cascade_blockcascade_wrong_collection_rejected() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let mut ctx = CascadeContext::new_block_cascade(BLK_URI.to_string(), SUBJ.to_string());
+        let token = ctx.mint_token_for_test(block_src());
+        let write = cascade_audience_write(
+            "tools.kryphocron.feed.postPrivate",
+            WriteOpAction::Update,
+            Some("bafytest"),
+            block_src(),
+            token,
+        );
+
+        let res = bind_pipeline(&write, &mut tx, Some(&mut ctx), BLK_DID, &mut Vec::new(), None).await;
+        assert!(
+            matches!(res, Err(PdsError::KryphocronCascadeWriteRejected(_))),
+            "wrong target collection must be rejected: {res:?}",
+        );
+    }
+
+    /// P3 — BlockCascade write that is not an Update (here, Create) → reject.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn cascade_blockcascade_non_update_rejected() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let mut ctx = CascadeContext::new_block_cascade(BLK_URI.to_string(), SUBJ.to_string());
+        let token = ctx.mint_token_for_test(block_src());
+        let write =
+            cascade_audience_write(AUD_COLL, WriteOpAction::Create, Some("bafytest"), block_src(), token);
+
+        let res = bind_pipeline(&write, &mut tx, Some(&mut ctx), BLK_DID, &mut Vec::new(), None).await;
+        assert!(
+            matches!(res, Err(PdsError::KryphocronCascadeWriteRejected(_))),
+            "non-Update BlockCascade must be rejected: {res:?}",
+        );
+    }
+
+    /// P4 — BlockCascade Update with no swap_cid pin → reject (presence-guard).
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn cascade_blockcascade_missing_swap_cid_rejected() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let mut ctx = CascadeContext::new_block_cascade(BLK_URI.to_string(), SUBJ.to_string());
+        let token = ctx.mint_token_for_test(block_src());
+        let write = cascade_audience_write(AUD_COLL, WriteOpAction::Update, None, block_src(), token);
+
+        let res = bind_pipeline(&write, &mut tx, Some(&mut ctx), BLK_DID, &mut Vec::new(), None).await;
+        assert!(
+            matches!(res, Err(PdsError::KryphocronCascadeWriteRejected(_))),
+            "BlockCascade Update without swap_cid must be rejected: {res:?}",
+        );
+    }
+
+    /// §2.4.3 — a non-BlockCascade source reaching the audience path is a hard
+    /// reject (#280 wires BlockCascade only), even with a valid token.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn cascade_non_block_source_rejected() {
+        let pool = fresh_shared_pool().await;
+        let mut tx = pool.begin().await.expect("begin shared tx");
+        let bsky_src = CascadeSource::BskyDeleteCascade {
+            bsky_uri: "at://did:plc:blocker/app.bsky.feed.post/p".to_string(),
+        };
+        let mut ctx = CascadeContext::new(bsky_src.clone());
+        let token = ctx.mint_token_for_test(bsky_src.clone());
+        let write =
+            cascade_audience_write(AUD_COLL, WriteOpAction::Update, Some("bafytest"), bsky_src, token);
+
+        let res = bind_pipeline(&write, &mut tx, Some(&mut ctx), BLK_DID, &mut Vec::new(), None).await;
+        assert!(
+            matches!(res, Err(PdsError::KryphocronCascadeWriteRejected(_))),
+            "non-BlockCascade source must be rejected: {res:?}",
+        );
     }
 }
 

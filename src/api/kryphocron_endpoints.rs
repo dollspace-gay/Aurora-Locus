@@ -107,21 +107,18 @@ pub fn routes() -> Router<AppContext> {
             post(manage_audience),
         );
 
-    // #281 route-not-registered discipline (rev4 F6/M-5). The `graph.block`
-    // create/delete routes are BUILT here — so `create_block`/`delete_block` are
-    // genuinely referenced (no dead code, no `#[allow]`) — but deliberately NOT
-    // merged into the returned router, so they are unreachable over HTTP in every
-    // build. A `createBlock` that persists a block without cascading the audience
-    // removals is a silent privacy failure, so the public route stays dark until
-    // #282 wires the cascade. #282 turns the `let _ = deferred;` below into
-    // `mounted.merge(deferred)` (a one-line flip) at the same time it adds the
-    // cascade pass. The `routes_omit_block_endpoints` test is the tripwire.
-    let deferred_block_routes = Router::<AppContext>::new()
+    // #282 — the `graph.block` cascade now ships, so the create/delete routes
+    // are registered. (#281 built these routes but deliberately left them
+    // unmerged — a `createBlock` that persisted a block without cascading the
+    // audience removals would be a silent privacy failure. `create_block` now
+    // runs the cascade pass after the block-create, so the public route is
+    // safe to mount.) The former `routes_omit_block_endpoints` tripwire is
+    // inverted to assert the routes ARE present.
+    let block_routes = Router::<AppContext>::new()
         .route(&format!("/xrpc/{PROC_CREATE_BLOCK}"), post(create_block))
         .route(&format!("/xrpc/{PROC_DELETE_BLOCK}"), post(delete_block));
-    let _ = deferred_block_routes; // built + referenced, intentionally unmounted (#282 merges)
 
-    mounted
+    mounted.merge(block_routes)
 }
 
 /// Common request shape for the three create-style endpoints:
@@ -680,16 +677,12 @@ async fn manage_audience(
 // the SAME `DedicatedEndpoint{User}` write path as the four endpoints above —
 // not security-sensitive at #282's level (per the #280 design doc §1/§5).
 //
-// ROUTE-NOT-REGISTERED DISCIPLINE (rev4 F6/M-5): neither handler is wired into
-// `routes()` in #281. A `createBlock` that persists the block record but does
-// NOT remove the blocked DID from the blocker's audiences is a silent privacy
-// failure, so the public route must not be reachable until #282 ships the
-// block cascade (which removes the subject from the blocker's list-mode
-// audiences) and registers the routes. #281 ships the substrate (handlers +
-// NSID + deny-map override + tests, callable directly in tests); #282 registers
-// the routes + wires the cascade pass after the block-create. The
-// `routes_do_not_register_block_endpoints` test below is the tripwire guarding
-// this invariant.
+// ROUTES REGISTERED IN #282 (rev4 F6/M-5). #281 shipped these handlers but left
+// their routes UNMERGED, because a `createBlock` that persisted the block record
+// without removing the blocked DID from the blocker's audiences would be a silent
+// privacy failure. #282 wires the cascade pass into `create_block` (it walks the
+// blocker's list-mode audiences and removes the subject — `crate::cascade`), so
+// the routes are now safe to mount and `routes()` merges them.
 // ---------------------------------------------------------------------------
 
 /// `tools.kryphocron.graph.createBlock` — create a
@@ -706,6 +699,13 @@ async fn create_block(
 ) -> PdsResult<Json<WriteResponse>> {
     let auth_did =
         authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoCreate).await?;
+    // Recover the blocked subject from the record body before it is moved into
+    // the write helper — the cascade pass and the audience audit both need it.
+    let subject = req
+        .record
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let resp = apply_single_create(
         &ctx,
         &auth_did,
@@ -715,9 +715,33 @@ async fn create_block(
         req.validate,
     )
     .await?;
-    // #282 wires the block cascade here (walk the blocker's list-mode audiences,
-    // remove `subject`, mint cascade tokens, emit KryphocronBlockChanged + write
-    // block-cascade.log). Until then this endpoint is unregistered.
+    // #282 — cascade the audience removals (§3.1): walk the blocker's list-mode
+    // audiences, remove `subject` (swap_cid-pinned), mint per-write cascade
+    // tokens, and emit the KryphocronBlockChanged pair + block-cascade.log. The
+    // minting lives in `crate::cascade` (H-5 confinement). Best-effort and
+    // forward-only: the block is already committed, so a cascade failure is
+    // logged loudly and never un-commits the block.
+    match subject {
+        Some(subject) => {
+            if let Err(e) =
+                crate::cascade::run_block_cascade(&ctx, auth_did.value(), &subject, &resp.uri).await
+            {
+                tracing::error!(
+                    target: "aurora_locus::kryphocron",
+                    block_uri = %resp.uri,
+                    error = %e,
+                    "createBlock committed but the block cascade failed (block stays committed)",
+                );
+            }
+        }
+        None => {
+            tracing::warn!(
+                target: "aurora_locus::kryphocron",
+                block_uri = %resp.uri,
+                "createBlock record carries no `subject`; audience cascade skipped",
+            );
+        }
+    }
     Ok(Json(resp))
 }
 
@@ -733,6 +757,14 @@ async fn delete_block(
 ) -> PdsResult<Json<serde_json::Value>> {
     let auth_did =
         authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoDelete).await?;
+    let block_uri = format!("at://{}/{}/{}", auth_did.value(), NSID_BLOCK, req.rkey);
+    // Recover the subject before the record is gone, so the forward-only delete
+    // audit can name it (best-effort — `None` if already absent).
+    let subject = crate::cascade::read_block_subject(&ctx, auth_did.value(), &block_uri).await;
     apply_single_delete(&ctx, &auth_did, NSID_BLOCK, req.rkey).await?;
+    // §3.3 forward-only: record the delete (KryphocronBlockChanged Deleted +
+    // block-cascade.log removed:0); membership is NOT restored.
+    crate::cascade::record_block_deleted(&ctx, auth_did.value(), subject.as_deref(), &block_uri)
+        .await;
     Ok(Json(serde_json::json!({})))
 }

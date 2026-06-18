@@ -526,6 +526,32 @@ pub enum PdsError {
     #[allow(dead_code)] // produced by step 5+ cascade flows
     KryphocronCascadeTokenInvalid(String),
 
+    /// Arc H §7.2.5 / #282 — a `Cascade`-authorized write failed the
+    /// `bind_pipeline` Cascade arm's per-source shape predicates (§2.4.1):
+    /// originator ≠ repo owner, target collection ≠ `policy.audience`,
+    /// operation ≠ `Update`, missing `swap_cid`, or a non-`BlockCascade`
+    /// source reaching the audience path. Because the cascade handler builds
+    /// every cascade `Update` from a live read and removes only the subject
+    /// (§2.4.2), a correctly-built cascade *cannot* trip these checks — so this
+    /// is unambiguously a bug or an attack, never a legitimate-but-unlucky
+    /// case. The handler routes it to **abort the whole cascade pass, loudly**
+    /// (§3.2, rev3 P-1), distinct from the best-effort swap/transient misses.
+    /// Mapped to HTTP 403 (the write's authorization shape is invalid).
+    #[error("kryphocron cascade write rejected: {0}")]
+    KryphocronCascadeWriteRejected(String),
+
+    /// Arc H §7.2.5 / #282 (M-10 / ST-3) — an `Update`/`Delete` carrying a
+    /// `swap_cid` did not match the record's current CID at apply time
+    /// (`repository.rs` CAS arm). For the block cascade this is the expected
+    /// "a concurrent `manageAudience` edit moved the record between my live
+    /// read and the apply" signal: the pinned write is stale, so the handler
+    /// **skips that one audience and continues** (§3.2 best-effort) — never
+    /// aborts. A dedicated variant (was untyped `Validation`) so the handler
+    /// can route on it cleanly, type-distinct from shape-rejects and generic
+    /// transients. Mapped to HTTP 409 Conflict.
+    #[error("swap CID mismatch: {0}")]
+    SwapCidMismatch(String),
+
     /// v0.7 arc 2 step 4 — `validate_write` reached the bind
     /// pipeline path (`kryphocron_authorization` is `Some(_)`)
     /// without an active lent shared-DB transaction on the
@@ -703,6 +729,11 @@ impl PartialEq for PdsError {
                 PdsError::KryphocronCascadeTokenInvalid(a),
                 PdsError::KryphocronCascadeTokenInvalid(b),
             ) => a == b,
+            (
+                PdsError::KryphocronCascadeWriteRejected(a),
+                PdsError::KryphocronCascadeWriteRejected(b),
+            ) => a == b,
+            (PdsError::SwapCidMismatch(a), PdsError::SwapCidMismatch(b)) => a == b,
             (
                 PdsError::KryphocronBindPipelineOutsideScope,
                 PdsError::KryphocronBindPipelineOutsideScope,
@@ -1057,6 +1088,16 @@ impl IntoResponse for PdsError {
             PdsError::KryphocronCascadeTokenInvalid(_) => (
                 StatusCode::FORBIDDEN,
                 "KryphocronCascadeTokenInvalid",
+                self.to_string(),
+            ),
+            PdsError::KryphocronCascadeWriteRejected(_) => (
+                StatusCode::FORBIDDEN,
+                "KryphocronCascadeWriteRejected",
+                self.to_string(),
+            ),
+            PdsError::SwapCidMismatch(_) => (
+                StatusCode::CONFLICT,
+                "SwapCidMismatch",
                 self.to_string(),
             ),
             PdsError::KryphocronBindPipelineOutsideScope => (
