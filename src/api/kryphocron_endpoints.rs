@@ -54,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     actor_store::{repository::WriteOpAction, RepositoryManager, WriteOp},
     api::{middleware, repo::create_actor_signer},
+    auth::AuthenticatedDid,
     context::AppContext,
     error::{PdsError, PdsResult},
     kryphocron::{CapabilityClass, KryphocronWriteAuthorization},
@@ -67,6 +68,9 @@ use crate::{
 /// duplicating string literals.
 pub(crate) const NSID_POST_PRIVATE: &str = "tools.kryphocron.feed.postPrivate";
 pub(crate) const NSID_AUDIENCE: &str = "tools.kryphocron.policy.audience";
+/// `graph.block` record collection (Arc H §7.2.5 / #281). Private-tier; written
+/// only via the dedicated `createBlock`/`deleteBlock` procedures.
+pub(crate) const NSID_BLOCK: &str = "tools.kryphocron.graph.block";
 
 /// XRPC procedure NSIDs (the dedicated-endpoint paths the
 /// `RequiresDedicatedEndpoint` suggested_endpoint field points to).
@@ -74,12 +78,18 @@ pub(crate) const PROC_CREATE_POST_PRIVATE: &str = "tools.kryphocron.feed.createP
 pub(crate) const PROC_DELETE_POST_PRIVATE: &str = "tools.kryphocron.feed.deletePostPrivate";
 pub(crate) const PROC_PARTICIPATE_PRIVATE: &str = "tools.kryphocron.actor.participatePrivate";
 pub(crate) const PROC_MANAGE_AUDIENCE: &str = "tools.kryphocron.policy.manageAudience";
+/// `graph.block` create/delete procedures (#281). The routes are intentionally
+/// NOT registered in [`routes`] until #282 wires the block cascade (rev4 F6/M-5)
+/// — a `createBlock` that persists the block without removing the blocked DID
+/// from the blocker's audiences would be a silent privacy failure.
+pub(crate) const PROC_CREATE_BLOCK: &str = "tools.kryphocron.graph.createBlock";
+pub(crate) const PROC_DELETE_BLOCK: &str = "tools.kryphocron.graph.deleteBlock";
 
 /// Build the four route bindings. Plain `.route(...)` per the arc
 /// 2 recon R2 finding: user-class endpoints aren't advertised in
 /// `RouteRegistry` (which is admin-tier only).
 pub fn routes() -> Router<AppContext> {
-    Router::new()
+    let mounted = Router::new()
         .route(
             &format!("/xrpc/{PROC_CREATE_POST_PRIVATE}"),
             post(create_post_private),
@@ -95,7 +105,23 @@ pub fn routes() -> Router<AppContext> {
         .route(
             &format!("/xrpc/{PROC_MANAGE_AUDIENCE}"),
             post(manage_audience),
-        )
+        );
+
+    // #281 route-not-registered discipline (rev4 F6/M-5). The `graph.block`
+    // create/delete routes are BUILT here — so `create_block`/`delete_block` are
+    // genuinely referenced (no dead code, no `#[allow]`) — but deliberately NOT
+    // merged into the returned router, so they are unreachable over HTTP in every
+    // build. A `createBlock` that persists a block without cascading the audience
+    // removals is a silent privacy failure, so the public route stays dark until
+    // #282 wires the cascade. #282 turns the `let _ = deferred;` below into
+    // `mounted.merge(deferred)` (a one-line flip) at the same time it adds the
+    // cascade pass. The `routes_omit_block_endpoints` test is the tripwire.
+    let deferred_block_routes = Router::<AppContext>::new()
+        .route(&format!("/xrpc/{PROC_CREATE_BLOCK}"), post(create_block))
+        .route(&format!("/xrpc/{PROC_DELETE_BLOCK}"), post(delete_block));
+    let _ = deferred_block_routes; // built + referenced, intentionally unmounted (#282 merges)
+
+    mounted
 }
 
 /// Common request shape for the three create-style endpoints:
@@ -136,7 +162,7 @@ async fn authenticated_did_for_repo(
     headers: HeaderMap,
     requested_repo: &str,
     scope: AtProtoScope,
-) -> PdsResult<String> {
+) -> PdsResult<AuthenticatedDid> {
     let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
     middleware::enforce_scope(&auth, &scope)?;
     if auth.is_cross_pds() {
@@ -150,7 +176,11 @@ async fn authenticated_did_for_repo(
                 .to_string(),
         ));
     }
-    Ok(auth_did.to_string())
+    // This is THE request-auth chokepoint: the requester is authenticated, the
+    // scope is enforced, and the target repo is confirmed to be the requester's
+    // own. Wrap the validated DID so the write helpers take `AuthenticatedDid`,
+    // not a bare `&str` (Arc H §7.2.5 / #281; see `AuthenticatedDid` rustdoc).
+    Ok(AuthenticatedDid::from_authenticated(auth_did.to_string()))
 }
 
 /// Helper — apply a single kryphocron-authorized create `WriteOp`
@@ -159,12 +189,13 @@ async fn authenticated_did_for_repo(
 /// share the same plumbing.
 async fn apply_single_create(
     ctx: &AppContext,
-    auth_did: &str,
+    auth: &AuthenticatedDid,
     collection: &str,
     rkey: Option<String>,
     record: serde_json::Value,
     validate: Option<bool>,
 ) -> PdsResult<WriteResponse> {
+    let auth_did = auth.value();
     let rkey = rkey.unwrap_or_else(|| next_tid(None).to_string());
     let repo_mgr = RepositoryManager::for_writer(ctx, auth_did.to_string());
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
@@ -196,6 +227,42 @@ async fn apply_single_create(
     })
 }
 
+/// Helper — apply a single kryphocron-authorized delete `WriteOp` for the
+/// authenticated writer's own repo. The delete-side analog of
+/// [`apply_single_create`]; shares the `DedicatedEndpoint`/`User` authorization
+/// so the dispatcher routes through `bind_pipeline`, not the deny-map.
+async fn apply_single_delete(
+    ctx: &AppContext,
+    auth: &AuthenticatedDid,
+    collection: &str,
+    rkey: String,
+) -> PdsResult<()> {
+    let auth_did = auth.value();
+    let repo_mgr = RepositoryManager::for_writer(ctx, auth_did.to_string());
+    let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
+
+    let write = WriteOp {
+        action: WriteOpAction::Delete,
+        collection: collection.to_string(),
+        rkey,
+        value: None,
+        validate: None,
+        swap_cid: None,
+        kryphocron_authorization: Some(KryphocronWriteAuthorization::DedicatedEndpoint {
+            capability_class: CapabilityClass::User,
+        }),
+    };
+
+    repo_mgr
+        .apply_writes(
+            vec![write],
+            signer,
+            Arc::new(crate::blob_store::StrictPromoter),
+        )
+        .await?;
+    Ok(())
+}
+
 /// `tools.kryphocron.feed.createPostPrivate` — create a
 /// `tools.kryphocron.feed.postPrivate` record under the
 /// `EditPrivatePost` (user-class) capability. The bind pipeline
@@ -217,7 +284,7 @@ async fn create_post_private(
     let mut record = req.record;
     crate::kryphocron_content::encode_private_content(
         &ctx,
-        &auth_did,
+        auth_did.value(),
         NSID_POST_PRIVATE,
         &rkey,
         &mut record,
@@ -249,29 +316,7 @@ async fn delete_post_private(
 ) -> PdsResult<Json<serde_json::Value>> {
     let auth_did =
         authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoDelete).await?;
-    let repo_mgr = RepositoryManager::for_writer(&ctx, auth_did.clone());
-    let signer = create_actor_signer(&ctx.account_manager, &auth_did).await?;
-
-    let write = WriteOp {
-        action: WriteOpAction::Delete,
-        collection: NSID_POST_PRIVATE.to_string(),
-        rkey: req.rkey.clone(),
-        value: None,
-        validate: None,
-        swap_cid: None,
-        kryphocron_authorization: Some(KryphocronWriteAuthorization::DedicatedEndpoint {
-            capability_class: CapabilityClass::User,
-        }),
-    };
-
-    repo_mgr
-        .apply_writes(
-            vec![write],
-            signer,
-            Arc::new(crate::blob_store::StrictPromoter),
-        )
-        .await?;
-
+    apply_single_delete(&ctx, &auth_did, NSID_POST_PRIVATE, req.rkey).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -333,13 +378,13 @@ async fn participate_private(
         })?
         .to_string();
 
-    match check_participate_audience(&ctx, &parent_uri, &auth_did).await? {
+    match check_participate_audience(&ctx, &parent_uri, auth_did.value()).await? {
         ParticipateAudienceOutcome::Allowed => {}
         ParticipateAudienceOutcome::DeferredCrossDid { parent_owner } => {
             tracing::warn!(
                 target: "aurora_locus::kryphocron",
                 event = "participate_private_audience_check_deferred",
-                requester_did = %auth_did,
+                requester_did = %auth_did.value(),
                 parent_uri = %parent_uri,
                 parent_owner = %parent_owner,
                 reason = "cross_did_audience_lookup_not_yet_wired",
@@ -355,7 +400,7 @@ async fn participate_private(
                 .await
                 .map_err(PdsError::Database)?;
             crate::kryphocron_audit::emit_audience_check_denied_in_tx(
-                &mut tx, &auth_did, payload,
+                &mut tx, auth_did.value(), payload,
             )
             .await?;
             tx.commit().await.map_err(PdsError::Database)?;
@@ -371,7 +416,7 @@ async fn participate_private(
     let mut record = req.record;
     crate::kryphocron_content::encode_private_content(
         &ctx,
-        &auth_did,
+        auth_did.value(),
         NSID_POST_PRIVATE,
         &rkey,
         &mut record,
@@ -626,4 +671,68 @@ async fn manage_audience(
     )
     .await?;
     Ok(Json(resp))
+}
+
+// ---------------------------------------------------------------------------
+// graph.block entry-point substrate (Arc H §7.2.5 / #281)
+//
+// These two handlers are the user-facing block create/delete surface. They use
+// the SAME `DedicatedEndpoint{User}` write path as the four endpoints above —
+// not security-sensitive at #282's level (per the #280 design doc §1/§5).
+//
+// ROUTE-NOT-REGISTERED DISCIPLINE (rev4 F6/M-5): neither handler is wired into
+// `routes()` in #281. A `createBlock` that persists the block record but does
+// NOT remove the blocked DID from the blocker's audiences is a silent privacy
+// failure, so the public route must not be reachable until #282 ships the
+// block cascade (which removes the subject from the blocker's list-mode
+// audiences) and registers the routes. #281 ships the substrate (handlers +
+// NSID + deny-map override + tests, callable directly in tests); #282 registers
+// the routes + wires the cascade pass after the block-create. The
+// `routes_do_not_register_block_endpoints` test below is the tripwire guarding
+// this invariant.
+// ---------------------------------------------------------------------------
+
+/// `tools.kryphocron.graph.createBlock` — create a
+/// `tools.kryphocron.graph.block` record (carrying `subject`, the blocked DID)
+/// in the caller's own repo, under the `DedicatedEndpoint`/`User` authorization.
+/// Private-tier (existence is private; consumed by `BlockOracle` outside the
+/// normal capability flow — §7.2.4). **Route intentionally unregistered until
+/// #282** (see the module note above): this persists the block but does not yet
+/// cascade the audience removals.
+async fn create_block(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Json(req): Json<CreateLikeRequest>,
+) -> PdsResult<Json<WriteResponse>> {
+    let auth_did =
+        authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoCreate).await?;
+    let resp = apply_single_create(
+        &ctx,
+        &auth_did,
+        NSID_BLOCK,
+        req.rkey,
+        req.record,
+        req.validate,
+    )
+    .await?;
+    // #282 wires the block cascade here (walk the blocker's list-mode audiences,
+    // remove `subject`, mint cascade tokens, emit KryphocronBlockChanged + write
+    // block-cascade.log). Until then this endpoint is unregistered.
+    Ok(Json(resp))
+}
+
+/// `tools.kryphocron.graph.deleteBlock` — delete a
+/// `tools.kryphocron.graph.block` record from the caller's repo. Forward-only
+/// per §7.2.4: deleting a block does NOT re-add the subject to audiences (#282
+/// emits the `removed: 0` audit). **Route intentionally unregistered until
+/// #282** (see the module note above).
+async fn delete_block(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteLikeRequest>,
+) -> PdsResult<Json<serde_json::Value>> {
+    let auth_did =
+        authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoDelete).await?;
+    apply_single_delete(&ctx, &auth_did, NSID_BLOCK, req.rkey).await?;
+    Ok(Json(serde_json::json!({})))
 }

@@ -19,6 +19,45 @@ fn parse_ts(s: &str) -> Result<chrono::DateTime<chrono::Utc>, crate::error::PdsE
         .map_err(|e| crate::error::PdsError::Internal(format!("Invalid timestamp: {}", e)))
 }
 
+/// A DID the caller has authenticated as authorized to write to — produced by
+/// the request-auth chokepoints (e.g. `authenticated_did_for_repo`, which
+/// validates that the request's authenticated identity owns the target repo).
+///
+/// Arc H §7.2.5 / #280 rev4 (LB-5/H-7), scoped per #281: this newtype makes the
+/// kryphocron dedicated-endpoint write boundary — including the `graph.block`
+/// cascade entry point (`createBlock`, #282) — take a *deliberately-constructed*
+/// DID rather than a bare `&str`, so a write DID sourced from request input
+/// can't be passed implicitly to the write helpers.
+///
+/// **Scope note (per the #281 §16 clarification).** rev4's literal "type-proof
+/// Boundary-1 everywhere via `for_writer`" was reduced to *this* boundary,
+/// because `RepositoryManager::for_writer` lives in `actor_store` and cannot
+/// depend on the `api` auth types (layering), and because a legitimate
+/// non-request writer exists (the rewrite-on-rotate system job). So this is a
+/// low-level, `api`-free newtype constructed from an already-validated DID
+/// string; `for_writer` still takes `String`. The global, auth-object-bound
+/// version is future work (precondition: resolve the layering bar / introduce a
+/// low-level principal type). Boundary-1 for #280 holds because `createBlock` —
+/// the only #280 cascade entry point — consumes this type at its boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedDid(String);
+
+impl AuthenticatedDid {
+    /// Construct from a DID the caller has already authenticated **and**
+    /// authorized — i.e. a request-auth chokepoint has validated
+    /// `requested_repo == auth.did()`. The kryphocron `authenticated_did_for_repo`
+    /// chokepoint is the producer; do not call this with a DID taken straight
+    /// from request input without that validation.
+    pub fn from_authenticated(did: impl Into<String>) -> Self {
+        Self(did.into())
+    }
+
+    /// The underlying DID string.
+    pub fn value(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Authentication method used for the request
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
@@ -2099,5 +2138,19 @@ mod admin_auth_third_path_tests {
             Err(PdsError::Authentication(_)) => {}
             other => panic!("expected Authentication (401) for unknown sid, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod authenticated_did_tests {
+    use super::AuthenticatedDid;
+
+    #[test]
+    fn from_authenticated_round_trips() {
+        let d = AuthenticatedDid::from_authenticated("did:plc:abc123".to_string());
+        assert_eq!(d.value(), "did:plc:abc123");
+        // Accepts &str via Into.
+        let d2 = AuthenticatedDid::from_authenticated("did:plc:abc123");
+        assert_eq!(d, d2);
     }
 }

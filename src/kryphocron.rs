@@ -163,6 +163,32 @@ pub fn build_deny_map() -> HashMap<(String, WriteOpAction), KryphocronDenyVarian
             ),
         },
     );
+    // graph.block Create/Delete → dedicated endpoints (Arc H §7.2.5 / #281).
+    // Generic createRecord/deleteRecord on graph.block now returns 400 with the
+    // dedicated procedure suggested (mirrors postPrivate). Update stays at the
+    // source-2 `NotYetSupported` default (no manageAudience-style update path).
+    map.insert(
+        (
+            crate::api::kryphocron_endpoints::NSID_BLOCK.to_string(),
+            WriteOpAction::Create,
+        ),
+        KryphocronDenyVariant::RequiresDedicatedEndpoint {
+            suggested_endpoint: Some(
+                crate::api::kryphocron_endpoints::PROC_CREATE_BLOCK.to_string(),
+            ),
+        },
+    );
+    map.insert(
+        (
+            crate::api::kryphocron_endpoints::NSID_BLOCK.to_string(),
+            WriteOpAction::Delete,
+        ),
+        KryphocronDenyVariant::RequiresDedicatedEndpoint {
+            suggested_endpoint: Some(
+                crate::api::kryphocron_endpoints::PROC_DELETE_BLOCK.to_string(),
+            ),
+        },
+    );
     map
 }
 
@@ -1721,8 +1747,9 @@ mod deny_map_step_5_tests {
 
     use super::*;
     use crate::api::kryphocron_endpoints::{
-        NSID_AUDIENCE, NSID_POST_PRIVATE, PROC_CREATE_POST_PRIVATE,
-        PROC_DELETE_POST_PRIVATE, PROC_MANAGE_AUDIENCE,
+        NSID_AUDIENCE, NSID_BLOCK, NSID_POST_PRIVATE, PROC_CREATE_BLOCK,
+        PROC_CREATE_POST_PRIVATE, PROC_DELETE_BLOCK, PROC_DELETE_POST_PRIVATE,
+        PROC_MANAGE_AUDIENCE,
     };
 
     fn assert_dedicated_endpoint(
@@ -1816,10 +1843,18 @@ mod deny_map_step_5_tests {
             "tools.kryphocron.feed.like",
             WriteOpAction::Delete,
         );
-        assert_not_yet_supported(
-            &map,
-            "tools.kryphocron.graph.block",
-            WriteOpAction::Create,
-        );
+    }
+
+    /// Arc H §7.2.5 / #281 — `graph.block` Create/Delete flip to
+    /// `RequiresDedicatedEndpoint` (createBlock/deleteBlock); Update stays at
+    /// the source-2 `NotYetSupported` default (no dedicated update path). This
+    /// replaces the pre-#281 assertion that `graph.block` Create was
+    /// `NotYetSupported`.
+    #[test]
+    fn block_endpoints_require_dedicated_endpoint() {
+        let map = build_deny_map();
+        assert_dedicated_endpoint(&map, NSID_BLOCK, WriteOpAction::Create, PROC_CREATE_BLOCK);
+        assert_dedicated_endpoint(&map, NSID_BLOCK, WriteOpAction::Delete, PROC_DELETE_BLOCK);
+        assert_not_yet_supported(&map, NSID_BLOCK, WriteOpAction::Update);
     }
 }
