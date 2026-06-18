@@ -377,6 +377,19 @@ async fn get_session(
     let unified = middleware::require_auth_forwarded(State(ctx.clone()), headers.clone()).await?;
     let did = unified.did().to_string();
 
+    // #297 — the caller's operator role, for the admin UI's live tier
+    // resolution. Looked up locally from `admin_roles` regardless of entryway
+    // mode (the role table is this PDS's, not the entryway's); `None` for
+    // regular accounts → the field is omitted (standard session shape). Fail
+    // soft: a lookup error degrades to no role rather than failing the session.
+    let role = ctx
+        .admin_role_manager
+        .get_role(&did)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.role.as_str().to_string());
+
     // Arc 12 §5.3.8 mint-pattern forward. Entryway is the canonical
     // source of session info in entryway mode (it owns the account
     // identity).
@@ -384,13 +397,16 @@ async fn get_session(
         let fwd_headers = ctx
             .entryway_auth_headers(&did, "com.atproto.server.getSession")
             .await?;
-        let resp: SessionInfo = entryway
+        let mut resp: SessionInfo = entryway
             .xrpc_get_json("com.atproto.server.getSession", fwd_headers, &[])
             .await?;
+        // The entryway owns identity but not this PDS's operator roles — graft
+        // the locally-resolved role onto the forwarded session.
+        resp.role = role;
         return Ok(Json(resp));
     }
 
-    // Standalone path (unchanged).
+    // Standalone path.
     let account = ctx.account_manager.get_account(&did).await?;
 
     Ok(Json(SessionInfo {
@@ -398,6 +414,7 @@ async fn get_session(
         handle: account.handle.unwrap_or_default(),
         email: account.email,
         email_confirmed: Some(account.email_confirmed_at.is_some()),
+        role,
     }))
 }
 
