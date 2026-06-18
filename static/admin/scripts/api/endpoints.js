@@ -139,6 +139,14 @@
     repairRepos: (body) => C().post('tools.aurora.superadmin.repairRepos', body),
     getBulkRepairProgress: () => C().get('tools.aurora.superadmin.getBulkRepairProgress'),
     cancelBulkRepair: () => C().post('tools.aurora.superadmin.cancelBulkRepair', {}),
+    // Sequencer recovery (§7.4.2 / #294). options: current state + available
+    // operations. run: dispatch one (v0.9: "validate", read-only deep
+    // integrity validation). progress/cancel: poll/abort the in-flight op.
+    sequencerRecoveryOptions: () => C().get('tools.aurora.superadmin.sequencerRecoveryOptions'),
+    runSequencerRecovery: (body) => C().post('tools.aurora.superadmin.runSequencerRecovery', body),
+    getSequencerRecoveryProgress: () =>
+      C().get('tools.aurora.superadmin.getSequencerRecoveryProgress'),
+    cancelSequencerRecovery: () => C().post('tools.aurora.superadmin.cancelSequencerRecovery', {}),
   };
 
   global.AuroraEndpoints = {

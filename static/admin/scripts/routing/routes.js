@@ -44,6 +44,10 @@
     { pattern: 'ops/invites', page: 'opsInvites', requires: 'admin' },
     { pattern: 'ops/invites/:code', page: 'opsInviteDetail', requires: 'admin' },
     { pattern: 'ops/sequencer', page: 'opsSequencer', requires: 'admin' },
+    // Sequencer recovery (Arc H §7.4.2 / #295). SuperAdmin escalation surface
+    // beyond the routine Sequencer controls — read-only deep integrity
+    // validation. Nested under sequencer per the spec route.
+    { pattern: 'ops/sequencer/recovery', page: 'opsSequencerRecovery', requires: 'superadmin' },
     { pattern: 'ops/federation', page: 'opsFederation', requires: 'admin' },
     { pattern: 'ops/blob-ops', page: 'opsBlobOps', requires: 'admin' },
     { pattern: 'ops/rate-limits', page: 'opsRateLimits', requires: 'admin' },
@@ -164,6 +168,7 @@
         { label: 'System health', route: 'ops/system-health', icon: 'heart-pulse', requires: 'admin' },
         { label: 'Repository rebuild', route: 'ops/repo-rebuild', icon: 'server', requires: 'superadmin' },
         { label: 'Repository repair', route: 'ops/repo-repair', icon: 'shield-check', requires: 'superadmin' },
+        { label: 'Sequencer recovery', route: 'ops/sequencer/recovery', icon: 'activity', requires: 'superadmin' },
       ],
     },
     {
