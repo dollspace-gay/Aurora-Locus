@@ -723,6 +723,29 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(cancel_rebuild),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // Bulk repository repair — scan substrate (§7.4.3 / #291): start an
+        // across-accounts inconsistency scan, poll its progress, cancel it,
+        // and read the persisted findings.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.scanReposForInconsistencies",
+            post(scan_repos_for_inconsistencies),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getScanProgress",
+            get(get_scan_progress),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.cancelScan",
+            post(cancel_scan),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getRepoScanResults",
+            get(get_repo_scan_results),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // Per-operator session management (§8.1.7 / #273). Admin-tier
         // namespace; the handlers gate finer: any operator lists/revokes
         // their OWN sessions (self-service), SuperAdmin lists all and
@@ -1820,6 +1843,185 @@ async fn cancel_rebuild(
             "rebuild job already complete; nothing to cancel".to_string(),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk repository repair — scan substrate (§7.4.3 / #291)
+// ---------------------------------------------------------------------------
+
+/// `POST /xrpc/tools.aurora.superadmin.scanReposForInconsistencies` — start a
+/// background across-accounts scan (§7.4.3 / #291). Walks every account,
+/// structurally reconstructs its repo from the sequencer, and persists any
+/// repo-vs-sequencer inconsistency as a finding (reviewable via
+/// getRepoScanResults). Read-only — it detects, it does not repair (#292).
+/// Deployment single-flight (409 if a scan is already running). SuperAdmin.
+async fn scan_repos_for_inconsistencies(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "scanReposForInconsistencies requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let job = ctx.repo_scan_job.clone();
+    match job.try_start(ctx.clone(), auth.did.clone()) {
+        Some(scan_id) => Ok(Json(serde_json::json!({
+            "scanId": scan_id,
+            "status": "started",
+        }))),
+        None => Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "a repository scan is already in progress".to_string(),
+        )),
+    }
+}
+
+/// Render a [`ScanProgress`](crate::repo_scan::ScanProgress) as the
+/// `getScanProgress` wire shape.
+fn scan_progress_json(p: &crate::repo_scan::ScanProgress) -> serde_json::Value {
+    fn ms(t: Option<std::time::SystemTime>) -> Option<u64> {
+        t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    }
+    serde_json::json!({
+        "running": p.running,
+        "scanId": p.scan_id,
+        "accountsScanned": p.accounts_scanned,
+        "findingsHigh": p.counts.high,
+        "findingsMedium": p.counts.medium,
+        "findingsLow": p.counts.low,
+        "findingsTotal": p.counts.total(),
+        "startedAt": ms(p.started_at),
+        "finishedAt": ms(p.finished_at),
+        "cancelRequested": p.cancel_requested,
+        "lastOutcome": p.last_outcome,
+    })
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.getScanProgress` — live progress of the
+/// repository scan (§7.4.3 / #291): running flag, accounts scanned, the
+/// severity breakdown so far, and the last run's outcome. SuperAdmin.
+async fn get_scan_progress(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("getScanProgress requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    Ok(Json(scan_progress_json(&ctx.repo_scan_job.progress())))
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.cancelScan` — request cancellation of
+/// the in-flight scan (§7.4.3 / #291); the walk stops at the next account
+/// boundary. SuperAdmin. 409 if no scan is in progress.
+async fn cancel_scan(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("cancelScan requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    if ctx.repo_scan_job.request_cancel() {
+        Ok(Json(serde_json::json!({ "status": "cancelling" })))
+    } else {
+        Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "no repository scan is in progress".to_string(),
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+struct GetRepoScanResultsParams {
+    /// Filter by severity (`high` | `medium` | `low`); omitted = all.
+    severity: Option<String>,
+    limit: Option<i64>,
+    /// Keyset cursor: the last did from the previous page.
+    cursor: Option<String>,
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.getRepoScanResults` — the latest scan's
+/// findings (§7.4.3 / #291), optionally filtered by severity, keyset-paginated
+/// by did, with the full severity breakdown. SuperAdmin.
+async fn get_repo_scan_results(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(params): Query<GetRepoScanResultsParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("getRepoScanResults requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    let severity = match params.severity.as_deref() {
+        None => None,
+        Some(s) => match s.parse::<crate::repo_scan::Severity>() {
+            Ok(sev) => Some(sev),
+            Err(e) => return Err(json_error(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string())),
+        },
+    };
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let findings = ctx
+        .scan_findings_store
+        .list(severity, limit, params.cursor.as_deref())
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
+    let counts = ctx
+        .scan_findings_store
+        .counts()
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
+    let next_cursor = if findings.len() as i64 == limit {
+        findings.last().map(|f| f.did.clone())
+    } else {
+        None
+    };
+    let items: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "did": f.did,
+                "severity": f.severity.as_str(),
+                "liveHead": f.live_head,
+                "reconstructedHead": f.recon_head,
+                "detail": f.detail,
+                "scanId": f.scan_id,
+                "createdAt": f.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "findings": items,
+        "counts": {
+            "high": counts.high,
+            "medium": counts.medium,
+            "low": counts.low,
+            "total": counts.total(),
+        },
+        "cursor": next_cursor,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -8462,14 +8664,18 @@ mod tests {
             r#""listAudiences","#,
             r#""getBlockCascadeImpact""#,
             r#"],"#,
-            // tools.aurora.superadmin (6 endpoints)
+            // tools.aurora.superadmin (10 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
             r#""preRebuildCheck","#,
             r#""rebuildRepo","#,
             r#""getRebuildProgress","#,
-            r#""cancelRebuild""#,
+            r#""cancelRebuild","#,
+            r#""scanReposForInconsistencies","#,
+            r#""getScanProgress","#,
+            r#""cancelScan","#,
+            r#""getRepoScanResults""#,
             r#"]"#,
             r#"},"#,
             // ---- implementation, version (literals) ----
@@ -8855,6 +9061,10 @@ mod tests {
         assert!(names.contains(&"rebuildRepo"), "rebuildRepo missing");
         assert!(names.contains(&"getRebuildProgress"), "getRebuildProgress missing");
         assert!(names.contains(&"cancelRebuild"), "cancelRebuild missing");
+        assert!(names.contains(&"scanReposForInconsistencies"), "scanReposForInconsistencies missing");
+        assert!(names.contains(&"getScanProgress"), "getScanProgress missing");
+        assert!(names.contains(&"cancelScan"), "cancelScan missing");
+        assert!(names.contains(&"getRepoScanResults"), "getRepoScanResults missing");
     }
 
     #[tokio::test]
@@ -11345,5 +11555,89 @@ mod tests {
         }
         assert_eq!(phase, "failed", "no-account rebuild must terminate as failed");
         assert!(error_present, "a failed job surfaces a diagnostic");
+    }
+
+    // ---------- §7.4.3 / #291 bulk-repair scan XRPCs ----------
+
+    #[tokio::test]
+    async fn scan_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = scan_repos_for_inconsistencies(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+        )
+        .await
+        .expect_err("Admin (not SuperAdmin) must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn get_repo_scan_results_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = get_repo_scan_results(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            axum::extract::Query(GetRepoScanResultsParams { severity: None, limit: None, cursor: None }),
+        )
+        .await
+        .expect_err("Admin must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cancel_scan_with_none_running_is_409() {
+        let ctx = create_test_context().await;
+        let err = cancel_scan(State(ctx), op_auth("did:plc:super", Role::SuperAdmin, "sid"))
+            .await
+            .expect_err("no scan in progress → Conflict");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    /// End-to-end scan lifecycle through the handlers: a fresh test context has
+    /// no accounts, so the scan completes with zero findings — exercising
+    /// start → run → finish (+ ScanCompleted audit) → getScanProgress →
+    /// getRepoScanResults.
+    #[tokio::test]
+    async fn scan_lifecycle_empty_completes_with_no_findings() {
+        let ctx = create_test_context().await;
+        let started = scan_repos_for_inconsistencies(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+        )
+        .await
+        .expect("scan starts")
+        .0;
+        assert_eq!(started["status"], "started");
+        assert!(started["scanId"].is_string());
+
+        // Poll until the scan reports not-running.
+        let mut last_outcome = serde_json::Value::Null;
+        for _ in 0..200 {
+            let p = get_scan_progress(
+                State(ctx.clone()),
+                op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            )
+            .await
+            .expect("progress")
+            .0;
+            if p["running"] == serde_json::Value::Bool(false) && p["lastOutcome"].is_string() {
+                last_outcome = p["lastOutcome"].clone();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(last_outcome, "completed", "empty scan completes");
+
+        // Results: no findings, zero counts.
+        let results = get_repo_scan_results(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            axum::extract::Query(GetRepoScanResultsParams { severity: None, limit: None, cursor: None }),
+        )
+        .await
+        .expect("results")
+        .0;
+        assert_eq!(results["findings"].as_array().unwrap().len(), 0);
+        assert_eq!(results["counts"]["total"], 0);
     }
 }

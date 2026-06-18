@@ -228,6 +228,17 @@ pub struct AppContext {
     /// `cancelRebuild` read/cancel it by job-id. Reconstructs an account's repo
     /// from its sequencer history in memory and atomically swaps it in.
     pub rebuild_registry: Arc<crate::rebuild::RebuildRegistry>,
+
+    /// Arc H §7.4.3 (#291) — persistent store of bulk-scan findings (the
+    /// `repo_scan_finding` table). Read by `getRepoScanResults`; written by the
+    /// scan job.
+    pub scan_findings_store: Arc<crate::repo_scan::ScanFindingsStore>,
+
+    /// Arc H §7.4.3 (#291) — the deployment's single repository-scan job
+    /// (`scanReposForInconsistencies` / `getScanProgress` / `cancelScan`).
+    /// Walks all accounts, structurally reconstructs each, and persists
+    /// inconsistencies as findings.
+    pub repo_scan_job: Arc<crate::repo_scan::ScanJob>,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -519,6 +530,10 @@ impl AppContext {
         // Initialize admin & moderation managers
         let admin_role_manager = Arc::new(AdminRoleManager::new(account_db.clone()));
         let operator_session_store = Arc::new(OperatorSessionStore::new(account_db.clone()));
+        // v0.9 Arc H §7.4.3 (#291) — bulk repository-repair scan substrate.
+        let scan_findings_store =
+            Arc::new(crate::repo_scan::ScanFindingsStore::new(account_db.clone()));
+        let repo_scan_job = Arc::new(crate::repo_scan::ScanJob::new());
         let moderation_manager = Arc::new(ModerationManager::new(
             account_db.clone(),
             account_manager.clone(),
@@ -1108,6 +1123,9 @@ impl AppContext {
             kryphocron_rewrite_job,
             // v0.9 Arc H (#290) — repository-rebuild job registry.
             rebuild_registry: Arc::new(crate::rebuild::RebuildRegistry::new()),
+            // v0.9 Arc H (#291) — bulk repository-repair scan substrate.
+            scan_findings_store,
+            repo_scan_job,
         })
     }
 

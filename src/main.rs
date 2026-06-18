@@ -34,6 +34,7 @@ mod oauth;
 mod rate_limit;
 mod read_after_write;
 mod rebuild;
+mod repo_scan;
 mod repository;
 mod sequencer;
 mod server;

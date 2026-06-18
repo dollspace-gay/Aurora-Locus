@@ -201,6 +201,15 @@ pub enum ModerationEventType {
     /// transaction after the swap commits (Category C — the rebuild is
     /// not itself a record-write, so there is no shared tx to join).
     RepoRebuilt,
+
+    /// Arc H §7.4.3 — a SuperAdmin bulk repository-inconsistency scan finished
+    /// (`tools.aurora.superadmin.scanReposForInconsistencies`). Host vocabulary
+    /// (§16 D1): `actor_did` is the triggering operator; `details` carries
+    /// `scanId` / `outcome` / `accountsScanned` plus the per-severity findings
+    /// breakdown (`findingsHigh` / `findingsMedium` / `findingsLow` /
+    /// `findingsTotal`). Emitted by the scan job in its own short transaction on
+    /// completion (Category C — the scan is read-only, no record write to join).
+    ScanCompleted,
 }
 
 impl ModerationEventType {
@@ -234,6 +243,7 @@ impl ModerationEventType {
             ModerationEventType::KryphocronRecoveryWrite => "kryphocron_recovery_write",
             ModerationEventType::KryphocronSystemCleanup => "kryphocron_system_cleanup",
             ModerationEventType::RepoRebuilt => "repo_rebuilt",
+            ModerationEventType::ScanCompleted => "scan_completed",
         }
     }
 }
@@ -273,6 +283,7 @@ impl FromStr for ModerationEventType {
             "kryphocron_recovery_write" => Ok(ModerationEventType::KryphocronRecoveryWrite),
             "kryphocron_system_cleanup" => Ok(ModerationEventType::KryphocronSystemCleanup),
             "repo_rebuilt" => Ok(ModerationEventType::RepoRebuilt),
+            "scan_completed" => Ok(ModerationEventType::ScanCompleted),
             _ => Err(PdsError::Validation(format!("Invalid event type: {}", s))),
         }
     }
