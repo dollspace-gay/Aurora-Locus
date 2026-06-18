@@ -9,31 +9,19 @@
   let lastFilters = {};
   let subscription = null;
 
-  // url-state wiring (§5.7.5) — see Reports.js for the shared shape.
-  // verifiedOnly is a boolean filter (applied client-side post-fetch).
+  // url-state wiring (§5.7.5) — the shared shape lives in AuroraListPage
+  // (components/ListPage.js, #257). verifiedOnly is a boolean filter (applied
+  // client-side post-fetch, below).
   const SCALAR_KEYS = ['actor', 'subject', 'subjectCid', 'action'];
   const BOOL_KEYS = ['verifiedOnly'];
 
-  function readFilters(defaults) {
-    const u = global.AuroraUrlState ? global.AuroraUrlState.read() : {};
-    const f = Object.assign({}, defaults || {});
-    for (const k of SCALAR_KEYS) { if (u[k]) f[k] = u[k]; }
-    for (const k of BOOL_KEYS) { if (u[k]) f[k] = true; }
-    if (u.since || u.until) {
-      f.when = { start: u.since ? new Date(u.since) : null, end: u.until ? new Date(u.until) : null };
-    }
-    return f;
-  }
-
   function applyFilters(vals) {
-    const when = (vals && vals.when) || (lastFilters && lastFilters.when) || null;
-    const u = {};
-    for (const k of SCALAR_KEYS) { if (vals[k]) u[k] = vals[k]; }
-    for (const k of BOOL_KEYS) { if (vals[k]) u[k] = '1'; }
-    if (when && when.start) u.since = when.start.toISOString();
-    if (when && when.end) u.until = when.end.toISOString();
-    if (global.AuroraUrlState) global.AuroraUrlState.write(u);
-    else { lastFilters = vals; cursorStack = []; nextCursor = null; refresh(null); }
+    global.AuroraListPage.applyFilters(SCALAR_KEYS, BOOL_KEYS, vals, lastFilters && lastFilters.when, function (v) {
+      lastFilters = v;
+      cursorStack = [];
+      nextCursor = null;
+      refresh(null);
+    });
   }
 
   async function mount({ container }) {
@@ -52,7 +40,7 @@
       '<div id="audit-pagination"></div>';
     cursorStack = [];
     nextCursor = null;
-    lastFilters = readFilters({});
+    lastFilters = global.AuroraListPage.readFilters(SCALAR_KEYS, BOOL_KEYS, {});
     if (global.AuroraFilterStrip) {
       global.AuroraFilterStrip.build({
         container: document.getElementById('audit-filter'),
@@ -79,12 +67,13 @@
 
   function startSubscription() {
     if (subscription || !global.AuroraSubscription) return;
-    const indicator = document.getElementById('audit-rt-indicator');
-    subscription = global.AuroraSubscription.subscribe('subscribe-mod-events', {}, {
-      onEvent: () => { if (cursorStack.length === 0) refresh(null); },
-      onError: (e) => console.warn('audit subscription error:', e),
-    });
-    if (indicator) global.AuroraSubscription.attachIndicator(indicator, subscription);
+    subscription = global.AuroraListPage.subscribeModEvents(
+      document.getElementById('audit-rt-indicator'),
+      {
+        onEvent: () => { if (cursorStack.length === 0) refresh(null); },
+        onError: (e) => console.warn('audit subscription error:', e),
+      },
+    );
   }
 
   async function refresh(cursor) {
@@ -250,20 +239,11 @@
   }
 
   function renderPagination() {
-    const c = document.getElementById('audit-pagination');
-    if (!c || !global.AuroraPagination) return;
-    global.AuroraPagination.render({
-      container: c,
-      prevDisabled: cursorStack.length === 0,
-      nextDisabled: !nextCursor,
-      onPrev: () => {
-        if (cursorStack.length > 1) {
-          cursorStack.pop();
-          const p = cursorStack[cursorStack.length - 1] || null;
-          refresh(p);
-        } else if (cursorStack.length === 1) { cursorStack = []; refresh(null); }
-      },
-      onNext: () => { if (nextCursor) { cursorStack.push(nextCursor); refresh(nextCursor); } },
+    global.AuroraListPage.renderPagination({
+      container: document.getElementById('audit-pagination'),
+      cursorStack: cursorStack,
+      nextCursor: nextCursor,
+      refresh: refresh,
     });
   }
 
