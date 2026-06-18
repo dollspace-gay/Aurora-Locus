@@ -33,7 +33,11 @@
   const adminTools = {
     describeCapabilities: () => C().get('tools.aurora.describeCapabilities'),
     getQueueStats: () => C().get('tools.aurora.admin.getQueueStats'),
-    getModerationMetrics: (body) => C().post('tools.aurora.admin.getModerationMetrics', body),
+    // GET per the XRPC `query` convention (chainlink #118; route registered
+    // `get(...)` in src/api/admin.rs). Params (timeRange/granularity/metrics)
+    // ride the query string — `metrics` is a repeated key (client.get expands
+    // arrays), which the handler's axum_extra Query requires.
+    getModerationMetrics: (params) => C().get('tools.aurora.admin.getModerationMetrics', params),
     getAuditTrail: (params) => C().get('tools.aurora.admin.getAuditTrail', params || { limit: 25 }),
     triggerPasswordReset: (body) => C().post('tools.aurora.admin.triggerPasswordReset', body),
     exportAccountForensicRaw: (body) => C().postRaw('tools.aurora.admin.exportAccountForensic', body),

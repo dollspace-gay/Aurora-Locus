@@ -84,7 +84,24 @@
 
   // GET <nsid>?<params>. Returns parsed JSON or throws.
   async function get(nsid, params) {
-    const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+    let qs = '';
+    if (params) {
+      // Build the query string explicitly so array values become REPEATED keys
+      // (`metrics=a&metrics=b`), not a comma-joined single value. XRPC `query`
+      // endpoints with list params (e.g. getModerationMetrics' `metrics`) parse
+      // via axum_extra Query, which requires repeated keys; the default
+      // `new URLSearchParams(obj)` stringifies an array to one comma-joined
+      // value and would 400. Scalars append once; null/undefined are skipped.
+      const sp = new URLSearchParams();
+      for (const k of Object.keys(params)) {
+        const v = params[k];
+        if (v == null) continue;
+        if (Array.isArray(v)) v.forEach((item) => { if (item != null) sp.append(k, item); });
+        else sp.append(k, v);
+      }
+      const s = sp.toString();
+      if (s) qs = '?' + s;
+    }
     const res = await withRefresh(() => fetch(API_BASE + '/' + nsid + qs, { headers: authHeaders() }));
     return await handle(res);
   }
