@@ -117,6 +117,16 @@
   const superadminTools = {
     grantRole: (body) => C().post('tools.aurora.superadmin.grantRole', body),
     revokeRole: (body) => C().post('tools.aurora.superadmin.revokeRole', body),
+    // Repository rebuild (§7.4.1 / #286 + #290). preRebuildCheck: shallow
+    // metadata preflight ({did}), or full reconstruction+verification
+    // ({did, deep:true}). rebuildRepo: start a rebuild ({did, rationale}) →
+    // {jobId}. getRebuildProgress/cancelRebuild: poll/abort by job-id.
+    preRebuildCheck: (params) => C().get('tools.aurora.superadmin.preRebuildCheck', params),
+    rebuildRepo: (body) => C().post('tools.aurora.superadmin.rebuildRepo', body),
+    getRebuildProgress: (jobId) =>
+      C().get('tools.aurora.superadmin.getRebuildProgress', { jobId: jobId }),
+    cancelRebuild: (jobId) =>
+      C().post('tools.aurora.superadmin.cancelRebuild', { jobId: jobId }),
   };
 
   global.AuroraEndpoints = {

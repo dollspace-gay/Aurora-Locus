@@ -48,6 +48,13 @@
     { pattern: 'ops/blob-ops', page: 'opsBlobOps', requires: 'admin' },
     { pattern: 'ops/rate-limits', page: 'opsRateLimits', requires: 'admin' },
     { pattern: 'ops/system-health', page: 'opsSystemHealth', requires: 'admin' },
+    // Repository rebuild (Arc H §7.4.1 / #288). SuperAdmin; per-account
+    // recovery operation reconstructing a repo from sequencer history then
+    // atomically swapping it in. Top-level Operations route with a DID-input
+    // affordance, plus a :did variant for deep-linking pre-filled from an
+    // account. full+reduced visibility follows the Operations domain gate.
+    { pattern: 'ops/repo-rebuild', page: 'opsRepoRebuild', requires: 'superadmin' },
+    { pattern: 'ops/repo-rebuild/:did', page: 'opsRepoRebuild', requires: 'superadmin' },
 
     // Configuration domain (was Settings — renamed in v0.9 per §5.5/§5.7.2).
     // The six policy/observability pages carry placeholder content from
@@ -152,6 +159,7 @@
         { label: 'Blob ops', route: 'ops/blob-ops', icon: 'image', requires: 'admin' },
         { label: 'Rate limits', route: 'ops/rate-limits', icon: 'gauge', requires: 'admin' },
         { label: 'System health', route: 'ops/system-health', icon: 'heart-pulse', requires: 'admin' },
+        { label: 'Repository rebuild', route: 'ops/repo-rebuild', icon: 'server', requires: 'superadmin' },
       ],
     },
     {
