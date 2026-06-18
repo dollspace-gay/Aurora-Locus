@@ -13,6 +13,7 @@ mod auth;
 mod backup;
 mod blob_store;
 mod cache;
+mod cascade;
 mod cli;
 mod config;
 mod context;

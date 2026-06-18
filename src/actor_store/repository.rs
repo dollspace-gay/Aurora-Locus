@@ -714,7 +714,7 @@ impl RepositoryManager {
         &self,
         write: &WriteOp,
         shared_tx: Option<&mut sqlx::Transaction<'_, sqlx::Any>>,
-        cascade_context: Option<&mut crate::kryphocron::CascadeContext>,
+        cascade_context: Option<&mut crate::cascade::CascadeContext>,
         // v0.8 arc 1 (#180) — bind_pipeline pushes the emitted
         // moderation_event.id here so `commit_with_orphan_recovery`
         // can key a persistent orphan marker off it. Only the
