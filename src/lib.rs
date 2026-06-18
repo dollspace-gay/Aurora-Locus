@@ -38,6 +38,7 @@ pub mod rebuild;
 pub mod repo_scan;
 pub mod repository;
 pub mod sequencer;
+pub mod sequencer_recovery;
 pub mod service_auth;
 pub mod themes;
 pub mod validation;

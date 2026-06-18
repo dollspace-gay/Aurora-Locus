@@ -244,6 +244,12 @@ pub struct AppContext {
     /// (`repairRepos` / `getBulkRepairProgress` / `cancelBulkRepair`). Iterates
     /// target DIDs and fires per-account rebuilds through `rebuild_registry`.
     pub bulk_repair_job: Arc<crate::repo_scan::BulkRepairJob>,
+
+    /// Arc H §7.4.2 (#294) — the deployment's single sequencer-recovery job
+    /// (`sequencerRecoveryOptions` / `runSequencerRecovery` /
+    /// `getSequencerRecoveryProgress` / `cancelSequencerRecovery`). v0.9 ships
+    /// one operation: a read-only deep integrity validation.
+    pub sequencer_recovery_job: Arc<crate::sequencer_recovery::SequencerRecoveryJob>,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -540,6 +546,8 @@ impl AppContext {
             Arc::new(crate::repo_scan::ScanFindingsStore::new(account_db.clone()));
         let repo_scan_job = Arc::new(crate::repo_scan::ScanJob::new());
         let bulk_repair_job = Arc::new(crate::repo_scan::BulkRepairJob::new());
+        let sequencer_recovery_job =
+            Arc::new(crate::sequencer_recovery::SequencerRecoveryJob::new());
         let moderation_manager = Arc::new(ModerationManager::new(
             account_db.clone(),
             account_manager.clone(),
@@ -1134,6 +1142,8 @@ impl AppContext {
             repo_scan_job,
             // v0.9 Arc H (#292) — bulk repository-repair job.
             bulk_repair_job,
+            // v0.9 Arc H (#294) — sequencer-recovery job.
+            sequencer_recovery_job,
         })
     }
 

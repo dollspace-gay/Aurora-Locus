@@ -765,6 +765,29 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(cancel_bulk_repair),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // Sequencer recovery — escalation surface (§7.4.2 / #294): enumerate
+        // available recovery operations + the sequencer state, run one (v0.9:
+        // read-only deep integrity validation), poll its progress, cancel it.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.sequencerRecoveryOptions",
+            get(sequencer_recovery_options),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.runSequencerRecovery",
+            post(run_sequencer_recovery),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getSequencerRecoveryProgress",
+            get(get_sequencer_recovery_progress),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.cancelSequencerRecovery",
+            post(cancel_sequencer_recovery),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // Per-operator session management (§8.1.7 / #273). Admin-tier
         // namespace; the handlers gate finer: any operator lists/revokes
         // their OWN sessions (self-service), SuperAdmin lists all and
@@ -2186,6 +2209,198 @@ async fn cancel_bulk_repair(
             StatusCode::CONFLICT,
             "Conflict",
             "no bulk repository repair is in progress".to_string(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sequencer recovery — §7.4.2 / #294 (escalation surface; one operation:
+// read-only deep integrity validation)
+// ---------------------------------------------------------------------------
+
+/// `GET /xrpc/tools.aurora.superadmin.sequencerRecoveryOptions` — the current
+/// sequencer state (row counts, head/min seq) plus the recovery operations
+/// available given that state (§7.4.2 / #294). v0.9 offers one operation,
+/// `validate` (read-only deep integrity validation). SuperAdmin.
+async fn sequencer_recovery_options(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("sequencerRecoveryOptions requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    let counts = ctx.sequencer.integrity_counts().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    let last = ctx.sequencer_recovery_job.progress();
+    let last_validation = last.report.as_ref().map(|r| {
+        serde_json::json!({
+            "outcome": last.last_outcome,
+            "malformedCount": r.malformed_count,
+            "nonMonotonicCount": r.non_monotonic_count,
+            "rowsScanned": r.rows_scanned,
+        })
+    });
+    Ok(Json(serde_json::json!({
+        "state": {
+            "totalRows": counts.total_rows,
+            "invalidatedRows": counts.invalidated_rows,
+            "headSeq": counts.head_seq,
+            "minSeq": counts.min_seq,
+        },
+        "operations": [
+            {
+                "id": crate::sequencer_recovery::OP_VALIDATE,
+                "label": "Deep integrity validation",
+                "destructive": false,
+                "available": true,
+                "description": "Walk the live sequencer log, decoding every event \
+                    and checking per-DID rev monotonicity. Read-only.",
+            }
+        ],
+        "running": last.running,
+        "lastValidation": last_validation,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RunSequencerRecoveryRequest {
+    operation: String,
+    /// Accepted but unused for the read-only `validate` operation; reserved for
+    /// future destructive recovery operations.
+    #[serde(default)]
+    #[allow(dead_code)]
+    rationale: Option<String>,
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.runSequencerRecovery` — dispatch a
+/// sequencer recovery operation (§7.4.2 / #294). v0.9 accepts `operation:
+/// "validate"` (read-only). Deployment single-flight (409 if one is already
+/// running). SuperAdmin.
+async fn run_sequencer_recovery(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RunSequencerRecoveryRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("runSequencerRecovery requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    match req.operation.as_str() {
+        crate::sequencer_recovery::OP_VALIDATE => {
+            let job = ctx.sequencer_recovery_job.clone();
+            match job.try_start_validate(ctx.clone(), auth.did.clone()) {
+                Some(job_id) => Ok(Json(serde_json::json!({
+                    "jobId": job_id,
+                    "operation": crate::sequencer_recovery::OP_VALIDATE,
+                    "status": "started",
+                }))),
+                None => Err(json_error(
+                    StatusCode::CONFLICT,
+                    "Conflict",
+                    "a sequencer recovery operation is already in progress".to_string(),
+                )),
+            }
+        }
+        other => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            format!("unknown or unavailable recovery operation: {other}"),
+        )),
+    }
+}
+
+/// Render a [`RecoveryProgress`](crate::sequencer_recovery::RecoveryProgress) as
+/// the `getSequencerRecoveryProgress` wire shape.
+fn sequencer_recovery_progress_json(
+    p: &crate::sequencer_recovery::RecoveryProgress,
+) -> serde_json::Value {
+    fn ms(t: Option<std::time::SystemTime>) -> Option<u64> {
+        t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    }
+    let report = p.report.as_ref().map(|r| {
+        serde_json::json!({
+            "totalRows": r.total_rows,
+            "invalidatedRows": r.invalidated_rows,
+            "headSeq": r.head_seq,
+            "minSeq": r.min_seq,
+            "rowsScanned": r.rows_scanned,
+            "malformedCount": r.malformed_count,
+            "malformed": r.malformed.iter().map(|m| serde_json::json!({
+                "seq": m.seq, "did": m.did, "eventType": m.event_type,
+            })).collect::<Vec<_>>(),
+            "nonMonotonicCount": r.non_monotonic_count,
+            "nonMonotonic": r.non_monotonic.iter().map(|n| serde_json::json!({
+                "did": n.did, "seq": n.seq, "rev": n.rev, "prevRev": n.prev_rev,
+            })).collect::<Vec<_>>(),
+        })
+    });
+    serde_json::json!({
+        "running": p.running,
+        "operation": p.operation,
+        "jobId": p.job_id,
+        "rowsScanned": p.rows_scanned,
+        "startedAt": ms(p.started_at),
+        "finishedAt": ms(p.finished_at),
+        "cancelRequested": p.cancel_requested,
+        "lastOutcome": p.last_outcome,
+        "error": p.error,
+        "report": report,
+    })
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.getSequencerRecoveryProgress` — live
+/// progress + the validation report once complete (§7.4.2 / #294). SuperAdmin.
+async fn get_sequencer_recovery_progress(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("getSequencerRecoveryProgress requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    Ok(Json(sequencer_recovery_progress_json(
+        &ctx.sequencer_recovery_job.progress(),
+    )))
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.cancelSequencerRecovery` — request
+/// cancellation of the in-flight recovery operation (§7.4.2 / #294); the walk
+/// stops at the next page boundary and returns its partial report. SuperAdmin.
+/// 409 if none is in progress.
+async fn cancel_sequencer_recovery(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("cancelSequencerRecovery requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    if ctx.sequencer_recovery_job.request_cancel() {
+        Ok(Json(serde_json::json!({ "status": "cancelling" })))
+    } else {
+        Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "no sequencer recovery operation is in progress".to_string(),
         ))
     }
 }
@@ -8830,7 +9045,7 @@ mod tests {
             r#""listAudiences","#,
             r#""getBlockCascadeImpact""#,
             r#"],"#,
-            // tools.aurora.superadmin (13 endpoints)
+            // tools.aurora.superadmin (17 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
@@ -8844,7 +9059,11 @@ mod tests {
             r#""getRepoScanResults","#,
             r#""repairRepos","#,
             r#""getBulkRepairProgress","#,
-            r#""cancelBulkRepair""#,
+            r#""cancelBulkRepair","#,
+            r#""sequencerRecoveryOptions","#,
+            r#""runSequencerRecovery","#,
+            r#""getSequencerRecoveryProgress","#,
+            r#""cancelSequencerRecovery""#,
             r#"]"#,
             r#"},"#,
             // ---- implementation, version (literals) ----
@@ -9237,6 +9456,10 @@ mod tests {
         assert!(names.contains(&"repairRepos"), "repairRepos missing");
         assert!(names.contains(&"getBulkRepairProgress"), "getBulkRepairProgress missing");
         assert!(names.contains(&"cancelBulkRepair"), "cancelBulkRepair missing");
+        assert!(names.contains(&"sequencerRecoveryOptions"), "sequencerRecoveryOptions missing");
+        assert!(names.contains(&"runSequencerRecovery"), "runSequencerRecovery missing");
+        assert!(names.contains(&"getSequencerRecoveryProgress"), "getSequencerRecoveryProgress missing");
+        assert!(names.contains(&"cancelSequencerRecovery"), "cancelSequencerRecovery missing");
     }
 
     #[tokio::test]
@@ -11909,5 +12132,96 @@ mod tests {
         assert_eq!(progress["processed"], 1);
         assert_eq!(progress["failed"], 1, "the no-account target fails its rebuild");
         assert_eq!(progress["repaired"], 0);
+    }
+
+    // ---------- §7.4.2 / #294 sequencer-recovery XRPCs ----------
+
+    #[tokio::test]
+    async fn sequencer_recovery_options_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = sequencer_recovery_options(State(ctx), op_auth("did:plc:admin", Role::Admin, "sid"))
+            .await
+            .expect_err("Admin must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sequencer_recovery_options_lists_validate() {
+        let ctx = create_test_context().await;
+        let out = sequencer_recovery_options(State(ctx), op_auth("did:plc:super", Role::SuperAdmin, "sid"))
+            .await
+            .expect("options")
+            .0;
+        let ops = out["operations"].as_array().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0]["id"], "validate");
+        assert_eq!(ops[0]["destructive"], false);
+        // Empty test sequencer → zero rows, no head.
+        assert_eq!(out["state"]["totalRows"], 0);
+        assert_eq!(out["state"]["invalidatedRows"], 0);
+    }
+
+    #[tokio::test]
+    async fn run_sequencer_recovery_unknown_op_400() {
+        let ctx = create_test_context().await;
+        let err = run_sequencer_recovery(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RunSequencerRecoveryRequest { operation: "reSequence".into(), rationale: None }),
+        )
+        .await
+        .expect_err("unknown operation → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cancel_sequencer_recovery_with_none_running_is_409() {
+        let ctx = create_test_context().await;
+        let err = cancel_sequencer_recovery(State(ctx), op_auth("did:plc:super", Role::SuperAdmin, "sid"))
+            .await
+            .expect_err("nothing running → Conflict");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    /// End-to-end validate lifecycle through the handlers: a fresh (empty)
+    /// sequencer validates clean — exercising runSequencerRecovery → run →
+    /// finish (+ SequencerValidated audit) → getSequencerRecoveryProgress with
+    /// the report attached.
+    #[tokio::test]
+    async fn sequencer_recovery_validate_lifecycle_clean() {
+        let ctx = create_test_context().await;
+        let started = run_sequencer_recovery(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RunSequencerRecoveryRequest { operation: "validate".into(), rationale: None }),
+        )
+        .await
+        .expect("validate starts")
+        .0;
+        assert_eq!(started["status"], "started");
+        assert_eq!(started["operation"], "validate");
+
+        let mut progress = serde_json::Value::Null;
+        let mut done = false;
+        for _ in 0..200 {
+            progress = get_sequencer_recovery_progress(
+                State(ctx.clone()),
+                op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            )
+            .await
+            .expect("progress")
+            .0;
+            if progress["running"] == serde_json::Value::Bool(false)
+                && progress["lastOutcome"].is_string()
+            {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done, "validate reached a terminal state");
+        assert_eq!(progress["lastOutcome"], "completed");
+        assert_eq!(progress["report"]["malformedCount"], 0);
+        assert_eq!(progress["report"]["nonMonotonicCount"], 0);
     }
 }

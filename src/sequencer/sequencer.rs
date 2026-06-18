@@ -678,6 +678,125 @@ impl Sequencer {
             first_rev: first_rev.unwrap_or_default(),
         }))
     }
+
+    /// Cheap sequencer-state counts for the recovery surface (§7.4.2 / #294):
+    /// total rows, invalidated rows (always 0 under current hard-delete
+    /// semantics — see [`Self::validate_integrity`]), and the live head / min
+    /// seq. `invalidated` is derived as `total − live` to stay backend-portable
+    /// (no `WHERE invalidated = 1`, which differs SQLite INTEGER vs PG BOOLEAN).
+    pub async fn integrity_counts(&self) -> PdsResult<IntegrityCounts> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo_seq")
+            .fetch_one(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo_seq WHERE NOT invalidated")
+            .fetch_one(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        let head_seq: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(seq) FROM repo_seq WHERE NOT invalidated")
+                .fetch_one(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
+        let min_seq: Option<i64> =
+            sqlx::query_scalar("SELECT MIN(seq) FROM repo_seq WHERE NOT invalidated")
+                .fetch_one(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
+        Ok(IntegrityCounts {
+            total_rows: total.max(0) as u64,
+            invalidated_rows: (total - live).max(0) as u64,
+            head_seq,
+            min_seq,
+        })
+    }
+
+    /// Deep integrity validation of the live sequencer log (§7.4.2 / #294) — the
+    /// read-only recovery diagnostic. Walks every non-invalidated row ascending
+    /// by seq, decoding each event blob, and reports two anomaly classes plus
+    /// the state counts:
+    ///
+    /// - **Undecodable blobs**: a row whose `event` bytes fail to decode. The
+    ///   firehose *silently drops* these (consumers see fewer events with no
+    ///   error surface), so this scan is the only way to find them.
+    /// - **Per-DID rev non-monotonicity**: a commit whose `rev` is not strictly
+    ///   greater than the prior commit's `rev` for the same DID — the signature
+    ///   of a concurrent-write ordering bug (e.g. a brief leader split-brain).
+    ///
+    /// Deliberately does NOT flag seq gaps: account deletion hard-deletes rows
+    /// (`delete_all_for_user`), so gaps in `seq` are expected, not anomalies.
+    /// `scanned` is bumped per row for live progress; `cancel` is polled at each
+    /// page boundary (a cancelled scan returns its partial report).
+    pub async fn validate_integrity(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+        scanned: &std::sync::atomic::AtomicU64,
+    ) -> PdsResult<IntegrityReport> {
+        use std::collections::HashMap;
+        use std::sync::atomic::Ordering;
+
+        const SAMPLE_CAP: usize = 50;
+        const PAGE: i64 = 1000;
+
+        let counts = self.integrity_counts().await?;
+        let mut report = IntegrityReport {
+            total_rows: counts.total_rows,
+            invalidated_rows: counts.invalidated_rows,
+            head_seq: counts.head_seq,
+            min_seq: counts.min_seq,
+            rows_scanned: 0,
+            malformed_count: 0,
+            malformed: Vec::new(),
+            non_monotonic_count: 0,
+            non_monotonic: Vec::new(),
+        };
+
+        let mut last_rev: HashMap<String, String> = HashMap::new();
+        let mut cursor = 0i64;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                break; // partial report on cancel
+            }
+            let rows = self.next_events(cursor, Some(PAGE)).await?;
+            if rows.is_empty() {
+                break;
+            }
+            cursor = rows.last().map(|r| r.seq).unwrap_or(cursor);
+            for row in rows {
+                let seq = row.seq;
+                let did = row.did.clone();
+                let event_type = row.event_type.clone();
+                report.rows_scanned += 1;
+                scanned.store(report.rows_scanned, Ordering::Relaxed);
+                match self.decode_event(row) {
+                    Err(_) => {
+                        report.malformed_count += 1;
+                        if report.malformed.len() < SAMPLE_CAP {
+                            report.malformed.push(MalformedRow { seq, did, event_type });
+                        }
+                    }
+                    Ok(Some(SeqEvent::Commit { evt, .. })) => {
+                        if let Some(prev) = last_rev.get(&evt.repo) {
+                            if &evt.rev <= prev {
+                                report.non_monotonic_count += 1;
+                                if report.non_monotonic.len() < SAMPLE_CAP {
+                                    report.non_monotonic.push(NonMonotonicCommit {
+                                        did: evt.repo.clone(),
+                                        seq,
+                                        rev: evt.rev.clone(),
+                                        prev_rev: prev.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        last_rev.insert(evt.repo.clone(), evt.rev.clone());
+                    }
+                    Ok(_) => {} // non-commit event decoded fine
+                }
+            }
+        }
+        Ok(report)
+    }
 }
 
 /// Aggregate a repo rebuild would reconstruct, computed from commit-event
@@ -692,6 +811,50 @@ pub struct RebuildPreflight {
     pub head_commit_cid: String,
     pub head_rev: String,
     pub first_rev: String,
+}
+
+/// Cheap sequencer-state counts (§7.4.2 / #294).
+#[derive(Debug, Clone, Copy)]
+pub struct IntegrityCounts {
+    pub total_rows: u64,
+    /// Always 0 under current hard-delete deletion semantics; reported for
+    /// future-compat if the substrate ever adopts soft-delete.
+    pub invalidated_rows: u64,
+    pub head_seq: Option<i64>,
+    pub min_seq: Option<i64>,
+}
+
+/// A row whose `event` blob failed to decode (the firehose silently drops it).
+#[derive(Debug, Clone)]
+pub struct MalformedRow {
+    pub seq: i64,
+    pub did: String,
+    pub event_type: String,
+}
+
+/// A commit whose `rev` is not strictly greater than the prior commit's for the
+/// same DID — a concurrent-write ordering anomaly.
+#[derive(Debug, Clone)]
+pub struct NonMonotonicCommit {
+    pub did: String,
+    pub seq: i64,
+    pub rev: String,
+    pub prev_rev: String,
+}
+
+/// The deep-integrity-validation result (§7.4.2 / #294). Anomaly samples are
+/// capped (50 each); the `*_count` fields are the true totals.
+#[derive(Debug, Clone)]
+pub struct IntegrityReport {
+    pub total_rows: u64,
+    pub invalidated_rows: u64,
+    pub head_seq: Option<i64>,
+    pub min_seq: Option<i64>,
+    pub rows_scanned: u64,
+    pub malformed_count: u64,
+    pub malformed: Vec<MalformedRow>,
+    pub non_monotonic_count: u64,
+    pub non_monotonic: Vec<NonMonotonicCommit>,
 }
 
 #[cfg(test)]
@@ -730,6 +893,84 @@ mod tests {
         .unwrap();
 
         Sequencer::new(db, SequencerConfig::default())
+    }
+
+    /// Build a sequencer over a pool we keep a handle to (for raw inserts of
+    /// deliberately-malformed rows the public API can't produce).
+    async fn sequencer_with_pool() -> (Sequencer, sqlx::AnyPool) {
+        let db = open_test_pool().await;
+        sqlx::query(
+            "CREATE TABLE repo_seq (seq INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT NOT NULL, \
+             event_type TEXT NOT NULL, event BLOB NOT NULL, invalidated INTEGER NOT NULL DEFAULT 0, \
+             sequenced_at TEXT NOT NULL)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        (Sequencer::new(db.clone(), SequencerConfig::default()), db)
+    }
+
+    fn commit(did: &str, rev: &str) -> CommitEvent {
+        CommitEvent::new(
+            did.to_string(),
+            format!("bafy{rev}"),
+            rev.to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn validate_integrity_clean_log_has_no_anomalies() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (seq, _db) = sequencer_with_pool().await;
+        // Ascending revs per DID — consistent.
+        seq.sequence_commit(commit("did:plc:a", "3aaa1")).await.unwrap();
+        seq.sequence_commit(commit("did:plc:b", "3bbb1")).await.unwrap();
+        seq.sequence_commit(commit("did:plc:a", "3aaa2")).await.unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let scanned = AtomicU64::new(0);
+        let r = seq.validate_integrity(&cancel, &scanned).await.unwrap();
+        assert_eq!(r.rows_scanned, 3);
+        assert_eq!(r.total_rows, 3);
+        assert_eq!(r.invalidated_rows, 0);
+        assert_eq!(r.malformed_count, 0);
+        assert_eq!(r.non_monotonic_count, 0, "ascending revs are monotonic");
+        assert_eq!(r.head_seq, Some(3));
+    }
+
+    #[tokio::test]
+    async fn validate_integrity_flags_nonmonotonic_and_malformed() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (seq, db) = sequencer_with_pool().await;
+        // did:plc:a: rev goes 3ccc then 3aaa (lower) → non-monotonic.
+        seq.sequence_commit(commit("did:plc:a", "3ccc")).await.unwrap();
+        seq.sequence_commit(commit("did:plc:a", "3aaa")).await.unwrap();
+        // A raw row with undecodable event bytes (the public API can't make this).
+        sqlx::query(
+            "INSERT INTO repo_seq (did, event_type, event, sequenced_at) VALUES ($1,$2,$3,$4)",
+        )
+        .bind("did:plc:bad")
+        .bind("commit")
+        .bind(vec![0xff_u8, 0x00, 0xff])
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let scanned = AtomicU64::new(0);
+        let r = seq.validate_integrity(&cancel, &scanned).await.unwrap();
+        assert_eq!(r.rows_scanned, 3);
+        assert_eq!(r.non_monotonic_count, 1, "the rev regression is flagged");
+        assert_eq!(r.non_monotonic[0].did, "did:plc:a");
+        assert_eq!(r.non_monotonic[0].prev_rev, "3ccc");
+        assert_eq!(r.non_monotonic[0].rev, "3aaa");
+        assert_eq!(r.malformed_count, 1, "the undecodable blob is flagged");
+        assert_eq!(r.malformed[0].did, "did:plc:bad");
     }
 
     #[tokio::test]

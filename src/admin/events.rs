@@ -219,6 +219,15 @@ pub enum ModerationEventType {
     /// the `targetDids` list); this envelope is not threaded into them. Emitted
     /// at batch start in its own short transaction (Category C).
     BulkRepairInitiated,
+
+    /// Arc H §7.4.2 — a SuperAdmin ran the sequencer deep integrity validation
+    /// (`tools.aurora.superadmin.runSequencerRecovery` with the `validate`
+    /// operation). Host vocabulary (§16 D1): `actor_did` is the triggering
+    /// operator; `details` carries `jobId` / `outcome` / `rowsScanned` /
+    /// `totalRows` / `invalidatedRows` / `headSeq` / `malformedCount` /
+    /// `nonMonotonicCount`. Read-only diagnostic; emitted on completion in its
+    /// own short transaction (Category C).
+    SequencerValidated,
 }
 
 impl ModerationEventType {
@@ -254,6 +263,7 @@ impl ModerationEventType {
             ModerationEventType::RepoRebuilt => "repo_rebuilt",
             ModerationEventType::ScanCompleted => "scan_completed",
             ModerationEventType::BulkRepairInitiated => "bulk_repair_initiated",
+            ModerationEventType::SequencerValidated => "sequencer_validated",
         }
     }
 }
@@ -295,6 +305,7 @@ impl FromStr for ModerationEventType {
             "repo_rebuilt" => Ok(ModerationEventType::RepoRebuilt),
             "scan_completed" => Ok(ModerationEventType::ScanCompleted),
             "bulk_repair_initiated" => Ok(ModerationEventType::BulkRepairInitiated),
+            "sequencer_validated" => Ok(ModerationEventType::SequencerValidated),
             _ => Err(PdsError::Validation(format!("Invalid event type: {}", s))),
         }
     }

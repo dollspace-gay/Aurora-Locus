@@ -37,6 +37,7 @@ mod rebuild;
 mod repo_scan;
 mod repository;
 mod sequencer;
+mod sequencer_recovery;
 mod server;
 mod service_auth;
 mod themes;

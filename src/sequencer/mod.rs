@@ -14,7 +14,7 @@ pub use leader_election::{
     LeaderElection, LeaderElectionConfig, LeaderRole, LockProvider, PostgresLockProvider,
     SEQUENCER_LEADER_LOCK_KEY,
 };
-pub use sequencer::{Sequencer, SequencerConfig};
+pub use sequencer::{IntegrityReport, Sequencer, SequencerConfig};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
