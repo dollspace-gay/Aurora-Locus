@@ -582,6 +582,15 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(crate::api::aurora_admin::get_audit_trail),
             CapsBuilder::new(Family::Admin).extensions(["audit-trail-v1"]),
         )
+        // #302 — single-report fetch for the report-detail page. The store
+        // method existed; this HTTP surface was never registered (the UI 404'd
+        // on the legacy com.atproto.admin.getReport NSID). Moderator+; no
+        // capability extension (a basic read, gated by role).
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.getReport",
+            get(crate::api::aurora_admin::get_report),
+            CapsBuilder::new(Family::Admin),
+        )
         // Phase 3.8 (chainlink #105) — chain-of-custody forensic
         // export. AdminServer scope; Admin+ baseline at handler with
         // SuperAdmin gates on metadata + chain-inclusion params per
@@ -8967,7 +8976,7 @@ mod tests {
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
-            // tools.aurora.admin (18 endpoints)
+            // tools.aurora.admin (19 endpoints)
             r#""tools.aurora.admin":["#,
             r#""emitEvent","#,
             r#""batchTakedownAccounts","#,
@@ -8980,6 +8989,7 @@ mod tests {
             r#""getQueueStats","#,
             r#""getModerationMetrics","#,
             r#""getAuditTrail","#,
+            r#""getReport","#,
             r#""exportAccountForensic","#,
             r#""subscribeModEvents","#,
             r#""getRuntimeSetting","#,

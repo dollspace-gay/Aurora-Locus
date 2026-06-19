@@ -3348,6 +3348,81 @@ pub struct GetAuditTrailOutput {
     pub chain_verified_through: i64,
 }
 
+/// Query params for `tools.aurora.admin.getReport` — the single report id.
+#[derive(serde::Deserialize)]
+pub struct GetReportParams {
+    pub id: i64,
+}
+
+/// Wire shape for `getReport`. A camelCase re-projection of
+/// [`crate::admin::reports::Report`] (whose own `Serialize` is snake_case and
+/// consumed internally) — the admin UI's ReportDetail page reads `subjectDid`,
+/// `reportedBy`, `reasonType`, etc. (#302).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetReportOutput {
+    pub id: i64,
+    pub subject_did: Option<String>,
+    pub subject_uri: Option<String>,
+    pub subject_cid: Option<String>,
+    pub reason_type: crate::admin::reports::ReportReason,
+    pub reason: Option<String>,
+    pub reported_by: String,
+    pub reported_at: chrono::DateTime<chrono::Utc>,
+    pub status: crate::admin::reports::ReportStatus,
+    pub reviewed_by: Option<String>,
+    pub reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub resolution: Option<String>,
+}
+
+impl From<crate::admin::reports::Report> for GetReportOutput {
+    fn from(r: crate::admin::reports::Report) -> Self {
+        Self {
+            id: r.id,
+            subject_did: r.subject_did,
+            subject_uri: r.subject_uri,
+            subject_cid: r.subject_cid,
+            reason_type: r.reason_type,
+            reason: r.reason,
+            reported_by: r.reported_by,
+            reported_at: r.reported_at,
+            status: r.status,
+            reviewed_by: r.reviewed_by,
+            reviewed_at: r.reviewed_at,
+            resolution: r.resolution,
+        }
+    }
+}
+
+/// `tools.aurora.admin.getReport` — fetch a single moderation report by id
+/// (#302). Moderator+. The `get_report` store method already existed; this is
+/// the HTTP surface that was never registered (the admin UI's report-detail
+/// page 404'd on the legacy `com.atproto.admin.getReport` NSID).
+pub async fn get_report(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    axum::extract::Query(params): axum::extract::Query<GetReportParams>,
+) -> Result<Json<GetReportOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::Moderator) {
+        return Err(forbidden(&format!(
+            "getReport requires Moderator+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+    let mgr = crate::admin::reports::ReportManager::new(ctx.account_db.clone());
+    let report = mgr.get_report(params.id).await.map_err(internal_pds)?.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "ReportNotFound",
+                "message": format!("report {} not found", params.id),
+            })),
+        )
+    })?;
+    Ok(Json(GetReportOutput::from(report)))
+}
+
 pub async fn get_audit_trail(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
@@ -3829,10 +3904,25 @@ pub async fn serve_active_theme_extension_points(
 /// progress" (§6.4.2 verification gate) and does NOT rotate the generation.
 /// In-progress visibility (`getRotationProgress`) and cancellation
 /// (`cancelRotation`) are the #225 XRPCs reading/calling this job.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TriggerRotationBody {
+    /// Operator rationale from the typed-confirm modal (#303). Threaded into the
+    /// audit chain so the manual-rotation decision is recorded with its reason.
+    pub rationale: Option<String>,
+}
+
 pub async fn trigger_rotation(
     State(ctx): State<AppContext>,
-    _auth: AdminAuthContext,
+    auth: AdminAuthContext,
+    // Tolerant of a missing/empty body (legacy callers): `Option<Json<…>>` is
+    // `None` if the body is absent or unparseable, and rationale falls back.
+    body: Option<Json<TriggerRotationBody>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let rationale = body
+        .and_then(|b| b.0.rationale)
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| "operator-triggered Laquna rotation".to_string());
     match &ctx.kryphocron_rewrite_job {
         Some(job) => {
             if job.try_start(ctx.clone()) {
@@ -3840,6 +3930,34 @@ pub async fn trigger_rotation(
                     "kryphocron Laquna rotation triggered (triggerRotation XRPC); \
                      rewrite-on-rotate job started",
                 );
+                // #303 — record the operator decision in the tamper-evident
+                // audit chain (read by getAuditTrail / #mod/audit). Manual
+                // rotation is operator-initiated with a typed-confirm rationale;
+                // the cadence-organic rotation path is a SYSTEM action and stays
+                // in the moderation_event feed only (per the F5 scope). Best-
+                // effort: a chain-emit failure never reverses the started job.
+                if let Err(e) = audit_chain::insert_chain_entry_pool(
+                    &ctx.account_db,
+                    ctx.config.database.backend,
+                    AppendEntryParams {
+                        actor_did: &auth.did,
+                        action: "kryphocron.laquna.rotate",
+                        subject: None,
+                        rationale: &rationale,
+                        snapshot_id: None,
+                        event_id: None,
+                        cascade_subjects: &[],
+                        cascade_snapshot_ids: &[],
+                    },
+                )
+                .await
+                {
+                    tracing::error!(
+                        target: "aurora_locus::kryphocron",
+                        error = %e,
+                        "laquna rotation audit-chain emit failed (rotation still started)",
+                    );
+                }
                 (
                     StatusCode::OK,
                     Json(serde_json::json!({ "status": "rotation-triggered" })),
@@ -4182,6 +4300,37 @@ mod tests {
     use super::*;
     use crate::admin::roles::Role;
     use crate::account::ValidatedSession;
+
+    // #302 — getReport's wire shape must be camelCase: the admin UI's
+    // ReportDetail page reads `subjectDid` / `reportedBy` / `reasonType`. The
+    // underlying Report struct serializes snake_case, so GetReportOutput is the
+    // camelCase re-projection — this pins that contract.
+    #[test]
+    fn get_report_output_serializes_camelcase() {
+        let out = GetReportOutput {
+            id: 7,
+            subject_did: Some("did:plc:subj".into()),
+            subject_uri: None,
+            subject_cid: None,
+            reason_type: crate::admin::reports::ReportReason::Spam,
+            reason: Some("spammy".into()),
+            reported_by: "did:plc:reporter".into(),
+            reported_at: chrono::Utc::now(),
+            status: crate::admin::reports::ReportStatus::Open,
+            reviewed_by: None,
+            reviewed_at: None,
+            resolution: None,
+        };
+        let v = serde_json::to_value(&out).expect("serialize");
+        assert_eq!(v["subjectDid"], serde_json::json!("did:plc:subj"));
+        assert_eq!(v["reportedBy"], serde_json::json!("did:plc:reporter"));
+        assert_eq!(v["reasonType"], serde_json::json!("spam"));
+        assert_eq!(v["status"], serde_json::json!("open"));
+        assert!(
+            v.get("subject_did").is_none(),
+            "must be camelCase (subjectDid), not snake_case (subject_did)",
+        );
+    }
 
     fn moderator_auth() -> AdminAuthContext {
         AdminAuthContext {

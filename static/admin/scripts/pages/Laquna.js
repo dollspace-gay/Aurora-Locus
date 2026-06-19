@@ -131,7 +131,9 @@
     });
     if (!res.confirmed) return;
     try {
-      await K().triggerRotation();
+      // #303 — carry the typed-confirm rationale to the backend so it lands in
+      // the operator-decision audit chain (previously captured then discarded).
+      await K().triggerRotation({ rationale: res.rationale });
       global.AuroraToast.success(t('kryphocron.laquna.rotate_started'));
       startProgress();
     } catch (e) {

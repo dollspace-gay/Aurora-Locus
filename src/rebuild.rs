@@ -596,6 +596,38 @@ async fn emit_repo_rebuilt(
             "repo rebuild succeeded but RepoRebuilt audit emit failed",
         );
     }
+
+    // #303 — the tamper-evident operator-decision chain (read by getAuditTrail /
+    // the #mod/audit page). A repo rebuild is an operator-initiated destructive
+    // action gated behind a typed-confirm + rationale, so the decision (and its
+    // rationale) must land in the chain, not only the moderation_event feed.
+    // Best-effort + post-commit, mirroring the moderation_event emit above: a
+    // chain-emit failure is logged and never reverses the already-committed
+    // rebuild.
+    let subject = crate::admin::defs::Subject::Repo { did: did.to_string() };
+    if let Err(e) = crate::admin::audit_chain::insert_chain_entry_pool(
+        &ctx.account_db,
+        ctx.config.database.backend,
+        crate::admin::audit_chain::AppendEntryParams {
+            actor_did: triggered_by,
+            action: "repo.rebuild",
+            subject: Some(&subject),
+            rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    {
+        tracing::error!(
+            target: "aurora_locus::rebuild",
+            did = %did,
+            error = %e,
+            "repo rebuild audit-chain emit failed (moderation_event still recorded)",
+        );
+    }
 }
 
 /// Resolve `did`'s published signing key as a `did:key:z...` string — the same

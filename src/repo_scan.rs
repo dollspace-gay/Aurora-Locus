@@ -870,6 +870,34 @@ async fn emit_bulk_repair_initiated(
     {
         tracing::error!(target: "aurora_locus::repo_scan", error = %e, "BulkRepairInitiated audit emit failed");
     }
+
+    // #303 — operator-decision audit chain (read by getAuditTrail). Bulk repair
+    // is an operator-initiated destructive batch (typed-REPAIR + rationale), so
+    // it lands in the chain as a multi-subject entry: the target repos go in
+    // `cascade_subjects` (the columns the chain provides for batch actions).
+    // Best-effort, mirroring the moderation_event emit above.
+    let cascade_subjects: Vec<crate::admin::defs::Subject> = targets
+        .iter()
+        .map(|d| crate::admin::defs::Subject::Repo { did: d.clone() })
+        .collect();
+    if let Err(e) = crate::admin::audit_chain::insert_chain_entry_pool(
+        &ctx.account_db,
+        ctx.config.database.backend,
+        crate::admin::audit_chain::AppendEntryParams {
+            actor_did: triggered_by,
+            action: "repo.bulk_repair",
+            subject: None,
+            rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &cascade_subjects,
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    {
+        tracing::error!(target: "aurora_locus::repo_scan", error = %e, "bulk repair audit-chain emit failed (moderation_event still recorded)");
+    }
 }
 
 #[cfg(test)]

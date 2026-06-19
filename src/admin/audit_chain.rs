@@ -1956,6 +1956,60 @@ mod tests {
             .expect("clean chain after concurrent appends");
     }
 
+    // #303 — the three operator-initiated destructive ops (repo rebuild, bulk
+    // repair, manual Laquna rotation) emit operator-decision chain entries. This
+    // pins that each entry shape is a valid, hash-linked, verifiable chain entry:
+    // single-subject (rebuild), multi-subject via cascade_subjects (the batch
+    // repair — the novel column path), and no-subject (deployment-wide rotation),
+    // with the typed-confirm rationale persisted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f303_operator_decision_entries_chain_verify() {
+        let db = open_concurrent_test_pool(2).await;
+        let be = crate::config::DatabaseBackend::Sqlite;
+
+        let rebuild_subj = Subject::Repo { did: "did:plc:rebuilt".into() };
+        insert_chain_entry_pool(&db, be, AppendEntryParams {
+            actor_did: "did:plc:op", action: "repo.rebuild", subject: Some(&rebuild_subj),
+            rationale: "corruption recovery", snapshot_id: None, event_id: None,
+            cascade_subjects: &[], cascade_snapshot_ids: &[],
+        }).await.expect("rebuild entry");
+
+        let targets = vec![
+            Subject::Repo { did: "did:plc:t1".into() },
+            Subject::Repo { did: "did:plc:t2".into() },
+        ];
+        insert_chain_entry_pool(&db, be, AppendEntryParams {
+            actor_did: "did:plc:op", action: "repo.bulk_repair", subject: None,
+            rationale: "batch scrub", snapshot_id: None, event_id: None,
+            cascade_subjects: &targets, cascade_snapshot_ids: &[],
+        }).await.expect("bulk-repair entry");
+
+        insert_chain_entry_pool(&db, be, AppendEntryParams {
+            actor_did: "did:plc:op", action: "kryphocron.laquna.rotate", subject: None,
+            rationale: "ahead-of-cadence rotation", snapshot_id: None, event_id: None,
+            cascade_subjects: &[], cascade_snapshot_ids: &[],
+        }).await.expect("rotation entry");
+
+        // All three form one clean, hash-linked, verifiable chain.
+        verify_chain_range(&db, 1, 3).await.expect("F5 entries chain-verify");
+
+        // The bulk-repair entry round-trips both targets in cascade_subjects.
+        let cascade_json: Option<String> = sqlx::query_scalar(
+            "SELECT cascade_subjects FROM audit_chain_entry WHERE action = 'repo.bulk_repair'",
+        ).fetch_one(&db).await.unwrap();
+        let cascade_json = cascade_json.expect("cascade_subjects present for bulk repair");
+        assert!(
+            cascade_json.contains("did:plc:t1") && cascade_json.contains("did:plc:t2"),
+            "both repair targets recorded in cascade_subjects: {cascade_json}",
+        );
+
+        // The typed-confirm rationale persists (the safety-critical reason).
+        let rebuild_rationale: String = sqlx::query_scalar(
+            "SELECT rationale FROM audit_chain_entry WHERE action = 'repo.rebuild'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(rebuild_rationale, "corruption recovery");
+    }
+
     // ====================================================================
     // Arc 3 Step 0.6 (§7.4.0.6) — invariants on `corrupt_entry_rationale`.
     //

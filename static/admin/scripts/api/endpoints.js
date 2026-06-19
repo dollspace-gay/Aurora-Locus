@@ -25,7 +25,7 @@
     disableInviteCodes: (body) => C().post('com.atproto.admin.disableInviteCodes', body),
     listRecentEvents: (params) => C().get('com.atproto.admin.listRecentEvents', params || { limit: 20 }),
     getRecord: (params) => C().get('com.atproto.repo.getRecord', params),
-    getReport: (params) => C().get('com.atproto.admin.getReport', params || {}),
+    getReport: (params) => C().get('tools.aurora.admin.getReport', params || {}),
     getSession: () => C().get('com.atproto.server.getSession'),
   };
 
@@ -107,7 +107,7 @@
     getOracleActivity: () => C().get('tools.aurora.ops.kryphocron.getOracleActivity'),
     getRotationStatus: () => C().get('tools.aurora.ops.kryphocron.getRotationStatus'),
     getRotationProgress: () => C().get('tools.aurora.ops.kryphocron.getRotationProgress'),
-    triggerRotation: () => C().post('tools.aurora.ops.kryphocron.triggerRotation', {}),
+    triggerRotation: (body) => C().post('tools.aurora.ops.kryphocron.triggerRotation', body || {}),
     cancelRotation: () => C().post('tools.aurora.ops.kryphocron.cancelRotation', {}),
     listRotations: () => C().get('tools.aurora.ops.kryphocron.listRotations'),
     getAudienceAggregate: () => C().get('tools.aurora.ops.kryphocron.getAudienceAggregate'),
