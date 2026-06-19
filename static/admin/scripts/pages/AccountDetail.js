@@ -589,7 +589,7 @@
       global.AuroraSkeleton.lines(3)));
 
     try {
-      const ctx = await global.AuroraEndpoints.moderator.getSubjectContext({ subjectDid: currentDid });
+      const ctx = await global.AuroraEndpoints.moderator.getSubjectContext({ did: currentDid });
       renderSubjectContext(ctx);
     } catch (e) {
       const body = railBodyEl('subject-context');
@@ -624,7 +624,7 @@
     const host = document.getElementById('ad-history-body');
     if (!host) return;
     try {
-      const data = await global.AuroraEndpoints.moderator.getSubjectHistory({ subjectDid: currentDid, limit: 25 });
+      const data = await global.AuroraEndpoints.moderator.getSubjectHistory({ did: currentDid, limit: 25 });
       const items = (data && data.items) || [];
       if (items.length === 0) {
         host.innerHTML = '<p class="empty-state">No prior actions on this account.</p>';
