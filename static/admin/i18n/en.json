@@ -602,7 +602,7 @@
       "operator_empty": "No operator-triggered rotations yet.",
       "organic_title": "Cadence-organic rotations",
       "organic_subtitle": "Slug-only rotations on the cadence schedule.",
-      "organic_pending": "Available when cadence-organic rotation-history bookkeeping is wired (backend follow-up #238). Records still rotate on cadence; this track surfaces them once the oracle records them.",
+      "organic_pending": "No cadence-organic rotations recorded yet. Generations rotate automatically on the deployment cadence; each one is appended here when it fires. (Operator-triggered rotations appear in the left track.)",
       "col_at": "When",
       "col_generation": "Generation",
       "col_rewritten": "Re-encoded",

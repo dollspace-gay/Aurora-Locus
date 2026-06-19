@@ -5,9 +5,11 @@
 // rotation-history.log). The backend sorts equal-`at` operator-triggered
 // first (§13.2); this page preserves the returned order.
 //
-// The cadence-organic track is empty until #238 (the oracle write-side for
-// rotation-history.log) lands — the column renders an honest empty-state
-// rather than implying no rotations have occurred.
+// The cadence-organic write-side (#238: append_rotation_history →
+// rotation-history.log, kryphocron_rotation.rs) and the listRotations reader
+// are both wired. The track simply stays empty until a cadence rotation
+// actually fires (they occur on the deployment cadence, not on operator
+// action), so the column renders an honest "none yet" empty-state.
 
 (function (global) {
   'use strict';
