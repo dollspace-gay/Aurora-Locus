@@ -54,10 +54,19 @@
     notify();
   }
 
-  // A no-id active.css URL lets the server resolve the deployment-default; an
-  // explicit id pins a chosen theme.
+  // An explicit pref pins a chosen theme via ?id (which also cache-busts when
+  // the pref changes). The 'default' sentinel uses NO ?id so the server
+  // resolves the deployment-default — but it carries a ?v cache-bust keyed on
+  // the *resolved* default, so when the deployment-default changes the URL
+  // changes and the browser refetches the new theme's colors instead of
+  // serving the stale cached no-id stylesheet (#306, the partial-repaint bug:
+  // typography reflowed live via data-theme but active.css colors stayed
+  // cached). The server ignores the extra `v` param (it keys on `id` only).
   function themeHref(base, pref) {
-    return pref === 'default' ? base : base + '?id=' + encodeURIComponent(pref);
+    if (pref === 'default') {
+      return base + '?v=' + encodeURIComponent(resolvedThemeId());
+    }
+    return base + '?id=' + encodeURIComponent(pref);
   }
 
   function applyTheme(pref) {
