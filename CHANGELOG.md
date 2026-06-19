@@ -10,45 +10,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.9.0] - 2026-06-19
 
 ### Added
-- Arc A — foundational IA reshape: four-domain structure (Moderation/Operations/Configuration/Kryphocron) + Dashboard role-tiering + role×mode visibility matrix + hash routing + sidebar/breadcrumb reshape (#193–#206)
-- Arc B — theming substrate: manifest/inheritance/28-token contract + WCAG 2.2 contrast verifier + effect-class library + 4 bundled themes (aurora-default root + light/dark/stack-classic) + Themes page + UI&modes picker (#212–#219)
-- Arc B — extension-point runtime: manifest validation + /theme/active-extensions.css + active-extension-points + themeProvidesExtension (#285)
-- Arc C — theme-author docs (authoring-themes.md ch1–9) + extension-point reference theme (#218, #284)
-- Arc D — Kryphocron domain pages: overview / audience-aggregate / laquna / laquna-history / tier-activity + account drawer + policy page + Dashboard block (#226–#234)
-- Arc D — Kryphocron backend: kryphocron 0.2→0.3 + aurora-locus-standard RotationOracle + encode-seam + decode-on-read + rewrite-on-rotate + 11 of 13 read XRPCs + rotation-history log (#222–#225, #236–#238)
-- Arc E — auth/sessions: admin refresh-token flow + rotation-on-use + per-operator session management (operator_session + listSessions/revokeSession + Sessions page) (#268, #270–#274)
-- Arc H — recovery surfaces: recovery-mode status + repository rebuild + bulk repository repair + sequencer-recovery deep-validation (4 of 4 surfaces) (#276, #286–#295)
-- #280 — graph.block dedicated endpoints (#281) + block-cascade orchestration with audience-removal + block-cascade.log (#282)
-- #257 — shared list-page helpers (AuroraListPage) across the four moderation pages
-- Arc I — UI primitives + audits: AuroraSkeleton/Spinner/InlineError/ErrorBoundary/Timestamp/SourceTier/AuditedSave + audit cross-pivots + lib/roles extraction (#241–#264)
+- Admin UI reorganized into four domains (Moderation, Operations, Configuration, Kryphocron) with role- and mode-based visibility, a role-tiered dashboard, and a reshaped sidebar, breadcrumbs, and routing
+- Customizable theming: theme manifests with inheritance, a design-token contract, WCAG 2.2 contrast checking, an effect-class library, four bundled themes (default, light, dark, stack-classic), a Themes settings page, and a theme/mode picker
+- Theme extension points — themes can declare and provide named extension points that surfaces opt into at runtime
+- Theme authoring documentation and a reference example theme
+- Kryphocron admin surface: overview, deployment-wide audiences, laquna status with rotation history, and tier-activity pages, plus a per-account drawer, a policy page, and a dashboard summary block
+- Encryption-at-rest for private-tier posts — encoded on write and transparently decoded for authorized readers — with a standard rotation oracle, automatic re-encoding on key rotation, and operator read endpoints
+- Admin authentication: refresh-token flow with rotation on use, and per-operator session management with a Sessions page to view and revoke active sessions
+- Recovery surfaces: recovery-mode status display, single-repository rebuild, bulk repository repair, and sequencer integrity validation
+- Blocking a subject now also removes them from the blocker's audiences, with an audit log of the cascade
+- Moderation list pages (Reports, Appeals, Events, Audit) share unified pagination and filtering behavior
+- UI building blocks: loading skeletons, spinners, inline errors, error boundaries, consistent timestamps, source-tier indicators, and a save-with-rationale confirmation
 
 ### Changed
-- §8.1.6 role-change resolved live per-request — satisfied-by-architecture, no token-stale machinery (#267)
-- §7.3.2 recovery-mode entry/exit translated to a read-only status surface (substrate is startup-scoped by design) (#276)
-- §7.4 "recovery-CLI parity" reframed as greenfield substrate-novel (no CLI to wrap) (#283)
-- toast-success / inline-error asymmetry kept intentional (audit-only) (#254)
+- Operator role changes now take effect on the next request, without requiring re-login
 
-### Fixed (Phase B)
-- #297 frontend role resolution returned moderator for all tiers (getSession now returns the live role)
-- #298 getModerationMetrics 405 (POST→GET + array query-param expansion)
-- #299 unbacked Config-General/Laquna runtime-setting fields shown read-only instead of failing saves
-- #300 InvalidEvent error mistranslated runtime-setting failures (now falls through to the substrate message)
-- #301 subject context/history drawers sent `subjectDid` instead of `did` (400)
-- #302 getReport route unregistered (registered `tools.aurora.admin.getReport`)
-- #303 destructive operator ops now emit to the audit chain, not just moderation_event
-- #304 Laquna cadence-organic empty-state cited an already-closed ticket
-- #306 theme switch left colors stale until reload (active.css cache-bust)
-- #307 prefers-reduced-motion strengthened (scroll-behavior) + pinned
-- #308 cosmetic-setting opt-out for audited saves (theme switch drops rationale friction)
-- #315 searchAccounts ignored the `q` parameter (now substring-filters handle/DID/email)
-- #235 Arc B regression: themes-v1/listInstalled missing from wire-extension order
-- time/ordering test-flake hardening (#258, #265, #266, #269)
+### Fixed
+- Admin UI displayed all operators as moderator regardless of their actual role
+- Moderation metrics failed to load on the dashboard
+- Configuration fields with no backing store are now shown read-only instead of offering saves that always fail
+- Runtime-setting errors now report the specific reason instead of a generic moderation message
+- Subject context and history drawers failed to load on the account-detail page
+- Report-detail pages returned not-found
+- Destructive operator actions (repository rebuild, repair, and manual rotation) are now recorded in the tamper-evident audit chain
+- Corrected the laquna rotation-history empty-state copy
+- Switching the default theme now repaints colors immediately instead of only after a reload
+- The reduced-motion preference now also suppresses smooth scrolling
+- Cosmetic settings such as the theme save with a lighter confirmation instead of requiring a typed rationale
+- Account search now filters by the search term instead of returning every account
+- Restored the installed-themes listing to the server's advertised capabilities
+- Hardened intermittent time- and ordering-sensitive test failures
 
-### Deferred to future cycle
-- #305 runtime-setting consumer wiring for Config-General/Laquna keys (fields read-only until the backend consumes them)
-- sequencer-recovery prune / re-sequence / malformed-blob-repair operations — validate-only shipped, preconditions documented (#278)
-- bulk-revoke-by-operator session action (#273)
-- feat/kryphocron-per-account-overrides — `getAccountOverrides`/`setAccountOverride`, 2 of 13 Arc-D endpoints; design-sanctioned partial coverage per §6.6/§6.8/§7.2.1 (#316)
+### Deferred
+- Per-account kryphocron overrides — partial coverage; the full surface lands in a future release
+- Sequencer recovery beyond integrity validation (pruning, re-sequencing, malformed-blob repair) — future release
+- Bulk session revocation across an operator's sessions — future release
+- Backing store for the display-only configuration fields — future release
 
 ## [0.8.0] - 2026-06-08
 
