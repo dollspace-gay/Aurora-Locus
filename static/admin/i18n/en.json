@@ -507,6 +507,7 @@
       "range_weekly_daily": "Weekly to daily",
       "range_weekly_hourly": "Weekly to hourly",
       "range_none": "No per-account override",
+      "range_readonly_note": "(read-only — not yet wired to the runtime)",
       "save_range": "Save range",
       "shape_title": "Process-shape declaration",
       "shape_help": "Operator declaration of deployment shape. Multi-process deployments require an operator-supplied coordinated rotation oracle; a mismatch surfaces a warning on the Overview (it does not block encoding).",

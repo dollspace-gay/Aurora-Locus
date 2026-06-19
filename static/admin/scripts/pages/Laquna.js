@@ -220,18 +220,23 @@
       ['weekly-to-hourly', t('kryphocron.policy.range_weekly_hourly')],
       ['no-override', t('kryphocron.policy.range_none')],
     ];
-    function sel(id, opts, cur) {
-      return '<select id="' + id + '" class="form-select"' + (isSuper ? '' : ' disabled') + '>' +
+    function sel(id, opts, cur, disabled) {
+      return '<select id="' + id + '" class="form-select"' + (disabled ? ' disabled' : '') + '>' +
         opts.map((o) => '<option value="' + esc(o[0]) + '"' + (o[0] === cur ? ' selected' : '') +
           '>' + esc(o[1]) + '</option>').join('') + '</select>';
     }
+    // #299 — rotation-cadence IS in the runtime-settings registry (editable by
+    // SuperAdmin). account-cadence-range is NOT registry-backed and nothing
+    // consumes it yet, so it is shown read-only until the backend wires it
+    // (deferred feature work); saveCadence below only persists rotation-cadence.
     card.innerHTML =
       '<h3>' + esc(t('kryphocron.laquna.cadence_title')) + '</h3>' +
       '<p class="settings-help">' + esc(t('kryphocron.laquna.cadence_help')) + '</p>' +
       '<div class="form-row"><label>' + esc(t('kryphocron.laquna.cadence_label')) + '</label>' +
-        sel('lq-cadence-sel', cadenceOpts, cadence) + '</div>' +
+        sel('lq-cadence-sel', cadenceOpts, cadence, !isSuper) + '</div>' +
       '<div class="form-row"><label>' + esc(t('kryphocron.policy.cadence_range_label')) + '</label>' +
-        sel('lq-range-sel', rangeOpts, range) + '</div>' +
+        sel('lq-range-sel', rangeOpts, range, true) +
+        ' <small class="settings-help">' + esc(t('kryphocron.policy.range_readonly_note')) + '</small></div>' +
       (isSuper
         ? '<div class="form-actions"><button class="btn btn-primary" id="lq-cadence-save">' +
           esc(t('common.save')) + '</button></div>'
@@ -244,13 +249,14 @@
 
   async function saveCadence() {
     const cadence = document.getElementById('lq-cadence-sel');
-    const range = document.getElementById('lq-range-sel');
+    // #299 — only rotation-cadence is registry-backed; account-cadence-range
+    // (KEY_RANGE) is shown read-only and intentionally not persisted here until
+    // the backend consumes it.
     await global.AuroraAuditedSave.run({
       heading: t('kryphocron.laquna.cadence_save_heading'),
       body: t('kryphocron.laquna.cadence_save_body'),
       settings: [
         { key: KEY_CADENCE, value: cadence.value },
-        { key: KEY_RANGE, value: range.value },
       ],
       successMessage: t('kryphocron.laquna.cadence_saved'),
     });
