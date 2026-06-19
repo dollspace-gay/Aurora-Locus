@@ -4250,6 +4250,12 @@ struct GetAccountInfoQuery {
 
 #[derive(Deserialize)]
 struct SearchAccountsQuery {
+    /// Free-text search term (#315) — case-insensitive substring over handle,
+    /// DID, and email. This is what the admin UI's Accounts search box sends;
+    /// it was previously absent from this struct, so `Query<>` silently dropped
+    /// it and every account came back regardless of the term.
+    #[serde(default)]
+    q: Option<String>,
     /// Optional email to filter by (exact, case-insensitive)
     #[serde(default)]
     email: Option<String>,
@@ -4298,6 +4304,7 @@ async fn search_accounts(
         .account_manager
         .search_accounts(
             query.email.as_deref(),
+            query.q.as_deref(),
             query.cursor.as_deref(),
             limit + 1,
         )
@@ -8502,6 +8509,7 @@ mod tests {
             State(ctx),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: None,
                 cursor: None,
                 limit: Some(101),
@@ -8520,6 +8528,7 @@ mod tests {
             State(ctx2),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: None,
                 cursor: None,
                 limit: Some(0),
@@ -8540,6 +8549,7 @@ mod tests {
             State(ctx),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: None,
                 cursor: None,
                 limit: None,
@@ -8564,6 +8574,7 @@ mod tests {
             State(ctx.clone()),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: Some("alice@example.com".to_string()),
                 cursor: None,
                 limit: None,
@@ -8581,6 +8592,7 @@ mod tests {
             State(ctx),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: Some("nobody@example.com".to_string()),
                 cursor: None,
                 limit: None,
@@ -8590,6 +8602,55 @@ mod tests {
         .unwrap()
         .0;
         assert!(resp.accounts.is_empty());
+    }
+
+    // #315 — the free-text `q` param must actually filter (it was silently
+    // dropped, returning every account). Covers handle / DID / email substring,
+    // the non-matching → 0 case (the bug), and no-q → all (preserved).
+    #[tokio::test]
+    async fn test_search_accounts_filters_by_q_across_handle_did_email() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:aaaa", "alice.test", Some("alice@example.com")).await;
+        seed_test_account(&ctx, "did:plc:bbbb", "bob.test", Some("bob@example.com")).await;
+        seed_test_account(&ctx, "did:plc:zzzz", "carol.test", None).await;
+
+        let q_search = |term: Option<&str>| {
+            let c = ctx.clone();
+            let t = term.map(str::to_string);
+            async move {
+                search_accounts(
+                    State(c),
+                    admin_test_auth(),
+                    Query(SearchAccountsQuery { q: t, email: None, cursor: None, limit: None }),
+                )
+                .await
+                .unwrap()
+                .0
+            }
+        };
+
+        // Handle substring (case-insensitive).
+        let r = q_search(Some("ALICE")).await;
+        assert_eq!(r.accounts.len(), 1, "q matches a handle substring");
+        assert_eq!(r.accounts[0].did, "did:plc:aaaa");
+
+        // DID substring.
+        let r = q_search(Some("zzzz")).await;
+        assert_eq!(r.accounts.len(), 1, "q matches a DID substring");
+        assert_eq!(r.accounts[0].did, "did:plc:zzzz");
+
+        // Email substring.
+        let r = q_search(Some("bob@")).await;
+        assert_eq!(r.accounts.len(), 1, "q matches an email substring");
+        assert_eq!(r.accounts[0].did, "did:plc:bbbb");
+
+        // Non-matching q → 0 accounts (the bug: previously returned all).
+        let r = q_search(Some("did:plc:nonexistent-prefix")).await;
+        assert!(r.accounts.is_empty(), "non-matching q must return 0 accounts, not the full list");
+
+        // No q → all accounts (existing behavior preserved).
+        let r = q_search(None).await;
+        assert_eq!(r.accounts.len(), 3, "absent q returns all accounts");
     }
 
     // ---- tools.aurora.ops.listAccounts (chainlink #84 / Phase 2.3.7) ----
@@ -11321,6 +11382,7 @@ mod tests {
             State(ctx),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: Some("s@x".to_string()),
                 cursor: None,
                 limit: None,
@@ -11383,6 +11445,7 @@ mod tests {
             State(ctx.clone()),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: None,
                 cursor: None,
                 limit: Some(2),
@@ -11401,6 +11464,7 @@ mod tests {
             State(ctx),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: None,
                 cursor: page1.cursor,
                 limit: Some(2),

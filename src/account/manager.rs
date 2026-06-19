@@ -2797,11 +2797,12 @@ impl AccountManager {
     pub async fn search_accounts(
         &self,
         email: Option<&str>,
+        q: Option<&str>,
         cursor: Option<&str>,
         limit: i64,
     ) -> PdsResult<Vec<ActorAccount>> {
-        // Build SQL with optional email and cursor predicates so we don't run
-        // a join+filter when the caller only wants pagination.
+        // Build SQL with optional email, free-text (`q`), and cursor predicates
+        // so we don't run a join+filter when the caller only wants pagination.
         let mut sql = String::from(
             "SELECT
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
@@ -2814,21 +2815,36 @@ impl AccountManager {
         if email.is_some() {
             sql.push_str(" AND LOWER(ac.email) = LOWER(?)");
         }
+        // #315 — free-text search the admin UI's Accounts box sends as `q`:
+        // case-insensitive substring across handle, DID, and email (matching
+        // the "Search by handle, DID, or email" affordance). Previously the
+        // handler accepted no `q` field, so the param was silently dropped and
+        // every account was returned regardless of the search term.
+        if q.is_some() {
+            sql.push_str(
+                " AND (LOWER(a.handle) LIKE ? OR LOWER(a.did) LIKE ? OR LOWER(ac.email) LIKE ?)",
+            );
+        }
         if cursor.is_some() {
             sql.push_str(" AND a.did > ?");
         }
         sql.push_str(" ORDER BY a.did LIMIT ?");
 
-        let mut q = sqlx::query(&sql);
+        // `%term%` substring, lower-cased to pair with the LOWER() columns.
+        let q_like = q.map(|s| format!("%{}%", s.to_lowercase()));
+        let mut stmt = sqlx::query(&sql);
         if let Some(e) = email {
-            q = q.bind(e);
+            stmt = stmt.bind(e);
+        }
+        if let Some(ref like) = q_like {
+            stmt = stmt.bind(like).bind(like).bind(like);
         }
         if let Some(c) = cursor {
-            q = q.bind(c);
+            stmt = stmt.bind(c);
         }
-        q = q.bind(limit);
+        stmt = stmt.bind(limit);
 
-        let rows = q.fetch_all(&self.db).await.map_err(PdsError::Database)?;
+        let rows = stmt.fetch_all(&self.db).await.map_err(PdsError::Database)?;
 
         let mut accounts = Vec::new();
         for row in rows {
