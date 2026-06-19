@@ -41,12 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restored the installed-themes listing to the server's advertised capabilities
 - Hardened intermittent time- and ordering-sensitive test failures
 
-### Deferred
-- Per-account kryphocron overrides — partial coverage; the full surface lands in a future release
-- Sequencer recovery beyond integrity validation (pruning, re-sequencing, malformed-blob repair) — future release
-- Bulk session revocation across an operator's sessions — future release
-- Backing store for the display-only configuration fields — future release
-
 ## [0.8.0] - 2026-06-08
 
 ### Added
