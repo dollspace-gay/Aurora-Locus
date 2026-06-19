@@ -14,11 +14,22 @@
 //     heading, body, confirmLabel?, typedConfirmGate?,
 //     settings: [{ key, value }, ...],   // one or more runtime settings, all written under the one rationale
 //     successMessage?,
+//     cosmetic?, autoRationale?,         // see below
 //   })  → Promise<{ saved: boolean, auditEntryId?: string, rationale?: string }>
 //
 // Returns { saved: false } if the operator cancels the modal or a write fails
 // (a danger toast is shown on failure). On success, shows a success toast with
 // a "View audit entry" action linking the last write's audit entry.
+//
+// `cosmetic: true` (#308) — for low-stakes operator preferences (e.g. the
+// deployment-default theme). A required typed rationale is the right gate for
+// destructive actions on durable state (rebuild / rotation / role grant) but is
+// pure friction for "make this the default theme". Cosmetic mode keeps a light
+// confirm (heading/body) but drops the required-rationale field and any
+// typed-confirm gate, and writes the setting under an auto-filled rationale
+// (`autoRationale`, default "cosmetic setting change") — so the change STILL
+// lands an audit-chain entry (audit-trail completeness preserved), just without
+// an operator-typed reason.
 
 (function (global) {
   'use strict';
@@ -27,15 +38,20 @@
 
   async function run(spec) {
     spec = spec || {};
+    const cosmetic = !!spec.cosmetic;
     const res = await global.AuroraModal.destructiveConfirm({
       heading: spec.heading,
       body: spec.body,
-      rationaleRequired: true,
-      typedConfirmGate: spec.typedConfirmGate,
+      rationaleRequired: !cosmetic,
+      typedConfirmGate: cosmetic ? undefined : spec.typedConfirmGate,
       confirmLabel: spec.confirmLabel || t('common.save'),
     });
     if (!res.confirmed) return { saved: false };
-    const rationale = res.rationale || '';
+    // Cosmetic settings auto-fill the rationale (no operator-typed reason) but
+    // still emit the audit entry via setRuntimeSetting below.
+    const rationale = cosmetic
+      ? (spec.autoRationale || 'cosmetic setting change')
+      : (res.rationale || '');
     let lastAudit = null;
     try {
       const settings = spec.settings || [];

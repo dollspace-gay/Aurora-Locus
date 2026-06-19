@@ -116,6 +116,10 @@
       heading: 'Set deployment-default theme',
       body: 'Make "' + themeId + '" the deployment-default theme? Every operator who has not set a personal preference will see it.',
       confirmLabel: 'Set as default',
+      // #308 — theme is a cosmetic setting: a light confirm, no required
+      // rationale (the change still lands an audit entry with this auto-reason).
+      cosmetic: true,
+      autoRationale: 'cosmetic setting: theme deployment-default = ' + themeId,
       settings: [{ key: 'theme.deployment-default', value: themeId }],
       successMessage: 'Deployment-default theme set to ' + themeId + '.',
     });
