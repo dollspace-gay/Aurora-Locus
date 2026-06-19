@@ -242,10 +242,17 @@
   --shadow-focus: 0 0 0 3px rgba(96, 165, 250, 0.5);
 }
 
+/* Honor the OS `prefers-reduced-motion` preference framework-wide (#307): a
+ * universal !important rule collapses every animation/transition to instant
+ * and disables smooth-scroll. Lives in tokens.css (always-loaded framework
+ * bundle) so it covers themed CSS too. `0.01ms` (not `0`) keeps animationend
+ * events firing while removing visible motion. No operator toggle ships — this
+ * is the browser-native default; an operator override is future work. */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
