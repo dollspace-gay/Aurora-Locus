@@ -74,6 +74,40 @@ pub fn verify(tokens: &HashMap<String, String>) -> Vec<String> {
     failures
 }
 
+/// One pair's measured contrast — the certification counterpart to the
+/// failure list [`verify`] returns. `ratio` is `0.0` when a color could not be
+/// resolved (the same fail-closed signal `verify` treats as a failure).
+#[derive(Clone, Copy, Debug)]
+pub struct PairContrast {
+    pub fg: &'static str,
+    pub bg: &'static str,
+    pub ratio: f64,
+    pub required: f64,
+}
+
+/// Measure every §11.10.3 pair against a resolved token map. Unlike [`verify`]
+/// (which returns only failures), this returns the measured ratio for every
+/// pair — the input to the per-theme WCAG certification report (#321). Uses the
+/// identical resolution + flatten + luminance math as `verify`.
+pub fn report(tokens: &HashMap<String, String>) -> Vec<PairContrast> {
+    CONTRAST_PAIRS
+        .iter()
+        .map(|(fg_name, bg_name, required)| {
+            let fg = tokens.get(*fg_name).and_then(|v| parse(v, tokens, 0));
+            let bg = tokens.get(*bg_name).and_then(|v| parse(v, tokens, 0));
+            let ratio = match (fg, bg) {
+                (Some(fg), Some(bg)) => {
+                    let bg_flat = flatten(bg, WHITE);
+                    let fg_flat = flatten(fg, bg_flat);
+                    contrast_ratio(luminance(fg_flat), luminance(bg_flat))
+                }
+                _ => 0.0,
+            };
+            PairContrast { fg: fg_name, bg: bg_name, ratio, required: *required }
+        })
+        .collect()
+}
+
 /// Flatten `over` (with straight alpha) onto opaque `under`. Returns an
 /// opaque color (alpha 1) — `under` is assumed opaque by callers.
 fn flatten(over: Color, under: Color) -> Color {

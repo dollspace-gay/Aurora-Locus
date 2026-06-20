@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Admin UI reorganized into four domains (Moderation, Operations, Configuration, Kryphocron) with role- and mode-based visibility, a role-tiered dashboard, and a reshaped sidebar, breadcrumbs, and routing
 - Customizable theming: theme manifests with inheritance, a design-token contract, WCAG 2.2 contrast checking, an effect-class library, and a Themes settings page with a row-list theme picker
-- Ten bundled themes — Dark, Light, Stack Classic, Ember, Emerald, Glacier, Meridian, Pride, and High Contrast Dark/Light (the two high-contrast themes verified to WCAG 2.2 AAA) — six dark and four light, with Stack Classic as the deployment default
+- Ten bundled themes — Dark, Light, Stack Classic, Ember, Emerald, Glacier, Meridian, Pride, and High Contrast Dark/Light — six dark and four light, with Stack Classic as the deployment default
+- All ten themes pass WCAG 2.2 AA contrast checks via the substrate's verifier; High Contrast Dark and High Contrast Light additionally clear AAA for text (7:1). Programmatic contrast only — not a full focus-indicator, keyboard, or screen-reader audit
 - Theme extension points — themes can declare and provide named extension points that surfaces opt into at runtime
 - Theme authoring documentation and a reference example theme
 - Kryphocron admin surface: overview, deployment-wide audiences, laquna status with rotation history, and tier-activity pages, plus a per-account drawer, a policy page, and a dashboard summary block

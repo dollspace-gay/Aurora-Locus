@@ -118,6 +118,21 @@ pub struct ThemeMetadata {
     pub metadata: serde_json::Value,
 }
 
+/// Per-theme WCAG 2.2 contrast certification result (#321). See
+/// [`ThemeRegistry::wcag_report`] for the AA/AAA criteria.
+#[derive(Debug, Clone)]
+pub struct ThemeWcag {
+    pub theme_id: String,
+    /// Meets the substrate's §11.10.3 gate (≥ WCAG 2.2 AA, stricter on body text).
+    pub aa: bool,
+    /// Every text-on-surface pair additionally clears 7:1 (WCAG 2.2 AAA, normal text).
+    pub aaa: bool,
+    /// The weakest contrast pair's ratio.
+    pub min_ratio: f64,
+    /// The weakest pair, as `"<fg-token> on <bg-token>"`.
+    pub min_pair: String,
+}
+
 /// The installed-theme registry, built once at startup.
 pub struct ThemeRegistry {
     records: Vec<ThemeRecord>,
@@ -198,6 +213,47 @@ impl ThemeRegistry {
     pub fn summary(&self) -> (usize, usize) {
         let valid = self.records.iter().filter(|r| r.valid).count();
         (self.records.len(), valid)
+    }
+
+    /// Per-theme WCAG 2.2 contrast certification over the resolved token maps
+    /// (#321), for every *valid* theme. `aa` = every §11.10.3 contrast pair
+    /// meets the substrate gate's threshold (≥ WCAG 2.2 AA throughout, and
+    /// stricter — 7:1 — on primary body text); this is exactly the step-9 gate,
+    /// so it holds for any theme the registry kept. `aaa` additionally requires
+    /// every text-on-surface pair to clear 7:1 (WCAG 2.2 1.4.6, normal text)
+    /// while UI-component pairs (focus ring, status dots) hold at their AA 3:1
+    /// floor — WCAG defines no AAA tier for non-text contrast. `min_ratio` is
+    /// the weakest pair, for the report line.
+    pub fn wcag_report(&self) -> Vec<ThemeWcag> {
+        // The resolver walks `extends` by id, so rebuild the id→theme map.
+        let by_id: HashMap<String, DiscoveredTheme> = self
+            .records
+            .iter()
+            .map(|r| (r.discovered.manifest.theme_id.clone(), r.discovered.clone()))
+            .collect();
+        self.records
+            .iter()
+            .filter(|r| r.valid)
+            .map(|r| {
+                let id = &r.discovered.manifest.theme_id;
+                let values = collect_declared_token_values(id, &by_id);
+                let pairs = contrast::report(&values);
+                let is_text = |p: &contrast::PairContrast| p.fg.starts_with("--color-text-");
+                let aa = pairs.iter().all(|p| p.ratio + 1e-3 >= p.required);
+                let aaa = pairs.iter().all(|p| {
+                    let need = if is_text(p) { 7.0 } else { p.required };
+                    p.ratio + 1e-3 >= need
+                });
+                let weakest = pairs
+                    .iter()
+                    .min_by(|a, b| a.ratio.partial_cmp(&b.ratio).unwrap_or(std::cmp::Ordering::Equal));
+                let (min_ratio, min_pair) = match weakest {
+                    Some(p) => (p.ratio, format!("{} on {}", p.fg, p.bg)),
+                    None => (0.0, String::new()),
+                };
+                ThemeWcag { theme_id: id.clone(), aa, aaa, min_ratio, min_pair }
+            })
+            .collect()
     }
 
     /// Resolve the active theme's token CSS: walk its `extends` chain
@@ -966,6 +1022,40 @@ mod tests {
             .expect("classic effects resolve");
         assert!(classic.contains(".heading-aurora"));
         assert!(classic.contains(".effect-focus-ring"), "inherits required focus-ring");
+    }
+
+    #[test]
+    fn wcag_certification_report() {
+        // #321 — programmatic WCAG 2.2 certification over the real bundled
+        // cohort. Every theme must clear the substrate's contrast gate (AA, and
+        // stricter on body text); the two high-contrast themes must additionally
+        // clear AAA (every text-on-surface pair ≥ 7:1). Prints the per-theme
+        // report; run with `-- --nocapture` to read it.
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
+        let reg = ThemeRegistry::build(&bundled, Path::new("/nonexistent/operator"));
+        let report = reg.wcag_report();
+        assert_eq!(report.len(), 10, "all ten themes certify");
+
+        eprintln!("\n=== WCAG 2.2 certification — bundled themes (#321) ===");
+        let mut sorted = report.clone();
+        sorted.sort_by(|a, b| a.theme_id.cmp(&b.theme_id));
+        for c in &sorted {
+            let tier = if c.aaa { "AAA" } else if c.aa { "AA " } else { "FAIL" };
+            eprintln!(
+                "  {:<20} {}  (weakest {:.2}:1 — {})",
+                c.theme_id, tier, c.min_ratio, c.min_pair
+            );
+        }
+
+        // AA across the whole cohort.
+        for c in &report {
+            assert!(c.aa, "{} fails WCAG 2.2 AA (weakest {:.2}:1)", c.theme_id, c.min_ratio);
+        }
+        // AAA for the two high-contrast themes specifically.
+        for id in ["high-contrast-dark", "high-contrast-light"] {
+            let c = report.iter().find(|c| c.theme_id == id).expect("HC theme certifies");
+            assert!(c.aaa, "{id} must clear WCAG 2.2 AAA (weakest {:.2}:1)", c.min_ratio);
+        }
     }
 
     #[test]

@@ -1081,6 +1081,20 @@ impl AppContext {
             let reg = crate::themes::ThemeRegistry::build(bundled_root, &operator_root);
             let (total, valid) = reg.summary();
             tracing::info!(total_themes = total, valid_themes = valid, "theme registry built");
+            // WCAG 2.2 certification record (#321): one structured line per
+            // valid theme. The operational audit trail of the accessibility
+            // claim — programmatic contrast only (not a focus-indicator /
+            // keyboard / screen-reader audit).
+            for c in reg.wcag_report() {
+                tracing::info!(
+                    theme = %c.theme_id,
+                    aa = c.aa,
+                    aaa = c.aaa,
+                    min_ratio = format_args!("{:.2}", c.min_ratio),
+                    weakest_pair = %c.min_pair,
+                    "theme wcag certification",
+                );
+            }
             Arc::new(reg)
         };
 
