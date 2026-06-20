@@ -8,6 +8,7 @@
   "themeAuthor": "Aurora-Locus",
   "themeDescription": "Subtle rainbow trim on dark base; Intersex-Inclusive Progress representation, year-round.",
   "files": {
-    "tokens": "tokens.css"
+    "tokens": "tokens.css",
+    "effects": "effects.css"
   }
 }

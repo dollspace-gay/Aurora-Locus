@@ -1,0 +1,141 @@
+/*
+ * pride — rainbow structural effects (v1). Extends dark.
+ *
+ * The identity claim made structural: the rainbow is the actual color of the
+ * UI's structural elements — card / panel / modal borders, button borders, the
+ * sidebar active-page indicator, major section dividers, and focus rings — plus
+ * one chrome motif (an Intersex-Inclusive Progress chevron in the sidebar
+ * header). The work surface (text, content, control interiors) is deliberately
+ * left alone so readability holds; rainbow never lands on body text or
+ * background surfaces.
+ *
+ * Everything is scoped under [data-theme="pride"] (set on <html> by the theme
+ * applier). That confines these rules to when Pride is active AND gives them
+ * the specificity to win over the base stylesheets, which load after the
+ * theme-served effects.css. Rounded rainbow borders use the
+ * padding-box/border-box double-background technique so corner radii survive.
+ *
+ * Effect classes and the token palette are inherited from the dark root and
+ * pride/tokens.css; this file is purely the rainbow layer.
+ */
+
+[data-theme="pride"] {
+  /* Standard 6-stripe Pride rainbow, as gradients reused below. The conic
+   * (--pride-angle is rotated on hover for the subtle button shift) wraps the
+   * rainbow around a border; the linear variants run a flag along a line. */
+  --pride-angle: 0deg;
+  --pride-rainbow: linear-gradient(90deg, #E40303, #FF8C00, #FFED00, #008026, #004CFF, #732982);
+  --pride-rainbow-vert: linear-gradient(180deg, #E40303, #FF8C00, #FFED00, #008026, #004CFF, #732982);
+  --pride-rainbow-ring: conic-gradient(from var(--pride-angle), #E40303, #FF8C00, #FFED00, #008026, #004CFF, #732982, #E40303);
+}
+
+/* ------------------------------------------------------------------ *
+ * 1. Card / panel / modal borders → rainbow gradient (corners preserved)
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] .settings-card,
+[data-theme="pride"] .modal {
+  border: 2px solid transparent;
+  background-image:
+    linear-gradient(var(--color-surface-secondary), var(--color-surface-secondary)),
+    var(--pride-rainbow-ring);
+  background-origin: border-box;
+  background-clip: padding-box, border-box;
+}
+
+/* ------------------------------------------------------------------ *
+ * 2. Button borders → rainbow; interior fill stays semantic. Hover rotates
+ *    the rainbow (a subtle shift) rather than recoloring the fill.
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] .btn-primary,
+[data-theme="pride"] .btn-secondary,
+[data-theme="pride"] .btn-danger,
+[data-theme="pride"] .btn-success {
+  border: 2px solid transparent;
+  background-origin: border-box;
+  background-clip: padding-box, border-box;
+}
+[data-theme="pride"] .btn-primary {
+  background-image: linear-gradient(var(--color-accent-primary), var(--color-accent-primary)), var(--pride-rainbow-ring);
+}
+[data-theme="pride"] .btn-secondary {
+  background-image: linear-gradient(transparent, transparent), var(--pride-rainbow-ring);
+}
+[data-theme="pride"] .btn-danger {
+  background-image: linear-gradient(var(--color-status-danger), var(--color-status-danger)), var(--pride-rainbow-ring);
+}
+[data-theme="pride"] .btn-success {
+  background-image: linear-gradient(var(--color-status-success), var(--color-status-success)), var(--pride-rainbow-ring);
+}
+[data-theme="pride"] .btn-primary:hover,
+[data-theme="pride"] .btn-secondary:hover,
+[data-theme="pride"] .btn-danger:hover,
+[data-theme="pride"] .btn-success:hover {
+  --pride-angle: 90deg;
+}
+
+/* ------------------------------------------------------------------ *
+ * 3. Sidebar active-page indicator → a rainbow left-edge bar + subtle tint,
+ *    replacing the solid accent fill.
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] .nav-item.active {
+  background: color-mix(in srgb, var(--color-accent-primary) 14%, transparent);
+  color: var(--sidebar-text);
+  position: relative;
+}
+[data-theme="pride"] .nav-item.active::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  width: 4px;
+  border-radius: 0 2px 2px 0;
+  background: var(--pride-rainbow-vert);
+}
+
+/* ------------------------------------------------------------------ *
+ * 4. Major section dividers → rainbow line. Within-section dividers (the
+ *    per-row hairlines in Installed Themes) stay neutral — not touched here.
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] .config-section-divider {
+  border: none;
+  height: 2px;
+  background: var(--pride-rainbow);
+}
+
+/* ------------------------------------------------------------------ *
+ * 5. Focus rings → tight concentric rainbow halo (≈3px), every focusable.
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] *:focus-visible,
+[data-theme="pride"] input:focus-visible,
+[data-theme="pride"] select:focus-visible,
+[data-theme="pride"] textarea:focus-visible,
+[data-theme="pride"] .effect-focus-ring:focus-visible {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  box-shadow:
+    0 0 0 0.5px #E40303,
+    0 0 0 1px #FF8C00,
+    0 0 0 1.5px #FFED00,
+    0 0 0 2px #008026,
+    0 0 0 2.5px #004CFF,
+    0 0 0 3px #732982;
+}
+
+/* ------------------------------------------------------------------ *
+ * 6. Progress chevron motif — a small Intersex-Inclusive Progress flag below
+ *    the wordmark in the sidebar header. Inline SVG data-URI so it stays
+ *    self-contained in this theme file (the served effects.css can't resolve a
+ *    relative asset path). Rainbow flag body + nested trans/brown/black chevron
+ *    + the intersex symbol (yellow ring on purple).
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] .logo::after {
+  content: "";
+  display: block;
+  width: 40px;
+  height: 24px;
+  margin-block-start: var(--space-2);
+  background-repeat: no-repeat;
+  background-size: contain;
+  border-radius: 2px;
+  background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 24'><rect width='40' height='4' y='0' fill='%23E40303'/><rect width='40' height='4' y='4' fill='%23FF8C00'/><rect width='40' height='4' y='8' fill='%23FFED00'/><rect width='40' height='4' y='12' fill='%23008026'/><rect width='40' height='4' y='16' fill='%23004CFF'/><rect width='40' height='4' y='20' fill='%23732982'/><g fill='none' stroke-width='2.4'><path d='M0,0 L10,12 L0,24' stroke='%235BCEFA'/><path d='M2.4,0 L12.4,12 L2.4,24' stroke='%23F5A9B8'/><path d='M4.8,0 L14.8,12 L4.8,24' stroke='%23FFFFFF'/><path d='M7.2,0 L17.2,12 L7.2,24' stroke='%23603814'/><path d='M9.6,0 L19.6,12 L9.6,24' stroke='%23000000'/></g><circle cx='3.4' cy='12' r='2.8' fill='%237902AA'/><circle cx='3.4' cy='12' r='2.8' fill='none' stroke='%23FFD800' stroke-width='1'/></svg>");
+}
