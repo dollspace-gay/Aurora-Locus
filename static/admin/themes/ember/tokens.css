@@ -1,0 +1,34 @@
+/*
+ * ember — token overrides. Extends dark.
+ *
+ * Warm reds and banked coal: dark warm-brown surfaces with a glowing ember
+ * accent. Designed for campfire warmth that doesn't strain over long
+ * moderation sessions — no fire-bright reds. Typography, sizing, motion, and
+ * the effect library are inherited from the dark root. Contrast is verified by
+ * the substrate WCAG gate.
+ */
+
+:root {
+  /* Surfaces — dark warm-brown, near-black */
+  --color-surface-primary: #1a1210;
+  --color-surface-secondary: #241915;
+  --color-surface-tertiary: #2e211b;
+  --color-surface-overlay: rgba(0, 0, 0, 0.6);
+
+  /* Text — warm off-whites on warm dark */
+  --color-text-primary: #f2e7e2;
+  --color-text-secondary: #c9b6ae;
+  --color-text-tertiary: #8f7d75;
+  --color-text-inverted: #160d0a;
+
+  /* Accent — banked-coal ember orange (glowing, not flame-bright) */
+  --color-accent-primary: #e3733f;
+  --color-accent-primary-hover: #ef8757;
+  --color-accent-primary-active: #cf6532;
+  --color-accent-secondary: #9c8079;
+
+  /* Borders — warm translucent hairlines */
+  --color-border-primary: rgba(255, 220, 200, 0.09);
+  --color-border-secondary: rgba(255, 220, 200, 0.05);
+  --color-border-focus: var(--color-accent-primary);
+}

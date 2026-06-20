@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "glacier",
+  "themeName": "Glacier",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "dark",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "Pale arctic blues and ice whites; airy and clinical.",
+  "files": {
+    "tokens": "tokens.css"
+  }
+}

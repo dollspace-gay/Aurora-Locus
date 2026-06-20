@@ -1,0 +1,37 @@
+/*
+ * pride — token overrides. Extends dark.
+ *
+ * A year-round shipping theme, not a Pride-month token. Dark violet base
+ * (cohesive with stack-classic's cyberpunk dark, and readable for sustained
+ * moderation work) with a single bright accent drawn from the
+ * Intersex-Inclusive Progress flag palette. The rainbow stays subtle — the work
+ * surface is monochrome-ish and readable; the rainbow application (focus rings,
+ * dividers, accent highlights, a chevron motif in chrome) lands in effects.css
+ * during iteration. Typography, sizing, motion, and the effect library are
+ * inherited from dark. Contrast is verified by the substrate WCAG gate.
+ */
+
+:root {
+  /* Surfaces — dark violet base */
+  --color-surface-primary: #15131c;
+  --color-surface-secondary: #1e1b29;
+  --color-surface-tertiary: #272336;
+  --color-surface-overlay: rgba(0, 0, 0, 0.6);
+
+  /* Text — light on dark violet */
+  --color-text-primary: #ece9f2;
+  --color-text-secondary: #b4afc2;
+  --color-text-tertiary: #847d96;
+  --color-text-inverted: #120f18;
+
+  /* Accent — a bright flag-pink (single accent; rainbow lives in chrome trim) */
+  --color-accent-primary: #f15fb0;
+  --color-accent-primary-hover: #f57cc0;
+  --color-accent-primary-active: #d94d99;
+  --color-accent-secondary: #8b84a6;
+
+  /* Borders — faint violet hairlines */
+  --color-border-primary: rgba(230, 220, 255, 0.09);
+  --color-border-secondary: rgba(230, 220, 255, 0.05);
+  --color-border-focus: var(--color-accent-primary);
+}

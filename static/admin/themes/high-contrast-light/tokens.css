@@ -1,0 +1,40 @@
+/*
+ * high-contrast-light — token overrides. Extends dark.
+ *
+ * Functional accessibility theme, light ambient: pure-white background,
+ * pure/near-black text, and a single deep-blue accent at maximum luminance
+ * differential against white. Every contrast-requiring pair is designed to
+ * clear WCAG 2.2 AAA (7:1 normal text). Typography, sizing, motion, and the
+ * effect library are inherited from dark.
+ */
+
+:root {
+  /* Surfaces — pure white, minimal elevation steps */
+  --color-surface-primary: #ffffff;
+  --color-surface-secondary: #f4f4f4;
+  --color-surface-tertiary: #e8e8e8;
+  --color-surface-overlay: rgba(0, 0, 0, 0.5);
+
+  /* Text — black / near-black, all pairs ≥ 7:1 */
+  --color-text-primary: #000000;
+  --color-text-secondary: #141414;
+  --color-text-tertiary: #2e2e2e;
+  --color-text-inverted: #ffffff;
+
+  /* Accent — deep blue, maximum differential against white */
+  --color-accent-primary: #0a3b8c;
+  --color-accent-primary-hover: #082f70;
+  --color-accent-primary-active: #06255a;
+  --color-accent-secondary: #2e2e2e;
+
+  /* Status — deep, high-differential against white */
+  --color-status-success: #086b2c;
+  --color-status-warning: #7a3d00;
+  --color-status-danger: #a3001a;
+  --color-status-info: #0a3b8c;
+
+  /* Borders — strongly visible (no faint hairlines in HC) */
+  --color-border-primary: rgba(0, 0, 0, 0.5);
+  --color-border-secondary: rgba(0, 0, 0, 0.3);
+  --color-border-focus: var(--color-accent-primary);
+}

@@ -944,20 +944,21 @@ mod tests {
     fn bundled_themes_all_validate() {
         // The shipped themes must enumerate and pass the full validation
         // contract (steps 1–9) against the real on-disk files — this is the
-        // accessibility/structure guard for the bundled palettes. Count is the
-        // post-merge baseline cohort (dark root + light + stack-classic);
-        // bumped as the showcase themes land.
+        // accessibility/structure guard for the bundled palettes. The full
+        // v0.9 cohort: dark root + light + stack-classic + the 7 showcase
+        // themes (ember, emerald, glacier, meridian, high-contrast-dark,
+        // high-contrast-light, pride).
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
         let reg = ThemeRegistry::build(&bundled, Path::new("/nonexistent/operator"));
         let (total, valid) = reg.summary();
-        assert_eq!(total, 3, "bundled themes enumerate");
+        assert_eq!(total, 10, "bundled themes enumerate");
         let invalid: Vec<_> = reg
             .list()
             .into_iter()
             .filter(|m| !m.valid)
             .map(|m| format!("{}: {:?}", m.theme_id, m.validation_errors))
             .collect();
-        assert_eq!(valid, 3, "all bundled themes valid; failures: {invalid:?}");
+        assert_eq!(valid, 10, "all bundled themes valid; failures: {invalid:?}");
 
         // The classic theme's gradient wordmark + resolved chain are present.
         let classic = reg

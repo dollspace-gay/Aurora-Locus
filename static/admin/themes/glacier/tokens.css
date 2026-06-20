@@ -1,0 +1,40 @@
+/*
+ * glacier — token overrides. Extends dark.
+ *
+ * Pale arctic blues and ice whites: a light theme with blue-tinted near-white
+ * surfaces and a cold steel-blue accent. Airy and clinical, but readable — not
+ * eyestrain-cold. Accents are dark so inverted (light) button text clears AA on
+ * fills, and status colors are deepened for legibility on pale surfaces.
+ * Typography, sizing, motion, and the effect library are inherited from dark.
+ */
+
+:root {
+  /* Surfaces — ice-white, blue-tinted */
+  --color-surface-primary: #f3f8fc;
+  --color-surface-secondary: #e6f0f7;
+  --color-surface-tertiary: #d8e6f1;
+  --color-surface-overlay: rgba(20, 40, 60, 0.4);
+
+  /* Text — cold dark on pale */
+  --color-text-primary: #132330;
+  --color-text-secondary: #38505f;
+  --color-text-tertiary: #5c7382;
+  --color-text-inverted: #f3f8fc;
+
+  /* Accent — cold steel-blue (dark, so light inverted text clears) */
+  --color-accent-primary: #2766a0;
+  --color-accent-primary-hover: #1f5489;
+  --color-accent-primary-active: #1a4773;
+  --color-accent-secondary: #5b7588;
+
+  /* Status — deepened for contrast on pale surfaces */
+  --color-status-success: #15803d;
+  --color-status-warning: #b45309;
+  --color-status-danger: #c81e1e;
+  --color-status-info: #1d5f96;
+
+  /* Borders — cold dark translucent hairlines */
+  --color-border-primary: rgba(20, 50, 80, 0.12);
+  --color-border-secondary: rgba(20, 50, 80, 0.06);
+  --color-border-focus: var(--color-accent-primary);
+}

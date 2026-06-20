@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "ember",
+  "themeName": "Ember",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "dark",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "Warm reds and banked coal; campfire warmth that doesn't strain over long sessions.",
+  "files": {
+    "tokens": "tokens.css"
+  }
+}

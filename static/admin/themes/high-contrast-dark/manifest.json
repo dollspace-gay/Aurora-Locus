@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "high-contrast-dark",
+  "themeName": "High Contrast Dark",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "dark",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "Maximum contrast on black.",
+  "files": {
+    "tokens": "tokens.css"
+  }
+}
