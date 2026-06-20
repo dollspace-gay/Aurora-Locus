@@ -1,37 +1,46 @@
 /*
  * pride — token overrides. Extends dark.
  *
- * A year-round shipping theme, not a Pride-month token. Dark violet base
- * (cohesive with stack-classic's cyberpunk dark, and readable for sustained
- * moderation work) with a single bright accent drawn from the
- * Intersex-Inclusive Progress flag palette. The rainbow stays subtle — the work
- * surface is monochrome-ish and readable; the rainbow application (focus rings,
- * dividers, accent highlights, a chevron motif in chrome) lands in effects.css
- * during iteration. Typography, sizing, motion, and the effect library are
- * inherited from dark. Contrast is verified by the substrate WCAG gate.
+ * A year-round shipping theme, not a Pride-month token. A LIGHT warm-tinted
+ * base — differentiated from stack-classic's cyberpunk dark, and a brighter
+ * canvas for the structural rainbow (pride/effects.css) to pop against. Warm
+ * off-white surfaces in three elevations, warm-neutral dark text, a deep
+ * flag-pink accent tuned so white button text clears AA on the pink hover fill,
+ * and a status palette redone for light surfaces. Typography, sizing, motion,
+ * and the effect library are inherited from dark; the rainbow + the
+ * Intersex-Inclusive Progress chevron live in effects.css. Contrast is verified
+ * by the substrate WCAG gate.
  */
 
 :root {
-  /* Surfaces — dark violet base */
-  --color-surface-primary: #15131c;
-  --color-surface-secondary: #1e1b29;
-  --color-surface-tertiary: #272336;
-  --color-surface-overlay: rgba(0, 0, 0, 0.6);
+  /* Surfaces — warm-tinted off-white, lightest → deepest by elevation */
+  --color-surface-primary: #faf7f4;
+  --color-surface-secondary: #f5f1ec;
+  --color-surface-tertiary: #efe9e1;
+  --color-surface-overlay: rgba(40, 30, 20, 0.4);
 
-  /* Text — light on dark violet */
-  --color-text-primary: #ece9f2;
-  --color-text-secondary: #b4afc2;
-  --color-text-tertiary: #847d96;
-  --color-text-inverted: #120f18;
+  /* Text — warm-neutral dark on warm off-white */
+  --color-text-primary: #2a2520;
+  --color-text-secondary: #5c5048;
+  --color-text-tertiary: #8a7e72;
+  --color-text-inverted: #ffffff;
 
-  /* Accent — a bright flag-pink (single accent; rainbow lives in chrome trim) */
-  --color-accent-primary: #f15fb0;
-  --color-accent-primary-hover: #f57cc0;
-  --color-accent-primary-active: #d94d99;
-  --color-accent-secondary: #8b84a6;
+  /* Accent — deep flag-pink: white button text clears AA on the pink hover
+   * fill, and the accent (= border-focus) clears 3:1 on the light surfaces. */
+  --color-accent-primary: #cc1b6b;
+  --color-accent-primary-hover: #d9237a;
+  --color-accent-primary-active: #a8155a;
+  --color-accent-secondary: #8a7e72;
 
-  /* Borders — faint violet hairlines */
-  --color-border-primary: rgba(230, 220, 255, 0.09);
-  --color-border-secondary: rgba(230, 220, 255, 0.05);
+  /* Status — redone for light surfaces (the inherited dark-mode palette is too
+   * light to clear contrast on near-white). */
+  --color-status-success: #1f7a3f;
+  --color-status-warning: #b8730f;
+  --color-status-danger: #c41e3a;
+  --color-status-info: #1b5394;
+
+  /* Borders — subtle warm-gray hairlines (rainbow borders are in effects.css) */
+  --color-border-primary: rgba(40, 30, 20, 0.12);
+  --color-border-secondary: rgba(40, 30, 20, 0.06);
   --color-border-focus: var(--color-accent-primary);
 }

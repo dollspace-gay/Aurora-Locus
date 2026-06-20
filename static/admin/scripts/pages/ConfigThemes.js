@@ -27,7 +27,7 @@
   // wire shape, so they are derived here for the bundled cohort. An
   // operator-installed theme (a future release) would declare its mode in the
   // manifest; until then this set classifies the four light bundled themes.
-  const LIGHT_THEMES = { light: 1, glacier: 1, meridian: 1, 'high-contrast-light': 1 };
+  const LIGHT_THEMES = { light: 1, glacier: 1, meridian: 1, 'high-contrast-light': 1, pride: 1 };
   function themeMode(id) { return LIGHT_THEMES[id] ? 'Light' : 'Dark'; }
   function isAAA(id) { return id.indexOf('high-contrast-') === 0; }
 

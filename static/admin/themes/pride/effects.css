@@ -54,8 +54,28 @@
   background-origin: border-box;
   background-clip: padding-box, border-box;
 }
+/* Primary action buttons (light base): white (lightest-surface) fill + dark
+ * text at rest; the flag-pink moves to the hover state and the text flips to
+ * white. Active deepens the pink; disabled is a muted gray-tint with a neutral
+ * border (no rainbow). The rainbow border + its hover rotation are unchanged. */
 [data-theme="pride"] .btn-primary {
+  background-image: linear-gradient(var(--color-surface-primary), var(--color-surface-primary)), var(--pride-rainbow-ring);
+  color: var(--color-text-primary);
+}
+[data-theme="pride"] .btn-primary:hover {
   background-image: linear-gradient(var(--color-accent-primary), var(--color-accent-primary)), var(--pride-rainbow-ring);
+  color: var(--color-text-inverted);
+}
+[data-theme="pride"] .btn-primary:active {
+  background-image: linear-gradient(var(--color-accent-primary-active), var(--color-accent-primary-active)), var(--pride-rainbow-ring);
+  color: var(--color-text-inverted);
+}
+[data-theme="pride"] .btn-primary:disabled,
+[data-theme="pride"] .btn-primary[disabled] {
+  background-image: none;
+  background-color: var(--color-surface-tertiary);
+  border-color: var(--color-border-primary);
+  color: var(--color-text-tertiary);
 }
 [data-theme="pride"] .btn-secondary {
   background-image: linear-gradient(transparent, transparent), var(--pride-rainbow-ring);

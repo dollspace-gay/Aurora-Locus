@@ -6,7 +6,7 @@
   "substrateVersion": "1.0",
   "extends": "dark",
   "themeAuthor": "Aurora-Locus",
-  "themeDescription": "Subtle rainbow trim on dark base; Intersex-Inclusive Progress representation, year-round.",
+  "themeDescription": "Light warm-tinted base with structural rainbow on borders, dividers, and focus; Intersex-Inclusive Progress representation, year-round.",
   "files": {
     "tokens": "tokens.css",
     "effects": "effects.css"
