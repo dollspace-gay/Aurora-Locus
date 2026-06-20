@@ -708,6 +708,17 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(revoke_role),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // v0.9 (#329) — upload a login-splash branding asset (logo/banner)
+        // directly; writes it under <data>/branding/ and repoints the
+        // branding.login-* runtime setting. Raw-body upload (uploadBlob idiom).
+        // Raise the body limit to cover the 5MB banner (axum defaults to 2MB);
+        // the handler enforces the precise per-asset cap (1MB logo / 5MB banner).
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.uploadBrandingAsset",
+            post(crate::api::aurora_admin::upload_branding_asset)
+                .layer(axum::extract::DefaultBodyLimit::max(6 * 1024 * 1024)),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // Repository rebuild preflight (§7.4.1 / #286) — non-destructive read.
         .route_with_caps(
             "/xrpc/tools.aurora.superadmin.preRebuildCheck",
@@ -9130,6 +9141,7 @@ mod tests {
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
+            r#""uploadBrandingAsset","#,
             r#""preRebuildCheck","#,
             r#""rebuildRepo","#,
             r#""getRebuildProgress","#,

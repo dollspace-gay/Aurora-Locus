@@ -11,6 +11,36 @@
     return global.AuroraSourceTier.suffix(source);
   }
 
+  // Branding assets (#329): the runtime key, per-type size cap, and accepted
+  // upload types for each login-splash asset.
+  const BRANDING = {
+    logo: { key: 'branding.login-logo-url', max: 1048576, label: '1MB' },
+    banner: { key: 'branding.login-banner-image-url', max: 5242880, label: '5MB' },
+  };
+  const BRANDING_ACCEPT = 'image/png,image/jpeg,image/svg+xml,image/webp';
+
+  function esc(s) {
+    return global.AuroraDom ? global.AuroraDom.esc(s) : String(s);
+  }
+
+  // One compound asset group: file upload + URL field + clear, with a preview
+  // thumbnail and a status line. The URL field keeps the id `branding-<type>`
+  // so the "Save URLs" flow reads it.
+  function brandingAsset(type, label, placeholder) {
+    return '<div class="branding-asset" data-asset="' + type + '">' +
+      '  <div class="branding-asset-label">' + esc(label) + '</div>' +
+      '  <div class="branding-controls">' +
+      '    <input type="file" class="branding-file" data-asset="' + type + '" accept="' + BRANDING_ACCEPT + '">' +
+      '    <input type="text" class="branding-url" id="branding-' + type + '" placeholder="' + esc(placeholder) + '">' +
+      '    <button type="button" class="btn-secondary btn-sm branding-clear" data-asset="' + type + '">Clear</button>' +
+      '  </div>' +
+      '  <div class="branding-row2">' +
+      '    <img class="branding-thumb" data-asset="' + type + '" alt="" hidden>' +
+      '    <span class="branding-status" data-asset="' + type + '"></span>' +
+      '  </div>' +
+      '</div>';
+  }
+
   async function mount({ container }) {
     const session = global.AuroraSession;
     const isSuper = session && session.hasRole('superadmin');
@@ -51,14 +81,10 @@
         '<hr class="config-section-divider">' +
         '<section class="branding-section">' +
         '  <h3>Branding</h3>' +
-        '  <p class="settings-help">Customize the login splash imagery (deployment-wide). Host an asset under <code>static/branding/</code> and reference <code>/static/branding/&lt;file&gt;</code>, or use any external URL.</p>' +
-        '  <label class="branding-field">Login logo URL' +
-        '    <input type="text" id="branding-logo" placeholder="/static/branding/logo.png">' +
-        '  </label>' +
-        '  <label class="branding-field">Login banner image URL' +
-        '    <input type="text" id="branding-banner" placeholder="https://your-cdn.example/banner.png">' +
-        '  </label>' +
-        '  <button type="button" class="btn-primary" id="branding-save">Save branding</button>' +
+        '  <p class="settings-help">Customize the login splash imagery (deployment-wide). Upload an image, or paste a URL (host it under <code>static/branding/</code> and reference <code>/static/branding/&lt;file&gt;</code>, or any external URL).</p>' +
+        brandingAsset('logo', 'Login logo', '/static/branding/logo.png') +
+        brandingAsset('banner', 'Login banner image', 'https://your-cdn.example/banner.png') +
+        '  <button type="button" class="btn-primary" id="branding-save">Save URLs</button>' +
         '</section>'
         : '') +
       // Installed Themes — folded in from the former standalone Themes page
@@ -97,43 +123,137 @@
     return {};
   }
 
-  // Load the current login-branding URLs into the section's inputs and wire the
-  // save button (SuperAdmin-only section).
+  // Load the current branding URLs into each asset group's URL field +
+  // preview, and wire the file uploads, clear buttons, and save (SuperAdmin
+  // section).
   async function loadBranding() {
     const ep = global.AuroraEndpoints;
-    const logoEl = document.getElementById('branding-logo');
-    const bannerEl = document.getElementById('branding-banner');
-    if (!ep || !logoEl || !bannerEl) return;
-    try {
-      const d = await ep.admin.getRuntimeSetting('branding.login-logo-url');
-      if (d && typeof d.value === 'string') logoEl.value = d.value;
-    } catch (e) { /* leave blank */ }
-    try {
-      const d = await ep.admin.getRuntimeSetting('branding.login-banner-image-url');
-      if (d && typeof d.value === 'string') bannerEl.value = d.value;
-    } catch (e) { /* leave blank */ }
+    if (!ep) return;
+    for (const type of ['logo', 'banner']) {
+      try {
+        const d = await ep.admin.getRuntimeSetting(BRANDING[type].key);
+        const val = (d && typeof d.value === 'string') ? d.value : '';
+        const urlEl = document.getElementById('branding-' + type);
+        if (urlEl) urlEl.value = val;
+        setPreview(type, val);
+      } catch (e) { /* leave blank */ }
+    }
+    document.querySelectorAll('.branding-file').forEach((el) => {
+      el.addEventListener('change', () => onUpload(el.dataset.asset, el.files && el.files[0]));
+    });
+    document.querySelectorAll('.branding-clear').forEach((el) => {
+      el.addEventListener('click', () => onClear(el.dataset.asset));
+    });
     const btn = document.getElementById('branding-save');
     if (btn) btn.addEventListener('click', saveBranding);
   }
 
-  // Save both branding URLs deployment-wide. Cosmetic (light confirm, no typed
-  // rationale) like the theme deployment-default save (#308), but still lands an
-  // audit-chain entry per setting via the auto-filled rationale.
+  function setPreview(type, url) {
+    const img = document.querySelector('.branding-thumb[data-asset="' + type + '"]');
+    if (!img) return;
+    if (url) { img.src = url; img.hidden = false; }
+    else { img.removeAttribute('src'); img.hidden = true; }
+  }
+
+  function setStatus(type, msg, isError) {
+    const el = document.querySelector('.branding-status[data-asset="' + type + '"]');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.classList.toggle('is-error', !!isError);
+  }
+
+  // Upload a chosen file directly to the substrate (raw body + assetType query,
+  // matching the XRPC's uploadBlob-style contract). The substrate writes it,
+  // repoints the runtime setting, and audits — so on success we just reflect
+  // the served URL into the field + preview (no separate save).
+  async function onUpload(type, file) {
+    if (!file || !BRANDING[type]) return;
+    const spec = BRANDING[type];
+    if (BRANDING_ACCEPT.split(',').indexOf(file.type) === -1) {
+      setStatus(type, 'Unsupported type — use PNG, JPEG, SVG, or WebP.', true);
+      return;
+    }
+    if (file.size > spec.max) {
+      setStatus(type, 'Too large — max ' + spec.label + '.', true);
+      return;
+    }
+    setStatus(type, 'Uploading…', false);
+    try {
+      const token = global.AuroraSession
+        ? global.AuroraSession.token()
+        : localStorage.getItem('aurora-admin-token');
+      const qs = '?assetType=' + encodeURIComponent(type) +
+        '&rationale=' + encodeURIComponent('branding upload: ' + type);
+      const res = await fetch('/xrpc/tools.aurora.superadmin.uploadBrandingAsset' + qs, {
+        method: 'POST',
+        headers: { 'Content-Type': file.type, Authorization: 'Bearer ' + (token || '') },
+        body: file,
+      });
+      if (!res.ok) {
+        let msg = 'Upload failed (' + res.status + ')';
+        try { const j = await res.json(); if (j && j.message) msg = j.message; } catch (e) { /* non-JSON */ }
+        setStatus(type, msg, true);
+        return;
+      }
+      const data = await res.json();
+      const urlEl = document.getElementById('branding-' + type);
+      if (urlEl) urlEl.value = data.url || '';
+      setPreview(type, data.url || '');
+      setStatus(type, 'Uploaded.', false);
+      if (global.AuroraToast) {
+        global.AuroraToast.success('Login ' + type + ' uploaded.', data.auditEntryId ? {
+          action: { label: 'View audit entry', href: '#mod/audit/' + encodeURIComponent(data.auditEntryId) },
+        } : undefined);
+      }
+    } catch (e) {
+      setStatus(type, 'Upload failed: ' + (e && e.message ? e.message : ''), true);
+    }
+  }
+
+  // Clear one asset — revert its runtime setting to empty (login reverts to the
+  // theme default). Cosmetic-but-audited, like the URL save.
+  async function onClear(type) {
+    if (!BRANDING[type]) return;
+    const r = await global.AuroraAuditedSave.run({
+      heading: 'Clear login ' + type,
+      body: 'Clear the login ' + type + '? The login page reverts to the theme default (no custom ' + type + ').',
+      confirmLabel: 'Clear',
+      cosmetic: true,
+      autoRationale: 'cosmetic setting: login branding ' + type + ' cleared',
+      settings: [{ key: BRANDING[type].key, value: '' }],
+      successMessage: 'Login ' + type + ' cleared.',
+    });
+    if (r && r.saved) {
+      const urlEl = document.getElementById('branding-' + type);
+      if (urlEl) urlEl.value = '';
+      setPreview(type, '');
+      setStatus(type, '', false);
+    }
+  }
+
+  // Save both branding URLs (manual URL entry) deployment-wide. Cosmetic (light
+  // confirm, no typed rationale) like the theme deployment-default save (#308),
+  // but still lands an audit-chain entry per setting via the auto-filled
+  // rationale.
   async function saveBranding() {
     const logo = document.getElementById('branding-logo').value.trim();
     const banner = document.getElementById('branding-banner').value.trim();
-    await global.AuroraAuditedSave.run({
+    const r = await global.AuroraAuditedSave.run({
       heading: 'Save login branding',
       body: 'Update the login splash logo and banner? This is deployment-wide — every operator sees it on the login page.',
       confirmLabel: 'Save branding',
       cosmetic: true,
       autoRationale: 'cosmetic setting: login branding URLs updated',
       settings: [
-        { key: 'branding.login-logo-url', value: logo },
-        { key: 'branding.login-banner-image-url', value: banner },
+        { key: BRANDING.logo.key, value: logo },
+        { key: BRANDING.banner.key, value: banner },
       ],
       successMessage: 'Login branding saved.',
     });
+    if (r && r.saved) {
+      setPreview('logo', logo);
+      setPreview('banner', banner);
+    }
   }
 
   async function loadModerationMode() {

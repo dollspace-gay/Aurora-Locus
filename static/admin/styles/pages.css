@@ -288,26 +288,58 @@
 .installed-themes-section > h3 {
   margin-block: 0 var(--space-3);
 }
-/* Branding section (UI & modes) — login-splash URL fields (#328). */
+/* Branding section (UI & modes) — login-splash assets: upload + URL + clear +
+ * preview per asset (#328 URL fields, #329 upload). */
 .branding-section > h3 {
   margin-block: 0 var(--space-2);
 }
-.branding-field {
-  display: block;
-  margin-block: var(--space-3);
+.branding-asset {
+  margin-block: var(--space-4);
+}
+.branding-asset-label {
   font-weight: var(--font-weight-medium);
   color: var(--color-text-primary);
+  margin-block-end: var(--space-1);
 }
-.branding-field input {
-  display: block;
-  width: 100%;
-  margin-block-start: var(--space-1);
+.branding-controls {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+.branding-controls .branding-url {
+  flex: 1;
+  min-width: 220px;
   padding: var(--space-2) var(--space-3);
   background: var(--color-surface-primary);
   color: var(--color-text-primary);
   border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
-  font-weight: var(--font-weight-normal);
+}
+.branding-controls .branding-file {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+.branding-row2 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-block-start: var(--space-2);
+  min-height: var(--space-4);
+}
+.branding-thumb {
+  max-height: 48px;
+  max-width: 160px;
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-tertiary);
+}
+.branding-status {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+.branding-status.is-error {
+  color: var(--color-status-danger);
 }
 .theme-validation-errors {
   margin: 0;

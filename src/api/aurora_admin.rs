@@ -4285,49 +4285,9 @@ pub async fn set_runtime_setting(
     } else {
         default_for_key(&input.key)
     };
-    let now = chrono::Utc::now().to_rfc3339();
-    let value_json =
-        serde_json::to_string(&input.value).map_err(internal)?;
-
-    // LB-1 Session 12 / chainlink #129: runtime_settings upsert +
-    // chain entry in one transaction. Upsert uses DELETE then INSERT
-    // for cross-backend portability — sqlx ON CONFLICT syntax differs
-    // between SQLite and Postgres.
-    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
-    sqlx::query("DELETE FROM runtime_settings WHERE key = $1")
-        .bind(&input.key)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal)?;
-    sqlx::query(
-        "INSERT INTO runtime_settings (key, value, last_modified, last_modified_by) \
-         VALUES ($1, $2, $3, $4)",
-    )
-    .bind(&input.key)
-    .bind(&value_json)
-    .bind(&now)
-    .bind(&auth.did)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal)?;
-    let audit_entry_id = audit_chain::insert_chain_entry(
-        &mut tx,
-        ctx.config.database.backend,
-        AppendEntryParams {
-            actor_did: &auth.did,
-            action: "SetRuntimeSetting",
-            subject: None,
-            rationale: &format!("{} → {}: {}", input.key, value_json, input.rationale),
-            snapshot_id: None,
-            event_id: None,
-            cascade_subjects: &[],
-            cascade_snapshot_ids: &[],
-        },
-    )
-    .await
-    .map_err(internal_pds)?;
-    tx.commit().await.map_err(internal)?;
+    let audit_entry_id =
+        write_runtime_setting_audited(&ctx, &input.key, &input.value, &auth.did, &input.rationale)
+            .await?;
 
     // v0.9 Arc D (#223) — propagate a cadence change to the live
     // aurora-locus-standard rotation oracle, so it takes effect on the next
@@ -4347,6 +4307,225 @@ pub async fn set_runtime_setting(
         new_value: input.value,
         audit_entry_id: audit_entry_id.to_string(),
     }))
+}
+
+/// Upsert a runtime setting and its audit-chain entry in one transaction,
+/// returning the chain entry id. Shared by [`set_runtime_setting`] and the
+/// branding-upload handler so both land an identical audit trail (rationale
+/// recorded as `key → value: rationale`). Upsert is DELETE-then-INSERT for
+/// cross-backend portability (#129).
+async fn write_runtime_setting_audited(
+    ctx: &AppContext,
+    key: &str,
+    value: &serde_json::Value,
+    actor_did: &str,
+    rationale: &str,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let value_json = serde_json::to_string(value).map_err(internal)?;
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    sqlx::query("DELETE FROM runtime_settings WHERE key = $1")
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    sqlx::query(
+        "INSERT INTO runtime_settings (key, value, last_modified, last_modified_by) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(key)
+    .bind(&value_json)
+    .bind(&now)
+    .bind(actor_did)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            actor_did,
+            action: "SetRuntimeSetting",
+            subject: None,
+            rationale: &format!("{} → {}: {}", key, value_json, rationale),
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(audit_entry_id)
+}
+
+/// Query params for `uploadBrandingAsset`: which asset, + an optional rationale.
+#[derive(serde::Deserialize)]
+pub struct UploadBrandingParams {
+    pub asset_type: String,
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
+/// Accepted image Content-Type → canonical file extension; `None` outside the
+/// whitelist (PNG / JPEG / SVG / WebP).
+fn branding_ext_for_content_type(ct: &str) -> Option<&'static str> {
+    match ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/svg+xml" => Some("svg"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// Content-Type for a stored branding file, from its extension.
+fn branding_content_type_for_filename(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// `tools.aurora.superadmin.uploadBrandingAsset` — upload a login-splash logo
+/// or banner directly (v0.9), so operators needn't host the asset themselves.
+/// SuperAdmin only. The raw file is the request body (matching `uploadBlob`'s
+/// idiom — no multipart); `assetType` (`logo`|`banner`) and an optional
+/// `rationale` are query params; the extension comes from Content-Type. The
+/// file is written atomically to `<data>/branding/<asset>.<ext>` (overwriting
+/// any prior asset of that type, including a different extension), the matching
+/// `branding.login-*` runtime setting is repointed to `/branding/<file>`, and
+/// an audit-chain entry is emitted. Returns the served URL, the runtime-setting
+/// key, and the audit entry id.
+pub async fn upload_branding_asset(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UploadBrandingParams>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "uploadBrandingAsset requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    let (key, base, max_bytes) = match params.asset_type.as_str() {
+        "logo" => (BRANDING_LOGIN_LOGO_KEY, "logo", 1_048_576usize),
+        "banner" => (BRANDING_LOGIN_BANNER_KEY, "banner", 5_242_880usize),
+        _ => return Err(validation("assetType must be 'logo' or 'banner'")),
+    };
+    if body.is_empty() {
+        return Err(validation("uploaded file is empty"));
+    }
+    if body.len() > max_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "PayloadTooLarge",
+                "message": format!("{base} must be at most {max_bytes} bytes"),
+            })),
+        ));
+    }
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let ext = branding_ext_for_content_type(content_type)
+        .ok_or_else(|| validation("unsupported image type; accepted: PNG, JPEG, SVG, WebP"))?;
+
+    let dir = ctx.config.storage.data_directory.join("branding");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| internal(format!("could not create branding dir: {e}")))?;
+    let filename = format!("{base}.{ext}");
+    // Atomic write: temp then rename, so a concurrent serve never sees a
+    // partial file.
+    let tmp_path = dir.join(format!("{base}.{ext}.tmp"));
+    let final_path = dir.join(&filename);
+    tokio::fs::write(&tmp_path, &body)
+        .await
+        .map_err(|e| internal(format!("could not stage branding asset: {e}")))?;
+    tokio::fs::rename(&tmp_path, &final_path)
+        .await
+        .map_err(|e| internal(format!("could not finalize branding asset: {e}")))?;
+    // Remove any prior asset of this type with a different extension, so only
+    // one logo / banner file exists and the runtime pointer is unambiguous.
+    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+        let prefix = format!("{base}.");
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && name != filename {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+
+    let url = format!("/branding/{filename}");
+    let rationale = params
+        .rationale
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("branding upload");
+    let value = serde_json::Value::String(url.clone());
+    let audit_entry_id =
+        write_runtime_setting_audited(&ctx, key, &value, &auth.did, rationale).await?;
+
+    Ok(Json(serde_json::json!({
+        "url": url,
+        "runtimeSetting": key,
+        "auditEntryId": audit_entry_id.to_string(),
+    })))
+}
+
+/// `GET /branding/<filename>` — serve an uploaded branding asset from
+/// `<data>/branding/`. Public (the pre-auth login page fetches it). The
+/// filename is constrained to a bare name (no separators / `..`) so it can't
+/// escape the directory; Content-Type is derived from the extension. 404 when
+/// the file is absent (nothing uploaded / cleared).
+pub async fn serve_branding_asset(
+    State(ctx): State<AppContext>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+    {
+        return (StatusCode::BAD_REQUEST, "invalid filename").into_response();
+    }
+    let path = ctx
+        .config
+        .storage
+        .data_directory
+        .join("branding")
+        .join(&filename);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                branding_content_type_for_filename(&filename),
+            )],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
 }
 
 // ===========================================================================
@@ -7872,6 +8051,181 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(audit_count, 1);
+    }
+
+    // ---- uploadBrandingAsset / serve_branding_asset (#329) ----
+
+    fn png_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::CONTENT_TYPE, "image/png".parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn upload_branding_writes_file_setting_and_audit() {
+        let ctx = create_test_context().await;
+        let bytes = axum::body::Bytes::from(vec![7u8; 256]);
+        let resp = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            png_headers(),
+            axum::extract::Query(UploadBrandingParams {
+                asset_type: "logo".to_string(),
+                rationale: Some("new wordmark".to_string()),
+            }),
+            bytes,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp["url"], "/branding/logo.png");
+        assert_eq!(resp["runtimeSetting"], BRANDING_LOGIN_LOGO_KEY);
+        assert!(resp["auditEntryId"].as_str().is_some_and(|s| !s.is_empty()));
+
+        // File on disk.
+        let path = ctx.config.storage.data_directory.join("branding").join("logo.png");
+        let on_disk = tokio::fs::read(&path).await.expect("logo written");
+        assert_eq!(on_disk, vec![7u8; 256]);
+
+        // Runtime setting repointed.
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM runtime_settings WHERE key = $1")
+                .bind(BRANDING_LOGIN_LOGO_KEY)
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(stored, "\"/branding/logo.png\"");
+
+        // Audit-chain entry landed.
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1",
+        )
+        .bind("SetRuntimeSetting")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 1);
+    }
+
+    #[tokio::test]
+    async fn upload_branding_overwrites_other_extension() {
+        let ctx = create_test_context().await;
+        // First a PNG logo, then an SVG logo — only logo.svg should remain.
+        let _ = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            png_headers(),
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            axum::body::Bytes::from(vec![1u8; 16]),
+        )
+        .await
+        .unwrap();
+        let mut svg_headers = axum::http::HeaderMap::new();
+        svg_headers.insert(axum::http::header::CONTENT_TYPE, "image/svg+xml".parse().unwrap());
+        let resp = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            svg_headers,
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            axum::body::Bytes::from(vec![2u8; 16]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp["url"], "/branding/logo.svg");
+        let dir = ctx.config.storage.data_directory.join("branding");
+        assert!(tokio::fs::metadata(dir.join("logo.svg")).await.is_ok());
+        assert!(tokio::fs::metadata(dir.join("logo.png")).await.is_err(), "old png removed");
+    }
+
+    #[tokio::test]
+    async fn upload_branding_rejects_oversized() {
+        let ctx = create_test_context().await;
+        // 1MB + 1 byte exceeds the logo cap.
+        let bytes = axum::body::Bytes::from(vec![0u8; 1_048_577]);
+        let err = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            png_headers(),
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            bytes,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn upload_branding_rejects_unknown_format() {
+        let ctx = create_test_context().await;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+        let err = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            headers,
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            axum::body::Bytes::from(vec![0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn upload_branding_requires_superadmin() {
+        let ctx = create_test_context().await;
+        let err = upload_branding_asset(
+            State(ctx.clone()),
+            admin_auth(),
+            png_headers(),
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            axum::body::Bytes::from(vec![0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn serve_branding_asset_serves_uploaded_and_404s_missing() {
+        let ctx = create_test_context().await;
+        // Missing → 404.
+        let resp = serve_branding_asset(
+            State(ctx.clone()),
+            axum::extract::Path("logo.png".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Path traversal → 400.
+        let resp = serve_branding_asset(
+            State(ctx.clone()),
+            axum::extract::Path("../secret".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // After upload → 200 + the exact bytes + image content-type.
+        let _ = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            png_headers(),
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            axum::body::Bytes::from(vec![9u8; 64]),
+        )
+        .await
+        .unwrap();
+        let resp = serve_branding_asset(
+            State(ctx.clone()),
+            axum::extract::Path("logo.png".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "image/png",
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], &vec![9u8; 64][..]);
     }
 
     #[tokio::test]

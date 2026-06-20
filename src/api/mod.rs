@@ -91,6 +91,12 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
             "/theme/login-branding",
             axum::routing::get(crate::api::aurora_admin::serve_login_branding),
         )
+        // v0.9 (#329) — serve uploaded branding assets from <data>/branding/.
+        // Public (the pre-auth login page fetches the logo/banner by URL).
+        .route(
+            "/branding/:filename",
+            axum::routing::get(crate::api::aurora_admin::serve_branding_asset),
+        )
         .merge(sync::routes())
         .merge(firehose::routes())
         .merge(labels::routes())
