@@ -1,13 +1,13 @@
 /*
- * pride — rainbow structural effects (v1). Extends dark.
+ * pride — rainbow structural effects. Extends dark.
  *
  * The identity claim made structural: the rainbow is the actual color of the
- * UI's structural elements — card / panel / modal borders, button borders, the
- * sidebar active-page indicator, major section dividers, and focus rings — plus
- * one chrome motif (an Intersex-Inclusive Progress chevron in the sidebar
- * header). The work surface (text, content, control interiors) is deliberately
- * left alone so readability holds; rainbow never lands on body text or
- * background surfaces.
+ * UI's structural elements — card / panel / modal borders, button borders
+ * (with a random rainbow fill per hover), the sidebar active-page indicator,
+ * major section dividers, and focus rings. The work surface (text, content,
+ * control interiors) is deliberately left alone so readability holds; rainbow
+ * never lands on body text or background surfaces. The rainbow structural
+ * color carries the identity on its own — no separate chrome motif.
  *
  * Everything is scoped under [data-theme="pride"] (set on <html> by the theme
  * applier). That confines these rules to when Pride is active AND gives them
@@ -55,20 +55,11 @@
   background-clip: padding-box, border-box;
 }
 /* Primary action buttons (light base): white (lightest-surface) fill + dark
- * text at rest; the flag-pink moves to the hover state and the text flips to
- * white. Active deepens the pink; disabled is a muted gray-tint with a neutral
- * border (no rainbow). The rainbow border + its hover rotation are unchanged. */
+ * text at rest. The hover fill/text come from the random-rainbow rule below;
+ * disabled is a muted gray-tint with a neutral border (no rainbow). */
 [data-theme="pride"] .btn-primary {
   background-image: linear-gradient(var(--color-surface-primary), var(--color-surface-primary)), var(--pride-rainbow-ring);
   color: var(--color-text-primary);
-}
-[data-theme="pride"] .btn-primary:hover {
-  background-image: linear-gradient(var(--color-accent-primary), var(--color-accent-primary)), var(--pride-rainbow-ring);
-  color: var(--color-text-inverted);
-}
-[data-theme="pride"] .btn-primary:active {
-  background-image: linear-gradient(var(--color-accent-primary-active), var(--color-accent-primary-active)), var(--pride-rainbow-ring);
-  color: var(--color-text-inverted);
 }
 [data-theme="pride"] .btn-primary:disabled,
 [data-theme="pride"] .btn-primary[disabled] {
@@ -86,11 +77,26 @@
 [data-theme="pride"] .btn-success {
   background-image: linear-gradient(var(--color-status-success), var(--color-status-success)), var(--pride-rainbow-ring);
 }
+/* Random rainbow hover (#325): every action button takes a random 6-stripe
+ * rainbow color as its interior fill on hover, with the AA-paired text color —
+ * both set per-hover by the pride-gated shim (PrideHover.js), since CSS cannot
+ * randomize. The rainbow border stays and its angle rotates. The fallbacks (no
+ * pointer, or JS disabled) keep the flag-pink fill + inverted text. */
 [data-theme="pride"] .btn-primary:hover,
 [data-theme="pride"] .btn-secondary:hover,
 [data-theme="pride"] .btn-danger:hover,
 [data-theme="pride"] .btn-success:hover {
   --pride-angle: 90deg;
+  background-image:
+    linear-gradient(var(--pride-hover-fill, var(--color-accent-primary)), var(--pride-hover-fill, var(--color-accent-primary))),
+    var(--pride-rainbow-ring);
+  color: var(--pride-hover-text, var(--color-text-inverted));
+}
+[data-theme="pride"] .btn-primary:active,
+[data-theme="pride"] .btn-secondary:active,
+[data-theme="pride"] .btn-danger:active,
+[data-theme="pride"] .btn-success:active {
+  filter: brightness(0.92);
 }
 
 /* ------------------------------------------------------------------ *
@@ -139,23 +145,4 @@
     0 0 0 2px #008026,
     0 0 0 2.5px #004CFF,
     0 0 0 3px #732982;
-}
-
-/* ------------------------------------------------------------------ *
- * 6. Progress chevron motif — a small Intersex-Inclusive Progress flag below
- *    the wordmark in the sidebar header. Inline SVG data-URI so it stays
- *    self-contained in this theme file (the served effects.css can't resolve a
- *    relative asset path). Rainbow flag body + nested trans/brown/black chevron
- *    + the intersex symbol (yellow ring on purple).
- * ------------------------------------------------------------------ */
-[data-theme="pride"] .logo::after {
-  content: "";
-  display: block;
-  width: 40px;
-  height: 24px;
-  margin-block-start: var(--space-2);
-  background-repeat: no-repeat;
-  background-size: contain;
-  border-radius: 2px;
-  background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 24'><rect width='40' height='4' y='0' fill='%23E40303'/><rect width='40' height='4' y='4' fill='%23FF8C00'/><rect width='40' height='4' y='8' fill='%23FFED00'/><rect width='40' height='4' y='12' fill='%23008026'/><rect width='40' height='4' y='16' fill='%23004CFF'/><rect width='40' height='4' y='20' fill='%23732982'/><g fill='none' stroke-width='2.4'><path d='M0,0 L10,12 L0,24' stroke='%235BCEFA'/><path d='M2.4,0 L12.4,12 L2.4,24' stroke='%23F5A9B8'/><path d='M4.8,0 L14.8,12 L4.8,24' stroke='%23FFFFFF'/><path d='M7.2,0 L17.2,12 L7.2,24' stroke='%23603814'/><path d='M9.6,0 L19.6,12 L9.6,24' stroke='%23000000'/></g><circle cx='3.4' cy='12' r='2.8' fill='%237902AA'/><circle cx='3.4' cy='12' r='2.8' fill='none' stroke='%23FFD800' stroke-width='1'/></svg>");
 }

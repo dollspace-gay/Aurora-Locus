@@ -1,46 +1,48 @@
 /*
  * pride — token overrides. Extends dark.
  *
- * A year-round shipping theme, not a Pride-month token. A LIGHT warm-tinted
- * base — differentiated from stack-classic's cyberpunk dark, and a brighter
- * canvas for the structural rainbow (pride/effects.css) to pop against. Warm
- * off-white surfaces in three elevations, warm-neutral dark text, a deep
- * flag-pink accent tuned so white button text clears AA on the pink hover fill,
- * and a status palette redone for light surfaces. Typography, sizing, motion,
- * and the effect library are inherited from dark; the rainbow + the
- * Intersex-Inclusive Progress chevron live in effects.css. Contrast is verified
- * by the substrate WCAG gate.
+ * A year-round shipping theme, not a Pride-month token. A LIGHT warm cream /
+ * parchment base — differentiated from stack-classic's cyberpunk dark and from
+ * glacier's cold arctic light, and a celebratory warm canvas the structural
+ * rainbow (pride/effects.css) pops against. Three clearly-separated elevation
+ * tones (the v1 near-white was too bright and the cards didn't separate),
+ * warm-neutral dark text, a deep flag-pink accent, and a status palette redone
+ * for light surfaces. Buttons take a random rainbow fill per hover (the shim in
+ * PrideHover.js). Typography, sizing, motion, and the effect library are
+ * inherited from dark. Contrast is verified by the substrate WCAG gate.
  */
 
 :root {
-  /* Surfaces — warm-tinted off-white, lightest → deepest by elevation */
-  --color-surface-primary: #faf7f4;
-  --color-surface-secondary: #f5f1ec;
-  --color-surface-tertiary: #efe9e1;
-  --color-surface-overlay: rgba(40, 30, 20, 0.4);
+  /* Surfaces — warm cream/parchment, widened elevation gaps so cards and
+   * modals separate clearly from the background. */
+  --color-surface-primary: #efe9dc;
+  --color-surface-secondary: #e5decc;
+  --color-surface-tertiary: #d8cfb8;
+  --color-surface-overlay: rgba(40, 30, 15, 0.45);
 
-  /* Text — warm-neutral dark on warm off-white */
-  --color-text-primary: #2a2520;
-  --color-text-secondary: #5c5048;
-  --color-text-tertiary: #8a7e72;
+  /* Text — warm-neutral dark on cream */
+  --color-text-primary: #2a2418;
+  --color-text-secondary: #5c5040;
+  --color-text-tertiary: #857b68;
   --color-text-inverted: #ffffff;
 
-  /* Accent — deep flag-pink: white button text clears AA on the pink hover
-   * fill, and the accent (= border-focus) clears 3:1 on the light surfaces. */
+  /* Accent — deep flag-pink (the resting/fallback accent + focus border; the
+   * per-hover button fills come from the random-rainbow shim). */
   --color-accent-primary: #cc1b6b;
   --color-accent-primary-hover: #d9237a;
   --color-accent-primary-active: #a8155a;
-  --color-accent-secondary: #8a7e72;
+  --color-accent-secondary: #857b68;
 
-  /* Status — redone for light surfaces (the inherited dark-mode palette is too
-   * light to clear contrast on near-white). */
+  /* Status — redone for the cream base (deepened so they clear contrast on the
+   * darker-than-white surfaces). */
   --color-status-success: #1f7a3f;
-  --color-status-warning: #b8730f;
+  --color-status-warning: #a8650d;
   --color-status-danger: #c41e3a;
   --color-status-info: #1b5394;
 
-  /* Borders — subtle warm-gray hairlines (rainbow borders are in effects.css) */
-  --color-border-primary: rgba(40, 30, 20, 0.12);
-  --color-border-secondary: rgba(40, 30, 20, 0.06);
+  /* Borders — warm-gray hairlines, deepened to read on cream (rainbow borders
+   * are in effects.css). */
+  --color-border-primary: rgba(40, 30, 15, 0.16);
+  --color-border-secondary: rgba(40, 30, 15, 0.08);
   --color-border-focus: var(--color-accent-primary);
 }
