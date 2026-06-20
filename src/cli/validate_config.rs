@@ -658,21 +658,21 @@ fn validate_kryphocron_config(config: &ServerConfig, issues: &mut Vec<Validation
     if config.kryphocron.enabled {
         issues.push(ValidationIssue::info(
             "Kryphocron",
-            "kryphocron substrate integration enabled (PDS_KRYPHOCRON_ENABLED=true). \
-             Lexicons warm at startup; all `tools.kryphocron.*` NSIDs are routed \
-             through the closed-namespace dispatcher. Arc 1 ship state: every \
-             kryphocron NSID through the generic write path returns \
-             KryphocronRecordNotYetSupported (no dedicated endpoints exist yet \
-             — arc 3+)."
+            "kryphocron substrate integration enabled (PDS_KRYPHOCRON_ENABLED=true, \
+             the default). Lexicons warm at startup; `tools.kryphocron.*` writes are \
+             routed through the closed-namespace dispatcher and the dedicated \
+             endpoints, and the operator admin surfaces (Overview, Audiences, \
+             Laquna, Tier Activity) are live."
                 .to_string(),
         ));
     } else {
         issues.push(ValidationIssue::info(
             "Kryphocron",
-            "kryphocron substrate integration disabled (PDS_KRYPHOCRON_ENABLED=false, \
-             default). `tools.kryphocron.*` NSIDs through the generic write path \
-             return UnsupportedNamespace; lexicons are not warmed; deny-error \
-             map is not built. Set PDS_KRYPHOCRON_ENABLED=true to enable."
+            "kryphocron substrate integration disabled (PDS_KRYPHOCRON_ENABLED=false). \
+             `tools.kryphocron.*` NSIDs through the generic write path return \
+             UnsupportedNamespace; lexicons are not warmed; the deny-error map is \
+             not built. The default is enabled — this deployment has explicitly \
+             opted out; remove the override (or set =true) to re-enable."
                 .to_string(),
         ));
     }

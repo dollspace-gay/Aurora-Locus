@@ -7787,6 +7787,15 @@ mod tests {
     }
 
     async fn create_test_context() -> AppContext {
+        create_test_context_with(|_| {}).await
+    }
+
+    // Variant that lets a test tweak the config before the context is built —
+    // e.g. flip kryphocron off, since it is ON by default as of v0.9 and the
+    // disabled-path tests need to opt the fixture back out.
+    async fn create_test_context_with(
+        mutate: impl FnOnce(&mut ServerConfig),
+    ) -> AppContext {
         let _guard = fixture_setup_lock().lock().await;
         // `into_path()` leaks the TempDir so its Drop doesn't unlink the
         // directory while sqlx connections still hold it open. Under the
@@ -7797,7 +7806,7 @@ mod tests {
         let dir = tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
 
-        let config = ServerConfig {
+        let mut config = ServerConfig {
             service: ServiceConfig {
                 hostname: "localhost".to_string(),
                 port: 2583,
@@ -7892,6 +7901,7 @@ mod tests {
         // fixtures (auth.rs, aurora_*.rs, tests/) keep the empty
         // default — they don't exercise the capability probe.
         let (_router, registry) = super::routes();
+        mutate(&mut config);
         AppContext::new(config, registry).await.unwrap()
     }
 
@@ -9215,7 +9225,9 @@ mod tests {
     #[tokio::test]
     async fn test_kryphocron_ops_disabled_returns_400() {
         use crate::api::aurora_kryphocron_ops as k;
-        let ctx = create_test_context().await;
+        // Kryphocron is on by default (v0.9); this test exercises the
+        // explicitly-disabled deployment, so opt the fixture back out.
+        let ctx = create_test_context_with(|c| c.kryphocron.enabled = false).await;
         let acct = || {
             axum::extract::Query(k::AccountFilter {
                 account: "did:plc:test".to_string(),
@@ -9272,7 +9284,10 @@ mod tests {
     #[tokio::test]
     async fn test_kryphocron_ops_admin_gate_denies_moderator() {
         use crate::api::aurora_kryphocron_ops as k;
-        let ctx = create_test_context().await;
+        // The Admin-gate (403) checks fire before the disabled (400) check, but
+        // the final assertion reaches the disabled check — so opt the fixture
+        // out of the now-default-on kryphocron to keep exercising that 400.
+        let ctx = create_test_context_with(|c| c.kryphocron.enabled = false).await;
 
         // The three Laquna-control reads gate at Admin+ (§6.4.2 / §6.4.2.1):
         // a Moderator is rejected with 403 BEFORE the disabled check.

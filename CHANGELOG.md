@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - UI building blocks: loading skeletons, spinners, inline errors, error boundaries, consistent timestamps, source-tier indicators, and a save-with-rationale confirmation
 
 ### Changed
+- Kryphocron is now enabled by default on fresh deployments; operators can disable it by setting PDS_KRYPHOCRON_ENABLED=false
 - Operator role changes now take effect on the next request, without requiring re-login
 
 ### Fixed

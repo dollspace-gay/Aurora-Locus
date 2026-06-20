@@ -77,16 +77,14 @@ pub struct ServerConfig {
     /// opt in via `PDS_LEXICON_ENABLED=true`. See [`LexiconConfig`].
     #[serde(default)]
     pub lexicon: LexiconConfig,
-    /// v0.7 arc 1 — kryphocron substrate integration. Off-by-default
-    /// (master switch `enabled: false`). When enabled, kryphocron
-    /// lexicons are validated against `kryphocron::lexicons()` at
-    /// startup, the `tools.kryphocron.*` namespace becomes closed
-    /// (no dynamic-resolver fall-through), and Aurora-Locus's
-    /// dedicated kryphocron endpoints (arc 3+) become reachable.
-    /// In arc 1 ship state with the switch on, every kryphocron
-    /// NSID through the generic write path returns
-    /// `KryphocronRecordNotYetSupported` because no dedicated
-    /// endpoints exist yet. See [`KryphocronConfig`].
+    /// Kryphocron substrate integration. On by default as of v0.9
+    /// (Aurora-Locus ships as "the kryphocron PDS"); set
+    /// `PDS_KRYPHOCRON_ENABLED=false` to opt out. When enabled, kryphocron
+    /// lexicons are validated against `kryphocron::lexicons()` at startup,
+    /// the `tools.kryphocron.*` namespace becomes closed (no dynamic-resolver
+    /// fall-through), Aurora-Locus's dedicated kryphocron endpoints are
+    /// reachable, and the operator admin surfaces (Overview, Audiences,
+    /// Laquna, Tier Activity) render live. See [`KryphocronConfig`].
     #[serde(default)]
     pub kryphocron: KryphocronConfig,
 }
@@ -1311,13 +1309,16 @@ pub struct LexiconConfig {
 /// member limits, oracle cache TTLs, etc.
 ///
 /// Env-var loading lives in [`KryphocronConfig::from_env_values`].
-/// Default `enabled: false` per v07_DESIGN.md §9 — closed-namespace
-/// policy applies whether the switch is on or off, but the registered-
-/// NSID branch of the dispatcher and the `kryphocron::lexicons()`
-/// startup load only fire when enabled.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Default `enabled: true` (v0.9) — Aurora-Locus's identity is "the
+/// kryphocron PDS", so the substrate ships on out of the box; operators who
+/// don't want it set `PDS_KRYPHOCRON_ENABLED=false`. (v0.7–0.8 defaulted off
+/// per the v07_DESIGN.md §9 friction-risk posture, before the admin surfaces
+/// landed.) The closed-namespace policy applies whether the switch is on or
+/// off; the registered-NSID branch of the dispatcher and the
+/// `kryphocron::lexicons()` startup load only fire when enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KryphocronConfig {
-    /// Master switch. Default `false`. When `false`, the dispatcher's
+    /// Master switch. Default `true` (v0.9). When `false`, the dispatcher's
     /// closed-namespace check still rejects `tools.kryphocron.*` writes
     /// from the generic path with `UnsupportedNamespace`, but the
     /// registry tier lookup, lexicon validation, and bind pipeline are
@@ -1325,6 +1326,12 @@ pub struct KryphocronConfig {
     /// state is behaviorally indistinguishable from "not compiled in"
     /// for clients.
     pub enabled: bool,
+}
+
+impl Default for KryphocronConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 
@@ -1994,7 +2001,9 @@ impl ServerConfig {
             env::var("PDS_LEXICON_VALIDATE_IMPORTS").ok(),
         )?;
 
-        // v0.7 arc 1 — kryphocron substrate integration. Off-by-default.
+        // v0.7 arc 1 — kryphocron substrate integration. On by default as of
+        // v0.9 (Aurora-Locus ships as "the kryphocron PDS"); set
+        // PDS_KRYPHOCRON_ENABLED=false to opt out.
         let kryphocron = KryphocronConfig::from_env_values(
             env::var("PDS_KRYPHOCRON_ENABLED").ok(),
         )?;
