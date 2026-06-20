@@ -1,8 +1,8 @@
 /*
- * aurora-default — effect-class library (design §11.6 / §11.9.2).
+ * dark — effect-class library (design §11.6 / §11.9.2).
  *
  * The sober baseline implementations of the substrate's effect classes. Themes
- * that extend aurora-default inherit these and override individual classes in
+ * that extend dark inherit these and override individual classes in
  * their own effects.css. Required classes (§11.6.5): effect-focus-ring and
  * effect-surface-elevation-1 / -2 / -3.
  *
@@ -94,7 +94,7 @@
 }
 
 /* ------------------------------------------------------------------ *
- * Decorative effects — trivial in aurora-default (§11.9.2). The class
+ * Decorative effects — trivial in dark (§11.9.2). The class
  * exists for surfaces that apply it; richer themes override.
  * ------------------------------------------------------------------ */
 

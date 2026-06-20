@@ -1,12 +1,12 @@
 /*
- * aurora-stack-classic — token overrides (design §11.11.3).
+ * stack-classic — token overrides (design §11.11.3).
  *
  * The classic Aurora-Stack identity translated onto the v0.9 substrate (the
  * named source artifact aurora_prism_theme_extraction.md is not in-tree; this
  * is an authored translation of the design's stated cues — recorded in
  * docs/internal/recon/v09_arc_b_recon.md). Deep blue-black surfaces, a
  * periwinkle/violet aurora accent, Inter + JetBrains Mono. Status colors,
- * sizing, and motion are inherited from aurora-default. Contrast verified by
+ * sizing, and motion are inherited from dark. Contrast verified by
  * the substrate gate.
  *
  * The @import is valid at the head of this standalone file; when the registry

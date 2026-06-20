@@ -65,8 +65,9 @@ pub const REQUIRED_EFFECT_CLASSES: &[&str] = &[
     "effect-surface-elevation-3",
 ];
 
-/// The inheritance root every chain must terminate at (§11.9).
-pub const ROOT_THEME_ID: &str = "aurora-default";
+/// The inheritance root every chain must terminate at (§11.9). The former
+/// `aurora-default` + `aurora-dark` pair was merged into a single `dark` root.
+pub const ROOT_THEME_ID: &str = "dark";
 
 /// Maximum inheritance depth (§11.4) — a chain of more than this many
 /// `extends` hops is rejected.
@@ -328,7 +329,7 @@ impl ThemeRegistry {
 }
 
 /// Hoist `@import` statements to the top of a concatenated stylesheet. A
-/// theme's `tokens.css` may carry an `@import` (aurora-stack-classic loads
+/// theme's `tokens.css` may carry an `@import` (stack-classic loads
 /// Google Fonts), but the chain concatenates leaf-last, so a leaf's `@import`
 /// lands mid-file where browsers ignore it (CSS requires `@import` before all
 /// other rules). This moves every line-leading `@import` to the front in source
@@ -506,7 +507,7 @@ fn validate(theme: &DiscoveredTheme, by_id: &HashMap<String, DiscoveredTheme>) -
 }
 
 /// Walk the `extends` chain from `start`, asserting it terminates at the
-/// root (`aurora-default`, whose `extends` is `None`), has no cycle, and is
+/// root (`dark`, whose `extends` is `None`), has no cycle, and is
 /// within the depth bound.
 fn validate_chain(start: &str, by_id: &HashMap<String, DiscoveredTheme>) -> Result<(), String> {
     let mut current = start.to_string();
@@ -821,7 +822,7 @@ mod tests {
     #[test]
     fn orphan_chain_fails() {
         let bundled = tmp("orphan");
-        // a theme that extends a non-root with no path to aurora-default
+        // a theme that extends a non-root with no path to the dark root
         write_theme(&bundled, "lonely", Some("ghost"), &all_required_css());
         let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
         let (_, valid) = reg.summary();
@@ -853,7 +854,7 @@ mod tests {
             Path::new("/nonexistent/operator"),
         );
         assert_eq!(reg.summary(), (0, 0));
-        assert!(reg.resolve_token_css("aurora-default").is_none());
+        assert!(reg.resolve_token_css("dark").is_none());
         assert!(reg.list().is_empty());
     }
 
@@ -941,24 +942,26 @@ mod tests {
 
     #[test]
     fn bundled_themes_all_validate() {
-        // The four shipped themes must enumerate and pass the full validation
+        // The shipped themes must enumerate and pass the full validation
         // contract (steps 1–9) against the real on-disk files — this is the
-        // accessibility/structure guard for the bundled palettes.
+        // accessibility/structure guard for the bundled palettes. Count is the
+        // post-merge baseline cohort (dark root + light + stack-classic);
+        // bumped as the showcase themes land.
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
         let reg = ThemeRegistry::build(&bundled, Path::new("/nonexistent/operator"));
         let (total, valid) = reg.summary();
-        assert_eq!(total, 4, "four bundled themes enumerate");
+        assert_eq!(total, 3, "bundled themes enumerate");
         let invalid: Vec<_> = reg
             .list()
             .into_iter()
             .filter(|m| !m.valid)
             .map(|m| format!("{}: {:?}", m.theme_id, m.validation_errors))
             .collect();
-        assert_eq!(valid, 4, "all bundled themes valid; failures: {invalid:?}");
+        assert_eq!(valid, 3, "all bundled themes valid; failures: {invalid:?}");
 
         // The classic theme's gradient wordmark + resolved chain are present.
         let classic = reg
-            .resolve_effect_css("aurora-stack-classic")
+            .resolve_effect_css("stack-classic")
             .expect("classic effects resolve");
         assert!(classic.contains(".heading-aurora"));
         assert!(classic.contains(".effect-focus-ring"), "inherits required focus-ring");
@@ -966,13 +969,13 @@ mod tests {
 
     #[test]
     fn classic_tokens_hoist_import_to_top() {
-        // aurora-stack-classic's @import is in its (leaf) tokens.css, so the
+        // stack-classic's @import is in its (leaf) tokens.css, so the
         // root→leaf concatenation puts it mid-file; hoisting must lift it back
         // to the top where browsers honor it.
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
         let reg = ThemeRegistry::build(&bundled, Path::new("/nonexistent/operator"));
         let css = reg
-            .resolve_token_css("aurora-stack-classic")
+            .resolve_token_css("stack-classic")
             .expect("classic resolves");
         // The Google Fonts @import (the only `@import url(...)`; the header
         // comment mentions the word in prose) must lead the stylesheet and

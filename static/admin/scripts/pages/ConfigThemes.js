@@ -14,7 +14,7 @@
     return global.AuroraDom ? global.AuroraDom.esc(s) : String(s);
   }
 
-  let currentDefault = 'aurora-default';
+  let currentDefault = 'stack-classic';
 
   async function mount({ container }) {
     const session = global.AuroraSession;

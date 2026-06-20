@@ -1,10 +1,10 @@
 /*
- * aurora-light — token overrides (design §11.11.1).
+ * light — token overrides (design §11.11.1).
  *
- * The light-mode counterpart to aurora-default: the same sober structure with
+ * The light-mode counterpart to dark: the same sober structure with
  * lightness inverted (dark-on-light). Only the palette tokens are overridden;
  * typography, sizing, motion, and the entire effect library are inherited from
- * aurora-default. Accents are darkened relative to aurora-default so inverted
+ * dark. Accents are darkened relative to dark so inverted
  * (white) button text clears AA on accent fills, and status colors are deepened
  * for legibility on light surfaces. Contrast is verified by the substrate gate.
  */

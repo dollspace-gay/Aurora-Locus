@@ -23,7 +23,7 @@ pub struct ThemeManifest {
     #[serde(default)]
     pub theme_version: Option<String>,
     pub substrate_version: String,
-    /// Parent theme id. `None` for the inheritance root (`aurora-default`).
+    /// Parent theme id. `None` for the inheritance root (`dark`).
     #[serde(default)]
     pub extends: Option<String>,
     pub files: ThemeFiles,
@@ -90,14 +90,14 @@ mod tests {
               "themeId": "demo",
               "themeName": "Demo",
               "substrateVersion": "1.0",
-              "extends": "aurora-default",
+              "extends": "dark",
               "files": { "tokens": "tokens.css" }
             }"#,
         )
         .unwrap();
         let m = ThemeManifest::parse_file(&path).expect("parses");
         assert_eq!(m.theme_id, "demo");
-        assert_eq!(m.extends.as_deref(), Some("aurora-default"));
+        assert_eq!(m.extends.as_deref(), Some("dark"));
         assert_eq!(m.files.tokens, "tokens.css");
         assert!(m.theme_version.is_none());
         assert!(m.provided_extension_points.is_empty());
@@ -113,8 +113,8 @@ mod tests {
             &path,
             r#"{
               "schemaVersion": "1.0",
-              "themeId": "aurora-default",
-              "themeName": "Aurora Default",
+              "themeId": "dark",
+              "themeName": "Dark",
               "substrateVersion": "1.0",
               "files": { "tokens": "tokens.css" }
             }"#,

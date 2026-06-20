@@ -1,15 +1,15 @@
 /*
- * aurora-stack-classic — effect overrides + the gradient wordmark (§11.11.3).
+ * stack-classic — effect overrides + the gradient wordmark (§11.11.3).
  *
  * The full Aurora effect library lit up: a visible aurora-glow, the pronounced
  * gradient-plus-blur frosted glass (§11.6.3), real decorative textures, and the
  * signature gradient wordmark (.heading-aurora — a theme-specific class the
  * sidebar applies, no-op under the sober themes). Required classes (focus-ring,
- * surface-elevation) are inherited from aurora-default.
+ * surface-elevation) are inherited from dark.
  */
 
 /* The signature gradient wordmark. The sidebar <h1> carries .heading-aurora;
- * only this theme paints it (aurora-default/-light/-dark leave it plain). */
+ * only this theme paints it (dark/light leave it plain). */
 .heading-aurora {
   background: linear-gradient(135deg, #6c7cff 0%, #a06cff 50%, #4cc9f0 100%);
   -webkit-background-clip: text;
