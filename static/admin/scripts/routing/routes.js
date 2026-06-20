@@ -69,7 +69,6 @@
     // owns only the route definitions here.
     { pattern: 'configuration', page: 'configGeneral', requires: 'admin' }, // default configuration view
     { pattern: 'configuration/general', page: 'configGeneral', requires: 'admin' },
-    { pattern: 'configuration/themes', page: 'configThemes', requires: 'admin' },
     { pattern: 'configuration/ui-modes', page: 'configUiModes' },
     { pattern: 'configuration/federation-policy', page: 'configFederationPolicy', requires: 'superadmin' },
     { pattern: 'configuration/registration-policy', page: 'configRegistrationPolicy', requires: 'superadmin' },
@@ -130,6 +129,10 @@
     'settings/ui-modes': 'configuration/ui-modes',
     'settings/roles': 'configuration/roles',
     'settings/capabilities': 'configuration/capabilities',
+    // #322 — the standalone Themes page was folded into UI & modes; old
+    // bookmarks (v0.9 pre-fold or the v0.2-era settings hash) land there.
+    'settings/themes': 'configuration/ui-modes',
+    'configuration/themes': 'configuration/ui-modes',
   };
 
   // Sidebar nav structure per §4.1.
@@ -175,7 +178,6 @@
       heading: 'Configuration',
       items: [
         { label: 'General', route: 'configuration/general', icon: 'settings', requires: 'admin' },
-        { label: 'Themes', route: 'configuration/themes', icon: 'monitor', requires: 'admin' },
         { label: 'UI & modes', route: 'configuration/ui-modes', icon: 'sliders' },
         { label: 'Recovery mode', route: 'configuration/recovery-mode', icon: 'life-buoy', requires: 'superadmin' },
         { label: 'Federation policy', route: 'configuration/federation-policy', icon: 'network', requires: 'superadmin' },

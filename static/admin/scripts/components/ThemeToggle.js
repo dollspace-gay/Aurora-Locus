@@ -4,7 +4,9 @@
 // hardcoded light/dark/system triplet. The options are "Follow deployment
 // default" plus each validated installed theme (§11.10.2). Two variants:
 //   - 'compact': one button cycling through the options (sidebar footer)
-//   - 'full': labeled radios (Configuration → UI & modes)
+//   - 'dropdown': a <select> (Configuration → UI & modes). A dropdown rather
+//     than a radio pill so it stays single-line as the installed-theme count
+//     grows (the v0.9 cohort is ten).
 //
 // The installed-theme list is cached in AuroraSettings (fetched at boot); this
 // control subscribes so it re-paints when the list arrives.
@@ -64,31 +66,26 @@
     if (global.AuroraSettings) global.AuroraSettings.subscribe(paint);
   }
 
-  // Full: role=radiogroup list for Configuration → UI & modes.
-  function mountFull(container) {
+  // Dropdown: a <select> for Configuration → UI & modes. Single-line as the
+  // installed-theme list grows; the operator's personal session-theme picker.
+  function mountDropdown(container) {
     if (!container) return;
     function paint() {
       const pref = currentPref();
       const opts = themeOptions();
-      const seg = (o) =>
-        '<button type="button" role="radio" aria-checked="' + (pref === o.id ? 'true' : 'false') +
-        '" data-theme="' + esc(o.id) + '">' + esc(o.label) + '</button>';
-      container.innerHTML = '<div class="theme-toggle-pill" role="radiogroup" aria-label="Theme preference">' +
-        opts.map(seg).join('') + '</div>';
-      const buttons = Array.from(container.querySelectorAll('button[role="radio"]'));
-      buttons.forEach((btn) => {
-        btn.addEventListener('click', () => {
-          applyPref(btn.dataset.theme);
+      container.innerHTML =
+        '<select id="ui-theme-select" aria-label="Theme preference">' +
+        opts.map((o) =>
+          '<option value="' + esc(o.id) + '"' + (pref === o.id ? ' selected' : '') + '>' +
+          esc(o.label) + '</option>').join('') +
+        '</select>';
+      const sel = container.querySelector('select');
+      if (sel) {
+        sel.addEventListener('change', () => {
+          applyPref(sel.value);
           paint();
         });
-        btn.addEventListener('keydown', (e) => {
-          if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-          const idx = buttons.indexOf(btn);
-          const next = e.key === 'ArrowRight' ? (idx + 1) % buttons.length : (idx - 1 + buttons.length) % buttons.length;
-          buttons[next].focus();
-          buttons[next].click();
-        });
-      });
+      }
     }
     paint();
     if (global.AuroraSettings) global.AuroraSettings.subscribe(paint);
@@ -96,6 +93,6 @@
 
   global.AuroraThemeToggle = {
     mountCompact: mountCompact,
-    mountFull: mountFull,
+    mountDropdown: mountDropdown,
   };
 })(window);

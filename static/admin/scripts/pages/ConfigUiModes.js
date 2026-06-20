@@ -43,9 +43,18 @@
       (isSuper ? '<button type="button" class="btn-primary" id="mod-mode-save">Save mode change</button>' : '<p class="settings-help">SuperAdmin role required to change deployment-wide moderation mode.</p>') +
       '    </fieldset>' +
       '  </div>' +
-      '</div>';
+      '</div>' +
+      // Installed Themes — folded in from the former standalone Themes page
+      // (#322). The row list is owned by AuroraInstalledThemes; set-default is
+      // superadmin-only, the rest is read-only for moderator/admin.
+      '<hr class="config-section-divider">' +
+      '<section class="installed-themes-section">' +
+      '  <h3>Installed Themes</h3>' +
+      '  <div id="installed-themes"></div>' +
+      '</section>';
 
-    if (global.AuroraThemeToggle) global.AuroraThemeToggle.mountFull(document.getElementById('ui-theme-toggle'));
+    if (global.AuroraThemeToggle) global.AuroraThemeToggle.mountDropdown(document.getElementById('ui-theme-toggle'));
+    if (global.AuroraInstalledThemes) global.AuroraInstalledThemes.mount(document.getElementById('installed-themes'), isSuper);
 
     const langSel = document.getElementById('ui-language');
     if (langSel) {

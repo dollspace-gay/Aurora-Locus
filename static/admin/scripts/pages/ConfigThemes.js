@@ -1,16 +1,15 @@
-// Configuration → Themes page (route: #configuration/themes).
+// Installed-themes section — composed into Configuration → UI & modes.
 // Per docs/internal/design/v09_UI_Design.md §11.10.2 / §5.5.2.
 //
-// SuperAdmin's view of installed themes as a single-column row list: one row
-// per theme showing display name, a Dark/Light mode pill, an AAA badge on the
-// high-contrast themes, the one-line themeDescription, and a per-row action
-// ("Set as deployment default", or an "Active" pill if it is the current
-// default). The active row carries a left-border accent so the default is
-// obvious without reading the action column. Internal substrate metadata
-// (validation state on the happy path, slug/version/inheritance/source, author
-// attribution) is not surfaced — the picker is operator-facing. A theme that
-// fails validation keeps a distinct error affordance. Admin+ reads; SuperAdmin
-// writes (rationale-light cosmetic confirm, audit-logged via setRuntimeSetting
+// Was the standalone #configuration/themes page; folded into UI & modes (#322)
+// as a section below the personal-preference controls. Exposes
+// AuroraInstalledThemes.mount(container, isSuper) — it renders the row list
+// (one row per theme: display name, Dark/Light pill, AAA badge on the
+// high-contrast themes, the one-line description, and a per-row action) into
+// the given container, with no breadcrumb/header of its own. Internal substrate
+// metadata is not surfaced; a theme that fails validation keeps a distinct
+// error affordance. Admin+ reads; SuperAdmin sets the deployment default
+// (rationale-light cosmetic confirm, audit-logged via setRuntimeSetting
 // theme.deployment-default).
 
 (function (global) {
@@ -21,6 +20,8 @@
   }
 
   let currentDefault = 'stack-classic';
+  let listEl = null;
+  let superFlag = false;
 
   // Mode + AAA are theme-intrinsic but not carried on the listInstalledThemes
   // wire shape, so they are derived here for the bundled cohort. An
@@ -30,28 +31,27 @@
   function themeMode(id) { return LIGHT_THEMES[id] ? 'Light' : 'Dark'; }
   function isAAA(id) { return id.indexOf('high-contrast-') === 0; }
 
-  async function mount({ container }) {
-    const session = global.AuroraSession;
-    const isSuper = session && session.hasRole('superadmin');
+  // Render the installed-themes row list into `container`. Called from
+  // ConfigUiModes after it lays out its own controls + the section heading.
+  async function mount(container, isSuper) {
+    if (!container) return;
+    superFlag = !!isSuper;
     container.innerHTML =
-      '<nav class="breadcrumb" aria-label="Breadcrumb"><a href="#configuration/general">Configuration</a> <span class="breadcrumb-sep">›</span> Themes</nav>' +
-      '<header class="page-header"><div><h2>Themes</h2><p class="page-subtitle">Installed themes and the deployment-default selection</p></div></header>' +
-      '<div id="themes-list" class="theme-list">' + global.AuroraSkeleton.cards(3) + '</div>';
-    await load(isSuper);
-    return {};
+      '<div class="theme-list" data-installed-themes>' + global.AuroraSkeleton.cards(3) + '</div>';
+    listEl = container.querySelector('[data-installed-themes]');
+    await load();
   }
 
-  async function load(isSuper) {
-    const list = document.getElementById('themes-list');
-    if (!list) return;
+  async function load() {
+    if (!listEl) return;
     let themes = [];
     try {
       const data = await global.AuroraEndpoints.ops.listInstalledThemes();
       themes = (data && Array.isArray(data.themes)) ? data.themes : [];
     } catch (e) {
-      global.AuroraErrorBoundary.mount(list, {
+      global.AuroraErrorBoundary.mount(listEl, {
         message: 'Could not load themes: ' + ((e && e.message) || 'request failed'),
-        onRetry: function () { load(isSuper); },
+        onRetry: function () { load(); },
       });
       return;
     }
@@ -64,9 +64,9 @@
       global.AuroraSettings.setInstalledThemesCache(themes);
       global.AuroraSettings.setDeploymentDefaultCache(currentDefault);
     }
-    if (!themes.length) { list.innerHTML = '<p>No themes installed.</p>'; return; }
-    list.innerHTML = themes.map((t) => row(t, isSuper)).join('');
-    wire(themes, isSuper);
+    if (!themes.length) { listEl.innerHTML = '<p>No themes installed.</p>'; return; }
+    listEl.innerHTML = themes.map((t) => row(t, superFlag)).join('');
+    wire(themes, superFlag);
   }
 
   function row(t, isSuper) {
@@ -109,7 +109,7 @@
   }
 
   function wire(themes, isSuper) {
-    document.querySelectorAll('[data-errors]').forEach((btn) => {
+    listEl.querySelectorAll('[data-errors]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const t = themes.find((x) => x.themeId === btn.dataset.errors);
         const errs = (t && Array.isArray(t.validationErrors)) ? t.validationErrors : [];
@@ -123,7 +123,7 @@
       });
     });
     if (!isSuper) return;
-    document.querySelectorAll('[data-setdefault]').forEach((btn) => {
+    listEl.querySelectorAll('[data-setdefault]').forEach((btn) => {
       btn.addEventListener('click', () => setDefault(btn.dataset.setdefault, isSuper));
     });
   }
@@ -140,8 +140,8 @@
       settings: [{ key: 'theme.deployment-default', value: themeId }],
       successMessage: 'Deployment-default theme set to ' + themeId + '.',
     });
-    if (r.saved) await load(isSuper);
+    if (r.saved) await load();
   }
 
-  if (global.AuroraRouter) global.AuroraRouter.register('configThemes', { mount: mount });
+  global.AuroraInstalledThemes = { mount: mount };
 })(window);
