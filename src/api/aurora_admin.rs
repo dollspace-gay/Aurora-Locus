@@ -4362,7 +4362,10 @@ async fn write_runtime_setting_audited(
 }
 
 /// Query params for `uploadBrandingAsset`: which asset, + an optional rationale.
+/// camelCase on the wire (`assetType`) per the atproto convention the admin
+/// client sends.
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadBrandingParams {
     pub asset_type: String,
     #[serde(default)]
@@ -8059,6 +8062,22 @@ mod tests {
         let mut h = axum::http::HeaderMap::new();
         h.insert(axum::http::header::CONTENT_TYPE, "image/png".parse().unwrap());
         h
+    }
+
+    #[test]
+    fn upload_branding_params_deserialize_camelcase() {
+        // Wire form is camelCase (`assetType`) per atproto convention + what the
+        // admin client sends; pins the serde rename (the bug was its absence —
+        // the query failed to deserialize `assetType`).
+        let p: UploadBrandingParams =
+            serde_json::from_value(serde_json::json!({ "assetType": "banner" })).unwrap();
+        assert_eq!(p.asset_type, "banner");
+        assert!(p.rationale.is_none());
+        // snake_case is no longer the wire name.
+        assert!(serde_json::from_value::<UploadBrandingParams>(
+            serde_json::json!({ "asset_type": "banner" })
+        )
+        .is_err());
     }
 
     #[tokio::test]
