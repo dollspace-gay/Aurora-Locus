@@ -83,6 +83,14 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
             "/theme/active-extension-points",
             axum::routing::get(crate::api::aurora_admin::serve_active_theme_extension_points),
         )
+        // v0.9 — login-splash branding + the resolved default theme for the
+        // pre-auth login page. Unauthenticated (the page reads it before any
+        // token exists); returns only the deployment-default theme id and the
+        // operator-set branding URLs — all non-secret.
+        .route(
+            "/theme/login-branding",
+            axum::routing::get(crate::api::aurora_admin::serve_login_branding),
+        )
         .merge(sync::routes())
         .merge(firehose::routes())
         .merge(labels::routes())

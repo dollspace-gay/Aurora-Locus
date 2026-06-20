@@ -44,6 +44,23 @@
       '    </fieldset>' +
       '  </div>' +
       '</div>' +
+      // Branding — SuperAdmin-only login-splash customization (deployment-wide).
+      // Below Moderation mode, above Installed Themes. Hidden for moderator/admin
+      // (matches the superadmin-only set-deployment-default gating).
+      (isSuper ?
+        '<hr class="config-section-divider">' +
+        '<section class="branding-section">' +
+        '  <h3>Branding</h3>' +
+        '  <p class="settings-help">Customize the login splash imagery (deployment-wide). Host an asset under <code>static/branding/</code> and reference <code>/static/branding/&lt;file&gt;</code>, or use any external URL.</p>' +
+        '  <label class="branding-field">Login logo URL' +
+        '    <input type="text" id="branding-logo" placeholder="/static/branding/logo.png">' +
+        '  </label>' +
+        '  <label class="branding-field">Login banner image URL' +
+        '    <input type="text" id="branding-banner" placeholder="https://your-cdn.example/banner.png">' +
+        '  </label>' +
+        '  <button type="button" class="btn-primary" id="branding-save">Save branding</button>' +
+        '</section>'
+        : '') +
       // Installed Themes — folded in from the former standalone Themes page
       // (#322). The row list is owned by AuroraInstalledThemes; set-default is
       // superadmin-only, the rest is read-only for moderator/admin.
@@ -75,8 +92,48 @@
     if (isSuper) {
       const saveBtn = document.getElementById('mod-mode-save');
       if (saveBtn) saveBtn.addEventListener('click', saveModerationMode);
+      await loadBranding();
     }
     return {};
+  }
+
+  // Load the current login-branding URLs into the section's inputs and wire the
+  // save button (SuperAdmin-only section).
+  async function loadBranding() {
+    const ep = global.AuroraEndpoints;
+    const logoEl = document.getElementById('branding-logo');
+    const bannerEl = document.getElementById('branding-banner');
+    if (!ep || !logoEl || !bannerEl) return;
+    try {
+      const d = await ep.admin.getRuntimeSetting('branding.login-logo-url');
+      if (d && typeof d.value === 'string') logoEl.value = d.value;
+    } catch (e) { /* leave blank */ }
+    try {
+      const d = await ep.admin.getRuntimeSetting('branding.login-banner-image-url');
+      if (d && typeof d.value === 'string') bannerEl.value = d.value;
+    } catch (e) { /* leave blank */ }
+    const btn = document.getElementById('branding-save');
+    if (btn) btn.addEventListener('click', saveBranding);
+  }
+
+  // Save both branding URLs deployment-wide. Cosmetic (light confirm, no typed
+  // rationale) like the theme deployment-default save (#308), but still lands an
+  // audit-chain entry per setting via the auto-filled rationale.
+  async function saveBranding() {
+    const logo = document.getElementById('branding-logo').value.trim();
+    const banner = document.getElementById('branding-banner').value.trim();
+    await global.AuroraAuditedSave.run({
+      heading: 'Save login branding',
+      body: 'Update the login splash logo and banner? This is deployment-wide — every operator sees it on the login page.',
+      confirmLabel: 'Save branding',
+      cosmetic: true,
+      autoRationale: 'cosmetic setting: login branding URLs updated',
+      settings: [
+        { key: 'branding.login-logo-url', value: logo },
+        { key: 'branding.login-banner-image-url', value: banner },
+      ],
+      successMessage: 'Login branding saved.',
+    });
   }
 
   async function loadModerationMode() {

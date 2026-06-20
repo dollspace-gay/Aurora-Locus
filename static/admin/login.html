@@ -4,18 +4,26 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Aurora-Locus admin — Login</title>
+    <!-- Base token alias layer, then the deployment-default theme's resolved
+         token + effect CSS (same routes the admin UI uses). login.js sets
+         <html data-theme> from /theme/login-branding so theme-scoped rules
+         (e.g. Pride's rainbow borders) apply on the pre-auth page too. -->
     <link rel="stylesheet" href="/admin/styles/tokens.css">
+    <link id="theme-tokens" rel="stylesheet" href="/theme/active.css">
+    <link id="theme-effects" rel="stylesheet" href="/theme/active-effects.css">
     <link rel="stylesheet" href="/admin/login/login.css">
 </head>
 <body>
     <div class="login-container">
         <div class="login-card">
             <div class="login-header">
-                <svg class="logo" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-                    <path d="M2 17l10 5 10-5"/>
-                    <path d="M2 12l10 5 10-5"/>
-                </svg>
+                <div class="login-logo" id="login-logo">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                        <path d="M2 17l10 5 10-5"/>
+                        <path d="M2 12l10 5 10-5"/>
+                    </svg>
+                </div>
                 <h1>Aurora Locus</h1>
                 <p>Personal Data Server Administration</p>
             </div>
@@ -31,7 +39,7 @@
                             placeholder="user.bsky.social"
                             autocomplete="username"
                         >
-                        <small style="color: #888; font-size: 12px; margin-top: 4px; display: block;">
+                        <small class="login-hint">
                             Leave blank to use default PDS
                         </small>
                     </div>
@@ -55,10 +63,10 @@
                 </div>
             </div>
         </div>
-
-        <div class="background-pattern"></div>
     </div>
 
+    <!-- Pride's random rainbow button hover (no-op unless data-theme=pride). -->
+    <script src="/admin/scripts/components/PrideHover.js"></script>
     <script src="/admin/login/login.js"></script>
 </body>
 </html>

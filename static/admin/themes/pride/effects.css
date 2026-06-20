@@ -30,10 +30,12 @@
 }
 
 /* ------------------------------------------------------------------ *
- * 1. Card / panel / modal borders → rainbow gradient (corners preserved)
+ * 1. Card / panel / modal borders → rainbow gradient (corners preserved).
+ *    Includes the login splash card so the pre-auth page carries the rainbow.
  * ------------------------------------------------------------------ */
 [data-theme="pride"] .settings-card,
-[data-theme="pride"] .modal {
+[data-theme="pride"] .modal,
+[data-theme="pride"] .login-card {
   border: 2px solid transparent;
   background-image:
     linear-gradient(var(--color-surface-secondary), var(--color-surface-secondary)),

@@ -3694,6 +3694,15 @@ const THEME_DEPLOYMENT_DEFAULT_KEY: &str = "theme.deployment-default";
 /// effect on the next encode without a restart).
 const LAQUNA_ROTATION_CADENCE_KEY: &str = "kryphocron.laquna.rotation-cadence";
 
+/// v0.9 — operator login-splash branding. URLs the (theme-aware) login page
+/// renders: the logo image at the top of the splash card, and a banner image
+/// behind it. Both default to empty (the built-in stack icon + the theme's
+/// surface, no banner). Operators host the assets themselves (drop in
+/// `static/branding/` and reference `/static/branding/<file>`, or any external
+/// URL). Read unauthenticated by the login page via `serve_login_branding`.
+const BRANDING_LOGIN_LOGO_KEY: &str = "branding.login-logo-url";
+const BRANDING_LOGIN_BANNER_KEY: &str = "branding.login-banner-image-url";
+
 /// Allowlist of runtime-setting keys this build accepts. Per CR-2 /
 /// chainlink #119, `setRuntimeSetting` rejects any other key with
 /// 400 — the inventory's "validates known keys" framing
@@ -3709,6 +3718,8 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     MODERATION_MODE_REDIRECT_KEY,
     THEME_DEPLOYMENT_DEFAULT_KEY,
     LAQUNA_ROTATION_CADENCE_KEY,
+    BRANDING_LOGIN_LOGO_KEY,
+    BRANDING_LOGIN_BANNER_KEY,
 ];
 const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
@@ -3722,6 +3733,9 @@ fn default_for_key(key: &str) -> serde_json::Value {
         MODERATION_MODE_REDIRECT_KEY => serde_json::Value::String(String::new()),
         THEME_DEPLOYMENT_DEFAULT_KEY => serde_json::Value::String("stack-classic".to_string()),
         LAQUNA_ROTATION_CADENCE_KEY => serde_json::Value::String("daily".to_string()),
+        BRANDING_LOGIN_LOGO_KEY | BRANDING_LOGIN_BANNER_KEY => {
+            serde_json::Value::String(String::new())
+        }
         _ => serde_json::Value::Null,
     }
 }
@@ -3741,6 +3755,9 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         LAQUNA_ROTATION_CADENCE_KEY => value
             .as_str()
             .is_some_and(|s| matches!(s, "hourly" | "daily" | "weekly" | "manual-only")),
+        // Branding URLs: any string (including empty = "use the default").
+        // No URL/size validation in v0.9 — operators host their own assets.
+        BRANDING_LOGIN_LOGO_KEY | BRANDING_LOGIN_BANNER_KEY => value.as_str().is_some(),
         _ => true,
     }
 }
@@ -3834,6 +3851,47 @@ async fn resolve_active_theme_id(ctx: &AppContext, params: &ActiveThemeParams) -
         Some(id) => id.to_string(),
         None => deployment_default_theme(ctx).await,
     }
+}
+
+/// Read a runtime-setting string from the tiers (runtime row → file tier),
+/// returning the trimmed value when non-empty. Used by the unauthenticated
+/// login-branding read; never errors (a DB error yields `None`, i.e. the
+/// default behavior).
+async fn read_runtime_string(ctx: &AppContext, key: &str) -> Option<String> {
+    use sqlx::Row as _;
+    let from_runtime = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(&ctx.account_db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("value").ok())
+        .map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s)));
+    let tiered = from_runtime.or_else(|| ctx.file_tier_settings.get(key).cloned());
+    tiered
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `GET /theme/login-branding` — unauthenticated JSON the (pre-auth) login page
+/// reads to theme itself and apply operator branding: the resolved
+/// deployment-default theme id (so the page sets `data-theme` for theme-scoped
+/// rules + cache-busts the theme CSS) plus the two `branding.login-*` URLs
+/// (empty string when unset → the page keeps its built-in logo / no banner).
+/// Same unauthenticated, secret-free contract as the theme-serve routes.
+pub async fn serve_login_branding(State(ctx): State<AppContext>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "theme": deployment_default_theme(&ctx).await,
+        "logoUrl": read_runtime_string(&ctx, BRANDING_LOGIN_LOGO_KEY)
+            .await
+            .unwrap_or_default(),
+        "bannerUrl": read_runtime_string(&ctx, BRANDING_LOGIN_BANNER_KEY)
+            .await
+            .unwrap_or_default(),
+    }))
 }
 
 /// Serve the active theme's inheritance-resolved effect-class CSS (§11.6).
