@@ -43,8 +43,20 @@
 }
 
 /* ------------------------------------------------------------------ *
- * 2. Button borders → rainbow; interior fill stays semantic. Hover rotates
- *    the rainbow (a subtle shift) rather than recoloring the fill.
+ * 2. Button borders → rainbow. Every action-button variant gets the SAME
+ *    resting treatment: an opaque near-white (lightest-surface) interior with
+ *    dark text + the 2px rainbow gradient border. Uniform on purpose — no
+ *    per-variant fill.
+ *
+ *    The interior layer MUST be opaque: it is painted over the rainbow
+ *    border-box layer and clipped to the padding box, so it is what hides the
+ *    rainbow everywhere except the border. A transparent interior (the old
+ *    .btn-secondary, and the bug this fixes) lets the border-box rainbow show
+ *    through and fill the whole button — which is what the dashboard pills
+ *    (Details / Open Kryphocron / Audit trail — all .btn-secondary) were doing.
+ *    Semantic danger/success fills are dropped here too for the one consistent
+ *    Pride button; the destructive affordance still lives in the typed-confirm
+ *    modals (#326).
  * ------------------------------------------------------------------ */
 [data-theme="pride"] .btn-primary,
 [data-theme="pride"] .btn-secondary,
@@ -53,29 +65,24 @@
   border: 2px solid transparent;
   background-origin: border-box;
   background-clip: padding-box, border-box;
-}
-/* Primary action buttons (light base): white (lightest-surface) fill + dark
- * text at rest. The hover fill/text come from the random-rainbow rule below;
- * disabled is a muted gray-tint with a neutral border (no rainbow). */
-[data-theme="pride"] .btn-primary {
-  background-image: linear-gradient(var(--color-surface-primary), var(--color-surface-primary)), var(--pride-rainbow-ring);
+  background-image:
+    linear-gradient(var(--color-surface-primary), var(--color-surface-primary)),
+    var(--pride-rainbow-ring);
   color: var(--color-text-primary);
 }
+/* Disabled: muted gray-tint + neutral border (no rainbow), all variants. */
 [data-theme="pride"] .btn-primary:disabled,
-[data-theme="pride"] .btn-primary[disabled] {
+[data-theme="pride"] .btn-primary[disabled],
+[data-theme="pride"] .btn-secondary:disabled,
+[data-theme="pride"] .btn-secondary[disabled],
+[data-theme="pride"] .btn-danger:disabled,
+[data-theme="pride"] .btn-danger[disabled],
+[data-theme="pride"] .btn-success:disabled,
+[data-theme="pride"] .btn-success[disabled] {
   background-image: none;
   background-color: var(--color-surface-tertiary);
   border-color: var(--color-border-primary);
   color: var(--color-text-tertiary);
-}
-[data-theme="pride"] .btn-secondary {
-  background-image: linear-gradient(transparent, transparent), var(--pride-rainbow-ring);
-}
-[data-theme="pride"] .btn-danger {
-  background-image: linear-gradient(var(--color-status-danger), var(--color-status-danger)), var(--pride-rainbow-ring);
-}
-[data-theme="pride"] .btn-success {
-  background-image: linear-gradient(var(--color-status-success), var(--color-status-success)), var(--pride-rainbow-ring);
 }
 /* Random rainbow hover (#325): every action button takes a random 6-stripe
  * rainbow color as its interior fill on hover, with the AA-paired text color —
