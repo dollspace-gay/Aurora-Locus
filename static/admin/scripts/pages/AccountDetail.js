@@ -106,6 +106,7 @@
     const session = global.AuroraSession;
     const isAdmin = session && session.hasRole('admin');
     const isMod = session && session.hasRole('moderator');
+    const isSuper = session && session.hasRole('superadmin');
     const drawer = global.AuroraDrawer;
     const primary = document.getElementById('ad-primary');
     if (!primary || !drawer) return;
@@ -154,12 +155,24 @@
         bodyHtml: '<div id="ad-kryphocron-body">' + global.AuroraSkeleton.lines(3) + '</div>',
       });
     }
+    // Kryphocron overrides (SuperAdmin, §6.6.2 item 4 / #316) — per-account
+    // policy exceptions, distinct from the Mod+ read-only audience drawer above.
+    if (isSuper) {
+      html += drawer.render({
+        id: 'kryphocron-overrides-' + currentDid,
+        summary: '<strong>' + esc(T('kryphocron.overrides.title')) + '</strong>',
+        roleTag: 'SuperAdmin',
+        bodyHtml: '<div id="ad-overrides-body">' + global.AuroraSkeleton.lines(3) + '</div>',
+      });
+    }
     primary.innerHTML = html;
     drawer.attach(primary);
 
     // Kryphocron drawer content (audiences owned + block-cascade impact),
     // loaded async from the #225 per-account read endpoints.
     if (isMod) loadKryphocronDrawer(currentDid);
+    // Per-account override controls (SuperAdmin, #316).
+    if (isSuper) loadOverridesDrawer(currentDid);
 
     // Mount Pattern B (moderation) ActionPanel.
     const modPanelHost = document.getElementById('ad-mod-action-panel');
@@ -222,6 +235,64 @@
     }
 
     host.innerHTML = html;
+  }
+
+  // Per-account override controls (SuperAdmin, §6.6.2 item 4 / #316): two
+  // checkboxes (block capability-issuance; exempt from rate limits — stored,
+  // enforced when per-tier limits ship) + a required rationale + an audit pivot.
+  async function loadOverridesDrawer(did) {
+    const K = global.AuroraEndpoints && global.AuroraEndpoints.ops && global.AuroraEndpoints.ops.kryphocron;
+    const host = document.getElementById('ad-overrides-body');
+    if (!host || !K) return;
+    let ov = {};
+    try {
+      const res = await K.getAccountOverrides(did);
+      ov = (res && res.overrides) || {};
+    } catch (e) {
+      host.innerHTML = '<p class="empty-state">' + esc(T('kryphocron.overrides.error')) + '</p>';
+      return;
+    }
+    if (currentDid !== did) return;
+    const blocked = ov.capabilityIssuance === false;
+    const rlExempt = ov.rateLimitExempt === true;
+    host.innerHTML =
+      '<label class="ad-ov-row"><input type="checkbox" id="ad-ov-block"' + (blocked ? ' checked' : '') + '> ' +
+        esc(T('kryphocron.overrides.block_label')) + '</label>' +
+      '<label class="ad-ov-row"><input type="checkbox" id="ad-ov-ratelimit"' + (rlExempt ? ' checked' : '') + '> ' +
+        esc(T('kryphocron.overrides.ratelimit_label')) + '</label>' +
+      '<p class="settings-help">' + esc(T('kryphocron.overrides.ratelimit_note')) + '</p>' +
+      '<label class="ad-ov-rationale">' + esc(T('kryphocron.overrides.rationale_label')) +
+        '<textarea id="ad-ov-rationale" rows="2"></textarea></label>' +
+      '<div class="ad-ov-actions">' +
+        '<button type="button" class="btn-primary btn-sm" id="ad-ov-save">' + esc(T('common.save')) + '</button>' +
+        '<a class="btn-secondary btn-sm" href="#mod/audit?subject=' + encodeURIComponent(did) + '">' +
+          esc(T('kryphocron.overrides.audit_pivot')) + '</a>' +
+      '</div>';
+    const saveBtn = document.getElementById('ad-ov-save');
+    if (saveBtn) saveBtn.addEventListener('click', function () { saveOverride(did); });
+  }
+
+  async function saveOverride(did) {
+    const K = global.AuroraEndpoints.ops.kryphocron;
+    const rationale = (document.getElementById('ad-ov-rationale').value || '').trim();
+    if (!rationale) { global.AuroraToast.warning(T('kryphocron.overrides.rationale_required')); return; }
+    // Checkbox → full-state value: blocked sets capabilityIssuance=false,
+    // unchecked clears to null (default allowed); exempt sets rateLimitExempt=true.
+    const body = {
+      did: did,
+      capabilityIssuance: document.getElementById('ad-ov-block').checked ? false : null,
+      rateLimitExempt: document.getElementById('ad-ov-ratelimit').checked ? true : null,
+      rationale: rationale,
+    };
+    try {
+      const res = await K.setAccountOverride(body);
+      global.AuroraToast.success(T('kryphocron.overrides.saved'), res && res.auditEntryId ? {
+        action: { label: T('settings.roles.view_audit'), href: '#mod/audit/' + encodeURIComponent(res.auditEntryId) },
+      } : undefined);
+      loadOverridesDrawer(did);
+    } catch (e) {
+      global.AuroraToast.danger(T('kryphocron.overrides.save_failed') + (e && e.message ? ': ' + e.message : ''));
+    }
   }
 
   function overviewHtml(info) {

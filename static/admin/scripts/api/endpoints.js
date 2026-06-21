@@ -115,6 +115,11 @@
       C().get('tools.aurora.ops.kryphocron.listAudiences', { account: account }),
     getBlockCascadeImpact: (account) =>
       C().get('tools.aurora.ops.kryphocron.getBlockCascadeImpact', { account: account }),
+    // Per-account overrides (#316, SuperAdmin) — Account Detail drawer.
+    getAccountOverrides: (did) =>
+      C().get('tools.aurora.ops.kryphocron.getAccountOverrides', { did: did }),
+    setAccountOverride: (body) =>
+      C().post('tools.aurora.ops.kryphocron.setAccountOverride', body || {}),
   };
 
   // -------- tools.aurora.superadmin.* --------

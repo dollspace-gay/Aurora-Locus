@@ -629,6 +629,18 @@
       "cascade_count": "{count, plural, =0 {No cascade-driven audience removals} one {# cascade-driven audience removal} other {# cascade-driven audience removals}}",
       "cascade_pending": "Block-cascade bookkeeping is not yet recorded on this deployment.",
       "cascade_error": "Could not load block-cascade impact."
+    },
+    "overrides": {
+      "title": "Kryphocron overrides",
+      "error": "Could not load per-account overrides.",
+      "block_label": "Block this account from issuing kryphocron capabilities (private posts, blocks, audiences)",
+      "ratelimit_label": "Exempt this account from per-tier kryphocron rate limits",
+      "ratelimit_note": "Stored now; enforced once per-tier kryphocron rate limits ship.",
+      "rationale_label": "Rationale (required)",
+      "rationale_required": "A rationale is required to change an override.",
+      "audit_pivot": "View override history",
+      "saved": "Per-account override saved.",
+      "save_failed": "Could not save override"
     }
   },
   "actions": {
