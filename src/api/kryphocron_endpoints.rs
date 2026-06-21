@@ -437,9 +437,15 @@ async fn participate_private(
         })?
         .to_string();
 
+    // #335 — instrument the write-side audience-oracle consultation (§6.4.1).
+    // Aggregate counts only; surfaced by getOracleActivity.
+    use crate::kryphocron_oracle_activity::OracleConsultation;
     match check_participate_audience(&ctx, &parent_uri, auth_did.value()).await? {
-        ParticipateAudienceOutcome::Allowed => {}
+        ParticipateAudienceOutcome::Allowed => {
+            ctx.audience_oracle_activity.record(OracleConsultation::WriteAllowed);
+        }
         ParticipateAudienceOutcome::DeferredCrossDid { parent_owner } => {
+            ctx.audience_oracle_activity.record(OracleConsultation::WriteDeferred);
             tracing::warn!(
                 target: "aurora_locus::kryphocron",
                 event = "participate_private_audience_check_deferred",
@@ -453,6 +459,7 @@ async fn participate_private(
             );
         }
         ParticipateAudienceOutcome::Denied(payload) => {
+            ctx.audience_oracle_activity.record(OracleConsultation::WriteDenied);
             let mut tx = ctx
                 .account_db
                 .begin()

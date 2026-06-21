@@ -198,6 +198,14 @@ pub struct AppContext {
     pub kryphocron_rotation_oracle:
         Option<Arc<crate::kryphocron_rotation::AuroraLocusStandardRotationOracle>>,
 
+    /// v0.9 Arc D (#335) — process-local tally of audience-oracle consultations
+    /// (§6.4.1). The write path (`participatePrivate`) and read path
+    /// (`authorize_private_read`) increment it; `getOracleActivity` reads the
+    /// snapshot. Aggregate counts only (no per-subject data), so it honours the
+    /// substrate privacy property. Always present (cheap, no kryphocron
+    /// dependency); the endpoint still gates on kryphocron being enabled.
+    pub audience_oracle_activity: Arc<crate::kryphocron_oracle_activity::AudienceOracleActivity>,
+
     /// v0.9 Arc D (#236) — the persisted kryphocron at-rest hooks
     /// (Laquna `ContentCodec` baseline + the #223
     /// `aurora-locus-standard` rotation oracle). `Some` when
@@ -1118,6 +1126,9 @@ impl AppContext {
             config: Arc::new(config),
             account_db,
             account_manager,
+            audience_oracle_activity: Arc::new(
+                crate::kryphocron_oracle_activity::AudienceOracleActivity::new(chrono::Utc::now()),
+            ),
             actor_store,
             blob_store,
             identity_resolver,

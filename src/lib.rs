@@ -28,6 +28,7 @@ pub mod jobs;
 pub mod kryphocron;
 pub mod kryphocron_audit;
 pub mod kryphocron_content;
+pub mod kryphocron_oracle_activity;
 pub mod kryphocron_override;
 pub mod kryphocron_policy;
 pub mod kryphocron_rewrite;

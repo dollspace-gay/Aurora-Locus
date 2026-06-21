@@ -556,10 +556,21 @@ pub(crate) async fn authorize_private_read(
         .expect("precheck returned None only when audienceList is present");
     let reader = reader_did.expect("precheck returned None only for a non-anonymous reader");
 
+    // #335 — this membership resolution IS the read-side audience-oracle
+    // consultation (the store-free prechecks above are not). Record the
+    // aggregate outcome for getOracleActivity (§6.4.1).
+    use crate::kryphocron_oracle_activity::OracleConsultation;
     match resolve_list_audience_membership(ctx, audience_uri, reader).await {
-        Ok(true) => ReadAuthz::Authorized,
-        Ok(false) => ReadAuthz::NotAuthorized,
+        Ok(true) => {
+            ctx.audience_oracle_activity.record(OracleConsultation::ReadAuthorized);
+            ReadAuthz::Authorized
+        }
+        Ok(false) => {
+            ctx.audience_oracle_activity.record(OracleConsultation::ReadDenied);
+            ReadAuthz::NotAuthorized
+        }
         Err(e) => {
+            ctx.audience_oracle_activity.record(OracleConsultation::ReadDenied);
             // Fail closed: an audience-resolution error denies the read.
             tracing::warn!(
                 target: "aurora_locus::kryphocron",

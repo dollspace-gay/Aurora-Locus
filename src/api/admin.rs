@@ -9259,6 +9259,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_oracle_activity_reports_instrumented_audience_counts() {
+        // #335 — with kryphocron enabled (the v0.9 default), the endpoint
+        // surfaces the audience-oracle consultation tally as instrumented
+        // aggregate counts (not the old instrumented:false stub).
+        use crate::api::aurora_kryphocron_ops as k;
+        use crate::kryphocron_oracle_activity::OracleConsultation;
+        let ctx = create_test_context().await;
+        ctx.audience_oracle_activity.record(OracleConsultation::WriteAllowed);
+        ctx.audience_oracle_activity.record(OracleConsultation::WriteDenied);
+        ctx.audience_oracle_activity.record(OracleConsultation::WriteDeferred);
+        ctx.audience_oracle_activity.record(OracleConsultation::ReadAuthorized);
+        ctx.audience_oracle_activity.record(OracleConsultation::ReadAuthorized);
+
+        let body = k::get_oracle_activity(State(ctx.clone()), admin_test_auth())
+            .await
+            .expect("enabled substrate returns activity")
+            .0;
+        assert_eq!(body["instrumented"], true);
+        assert_eq!(body["oracle"], "audience");
+        assert!(body["since"].is_string());
+        assert_eq!(body["consultations"]["total"], 5);
+        assert_eq!(body["consultations"]["write"]["allowed"], 1);
+        assert_eq!(body["consultations"]["write"]["denied"], 1);
+        assert_eq!(body["consultations"]["write"]["deferred"], 1);
+        assert_eq!(body["consultations"]["read"]["authorized"], 2);
+        assert_eq!(body["consultations"]["read"]["denied"], 0);
+    }
+
+    #[tokio::test]
     async fn test_kryphocron_ops_disabled_returns_400() {
         use crate::api::aurora_kryphocron_ops as k;
         // Kryphocron is on by default (v0.9); this test exercises the

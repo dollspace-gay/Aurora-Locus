@@ -142,10 +142,33 @@
     if (!card) return;
     try {
       const o = await K().getOracleActivity();
-      const body = o && o.instrumented
-        ? '<p class="stat-value">' + esc(String(o.consultations != null ? o.consultations : '—')) + '</p>'
-        : '<div class="empty-state" role="status"><p>' +
+      let body;
+      if (o && o.instrumented) {
+        // #335 — audience-oracle consultation counts (aggregate; no per-subject
+        // data). Write path = participate checks; read path = membership checks.
+        const c = (o && o.consultations) || {};
+        const w = c.write || {};
+        const r = c.read || {};
+        const n = (v) => esc(String(v == null ? 0 : v));
+        const since = o.since
+          ? '<p class="settings-help">' + esc(t('kryphocron.overview.oracle_since')) + ' ' +
+            ts(o.since, 'absolute') + '</p>'
+          : '';
+        body =
+          '<p class="stat-value">' + n(c.total) + ' ' +
+          esc(t('kryphocron.overview.oracle_consultations')) + '</p>' +
+          '<p>' + esc(t('kryphocron.overview.oracle_write')) + ': ' +
+          n(w.allowed) + ' ' + esc(t('kryphocron.overview.oracle_allowed')) + ' · ' +
+          n(w.denied) + ' ' + esc(t('kryphocron.overview.oracle_denied')) + ' · ' +
+          n(w.deferred) + ' ' + esc(t('kryphocron.overview.oracle_deferred')) + '</p>' +
+          '<p>' + esc(t('kryphocron.overview.oracle_read')) + ': ' +
+          n(r.authorized) + ' ' + esc(t('kryphocron.overview.oracle_authorized')) + ' · ' +
+          n(r.denied) + ' ' + esc(t('kryphocron.overview.oracle_denied')) + '</p>' +
+          since;
+      } else {
+        body = '<div class="empty-state" role="status"><p>' +
           esc((o && o.message) || t('kryphocron.overview.oracle_pending')) + '</p></div>';
+      }
       card.innerHTML = '<h3>' + esc(t('kryphocron.overview.oracle_title')) + '</h3>' + body;
     } catch (e) {
       card.innerHTML = errorCard(t('kryphocron.overview.oracle_title'), e);

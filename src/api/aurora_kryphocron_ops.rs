@@ -14,7 +14,7 @@
 //! |---|---|---|
 //! | `getSubstrateInfo` | Overview (§6.4.1) | Moderator+ |
 //! | `getTierStats` | Overview, Tier activity (§6.4.4) | Moderator+ |
-//! | `getOracleActivity` | Overview (§6.4.1, stub) | Moderator+ |
+//! | `getOracleActivity` | Overview (§6.4.1) | Moderator+ |
 //! | `getRotationStatus` | Overview, Laquna (§6.4.2) | Moderator+ |
 //! | `getRotationProgress` | Laquna (§6.4.2) | Admin+ |
 //! | `cancelRotation` | Laquna (§6.4.2) | Admin+ |
@@ -37,9 +37,6 @@
 //!
 //! ## What is stub-gated today
 //!
-//! - `getOracleActivity` — Aurora-Locus's standard oracle ships no consultation
-//!   instrumentation (kryphocron exposes no oracle-internal metrics by design,
-//!   §6.4.1 note); the endpoint returns an explicit `instrumented: false` shape.
 //! - `getBlockCascadeImpact` — reads `block-cascade.log`, which the block
 //!   handler does not yet write (post-Arc-2 work); a missing log reads as a
 //!   zero-impact `available: false` shape.
@@ -467,11 +464,15 @@ async fn walk_time_series(
 // getOracleActivity (§6.4.1, stub) — Moderator+
 // ============================================================================
 
-/// `tools.aurora.ops.kryphocron.getOracleActivity` — oracle consultation
-/// counts. Stub-gated (§6.4.1 / §7.2.1): Aurora-Locus's standard oracle ships
-/// no consultation instrumentation, and kryphocron exposes no oracle-internal
-/// metrics by design, so this returns an explicit `instrumented: false` shape
-/// the Overview renders as its "available when …" placeholder. Moderator+.
+/// `tools.aurora.ops.kryphocron.getOracleActivity` — audience-oracle
+/// consultation counts (#335 / §6.4.1). kryphocron 0.3.0 exposes no
+/// oracle-internal metrics, and there is no block/mute oracle in a standard
+/// deployment; the real Aurora-Locus-side oracle is the audience oracle,
+/// consulted on the private-write (`participatePrivate`) and private-read
+/// (`authorize_private_read`) paths. This surfaces the design's "consultation
+/// counts via Aurora-Locus-side wrapping" — aggregate counts only (no
+/// per-subject data, honouring the substrate privacy property). The window is
+/// process-local since `since` (restart resets it). Moderator+.
 pub async fn get_oracle_activity(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
@@ -479,12 +480,23 @@ pub async fn get_oracle_activity(
     if ctx.kryphocron_rotation_oracle.is_none() {
         return Err(kryphocron_disabled());
     }
+    let s = ctx.audience_oracle_activity.snapshot();
     Ok(Json(json!({
-        "instrumented": false,
-        "consultations": serde_json::Value::Null,
-        "message": "Oracle consultation instrumentation is not installed in this \
-                    substrate build; available when Aurora-Locus ships oracle-activity \
-                    instrumentation.",
+        "instrumented": true,
+        "oracle": "audience",
+        "since": s.started_at.to_rfc3339(),
+        "consultations": {
+            "total": s.total,
+            "write": {
+                "allowed": s.write_allowed,
+                "denied": s.write_denied,
+                "deferred": s.write_deferred,
+            },
+            "read": {
+                "authorized": s.read_authorized,
+                "denied": s.read_denied,
+            },
+        },
     })))
 }
 

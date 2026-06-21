@@ -27,6 +27,7 @@ mod jobs;
 mod kryphocron;
 mod kryphocron_audit;
 mod kryphocron_content;
+mod kryphocron_oracle_activity;
 mod kryphocron_override;
 mod kryphocron_policy;
 mod kryphocron_rewrite;
