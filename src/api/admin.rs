@@ -5740,6 +5740,10 @@ async fn get_subject_status(
 
 #[derive(Deserialize)]
 struct GetModerationQueueQuery {
+    /// Queue header status filter (#209). Absent → open-only (prior default);
+    /// `all` → every status; otherwise a report status, else `400`.
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     limit: Option<i64>,
 }
@@ -5752,10 +5756,15 @@ async fn get_moderation_queue(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     use crate::admin::reports::ReportStatus;
 
-    // Get open reports as the moderation queue
+    // Resolve the header status filter (#209). No param preserves the prior
+    // hardcoded open-only queue; `all` widens to every status; an unknown
+    // value is a 400 rather than a silently-ignored decorative filter.
+    let status_filter = ReportStatus::queue_filter_from_param(query.status.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
     let reports = ctx
         .report_manager
-        .list_reports(Some(ReportStatus::Open), query.limit)
+        .list_reports(status_filter, query.limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

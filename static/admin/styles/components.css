@@ -1126,6 +1126,13 @@ input[type="checkbox"][disabled] {
   color: var(--color-text-secondary);
 }
 
+/* Clear-filters link under a filtered-empty list (§5.3.1 queue, #209). */
+.empty-state-action {
+  text-align: center;
+  margin-block-start: var(--space-2);
+  font-size: var(--font-size-sm);
+}
+
 .filter-bar input[type="text"],
 .filter-bar select {
   flex: 1;

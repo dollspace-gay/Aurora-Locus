@@ -5,19 +5,54 @@
   'use strict';
 
   let bulkSelected = new Set();
+  let lastFilters = {};
+
+  // §5.3.1 / #209: the queue header status filter, restored with backend
+  // wiring. Only the Status facet is surfaced: the queue is reports-only, so
+  // the design's Type facet would need the (unbuilt) appeals-merge, and
+  // Subject/Date have no queue-path backend — adding them would re-create the
+  // decorative no-op filter that #209 was filed to remove. Scalar `status`
+  // round-trips through the URL hash via the shared AuroraListPage shape
+  // (components/ListPage.js, #257), so it survives navigation and reload.
+  const SCALAR_KEYS = ['status'];
+  const BOOL_KEYS = [];
+
+  function applyFilters(vals) {
+    global.AuroraListPage.applyFilters(SCALAR_KEYS, BOOL_KEYS, vals, null, function (v) {
+      lastFilters = v;
+      refresh();
+    });
+  }
 
   async function mount({ container }) {
     container.innerHTML =
       '<header class="page-header">' +
       '  <div><h2>Queue</h2><p class="page-subtitle">Items needing attention</p></div>' +
       '</header>' +
+      '<div id="queue-filter"></div>' +
+      '<p class="filter-url-hint">' + (global.t ? global.t('common.filters_in_url') : '') + '</p>' +
       '<div id="queue-bulk-bar"></div>' +
       '<div class="moderation-queue" id="queue-items"></div>';
     bulkSelected = new Set();
-    // §10.1.1: the prior header filter select (all/pending/reviewed) was
-    // never wired — get_moderation_queue is hardcoded to open reports and
-    // accepts no status filter — so it's removed rather than left decorative.
-    // Backend support for queue filtering is tracked separately (#209).
+    // Default to open-only, matching the backend's no-param behavior and the
+    // §5.3.1 "items needing attention" framing.
+    lastFilters = global.AuroraListPage.readFilters(SCALAR_KEYS, BOOL_KEYS, { status: 'open' });
+    if (global.AuroraFilterStrip) {
+      global.AuroraFilterStrip.build({
+        container: document.getElementById('queue-filter'),
+        filters: [
+          { type: 'select', id: 'status', label: 'Status', options: [
+            { value: 'open', label: 'Open' },
+            { value: 'acknowledged', label: 'Acknowledged' },
+            { value: 'escalated', label: 'Escalated' },
+            { value: 'resolved', label: 'Resolved' },
+            { value: 'all', label: 'All' },
+          ] },
+        ],
+        initial: lastFilters,
+        onApply: applyFilters,
+      });
+    }
     await refresh();
     return { unmount: () => { bulkSelected = new Set(); } };
   }
@@ -26,16 +61,34 @@
     const ep = global.AuroraEndpoints;
     const c = document.getElementById('queue-items');
     if (!c || !ep) return;
+    const params = { limit: 50 };
+    // Omit status only when unset; the default 'open' and explicit 'all' both
+    // round-trip ('all' clears the filter server-side).
+    if (lastFilters.status) params.status = lastFilters.status;
     try {
-      const data = await ep.atproto.getModerationQueue({ limit: 50 });
+      const data = await ep.atproto.getModerationQueue(params);
       // Canonical key is `queue` (get_moderation_queue returns {queue, count});
       // tolerate `items` defensively. Reading only `items` left the list
       // permanently empty.
       const items = (data && (data.queue || data.items)) || [];
       if (items.length === 0) {
-        c.innerHTML = global.AuroraEmptyState
-          ? global.AuroraEmptyState.render({ icon: 'inbox', primary: 'Nothing in the queue.', secondary: 'Things will appear here as reports and appeals come in.' })
-          : '<p class="empty-state">Nothing in the queue.</p>';
+        // §5.3.1: distinguish a filtered miss from a genuinely empty queue.
+        const filterActive = lastFilters.status && lastFilters.status !== 'open';
+        if (filterActive) {
+          c.innerHTML = (global.AuroraEmptyState
+            ? global.AuroraEmptyState.render({ icon: 'inbox', primary: 'No matches.', secondary: 'Try widening your filters.' })
+            : '<p class="empty-state">No matches.</p>') +
+            '<p class="empty-state-action"><a href="#" id="queue-clear-filters">Clear all filters</a></p>';
+          const clear = document.getElementById('queue-clear-filters');
+          if (clear) clear.addEventListener('click', function (e) {
+            e.preventDefault();
+            applyFilters({ status: 'open' });
+          });
+        } else {
+          c.innerHTML = global.AuroraEmptyState
+            ? global.AuroraEmptyState.render({ icon: 'inbox', primary: 'Nothing in the queue.', secondary: 'Things will appear here as reports and appeals come in.' })
+            : '<p class="empty-state">Nothing in the queue.</p>';
+        }
         bulkSelected = new Set();
         renderBulkBar();
         return;

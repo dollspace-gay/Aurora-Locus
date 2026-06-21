@@ -71,6 +71,24 @@ impl ReportStatus {
             ReportStatus::Escalated => "escalated",
         }
     }
+
+    /// Resolve the moderation-queue `status` query parameter to a report-status
+    /// filter (#209). The queue header's status filter restores against this:
+    ///
+    /// - **absent** → `Some(Open)`: the queue's prior hardcoded open-only view
+    ///   and the design default (§5.3.1, "open reports … needing attention"),
+    ///   so a bare call to the endpoint behaves exactly as before this param;
+    /// - the literal **`all`** → `None`: no filter, every status (the
+    ///   FilterStrip "All" option);
+    /// - **any other value** → parsed as a [`ReportStatus`], or a validation
+    ///   error the handler maps to `400` (no silently-ignored garbage).
+    pub fn queue_filter_from_param(param: Option<&str>) -> PdsResult<Option<ReportStatus>> {
+        match param {
+            None => Ok(Some(ReportStatus::Open)),
+            Some(s) if s.eq_ignore_ascii_case("all") => Ok(None),
+            Some(s) => s.parse::<ReportStatus>().map(Some),
+        }
+    }
 }
 
 impl FromStr for ReportStatus {
@@ -393,5 +411,101 @@ mod tests {
         let post = manager.get_report(report.id).await.unwrap().unwrap();
         assert_eq!(post.status, ReportStatus::Open);
         assert!(post.resolution.is_none());
+    }
+
+    // #209: the queue header status filter resolves through
+    // ReportStatus::queue_filter_from_param. Pins the three branches the
+    // get_moderation_queue handler depends on.
+    #[test]
+    fn queue_filter_absent_defaults_to_open() {
+        // No param → open-only, preserving the queue's prior hardcoded view.
+        assert_eq!(
+            ReportStatus::queue_filter_from_param(None).unwrap(),
+            Some(ReportStatus::Open)
+        );
+    }
+
+    #[test]
+    fn queue_filter_all_is_unfiltered() {
+        // The FilterStrip "All" option (case-insensitive) clears the filter.
+        assert_eq!(
+            ReportStatus::queue_filter_from_param(Some("all")).unwrap(),
+            None
+        );
+        assert_eq!(
+            ReportStatus::queue_filter_from_param(Some("ALL")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn queue_filter_parses_known_statuses() {
+        assert_eq!(
+            ReportStatus::queue_filter_from_param(Some("escalated")).unwrap(),
+            Some(ReportStatus::Escalated)
+        );
+        assert_eq!(
+            ReportStatus::queue_filter_from_param(Some("resolved")).unwrap(),
+            Some(ReportStatus::Resolved)
+        );
+    }
+
+    #[test]
+    fn queue_filter_rejects_unknown_value() {
+        // Drives the handler's 400 — no silently-ignored garbage filter.
+        assert!(ReportStatus::queue_filter_from_param(Some("garbage")).is_err());
+    }
+
+    // #209: list_reports actually narrows by status, so the resolved filter
+    // changes the queue result set (not just the param plumbing).
+    #[tokio::test]
+    async fn list_reports_status_filter_narrows_result_set() {
+        let db = open_test_pool().await;
+        let manager = ReportManager::new(db.clone());
+
+        // Two open reports; one then escalated.
+        let r1 = manager
+            .submit_report(
+                Some("did:plc:a"),
+                None,
+                None,
+                ReportReason::Spam,
+                Some("one"),
+                "did:plc:reporter",
+            )
+            .await
+            .unwrap();
+        manager
+            .submit_report(
+                Some("did:plc:b"),
+                None,
+                None,
+                ReportReason::Spam,
+                Some("two"),
+                "did:plc:reporter",
+            )
+            .await
+            .unwrap();
+        manager
+            .update_status(r1.id, ReportStatus::Escalated, "did:plc:mod", None)
+            .await
+            .unwrap();
+
+        let open = manager
+            .list_reports(Some(ReportStatus::Open), None)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1, "one report remains open");
+        assert_eq!(open[0].subject_did.as_deref(), Some("did:plc:b"));
+
+        let escalated = manager
+            .list_reports(Some(ReportStatus::Escalated), None)
+            .await
+            .unwrap();
+        assert_eq!(escalated.len(), 1, "one report escalated");
+        assert_eq!(escalated[0].subject_did.as_deref(), Some("did:plc:a"));
+
+        let all = manager.list_reports(None, None).await.unwrap();
+        assert_eq!(all.len(), 2, "no filter returns the full set");
     }
 }
