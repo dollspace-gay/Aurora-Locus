@@ -253,6 +253,31 @@ async fn create_account(
         }
     }
 
+    // Default audience auto-create (#334 / §6.6.2 item 2 / §7.3.3): when the
+    // deployment's default-audience-mode is a participating mode, author a
+    // policy.audience record on the new account carrying that initial mode (the
+    // holder populates its members later). The `nobody` default authors nothing
+    // (the prior behavior). Best-effort: a failure is logged but never fails
+    // account creation — the account and its repo already exist.
+    if let Some(mode) = crate::kryphocron_policy::default_audience_mode(&ctx.account_db).await {
+        match crate::api::kryphocron_endpoints::author_default_audience(&ctx, &account.did, &mode)
+            .await
+        {
+            Ok(uri) => tracing::info!(
+                did = %account.did,
+                mode = %mode,
+                uri = %uri,
+                "create_account: authored default policy.audience"
+            ),
+            Err(e) => tracing::warn!(
+                did = %account.did,
+                mode = %mode,
+                error = %e,
+                "create_account: default audience auto-create failed (account created OK)"
+            ),
+        }
+    }
+
     // Generate and send email verification token if email was provided
     if let Some(email_val) = &email {
         if ctx.mailer.is_configured() {

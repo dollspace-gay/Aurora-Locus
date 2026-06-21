@@ -290,6 +290,38 @@ async fn apply_single_delete(
     Ok(())
 }
 
+/// Build the default `policy.audience` record for a freshly-created account
+/// (#334 / §7.3.3). Only `list` mode carries a member list (empty — the holder
+/// populates it); the relational modes (`everyone`/`followers`/`following`)
+/// need none. Pure, so the record shape is unit-testable without a repo.
+fn default_audience_record(mode: &str) -> serde_json::Value {
+    let mut record = serde_json::json!({ "$type": NSID_AUDIENCE, "mode": mode });
+    if mode == "list" {
+        record["members"] = serde_json::json!([]);
+    }
+    record
+}
+
+/// Author the deployment's default `policy.audience` record on a newly-created
+/// account's own repo (#334 / §6.6.2 item 2 / §7.3.3). Host-initiated on the
+/// account's behalf at setup: it authors through `apply_writes` directly (not
+/// the request chokepoint, so the new-account-access delay guard doesn't apply
+/// to this host write), signed with the new account's key, emitting a normal
+/// #commit. The caller treats failure as non-fatal — the account already
+/// exists. `mode` must be a participating mode (the `nobody` default never
+/// reaches here; see [`crate::kryphocron_policy::default_audience_mode`]).
+pub async fn author_default_audience(
+    ctx: &AppContext,
+    did: &str,
+    mode: &str,
+) -> PdsResult<String> {
+    let auth = AuthenticatedDid::from_authenticated(did.to_string());
+    let resp =
+        apply_single_create(ctx, &auth, NSID_AUDIENCE, None, default_audience_record(mode), None)
+            .await?;
+    Ok(resp.uri)
+}
+
 /// `tools.kryphocron.feed.createPostPrivate` — create a
 /// `tools.kryphocron.feed.postPrivate` record under the
 /// `EditPrivatePost` (user-class) capability. The bind pipeline
@@ -797,4 +829,24 @@ async fn delete_block(
     crate::cascade::record_block_deleted(&ctx, auth_did.value(), subject.as_deref(), &block_uri)
         .await;
     Ok(Json(serde_json::json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #334 — the default policy.audience record shape authored at account setup.
+    #[test]
+    fn default_audience_record_shapes_per_mode() {
+        let list = default_audience_record("list");
+        assert_eq!(list["$type"], NSID_AUDIENCE);
+        assert_eq!(list["mode"], "list");
+        assert_eq!(list["members"], serde_json::json!([]), "list mode carries an empty member list");
+
+        for mode in ["everyone", "followers", "following"] {
+            let rec = default_audience_record(mode);
+            assert_eq!(rec["mode"], mode);
+            assert!(rec.get("members").is_none(), "{mode} mode carries no member list");
+        }
+    }
 }

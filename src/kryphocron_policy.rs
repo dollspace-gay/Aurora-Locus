@@ -13,7 +13,8 @@
 //! rotation-oracle's read in `context.rs`.
 
 use crate::api::aurora_admin::{
-    KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY,
+    KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY,
+    KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY,
 };
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{AnyPool, Row};
@@ -78,6 +79,24 @@ pub async fn new_account_access_delay_remaining(
         Some((secs + 86_399) / 86_400)
     } else {
         None
+    }
+}
+
+/// The deployment's default audience mode for newly-created accounts (§6.6.2
+/// item 2 / §7.3.3). Returns `Some(mode)` only when the operator has selected a
+/// real participating mode (`list` / `everyone` / `followers` / `following`) —
+/// the signal to auto-author a `policy.audience` record at account setup. The
+/// default `nobody` (and any unset/unreadable/invalid value) returns `None`:
+/// no record is authored, the account participates nowhere until its holder
+/// opts in (the prior behavior). Fail-soft.
+pub async fn default_audience_mode(pool: &AnyPool) -> Option<String> {
+    let mode = read_runtime_value(pool, KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY)
+        .await
+        .and_then(|v| v.as_str().map(str::to_string))?;
+    match mode.as_str() {
+        "list" | "everyone" | "followers" | "following" => Some(mode),
+        // `nobody` (the default) and anything unexpected → author nothing.
+        _ => None,
     }
 }
 
@@ -184,5 +203,24 @@ mod tests {
         // No actor row for this DID → fail-soft to open (the write-authz layer
         // confirms repo ownership separately).
         assert_eq!(new_account_access_delay_remaining(&p, "did:plc:ghost", now()).await, None);
+    }
+
+    #[tokio::test]
+    async fn default_audience_mode_only_for_participating_modes() {
+        let p = pool().await;
+        // Unset → None (no record authored; the nobody default).
+        assert_eq!(default_audience_mode(&p).await, None);
+        // Explicit nobody → still None.
+        set(&p, KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY, "\"nobody\"").await;
+        assert_eq!(default_audience_mode(&p).await, None);
+    }
+
+    #[tokio::test]
+    async fn default_audience_mode_returns_participating_value() {
+        for mode in ["list", "everyone", "followers", "following"] {
+            let p = pool().await;
+            set(&p, KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY, &format!("\"{mode}\"")).await;
+            assert_eq!(default_audience_mode(&p).await.as_deref(), Some(mode));
+        }
     }
 }

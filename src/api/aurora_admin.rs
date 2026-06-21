@@ -3710,8 +3710,9 @@ pub const KRYPHOCRON_ACCESS_DELAY_DAYS_KEY: &str = "kryphocron.policy.access-del
 /// Initial `mode` of the `policy.audience` record Aurora-Locus auto-creates for
 /// a new account (§6.6.2 item 2 / §7.3.3). One of the five kryphocron audience
 /// modes; `nobody` (default) authors no record at all — the account
-/// participates nowhere until its holder opts in.
-const KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY: &str = "kryphocron.policy.default-audience-mode";
+/// participates nowhere until its holder opts in. Consumed by
+/// [`crate::kryphocron_policy`] at account creation.
+pub const KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY: &str = "kryphocron.policy.default-audience-mode";
 
 /// Deployment process-shape declaration (§8.3.4): `single-process` (the
 /// standard oracle) or `multi-process` (an operator-coordinated oracle). Pure
