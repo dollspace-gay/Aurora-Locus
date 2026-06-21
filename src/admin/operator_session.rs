@@ -299,6 +299,37 @@ impl OperatorSessionStore {
         Ok(did)
     }
 
+    /// Revoke EVERY active session for one operator (#338) — the SuperAdmin
+    /// bulk force-logout for a compromised or departed operator. "Active" =
+    /// not already revoked and not past expiry, so the returned count matches
+    /// what `list_by_did` shows and an already-expired session isn't counted
+    /// (the #271 per-request gate already rejects it). Idempotent: a second
+    /// call revokes nothing and returns 0. The caller authorizes (SuperAdmin)
+    /// and audits against `did` before invoking. Session revocation only forces
+    /// re-authentication — it does not touch roles — so there is no
+    /// last-SuperAdmin lockout to guard here (that guard is for role revocation).
+    pub async fn revoke_all_for_did_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        revoked_by: &str,
+        reason: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> PdsResult<u64> {
+        let now_str = now.to_rfc3339();
+        let res = sqlx::query(
+            "UPDATE operator_session \
+             SET revoked = TRUE, revoked_at = $1, revoked_by = $2, revoke_reason = $3 \
+             WHERE did = $4 AND NOT revoked AND expires_at > $1",
+        )
+        .bind(&now_str)
+        .bind(revoked_by)
+        .bind(reason)
+        .bind(did)
+        .execute(&mut **tx)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// List a single operator's active sessions (self-service), newest
     /// first, keyset-paginated. "Active" excludes revoked and expired.
     pub async fn list_by_did(
@@ -536,6 +567,69 @@ mod tests {
             !store.validate_and_touch(&sid).await.unwrap(),
             "revoked session must fail the per-request gate immediately"
         );
+    }
+
+    // ---------- #338 bulk revoke-all-for-operator ----------
+
+    #[tokio::test]
+    async fn revoke_all_for_did_revokes_only_that_operators_active_sessions() {
+        let clock = Arc::new(MockClock::new(anchor()));
+        let store = OperatorSessionStore::new(open_test_pool().await).with_clock(clock.clone());
+        store.create("did:plc:a", None, None, "ra1", Duration::days(30)).await.unwrap();
+        store.create("did:plc:a", None, None, "ra2", Duration::days(30)).await.unwrap();
+        store.create("did:plc:b", None, None, "rb1", Duration::days(30)).await.unwrap();
+
+        let now = clock.now();
+        let mut tx = store.db.begin().await.unwrap();
+        let n = OperatorSessionStore::revoke_all_for_did_in_tx(
+            &mut tx,
+            "did:plc:a",
+            "did:plc:super",
+            Some("suspected compromise"),
+            now,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(n, 2, "both of operator A's active sessions revoked");
+
+        let (a, _) = store.list_by_did("did:plc:a", 50, None).await.unwrap();
+        assert!(a.is_empty(), "A has no active sessions left");
+        let (b, _) = store.list_by_did("did:plc:b", 50, None).await.unwrap();
+        assert_eq!(b.len(), 1, "operator B is untouched");
+
+        // Idempotent: a second bulk revoke finds nothing active.
+        let mut tx2 = store.db.begin().await.unwrap();
+        let n2 = OperatorSessionStore::revoke_all_for_did_in_tx(
+            &mut tx2,
+            "did:plc:a",
+            "did:plc:super",
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        tx2.commit().await.unwrap();
+        assert_eq!(n2, 0, "nothing left to revoke on the second pass");
+    }
+
+    #[tokio::test]
+    async fn revoke_all_for_did_skips_already_expired_sessions() {
+        let clock = Arc::new(MockClock::new(anchor()));
+        let store = OperatorSessionStore::new(open_test_pool().await).with_clock(clock.clone());
+        store.create("did:plc:c", None, None, "rc1", Duration::seconds(10)).await.unwrap();
+        // Past expiry: the session is already dead to the per-request gate, so a
+        // bulk revoke targeting "active" sessions counts it as nothing.
+        clock.advance(Duration::seconds(20));
+        let now = clock.now();
+        let mut tx = store.db.begin().await.unwrap();
+        let n = OperatorSessionStore::revoke_all_for_did_in_tx(
+            &mut tx, "did:plc:c", "did:plc:super", None, now,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(n, 0, "an already-expired session is not an active revoke target");
     }
 
     // ---------- #272 rotation-on-use ----------

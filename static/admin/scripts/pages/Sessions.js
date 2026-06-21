@@ -40,7 +40,8 @@
       html += '<div id="sessions-filter"></div>' +
         '<p class="filter-url-hint">' + esc(T('sessions.all_operators_hint')) + '</p>';
     }
-    html += '<div id="sessions-table">' + global.AuroraSkeleton.lines(4) + '</div>' +
+    html += '<div id="sessions-bulk"></div>' +
+      '<div id="sessions-table">' + global.AuroraSkeleton.lines(4) + '</div>' +
       '<div id="sessions-pagination"></div>';
     container.innerHTML = html;
 
@@ -86,7 +87,60 @@
     const sessions = (data && data.sessions) || [];
     nextCursor = (data && data.cursor) || null;
     renderTable(c, sessions);
+    renderBulkBar(sessions);
     renderPagination();
+  }
+
+  // #338 — SuperAdmin bulk force-logout, shown only when scoped to one operator
+  // (a `did` filter is set) and that operator has active sessions. Revokes ALL
+  // of the operator's active sessions in one action, regardless of page.
+  function renderBulkBar(sessions) {
+    const el = document.getElementById('sessions-bulk');
+    if (!el) return;
+    if (!isSuperadmin() || !filterDid || sessions.length === 0) {
+      el.innerHTML = '';
+      return;
+    }
+    el.innerHTML =
+      '<div class="bulk-action-bar" role="region" aria-label="' + esc(T('sessions.bulk_revoke')) + '">' +
+      '<span>' + esc(T('sessions.bulk_scope', { did: filterDid })) + '</span>' +
+      '<button class="btn-danger btn-sm" id="sessions-bulk-revoke">' + esc(T('sessions.bulk_revoke')) + '</button>' +
+      '</div>';
+    document.getElementById('sessions-bulk-revoke')
+      .addEventListener('click', () => onBulkRevoke(filterDid));
+  }
+
+  // Bulk revoke an operator's sessions: typed-confirm + rationale (a security
+  // event). Targeting one's own DID logs the caller out everywhere → bounce to
+  // login (the server already invalidated the current session).
+  async function onBulkRevoke(did) {
+    const isSelf = did === ownDid();
+    const result = await global.AuroraModal.destructiveConfirm({
+      heading: T('sessions.bulk_revoke_heading'),
+      body: isSelf ? T('sessions.bulk_revoke_self_body') : T('sessions.bulk_revoke_body', { did: did }),
+      typedConfirmGate: 'REVOKE ALL',
+      rationaleRequired: true,
+      confirmLabel: T('sessions.bulk_revoke_confirm'),
+    });
+    if (!result.confirmed) return;
+    try {
+      const res = await global.AuroraEndpoints.admin.revokeOperatorSessions({ did: did, rationale: result.rationale });
+      if (isSelf) {
+        if (global.AuroraSession) global.AuroraSession.logout();
+        return;
+      }
+      const n = (res && res.revoked) || 0;
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success(T('sessions.bulk_revoke_success', { count: n }), auditEntryId ? {
+        action: {
+          label: T('sessions.view_audit'),
+          href: '#mod/audit/' + encodeURIComponent(auditEntryId),
+        },
+      } : undefined);
+      await refresh(cursorStack[cursorStack.length - 1] || null);
+    } catch (e) {
+      global.AuroraToast.danger(T('sessions.bulk_revoke_failed') + (e && e.message ? ': ' + e.message : ''));
+    }
   }
 
   function renderTable(c, sessions) {

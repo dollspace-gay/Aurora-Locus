@@ -342,7 +342,15 @@
     "revoke_success": "Session revoked.",
     "revoke_failed": "Could not revoke session",
     "empty": "No active sessions.",
-    "error": "Could not load sessions"
+    "error": "Could not load sessions",
+    "bulk_scope": "Bulk action for {did}",
+    "bulk_revoke": "Revoke all sessions for this operator",
+    "bulk_revoke_heading": "Revoke all of this operator's sessions?",
+    "bulk_revoke_body": "This force-logs-out every active session for {did} across all their devices. They will need to sign in again. Use this for suspected compromise or operator departure.",
+    "bulk_revoke_self_body": "This force-logs-out ALL of your own active sessions, including this one — you will be signed out immediately and must log back in. Continue?",
+    "bulk_revoke_confirm": "Revoke all sessions",
+    "bulk_revoke_success": "Revoked {count} session(s).",
+    "bulk_revoke_failed": "Could not revoke the operator's sessions"
   },
   "accountDetail": {
     "viewAuditChain": "View audit chain →",

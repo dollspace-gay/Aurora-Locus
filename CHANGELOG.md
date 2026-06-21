@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Default audience for new accounts: operators can have each new account start with a chosen kryphocron audience mode, created automatically at signup (off by default — new accounts start with no audience)
 - Encryption-at-rest for private-tier posts — encoded on write and transparently decoded for authorized readers — with a standard rotation oracle, automatic re-encoding on key rotation, and operator read endpoints
 - Admin authentication: refresh-token flow with rotation on use, and per-operator session management with a Sessions page to view and revoke active sessions
+- SuperAdmin can revoke all of an operator's active sessions in one action (for suspected compromise or operator departure), audited with rationale
 - Recovery surfaces: recovery-mode status display, single-repository rebuild, bulk repository repair, and sequencer integrity validation
 - Blocking a subject now also removes them from the blocker's audiences, with an audit log of the cascade
 - Moderation list pages (Reports, Appeals, Events, Audit) share unified pagination and filtering behavior

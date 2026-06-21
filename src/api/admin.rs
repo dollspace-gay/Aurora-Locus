@@ -835,6 +835,13 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(revoke_session),
             CapsBuilder::new(Family::Admin),
         )
+        // #338 — SuperAdmin bulk force-logout of an operator's sessions. Same
+        // session-management capability; the handler enforces the SuperAdmin floor.
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.revokeOperatorSessions",
+            post(revoke_operator_sessions),
+            CapsBuilder::new(Family::Admin),
+        )
         .build()
 }
 
@@ -1634,6 +1641,109 @@ async fn revoke_session(
     Ok(Json(RevokeSessionOutput {
         success: true,
         sid: req.sid,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct RevokeOperatorSessionsRequest {
+    /// The operator DID whose active sessions to force-logout.
+    did: String,
+    /// Required — a bulk force-logout of an operator is always a security event.
+    rationale: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct RevokeOperatorSessionsOutput {
+    success: bool,
+    did: String,
+    /// Count of active sessions revoked (0 when the operator had none active).
+    revoked: u64,
+    #[serde(rename = "auditEntryId")]
+    audit_entry_id: String,
+}
+
+/// `POST /xrpc/tools.aurora.admin.revokeOperatorSessions` — bulk force-logout of
+/// EVERY active session for one operator (#338), for compromise / departure
+/// response. SuperAdmin-only: revoking another operator's sessions
+/// deployment-wide is escalation-of-trust territory. Rationale required (a
+/// security event). Revokes all of `did`'s active sessions — the #271
+/// per-request gate then rejects each on its next request — and audits the bulk
+/// action with the count, in one transaction (the revoke_role / revoke_session
+/// pattern). A zero count (operator had no active sessions) is still a success
+/// and still audited, for forensic completeness. Targeting one's own DID is
+/// permitted (it logs the caller out everywhere, current session included —
+/// recoverable by re-login); session revocation never touches roles, so there
+/// is no last-SuperAdmin lockout to guard (that guard is for role revocation).
+async fn revoke_operator_sessions(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RevokeOperatorSessionsRequest>,
+) -> Result<Json<RevokeOperatorSessionsOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "bulk session revocation requires SuperAdmin",
+        ));
+    }
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required"))?;
+    let did = req.did.trim();
+    if did.is_empty() {
+        return Err(json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "did-required"));
+    }
+    let subject = Subject::Repo { did: did.to_string() };
+    let now = chrono::Utc::now();
+
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    let count = OperatorSessionStore::revoke_all_for_did_in_tx(
+        &mut tx,
+        did,
+        &auth.did,
+        Some(rationale),
+        now,
+    )
+    .await
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    let audit_rationale = format!("{} (bulk revoke: {} session(s))", rationale, count);
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "session.revoke_all",
+            subject: Some(&subject),
+            rationale: &audit_rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    tx.commit().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+
+    Ok(Json(RevokeOperatorSessionsOutput {
+        success: true,
+        did: did.to_string(),
+        revoked: count,
         audit_entry_id: audit_entry_id.to_string(),
     }))
 }
@@ -7987,6 +8097,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoke_operator_sessions_gates_super_requires_rationale_and_audits() {
+        let ctx = create_test_context().await;
+        let mk_auth = |did: &str, role: Role| AdminAuthContext {
+            did: did.to_string(),
+            session: ValidatedSession {
+                did: did.to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role,
+        };
+        let target = "did:plc:target";
+        let req = |rationale: Option<&str>| {
+            Json(RevokeOperatorSessionsRequest {
+                did: target.to_string(),
+                rationale: rationale.map(str::to_string),
+            })
+        };
+        // Two active sessions for the target operator.
+        for rid in ["r1", "r2"] {
+            ctx.operator_session_store
+                .create(target, None, None, rid, chrono::Duration::days(30))
+                .await
+                .unwrap();
+        }
+
+        // Non-SuperAdmin → 403.
+        let forbidden = revoke_operator_sessions(
+            State(ctx.clone()),
+            mk_auth("did:plc:adm", Role::Admin),
+            req(Some("x")),
+        )
+        .await;
+        assert_eq!(forbidden.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // SuperAdmin without rationale → 400.
+        let no_rationale = revoke_operator_sessions(
+            State(ctx.clone()),
+            mk_auth("did:plc:super", Role::SuperAdmin),
+            req(None),
+        )
+        .await;
+        assert_eq!(no_rationale.unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        // SuperAdmin happy path → both sessions revoked + an audit entry.
+        let ok = revoke_operator_sessions(
+            State(ctx.clone()),
+            mk_auth("did:plc:super", Role::SuperAdmin),
+            req(Some("operator departed")),
+        )
+        .await
+        .expect("bulk revoke succeeds")
+        .0;
+        assert!(ok.success);
+        assert_eq!(ok.revoked, 2);
+        assert!(!ok.audit_entry_id.is_empty());
+
+        // The target now has no active sessions.
+        let (left, _) = ctx
+            .operator_session_store
+            .list_by_did(target, 50, None)
+            .await
+            .unwrap();
+        assert!(left.is_empty(), "all target sessions revoked");
+
+        // Idempotent: a second bulk revoke succeeds with a zero count.
+        let again = revoke_operator_sessions(
+            State(ctx.clone()),
+            mk_auth("did:plc:super", Role::SuperAdmin),
+            req(Some("re-run")),
+        )
+        .await
+        .expect("idempotent success")
+        .0;
+        assert_eq!(again.revoked, 0);
+    }
+
+    #[tokio::test]
     async fn test_get_resource_usage() {
         let ctx = create_test_context().await;
         let auth = AdminAuthContext {
@@ -9100,7 +9288,8 @@ mod tests {
             r#""setRuntimeSetting","#,
             r#""listInstalled","#,
             r#""listSessions","#,
-            r#""revokeSession""#,
+            r#""revokeSession","#,
+            r#""revokeOperatorSessions""#,
             r#"],"#,
             // tools.aurora.moderator (7 endpoints)
             r#""tools.aurora.moderator":["#,

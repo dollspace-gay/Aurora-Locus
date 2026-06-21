@@ -49,6 +49,8 @@
     // / omitted for all. revokeSession: force-logout a single sid.
     listSessions: (params) => C().get('tools.aurora.admin.listSessions', params || { limit: 25 }),
     revokeSession: (body) => C().post('tools.aurora.admin.revokeSession', body),
+    // Bulk force-logout of every active session for one operator (SuperAdmin; #338).
+    revokeOperatorSessions: (body) => C().post('tools.aurora.admin.revokeOperatorSessions', body || {}),
   };
 
   // -------- tools.aurora.moderator.* --------
