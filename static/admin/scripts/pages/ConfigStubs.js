@@ -46,14 +46,10 @@
       blurb: 'Available when the registration-policy backend ships. This page ' +
              'will manage account-creation rules.',
     },
-    {
-      key: 'configModerationPolicy',
-      domain: 'Configuration',
-      domainRoute: 'configuration/general',
-      title: 'Moderation policy',
-      blurb: 'Available when the moderation-policy backend ships. This page ' +
-             'will manage configurable moderation defaults.',
-    },
+    // configModerationPolicy retired in #340 — the real page
+    // (ConfigModerationPolicy.js) registers that key now; it hosts the
+    // moderation-tier switch (moved from UI & modes), with configurable
+    // defaults as an in-page in-development section.
     // configKryphocronPolicy retired in #227 (D-policy-page) — the real
     // page (ConfigKryphocronPolicy.js) registers that key now.
     {
