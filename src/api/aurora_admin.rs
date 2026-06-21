@@ -3694,6 +3694,41 @@ const THEME_DEPLOYMENT_DEFAULT_KEY: &str = "theme.deployment-default";
 /// effect on the next encode without a restart).
 const LAQUNA_ROTATION_CADENCE_KEY: &str = "kryphocron.laquna.rotation-cadence";
 
+// v0.9 Arc D (#334) — the Kryphocron Policy page's deployment settings
+// (§6.6.2 / §7.3.3 / §8.3.4). Registered so `setRuntimeSetting` accepts them
+// (the live page was 400ing on save). Each is consumed at its decision point,
+// except where the substrate has nothing to act on yet (see per-key notes).
+
+/// New-account access to private-tier writes (§6.6.2 item 1): `immediate`
+/// (write at once) or `delayed` (an N-day host-side guard before the kryphocron
+/// capability is issued). `earned` is a backend-prereq (§7) and is rejected.
+const KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY: &str = "kryphocron.policy.new-account-access";
+/// The N (in days) for `delayed` access — a positive integer (default 7).
+const KRYPHOCRON_ACCESS_DELAY_DAYS_KEY: &str = "kryphocron.policy.access-delay-days";
+
+/// Initial `mode` of the `policy.audience` record Aurora-Locus auto-creates for
+/// a new account (§6.6.2 item 2 / §7.3.3). One of the five kryphocron audience
+/// modes; `nobody` (default) authors no record at all — the account
+/// participates nowhere until its holder opts in.
+const KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY: &str = "kryphocron.policy.default-audience-mode";
+
+/// Deployment process-shape declaration (§8.3.4): `single-process` (the
+/// standard oracle) or `multi-process` (an operator-coordinated oracle). Pure
+/// host-side bookkeeping — it installs no oracle; it drives a mismatch *warning*
+/// on Kryphocron Overview when the declaration disagrees with the oracle
+/// actually installed (always the standard one in v0.9, so `multi-process`
+/// always warns). The operator-supplied-oracle install path is out of scope
+/// (design-unspecified; a code-execution surface — cf. §11.8 hook deferral).
+const KRYPHOCRON_PROCESS_SHAPE_KEY: &str = "kryphocron.deployment.process-shape";
+
+/// Per-account rotation-cadence override bounds (§6.6.2 item 5):
+/// `weekly-to-daily` / `weekly-to-hourly` / `no-override`. Store-only in v0.9 —
+/// per-account cadence overrides don't exist (the laquna slug is
+/// deployment-wide; #316 found per-account cadence substrate-incoherent), so
+/// there is nothing to bound yet. Registered to back the page; the value
+/// records the operator's intent for when a per-account mechanism lands.
+const KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY: &str = "kryphocron.laquna.account-cadence-range";
+
 /// v0.9 — operator login-splash branding. URLs the (theme-aware) login page
 /// renders: the logo image at the top of the splash card, and a banner image
 /// behind it. Both default to empty (the built-in stack icon + the theme's
@@ -3745,6 +3780,11 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     BRANDING_LOGIN_SUBTITLE_TEXT_KEY,
     BRANDING_LOGIN_TITLE_COLOR_KEY,
     BRANDING_LOGIN_SUBTITLE_COLOR_KEY,
+    KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY,
+    KRYPHOCRON_ACCESS_DELAY_DAYS_KEY,
+    KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY,
+    KRYPHOCRON_PROCESS_SHAPE_KEY,
+    KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY,
 ];
 const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
@@ -3764,6 +3804,13 @@ fn default_for_key(key: &str) -> serde_json::Value {
         | BRANDING_LOGIN_SUBTITLE_TEXT_KEY
         | BRANDING_LOGIN_TITLE_COLOR_KEY
         | BRANDING_LOGIN_SUBTITLE_COLOR_KEY => serde_json::Value::String(String::new()),
+        KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY => serde_json::Value::String("immediate".to_string()),
+        KRYPHOCRON_ACCESS_DELAY_DAYS_KEY => serde_json::Value::from(7),
+        KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY => serde_json::Value::String("nobody".to_string()),
+        KRYPHOCRON_PROCESS_SHAPE_KEY => serde_json::Value::String("single-process".to_string()),
+        KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY => {
+            serde_json::Value::String("weekly-to-daily".to_string())
+        }
         _ => serde_json::Value::Null,
     }
 }
@@ -3797,6 +3844,24 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         BRANDING_LOGIN_TITLE_COLOR_KEY | BRANDING_LOGIN_SUBTITLE_COLOR_KEY => {
             value.as_str().is_some_and(is_branding_color_value)
         }
+        // Kryphocron policy settings (#334). `earned` access is a backend-prereq
+        // (§6.6.2:1777) and rejected — only immediate/delayed are shippable.
+        KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY => {
+            value.as_str().is_some_and(|s| matches!(s, "immediate" | "delayed"))
+        }
+        // Delay window: a positive integer number of days, generously bounded.
+        KRYPHOCRON_ACCESS_DELAY_DAYS_KEY => {
+            value.as_u64().is_some_and(|n| (1..=36500).contains(&n))
+        }
+        KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY => value.as_str().is_some_and(|s| {
+            matches!(s, "list" | "everyone" | "followers" | "following" | "nobody")
+        }),
+        KRYPHOCRON_PROCESS_SHAPE_KEY => {
+            value.as_str().is_some_and(|s| matches!(s, "single-process" | "multi-process"))
+        }
+        KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY => value
+            .as_str()
+            .is_some_and(|s| matches!(s, "weekly-to-daily" | "weekly-to-hourly" | "no-override")),
         _ => true,
     }
 }
@@ -8149,6 +8214,61 @@ mod tests {
         assert!(!validate_runtime_value(BRANDING_LOGIN_TITLE_COLOR_KEY, &json!("#abc")));
         assert!(!validate_runtime_value(BRANDING_LOGIN_TITLE_COLOR_KEY, &json!("aabbcc")));
         assert!(!validate_runtime_value(BRANDING_LOGIN_SUBTITLE_COLOR_KEY, &json!("#gggggg")));
+    }
+
+    #[test]
+    fn kryphocron_policy_settings_registered_with_defaults() {
+        // #334 — the five Kryphocron Policy keys must be in the allowlist (so
+        // setRuntimeSetting stops 400ing) and carry the UI's assumed defaults.
+        for key in [
+            KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY,
+            KRYPHOCRON_ACCESS_DELAY_DAYS_KEY,
+            KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY,
+            KRYPHOCRON_PROCESS_SHAPE_KEY,
+            KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY,
+        ] {
+            assert!(KNOWN_RUNTIME_KEYS.contains(&key), "{key} must be allowlisted");
+        }
+        use serde_json::json;
+        assert_eq!(default_for_key(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY), json!("immediate"));
+        assert_eq!(default_for_key(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY), json!(7));
+        assert_eq!(default_for_key(KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY), json!("nobody"));
+        assert_eq!(default_for_key(KRYPHOCRON_PROCESS_SHAPE_KEY), json!("single-process"));
+        assert_eq!(
+            default_for_key(KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY),
+            json!("weekly-to-daily")
+        );
+    }
+
+    #[test]
+    fn kryphocron_policy_value_validation() {
+        use serde_json::json;
+        // new-account-access: immediate/delayed only; earned (backend-prereq) rejected.
+        assert!(validate_runtime_value(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY, &json!("immediate")));
+        assert!(validate_runtime_value(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY, &json!("delayed")));
+        assert!(!validate_runtime_value(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY, &json!("earned")));
+        assert!(!validate_runtime_value(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY, &json!("open")));
+        // access-delay-days: positive integer, bounded; reject 0, negatives, non-ints.
+        assert!(validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(7)));
+        assert!(validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(1)));
+        assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(0)));
+        assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(-3)));
+        assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!("7")));
+        assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(40000)));
+        // default-audience-mode: the five kryphocron modes; reject anything else.
+        for m in ["list", "everyone", "followers", "following", "nobody"] {
+            assert!(validate_runtime_value(KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY, &json!(m)));
+        }
+        assert!(!validate_runtime_value(KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY, &json!("public")));
+        // process-shape: the two declarations.
+        assert!(validate_runtime_value(KRYPHOCRON_PROCESS_SHAPE_KEY, &json!("single-process")));
+        assert!(validate_runtime_value(KRYPHOCRON_PROCESS_SHAPE_KEY, &json!("multi-process")));
+        assert!(!validate_runtime_value(KRYPHOCRON_PROCESS_SHAPE_KEY, &json!("clustered")));
+        // account-cadence-range: the three range options.
+        for r in ["weekly-to-daily", "weekly-to-hourly", "no-override"] {
+            assert!(validate_runtime_value(KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY, &json!(r)));
+        }
+        assert!(!validate_runtime_value(KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY, &json!("hourly-to-daily")));
     }
 
     #[tokio::test]
