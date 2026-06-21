@@ -37,11 +37,13 @@
 //!
 //! ## What is stub-gated today
 //!
-//! - `getBlockCascadeImpact` — reads `block-cascade.log`, which the block
-//!   handler does not yet write (post-Arc-2 work); a missing log reads as a
-//!   zero-impact `available: false` shape.
-//!
 //! ## What populates lazily (no stub; data accrues at runtime)
+//!
+//! - `getBlockCascadeImpact` — reads `block-cascade.log`, which the #282 block
+//!   cascade (`crate::cascade::run_block_cascade`, run from `createBlock`) **does**
+//!   append to: a `pass_start`/`pass_end` pair per cascade, and a `removed: 0`
+//!   line per `deleteBlock`. A missing log (no block has run on this deployment)
+//!   reads as a zero-impact `available: false` shape. Not a missing write-side.
 //!
 //! - `listRotations` cadence-organic track — reads `rotation-history.log`,
 //!   which the #238 oracle **does** append to on every cadence-organic (i.e.
@@ -1041,9 +1043,10 @@ pub async fn list_audiences(
 
 /// `tools.aurora.ops.kryphocron.getBlockCascadeImpact?account=<did>` — per-
 /// account cascade-driven audience-removal counts (§6.5 / §7.2.4), read from
-/// `<data-dir>/aurora-locus/block-cascade.log`. The block handler does not yet
-/// write this log (post-Arc-2 work), so a missing log reads as a zero-impact
-/// `available: false` shape — the drawer's field-level stub gate. Moderator+.
+/// `<data-dir>/aurora-locus/block-cascade.log`. The #282 block cascade appends
+/// to this log on every `createBlock`/`deleteBlock`; a missing log means no
+/// block has run on this deployment yet, read as a zero-impact
+/// `available: false` shape. Moderator+.
 pub async fn get_block_cascade_impact(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
@@ -1066,7 +1069,7 @@ pub async fn get_block_cascade_impact(
                 "account": did,
                 "available": false,
                 "cascadeRemovals": 0,
-                "message": "Block-cascade bookkeeping is not yet recorded on this deployment.",
+                "message": "No block cascades have been recorded on this deployment yet.",
             })));
         }
     };
@@ -1078,10 +1081,12 @@ pub async fn get_block_cascade_impact(
 }
 
 /// Count cascade-driven audience removals attributed to `did` from
-/// `block-cascade.log` (JSONL; each line records an `account` + a removal). The
-/// log format is the block handler's host-side bookkeeping (§7.2.4); this
-/// reader is shaped for the `{ "account": <did>, "removed": <n> }` line the
-/// write-side will append.
+/// `block-cascade.log` (JSONL; §7.2.4 host-side bookkeeping the #282 cascade
+/// appends). Each line carries `{ "account": <subject did>, "removed": <n>, … }`;
+/// this sums `removed` across the subject's lines. The writer emits a
+/// `pass_start` (removed: 0) and `pass_end` (removed: N) per cascade, so the
+/// sum totals N per cascade — `pass_start` and `deleteBlock` (removed: 0) lines
+/// contribute nothing, no double-count.
 fn count_cascade_removals(contents: &str, did: &str) -> u64 {
     contents
         .lines()
@@ -1272,6 +1277,36 @@ not json
         assert_eq!(count_cascade_removals(log, "did:plc:aaa"), 4);
         assert_eq!(count_cascade_removals(log, "did:plc:bbb"), 5);
         assert_eq!(count_cascade_removals(log, "did:plc:zzz"), 0);
+    }
+
+    #[test]
+    fn count_cascade_removals_against_real_writer_line_shapes() {
+        // #337 — pin the reader against the exact lines the #282 cascade writer
+        // (src/cascade.rs `append_block_cascade_log`) emits: a pass_start
+        // (removed:0) + pass_end (removed:N) per createBlock cascade, and a
+        // removed:0 line per deleteBlock. The total must be N per cascade —
+        // pass_start and delete lines contribute 0, so summing never
+        // double-counts. Guards the writer↔reader format contract by
+        // construction (the #336 pattern, applied to the block-cascade track).
+        let subject = "did:plc:subject";
+        let line = |v: serde_json::Value| v.to_string();
+        let log = [
+            line(json!({"phase":"pass_start","account":subject,"blocker_did":"did:plc:blk",
+                        "cascade_id":"c1","operation":"created","removed":0,"attempted":0,"failed":0,"at_ms":1})),
+            line(json!({"phase":"pass_end","account":subject,"blocker_did":"did:plc:blk",
+                        "cascade_id":"c1","operation":"created","removed":3,"attempted":3,"failed":0,"at_ms":2})),
+            line(json!({"phase":"pass_start","account":subject,"blocker_did":"did:plc:blk",
+                        "cascade_id":"c2","operation":"created","removed":0,"attempted":0,"failed":0,"at_ms":3})),
+            line(json!({"phase":"pass_end","account":subject,"blocker_did":"did:plc:blk",
+                        "cascade_id":"c2","operation":"created","removed":2,"attempted":2,"failed":0,"at_ms":4})),
+            // deleteBlock line (record_block_deleted) — removed:0, contributes nothing.
+            line(json!({"phase":"pass_end","account":subject,"blocker_did":"did:plc:blk",
+                        "cascade_id":"c3","operation":"deleted","removed":0,"attempted":0,"failed":0,"at_ms":5})),
+        ]
+        .join("\n");
+        // Two cascades removed 3 and 2; pass_start (0) + delete (0) add nothing.
+        assert_eq!(count_cascade_removals(&log, subject), 5);
+        assert_eq!(count_cascade_removals(&log, "did:plc:unrelated"), 0);
     }
 
     #[test]
