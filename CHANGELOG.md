@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ten bundled themes — Dark, Light, Stack Classic, Ember, Emerald, Glacier, Meridian, Pride, and High Contrast Dark/Light — five dark and five light, with Stack Classic as the deployment default
 - All ten themes pass WCAG 2.2 AA contrast checks via the substrate's verifier; High Contrast Dark and High Contrast Light additionally clear AAA for text (7:1). Programmatic contrast only — not a full focus-indicator, keyboard, or screen-reader audit
 - Theme extension points — themes can declare and provide named extension points that surfaces opt into at runtime
+- Themes can declare lifecycle hooks (install, activate, deactivate); the substrate recognizes and lists them but does not execute them yet — script execution waits on a security-reviewed sandbox in a later version
 - Theme authoring documentation and a reference example theme
 - Kryphocron admin surface: overview, deployment-wide audiences, laquna status with rotation history, and tier-activity pages, plus a per-account drawer, a policy page, and a dashboard summary block
 - Per-account kryphocron overrides on the Account Detail page: operators can block a specific account from issuing kryphocron capabilities (and flag a rate-limit exemption), audited with rationale

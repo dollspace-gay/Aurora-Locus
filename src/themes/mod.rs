@@ -65,6 +65,24 @@ pub const REQUIRED_EFFECT_CLASSES: &[&str] = &[
     "effect-surface-elevation-3",
 ];
 
+/// The three lifecycle-hook custom properties a theme may declare in its
+/// `extensions.css` (§11.8), mapping each lifecycle phase to the CSS custom
+/// property that registers its hook script. §11.8.1 spells out the property for
+/// `onInstall` (`--theme-install-hook`); the `onActivate`/`onDeactivate`
+/// property names extend the same convention (a translation per the design's
+/// stated three-hook set, recorded here since §11.8.1 only names install).
+///
+/// v0.9 treats these as **declaration-aware no-ops** (§11.8.4): the substrate
+/// detects and surfaces declared hooks and logs that execution is off, but does
+/// not fetch or run any hook script. Hook *execution* opens a code-execution
+/// surface the design defers until the sandboxing model is specified and
+/// security-reviewed; only then does this become the wiring point.
+pub const LIFECYCLE_HOOK_PROPERTIES: &[(&str, &str)] = &[
+    ("install", "--theme-install-hook"),
+    ("activate", "--theme-activate-hook"),
+    ("deactivate", "--theme-deactivate-hook"),
+];
+
 /// The inheritance root every chain must terminate at (§11.9). The former
 /// `aurora-default` + `aurora-dark` pair was merged into a single `dark` root.
 pub const ROOT_THEME_ID: &str = "dark";
@@ -96,6 +114,30 @@ struct ThemeRecord {
     errors: Vec<String>,
 }
 
+/// A lifecycle hook a theme declares in its `extensions.css` (§11.8). Surfaced
+/// to operators so a theme's declared-but-dormant hooks are visible, and logged
+/// at startup as execution-off. Carries no behavior in v0.9 — see
+/// [`LIFECYCLE_HOOK_PROPERTIES`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclaredHook {
+    /// The lifecycle phase — `install`, `activate`, or `deactivate`.
+    pub phase: String,
+    /// The script reference the theme registered for that phase (the
+    /// custom-property value, surrounding quotes stripped). Recorded verbatim;
+    /// never fetched or executed in v0.9.
+    pub script: String,
+}
+
+/// One valid theme's declared lifecycle hooks (§11.8) — the startup
+/// execution-off report shape. Only themes that declare at least one hook
+/// appear in [`ThemeRegistry::lifecycle_hook_report`].
+#[derive(Debug, Clone)]
+pub struct ThemeLifecycleHooks {
+    pub theme_id: String,
+    pub hooks: Vec<DeclaredHook>,
+}
+
 /// Operator-facing metadata for one installed theme — the `listInstalled`
 /// wire shape (§11.10.2).
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +157,11 @@ pub struct ThemeMetadata {
     /// (§11.7.3 discovery). Own declarations only — the effective (inherited)
     /// set for the *active* theme is served by `/theme/active-extension-points`.
     pub provided_extension_points: Vec<String>,
+    /// Lifecycle hooks this theme declares in its `extensions.css` (§11.8). v0.9
+    /// surfaces them but does not execute them (declaration-aware no-op,
+    /// §11.8.4), so the picker can show a theme carries dormant hooks. Empty for
+    /// the common case (no theme declares any today).
+    pub declared_lifecycle_hooks: Vec<DeclaredHook>,
     pub metadata: serde_json::Value,
 }
 
@@ -203,7 +250,30 @@ impl ThemeRegistry {
                     valid: r.valid,
                     validation_errors: r.errors.clone(),
                     provided_extension_points: m.provided_extension_points.clone(),
+                    declared_lifecycle_hooks: collect_declared_lifecycle_hooks(&r.discovered),
                     metadata: m.metadata.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Declared lifecycle hooks per *valid* theme that declares any (§11.8), for
+    /// the startup execution-off log. v0.9 detects and reports hooks but runs
+    /// none (§11.8.4); this is the operational record that a theme carries a
+    /// dormant hook. Themes declaring no hooks (the common case) are omitted.
+    pub fn lifecycle_hook_report(&self) -> Vec<ThemeLifecycleHooks> {
+        self.records
+            .iter()
+            .filter(|r| r.valid)
+            .filter_map(|r| {
+                let hooks = collect_declared_lifecycle_hooks(&r.discovered);
+                if hooks.is_empty() {
+                    None
+                } else {
+                    Some(ThemeLifecycleHooks {
+                        theme_id: r.discovered.manifest.theme_id.clone(),
+                        hooks,
+                    })
                 }
             })
             .collect()
@@ -708,6 +778,43 @@ fn collect_declared_extension_points(
     classes
 }
 
+/// Detect the lifecycle hooks a theme declares in its OWN `extensions.css`
+/// (§11.8) — the `--theme-<phase>-hook` custom properties of
+/// [`LIFECYCLE_HOOK_PROPERTIES`]. Own-file only: hooks carry no execution in
+/// v0.9, so the effective (inherited-cascade) resolution that would matter for
+/// *running* a hook is deferred with execution; what an operator needs now is
+/// what each theme itself declares. Surrounding quotes on the value are
+/// stripped. Not a full CSS parse (mirrors the other `collect_*` scanners).
+fn collect_declared_lifecycle_hooks(theme: &DiscoveredTheme) -> Vec<DeclaredHook> {
+    let Some(extensions_file) = &theme.manifest.files.extensions else {
+        return Vec::new();
+    };
+    let path = theme.dir.join(extensions_file);
+    let Ok(css) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut hooks = Vec::new();
+    for (phase, prop) in LIFECYCLE_HOOK_PROPERTIES {
+        // `--theme-<phase>-hook : "..." ;` — value up to the next `;` or `}`.
+        let re = regex::Regex::new(&format!(r#"{}\s*:\s*([^;}}]+)"#, regex::escape(prop)))
+            .expect("static lifecycle-hook regex compiles");
+        if let Some(cap) = re.captures(&css) {
+            let script = cap[1]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .trim()
+                .to_string();
+            if !script.is_empty() {
+                hooks.push(DeclaredHook {
+                    phase: (*phase).to_string(),
+                    script,
+                });
+            }
+        }
+    }
+    hooks
+}
+
 /// Collect every custom-property declaration's resolved *value* across a
 /// theme's chain (leaf-wins), for contrast verification. Within a single file
 /// the last declaration wins (CSS cascade); across the chain the leaf overrides
@@ -1194,6 +1301,92 @@ mod tests {
         assert!(
             errs.iter().any(|e| e == "theme.extensions.declared.duplicate: dup"),
             "duplicate declaration must fail: {errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    // ---------- §11.8 lifecycle-hook declaration-aware no-op ----------
+
+    /// Metadata for one theme id in a freshly-built registry.
+    fn meta_for(reg: &ThemeRegistry, id: &str) -> ThemeMetadata {
+        reg.list().into_iter().find(|t| t.theme_id == id).expect("theme present")
+    }
+
+    #[test]
+    fn lifecycle_hooks_declared_are_detected_and_surfaced() {
+        let bundled = tmp("hookdetect");
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        // A theme declaring two of the three hooks in extensions.css. Quotes
+        // (double here) are stripped; the third hook is absent.
+        write_theme_with_extensions(
+            &bundled,
+            "hooktheme",
+            Some(ROOT_THEME_ID),
+            &[],
+            ":root {\n  --theme-install-hook: \"/themes/hooktheme/install.js\";\n  --theme-activate-hook: \"/themes/hooktheme/activate.js\";\n}",
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+
+        // Surfaced on the listInstalled metadata.
+        let hooks = meta_for(&reg, "hooktheme").declared_lifecycle_hooks;
+        assert_eq!(hooks.len(), 2, "two declared hooks detected: {hooks:?}");
+        assert!(hooks.iter().any(|h| h.phase == "install"
+            && h.script == "/themes/hooktheme/install.js"));
+        assert!(hooks.iter().any(|h| h.phase == "activate"
+            && h.script == "/themes/hooktheme/activate.js"));
+        assert!(!hooks.iter().any(|h| h.phase == "deactivate"), "no deactivate declared");
+
+        // Reported for the startup execution-off log.
+        let report = reg.lifecycle_hook_report();
+        let entry = report.iter().find(|t| t.theme_id == "hooktheme").expect("reported");
+        assert_eq!(entry.hooks.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    #[test]
+    fn lifecycle_hooks_absent_surface_nothing() {
+        let bundled = tmp("hooknone");
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        // An extensions.css with no hook custom properties.
+        write_theme_with_extensions(
+            &bundled,
+            "plaintheme",
+            Some(ROOT_THEME_ID),
+            &["feature-x"],
+            ".extension-feature-x { opacity: 1; }",
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+
+        assert!(
+            meta_for(&reg, "plaintheme").declared_lifecycle_hooks.is_empty(),
+            "no hooks declared → empty"
+        );
+        assert!(
+            !reg.lifecycle_hook_report().iter().any(|t| t.theme_id == "plaintheme"),
+            "themes declaring no hooks are omitted from the report"
+        );
+        let _ = std::fs::remove_dir_all(&bundled);
+    }
+
+    #[test]
+    fn lifecycle_hook_declaration_does_not_invalidate_theme() {
+        // Declaring a hook is valid (§11.8: "themes can declare them"); the
+        // no-op layer must not turn a dormant hook into a validation failure.
+        let bundled = tmp("hookvalid");
+        write_theme(&bundled, ROOT_THEME_ID, None, &all_required_css());
+        write_theme_with_extensions(
+            &bundled,
+            "hooktheme",
+            Some(ROOT_THEME_ID),
+            &[],
+            ":root { --theme-deactivate-hook: \"/themes/hooktheme/cleanup.js\"; }",
+        );
+        let reg = ThemeRegistry::build(&bundled, &bundled.join("__none__"));
+        assert!(
+            errors_for(&reg, "hooktheme").is_empty(),
+            "a declared hook must not invalidate the theme: {:?}",
+            errors_for(&reg, "hooktheme")
         );
         let _ = std::fs::remove_dir_all(&bundled);
     }

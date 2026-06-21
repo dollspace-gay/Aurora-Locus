@@ -1095,6 +1095,22 @@ impl AppContext {
                     "theme wcag certification",
                 );
             }
+            // §11.8 lifecycle hooks — declaration-aware no-op (§11.8.4). v0.9
+            // detects and surfaces hooks a theme declares but does not fetch or
+            // run them: execution opens a code-execution surface the design
+            // defers until the sandboxing model is security-reviewed. One line
+            // per declared hook so an operator sees the hook is dormant, not
+            // silently ignored.
+            for t in reg.lifecycle_hook_report() {
+                for h in &t.hooks {
+                    tracing::info!(
+                        theme = %t.theme_id,
+                        hook = %h.phase,
+                        script = %h.script,
+                        "theme lifecycle hook declared but execution-mode off in v0.9 (§11.8.4)",
+                    );
+                }
+            }
             Arc::new(reg)
         };
 

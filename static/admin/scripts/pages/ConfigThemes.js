@@ -95,6 +95,15 @@
       ? '<p class="theme-row-ext">Extension points: ' + points.map(esc).join(', ') + '</p>'
       : '';
 
+    // §11.8 lifecycle hooks — declaration-aware no-op (§11.8.4): a theme can
+    // declare hooks, but v0.9 does not execute them. Surface declared hooks as
+    // dormant so the operator sees they exist and aren't silently running.
+    const hooks = Array.isArray(t.declaredLifecycleHooks) ? t.declaredLifecycleHooks : [];
+    const lifecycleHooks = hooks.length
+      ? '<p class="theme-row-ext">Lifecycle hooks (declared, not run in this version): '
+        + hooks.map((h) => esc(h.phase)).join(', ') + '</p>'
+      : '';
+
     return '<div class="theme-row' + (isDefault ? ' is-active' : '') + '">'
       + '<div class="theme-row-main">'
       +   '<div class="theme-row-head">'
@@ -103,6 +112,7 @@
       +   '</div>'
       +   (t.themeDescription ? '<p class="theme-row-desc">' + esc(t.themeDescription) + '</p>' : '')
       +   extensions
+      +   lifecycleHooks
       + '</div>'
       + '<div class="theme-row-action">' + action + '</div>'
       + '</div>';
