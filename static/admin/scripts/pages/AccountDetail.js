@@ -548,8 +548,8 @@
            esc((currentAccount.handle ? '@' + currentAccount.handle + ' — ' : '') + currentDid) + '</p>' +
            '<fieldset>' +
            '  <legend>Include</legend>' +
-           '  <label style="display:block;"><input type="checkbox" id="fx-repo" checked> Repository content (CAR file) — deferred to v0.3</label>' +
-           '  <label style="display:block;"><input type="checkbox" id="fx-blobs" checked> Blobs — deferred to v0.3</label>' +
+           '  <label style="display:block;"><input type="checkbox" id="fx-repo" checked> Repository content (CAR file)</label>' +
+           '  <label style="display:block;"><input type="checkbox" id="fx-blobs" checked> Blobs (the account\'s uploaded files)</label>' +
            '  <label style="display:block;"><input type="checkbox" id="fx-mod" checked> Moderation history</label>' +
            '  <label style="display:block;"><input type="checkbox" id="fx-meta"' + (isSuper ? '' : ' disabled') +
            '> Account metadata <span class="role-tag">SuperAdmin only</span></label>' +

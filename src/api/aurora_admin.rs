@@ -3088,11 +3088,69 @@ pub async fn export_account_forensic(
         ));
     }
 
-    // Manifest with per-file hashes. include_repo / include_blobs
-    // accepted but their contents land in v0.3 (streaming CAR +
-    // bounded-blob serialization is non-trivial under AnyPool); the
-    // manifest records the deferral so consumers know the bundle is
-    // metadata-only for v0.2.
+    // #339 — repo CAR (§8.7 bundle structure: `repo.car` at root when
+    // include_repo). Composed from the same full-repo serialization federation
+    // uses (`export_repo_to_car` → `get_all_blocks` + `blocks_to_car`), so the
+    // bundle is parseable offline with standard atproto tooling and tamper-
+    // evident against the repo's commit history. The per-file hash loop below
+    // covers it for §3.4 chain-of-custody. Best-effort: an account with no
+    // resolvable repo (e.g. fully deleted) records a repo status note rather
+    // than failing the whole bundle. Admin+ (not SuperAdmin) per §8.7 — repo +
+    // blobs are the "basic" export; only metadata + audit_chain are gated above.
+    let repo_status: serde_json::Value = if input.include_repo {
+        match crate::actor_store::car::export_repo_to_car(&ctx.actor_store, &input.did, None).await {
+            Ok(car) => {
+                files.push(("repo.car".to_string(), car));
+                serde_json::json!({ "included": true })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "aurora_locus::forensic",
+                    did = %input.did,
+                    error = %e,
+                    "forensic export: repo CAR unavailable; bundle continues without repo.car",
+                );
+                serde_json::json!({ "included": false, "reason": e.to_string() })
+            }
+        }
+    } else {
+        serde_json::Value::Null
+    };
+
+    // #339 — blobs (§8.7: `blobs/<cid>.bin` when include_blobs). Every blob the
+    // account uploaded (`creator_did`), each fetched and packaged. A
+    // referenced-but-missing blob is recorded in the manifest, not fatal. The
+    // count is capped defensively; the manifest flags if the cap was hit.
+    const FORENSIC_BLOB_LIMIT: i64 = 100_000;
+    let blobs_status: serde_json::Value = if input.include_blobs {
+        let metas = ctx
+            .blob_store
+            .list_for_user(&input.did, FORENSIC_BLOB_LIMIT)
+            .await
+            .map_err(internal_pds)?;
+        let mut included: u64 = 0;
+        let mut missing: Vec<String> = Vec::new();
+        for m in &metas {
+            match ctx.blob_store.get(&m.cid).await.map_err(internal_pds)? {
+                Some((bytes, _mime)) => {
+                    files.push((format!("blobs/{}.bin", m.cid), bytes));
+                    included += 1;
+                }
+                None => missing.push(m.cid.clone()),
+            }
+        }
+        serde_json::json!({
+            "included": included,
+            "missing": missing,
+            "capped": metas.len() as i64 >= FORENSIC_BLOB_LIMIT,
+        })
+    } else {
+        serde_json::Value::Null
+    };
+
+    // Manifest with per-file hashes — covers repo.car + every blobs/<cid>.bin
+    // added above (they are in `files`), so the chain-of-custody hash commits to
+    // the full content, not just the metadata JSON.
     use sha2::{Digest, Sha256};
     let mut file_hashes: serde_json::Map<String, serde_json::Value> = Default::default();
     for (name, bytes) in &files {
@@ -3122,11 +3180,14 @@ pub async fn export_account_forensic(
             "includeAuditChain": input.include_audit_chain,
         },
         "fileHashes": file_hashes,
-        "deferredContents": {
-            "repoCar": input.include_repo,
-            "blobs": input.include_blobs,
-            "note": "v0.2 forensic bundles ship metadata only; CAR + blob streaming remains a v0.5+ candidate"
-        },
+        // #339 — repo.car + blobs/ now ship in-bundle (§8.7). These record what
+        // was actually included: `repo.included` (+ `reason` when a repo wasn't
+        // resolvable), and the blob `included` count (+ any `missing` cids, +
+        // `capped` if the blob count hit the export limit). The bundle is
+        // assembled in-memory and shipped as one response body per §8.7;
+        // streaming for very large bundles remains a separate future item.
+        "repo": repo_status,
+        "blobs": blobs_status,
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(internal)?;
 
@@ -7729,6 +7790,84 @@ mod tests {
             Some("2"),
             "manifest.schemaVersion must be \"2\" after Arc 9 Step 4 migration"
         );
+    }
+
+    #[tokio::test]
+    async fn export_forensic_bundles_blobs_and_records_repo_status() {
+        // #339 — include_repo + include_blobs now ship content. An Admin (not
+        // SuperAdmin — repo/blobs are the §8.7 "basic" export) gets the
+        // account's blobs as blobs/<cid>.bin, and the manifest records the
+        // repo/blob status (replacing the old deferredContents note).
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:exported", "exported.test").await;
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES ($1, $2, $3, NULL, FALSE)",
+        )
+        .bind("did:plc:exported")
+        .bind("exp@example.com")
+        .bind("$argon2id$dummy")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        // One blob owned by the account.
+        ctx.blob_store
+            .upload(
+                b"\x89PNG\r\n\x1a\nforensic-fake-image".to_vec(),
+                Some("image/png"),
+                "did:plc:exported",
+            )
+            .await
+            .unwrap();
+
+        let resp = export_account_forensic(
+            State(ctx.clone()),
+            admin_auth(),
+            Json(ExportAccountForensicInput {
+                did: "did:plc:exported".to_string(),
+                rationale: "investigation".to_string(),
+                include_repo: true,
+                include_blobs: true,
+                include_moderation_history: false,
+                include_account_metadata: false,
+                include_audit_chain: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        let mut archive = tar::Archive::new(&body[..]);
+        let mut blob_entries = 0;
+        let mut has_repo_car = false;
+        let mut manifest_json: Option<serde_json::Value> = None;
+        for entry in archive.entries().expect("archive iterates") {
+            let mut entry = entry.expect("entry readable");
+            let name = entry.path().expect("path").to_string_lossy().to_string();
+            if name.starts_with("blobs/") && name.ends_with(".bin") {
+                blob_entries += 1;
+            }
+            if name == "repo.car" {
+                has_repo_car = true;
+            }
+            if name == "manifest.json" {
+                let mut buf = Vec::new();
+                use std::io::Read as _;
+                entry.read_to_end(&mut buf).expect("manifest readable");
+                manifest_json = Some(serde_json::from_slice(&buf).expect("manifest parses"));
+            }
+        }
+        assert_eq!(blob_entries, 1, "the account's one blob is bundled as blobs/<cid>.bin");
+        assert!(!has_repo_car, "the seeded actor has no repo, so no repo.car is added");
+
+        let m = manifest_json.expect("tar contains manifest.json");
+        assert!(m.get("deferredContents").is_none(), "the v0.2 deferred note is gone");
+        assert_eq!(m["blobs"]["included"], 1, "manifest records one blob included");
+        assert_eq!(m["repo"]["included"], false, "no repo → recorded as not included");
+        assert!(m["repo"]["reason"].is_string(), "repo status carries a reason when absent");
     }
 
     // ---------- Phase 3.10 — runtime settings (§8.16) ----------
