@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Theme authoring documentation and a reference example theme
 - Kryphocron admin surface: overview, deployment-wide audiences, laquna status with rotation history, and tier-activity pages, plus a per-account drawer, a policy page, and a dashboard summary block
 - Per-account kryphocron overrides on the Account Detail page: operators can block a specific account from issuing kryphocron capabilities (and flag a rate-limit exemption), audited with rationale
+- New-account access policy: operators can require new accounts to wait a configurable number of days before posting to the private tier (off by default — accounts can post immediately)
+- Default audience for new accounts: operators can have each new account start with a chosen kryphocron audience mode, created automatically at signup (off by default — new accounts start with no audience)
 - Encryption-at-rest for private-tier posts — encoded on write and transparently decoded for authorized readers — with a standard rotation oracle, automatic re-encoding on key rotation, and operator read endpoints
 - Admin authentication: refresh-token flow with rotation on use, and per-operator session management with a Sessions page to view and revoke active sessions
 - Recovery surfaces: recovery-mode status display, single-repository rebuild, bulk repository repair, and sequencer integrity validation
@@ -34,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator role changes now take effect on the next request, without requiring re-login
 
 ### Fixed
+- Kryphocron Policy settings now save instead of erroring (new-account access, default audience mode, deployment process-shape, and per-account cadence range); the process-shape declaration drives the Overview's single-/multi-process mismatch warning
 - Admin UI displayed all operators as moderator regardless of their actual role
 - Moderation metrics failed to load on the dashboard
 - Configuration fields with no backing store are now shown read-only instead of offering saves that always fail

@@ -1,14 +1,16 @@
 // Regression pin for #299 — pages must not present a save affordance for
 // runtime-setting keys the substrate registry doesn't back.
 //
-// Recon found the substrate runtime-settings registry backs these keys
-// (moderation-mode, moderation-mode-redirect-url, theme.deployment-default,
-// kryphocron.laquna.rotation-cadence, and the two branding.login-* URLs added
-// in #328) and nothing consumes the `general.*` keys or
-// kryphocron.laquna.account-cadence-range. So ConfigGeneral's 7 keys
-// and Laquna's range field can't be saved — they're now read-only until the
-// backend wires them (deferred feature work). These pins guard that the
-// unbacked write paths stay disabled.
+// Recon found the substrate runtime-settings registry backs the moderation,
+// theme, cadence, and branding keys but NOT the `general.*` keys, so
+// ConfigGeneral's 7 keys can't be saved — they're read-only until the backend
+// wires them (deferred feature work). This pin guards that ConfigGeneral's
+// unbacked write path stays disabled.
+//
+// Note: kryphocron.laquna.account-cadence-range is now backed (#334, store-only)
+// and edited on the Kryphocron Policy page. The Laquna page intentionally keeps
+// its range field read-only (single editor on the Policy page), which the second
+// assertion below still pins — saveCadence persists rotation-cadence only.
 //
 // Static-source pins. No framework —
 //   node static/admin/scripts/api/__tests__/runtime-settings-unbacked-keys.test.js
