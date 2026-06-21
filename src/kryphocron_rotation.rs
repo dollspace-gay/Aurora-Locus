@@ -581,6 +581,82 @@ mod tests {
     }
 
     #[test]
+    fn cadence_organic_rotation_via_current_generation_appends_history() {
+        // End-to-end (#336): a cadence-stale consultation through
+        // `current_generation` — the path kryphocron drives on every
+        // private-tier encode — must produce a rotation-history.log record (the
+        // §6.4.2.1 cadence-organic track `listRotations` reads). The earlier
+        // tests exercise the writer fn in isolation; this proves the wiring from
+        // an organic (non-forced) rotation to the log. `cadence_secs = 0` makes
+        // every consultation past-cadence, so the path fires deterministically
+        // without waiting on the 24h default.
+        let dir = tmp_dir("cadence-organic-e2e");
+        let o = AuroraLocusStandardRotationOracle::construct(state_path(&dir), 0).unwrap();
+        let m1 = o.current_generation(&RotationContext::for_install_probe()).unwrap();
+        let m2 = o.current_generation(&RotationContext::for_install_probe()).unwrap();
+        assert_ne!(
+            mark_str(&m1),
+            mark_str(&m2),
+            "each cadence-stale consultation rotates organically"
+        );
+
+        // The append runs on the oracle's persist worker thread; poll briefly
+        // for it (bounded — a background flush, not a clock/TTL dependency).
+        let history = state_path(&dir).parent().unwrap().join("rotation-history.log");
+        let mut parsed: Vec<(u64, String)> = Vec::new();
+        for _ in 0..600 {
+            if let Ok(contents) = std::fs::read_to_string(&history) {
+                parsed = contents
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter_map(parse_history_line)
+                    .collect();
+                if parsed.len() >= 2 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            parsed.len() >= 2,
+            "two organic rotations append two history records (got {})",
+            parsed.len()
+        );
+        assert!(
+            parsed.iter().all(|(_, g)| g.starts_with("laquna/")),
+            "each record carries a laquna generation mark"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forced_rotation_does_not_append_cadence_organic_history() {
+        // The cadence-organic track is organic-only: a force_rotation (the
+        // triggerRotation path, recorded by #224's rewrite-history.log) must NOT
+        // append here, or the two tracks would double-count. Manual-only cadence
+        // means the ONLY rotation is the forced one.
+        let dir = tmp_dir("forced-no-organic");
+        let o = AuroraLocusStandardRotationOracle::construct(state_path(&dir), MANUAL_ONLY_SECS)
+            .unwrap();
+        let before = o.current_generation(&RotationContext::for_install_probe()).unwrap();
+        o.force_rotation();
+        let after = o.current_generation(&RotationContext::for_install_probe()).unwrap();
+        assert_ne!(mark_str(&before), mark_str(&after), "force_rotation rotated");
+
+        // Give the worker a chance to (not) write, then assert no organic record.
+        let history = state_path(&dir).parent().unwrap().join("rotation-history.log");
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let organic = std::fs::read_to_string(&history)
+            .ok()
+            .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        assert_eq!(organic, 0, "a forced rotation appends no cadence-organic record");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rotation_history_append_is_fail_soft_on_bad_path() {
         // Point the "file" at a directory: OpenOptions::append fails to open it,
         // and the writer must swallow the error (best-effort) rather than panic

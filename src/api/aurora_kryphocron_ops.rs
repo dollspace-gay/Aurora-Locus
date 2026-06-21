@@ -40,10 +40,20 @@
 //! - `getBlockCascadeImpact` — reads `block-cascade.log`, which the block
 //!   handler does not yet write (post-Arc-2 work); a missing log reads as a
 //!   zero-impact `available: false` shape.
+//!
+//! ## What populates lazily (no stub; data accrues at runtime)
+//!
 //! - `listRotations` cadence-organic track — reads `rotation-history.log`,
-//!   which #223's oracle does not yet append to; the operator-triggered track
-//!   (from #224's `rewrite-history.log`) is fully populated, the cadence-organic
-//!   track is empty until the oracle write-side lands (tracked separately).
+//!   which the #238 oracle **does** append to on every cadence-organic (i.e.
+//!   non-forced) rotation. Rotation is lazy: it fires inside
+//!   `current_generation` — the call kryphocron makes on each private-tier
+//!   encode — when the cadence boundary has elapsed (there is no background
+//!   timer; the single-process oracle mirrors `DefaultRotationOracle`'s lazy
+//!   model). So the track is empty until the deployment's cadence first elapses
+//!   (24h default) and a private-tier write then consults the oracle; it is not
+//!   a missing write-side. Lower `kryphocron.laquna.rotation-cadence` to observe
+//!   it sooner. The operator-triggered track (from #224's `rewrite-history.log`)
+//!   populates immediately on `triggerRotation`.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -723,7 +733,10 @@ pub async fn list_rotations(
         })
         .collect();
 
-    // Cadence-organic track: from rotation-history.log if present (empty today).
+    // Cadence-organic track: from rotation-history.log, appended by the #238
+    // oracle on each cadence-organic rotation. Empty until the deployment's
+    // cadence first elapses (24h default) and a private-tier encode then
+    // consults the oracle — lazy, no background timer (see the module docs).
     for (at_ms, gen) in read_rotation_history(&ctx) {
         if let Some(at) = ms_to_rfc3339(at_ms) {
             entries.push((
