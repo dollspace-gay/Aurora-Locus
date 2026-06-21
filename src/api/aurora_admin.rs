@@ -3702,9 +3702,10 @@ const LAQUNA_ROTATION_CADENCE_KEY: &str = "kryphocron.laquna.rotation-cadence";
 /// New-account access to private-tier writes (§6.6.2 item 1): `immediate`
 /// (write at once) or `delayed` (an N-day host-side guard before the kryphocron
 /// capability is issued). `earned` is a backend-prereq (§7) and is rejected.
-const KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY: &str = "kryphocron.policy.new-account-access";
+/// Consumed by [`crate::kryphocron_policy`] at the dedicated-write chokepoint.
+pub const KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY: &str = "kryphocron.policy.new-account-access";
 /// The N (in days) for `delayed` access — a positive integer (default 7).
-const KRYPHOCRON_ACCESS_DELAY_DAYS_KEY: &str = "kryphocron.policy.access-delay-days";
+pub const KRYPHOCRON_ACCESS_DELAY_DAYS_KEY: &str = "kryphocron.policy.access-delay-days";
 
 /// Initial `mode` of the `policy.audience` record Aurora-Locus auto-creates for
 /// a new account (§6.6.2 item 2 / §7.3.3). One of the five kryphocron audience

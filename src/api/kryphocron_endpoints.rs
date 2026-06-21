@@ -185,6 +185,24 @@ async fn authenticated_did_for_repo(
                 .to_string(),
         ));
     }
+    // New-account access policy (#334 / §6.6.2 item 1): when the deployment runs
+    // `delayed` access, an account younger than the delay window can't issue any
+    // kryphocron capability yet — the host-side guard the design places "before
+    // the kryphocron capability is even issued". Default `immediate` is open;
+    // the check is fail-soft (a settings hiccup never blocks). Same chokepoint as
+    // the capability-issuance gate above, so it covers every dedicated write.
+    if let Some(days) = crate::kryphocron_policy::new_account_access_delay_remaining(
+        &ctx.account_db,
+        auth_did,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        return Err(PdsError::Authorization(format!(
+            "this account cannot use private-tier writes yet: the deployment \
+             delays new-account access (about {days} day(s) remaining)"
+        )));
+    }
     // This is THE request-auth chokepoint: the requester is authenticated, the
     // scope is enforced, and the target repo is confirmed to be the requester's
     // own. Wrap the validated DID so the write helpers take `AuthenticatedDid`,
