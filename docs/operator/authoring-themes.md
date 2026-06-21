@@ -6,13 +6,11 @@ or tuning one for accessibility. It assumes you have Aurora-Locus running and
 know basic CSS. It does *not* cover substrate internals (see the v0.9 design
 doc) or general CSS (see [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS)).
 
-The theming substrate ships in Aurora-Locus 0.9.0. This document covers the
-0.9.0 surface. Two chapters are forward-dated and noted where they appear:
-
-- **Chapter 6 (Extension points)** ships with the extension-point runtime in
-  **0.9.1**.
-- **Chapter 10 (Forward-compatibility)** fleshes out as the 0.9.x cycle
-  accumulates substrate changes (**0.9.2+**).
+The theming substrate ships in Aurora-Locus 0.9, and this guide covers it in
+full — all ten chapters, including extension points (Chapter 6) and
+forward-compatibility (Chapter 10). Chapter 10's version-by-version migration log
+is a living section that gains an entry each time a real substrate change ships;
+the rules it states hold today.
 
 ---
 
@@ -736,15 +734,154 @@ iterate against the number, not by eye.
 
 ## Chapter 10 — Forward-compatibility and theme maintenance
 
-> **Fleshes out in 0.9.2+.** This chapter documents how themes survive
-> Aurora-Locus updates. The load-bearing rule already holds: because you
-> *inherit* everything you don't override, a substrate that adds tokens or effect
-> classes in a minor release flows into your theme automatically — you act only
-> when you've overridden something whose parent meaning changed, or when a
-> breaking release bumps the substrate version (signalled by
-> `theme.substrate.version.future` if your `substrateVersion` is now too low).
-> Concrete version-by-version guidance accrues as the 0.9.x cycle produces real
-> migration scenarios.
+This chapter is about what happens to your theme when Aurora-Locus updates. The
+short version: **you inherit everything you don't override**, so most updates
+reach your theme on their own and you do nothing. This chapter explains when
+that holds, the one case where it doesn't, and how the substrate tells you.
+
+Two version numbers matter, and they're separate:
+
+- The **Aurora-Locus version** (e.g. `0.9.0`) — the application release.
+- The **substrate version** — the theming contract's own version, declared by
+  your theme's `substrateVersion` and checked at load. It is **`1.0`** today and
+  moves independently of the application version. Everything below is about the
+  substrate version.
+
+### 10.1 The substrate-version compatibility table
+
+`substrateVersion` is a **floor**: it's the *minimum* substrate your theme
+needs. The running substrate loads any theme whose declared `substrateVersion`
+is **≤** its own, and rejects one that targets a *newer* substrate (it might use
+tokens or classes this version doesn't have) — see step 4 in §9.1 and the
+`theme.substrate.version.future` entry in §9.2.
+
+| Substrate version | Shipped in | Contract |
+|---|---|---|
+| `1.0` | Aurora-Locus 0.9 | 28 required tokens (§4.1); 4 required effect classes (§5.5); the optional `aurora-default` token set (§4.2); the effect-class library (§5.2); extension points (§6); lifecycle-hook *declaration* (§10.6). |
+
+There is one substrate version so far. As the contract grows, rows are added
+here; a theme keeps working as long as its declared floor stays ≤ the running
+substrate. Declare the *lowest* version that has everything you use — that
+maximises the range of Aurora-Locus releases your theme runs on.
+
+### 10.2 Minor releases — what can and can't change
+
+A minor (non-breaking) substrate release only ever **adds** to the contract. It
+can:
+
+- add new **optional** tokens to `aurora-default`,
+- add new effect classes,
+- add new extension points or other opt-in capabilities.
+
+It will **not** rename or remove an existing token, effect class, or extension
+point, and it will not make a previously-optional thing newly required in a way
+your theme can't already satisfy. Because additions land in the inheritance
+root, your theme inherits them automatically (§10.4–10.6). **You do nothing.**
+You only revisit your theme in a minor release if you *want* to adopt something
+new — never because something broke.
+
+This is not hypothetical: extension points (§6) and lifecycle-hook declaration
+(§10.6) were both *added* to the substrate after the first themes shipped, both
+under substrate version `1.0`, and no existing theme needed a change.
+
+### 10.3 Breaking releases — what changes, and how it's signalled
+
+A breaking substrate release is one that **renames or removes** a contract item,
+or makes a new item required that inheritance can't supply. Those are the only
+changes that can invalidate a theme that was valid before. A breaking release
+**bumps the substrate version** (e.g. `1.0` → `2.0`).
+
+The substrate signals the mismatch the same way in both directions:
+
+- If your theme targets a **newer** substrate than is running (you upgraded the
+  theme but not Aurora-Locus, or moved it to an older deployment), it's rejected
+  with `theme.substrate.version.future` and is skipped at load.
+- If a release **renamed or removed** something your theme *overrode*, the
+  override now points at a name the contract no longer has. You'll see it as the
+  matching validation failure — most often `theme.tokens.required.missing` or
+  `theme.effects.required.missing` (§9.2) — on the Configuration → Themes page
+  and in the startup log.
+
+The fix for a breaking change is always: read the failing `theme.*` reasons
+(§9.2), update the renamed/removed references, and raise your `substrateVersion`
+to the new floor once your theme uses the new contract.
+
+### 10.4 New tokens in a release
+
+When a release adds a token, it adds it to `aurora-default` (the root every
+chain terminates at). Your theme `extends` that chain, so the new token
+**resolves through inheritance with no change on your part** — whether it's
+optional or part of the required set, it's already defined upstream and your
+theme satisfies the contract automatically.
+
+You only act if you want the new token to look *different* in your theme: define
+it in your own `tokens.css`, exactly as you'd override any inherited token
+(§4.5). If you leave it alone, you get the substrate's value. There is no case
+where a newly-added token forces you to edit a theme just to keep it valid.
+
+### 10.5 Effect-class additions and modifications
+
+Effect classes follow the same inherit-by-default rule as tokens. A release that
+adds an effect class adds it upstream; your theme inherits it and can use it
+immediately, or override it in your `effects.css` if you want a different
+treatment (§5.3).
+
+One nuance specific to effect classes: because they're *CSS rules* rather than
+single values, a substrate release may **refine** an existing class (e.g. adjust
+what `effect-frosted-glass` renders) without renaming it. If you have **not**
+overridden that class, you inherit the refinement automatically. If you **have**
+overridden it, your version keeps winning — the cascade still resolves to your
+definition — so a refinement upstream never silently changes a class you've
+taken ownership of. The trade-off is the migration note in §8.6: when you
+override an effect class, you also opt out of future improvements to it, so
+re-check your overrides against the substrate's current version periodically.
+
+### 10.6 Extension-point and lifecycle-hook compatibility
+
+**Extension points** (§6) are additive and opt-in by construction. A surface
+checks whether the active theme provides a point and falls back to its default
+when it doesn't, so:
+
+- A theme that declares no extension points is unaffected by any number of new
+  ones.
+- A theme that declares an extension point keeps providing it across releases;
+  the substrate doesn't remove a point your theme defines.
+- New extension points added by a release are simply available for you to adopt
+  (declare them in your manifest and define `.extension-<name>` in
+  `extensions.css`); ignoring them costs nothing.
+
+**Lifecycle hooks** are forward-compatible by design. A theme may *declare*
+lifecycle hooks — `install`, `activate`, and `deactivate` — as
+`--theme-<phase>-hook` custom properties in `extensions.css`. In this version
+the substrate **recognises and lists declared hooks but does not execute them**:
+script execution opens a sandboxing surface that ships only once it has been
+fully specified and security-reviewed. Declared hooks appear on the
+Configuration → Themes page as *declared, not run in this version*, and a line
+is logged at startup for each.
+
+The forward-compatibility guarantee is this: **you can write and declare hook
+scripts now, and they begin running automatically when hook execution lands** —
+no theme change required at that point. Until then, a declared hook is inert and
+never affects whether your theme loads. If your theme needs setup *today* that a
+hook would eventually perform (loading a font, say), do it with CSS-only means —
+an `@import url()` at the top of your `tokens.css` works and needs no hook.
+
+### 10.7 Keeping your theme current — a short checklist
+
+- Pin the **lowest** `substrateVersion` that covers what you use (§10.1).
+- After an Aurora-Locus upgrade, glance at Configuration → Themes: a **Valid**
+  badge means you're done. A **Failed** badge means a breaking change touched
+  something you overrode — read the `theme.*` reasons (§9.2) and §10.3.
+- Re-check any **overridden** tokens or effect classes against the current
+  substrate now and then; overriding opts you out of upstream improvements
+  (§10.5, §8.6).
+- You never need to act on *additions* to keep a theme valid — only on
+  *renames/removals*, which are breaking and version-bumped (§10.3).
+
+> **A living section.** §10.1's table and §10.3's guidance grow a concrete entry
+> each time a real substrate change ships — that version-by-version migration
+> log accrues over the project's life. The rules above hold regardless of how
+> many rows the table eventually has.
 
 ---
 
