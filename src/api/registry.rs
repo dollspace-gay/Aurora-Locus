@@ -165,6 +165,9 @@ pub const WIRE_EXTENSION_ORDER: &[&str] = &[
     // v0.9 Arc E 0.9.3 (#273) — per-operator session management (§8.1.7);
     // admin.listSessions + admin.revokeSession.
     "session-management-v1",
+    // v0.9 Arc D (#316) — per-account kryphocron overrides (§6.6.2 item 4);
+    // ops.kryphocron.getAccountOverrides + setAccountOverride.
+    "kryphocron-overrides-v1",
 ];
 
 /// Typed family identifier — enum so typos are compile errors;

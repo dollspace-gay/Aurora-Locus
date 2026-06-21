@@ -691,6 +691,18 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(crate::api::aurora_kryphocron_ops::get_block_cascade_impact),
             CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
         )
+        // Per-account overrides (#316 / §6.6.2 item 4) — SuperAdmin (in-handler);
+        // read + audited write of the per-account kryphocron override row.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getAccountOverrides",
+            get(crate::api::aurora_kryphocron_ops::get_account_overrides),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-overrides-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.setAccountOverride",
+            post(crate::api::aurora_kryphocron_ops::set_account_override),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-overrides-v1"]),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -9054,7 +9066,8 @@ mod tests {
             r#"{"name":"themes-v1"},"#,
             r#"{"name":"kryphocron-rotation-v1"},"#,
             r#"{"name":"kryphocron-read-v1"},"#,
-            r#"{"name":"session-management-v1"}"#,
+            r#"{"name":"session-management-v1"},"#,
+            r#"{"name":"kryphocron-overrides-v1"}"#,
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
@@ -9135,7 +9148,9 @@ mod tests {
             r#""listRotations","#,
             r#""getAudienceAggregate","#,
             r#""listAudiences","#,
-            r#""getBlockCascadeImpact""#,
+            r#""getBlockCascadeImpact","#,
+            r#""getAccountOverrides","#,
+            r#""setAccountOverride""#,
             r#"],"#,
             // tools.aurora.superadmin (17 endpoints)
             r#""tools.aurora.superadmin":["#,

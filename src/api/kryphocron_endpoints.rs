@@ -173,6 +173,18 @@ async fn authenticated_did_for_repo(
                 .to_string(),
         ));
     }
+    // Per-account capability-issuance gate (#316 / §6.6.2 item 4): a SuperAdmin
+    // can block a specific account from issuing kryphocron capabilities at all.
+    // This chokepoint covers every dedicated-endpoint write (postPrivate /
+    // participatePrivate / block …), so the block is enforced uniformly here —
+    // a host-side gate, not a substrate concept. Default (no override) = allowed.
+    if crate::kryphocron_override::capability_blocked(&ctx.account_db, auth_did).await {
+        return Err(PdsError::Authorization(
+            "this account is blocked from issuing kryphocron capabilities \
+             (per-account override)"
+                .to_string(),
+        ));
+    }
     // This is THE request-auth chokepoint: the requester is authenticated, the
     // scope is enforced, and the target repo is confirmed to be the requester's
     // own. Wrap the validated DID so the write helpers take `AuthenticatedDid`,

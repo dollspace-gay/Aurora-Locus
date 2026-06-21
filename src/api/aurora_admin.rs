@@ -8172,6 +8172,98 @@ mod tests {
         assert_eq!(body["titleColor"], "#ffcc00");
     }
 
+    // ---- per-account kryphocron overrides (#316) ----
+
+    // Seed an override row via the tx-aware store fn (the path the audited
+    // handler uses), so the store tests don't depend on the handler/auth.
+    async fn seed_ov(
+        pool: &sqlx::AnyPool,
+        did: &str,
+        rle: Option<bool>,
+        ci: Option<bool>,
+    ) {
+        let mut tx = pool.begin().await.unwrap();
+        crate::kryphocron_override::upsert_override_in_tx(
+            &mut tx, did, rle, ci, "did:plc:op", Some("r"), "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_override_store_roundtrip_and_capability_blocked() {
+        use crate::kryphocron_override as ov;
+        let ctx = create_test_context().await;
+        let pool = &ctx.account_db;
+        // Set rate-limit-exempt + capability blocked.
+        seed_ov(pool, "did:plc:x", Some(true), Some(false)).await;
+        let got = ov::get_override(pool, "did:plc:x").await.unwrap().unwrap();
+        assert_eq!(got.rate_limit_exempt, Some(true));
+        assert_eq!(got.capability_issuance, Some(false));
+        assert!(ov::capability_blocked(pool, "did:plc:x").await);
+        // Full-state replace clears both back to unset → not blocked.
+        seed_ov(pool, "did:plc:x", None, None).await;
+        let got = ov::get_override(pool, "did:plc:x").await.unwrap().unwrap();
+        assert_eq!(got.rate_limit_exempt, None);
+        assert_eq!(got.capability_issuance, None);
+        assert!(!ov::capability_blocked(pool, "did:plc:x").await);
+        // No row → not blocked, no override.
+        assert!(!ov::capability_blocked(pool, "did:plc:none").await);
+        assert!(ov::get_override(pool, "did:plc:none").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_account_overrides_gating_and_shapes() {
+        use crate::api::aurora_kryphocron_ops::{get_account_overrides, AccountDidQuery};
+        let q = || axum::extract::Query(AccountDidQuery { did: "did:plc:x".to_string() });
+        let ctx = create_test_context().await;
+        // Admin (not SuperAdmin) → 403.
+        let err = get_account_overrides(State(ctx.clone()), admin_auth(), q()).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        // SuperAdmin, no row → empty overrides object.
+        let body = get_account_overrides(State(ctx.clone()), super_admin_auth(), q()).await.unwrap().0;
+        assert!(body["overrides"].as_object().unwrap().is_empty());
+        // After a set → values surface.
+        seed_ov(&ctx.account_db, "did:plc:x", Some(true), Some(false)).await;
+        let body = get_account_overrides(State(ctx), super_admin_auth(), q()).await.unwrap().0;
+        assert_eq!(body["overrides"]["rateLimitExempt"], true);
+        assert_eq!(body["overrides"]["capabilityIssuance"], false);
+    }
+
+    #[tokio::test]
+    async fn set_account_override_gating_rationale_and_audit() {
+        use crate::api::aurora_kryphocron_ops::{set_account_override, SetAccountOverrideInput};
+        let ctx = create_test_context().await;
+        let mk = |rationale: &str| SetAccountOverrideInput {
+            did: "did:plc:x".to_string(),
+            rate_limit_exempt: Some(true),
+            capability_issuance: Some(false),
+            rationale: rationale.to_string(),
+        };
+        // Admin → 403.
+        let err = set_account_override(State(ctx.clone()), admin_auth(), Json(mk("ok"))).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        // SuperAdmin, empty rationale → 400.
+        let err = set_account_override(State(ctx.clone()), super_admin_auth(), Json(mk(""))).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // SuperAdmin, valid → row written + audit entry.
+        let out = set_account_override(State(ctx.clone()), super_admin_auth(), Json(mk("blocking a spammer")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(out["did"], "did:plc:x");
+        assert!(out["auditEntryId"].as_str().is_some_and(|s| !s.is_empty()));
+        let got = crate::kryphocron_override::get_override(&ctx.account_db, "did:plc:x").await.unwrap().unwrap();
+        assert_eq!(got.capability_issuance, Some(false));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1")
+            .bind("kryphocron_account_override_changed")
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
     #[tokio::test]
     async fn upload_branding_writes_file_setting_and_audit() {
         let ctx = create_test_context().await;

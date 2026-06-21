@@ -27,6 +27,7 @@ mod jobs;
 mod kryphocron;
 mod kryphocron_audit;
 mod kryphocron_content;
+mod kryphocron_override;
 mod kryphocron_rewrite;
 mod kryphocron_rotation;
 mod mailer;

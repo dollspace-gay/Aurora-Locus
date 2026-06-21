@@ -56,6 +56,8 @@ use axum::{extract::Query, extract::State, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::admin::audit_chain::{self, AppendEntryParams};
+use crate::admin::defs::Subject;
 use crate::api::kryphocron_endpoints::{NSID_AUDIENCE, NSID_POST_PRIVATE};
 use crate::auth::AdminAuthContext;
 use crate::context::AppContext;
@@ -1063,6 +1065,140 @@ fn count_cascade_removals(contents: &str, did: &str) -> u64 {
         .filter(|v| v.get("account").and_then(|a| a.as_str()) == Some(did))
         .map(|v| v.get("removed").and_then(|r| r.as_u64()).unwrap_or(1))
         .sum()
+}
+
+// ============================================================================
+// Per-account overrides (#316 / design §6.6.2 item 4) — SuperAdmin
+// ============================================================================
+
+/// SuperAdmin floor for the per-account override surface (deployment-wide
+/// per-account policy is a SuperAdmin decision).
+fn require_super(auth: &AdminAuthContext) -> Result<(), ApiErr> {
+    use crate::admin::roles::Role;
+    if auth.role.can_act_as(Role::SuperAdmin) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "InsufficientRole",
+                "message": format!("endpoint requires SuperAdmin role; caller has {:?}", auth.role),
+            })),
+        ))
+    }
+}
+
+/// 400 with a stable code (the override handlers' validation failures).
+fn validation(msg: &str) -> ApiErr {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "InvalidRequest", "message": msg })),
+    )
+}
+
+/// `?did=` query for the account-override read.
+#[derive(Deserialize)]
+pub struct AccountDidQuery {
+    pub did: String,
+}
+
+/// `tools.aurora.ops.kryphocron.getAccountOverrides` (GET, SuperAdmin) — read
+/// the per-account override row for `did`. Returns an empty `overrides` object
+/// when no override is set (overrides may pre-exist the account).
+pub async fn get_account_overrides(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(q): Query<AccountDidQuery>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    require_super(&auth)?;
+    match crate::kryphocron_override::get_override(&ctx.account_db, &q.did)
+        .await
+        .map_err(internal)?
+    {
+        Some(o) => Ok(Json(json!({
+            "did": o.did,
+            "overrides": {
+                "rateLimitExempt": o.rate_limit_exempt,
+                "capabilityIssuance": o.capability_issuance,
+            },
+            "lastModifiedAt": o.last_modified_at,
+            "lastModifiedByDid": o.last_modified_by_did,
+            "lastModifiedRationale": o.last_modified_rationale,
+        }))),
+        None => Ok(Json(json!({ "did": q.did, "overrides": {} }))),
+    }
+}
+
+/// `setAccountOverride` input. Full-state replace per field: an absent / null
+/// field is unset (= deployment default); a present boolean is explicit. (Recon
+/// note: a 2-field surface where the UI always submits full state — simpler than
+/// field-level partial-update + double-option.)
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountOverrideInput {
+    pub did: String,
+    #[serde(default)]
+    pub rate_limit_exempt: Option<bool>,
+    #[serde(default)]
+    pub capability_issuance: Option<bool>,
+    pub rationale: String,
+}
+
+/// `tools.aurora.ops.kryphocron.setAccountOverride` (POST, SuperAdmin,
+/// rationale-required) — upsert the override row + emit an audit-chain entry
+/// (subject = the overridden account) in one transaction.
+pub async fn set_account_override(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<SetAccountOverrideInput>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    require_super(&auth)?;
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    if input.did.trim().is_empty() {
+        return Err(validation("did is required"));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let _guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    crate::kryphocron_override::upsert_override_in_tx(
+        &mut tx,
+        &input.did,
+        input.rate_limit_exempt,
+        input.capability_issuance,
+        &auth.did,
+        Some(&input.rationale),
+        &now,
+    )
+    .await
+    .map_err(internal)?;
+
+    let subject = Subject::Repo { did: input.did.clone() };
+    let detail = format!(
+        "rate_limit_exempt={:?} capability_issuance={:?}: {}",
+        input.rate_limit_exempt, input.capability_issuance, input.rationale
+    );
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            actor_did: &auth.did,
+            action: "kryphocron_account_override_changed",
+            subject: Some(&subject),
+            rationale: &detail,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+
+    Ok(Json(json!({ "did": input.did, "auditEntryId": audit_entry_id.to_string() })))
 }
 
 #[cfg(test)]
