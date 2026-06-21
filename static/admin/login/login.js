@@ -61,6 +61,18 @@ if (localStorage.getItem('aurora-admin-token')) {
                         'url("' + b.bannerUrl.replace(/"/g, '%22') + '")';
                 }
             }
+            // Operator title/subtitle text + color overrides. Empty = keep the
+            // built-in wordmark / theme-token color (the CSS var fallback).
+            var titleEl = document.getElementById('login-title');
+            var subtitleEl = document.getElementById('login-subtitle');
+            if (titleEl) {
+                if (b.titleText) titleEl.textContent = b.titleText;
+                if (b.titleColor) titleEl.style.setProperty('--login-title-color', b.titleColor);
+            }
+            if (subtitleEl) {
+                if (b.subtitleText) subtitleEl.textContent = b.subtitleText;
+                if (b.subtitleColor) subtitleEl.style.setProperty('--login-subtitle-color', b.subtitleColor);
+            }
         })
         .catch(function () { /* keep the default theme + built-in logo */ });
 })();

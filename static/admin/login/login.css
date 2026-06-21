@@ -81,12 +81,15 @@ body {
     font-size: 1.75rem;
     font-weight: 700;
     margin-bottom: 0.5rem;
-    color: var(--color-text-primary);
+    /* Operator title-color override (login.js sets --login-title-color when set);
+       falls back to the theme's primary text token. */
+    color: var(--login-title-color, var(--color-text-primary));
 }
 
 .login-header p {
     font-size: 0.95rem;
-    color: var(--color-text-secondary);
+    /* Operator subtitle-color override; falls back to the secondary text token. */
+    color: var(--login-subtitle-color, var(--color-text-secondary));
     font-weight: 400;
 }
 

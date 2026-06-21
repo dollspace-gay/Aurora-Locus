@@ -3703,6 +3703,27 @@ const LAQUNA_ROTATION_CADENCE_KEY: &str = "kryphocron.laquna.rotation-cadence";
 const BRANDING_LOGIN_LOGO_KEY: &str = "branding.login-logo-url";
 const BRANDING_LOGIN_BANNER_KEY: &str = "branding.login-banner-image-url";
 
+/// v0.9 — login-splash text + color overrides, so operators can pair a custom
+/// banner with readable foreground. Each defaults to empty: the title/subtitle
+/// fall back to the built-in wordmark, and the colors fall back to the theme's
+/// text tokens. Text is length-capped to keep the splash from breaking; colors
+/// are `#RRGGBB` (or empty). Read unauthenticated via `serve_login_branding`.
+const BRANDING_LOGIN_TITLE_TEXT_KEY: &str = "branding.login-title-text";
+const BRANDING_LOGIN_SUBTITLE_TEXT_KEY: &str = "branding.login-subtitle-text";
+const BRANDING_LOGIN_TITLE_COLOR_KEY: &str = "branding.login-title-color";
+const BRANDING_LOGIN_SUBTITLE_COLOR_KEY: &str = "branding.login-subtitle-color";
+const BRANDING_LOGIN_TITLE_MAX: usize = 64;
+const BRANDING_LOGIN_SUBTITLE_MAX: usize = 128;
+
+/// `#RRGGBB` (6-digit hex, no 3-digit shorthand) or empty (= use the theme
+/// token). The branding color settings' value contract.
+fn is_branding_color_value(s: &str) -> bool {
+    s.is_empty()
+        || (s.len() == 7
+            && s.as_bytes()[0] == b'#'
+            && s[1..].bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Allowlist of runtime-setting keys this build accepts. Per CR-2 /
 /// chainlink #119, `setRuntimeSetting` rejects any other key with
 /// 400 — the inventory's "validates known keys" framing
@@ -3720,6 +3741,10 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     LAQUNA_ROTATION_CADENCE_KEY,
     BRANDING_LOGIN_LOGO_KEY,
     BRANDING_LOGIN_BANNER_KEY,
+    BRANDING_LOGIN_TITLE_TEXT_KEY,
+    BRANDING_LOGIN_SUBTITLE_TEXT_KEY,
+    BRANDING_LOGIN_TITLE_COLOR_KEY,
+    BRANDING_LOGIN_SUBTITLE_COLOR_KEY,
 ];
 const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
@@ -3733,9 +3758,12 @@ fn default_for_key(key: &str) -> serde_json::Value {
         MODERATION_MODE_REDIRECT_KEY => serde_json::Value::String(String::new()),
         THEME_DEPLOYMENT_DEFAULT_KEY => serde_json::Value::String("stack-classic".to_string()),
         LAQUNA_ROTATION_CADENCE_KEY => serde_json::Value::String("daily".to_string()),
-        BRANDING_LOGIN_LOGO_KEY | BRANDING_LOGIN_BANNER_KEY => {
-            serde_json::Value::String(String::new())
-        }
+        BRANDING_LOGIN_LOGO_KEY
+        | BRANDING_LOGIN_BANNER_KEY
+        | BRANDING_LOGIN_TITLE_TEXT_KEY
+        | BRANDING_LOGIN_SUBTITLE_TEXT_KEY
+        | BRANDING_LOGIN_TITLE_COLOR_KEY
+        | BRANDING_LOGIN_SUBTITLE_COLOR_KEY => serde_json::Value::String(String::new()),
         _ => serde_json::Value::Null,
     }
 }
@@ -3758,6 +3786,17 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         // Branding URLs: any string (including empty = "use the default").
         // No URL/size validation in v0.9 — operators host their own assets.
         BRANDING_LOGIN_LOGO_KEY | BRANDING_LOGIN_BANNER_KEY => value.as_str().is_some(),
+        // Branding text: any string up to the per-field cap (empty = default).
+        BRANDING_LOGIN_TITLE_TEXT_KEY => {
+            value.as_str().is_some_and(|s| s.chars().count() <= BRANDING_LOGIN_TITLE_MAX)
+        }
+        BRANDING_LOGIN_SUBTITLE_TEXT_KEY => {
+            value.as_str().is_some_and(|s| s.chars().count() <= BRANDING_LOGIN_SUBTITLE_MAX)
+        }
+        // Branding colors: #RRGGBB or empty (= use the theme token).
+        BRANDING_LOGIN_TITLE_COLOR_KEY | BRANDING_LOGIN_SUBTITLE_COLOR_KEY => {
+            value.as_str().is_some_and(is_branding_color_value)
+        }
         _ => true,
     }
 }
@@ -3880,8 +3919,9 @@ async fn read_runtime_string(ctx: &AppContext, key: &str) -> Option<String> {
 /// reads to theme itself and apply operator branding: the resolved
 /// deployment-default theme id (so the page sets `data-theme` for theme-scoped
 /// rules + cache-busts the theme CSS) plus the two `branding.login-*` URLs
-/// (empty string when unset → the page keeps its built-in logo / no banner).
-/// Same unauthenticated, secret-free contract as the theme-serve routes.
+/// (empty string when unset → the page keeps its built-in logo / no banner / the
+/// default wordmark / the theme's text colors). Same unauthenticated, secret-free
+/// contract as the theme-serve routes.
 pub async fn serve_login_branding(State(ctx): State<AppContext>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "theme": deployment_default_theme(&ctx).await,
@@ -3889,6 +3929,18 @@ pub async fn serve_login_branding(State(ctx): State<AppContext>) -> Json<serde_j
             .await
             .unwrap_or_default(),
         "bannerUrl": read_runtime_string(&ctx, BRANDING_LOGIN_BANNER_KEY)
+            .await
+            .unwrap_or_default(),
+        "titleText": read_runtime_string(&ctx, BRANDING_LOGIN_TITLE_TEXT_KEY)
+            .await
+            .unwrap_or_default(),
+        "subtitleText": read_runtime_string(&ctx, BRANDING_LOGIN_SUBTITLE_TEXT_KEY)
+            .await
+            .unwrap_or_default(),
+        "titleColor": read_runtime_string(&ctx, BRANDING_LOGIN_TITLE_COLOR_KEY)
+            .await
+            .unwrap_or_default(),
+        "subtitleColor": read_runtime_string(&ctx, BRANDING_LOGIN_SUBTITLE_COLOR_KEY)
             .await
             .unwrap_or_default(),
     }))
@@ -8078,6 +8130,46 @@ mod tests {
             serde_json::json!({ "asset_type": "banner" })
         )
         .is_err());
+    }
+
+    #[test]
+    fn branding_text_and_color_validation() {
+        use serde_json::json;
+        // Title text: <= 64 chars (empty ok), longer rejected.
+        assert!(validate_runtime_value(BRANDING_LOGIN_TITLE_TEXT_KEY, &json!("")));
+        assert!(validate_runtime_value(BRANDING_LOGIN_TITLE_TEXT_KEY, &json!("Acme PDS")));
+        assert!(!validate_runtime_value(BRANDING_LOGIN_TITLE_TEXT_KEY, &json!("x".repeat(65))));
+        // Subtitle text: <= 128 chars.
+        assert!(validate_runtime_value(BRANDING_LOGIN_SUBTITLE_TEXT_KEY, &json!("x".repeat(128))));
+        assert!(!validate_runtime_value(BRANDING_LOGIN_SUBTITLE_TEXT_KEY, &json!("x".repeat(129))));
+        // Colors: #RRGGBB (case-insensitive) or empty; reject 3-digit / no-# / non-hex.
+        assert!(validate_runtime_value(BRANDING_LOGIN_TITLE_COLOR_KEY, &json!("#aabbcc")));
+        assert!(validate_runtime_value(BRANDING_LOGIN_TITLE_COLOR_KEY, &json!("#AABBCC")));
+        assert!(validate_runtime_value(BRANDING_LOGIN_SUBTITLE_COLOR_KEY, &json!("")));
+        assert!(!validate_runtime_value(BRANDING_LOGIN_TITLE_COLOR_KEY, &json!("#abc")));
+        assert!(!validate_runtime_value(BRANDING_LOGIN_TITLE_COLOR_KEY, &json!("aabbcc")));
+        assert!(!validate_runtime_value(BRANDING_LOGIN_SUBTITLE_COLOR_KEY, &json!("#gggggg")));
+    }
+
+    #[tokio::test]
+    async fn serve_login_branding_includes_text_color_fields() {
+        let ctx = create_test_context().await;
+        let body = serve_login_branding(State(ctx.clone())).await.0;
+        for f in ["titleText", "subtitleText", "titleColor", "subtitleColor"] {
+            assert_eq!(body[f], "", "{f} defaults empty");
+        }
+        // Set the title color → it surfaces in the payload.
+        write_runtime_setting_audited(
+            &ctx,
+            BRANDING_LOGIN_TITLE_COLOR_KEY,
+            &serde_json::Value::String("#ffcc00".to_string()),
+            "did:plc:test",
+            "set",
+        )
+        .await
+        .unwrap();
+        let body = serve_login_branding(State(ctx)).await.0;
+        assert_eq!(body["titleColor"], "#ffcc00");
     }
 
     #[tokio::test]
