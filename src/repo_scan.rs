@@ -884,6 +884,8 @@ async fn emit_bulk_repair_initiated(
         &ctx.account_db,
         ctx.config.database.backend,
         crate::admin::audit_chain::AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: triggered_by,
             action: "repo.bulk_repair",
             subject: None,

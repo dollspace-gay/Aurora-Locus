@@ -673,6 +673,8 @@ mod verify_audit_chain_tests {
                 previous_hash TEXT,
                 cascade_subjects TEXT,
                 cascade_snapshot_ids TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                payload TEXT,
                 UNIQUE(sequence)
             )",
         )
@@ -712,6 +714,8 @@ mod verify_audit_chain_tests {
                 db,
                 crate::config::DatabaseBackend::Sqlite,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:m1",
                     action: "TakedownAccount",
                     subject: Some(&subject),

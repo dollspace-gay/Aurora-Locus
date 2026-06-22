@@ -769,6 +769,8 @@ pub async fn emit_event(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: action_str,
             subject: chain_subject,
@@ -1701,6 +1703,8 @@ pub async fn batch_takedown_accounts(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.batch_takedown",
             subject: None,
@@ -1793,6 +1797,8 @@ pub async fn batch_suspend_accounts(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.batch_suspend",
             subject: None,
@@ -1871,6 +1877,8 @@ pub async fn batch_restore_accounts(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.batch_restore",
             subject: None,
@@ -1961,6 +1969,8 @@ pub async fn batch_takedown_records(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "record.batch_takedown",
             subject: None,
@@ -2074,6 +2084,8 @@ pub async fn batch_apply_label(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "label.batch_apply",
             subject: None,
@@ -2234,6 +2246,8 @@ pub async fn batch_remove_label(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "label.batch_remove",
             subject: None,
@@ -2351,6 +2365,8 @@ pub async fn trigger_password_reset(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.trigger_password_reset",
             subject: Some(&subject),
@@ -3264,6 +3280,8 @@ pub async fn export_account_forensic(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "ForensicExport",
             subject: Some(&subject),
@@ -4178,6 +4196,8 @@ pub async fn trigger_rotation(
                     &ctx.account_db,
                     ctx.config.database.backend,
                     AppendEntryParams {
+                        source: "manual",
+                        payload: None,
                         actor_did: &auth.did,
                         action: "kryphocron.laquna.rotate",
                         subject: None,
@@ -4526,6 +4546,8 @@ async fn write_runtime_setting_audited(
         ctx.config.database.backend,
         AppendEntryParams {
             actor_did,
+            source: "manual",
+            payload: None,
             action: "SetRuntimeSetting",
             subject: None,
             rationale: &format!("{} → {}: {}", key, value_json, rationale),
@@ -6521,6 +6543,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&repo_subject("did:plc:s1")),
@@ -6535,6 +6559,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m2",
                 action: "RestoreAccount",
                 subject: Some(&repo_subject("did:plc:s1")),
@@ -6580,6 +6606,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&Subject::Blob {
@@ -6600,6 +6628,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&Subject::Blob {
@@ -6678,6 +6708,8 @@ mod tests {
                 &ctx.account_db,
                 ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: actor,
                     action: "TakedownAccount",
                     subject: Some(&Subject::Blob {
@@ -6844,6 +6876,8 @@ mod tests {
                 &ctx.account_db,
                 ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
                     subject: Some(&repo_subject("did:plc:victim")),
@@ -6941,6 +6975,8 @@ mod tests {
                         &ctx.account_db,
                         ctx.config.database.backend,
                         crate::admin::audit_chain::AppendEntryParams {
+                            source: "manual",
+                            payload: None,
                             actor_did: actor,
                             action,
                             subject: Some(&repo_subject(subj)),
@@ -7005,6 +7041,8 @@ mod tests {
                 &ctx.account_db,
                 ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
                     subject: Some(&repo_subject("did:plc:victim")),
@@ -7236,6 +7274,8 @@ mod tests {
                 &ctx.account_db,
                 ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
                     subject: Some(&repo_subject("did:plc:s1")),
@@ -7282,6 +7322,8 @@ mod tests {
                 &ctx.account_db,
                 ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
                     subject: Some(&repo_subject("did:plc:s1")),
@@ -7647,6 +7689,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:moderator",
                 action: "TakedownAccount",
                 subject: Some(&repo_subject("did:plc:parity")),

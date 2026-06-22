@@ -1214,6 +1214,8 @@ pub async fn set_account_override(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "kryphocron_account_override_changed",
             subject: Some(&subject),

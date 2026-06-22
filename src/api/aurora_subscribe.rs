@@ -489,7 +489,7 @@ async fn fetch_new_chain_entries(
     let rows = sqlx::query(
         "SELECT id, sequence, created_at, actor_did, action, subject_did, subject_uri, \
                 subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                cascade_subjects, cascade_snapshot_ids \
+                cascade_subjects, cascade_snapshot_ids, source, payload \
          FROM audit_chain_entry WHERE sequence > $1 ORDER BY sequence ASC LIMIT $2",
     )
     .bind(after_seq)
@@ -534,6 +534,10 @@ async fn fetch_new_chain_entries(
             .iter()
             .map(|opt| opt.map(|v| v.to_string()))
             .collect();
+        let source: String = row
+            .try_get::<String, _>("source")
+            .unwrap_or_else(|_| "manual".to_string());
+        let payload_str: Option<String> = row.try_get("payload").ok().flatten();
 
         let verified = crate::admin::audit_chain::verify_entry(
             sequence,
@@ -549,6 +553,8 @@ async fn fetch_new_chain_entries(
             previous_hash.as_deref(),
             cascade_str.as_deref(),
             cascade_snapshot_ids_str.as_deref(),
+            &source,
+            payload_str.as_deref(),
             &current_hash,
         );
 
@@ -577,6 +583,10 @@ async fn fetch_new_chain_entries(
             verified,
             cascade_subjects,
             cascade_snapshot_ids,
+            source,
+            payload: payload_str
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
         });
     }
     Ok(out)
@@ -739,6 +749,8 @@ mod tests {
             verified: true,
             cascade_subjects: Vec::new(),
             cascade_snapshot_ids: Vec::new(),
+            source: "manual".to_string(),
+            payload: None,
         }
     }
 
@@ -842,6 +854,8 @@ mod tests {
                 verified: true,
                 cascade_subjects: Vec::new(),
                 cascade_snapshot_ids: Vec::new(),
+                source: "manual".to_string(),
+                payload: None,
             }),
             sequence: 42,
         };
@@ -892,6 +906,8 @@ mod tests {
             verified: true,
             cascade_subjects: Vec::new(),
             cascade_snapshot_ids: Vec::new(),
+            source: "manual".to_string(),
+            payload: None,
         };
         let standalone = serde_json::to_value(&entry).unwrap();
         let wrapped = serde_json::to_value(&SubscribeMessage::AuditEntry {
@@ -1053,6 +1069,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action,
                 subject: Some(&subject),

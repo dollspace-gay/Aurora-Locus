@@ -209,6 +209,22 @@ pub struct AuditEntry {
     /// documented in `docs/operator/audit-chain-verification.md`
     /// (Arc 3 Step 2).
     pub cascade_snapshot_ids: Vec<Option<String>>,
+
+    /// Provenance discriminator (§5.5.4 / #345): `default_action |
+    /// auto_label_rule | manual | stale_expiration | operator_removal |
+    /// escalation | system_diagnostic`. NOT NULL on the row; surfaced
+    /// here so external verifiers can fold it into the canonical hash
+    /// (it joined the canonical set in the v0.9 format bump). Direct
+    /// copy into the canonical input.
+    pub source: String,
+
+    /// Action-specific scalars as a JSON object (§5.5.4 / #345), or
+    /// `None` when the action carries no payload. Wire form is the parsed
+    /// JSON value; the canonical hash sees its compact serialization —
+    /// the same wire-vs-canonical asymmetry as `cascade_subjects` (the
+    /// serialized string is embedded, escaped, in the canonical object).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Build an [`AuditEntry`] from a fetched `audit_chain_entry` row.
@@ -280,6 +296,15 @@ pub fn audit_entry_from_row(row: &sqlx::any::AnyRow) -> Result<AuditEntry, PdsEr
         .map(|opt| opt.map(|v| v.to_string()))
         .collect();
 
+    // `source` is NOT NULL post-v0.9 migration; legacy reads tolerate a
+    // missing column (pre-migration row in a mixed read path) by treating
+    // it as the 'manual' backfill default. `payload` is the stored JSON
+    // string, fed verbatim to the verifier.
+    let source: String = row
+        .try_get::<String, _>("source")
+        .unwrap_or_else(|_| "manual".to_string());
+    let payload_str: Option<String> = row.try_get("payload").ok().flatten();
+
     let verified = verify_entry(
         sequence,
         &created_at_str,
@@ -294,6 +319,8 @@ pub fn audit_entry_from_row(row: &sqlx::any::AnyRow) -> Result<AuditEntry, PdsEr
         previous_hash.as_deref(),
         cascade_str.as_deref(),
         cascade_snapshot_ids_str.as_deref(),
+        &source,
+        payload_str.as_deref(),
         &current_hash,
     );
     let subject_ref = Subject::from_columns(
@@ -317,6 +344,13 @@ pub fn audit_entry_from_row(row: &sqlx::any::AnyRow) -> Result<AuditEntry, PdsEr
         verified,
         cascade_subjects,
         cascade_snapshot_ids,
+        source,
+        // Wire form is the parsed JSON value; malformed on-disk JSON
+        // (should never happen — the writer serializes a Value) falls
+        // back to None rather than failing the whole row read.
+        payload: payload_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok()),
     })
 }
 
@@ -441,11 +475,25 @@ async fn fetch_account_snapshot(db: &AnyPool, did: &str) -> Result<SnapshotConte
 /// Append a new entry to the chain. Computes the SHA-256 over a
 /// canonical JSON of (sequence, timestamp, actor, action, subject,
 /// rationale, snapshot_id, event_id, previous_hash, cascade_subjects,
-/// cascade_snapshot_ids) — re-hashing later in the same way
-/// reproduces `current_hash`, which is the verification primitive.
+/// cascade_snapshot_ids, source, payload) — re-hashing later in the
+/// same way reproduces `current_hash`, which is the verification
+/// primitive. `source`/`payload` joined the canonical set in the v0.9
+/// format bump (chainlink #345); pre-v0.9 rows hash under the prior
+/// form (the accepted legacy tradeoff documented for cascade_snapshot_ids).
 pub struct AppendEntryParams<'a> {
     pub actor_did: &'a str,
     pub action: &'a str,
+    /// Provenance discriminator (§6.1): `default_action | auto_label_rule
+    /// | manual | stale_expiration | operator_removal | escalation |
+    /// system_diagnostic`. NOT NULL — non-substrate operator calls pass
+    /// `"manual"`. Enters the canonical hash (v0.9 chain-format bump) so
+    /// the §6.4 source filter reads a tamper-evident, attested column.
+    pub source: &'a str,
+    /// Action-specific scalars carried as a JSON object (§6.1). Phase A:
+    /// `{"applied": bool}` on `moderation_auto_label_applied`. NULL for
+    /// the common case. Serialized to a stable string and folded into the
+    /// canonical hash alongside `source`.
+    pub payload: Option<serde_json::Value>,
     pub subject: Option<&'a Subject>,
     pub rationale: &'a str,
     pub snapshot_id: Option<i64>,
@@ -647,16 +695,33 @@ async fn write_chain_entry_inner(
     // alphabetical source order makes the serialized output alphabetical
     // regardless of which `Map` backing serde_json is using — durable
     // against future feature-graph drift either direction.
+    // Serialize the action-scalar payload to a stable string once, and
+    // hash that exact string (the verifier re-hashes the stored string
+    // byte-for-byte). `None` → SQL NULL → canonical `null`, identical to
+    // an entry that never carried a payload. Same wire-vs-canonical
+    // nesting asymmetry as cascade_subjects (the string is embedded,
+    // escaped, inside the canonical object).
+    let payload_json: Option<String> = match &params.payload {
+        Some(v) => Some(serde_json::to_string(v).map_err(|e| PdsError::Internal(e.to_string()))?),
+        None => None,
+    };
+    // Alphabetical source order — `payload` falls between `event_id` and
+    // `previous_hash`; `source` between `snapshot_id` and `subject_cid`.
+    // See the cargo-feature-unification note above: writing keys
+    // alphabetically makes the serialized output alphabetical under either
+    // serde_json Map backing.
     let canon = serde_json::json!({
         "action": params.action,
         "actor_did": params.actor_did,
         "cascade_snapshot_ids": cascade_snapshot_ids_json,
         "cascade_subjects": cascade_json,
         "event_id": params.event_id,
+        "payload": payload_json,
         "previous_hash": prev_hash,
         "rationale": params.rationale,
         "sequence": seq,
         "snapshot_id": params.snapshot_id,
+        "source": params.source,
         "subject_cid": subject_cid,
         "subject_did": subject_did,
         "subject_uri": subject_uri,
@@ -671,8 +736,9 @@ async fn write_chain_entry_inner(
         "INSERT INTO audit_chain_entry \
          (sequence, created_at, actor_did, action, subject_did, subject_uri, subject_cid, \
           rationale, snapshot_id, event_id, current_hash, previous_hash, cascade_subjects, \
-          cascade_snapshot_ids) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
+          cascade_snapshot_ids, source, payload) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+         RETURNING id",
     )
     .bind(seq)
     .bind(&now_str)
@@ -688,6 +754,8 @@ async fn write_chain_entry_inner(
     .bind(&prev_hash)
     .bind(&cascade_json)
     .bind(&cascade_snapshot_ids_json)
+    .bind(params.source)
+    .bind(&payload_json)
     .fetch_one(&mut **tx)
     .await?;
     Ok(id)
@@ -811,7 +879,7 @@ pub async fn verify_chain_range(
     let rows = sqlx::query(
         "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                 subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                cascade_subjects, cascade_snapshot_ids \
+                cascade_subjects, cascade_snapshot_ids, source, payload \
          FROM audit_chain_entry \
          WHERE sequence >= $1 AND sequence <= $2 \
          ORDER BY sequence ASC",
@@ -896,6 +964,10 @@ pub async fn verify_chain_range(
         let cascade_str: Option<String> = row.try_get("cascade_subjects").ok().flatten();
         let cascade_snapshot_ids_str: Option<String> =
             row.try_get("cascade_snapshot_ids").ok().flatten();
+        let source: String = row
+            .try_get::<String, _>("source")
+            .unwrap_or_else(|_| "manual".to_string());
+        let payload_str: Option<String> = row.try_get("payload").ok().flatten();
 
         // Linkage check: the row's stored previous_hash must equal the
         // prior non-sentinel row's current_hash. The very first non-
@@ -925,6 +997,8 @@ pub async fn verify_chain_range(
             stored_prev.as_deref(),
             cascade_str.as_deref(),
             cascade_snapshot_ids_str.as_deref(),
+            &source,
+            payload_str.as_deref(),
             &current_hash,
         );
         if !row_ok {
@@ -984,20 +1058,26 @@ pub fn verify_entry(
     previous_hash: Option<&str>,
     cascade_subjects: Option<&str>,
     cascade_snapshot_ids: Option<&str>,
+    source: &str,
+    payload: Option<&str>,
     expected_hash: &str,
 ) -> bool {
     // Alphabetical source order — see write_chain_entry_inner's
     // canonical-form note for the cargo-feature-unification rationale.
+    // `payload` (the stored JSON string, re-hashed byte-for-byte) and
+    // `source` joined the canonical set in the v0.9 format bump (#345).
     let canon = serde_json::json!({
         "action": action,
         "actor_did": actor_did,
         "cascade_snapshot_ids": cascade_snapshot_ids,
         "cascade_subjects": cascade_subjects,
         "event_id": event_id,
+        "payload": payload,
         "previous_hash": previous_hash,
         "rationale": rationale,
         "sequence": sequence,
         "snapshot_id": snapshot_id,
+        "source": source,
         "subject_cid": subject_cid,
         "subject_did": subject_did,
         "subject_uri": subject_uri,
@@ -1103,6 +1183,8 @@ mod tests {
                 previous_hash TEXT,
                 cascade_subjects TEXT,
                 cascade_snapshot_ids TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                payload TEXT,
                 UNIQUE(sequence)
             )",
         )
@@ -1183,6 +1265,8 @@ mod tests {
                 &mut tx,
                 crate::config::DatabaseBackend::Sqlite,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:m1",
                     action: "TakedownAccount",
                     subject: Some(&subject),
@@ -1249,6 +1333,8 @@ mod tests {
             &mut tx,
             crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&subject),
@@ -1288,6 +1374,8 @@ mod tests {
             &db,
             crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&subject),
@@ -1316,11 +1404,15 @@ mod tests {
             did: "did:plc:s".to_string(),
         };
         insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:m1", action: "TakedownAccount",
             subject: Some(&subject), rationale: "first",
             snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
         }).await.unwrap();
         insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:m1", action: "RestoreAccount",
             subject: Some(&subject), rationale: "second",
             snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1355,6 +1447,8 @@ mod tests {
             &db,
             crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownRecord",
                 subject: Some(&subject),
@@ -1402,6 +1496,8 @@ mod tests {
             &db,
             crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownRecord",
                 subject: Some(&subject),
@@ -1453,6 +1549,8 @@ mod tests {
             &db,
             crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&Subject::Repo {
@@ -1513,6 +1611,8 @@ mod tests {
             did: "did:plc:victim".to_string(),
         };
         let id = insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:m1", action: "SuspendAccount",
             subject: Some(&subject), rationale: "rationale text",
             snapshot_id: Some(42), event_id: Some(7), cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1520,7 +1620,7 @@ mod tests {
         let row = sqlx::query(
             "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                     subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                    cascade_subjects, cascade_snapshot_ids \
+                    cascade_subjects, cascade_snapshot_ids , source, payload \
              FROM audit_chain_entry WHERE id = $1",
         )
         .bind(id)
@@ -1541,6 +1641,8 @@ mod tests {
             row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("source").unwrap(),
+            row.try_get::<Option<String>, _>("payload").unwrap().as_deref(),
             &row.try_get::<String, _>("current_hash").unwrap(),
         );
         assert!(verified, "fresh entry should verify against its stored hash");
@@ -1553,6 +1655,8 @@ mod tests {
             did: "did:plc:victim".to_string(),
         };
         let id = insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:m1", action: "TakedownAccount",
             subject: Some(&subject), rationale: "original rationale",
             snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1566,7 +1670,7 @@ mod tests {
         let row = sqlx::query(
             "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                     subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                    cascade_subjects, cascade_snapshot_ids \
+                    cascade_subjects, cascade_snapshot_ids , source, payload \
              FROM audit_chain_entry WHERE id = $1",
         )
         .bind(id)
@@ -1587,6 +1691,8 @@ mod tests {
             row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("source").unwrap(),
+            row.try_get::<Option<String>, _>("payload").unwrap().as_deref(),
             &row.try_get::<String, _>("current_hash").unwrap(),
         );
         assert!(!verified, "tampered entry must fail verification");
@@ -1600,6 +1706,8 @@ mod tests {
         };
         for i in 0..3 {
             insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&subject),
@@ -1620,6 +1728,8 @@ mod tests {
         };
         for i in 0..3 {
             insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("orig-{}", i),
                 snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1647,6 +1757,8 @@ mod tests {
         };
         for i in 0..3 {
             insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("orig-{}", i),
                 snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1659,22 +1771,28 @@ mod tests {
         let row = sqlx::query(
             "SELECT created_at, actor_did, action, subject_did, subject_uri, subject_cid, \
                     rationale, snapshot_id, event_id, previous_hash, cascade_subjects, \
-                    cascade_snapshot_ids \
+                    cascade_snapshot_ids, source, payload \
              FROM audit_chain_entry WHERE sequence = 2",
         )
         .fetch_one(&db).await.unwrap();
         let new_rationale = "attacker-rewrite";
-        // Alphabetical source order — see write_chain_entry_inner.
+        // Alphabetical source order — see write_chain_entry_inner. The
+        // attacker recomputes a per-row-CONSISTENT hash, so it must fold
+        // in source/payload exactly as production does — otherwise the
+        // per-row check would catch it at seq 2 and we'd never exercise
+        // the linkage path this test is about.
         let canon = serde_json::json!({
             "action": row.try_get::<String, _>("action").unwrap(),
             "actor_did": row.try_get::<String, _>("actor_did").unwrap(),
             "cascade_snapshot_ids": row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap(),
             "cascade_subjects": row.try_get::<Option<String>, _>("cascade_subjects").unwrap(),
             "event_id": row.try_get::<Option<i64>, _>("event_id").unwrap(),
+            "payload": row.try_get::<Option<String>, _>("payload").unwrap(),
             "previous_hash": row.try_get::<Option<String>, _>("previous_hash").unwrap(),
             "rationale": new_rationale,
             "sequence": 2,
             "snapshot_id": row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            "source": row.try_get::<String, _>("source").unwrap(),
             "subject_cid": row.try_get::<Option<String>, _>("subject_cid").unwrap(),
             "subject_did": row.try_get::<Option<String>, _>("subject_did").unwrap(),
             "subject_uri": row.try_get::<Option<String>, _>("subject_uri").unwrap(),
@@ -1718,6 +1836,8 @@ mod tests {
         // independently of the sentinel row above.
         for i in 0..2 {
             insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("post-{}", i),
                 snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1872,6 +1992,8 @@ mod tests {
                 previous_hash TEXT,
                 cascade_subjects TEXT,
                 cascade_snapshot_ids TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                payload TEXT,
                 UNIQUE(sequence)
             )",
         )
@@ -1900,6 +2022,8 @@ mod tests {
                     &pool,
                     crate::config::DatabaseBackend::Sqlite,
                     AppendEntryParams {
+                        source: "manual",
+                        payload: None,
                         actor_did: "did:plc:m1",
                         action: "TakedownAccount",
                         subject: Some(&subject),
@@ -1969,6 +2093,8 @@ mod tests {
 
         let rebuild_subj = Subject::Repo { did: "did:plc:rebuilt".into() };
         insert_chain_entry_pool(&db, be, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:op", action: "repo.rebuild", subject: Some(&rebuild_subj),
             rationale: "corruption recovery", snapshot_id: None, event_id: None,
             cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1979,12 +2105,16 @@ mod tests {
             Subject::Repo { did: "did:plc:t2".into() },
         ];
         insert_chain_entry_pool(&db, be, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:op", action: "repo.bulk_repair", subject: None,
             rationale: "batch scrub", snapshot_id: None, event_id: None,
             cascade_subjects: &targets, cascade_snapshot_ids: &[],
         }).await.expect("bulk-repair entry");
 
         insert_chain_entry_pool(&db, be, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:op", action: "kryphocron.laquna.rotate", subject: None,
             rationale: "ahead-of-cadence rotation", snapshot_id: None, event_id: None,
             cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -2033,6 +2163,8 @@ mod tests {
                 db,
                 crate::config::DatabaseBackend::Sqlite,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:m1",
                     action: "TakedownAccount",
                     subject: Some(&subject),
@@ -2056,7 +2188,7 @@ mod tests {
         let row = sqlx::query(
             "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                     subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                    cascade_subjects, cascade_snapshot_ids \
+                    cascade_subjects, cascade_snapshot_ids , source, payload \
              FROM audit_chain_entry WHERE id = $1",
         )
         .bind(id)
@@ -2077,6 +2209,8 @@ mod tests {
             row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("source").unwrap(),
+            row.try_get::<Option<String>, _>("payload").unwrap().as_deref(),
             &row.try_get::<String, _>("current_hash").unwrap(),
         )
     }

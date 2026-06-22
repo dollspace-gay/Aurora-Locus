@@ -902,6 +902,8 @@ async fn create_invite_code(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "invite.create",
             subject: None,
@@ -1309,6 +1311,8 @@ async fn grant_role(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "role.grant",
             subject: Some(&subject),
@@ -1424,6 +1428,8 @@ async fn revoke_role(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "role.revoke",
             subject: Some(&subject),
@@ -1630,6 +1636,8 @@ async fn revoke_session(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action,
             subject: Some(&subject),
@@ -1732,6 +1740,8 @@ async fn revoke_operator_sessions(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "session.revoke_all",
             subject: Some(&subject),
@@ -2733,6 +2743,8 @@ async fn update_account_email(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.update_email",
             subject: Some(&subject),
@@ -2810,6 +2822,8 @@ async fn update_account_handle(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.update_handle",
             subject: Some(&subject),
@@ -2889,6 +2903,8 @@ async fn update_account_password(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.reset_password",
             subject: Some(&subject),
@@ -2960,6 +2976,8 @@ async fn admin_delete_account(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.delete",
             subject: Some(&subject),
@@ -3212,6 +3230,8 @@ async fn update_account_signing_key(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.update_signing_key",
             subject: Some(&subject),
@@ -3298,6 +3318,8 @@ async fn takedown_account(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.takedown",
             subject: Some(&subject),
@@ -3397,6 +3419,8 @@ async fn suspend_account(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.suspend",
             subject: Some(&subject),
@@ -3467,6 +3491,8 @@ async fn restore_account(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.restore",
             subject: Some(&subject),
@@ -3590,6 +3616,8 @@ async fn apply_label(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "label.apply",
             subject: Some(&subject),
@@ -3658,6 +3686,8 @@ async fn remove_label(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "label.remove",
             subject: Some(&subject),
@@ -3807,6 +3837,8 @@ async fn update_report_status(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "report.update",
             subject: subject.as_ref(),
@@ -3976,6 +4008,8 @@ async fn send_email(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: sender,
             action: "email.send",
             subject: Some(&subject_ref),
@@ -5250,6 +5284,8 @@ async fn update_subject_status(
             &mut tx,
             ctx.config.database.backend,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: &auth.did,
                 action: "subject.update_status",
                 subject: Some(&chain_subject),
@@ -5928,6 +5964,8 @@ async fn disable_invite_code(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "invite.disable",
             subject: None,
@@ -6008,6 +6046,8 @@ async fn disable_invite_codes(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "invite.disable_batch",
             subject: None,
@@ -6091,6 +6131,8 @@ async fn enable_account_invites(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.invites.enable",
             subject: Some(&subject),
@@ -6151,6 +6193,8 @@ async fn disable_account_invites(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.invites.disable",
             subject: Some(&subject),
@@ -7147,6 +7191,8 @@ async fn pause_sequencer(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "sequencer.pause",
             subject: None,
@@ -7182,6 +7228,8 @@ async fn resume_sequencer(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "sequencer.resume",
             subject: None,
@@ -7248,6 +7296,8 @@ async fn reset_sequencer_cursor(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "sequencer.reset_cursor",
             subject: None,
@@ -7324,6 +7374,8 @@ async fn rebuild_sequencer(
             &ctx.account_db,
             ctx.config.database.backend,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: &auth.did,
                 action: "sequencer.verify",
                 subject: None,
@@ -7361,6 +7413,8 @@ async fn rebuild_sequencer(
             &ctx.account_db,
             ctx.config.database.backend,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: &auth.did,
                 action: "sequencer.rebuild",
                 subject: None,
@@ -7534,6 +7588,8 @@ async fn cleanup_rate_limit_state(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "rate_limit.cleanup",
             subject: None,
@@ -7826,6 +7882,8 @@ async fn trigger_pds_discovery(
                     &ctx.account_db,
                     ctx.config.database.backend,
                     AppendEntryParams {
+                        source: "manual",
+                        payload: None,
                         actor_did: &auth.did,
                         action: "federation.discover",
                         subject: None,
@@ -7937,6 +7995,8 @@ async fn cleanup_nonce_stores(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "federation.nonce_cleanup",
             subject: None,
@@ -10276,6 +10336,8 @@ mod tests {
                 &mut tx,
                 ctx.config.database.backend,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:admin",
                     action: "account.takedown",
                     subject: Some(&Subject::Repo {
@@ -10336,6 +10398,8 @@ mod tests {
                 &mut tx,
                 ctx.config.database.backend,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:admin",
                     action: "account.update_handle",
                     subject: Some(&Subject::Repo {
@@ -10492,6 +10556,8 @@ mod tests {
                 &mut tx,
                 ctx.config.database.backend,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:admin",
                     action: "account.update_email",
                     subject: Some(&Subject::Repo {
