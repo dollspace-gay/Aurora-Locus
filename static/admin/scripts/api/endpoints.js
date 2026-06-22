@@ -11,6 +11,9 @@
 
   // -------- com.atproto.* --------
   const atproto = {
+    // Public server descriptor — real static config (inviteCodeRequired,
+    // availableUserDomains, DID). Used by the Registration policy overview (#342).
+    describeServer: () => C().get('com.atproto.server.describeServer'),
     listAccounts: (params) => C().get('com.atproto.admin.listAccounts', params || { limit: 100 }),
     getAccount: (did) => C().get('com.atproto.admin.getAccount', { did: did }),
     getAccountInfo: (did) => C().get('com.atproto.admin.getAccountInfo', { did: did }),

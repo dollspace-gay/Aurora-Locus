@@ -38,14 +38,10 @@
       blurb: 'Available when the federation-policy backend ships. This page ' +
              'will manage registration, discovery, and relay posture.',
     },
-    {
-      key: 'configRegistrationPolicy',
-      domain: 'Configuration',
-      domainRoute: 'configuration/general',
-      title: 'Registration policy',
-      blurb: 'Available when the registration-policy backend ships. This page ' +
-             'will manage account-creation rules.',
-    },
+    // configRegistrationPolicy retired in #342 — the real page
+    // (ConfigRegistrationPolicy.js) registers that key now; it consolidates the
+    // already-shipped registration settings (read-only overview + edit-elsewhere
+    // links), with the novel rate/IP/blocklist controls reserved for a later cycle.
     // configModerationPolicy retired in #340 — the real page
     // (ConfigModerationPolicy.js) registers that key now; it hosts the
     // moderation-tier switch (moved from UI & modes), with configurable
