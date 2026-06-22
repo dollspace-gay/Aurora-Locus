@@ -174,6 +174,15 @@ async fn create_report(
             "moderation default-action consumer failed on createReport intake"
         );
     }
+    // §5.5.4 Phase B: route the new item to a reviewer (Pipeline A §4),
+    // after the §2 default action. Best-effort, full tier only.
+    if let Err(e) = crate::api::reviewer_assignment::assign_reviewer_on_intake(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "reviewer-assignment consumer failed on createReport intake"
+        );
+    }
 
     // Build response subject
     let subject_json = match &req.subject {

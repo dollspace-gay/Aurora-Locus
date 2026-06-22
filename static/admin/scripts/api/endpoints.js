@@ -135,6 +135,8 @@
   const superadminTools = {
     grantRole: (body) => C().post('tools.aurora.superadmin.grantRole', body),
     revokeRole: (body) => C().post('tools.aurora.superadmin.revokeRole', body),
+    // §5.5.4 Phase B (#346) — manual reviewer reassignment.
+    assignReviewer: (body) => C().post('tools.aurora.superadmin.assignReviewer', body),
     // Repository rebuild (§7.4.1 / #286 + #290). preRebuildCheck: shallow
     // metadata preflight ({did}), or full reconstruction+verification
     // ({did, deep:true}). rebuildRepo: start a rebuild ({did, rationale}) →

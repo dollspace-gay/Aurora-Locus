@@ -47,7 +47,7 @@ use sqlx::Row as _;
 pub const HIDE_PENDING_LABEL: &str = "tools.aurora.ops.moderation.hide-pending";
 
 /// Substrate-identity DID for substrate-initiated actions (§6.1).
-const SYSTEM_DID: &str = "did:system";
+pub(crate) const SYSTEM_DID: &str = "did:system";
 
 // Audit action names (§6.1 registry — the three Phase A emits).
 const ACTION_DEFAULT_APPLIED: &str = "moderation_default_applied";
@@ -105,7 +105,7 @@ fn effective_action(
 /// Whether configurable defaults apply right now: `full` moderation
 /// tier only (§2.7 / §6.3). Recovery mode forces `full` (mirrors
 /// `get_runtime_setting`'s recovery override).
-async fn defaults_active(ctx: &AppContext) -> bool {
+pub(crate) async fn defaults_active(ctx: &AppContext) -> bool {
     let recovery = std::env::var(RECOVERY_MODE_ENV)
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
@@ -153,7 +153,7 @@ fn report_subject(report: &Report) -> PdsResult<(Subject, String, Option<String>
 
 /// `did:web:<hostname>` — the labeling authority / chain server DID,
 /// matching the manual label-apply convention in `api::admin`.
-fn server_did(ctx: &AppContext) -> String {
+pub(crate) fn server_did(ctx: &AppContext) -> String {
     format!("did:web:{}", ctx.config.service.hostname)
 }
 

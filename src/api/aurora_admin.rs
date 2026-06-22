@@ -3773,6 +3773,32 @@ pub const MODERATION_DEFAULTS_CATEGORY_MAP_KEY: &str =
 /// `1..=365`, default 90.
 pub const MODERATION_DEFAULTS_STALE_DAYS_KEY: &str =
     "moderation.defaults.hide-pending-review-stale-days";
+// §5.5.4 Phase B (#346) — reviewer assignment (§4).
+/// Assignment mode: `manual` | `round-robin` | `load-balanced` |
+/// `category-routed`. Default `manual`. Full tier only.
+pub const MODERATION_REVIEWER_MODE_KEY: &str =
+    "moderation.defaults.reviewer-assignment-mode";
+/// §4.3 per-category routing pool: object keyed on the ReportReason
+/// vocabulary, values are arrays of operator DIDs. Default `{}`.
+pub const MODERATION_REVIEWER_CATEGORY_MAP_KEY: &str =
+    "moderation.defaults.reviewer-routing-category-map";
+/// §4.7 round-robin rotation cursor (integer ≥ 0). Seeded by migration;
+/// advanced via the value-CAS primitive.
+pub const MODERATION_REVIEWER_ROTATION_CURSOR_KEY: &str =
+    "moderation.defaults.reviewer-rotation-cursor";
+/// §4.7 per-category rotation cursors: object keyed on the ReportReason
+/// vocabulary, values are integers ≥ 0. Seeded `{}` by migration.
+pub const MODERATION_REVIEWER_CATEGORY_CURSORS_KEY: &str =
+    "moderation.defaults.reviewer-category-rotation-cursors";
+/// §4.5 monotonically-incrementing mode-change version (integer ≥ 0),
+/// drives the per-operator mode-change banner dismissal key. Seeded 0.
+pub const MODERATION_REVIEWER_MODE_VERSION_KEY: &str =
+    "moderation.defaults.reviewer-mode-version";
+/// §4.5/§2.6 forward-compat: the §5 escalation SuperAdmin cursor. Phase D
+/// activates it; Phase B pre-registers (seeded 0) so the operator-set-change
+/// cursor-reset hook is uniform across all three cursor keys.
+pub const MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY: &str =
+    "moderation.defaults.escalation-superadmin-cursor";
 /// v0.9 Arc B (§11.10.2): the deployment-default theme id — what fresh
 /// sessions and operators without a personal preference render. Set is
 /// SuperAdmin-only (via `setRuntimeSetting` + rationale); read is allowed at
@@ -3884,6 +3910,12 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     MODERATION_DEFAULTS_REPORT_ACTION_KEY,
     MODERATION_DEFAULTS_CATEGORY_MAP_KEY,
     MODERATION_DEFAULTS_STALE_DAYS_KEY,
+    MODERATION_REVIEWER_MODE_KEY,
+    MODERATION_REVIEWER_CATEGORY_MAP_KEY,
+    MODERATION_REVIEWER_ROTATION_CURSOR_KEY,
+    MODERATION_REVIEWER_CATEGORY_CURSORS_KEY,
+    MODERATION_REVIEWER_MODE_VERSION_KEY,
+    MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY,
 ];
 pub const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
@@ -3916,6 +3948,13 @@ fn default_for_key(key: &str) -> serde_json::Value {
         }
         MODERATION_DEFAULTS_CATEGORY_MAP_KEY => serde_json::json!({}),
         MODERATION_DEFAULTS_STALE_DAYS_KEY => serde_json::Value::from(90),
+        // §5.5.4 Phase B reviewer assignment.
+        MODERATION_REVIEWER_MODE_KEY => serde_json::Value::String("manual".to_string()),
+        MODERATION_REVIEWER_CATEGORY_MAP_KEY => serde_json::json!({}),
+        MODERATION_REVIEWER_CATEGORY_CURSORS_KEY => serde_json::json!({}),
+        MODERATION_REVIEWER_ROTATION_CURSOR_KEY
+        | MODERATION_REVIEWER_MODE_VERSION_KEY
+        | MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY => serde_json::Value::from(0),
         _ => serde_json::Value::Null,
     }
 }
@@ -3990,8 +4029,42 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         MODERATION_DEFAULTS_STALE_DAYS_KEY => {
             value.as_u64().is_some_and(|n| (1..=365).contains(&n))
         }
+        // §5.5.4 §4.2: reviewer-assignment mode. The "≥1 entry when
+        // category-routed" cross-key invariant is enforced at apply time
+        // (empty pool → no assignment) + guarded client-side, same as the
+        // §2.2 default-action pattern.
+        MODERATION_REVIEWER_MODE_KEY => value.as_str().is_some_and(|s| {
+            matches!(s, "manual" | "round-robin" | "load-balanced" | "category-routed")
+        }),
+        // §5.5.4 §4.3: object keyed on the ReportReason vocabulary; values
+        // are arrays of operator-DID strings. Empty object valid (default).
+        MODERATION_REVIEWER_CATEGORY_MAP_KEY => value.as_object().is_some_and(|m| {
+            m.iter().all(|(k, v)| {
+                is_report_category(k)
+                    && v.as_array().is_some_and(|arr| arr.iter().all(|d| d.is_string()))
+            })
+        }),
+        // §5.5.4 §4.7: per-category rotation cursors — object keyed on the
+        // ReportReason vocabulary; values are non-negative integers.
+        MODERATION_REVIEWER_CATEGORY_CURSORS_KEY => value.as_object().is_some_and(|m| {
+            m.iter()
+                .all(|(k, v)| is_report_category(k) && v.as_u64().is_some())
+        }),
+        // §5.5.4 §4.7/§4.5: scalar non-negative integer counters.
+        MODERATION_REVIEWER_ROTATION_CURSOR_KEY
+        | MODERATION_REVIEWER_MODE_VERSION_KEY
+        | MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY => value.as_u64().is_some(),
         _ => true,
     }
+}
+
+/// The ReportReason vocabulary (per Phase A recon — the lexicon's six).
+/// Shared validator for the §2.3/§4.3 category-keyed setting maps.
+fn is_report_category(k: &str) -> bool {
+    matches!(
+        k,
+        "spam" | "violation" | "misleading" | "sexual" | "rude" | "other"
+    )
 }
 
 /// `tools.aurora.ops.themes.listInstalled` output (§11.10.2).
@@ -4411,6 +4484,51 @@ pub async fn resolve_runtime_setting(ctx: &AppContext, key: &str) -> serde_json:
     default_for_key(key)
 }
 
+/// Read the RAW stored value string for a runtime-row (the exact bytes the
+/// value-CAS witnesses), or `None` when no runtime row exists. Distinct
+/// from [`resolve_runtime_setting`], which parses + falls through to
+/// file/default tiers — the CAS needs the literal stored string, not the
+/// effective value.
+pub async fn read_runtime_row_value(ctx: &AppContext, key: &str) -> Option<String> {
+    use sqlx::Row as _;
+    sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(&ctx.account_db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("value").ok())
+}
+
+/// Compare-and-swap a runtime setting's stored value (§5.5.4 §4.7 cursor
+/// advance — the substrate-general optimistic-concurrency primitive). Sets
+/// `key`'s value to `new` iff its current stored value equals `expected`
+/// (the value column itself is the CAS witness — no version column needed);
+/// returns `true` when it won (`rows_affected >= 1`), `false` on contention.
+/// Caller re-reads + recomputes + retries. Targets only existing rows; the
+/// counter rows this is used against are migration-seeded, so a `false` here
+/// always means a concurrent writer won, never a missing row.
+pub async fn cas_runtime_setting(
+    ctx: &AppContext,
+    key: &str,
+    expected: &str,
+    new: &str,
+    actor: &str,
+) -> crate::error::PdsResult<bool> {
+    let res = sqlx::query(
+        "UPDATE runtime_settings SET value = $1, last_modified = $2, last_modified_by = $3 \
+         WHERE key = $4 AND value = $5",
+    )
+    .bind(new)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(actor)
+    .bind(key)
+    .bind(expected)
+    .execute(&ctx.account_db)
+    .await?;
+    Ok(res.rows_affected() >= 1)
+}
+
 pub async fn get_runtime_setting(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
@@ -4545,6 +4663,18 @@ pub async fn set_runtime_setting(
             ));
         }
     }
+    // §5.5.4 moderation-defaults keys (Phase A §2 + Phase B §4) validate at
+    // the API boundary via the same `validate_runtime_value` vocabulary the
+    // file-tier loader uses — enum/shape/range checks for the default-action,
+    // reviewer-assignment, category maps, and cursor counters.
+    if input.key.starts_with("moderation.defaults.")
+        && !validate_runtime_value(&input.key, &input.value)
+    {
+        return Err(validation(format!(
+            "invalid value for runtime setting '{}'",
+            input.key
+        )));
+    }
     // Read previous value for the diff returned in output.
     let prev_row = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
         .bind(&input.key)
@@ -4571,6 +4701,15 @@ pub async fn set_runtime_setting(
             (&ctx.kryphocron_rotation_oracle, input.value.as_str())
         {
             oracle.set_cadence(crate::kryphocron_rotation::Cadence::from_setting(s));
+        }
+    }
+
+    // §5.5.4 Phase B §4.5: a reviewer-assignment-mode change bumps the
+    // monotonic mode-version that drives per-operator mode-change-banner
+    // re-display. Only on an actual value change; best-effort.
+    if input.key == MODERATION_REVIEWER_MODE_KEY && previous_value != input.value {
+        if let Err(e) = crate::api::reviewer_assignment::bump_mode_version(&ctx).await {
+            tracing::warn!(error = %e, "failed to bump reviewer mode-change version");
         }
     }
 
@@ -8824,6 +8963,67 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_validates_phase_b_reviewer_keys() {
+        let ctx = create_test_context().await;
+        let try_set = |key: &str, value: serde_json::Value| {
+            let ctx = ctx.clone();
+            let key = key.to_string();
+            async move {
+                set_runtime_setting(
+                    State(ctx),
+                    super_admin_auth(),
+                    Json(SetRuntimeSettingInput {
+                        key,
+                        value,
+                        rationale: "t".to_string(),
+                    }),
+                )
+                .await
+            }
+        };
+        // Invalid mode enum → 400.
+        assert_eq!(
+            try_set(MODERATION_REVIEWER_MODE_KEY, serde_json::json!("bogus"))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Category map key outside ReportReason → 400.
+        assert_eq!(
+            try_set(
+                MODERATION_REVIEWER_CATEGORY_MAP_KEY,
+                serde_json::json!({"harassment": ["did:plc:a"]})
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Category map value not an array of strings → 400.
+        assert_eq!(
+            try_set(
+                MODERATION_REVIEWER_CATEGORY_MAP_KEY,
+                serde_json::json!({"spam": "did:plc:a"})
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Valid mode + valid map → accepted.
+        assert!(try_set(MODERATION_REVIEWER_MODE_KEY, serde_json::json!("round-robin"))
+            .await
+            .is_ok());
+        assert!(try_set(
+            MODERATION_REVIEWER_CATEGORY_MAP_KEY,
+            serde_json::json!({"spam": ["did:plc:a", "did:plc:b"]})
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]

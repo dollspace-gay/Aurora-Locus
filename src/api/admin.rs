@@ -730,6 +730,14 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(revoke_role),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // §5.5.4 Phase B (#346) — SuperAdmin manual reviewer reassignment
+        // (§4.7): set a queue item's assignee with assignment_source =
+        // 'manual_override'. Covers orphan-and-escalated recovery.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.assignReviewer",
+            post(assign_reviewer),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // v0.9 (#329) — upload a login-splash branding asset (logo/banner)
         // directly; writes it under <data>/branding/ and repoints the
         // branding.login-* runtime setting. Raw-body upload (uploadBlob idiom).
@@ -1327,6 +1335,14 @@ async fn grant_role(
     .map_err(|e| {
         json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
     })?;
+    // §5.5.4 Phase B §4.5/§2.7: an operator-set change (here, addition)
+    // invalidates the round-robin/category/escalation cursors — reset them
+    // single-step within this same mutation transaction (no CAS contention).
+    crate::api::reviewer_assignment::reset_assignment_cursors_in_tx(&mut tx, &auth.did)
+        .await
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?;
     tx.commit()
         .await
         .map_err(|e| {
@@ -1405,7 +1421,10 @@ async fn revoke_role(
         did: req.did.clone(),
     };
 
-    // LB-1 / chainlink #122: revoke + chain in one transaction.
+    // LB-1 / chainlink #122: revoke + chain in one transaction. §5.5.4
+    // Phase B (primary path): the §4.7 reviewer-routing cleanup (category-
+    // map prune + per-item assignment reset + cursor reset + audit) rides
+    // this same transaction — atomic with the revocation.
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
     let mut tx = ctx
         .account_db
@@ -1414,6 +1433,9 @@ async fn revoke_role(
         .map_err(|e| {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
         })?;
+    // Stage 1 — the revocation itself. A precondition failure here (e.g.
+    // no active role) is not a rollback of an in-progress revocation, so
+    // it does NOT emit the rollback diagnostic.
     crate::admin::AdminRoleManager::revoke_role_in_tx(
         &mut tx,
         &req.did,
@@ -1424,15 +1446,154 @@ async fn revoke_role(
     .map_err(|e| {
         json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
     })?;
+    // Stage 2 — audit + cleanup + commit. A failure from here rolls back a
+    // revocation that DID begin, so it emits `operator_revocation_rollback`
+    // (§4.7 / §6.1 system_diagnostic) from outside the rolled-back tx.
+    let staged: crate::error::PdsResult<i64> = async {
+        let audit_entry_id = audit_chain::insert_chain_entry(
+            &mut tx,
+            ctx.config.database.backend,
+            AppendEntryParams {
+                source: "manual",
+                payload: None,
+                actor_did: &auth.did,
+                action: "role.revoke",
+                subject: Some(&subject),
+                rationale,
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await?;
+        crate::api::reviewer_assignment::handle_operator_removal_in_tx(
+            &mut tx,
+            ctx.config.database.backend,
+            &req.did,
+            &auth.did,
+        )
+        .await?;
+        tx.commit().await.map_err(crate::error::PdsError::from)?;
+        Ok(audit_entry_id)
+    }
+    .await;
+    // Release the chain guard before any rollback-diagnostic emit (which
+    // re-acquires it on its own transaction).
+    drop(_chain_guard);
+
+    match staged {
+        Ok(audit_entry_id) => Ok(Json(RevokeRoleOutput {
+            success: true,
+            did: req.did,
+            audit_entry_id: audit_entry_id.to_string(),
+        })),
+        Err(e) => {
+            let _ = crate::api::reviewer_assignment::emit_revocation_rollback(
+                &ctx,
+                &req.did,
+                &e.to_string(),
+            )
+            .await;
+            Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                e.to_string(),
+            ))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AssignReviewerRequest {
+    report_id: i64,
+    operator_did: String,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+/// `tools.aurora.superadmin.assignReviewer` (§5.5.4 Phase B §4.7) — manual
+/// reviewer reassignment. Sets the queue item's `assigned_operator_did` and
+/// `assignment_source = 'manual_override'`, atomic with an audit entry.
+///
+/// Local-idiom translation (recorded): the design registers
+/// `moderation_reviewer_assigned` + the report-ID subject convention but does
+/// not pin an audit emit for the manual-reassignment affordance. Aurora-Locus
+/// audits every operator mutation, so this emits `moderation_reviewer_assigned`
+/// with `source = "manual"` (a non-substrate operator action) and the report's
+/// content subject + `report_id` in the payload — consistent with §6.1's
+/// subject convention.
+async fn assign_reviewer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<AssignReviewerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "assignReviewer requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("manual reviewer reassignment");
+
+    // Resolve the report so the audit subject reflects the content it points
+    // at (account/record), not the report row itself.
+    let report = ctx
+        .report_manager
+        .get_report(req.report_id)
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?
+        .ok_or_else(|| {
+            json_error(StatusCode::NOT_FOUND, "NotFound", format!("report {} not found", req.report_id))
+        })?;
+    let subject = report.subject_uri.as_deref().map_or_else(
+        || report.subject_did.as_deref().map(|d| Subject::Repo { did: d.to_string() }),
+        |uri| {
+            Some(Subject::Record {
+                uri: uri.to_string(),
+                cid: report.subject_cid.clone().unwrap_or_default(),
+            })
+        },
+    );
+
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
+    sqlx::query(
+        "UPDATE report SET assigned_operator_did = $1, assignment_source = 'manual_override' WHERE id = $2",
+    )
+    .bind(&req.operator_did)
+    .bind(req.report_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
+    let payload = serde_json::json!({
+        "report_id": req.report_id,
+        "assigned_operator_did": req.operator_did,
+    });
     let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
             source: "manual",
-            payload: None,
+            payload: Some(payload),
             actor_did: &auth.did,
-            action: "role.revoke",
-            subject: Some(&subject),
+            action: "moderation_reviewer_assigned",
+            subject: subject.as_ref(),
             rationale,
             snapshot_id: None,
             event_id: None,
@@ -1441,20 +1602,17 @@ async fn revoke_role(
         },
     )
     .await
-    .map_err(|e| {
-        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
-    })?;
+    .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
     tx.commit()
         .await
-        .map_err(|e| {
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
-        })?;
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
 
-    Ok(Json(RevokeRoleOutput {
-        success: true,
-        did: req.did,
-        audit_entry_id: audit_entry_id.to_string(),
-    }))
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "reportId": req.report_id,
+        "assignedOperatorDid": req.operator_did,
+        "auditEntryId": audit_entry_id.to_string(),
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -3767,6 +3925,16 @@ async fn submit_report(
             "moderation default-action consumer failed on submitReport intake"
         );
     }
+    // §5.5.4 Phase B: reviewer routing (Pipeline A §4), best-effort.
+    if let Err(e) =
+        crate::api::reviewer_assignment::assign_reviewer_on_intake(&ctx, &report).await
+    {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "reviewer-assignment consumer failed on submitReport intake"
+        );
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -3886,10 +4054,11 @@ struct ListReportsQuery {
 /// List reports
 async fn list_reports(
     State(ctx): State<AppContext>,
-    _auth: AdminAuthContext,
+    auth: AdminAuthContext,
     Query(query): Query<ListReportsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::admin::reports::ReportStatus;
+    use crate::admin::reports::{AssignmentScope, ReportStatus};
+    use crate::admin::roles::Role;
 
     // Parse status filter if provided
     let status_filter = if let Some(status_str) = query.status {
@@ -3902,10 +4071,17 @@ async fn list_reports(
         None
     };
 
+    // §5.5.4 §4.5 queue scope (same as getModerationQueue).
+    let scope = if auth.role.can_act_as(Role::SuperAdmin) {
+        AssignmentScope::All
+    } else {
+        AssignmentScope::AssignedTo(&auth.did)
+    };
+
     // List reports
     let reports = ctx
         .report_manager
-        .list_reports(status_filter, query.limit)
+        .list_reports_scoped(status_filter, query.limit, scope)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -5920,10 +6096,11 @@ struct GetModerationQueueQuery {
 /// Get moderation queue (reports needing review)
 async fn get_moderation_queue(
     State(ctx): State<AppContext>,
-    _auth: AdminAuthContext,
+    auth: AdminAuthContext,
     Query(query): Query<GetModerationQueueQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::admin::reports::ReportStatus;
+    use crate::admin::reports::{AssignmentScope, ReportStatus};
+    use crate::admin::roles::Role;
 
     // Resolve the header status filter (#209). No param preserves the prior
     // hardcoded open-only queue; `all` widens to every status; an unknown
@@ -5931,9 +6108,17 @@ async fn get_moderation_queue(
     let status_filter = ReportStatus::queue_filter_from_param(query.status.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
+    // §5.5.4 §4.5 queue scope: SuperAdmin sees every item; everyone else
+    // sees items assigned to them plus the unassigned pool.
+    let scope = if auth.role.can_act_as(Role::SuperAdmin) {
+        AssignmentScope::All
+    } else {
+        AssignmentScope::AssignedTo(&auth.did)
+    };
+
     let reports = ctx
         .report_manager
-        .list_reports(status_filter, query.limit)
+        .list_reports_scoped(status_filter, query.limit, scope)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -9542,10 +9727,11 @@ mod tests {
             r#""getAccountOverrides","#,
             r#""setAccountOverride""#,
             r#"],"#,
-            // tools.aurora.superadmin (17 endpoints)
+            // tools.aurora.superadmin (18 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
+            r#""assignReviewer","#,
             r#""uploadBrandingAsset","#,
             r#""preRebuildCheck","#,
             r#""rebuildRepo","#,

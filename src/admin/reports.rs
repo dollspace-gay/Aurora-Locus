@@ -123,6 +123,24 @@ pub struct Report {
     pub reviewed_by: Option<String>,
     pub reviewed_at: Option<DateTime<Utc>>,
     pub resolution: Option<String>,
+    /// §5.5.4 Phase B (#346): operator this queue item is routed to, or
+    /// `None` when unassigned (manual mode / pre-Phase-B rows / reset).
+    #[serde(default)]
+    pub assigned_operator_did: Option<String>,
+    /// Provenance of the assignment: `auto` (substrate routing) |
+    /// `manual_override` (SuperAdmin reassignment). `None` when unassigned.
+    #[serde(default)]
+    pub assignment_source: Option<String>,
+}
+
+/// §5.5.4 §4.5 queue-scope selector for [`ReportManager::list_reports_scoped`].
+#[derive(Debug, Clone, Copy)]
+pub enum AssignmentScope<'a> {
+    /// Every item, no assignment predicate (SuperAdmin view).
+    All,
+    /// Items assigned to this operator OR unassigned (`assigned_operator_did
+    /// IS NULL`) — the per-operator queue view.
+    AssignedTo(&'a str),
 }
 
 /// Report manager
@@ -185,6 +203,8 @@ impl ReportManager {
             reviewed_by: None,
             reviewed_at: None,
             resolution: None,
+            assigned_operator_did: None,
+            assignment_source: None,
         })
     }
 
@@ -268,39 +288,61 @@ impl ReportManager {
         status: Option<ReportStatus>,
         limit: Option<i64>,
     ) -> PdsResult<Vec<Report>> {
-        let query = if let Some(status) = status {
-            sqlx::query(
-                r#"
-                SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason,
-                       reported_by, reported_at, status, reviewed_by, reviewed_at, resolution
-                FROM report
-                WHERE status = $1
-                ORDER BY reported_at DESC
-                LIMIT $2
-                "#,
-            )
-            .bind(status.as_str())
-            .bind(limit.unwrap_or(100))
-        } else {
-            sqlx::query(
-                r#"
-                SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason,
-                       reported_by, reported_at, status, reviewed_by, reviewed_at, resolution
-                FROM report
-                ORDER BY reported_at DESC
-                LIMIT $1
-                "#,
-            )
-            .bind(limit.unwrap_or(100))
-        };
+        self.list_reports_scoped(status, limit, AssignmentScope::All)
+            .await
+    }
+
+    /// List reports with the §5.5.4 §4.5 per-operator queue scope applied.
+    /// `AssignmentScope::All` returns every item (SuperAdmin view, and the
+    /// `list_reports` back-compat shape); `AssignedTo(did)` returns items
+    /// assigned to that operator OR unassigned (`assigned_operator_did
+    /// IS NULL`). Combines with the optional status filter. Built dynamically
+    /// so the WHERE clause carries only the active predicates; binds are
+    /// positional ($1, $2, …) in clause order, then the LIMIT.
+    pub async fn list_reports_scoped(
+        &self,
+        status: Option<ReportStatus>,
+        limit: Option<i64>,
+        scope: AssignmentScope<'_>,
+    ) -> PdsResult<Vec<Report>> {
+        let mut sql = String::from(
+            "SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason, \
+             reported_by, reported_at, status, reviewed_by, reviewed_at, resolution, \
+             assigned_operator_did, assignment_source FROM report",
+        );
+        let mut clauses: Vec<String> = Vec::new();
+        let mut pos = 1;
+        if status.is_some() {
+            clauses.push(format!("status = ${}", pos));
+            pos += 1;
+        }
+        if let AssignmentScope::AssignedTo(_) = scope {
+            clauses.push(format!(
+                "(assigned_operator_did = ${} OR assigned_operator_did IS NULL)",
+                pos
+            ));
+            pos += 1;
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(&format!(" ORDER BY reported_at DESC LIMIT ${}", pos));
+
+        let mut query = sqlx::query(&sql);
+        if let Some(s) = status {
+            query = query.bind(s.as_str());
+        }
+        if let AssignmentScope::AssignedTo(did) = scope {
+            query = query.bind(did);
+        }
+        query = query.bind(limit.unwrap_or(100));
 
         let rows = query.fetch_all(&self.db).await?;
-
         let mut reports = Vec::new();
         for row in rows {
             reports.push(self.parse_report(row)?);
         }
-
         Ok(reports)
     }
 
@@ -335,6 +377,8 @@ impl ReportManager {
             reviewed_by: row.get("reviewed_by"),
             reviewed_at,
             resolution: row.get("resolution"),
+            assigned_operator_did: row.try_get("assigned_operator_did").ok().flatten(),
+            assignment_source: row.try_get("assignment_source").ok().flatten(),
         })
     }
 }
@@ -366,7 +410,9 @@ mod tests {
                 status TEXT NOT NULL,
                 reviewed_by TEXT,
                 reviewed_at TEXT,
-                resolution TEXT
+                resolution TEXT,
+                assigned_operator_did TEXT,
+                assignment_source TEXT
             )
             "#,
         )

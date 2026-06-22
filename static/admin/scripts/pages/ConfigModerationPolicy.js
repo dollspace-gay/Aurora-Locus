@@ -87,10 +87,35 @@
       (isSuper ? '<button type="button" class="btn-primary" id="mod-defaults-save">Save defaults</button>' : '<p class="settings-help">SuperAdmin role required to change moderation defaults.</p>') +
       '    </fieldset>' +
       '  </div>' +
+      // §5.5.4 Phase B — reviewer assignment (§4).
+      '  <div class="settings-card">' +
+      '    <h3>Reviewer assignment <span class="role-tag">SuperAdmin only</span></h3>' +
+      '    <p class="settings-help">How new queue items are routed to operators, in the <strong>Full</strong> tier only. Changing the mode re-shows the mode-change banner for every operator.</p>' +
+      '    <div id="mod-reviewer-banner" class="settings-help" style="display:none; padding:0.4rem; border-left:3px solid #c90;"></div>' +
+      '    <fieldset>' +
+      '      <label style="display:block;">Assignment mode' +
+      '        <select id="mod-reviewer-mode" style="display:block; margin-top:0.25rem;"' + (isSuper ? '' : ' disabled') + '>' +
+      '          <option value="manual">Manual (no auto-assignment)</option>' +
+      '          <option value="round-robin">Round-robin (rotate through operators)</option>' +
+      '          <option value="load-balanced">Load-balanced (fewest active items)</option>' +
+      '          <option value="category-routed">By report category (use the map below)</option>' +
+      '        </select></label>' +
+      '      <div id="mod-reviewer-map" style="display:none; margin-top:0.75rem;">' +
+      '        <p class="settings-help">Per-category operator pool — comma-separated DIDs. A category with an empty pool is left unassigned (warning shown).</p>' +
+      reviewerMapRows(isSuper) +
+      '        <div id="mod-reviewer-empty-warn" class="settings-help" style="color:#c00;"></div>' +
+      '      </div>' +
+      '      <label style="display:block; margin-top:0.5rem;">Rationale (required)' +
+      '        <textarea id="mod-reviewer-rationale" rows="2" style="width:100%;"' + (isSuper ? '' : ' disabled') + '></textarea></label>' +
+      '      <p>Current: <strong id="mod-reviewer-current">Loading…</strong></p>' +
+      (isSuper ? '<button type="button" class="btn-primary" id="mod-reviewer-save">Save assignment</button>' : '<p class="settings-help">SuperAdmin role required to change reviewer assignment.</p>') +
+      '    </fieldset>' +
+      '  </div>' +
       '</div>';
 
     await loadModerationMode();
     await loadModerationDefaults();
+    await loadReviewerAssignment();
     if (isSuper) {
       const saveBtn = document.getElementById('mod-mode-save');
       if (saveBtn) saveBtn.addEventListener('click', saveModerationMode);
@@ -98,8 +123,44 @@
       if (defSave) defSave.addEventListener('click', saveModerationDefaults);
       const actionSel = document.getElementById('mod-default-action');
       if (actionSel) actionSel.addEventListener('change', syncCategoryMapVisibility);
+      const revSave = document.getElementById('mod-reviewer-save');
+      if (revSave) revSave.addEventListener('click', saveReviewerAssignment);
+      const revMode = document.getElementById('mod-reviewer-mode');
+      if (revMode) revMode.addEventListener('change', syncReviewerMapVisibility);
+      document.querySelectorAll('.mod-reviewer-pool').forEach(function (el) {
+        el.addEventListener('input', syncReviewerEmptyWarning);
+      });
     }
     return {};
+  }
+
+  function reviewerMapRows(isSuper) {
+    return REPORT_CATEGORIES.map(function (cat) {
+      return '<label style="display:block; margin-top:0.25rem;">' + esc(cat) +
+        '          <input type="text" data-category="' + esc(cat) + '" class="mod-reviewer-pool" placeholder="did:plc:…, did:plc:…" style="display:block; width:100%; margin-top:0.15rem;"' + (isSuper ? '' : ' disabled') + '></label>';
+    }).join('');
+  }
+
+  function syncReviewerMapVisibility() {
+    const sel = document.getElementById('mod-reviewer-mode');
+    const map = document.getElementById('mod-reviewer-map');
+    if (sel && map) map.style.display = sel.value === 'category-routed' ? 'block' : 'none';
+    syncReviewerEmptyWarning();
+  }
+
+  // Parse a comma-separated DID input into a trimmed, non-empty array.
+  function parsePool(text) {
+    return (text || '').split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
+  }
+
+  function syncReviewerEmptyWarning() {
+    const warn = document.getElementById('mod-reviewer-empty-warn');
+    if (!warn) return;
+    const empties = [];
+    document.querySelectorAll('.mod-reviewer-pool').forEach(function (el) {
+      if (parsePool(el.value).length === 0) empties.push(el.getAttribute('data-category'));
+    });
+    warn.textContent = empties.length ? ('Empty pool (left unassigned): ' + empties.join(', ')) : '';
   }
 
   // The six report categories (ReportReason vocabulary). Map values are
@@ -244,6 +305,71 @@
         action: { label: 'View audit entry', href: '#mod/audit/' + encodeURIComponent(auditEntryId) },
       } : undefined);
       await loadModerationDefaults();
+    } catch (e) {
+      global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));
+    }
+  }
+
+  async function loadReviewerAssignment() {
+    const ep = global.AuroraEndpoints;
+    if (!ep) return;
+    try {
+      const data = await ep.admin.getRuntimeSetting('moderation.defaults.reviewer-assignment-mode');
+      const mode = (data && typeof data.value === 'string') ? data.value : 'manual';
+      const sel = document.getElementById('mod-reviewer-mode');
+      if (sel) sel.value = mode;
+      const cur = document.getElementById('mod-reviewer-current');
+      if (cur) cur.textContent = mode + settingSourceSuffix(data && data.source);
+    } catch (e) { /* ignore */ }
+    try {
+      const data = await ep.admin.getRuntimeSetting('moderation.defaults.reviewer-routing-category-map');
+      const map = (data && data.value && typeof data.value === 'object') ? data.value : {};
+      document.querySelectorAll('.mod-reviewer-pool').forEach(function (el) {
+        const arr = map[el.getAttribute('data-category')];
+        el.value = Array.isArray(arr) ? arr.join(', ') : '';
+      });
+    } catch (e) { /* ignore */ }
+    // Mode-change banner: show when the substrate version is newer than the
+    // per-operator localStorage dismissal (§4.5).
+    try {
+      const data = await ep.admin.getRuntimeSetting('moderation.defaults.reviewer-mode-version');
+      const version = (data && typeof data.value === 'number') ? data.value : 0;
+      const banner = document.getElementById('mod-reviewer-banner');
+      const dismissedKey = 'aurora.banner-dismissed.queue-assignment-mode-change.v' + version;
+      if (banner && version > 0 && !localStorage.getItem(dismissedKey)) {
+        banner.textContent = 'Reviewer-assignment mode changed (v' + version + '). New items route per the current mode. [dismiss]';
+        banner.style.display = 'block';
+        banner.style.cursor = 'pointer';
+        banner.onclick = function () { localStorage.setItem(dismissedKey, '1'); banner.style.display = 'none'; };
+      }
+    } catch (e) { /* ignore */ }
+    syncReviewerMapVisibility();
+  }
+
+  async function saveReviewerAssignment() {
+    const ep = global.AuroraEndpoints;
+    const mode = document.getElementById('mod-reviewer-mode').value;
+    const rationale = document.getElementById('mod-reviewer-rationale').value.trim();
+    if (!rationale) { global.AuroraToast.warning('Rationale is required.'); return; }
+    const map = {};
+    document.querySelectorAll('.mod-reviewer-pool').forEach(function (el) {
+      const pool = parsePool(el.value);
+      if (pool.length > 0) map[el.getAttribute('data-category')] = pool;
+    });
+    if (mode === 'category-routed' && Object.keys(map).length === 0) {
+      global.AuroraToast.warning('By-category mode needs at least one category with an operator pool.');
+      return;
+    }
+    try {
+      // Write the map first, then the mode (the mode write bumps the version
+      // server-side and lands the most-recent audit entry).
+      await ep.admin.setRuntimeSetting({ key: 'moderation.defaults.reviewer-routing-category-map', value: map, rationale: rationale });
+      const res = await ep.admin.setRuntimeSetting({ key: 'moderation.defaults.reviewer-assignment-mode', value: mode, rationale: rationale });
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success('Reviewer assignment saved.', auditEntryId ? {
+        action: { label: 'View audit entry', href: '#mod/audit/' + encodeURIComponent(auditEntryId) },
+      } : undefined);
+      await loadReviewerAssignment();
     } catch (e) {
       global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));
     }
