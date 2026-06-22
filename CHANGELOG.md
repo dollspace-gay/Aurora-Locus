@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Forensic export now includes the account's full repository (as a CAR file) and uploaded blobs alongside audit events, in one verifiable archive
 - A Registration policy page consolidating the deployment's account-registration settings — registration mode, new-account access, and default audience — into one overview, with links to where each is managed
 - An Observability page: a read-only overview of the deployment's monitoring surfaces (Prometheus metrics endpoint, system health, database, audit log, substrate metrics) with notes on the env-scoped logging and telemetry configuration
+- A Federation policy page: a read-only view of the deployment's federation posture (relays, trusted peers, appview, firehose/crawl flags) plus the exact federation info advertised to peers; server discovery (describeServer) now advertises a minimal federation posture, and a new federation-scoped describe endpoint exposes richer posture to federation-aware tooling
 - UI building blocks: loading skeletons, spinners, inline errors, error boundaries, consistent timestamps, source-tier indicators, and a save-with-rationale confirmation
 
 ### Changed

@@ -403,6 +403,16 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(trigger_pds_discovery),
             CapsBuilder::new(Family::Ops),
         )
+        // #344 — SuperAdmin read of the full deployment federation config (the
+        // env-view the Configuration → Federation policy page renders). Distinct
+        // from getFederationStatus (counts/connectivity); the handler gates
+        // SuperAdmin and returns security-adjacent fields (peer allowlist) the
+        // public describe endpoints intentionally omit.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.getFederationPolicy",
+            get(get_federation_policy),
+            CapsBuilder::new(Family::Ops),
+        )
         // ---- tools.aurora.moderator.* (chainlink #100 / Phase 3.3) ----
         //
         // Moderator-tier read endpoints. Five queries with shared
@@ -7619,6 +7629,73 @@ async fn get_federation_status(
     }))
 }
 
+/// The full deployment federation config (#344) — the env-view the
+/// Configuration → Federation policy page renders. Unlike the public describe
+/// endpoints, this is the SuperAdmin's *complete* view: it includes the
+/// trusted-issuer peer allowlist and the internal auto-stream toggle, which the
+/// peer-facing describes omit. Read-only; all fields come straight from
+/// `FederationConfig` (env/startup config), so the page is honest that mutation
+/// is a restart-time deployment change, not a runtime setting.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FederationPolicyView {
+    enabled: bool,
+    relay_urls: Vec<String>,
+    appview_url: Option<String>,
+    firehose_enabled: bool,
+    crawl_enabled: bool,
+    public_url: Option<String>,
+    auto_stream_events: bool,
+    peer_pds: Vec<PeerPdsConfigView>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerPdsConfigView {
+    did: String,
+    url: String,
+}
+
+/// `tools.aurora.ops.getFederationPolicy` (#344) — SuperAdmin read of the full
+/// deployment federation config for the Federation policy page. SuperAdmin-only
+/// because it surfaces the trusted-issuer peer allowlist (who this PDS trusts)
+/// and the auto-stream toggle — the same security-adjacent fields the public
+/// `describeServer` / `describePosture` endpoints intentionally exclude.
+/// Read-only; no mutation.
+async fn get_federation_policy(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<FederationPolicyView>, (StatusCode, String)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "getFederationPolicy requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let fc = &ctx.config.federation;
+    Ok(Json(FederationPolicyView {
+        enabled: fc.enabled,
+        relay_urls: fc.relay_urls.clone(),
+        appview_url: fc.appview_url.clone(),
+        firehose_enabled: fc.firehose_enabled,
+        crawl_enabled: fc.crawl_enabled,
+        public_url: fc.public_url.clone(),
+        auto_stream_events: fc.auto_stream_events,
+        peer_pds: fc
+            .peer_pds
+            .iter()
+            .map(|p| PeerPdsConfigView {
+                did: p.did.clone(),
+                url: p.url.clone(),
+            })
+            .collect(),
+    }))
+}
+
 /// Relay server info
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -8045,6 +8122,47 @@ mod tests {
         let (_router, registry) = super::routes();
         mutate(&mut config);
         AppContext::new(config, registry).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_federation_policy_superadmin_only_full_view() {
+        // #344 — SuperAdmin-only; returns the FULL env config including the
+        // peer allowlist + auto-stream toggle (the security-adjacent fields the
+        // public describes omit).
+        use crate::admin::roles::Role;
+        let ctx = create_test_context_with(|c| {
+            c.federation.enabled = true;
+            c.federation.appview_url = Some("https://api.example".to_string());
+            c.federation.auto_stream_events = true;
+            c.federation.peer_pds = vec![crate::config::PeerPdsConfig {
+                did: "did:plc:peer".to_string(),
+                url: "https://peer.example".to_string(),
+            }];
+        })
+        .await;
+        let mk = |role: Role| AdminAuthContext {
+            did: "did:plc:op".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:op".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role,
+        };
+        // Non-SuperAdmin → 403.
+        let forbidden = get_federation_policy(State(ctx.clone()), mk(Role::Admin)).await;
+        assert_eq!(forbidden.unwrap_err().0, StatusCode::FORBIDDEN);
+        // SuperAdmin → full view incl peer_pds + auto_stream_events.
+        let view = get_federation_policy(State(ctx.clone()), mk(Role::SuperAdmin))
+            .await
+            .expect("superadmin gets the policy view")
+            .0;
+        assert!(view.enabled);
+        assert_eq!(view.appview_url.as_deref(), Some("https://api.example"));
+        assert!(view.auto_stream_events);
+        assert_eq!(view.peer_pds.len(), 1);
+        assert_eq!(view.peer_pds[0].did, "did:plc:peer");
+        assert_eq!(view.peer_pds[0].url, "https://peer.example");
     }
 
     #[tokio::test]
@@ -9335,6 +9453,7 @@ mod tests {
             r#""getRelayConfig","#,
             r#""listKnownInstances","#,
             r#""triggerPdsDiscovery","#,
+            r#""getFederationPolicy","#,
             r#""triggerRotation","#,
             // v0.9 Arc D (#225) — kryphocron operator read cohort.
             r#""getSubstrateInfo","#,

@@ -30,14 +30,10 @@
 
   // { key, domain, title, blurb } — `domain` drives the breadcrumb prefix.
   const STUBS = [
-    {
-      key: 'configFederationPolicy',
-      domain: 'Configuration',
-      domainRoute: 'configuration/general',
-      title: 'Federation policy',
-      blurb: 'Available when the federation-policy backend ships. This page ' +
-             'will manage registration, discovery, and relay posture.',
-    },
+    // configFederationPolicy retired in #344 — the real page
+    // (ConfigFederationPolicy.js) registers that key now; a read-only posture
+    // surface over the env-configured federation state + the two public
+    // describe endpoints, with runtime-mutable policy reserved for a later cycle.
     // configRegistrationPolicy retired in #342 — the real page
     // (ConfigRegistrationPolicy.js) registers that key now; it consolidates the
     // already-shipped registration settings (read-only overview + edit-elsewhere

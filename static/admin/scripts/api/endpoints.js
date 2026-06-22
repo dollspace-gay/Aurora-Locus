@@ -14,6 +14,8 @@
     // Public server descriptor — real static config (inviteCodeRequired,
     // availableUserDomains, DID). Used by the Registration policy overview (#342).
     describeServer: () => C().get('com.atproto.server.describeServer'),
+    // Public federation-scoped describe (#344) — Aurora-aware peer posture.
+    describeFederationPosture: () => C().get('com.aurora.federation.describePosture'),
     listAccounts: (params) => C().get('com.atproto.admin.listAccounts', params || { limit: 100 }),
     getAccount: (did) => C().get('com.atproto.admin.getAccount', { did: did }),
     getAccountInfo: (did) => C().get('com.atproto.admin.getAccountInfo', { did: did }),
@@ -73,6 +75,8 @@
     getInstanceMetrics: () => C().get('tools.aurora.ops.getInstanceMetrics'),
     getSystemHealth: () => C().get('tools.aurora.ops.getSystemHealth'),
     getFederationStatus: () => C().get('tools.aurora.ops.getFederationStatus'),
+    // SuperAdmin full deployment-federation env view for the policy page (#344).
+    getFederationPolicy: () => C().get('tools.aurora.ops.getFederationPolicy'),
     getVersionInfo: () => C().get('tools.aurora.ops.getVersionInfo'),
     listBlobs: (params) => C().get('tools.aurora.ops.listBlobs', params || {}),
     getBlobStatistics: () => C().get('tools.aurora.ops.getBlobStatistics'),

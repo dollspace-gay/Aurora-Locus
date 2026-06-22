@@ -1292,6 +1292,30 @@ struct DescribeServerResponse {
     /// Links (e.g., privacy policy, terms of service)
     #[serde(skip_serializing_if = "Option::is_none")]
     links: Option<DescribeServerLinks>,
+    /// Aurora-Locus additive extension (#344): minimal federation posture for
+    /// any ATProto peer. NOT part of upstream's canonical describeServer —
+    /// Bluesky's spec does not define this field; Aurora-Locus declares it
+    /// (response-additive, so clients that don't know it ignore it). It always
+    /// reflects the substrate's *enforced* federation state; future
+    /// runtime-mutable federation policy won't change this field's semantic. If
+    /// upstream ever adds a `federation` field with a different shape, realign.
+    /// Richer Aurora-aware posture (relay URLs, appview/public URL) lives on the
+    /// federation-scoped `com.aurora.federation.describePosture`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    federation: Option<FederationDescribe>,
+}
+
+/// The `federation` extension block on `describeServer` (#344). Minimal by
+/// design: when federation is off, only `enabled: false` is emitted (URLs and
+/// flags are omitted — the off-posture is itself the information a peer needs).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FederationDescribe {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    firehose_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crawl_enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1314,6 +1338,15 @@ async fn describe_server(State(ctx): State<AppContext>) -> PdsResult<Json<Descri
         invite_code_required: Some(ctx.config.invites.required),
         phone_verification_required: Some(false), // Not implemented yet
         links: None,                              // TODO: Add from config if available
+        federation: {
+            let fc = &ctx.config.federation;
+            // enabled always present; flags only when on (off-posture = enabled:false alone).
+            Some(FederationDescribe {
+                enabled: fc.enabled,
+                firehose_enabled: fc.enabled.then_some(fc.firehose_enabled),
+                crawl_enabled: fc.enabled.then_some(fc.crawl_enabled),
+            })
+        },
     }))
 }
 
@@ -1837,4 +1870,41 @@ async fn reserve_signing_key(
     );
 
     Ok(Json(ReserveSigningKeyResponse { signing_key }))
+}
+
+#[cfg(test)]
+mod describe_server_federation_tests {
+    use super::*;
+
+    // #344 — the describeServer `federation` extension wire shape. When
+    // federation is off, the block is `{enabled: false}` alone (flags omitted —
+    // the off-posture is itself the signal a peer needs).
+    #[test]
+    fn federation_off_emits_enabled_false_only() {
+        let v = serde_json::to_value(FederationDescribe {
+            enabled: false,
+            firehose_enabled: None,
+            crawl_enabled: None,
+        })
+        .unwrap();
+        assert_eq!(v["enabled"], false);
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            1,
+            "off-posture is enabled:false alone: {v}"
+        );
+    }
+
+    #[test]
+    fn federation_on_emits_camelcase_flags() {
+        let v = serde_json::to_value(FederationDescribe {
+            enabled: true,
+            firehose_enabled: Some(true),
+            crawl_enabled: Some(false),
+        })
+        .unwrap();
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["firehoseEnabled"], true);
+        assert_eq!(v["crawlEnabled"], false);
+    }
 }

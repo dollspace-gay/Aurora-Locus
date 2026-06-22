@@ -26,6 +26,11 @@ pub fn routes() -> Router<AppContext> {
     Router::new()
         // Phase 1: Admin & status endpoints
         .route("/xrpc/com.aurora.federation.status", get(federation_status))
+        // Federation-scoped describe (#344) — public; Aurora-aware posture.
+        .route(
+            "/xrpc/com.aurora.federation.describePosture",
+            get(describe_posture),
+        )
         .route(
             "/xrpc/com.aurora.federation.listInstances",
             get(list_instances),
@@ -42,6 +47,59 @@ pub fn routes() -> Router<AppContext> {
         )
         // Phase 4: DPoP support
         .route("/xrpc/com.aurora.dpop.getNonce", get(get_dpop_nonce))
+}
+
+/// `com.aurora.federation.describePosture` — public, federation-scoped describe
+/// (#344). Aurora-aware tooling calls this for richer federation posture than
+/// upstream `com.atproto.server.describeServer`'s minimal `federation`
+/// extension provides. Under Aurora-Locus's per-subsystem describe convention
+/// (Path B), server-identity fields (DID, handle domains, links) live in
+/// `describeServer`; this endpoint is federation-only. Future Aurora subsystems
+/// get their own `describe*` in their own namespace as needed. Public-readable
+/// (no auth), mirroring describeServer's public contract — Aurora-aware peers
+/// discover capabilities without credentials.
+///
+/// Intentionally excludes `peer_pds` (the trusted-issuer allowlist — disclosing
+/// who this PDS trusts invites adversarial probing) and `auto_stream_events`
+/// (internal operational choice peers don't need). When federation is off, only
+/// `enabled` + `auroraVersion` are emitted.
+async fn describe_posture(State(ctx): State<AppContext>) -> Json<FederationDescribePosture> {
+    let fc = &ctx.config.federation;
+    let on = fc.enabled;
+    Json(FederationDescribePosture {
+        enabled: on,
+        appview_url: if on { fc.appview_url.clone() } else { None },
+        public_url: if on { fc.public_url.clone() } else { None },
+        firehose_enabled: on.then_some(fc.firehose_enabled),
+        crawl_enabled: on.then_some(fc.crawl_enabled),
+        relay_urls: if on && !fc.relay_urls.is_empty() {
+            Some(fc.relay_urls.clone())
+        } else {
+            None
+        },
+        aurora_version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
+/// Federation-scoped posture (`com.aurora.federation.describePosture`, #344).
+/// All optional fields are omitted when federation is off (or, for the URLs,
+/// when not configured); `aurora_version` is always present for
+/// compatibility-check tooling.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FederationDescribePosture {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    appview_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    firehose_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crawl_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_urls: Option<Vec<String>>,
+    aurora_version: String,
 }
 
 /// Get federation status (public endpoint)
@@ -278,5 +336,59 @@ mod tests {
     fn test_routes_compile() {
         // Ensure routes() compiles correctly
         let _router = routes();
+    }
+
+    // #344 — describePosture wire shape. Disabled posture is enabled +
+    // auroraVersion only (all flags/urls omitted by the optional serializer).
+    #[test]
+    fn describe_posture_disabled_emits_minimal_shape() {
+        let v = serde_json::to_value(FederationDescribePosture {
+            enabled: false,
+            appview_url: None,
+            public_url: None,
+            firehose_enabled: None,
+            crawl_enabled: None,
+            relay_urls: None,
+            aurora_version: "0.0.0-test".to_string(),
+        })
+        .unwrap();
+        assert_eq!(v["enabled"], false);
+        assert!(v["auroraVersion"].is_string());
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            2,
+            "disabled posture omits all flags/urls: {v}"
+        );
+    }
+
+    // The federation-scoped posture must never leak the trusted-peer allowlist,
+    // the internal auto-stream toggle, or server-identity fields — even fully
+    // populated. (Those are SuperAdmin-only / live in describeServer.)
+    #[test]
+    fn describe_posture_excludes_peer_and_identity_fields() {
+        let v = serde_json::to_value(FederationDescribePosture {
+            enabled: true,
+            appview_url: Some("https://api.example".to_string()),
+            public_url: Some("https://pds.example".to_string()),
+            firehose_enabled: Some(true),
+            crawl_enabled: Some(false),
+            relay_urls: Some(vec!["https://relay.example".to_string()]),
+            aurora_version: "0.0.0-test".to_string(),
+        })
+        .unwrap();
+        assert_eq!(v["appviewUrl"], "https://api.example");
+        assert!(v["relayUrls"].is_array());
+        let obj = v.as_object().unwrap();
+        for forbidden in [
+            "peerPds",
+            "peer_pds",
+            "autoStreamEvents",
+            "auto_stream_events",
+            "did",
+            "availableUserDomains",
+            "links",
+        ] {
+            assert!(!obj.contains_key(forbidden), "describePosture must not expose {forbidden}");
+        }
     }
 }
