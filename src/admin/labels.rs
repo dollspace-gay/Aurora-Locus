@@ -19,6 +19,24 @@ pub struct Label {
     pub sig: Option<Vec<u8>>,
 }
 
+/// Outcome of an apply-label attempt (§5.5.4 §2.4 / chainlink #345).
+///
+/// `issued` distinguishes a freshly inserted label from one that was
+/// already present (a non-negated label with the same `(uri, val)`) —
+/// the dedup signal the moderation-defaults consumer records as
+/// `applied: bool` in the `moderation_auto_label_applied` audit
+/// payload. Phase-A-minimal: existence is keyed on `(uri, val, neg=false)`
+/// only; richer dedup (carrying the prior `source`) is deferred to a
+/// later phase per the design's §3.8.
+#[derive(Debug, Clone)]
+pub struct LabelApplication {
+    pub label: Label,
+    /// `true` when this call inserted a new label row; `false` when a
+    /// matching non-negated label already existed (no row inserted —
+    /// the returned `label` is the pre-existing row).
+    pub issued: bool,
+}
+
 /// Label manager
 #[derive(Clone)]
 pub struct LabelManager {
@@ -50,7 +68,8 @@ impl LabelManager {
             created_by,
             expires_in,
         )
-        .await?;
+        .await?
+        .label;
         tx.commit().await?;
         Ok(label)
     }
@@ -72,7 +91,40 @@ impl LabelManager {
         val: &str,
         created_by: &str,
         expires_in: Option<chrono::Duration>,
-    ) -> PdsResult<Label> {
+    ) -> PdsResult<LabelApplication> {
+        // §2.4 dedup: an ACTIVE non-negated label with the same (uri,
+        // val) makes this apply a no-op — return the existing row with
+        // issued=false rather than inserting a duplicate. "Active" means
+        // not superseded by a later negation (label rows are append-only;
+        // a higher-id neg=TRUE row negates a prior neg=FALSE row), so a
+        // label that was applied, then removed/expired, then re-reported
+        // re-issues fresh (issued=true) rather than being suppressed. The
+        // moderation-defaults consumer reads `issued` for its audit
+        // `applied` field; manual callers ignore it via `.label`.
+        let existing = sqlx::query(
+            r#"
+            SELECT id, cid, src, created_at, created_by, expires_at
+            FROM label l
+            WHERE l.uri = $1 AND l.val = $2 AND l.neg = FALSE
+              AND NOT EXISTS (
+                SELECT 1 FROM label n
+                WHERE n.uri = l.uri AND n.val = l.val AND n.neg = TRUE AND n.id > l.id
+              )
+            ORDER BY l.id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(uri)
+        .bind(val)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(row) = existing {
+            return Ok(LabelApplication {
+                label: Self::label_from_row(&row, uri, val, false)?,
+                issued: false,
+            });
+        }
+
         let now = Utc::now();
         let expires_at = expires_in.map(|d| now + d);
 
@@ -93,15 +145,52 @@ impl LabelManager {
         .fetch_one(&mut **tx)
         .await?;
 
+        Ok(LabelApplication {
+            label: Label {
+                id,
+                uri: uri.to_string(),
+                cid: cid.map(String::from),
+                val: val.to_string(),
+                neg: false,
+                src: server_did.to_string(),
+                created_at: now,
+                created_by: created_by.to_string(),
+                expires_at,
+                sig: None,
+            },
+            issued: true,
+        })
+    }
+
+    /// Reconstruct a [`Label`] from a fetched `label` row for the
+    /// dedup-hit path of [`apply_label_in_tx`]. `uri`/`val`/`neg` are
+    /// known from the query predicate and passed through verbatim.
+    fn label_from_row(
+        row: &sqlx::any::AnyRow,
+        uri: &str,
+        val: &str,
+        neg: bool,
+    ) -> PdsResult<Label> {
+        let parse_ts = |s: &str| {
+            DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| PdsError::Internal(e.to_string()))
+        };
+        let created_at_s: String = row.try_get("created_at")?;
+        let expires_at_s: Option<String> = row.try_get("expires_at").ok().flatten();
+        let expires_at = match expires_at_s {
+            Some(s) => Some(parse_ts(&s)?),
+            None => None,
+        };
         Ok(Label {
-            id,
+            id: row.try_get("id")?,
             uri: uri.to_string(),
-            cid: cid.map(String::from),
+            cid: row.try_get("cid").ok().flatten(),
             val: val.to_string(),
-            neg: false,
-            src: server_did.to_string(),
-            created_at: now,
-            created_by: created_by.to_string(),
+            neg,
+            src: row.try_get("src")?,
+            created_at: parse_ts(&created_at_s)?,
+            created_by: row.try_get("created_by")?,
             expires_at,
             sig: None,
         })
@@ -290,7 +379,8 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .label;
         tx.commit().await.unwrap();
 
         assert_eq!(label.val, "spam");

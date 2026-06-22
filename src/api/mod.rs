@@ -19,6 +19,7 @@ pub mod identity;
 pub mod labels;
 pub mod middleware;
 pub mod moderation;
+pub mod moderation_defaults;
 pub mod oauth_admin;
 pub mod oauth_server;
 pub mod kryphocron_endpoints;

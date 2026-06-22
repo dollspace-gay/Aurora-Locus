@@ -23,7 +23,8 @@ test('Moderation policy page hosts the tier switch wired to moderation-mode', ()
   }
   assert.ok(src.includes("setRuntimeSetting({ key: 'moderation-mode'"), 'saves moderation-mode');
   assert.ok(src.includes("'moderation-mode-redirect-url'"), 'handles the disabled redirect URL');
-  assert.ok(/Configurable moderation defaults/i.test(src), 'carries the in-development defaults section');
+  // §5.5.4 Phase A activated the defaults section in place of the old stub.
+  assert.ok(src.includes("'moderation.defaults.report-action'"), 'hosts the activated default-action control');
 });
 
 test('switching to disabled requires a typed-confirm', () => {

@@ -3611,7 +3611,8 @@ async fn apply_label(
         expires_in,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .label;
     audit_chain::insert_chain_entry(
         &mut tx,
         ctx.config.database.backend,
@@ -3754,6 +3755,18 @@ async fn submit_report(
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // §5.5.4 Phase A: apply the configured default action (full tier
+    // only). Best-effort — the report is already persisted.
+    if let Err(e) =
+        crate::api::moderation_defaults::apply_report_default(&ctx, &report).await
+    {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "moderation default-action consumer failed on submitReport intake"
+        );
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,

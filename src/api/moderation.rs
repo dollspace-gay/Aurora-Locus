@@ -164,6 +164,17 @@ async fn create_report(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // §5.5.4 Phase A: apply the configured default action (full tier
+    // only). Best-effort — the report is already persisted, so a
+    // default-application failure is logged, not surfaced as a 500.
+    if let Err(e) = crate::api::moderation_defaults::apply_report_default(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "moderation default-action consumer failed on createReport intake"
+        );
+    }
+
     // Build response subject
     let subject_json = match &req.subject {
         ReportSubject::Repo(repo_ref) => serde_json::json!({

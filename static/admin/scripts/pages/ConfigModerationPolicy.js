@@ -59,20 +59,67 @@
       '    </fieldset>' +
       '  </div>' +
       '</div>' +
-      // §5.5.4 — configurable moderation defaults. Separate work-thread (design
-      // contracts in progress); honest in-development surface, not a dead stub.
+      // §5.5.4 Phase A — default action on report submission (§2),
+      // its per-category override map (§2.3), and the stale-hold timeout
+      // (§2.5). SuperAdmin-only; applies in the `full` tier (§2.7).
       '<hr class="config-section-divider">' +
-      '<section class="installed-themes-section">' +
-      '  <h3>Configurable moderation defaults</h3>' +
-      '  <p class="settings-help">Default moderation actions (e.g. new-account default status), auto-moderation rules, and reviewer-assignment policy. Design pass in progress — this section activates in a later release once the policy-defaults contract is locked.</p>' +
-      '</section>';
+      '<div class="settings-grid">' +
+      '  <div class="settings-card">' +
+      '    <h3>Default action on report submission <span class="role-tag">SuperAdmin only</span></h3>' +
+      '    <p class="settings-help">Applied by substrate the moment a report lands, in the <strong>Full</strong> tier only. Operators confirm or override it during review.</p>' +
+      '    <fieldset>' +
+      '      <label style="display:block;">Default action' +
+      '        <select id="mod-default-action" style="display:block; margin-top:0.25rem;"' + (isSuper ? '' : ' disabled') + '>' +
+      '          <option value="acknowledge">Acknowledge (log only)</option>' +
+      '          <option value="hide-pending-review">Hide pending review (apply hide-pending label)</option>' +
+      '          <option value="auto-resolve-by-category">By report category (use the map below)</option>' +
+      '        </select></label>' +
+      '      <div id="mod-category-map" style="display:none; margin-top:0.75rem;">' +
+      '        <p class="settings-help">Per-category action. Categories left at “acknowledge” may be omitted; an empty map falls back to acknowledge for all.</p>' +
+      categoryMapRows(isSuper) +
+      '      </div>' +
+      '      <label style="display:block; margin-top:0.75rem;">Stale hide-pending hold (days)' +
+      '        <input type="number" id="mod-stale-days" min="1" max="365" style="display:block; margin-top:0.25rem; width:8rem;"' + (isSuper ? '' : ' disabled') + '></label>' +
+      '      <p class="settings-help">Hide-pending labels older than this are lazily auto-removed (1–365).</p>' +
+      '      <label style="display:block; margin-top:0.5rem;">Rationale (required)' +
+      '        <textarea id="mod-defaults-rationale" rows="2" style="width:100%;"' + (isSuper ? '' : ' disabled') + '></textarea></label>' +
+      '      <p>Current: <strong id="mod-defaults-current">Loading…</strong></p>' +
+      (isSuper ? '<button type="button" class="btn-primary" id="mod-defaults-save">Save defaults</button>' : '<p class="settings-help">SuperAdmin role required to change moderation defaults.</p>') +
+      '    </fieldset>' +
+      '  </div>' +
+      '</div>';
 
     await loadModerationMode();
+    await loadModerationDefaults();
     if (isSuper) {
       const saveBtn = document.getElementById('mod-mode-save');
       if (saveBtn) saveBtn.addEventListener('click', saveModerationMode);
+      const defSave = document.getElementById('mod-defaults-save');
+      if (defSave) defSave.addEventListener('click', saveModerationDefaults);
+      const actionSel = document.getElementById('mod-default-action');
+      if (actionSel) actionSel.addEventListener('change', syncCategoryMapVisibility);
     }
     return {};
+  }
+
+  // The six report categories (ReportReason vocabulary). Map values are
+  // acknowledge | hide-pending-review; "acknowledge" doubles as "unset".
+  var REPORT_CATEGORIES = ['spam', 'violation', 'misleading', 'sexual', 'rude', 'other'];
+
+  function categoryMapRows(isSuper) {
+    return REPORT_CATEGORIES.map(function (cat) {
+      return '<label style="display:block; margin-top:0.25rem;">' + esc(cat) +
+        '          <select data-category="' + esc(cat) + '" class="mod-cat-action" style="margin-left:0.5rem;"' + (isSuper ? '' : ' disabled') + '>' +
+        '            <option value="acknowledge">acknowledge</option>' +
+        '            <option value="hide-pending-review">hide-pending-review</option>' +
+        '          </select></label>';
+    }).join('');
+  }
+
+  function syncCategoryMapVisibility() {
+    const sel = document.getElementById('mod-default-action');
+    const map = document.getElementById('mod-category-map');
+    if (sel && map) map.style.display = sel.value === 'auto-resolve-by-category' ? 'block' : 'none';
   }
 
   async function loadModerationMode() {
@@ -132,6 +179,71 @@
         },
       } : undefined);
       await loadModerationMode();
+    } catch (e) {
+      global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));
+    }
+  }
+
+  async function loadModerationDefaults() {
+    const ep = global.AuroraEndpoints;
+    if (!ep) return;
+    let action = 'acknowledge';
+    try {
+      const data = await ep.admin.getRuntimeSetting('moderation.defaults.report-action');
+      if (data && typeof data.value === 'string') action = data.value;
+      const sel = document.getElementById('mod-default-action');
+      if (sel) sel.value = action;
+      const cur = document.getElementById('mod-defaults-current');
+      if (cur) cur.textContent = action + settingSourceSuffix(data && data.source);
+    } catch (e) { /* ignore */ }
+    try {
+      const data = await ep.admin.getRuntimeSetting('moderation.defaults.report-action-category-map');
+      const map = (data && data.value && typeof data.value === 'object') ? data.value : {};
+      document.querySelectorAll('.mod-cat-action').forEach(function (el) {
+        const v = map[el.getAttribute('data-category')];
+        el.value = (v === 'hide-pending-review') ? 'hide-pending-review' : 'acknowledge';
+      });
+    } catch (e) { /* ignore */ }
+    try {
+      const data = await ep.admin.getRuntimeSetting('moderation.defaults.hide-pending-review-stale-days');
+      const v = (data && typeof data.value === 'number') ? data.value : 90;
+      const input = document.getElementById('mod-stale-days');
+      if (input) input.value = v;
+    } catch (e) { /* ignore */ }
+    syncCategoryMapVisibility();
+  }
+
+  async function saveModerationDefaults() {
+    const ep = global.AuroraEndpoints;
+    const actionSel = document.getElementById('mod-default-action');
+    const action = actionSel ? actionSel.value : 'acknowledge';
+    const rationale = document.getElementById('mod-defaults-rationale').value.trim();
+    if (!rationale) { global.AuroraToast.warning('Rationale is required.'); return; }
+    const staleRaw = parseInt(document.getElementById('mod-stale-days').value, 10);
+    if (!(staleRaw >= 1 && staleRaw <= 365)) {
+      global.AuroraToast.warning('Stale-hold days must be 1–365.');
+      return;
+    }
+    // Build the per-category map from non-acknowledge selections only —
+    // acknowledge is the implicit default, so an all-acknowledge map is {}.
+    const map = {};
+    document.querySelectorAll('.mod-cat-action').forEach(function (el) {
+      if (el.value === 'hide-pending-review') map[el.getAttribute('data-category')] = el.value;
+    });
+    if (action === 'auto-resolve-by-category' && Object.keys(map).length === 0) {
+      global.AuroraToast.warning('By-category action needs at least one category set to hide-pending-review.');
+      return;
+    }
+    try {
+      await ep.admin.setRuntimeSetting({ key: 'moderation.defaults.report-action', value: action, rationale: rationale });
+      await ep.admin.setRuntimeSetting({ key: 'moderation.defaults.report-action-category-map', value: map, rationale: rationale });
+      // Last of the three writes lands the most-recent audit entry; link the toast to it.
+      const res = await ep.admin.setRuntimeSetting({ key: 'moderation.defaults.hide-pending-review-stale-days', value: staleRaw, rationale: rationale });
+      const auditEntryId = res && res.auditEntryId;
+      global.AuroraToast.success('Moderation defaults saved.', auditEntryId ? {
+        action: { label: 'View audit entry', href: '#mod/audit/' + encodeURIComponent(auditEntryId) },
+      } : undefined);
+      await loadModerationDefaults();
     } catch (e) {
       global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));
     }

@@ -3756,8 +3756,23 @@ impl Serialize for SettingSource {
     }
 }
 
-const MODERATION_MODE_KEY: &str = "moderation-mode";
+pub const MODERATION_MODE_KEY: &str = "moderation-mode";
 const MODERATION_MODE_REDIRECT_KEY: &str = "moderation-mode-redirect-url";
+/// §5.5.4 Phase A (#345) — default action applied to a report on intake.
+/// `acknowledge` | `hide-pending-review` | `auto-resolve-by-category`.
+/// Consulted live by the report-intake consumer; full tier only (§2.7).
+pub const MODERATION_DEFAULTS_REPORT_ACTION_KEY: &str = "moderation.defaults.report-action";
+/// §5.5.4 §2.3 — per-report-category action override map (JSON object).
+/// Keys ∈ the `ReportReason` vocabulary; values ∈ `acknowledge` |
+/// `hide-pending-review`. Consulted when report-action is
+/// `auto-resolve-by-category`. Default `{}`.
+pub const MODERATION_DEFAULTS_CATEGORY_MAP_KEY: &str =
+    "moderation.defaults.report-action-category-map";
+/// §5.5.4 §2.5 — age in days after which a substrate-applied
+/// hide-pending label is treated as stale and lazily auto-removed.
+/// `1..=365`, default 90.
+pub const MODERATION_DEFAULTS_STALE_DAYS_KEY: &str =
+    "moderation.defaults.hide-pending-review-stale-days";
 /// v0.9 Arc B (§11.10.2): the deployment-default theme id — what fresh
 /// sessions and operators without a personal preference render. Set is
 /// SuperAdmin-only (via `setRuntimeSetting` + rationale); read is allowed at
@@ -3866,8 +3881,11 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY,
     KRYPHOCRON_PROCESS_SHAPE_KEY,
     KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY,
+    MODERATION_DEFAULTS_REPORT_ACTION_KEY,
+    MODERATION_DEFAULTS_CATEGORY_MAP_KEY,
+    MODERATION_DEFAULTS_STALE_DAYS_KEY,
 ];
-const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
+pub const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
 /// Env-var override of the file-tier YAML path. Default is
 /// `<data_directory>/runtime.yaml`. Resolved in `AppContext::new`.
@@ -3892,6 +3910,12 @@ fn default_for_key(key: &str) -> serde_json::Value {
         KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY => {
             serde_json::Value::String("weekly-to-daily".to_string())
         }
+        // §5.5.4 Phase A moderation defaults.
+        MODERATION_DEFAULTS_REPORT_ACTION_KEY => {
+            serde_json::Value::String("acknowledge".to_string())
+        }
+        MODERATION_DEFAULTS_CATEGORY_MAP_KEY => serde_json::json!({}),
+        MODERATION_DEFAULTS_STALE_DAYS_KEY => serde_json::Value::from(90),
         _ => serde_json::Value::Null,
     }
 }
@@ -3943,6 +3967,29 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY => value
             .as_str()
             .is_some_and(|s| matches!(s, "weekly-to-daily" | "weekly-to-hourly" | "no-override")),
+        // §5.5.4 §2.2: top-level default action. The "≥1 entry when
+        // auto-resolve-by-category" cross-key invariant cannot be checked
+        // here (no map access); the consumer degrades an empty map to
+        // `acknowledge` at apply time.
+        MODERATION_DEFAULTS_REPORT_ACTION_KEY => value.as_str().is_some_and(|s| {
+            matches!(s, "acknowledge" | "hide-pending-review" | "auto-resolve-by-category")
+        }),
+        // §5.5.4 §2.3: object keyed on the ReportReason vocabulary with
+        // per-category action values. Empty object is valid (the default).
+        MODERATION_DEFAULTS_CATEGORY_MAP_KEY => value.as_object().is_some_and(|m| {
+            m.iter().all(|(k, v)| {
+                matches!(
+                    k.as_str(),
+                    "spam" | "violation" | "misleading" | "sexual" | "rude" | "other"
+                ) && v
+                    .as_str()
+                    .is_some_and(|s| matches!(s, "acknowledge" | "hide-pending-review"))
+            })
+        }),
+        // §5.5.4 §2.5: stale-hold timeout, 1..=365 days.
+        MODERATION_DEFAULTS_STALE_DAYS_KEY => {
+            value.as_u64().is_some_and(|n| (1..=365).contains(&n))
+        }
         _ => true,
     }
 }
@@ -4336,6 +4383,32 @@ pub fn load_file_tier_settings(
         out.insert(key, json_val);
     }
     Ok(out)
+}
+
+/// Resolve a runtime setting's effective value for substrate consumers
+/// that read settings outside the XRPC handler (e.g. the §5.5.4
+/// report-intake default-action consumer). Mirrors
+/// [`get_runtime_setting`]'s three-tier resolution — runtime row →
+/// file-tier YAML → compiled default — minus the role gate and the
+/// recovery-mode override (callers needing the latter apply it
+/// themselves). A DB read error falls through to file-tier/default
+/// rather than erroring: read-only resolution must never fail a caller.
+pub async fn resolve_runtime_setting(ctx: &AppContext, key: &str) -> serde_json::Value {
+    use sqlx::Row as _;
+    if let Ok(Some(r)) = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(&ctx.account_db)
+        .await
+    {
+        if let Ok(value_str) = r.try_get::<String, _>("value") {
+            return serde_json::from_str(&value_str)
+                .unwrap_or(serde_json::Value::String(value_str));
+        }
+    }
+    if let Some(value) = ctx.file_tier_settings.get(key) {
+        return value.clone();
+    }
+    default_for_key(key)
 }
 
 pub async fn get_runtime_setting(
