@@ -56,14 +56,11 @@
       blurb: 'Available when the integration-hooks backend ships. This page ' +
              'will manage webhook configuration and external moderation pairing.',
     },
-    {
-      key: 'configObservability',
-      domain: 'Configuration',
-      domainRoute: 'configuration/general',
-      title: 'Observability',
-      blurb: 'Available when the observability backend ships. This page will ' +
-             'manage metrics, logging, and telemetry posture.',
-    },
+    // configObservability retired in #343 — the real page
+    // (ConfigObservability.js) registers that key now; a read-only status/
+    // overview surface (Recovery-Mode pattern) over the shipped observability
+    // surfaces + env-scoped config docs, with runtime telemetry config reserved
+    // for a later cycle.
     // The `kryphocronStub` Overview placeholder was retired in #226 (D-routes):
     // the Kryphocron domain's real routes (overview / laquna / laquna-history /
     // audiences / tier-activity) ship across #228–#231 + #229. The
