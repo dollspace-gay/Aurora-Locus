@@ -37,6 +37,7 @@
       '<nav class="breadcrumb"><a href="#configuration/general">Configuration</a> <span class="breadcrumb-sep">›</span> Moderation policy</nav>' +
       '<header class="page-header"><div><h2>Moderation policy</h2>' +
       '<p class="page-subtitle">Deployment moderation tier and (soon) configurable defaults</p></div></header>' +
+      '<div id="mod-lexicon-banner" style="display:none;"></div>' +
       '<div class="settings-grid">' +
       '  <div class="settings-card">' +
       '    <h3>Moderation tier <span class="role-tag">SuperAdmin only</span></h3>' +
@@ -194,6 +195,7 @@
       '  </div>' +
       '</div>';
 
+    await loadLexiconBanner();
     await loadModerationMode();
     await loadModerationDefaults();
     await loadReviewerAssignment();
@@ -762,6 +764,32 @@
     } catch (e) {
       global.AuroraToast.danger('Delete failed: ' + (e && e.message ? e.message : ''));
     }
+  }
+
+  // §5.5.4 Phase E — lexicon-migration banner (§6.4). Shows what a boot-time
+  // report-category change migrated (pruned map keys + flagged rules) until
+  // per-operator localStorage dismissal keyed on the migration timestamp.
+  async function loadLexiconBanner() {
+    const ep = global.AuroraEndpoints;
+    const el = document.getElementById('mod-lexicon-banner');
+    if (!ep || !el) return;
+    try {
+      const data = await ep.admin.getRuntimeSetting('moderation.lexicon.migration-banner');
+      const raw = data && data.value;
+      if (!raw || typeof raw !== 'string') return;
+      const b = JSON.parse(raw);
+      if (!b || !b.migratedAt) return;
+      const dismissKey = 'aurora.banner-dismissed.lexicon-migration.' + b.migratedAt;
+      if (localStorage.getItem(dismissKey)) return;
+      const pruned = (b.prunedKeys || []).join(', ') || 'none';
+      const flagged = (b.flaggedRuleIds || []).join(', ') || 'none';
+      el.className = 'settings-help';
+      el.style.cssText = 'display:block; padding:0.5rem; border-left:3px solid #c90; background:#fffbe6;';
+      el.innerHTML = 'Report-category lexicon changed (' + esc(b.migratedAt) + '). Pruned map keys: ' + esc(pruned) +
+        '. Flagged rules (review their category): ' + esc(flagged) + '. <button type="button" id="mod-lexicon-dismiss">Acknowledge</button>';
+      const btn = document.getElementById('mod-lexicon-dismiss');
+      if (btn) btn.addEventListener('click', function () { localStorage.setItem(dismissKey, '1'); el.style.display = 'none'; });
+    } catch (e) { /* no banner */ }
   }
 
   if (global.AuroraRouter) global.AuroraRouter.register('configModerationPolicy', { mount: mount });

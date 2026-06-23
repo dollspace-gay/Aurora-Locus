@@ -12,10 +12,19 @@
   // url-state wiring (§5.7.5) — the shared shape lives in AuroraListPage
   // (components/ListPage.js, #257). verifiedOnly is a boolean filter (applied
   // client-side post-fetch, below).
-  const SCALAR_KEYS = ['actor', 'subject', 'subjectCid', 'action'];
-  const BOOL_KEYS = ['verifiedOnly'];
+  const SCALAR_KEYS = ['actor', 'subject', 'subjectCid', 'action', 'source'];
+  const BOOL_KEYS = ['verifiedOnly', 'ruleManagement'];
 
   function applyFilters(vals) {
+    // §5.5.4 Phase E (MD-44): the source-field filter and the Operator
+    // rule-management filter are mutually exclusive — selecting one clears
+    // the other (precludes the always-empty source+rule-lifecycle combos).
+    if (vals) {
+      if (vals.source && vals.ruleManagement) {
+        // Whichever the user just changed wins; default to source.
+        vals.ruleManagement = false;
+      }
+    }
     global.AuroraListPage.applyFilters(SCALAR_KEYS, BOOL_KEYS, vals, lastFilters && lastFilters.when, function (v) {
       lastFilters = v;
       cursorStack = [];
@@ -49,6 +58,19 @@
           { type: 'text', id: 'subject', placeholder: 'Filter by subject DID' },
           { type: 'text', id: 'subjectCid', placeholder: 'Filter by subject CID' },
           { type: 'text', id: 'action', placeholder: 'Filter by action' },
+          // §5.5.4 Phase E (§6.4): substrate-action source filter.
+          { type: 'select', id: 'source', label: 'Source', options: [
+            { value: '', label: 'Any source' },
+            { value: 'default_action', label: 'Default action' },
+            { value: 'auto_label_rule', label: 'Auto-label rule' },
+            { value: 'stale_expiration', label: 'Stale expiration' },
+            { value: 'operator_removal', label: 'Operator removal' },
+            { value: 'escalation', label: 'Escalation' },
+            { value: 'system_diagnostic', label: 'System diagnostic' },
+            { value: 'manual', label: 'Manual (operator)' },
+          ] },
+          // §5.5.4 Phase E (MD-40): Operator rule-management (rule-lifecycle).
+          { type: 'checkbox', id: 'ruleManagement', label: 'Operator rule management' },
           { type: 'checkbox', id: 'verifiedOnly', label: 'Verified only' },
           { type: 'dateRange', id: 'when', label: 'Date range' },
         ],
@@ -85,6 +107,9 @@
     if (lastFilters.subject) params.subjectDid = lastFilters.subject;
     if (lastFilters.subjectCid) params.subjectCid = lastFilters.subjectCid;
     if (lastFilters.action) params.action = lastFilters.action;
+    // §5.5.4 Phase E — mutually-exclusive source / rule-management filters.
+    if (lastFilters.ruleManagement) params.ruleManagement = true;
+    else if (lastFilters.source) params.source = lastFilters.source;
     if (cursor) params.cursor = cursor;
     if (lastFilters.when && lastFilters.when.start) params.since = lastFilters.when.start.toISOString();
     if (lastFilters.when && lastFilters.when.end) params.until = lastFilters.when.end.toISOString();

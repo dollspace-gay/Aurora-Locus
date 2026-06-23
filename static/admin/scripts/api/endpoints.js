@@ -148,6 +148,8 @@
     deleteEscalationRule: (body) => C().post('tools.aurora.superadmin.deleteEscalationRule', body),
     listEscalationRules: (params) => C().get('tools.aurora.superadmin.listEscalationRules', params || {}),
     clearEscalation: (body) => C().post('tools.aurora.superadmin.clearEscalation', body),
+    // §5.5.4 Phase E (#349) — composite-load of all four sub-surfaces.
+    getDefaultsState: () => C().get('tools.aurora.superadmin.getDefaultsState'),
     // Repository rebuild (§7.4.1 / #286 + #290). preRebuildCheck: shallow
     // metadata preflight ({did}), or full reconstruction+verification
     // ({did, deep:true}). rebuildRepo: start a rebuild ({did, rationale}) →

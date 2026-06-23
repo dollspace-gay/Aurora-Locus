@@ -785,6 +785,15 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(clear_escalation),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // §5.5.4 Phase E (#349) — composite-load of all four sub-surfaces (§6.5).
+        // Design names it ops.moderation.getDefaultsState; kept under the
+        // superadmin family for consistency with the §5.5.4 CRUD + the
+        // SuperAdmin gate (namespace is cosmetic; the handler gates).
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getDefaultsState",
+            get(get_defaults_state),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // v0.9 (#329) — upload a login-splash branding asset (logo/banner)
         // directly; writes it under <data>/branding/ and repoints the
         // branding.login-* runtime setting. Raw-body upload (uploadBlob idiom).
@@ -1914,6 +1923,61 @@ async fn clear_escalation(
         .await
         .map_err(rule_err)?;
     Ok(Json(serde_json::json!({ "success": true, "itemId": req.item_id })))
+}
+
+// ---------------------------------------------------------------------------
+// §5.5.4 Phase E — composite-load (#349, §6.5). SuperAdmin.
+// ---------------------------------------------------------------------------
+
+fn section_ok(data: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "status": "ok", "data": data })
+}
+
+fn section_err(code: &str, message: String) -> serde_json::Value {
+    serde_json::json!({ "status": "error", "error": { "code": code, "message": message } })
+}
+
+/// `tools.aurora.ops.moderation.getDefaultsState` (§6.5) — one SuperAdmin GET
+/// returning all four §5.5.4 sub-surfaces with partial-success semantics: a
+/// section's failure surfaces as `{status:"error"}` in its slot, the endpoint
+/// still returns HTTP 200. Saves the ConfigModerationPolicy page four calls.
+async fn get_defaults_state(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::api::aurora_admin::{
+        resolve_runtime_setting, MODERATION_DEFAULTS_CATEGORY_MAP_KEY,
+        MODERATION_DEFAULTS_REPORT_ACTION_KEY, MODERATION_DEFAULTS_STALE_DAYS_KEY,
+        MODERATION_REVIEWER_CATEGORY_MAP_KEY, MODERATION_REVIEWER_MODE_KEY,
+        MODERATION_REVIEWER_MODE_VERSION_KEY,
+    };
+    require_superadmin(&auth)?;
+
+    let report_action = section_ok(serde_json::json!({
+        "mode": resolve_runtime_setting(&ctx, MODERATION_DEFAULTS_REPORT_ACTION_KEY).await,
+        "categoryMap": resolve_runtime_setting(&ctx, MODERATION_DEFAULTS_CATEGORY_MAP_KEY).await,
+        "staleDays": resolve_runtime_setting(&ctx, MODERATION_DEFAULTS_STALE_DAYS_KEY).await,
+    }));
+    let reviewer_assignment = section_ok(serde_json::json!({
+        "mode": resolve_runtime_setting(&ctx, MODERATION_REVIEWER_MODE_KEY).await,
+        "categoryMap": resolve_runtime_setting(&ctx, MODERATION_REVIEWER_CATEGORY_MAP_KEY).await,
+        "modeVersion": resolve_runtime_setting(&ctx, MODERATION_REVIEWER_MODE_VERSION_KEY).await,
+    }));
+    let auto_label_rules = match crate::api::auto_label_rules::list_rules(&ctx, false).await {
+        Ok(rules) => section_ok(serde_json::json!(rules)),
+        Err((_, msg)) => section_err("auto_label_load_failed", msg),
+    };
+    let escalation_rules = match crate::api::escalation_rules::list_rules(&ctx, false).await {
+        Ok(rules) => section_ok(serde_json::json!(rules)),
+        Err((_, msg)) => section_err("escalation_load_failed", msg),
+    };
+
+    Ok(Json(serde_json::json!({
+        "reportAction": report_action,
+        "reviewerAssignment": reviewer_assignment,
+        "autoLabelRules": auto_label_rules,
+        "escalationRules": escalation_rules,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -8742,6 +8806,82 @@ mod tests {
         assert_eq!(view.peer_pds[0].url, "https://peer.example");
     }
 
+    // §5.5.4 Phase E — composite-load gating + section composition.
+    #[tokio::test]
+    async fn phase_e_get_defaults_state_gated_and_composes() {
+        let ctx = create_test_context().await;
+        let mk = |role: Role| AdminAuthContext {
+            did: "did:plc:op".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:op".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role,
+        };
+        assert_eq!(
+            get_defaults_state(State(ctx.clone()), mk(Role::Admin)).await.unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        let v = get_defaults_state(State(ctx.clone()), mk(Role::SuperAdmin)).await.unwrap().0;
+        for sec in ["reportAction", "reviewerAssignment", "autoLabelRules", "escalationRules"] {
+            assert_eq!(v[sec]["status"], "ok", "section {} ok", sec);
+        }
+    }
+
+    // §5.5.4 Phase E — SuperAdmin gating sweep across the §5.5.4 XRPCs.
+    #[tokio::test]
+    async fn phase_e_superadmin_gating_sweep() {
+        let ctx = create_test_context().await;
+        let admin = || AdminAuthContext {
+            did: "did:plc:op".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:op".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+        let f = StatusCode::FORBIDDEN;
+        assert_eq!(get_defaults_state(State(ctx.clone()), admin()).await.unwrap_err().0, f);
+        assert_eq!(
+            create_auto_label_rule(State(ctx.clone()), admin(), Json(CreateAutoLabelRuleRequest {
+                trigger_type: "report-count".into(),
+                trigger_params: serde_json::json!({}),
+                label_value: "l".into(),
+                subject_scope: "account".into(),
+                enabled: true,
+                rationale: None,
+            })).await.unwrap_err().0,
+            f
+        );
+        assert_eq!(
+            create_escalation_rule(State(ctx.clone()), admin(), Json(CreateEscalationRuleRequest {
+                trigger_type: "category-match".into(),
+                trigger_params: serde_json::json!({}),
+                action_type: "mark".into(),
+                enabled: true,
+                rationale: None,
+            })).await.unwrap_err().0,
+            f
+        );
+        assert_eq!(
+            clear_escalation(State(ctx.clone()), admin(), Json(ClearEscalationRequest {
+                item_id: "1".into(),
+                rationale: None,
+            })).await.unwrap_err().0,
+            f
+        );
+        assert_eq!(
+            assign_reviewer(State(ctx.clone()), admin(), Json(AssignReviewerRequest {
+                report_id: 1,
+                operator_did: "did:plc:x".into(),
+                rationale: None,
+            })).await.unwrap_err().0,
+            f
+        );
+    }
+
     #[tokio::test]
     async fn test_get_system_health() {
         let ctx = create_test_context().await;
@@ -10046,7 +10186,7 @@ mod tests {
             r#""getAccountOverrides","#,
             r#""setAccountOverride""#,
             r#"],"#,
-            // tools.aurora.superadmin (27 endpoints)
+            // tools.aurora.superadmin (28 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
@@ -10060,6 +10200,7 @@ mod tests {
             r#""deleteEscalationRule","#,
             r#""listEscalationRules","#,
             r#""clearEscalation","#,
+            r#""getDefaultsState","#,
             r#""uploadBrandingAsset","#,
             r#""preRebuildCheck","#,
             r#""rebuildRepo","#,

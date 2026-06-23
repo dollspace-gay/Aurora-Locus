@@ -3385,6 +3385,16 @@ pub struct GetAuditTrailParams {
     pub after_created: Option<String>,
     #[serde(default)]
     pub before_created: Option<String>,
+    /// §5.5.4 Phase E (§6.4) — additive source-discriminator filter
+    /// (`default_action | auto_label_rule | stale_expiration |
+    /// operator_removal | escalation | system_diagnostic | manual`).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// §5.5.4 Phase E (MD-40) — the "Operator rule management" filter:
+    /// when true, restricts to the six rule-lifecycle action names. UI-side
+    /// mutually exclusive with `source` (MD-44). Additive.
+    #[serde(default)]
+    pub rule_management: Option<bool>,
     #[serde(flatten)]
     pub pagination: PaginationParams,
 }
@@ -3572,6 +3582,21 @@ pub async fn get_audit_trail(
     if let Some(b) = &params.before_created {
         clauses.push("created_at <= ?");
         binds.push(b.clone());
+    }
+    // §5.5.4 Phase E (§6.4): source-discriminator filter.
+    if let Some(s) = &params.source {
+        clauses.push("source = ?");
+        binds.push(s.clone());
+    }
+    // §5.5.4 Phase E (MD-40): the Operator rule-management filter — the six
+    // rule-lifecycle action names. A static IN-clause (no binds).
+    if params.rule_management == Some(true) {
+        clauses.push(
+            "action IN ('moderation_auto_label_rule_created', \
+             'moderation_auto_label_rule_edited', 'moderation_auto_label_rule_deleted', \
+             'moderation_escalation_rule_created', 'moderation_escalation_rule_edited', \
+             'moderation_escalation_rule_deleted')",
+        );
     }
     if let Some(c) = &cursor {
         clauses.push("(created_at < ? OR (created_at = ? AND id < ?))");
@@ -3822,6 +3847,14 @@ pub const MODERATION_REVIEWER_MODE_VERSION_KEY: &str =
 /// cursor-reset hook is uniform across all three cursor keys.
 pub const MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY: &str =
     "moderation.defaults.escalation-superadmin-cursor";
+// §5.5.4 Phase E (#349) — lexicon-migration state.
+/// SHA-256 of the last-seen ReportReason category set; the boot-time
+/// change witness (§6.7 #1).
+pub const MODERATION_LEXICON_ENUM_HASH_KEY: &str =
+    "moderation.lexicon.report-category-enum-hash";
+/// JSON banner content set when a boot migration runs (pruned keys + flagged
+/// rule ids); the UI shows it until per-operator localStorage dismissal.
+pub const MODERATION_LEXICON_BANNER_KEY: &str = "moderation.lexicon.migration-banner";
 /// v0.9 Arc B (§11.10.2): the deployment-default theme id — what fresh
 /// sessions and operators without a personal preference render. Set is
 /// SuperAdmin-only (via `setRuntimeSetting` + rationale); read is allowed at
@@ -3939,6 +3972,8 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     MODERATION_REVIEWER_CATEGORY_CURSORS_KEY,
     MODERATION_REVIEWER_MODE_VERSION_KEY,
     MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY,
+    MODERATION_LEXICON_ENUM_HASH_KEY,
+    MODERATION_LEXICON_BANNER_KEY,
 ];
 pub const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
@@ -3978,6 +4013,9 @@ fn default_for_key(key: &str) -> serde_json::Value {
         MODERATION_REVIEWER_ROTATION_CURSOR_KEY
         | MODERATION_REVIEWER_MODE_VERSION_KEY
         | MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY => serde_json::Value::from(0),
+        MODERATION_LEXICON_ENUM_HASH_KEY | MODERATION_LEXICON_BANNER_KEY => {
+            serde_json::Value::String(String::new())
+        }
         _ => serde_json::Value::Null,
     }
 }
@@ -6755,6 +6793,8 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6767,6 +6807,76 @@ mod tests {
         assert_eq!(entry.actor_did, "did:plc:moderator");
         assert_eq!(entry.action, "TakedownAccount");
         assert!(entry.snapshot_id.is_some());
+    }
+
+    // §5.5.4 Phase E (§6.4 / MD-40) — source filter + rule-management filter.
+    #[tokio::test]
+    async fn get_audit_trail_phase_e_source_and_rule_management_filters() {
+        let ctx = create_test_context().await;
+        let ins = |source: &'static str, action: &'static str| {
+            let db = ctx.account_db.clone();
+            let backend = ctx.config.database.backend;
+            async move {
+                crate::admin::audit_chain::insert_chain_entry_pool(
+                    &db,
+                    backend,
+                    crate::admin::audit_chain::AppendEntryParams {
+                        source,
+                        payload: None,
+                        actor_did: "did:plc:m1",
+                        action,
+                        subject: Some(&repo_subject("did:plc:s1")),
+                        rationale: "r",
+                        snapshot_id: None,
+                        event_id: None,
+                        cascade_subjects: &[],
+                        cascade_snapshot_ids: &[],
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+        ins("escalation", "moderation_escalation_triggered").await;
+        ins("manual", "role.grant").await;
+        ins("manual", "moderation_auto_label_rule_created").await; // rule-lifecycle
+
+        let query = |source: Option<&str>, rule_management: Option<bool>| {
+            let ctx = ctx.clone();
+            let source = source.map(String::from);
+            async move {
+                get_audit_trail(
+                    State(ctx),
+                    moderator_auth(),
+                    axum::extract::Query(GetAuditTrailParams {
+                        actor_did: None,
+                        action: None,
+                        subject_did: None,
+                        subject_uri: None,
+                        subject_cid: None,
+                        after_created: None,
+                        before_created: None,
+                        source,
+                        rule_management,
+                        pagination: PaginationParams::default(),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0
+                .items
+            }
+        };
+        // source='escalation' → only the escalation entry.
+        let esc = query(Some("escalation"), None).await;
+        assert_eq!(esc.len(), 1);
+        assert_eq!(esc[0].action, "moderation_escalation_triggered");
+        // rule-management → only the rule-lifecycle entry (NOT the other manuals).
+        let rm = query(None, Some(true)).await;
+        assert_eq!(rm.len(), 1);
+        assert_eq!(rm[0].action, "moderation_auto_label_rule_created");
+        // source='manual' → both manual entries (incl. the rule-lifecycle one).
+        assert_eq!(query(Some("manual"), None).await.len(), 2);
     }
 
     #[tokio::test]
@@ -6814,6 +6924,8 @@ mod tests {
                 action: None, subject_did: None, subject_uri: None,
                 subject_cid: None,
                 after_created: None, before_created: None,
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6894,6 +7006,8 @@ mod tests {
                 subject_cid: Some(target_cid.to_string()),
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6915,6 +7029,8 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6975,6 +7091,8 @@ mod tests {
                 subject_cid: Some(cid_a.to_string()),
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7028,6 +7146,8 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7137,6 +7257,8 @@ mod tests {
             subject_cid: None,
             after_created: None,
             before_created: None,
+            source: None,
+            rule_management: None,
             pagination: PaginationParams { limit, cursor },
         }
     }
@@ -7240,6 +7362,8 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7316,6 +7440,8 @@ mod tests {
                 subject_cid: None,
                 after_created: Some(timestamps[1].clone()),
                 before_created: Some(timestamps[3].clone()),
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7535,6 +7661,8 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7596,6 +7724,8 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7951,6 +8081,8 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
                 pagination: PaginationParams::default(),
             }),
         )

@@ -1168,6 +1168,32 @@ mod tests {
             a == ACTION_EVAL_SKIPPED && p.as_deref().unwrap().contains("concurrent_evaluation_in_progress")));
     }
 
+    // §5.5.4 Phase E (§6.2) — reversibility: soft-deleting a rule stops its
+    // go-forward behavior; existing audit history is preserved.
+    #[tokio::test]
+    async fn reversibility_deleting_rule_stops_escalation_keeps_history() {
+        let ctx = create_test_context().await;
+        let rule = mk_rule(&ctx, "category-match", serde_json::json!({"category": "spam"}), "mark").await;
+        let r1 = submit(&ctx, ReportReason::Spam).await;
+        evaluate_pipeline_a(&ctx, &r1).await.unwrap();
+        assert_eq!(status_of(&ctx, r1.id).await.0, "escalated");
+        let triggered_before = audit_actions(&ctx).await.iter().filter(|(a, _, _)| a == ACTION_TRIGGERED).count();
+        assert!(triggered_before >= 1);
+
+        // Rollback: soft-delete the rule.
+        delete_rule(&ctx, "did:plc:super", &rule.id).await.unwrap();
+
+        // Re-exercise with a fresh account → no escalation.
+        let r2 = ctx.report_manager
+            .submit_report(Some("did:plc:other"), None, None, ReportReason::Spam, Some("r"), "did:plc:reporter")
+            .await.unwrap();
+        evaluate_pipeline_a(&ctx, &r2).await.unwrap();
+        assert_eq!(status_of(&ctx, r2.id).await.0, "open", "deleted rule does not fire");
+        // History preserved: no new _triggered, the original still present.
+        let triggered_after = audit_actions(&ctx).await.iter().filter(|(a, _, _)| a == ACTION_TRIGGERED).count();
+        assert_eq!(triggered_after, triggered_before, "audit history preserved, no new fires");
+    }
+
     #[tokio::test]
     async fn tier_gate_blocks_escalation() {
         let ctx = create_test_context().await;

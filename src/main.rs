@@ -102,6 +102,12 @@ async fn main() -> PdsResult<()> {
     // Handle CLI commands
     match cli.command {
         Some(Commands::Serve) | None => {
+            // §5.5.4 Phase E (#349) — startup-trigger lexicon migration (§6.7):
+            // runs after AppContext::new (audit-chain ready) and before serving
+            // so any migrated category-config is visible to the first request.
+            // Best-effort; never blocks boot.
+            api::lexicon_migration::run_lexicon_migration(&ctx).await;
+
             // Start background jobs
             let scheduler = std::sync::Arc::new(jobs::JobScheduler::new(Arc::clone(&ctx)));
             scheduler.start();
