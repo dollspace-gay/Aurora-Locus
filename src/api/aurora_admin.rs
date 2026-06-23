@@ -4158,8 +4158,49 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         // well-formed even if env-var parsing has a bug. discovery-mode /
         // relay-urls / pending-discoveries stay accept-any (Phase C/D tighten).
         FEDERATION_POLICY_PEER_ALLOWLIST_KEY => is_valid_peer_allowlist(value),
+        // v0.9 Federation Pattern-1 Phase C (#353) — discovery-mode enum +
+        // pending-discoveries shape tighten from Phase A's accept-any.
+        FEDERATION_POLICY_DISCOVERY_MODE_KEY => value
+            .as_str()
+            .is_some_and(|s| matches!(s, "allowlist-only" | "auto-accept" | "discovery-disabled")),
+        FEDERATION_POLICY_PENDING_DISCOVERIES_KEY => is_valid_pending_discoveries(value),
         _ => true,
     }
+}
+
+/// v0.9 Federation Pattern-1 Phase C (#353) — pending-discoveries structural
+/// validator: a JSON array (≤100) of objects with exactly `{did, url,
+/// first_seen_at, last_seen_at, first_scan_id, last_seen_scan_id}`, all strings,
+/// DIDs `did:`-prefixed.
+fn is_valid_pending_discoveries(value: &serde_json::Value) -> bool {
+    let Some(arr) = value.as_array() else {
+        return false;
+    };
+    if arr.len() > 100 {
+        return false;
+    }
+    const FIELDS: [&str; 6] = [
+        "did",
+        "url",
+        "first_seen_at",
+        "last_seen_at",
+        "first_scan_id",
+        "last_seen_scan_id",
+    ];
+    arr.iter().all(|el| {
+        let Some(obj) = el.as_object() else {
+            return false;
+        };
+        if obj.len() != FIELDS.len() {
+            return false;
+        }
+        if !FIELDS.iter().all(|f| obj.get(*f).and_then(|v| v.as_str()).is_some()) {
+            return false;
+        }
+        obj.get("did")
+            .and_then(|v| v.as_str())
+            .is_some_and(|d| d.starts_with("did:"))
+    })
 }
 
 /// v0.9 Federation Pattern-1 Phase B (#352) — peer-allowlist structural

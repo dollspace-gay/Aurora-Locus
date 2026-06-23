@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub mod tasks;
 
@@ -544,6 +544,16 @@ impl JobScheduler {
         loop {
             interval.tick().await;
 
+            // v0.9 Federation Pattern-1 Phase C (#353 / design §3.2): read the
+            // discovery mode once at scan-start. `discovery-disabled` skips the
+            // scan entirely (no fetch, no scheduled_discovery_ran audit).
+            let mode =
+                crate::api::federation_discovery::current_mode(&scheduler.context).await;
+            if mode == crate::api::federation_discovery::DiscoveryMode::DiscoveryDisabled {
+                debug!("Discovery mode is discovery-disabled; skipping scheduled scan");
+                continue;
+            }
+
             if let Some(discovery) = &scheduler.context.pds_discovery {
                 info!("Running PDS discovery refresh");
 
@@ -551,6 +561,15 @@ impl JobScheduler {
                     Ok(_) => {
                         let instances = discovery.get_known_instances().await;
                         info!("PDS discovery: {} instance(s) found", instances.len());
+                        // Mode-aware per-peer processing + scheduled_discovery_ran
+                        // audit (the scan_id is generated inside process_scan).
+                        crate::api::federation_discovery::process_scan(
+                            &scheduler.context,
+                            &instances,
+                            mode,
+                            true,
+                        )
+                        .await;
                     }
                     Err(e) => error!("Failed to refresh PDS instances: {}", e),
                 }

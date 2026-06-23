@@ -81,6 +81,9 @@
     addFederationPeer: (body) => C().post('tools.aurora.ops.addFederationPeer', body),
     removeFederationPeer: (body) => C().post('tools.aurora.ops.removeFederationPeer', body),
     modifyFederationPeer: (body) => C().post('tools.aurora.ops.modifyFederationPeer', body),
+    // v0.9 Federation Pattern-1 Phase C (#353) — discovery mode + pending dismissal.
+    setDiscoveryMode: (body) => C().post('tools.aurora.ops.setDiscoveryMode', body),
+    dismissPendingDiscovery: (body) => C().post('tools.aurora.ops.dismissPendingDiscovery', body),
     getVersionInfo: () => C().get('tools.aurora.ops.getVersionInfo'),
     listBlobs: (params) => C().get('tools.aurora.ops.listBlobs', params || {}),
     getBlobStatistics: () => C().get('tools.aurora.ops.getBlobStatistics'),

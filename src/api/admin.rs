@@ -432,6 +432,18 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(modify_federation_peer),
             CapsBuilder::new(Family::Ops),
         )
+        // v0.9 Federation Pattern-1 Phase C (#353) — discovery-mode +
+        // pending-discovery dismissal.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.setDiscoveryMode",
+            post(set_discovery_mode),
+            CapsBuilder::new(Family::Ops),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.dismissPendingDiscovery",
+            post(dismiss_pending_discovery),
+            CapsBuilder::new(Family::Ops),
+        )
         // ---- tools.aurora.moderator.* (chainlink #100 / Phase 3.3) ----
         //
         // Moderator-tier read endpoints. Five queries with shared
@@ -8554,6 +8566,43 @@ async fn modify_federation_peer(
     Ok(Json(serde_json::json!({ "success": true, "did": req.did })))
 }
 
+// v0.9 Federation Pattern-1 Phase C (#353) — discovery-mode + pending-discovery
+// dismissal. SuperAdmin-gated; core logic in `crate::api::federation_discovery`.
+
+#[derive(Deserialize)]
+struct SetDiscoveryModeRequest {
+    mode: String,
+}
+
+async fn set_discovery_mode(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SetDiscoveryModeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::federation_discovery::set_discovery_mode(&ctx, &auth.did, &req.mode)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "mode": req.mode })))
+}
+
+#[derive(Deserialize)]
+struct DismissPendingDiscoveryRequest {
+    did: String,
+}
+
+async fn dismiss_pending_discovery(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<DismissPendingDiscoveryRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::federation_discovery::dismiss_pending_discovery(&ctx, &auth.did, &req.did)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "did": req.did })))
+}
+
 /// Relay server info
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -8698,6 +8747,14 @@ async fn trigger_pds_discovery(
                 )
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                // v0.9 Federation Pattern-1 Phase C (#353 / Step 7): manual
+                // scans bypass the scheduler-level discovery-disabled
+                // short-circuit (operator-initiated), but per-peer processing
+                // still honors the active mode. No scheduled_discovery_ran audit
+                // (manual keeps its own federation.discover above).
+                let mode = crate::api::federation_discovery::current_mode(&ctx).await;
+                crate::api::federation_discovery::process_scan(&ctx, &instances, mode, false).await;
 
                 tracing::info!(
                     "Admin {} triggered PDS discovery: {} instances found",
@@ -10357,7 +10414,7 @@ mod tests {
             r#""listAppeals","#,
             r#""getAppeal""#,
             r#"],"#,
-            // tools.aurora.ops (46 endpoints)
+            // tools.aurora.ops (48 endpoints)
             r#""tools.aurora.ops":["#,
             r#""getStats","#,
             r#""listAccounts","#,
@@ -10395,6 +10452,8 @@ mod tests {
             r#""addFederationPeer","#,
             r#""removeFederationPeer","#,
             r#""modifyFederationPeer","#,
+            r#""setDiscoveryMode","#,
+            r#""dismissPendingDiscovery","#,
             r#""triggerRotation","#,
             // v0.9 Arc D (#225) — kryphocron operator read cohort.
             r#""getSubstrateInfo","#,

@@ -27,7 +27,7 @@
 
 use crate::api::aurora_admin::{
     cas_runtime_setting, read_runtime_row_value, FEDERATION_POLICY_PEER_ALLOWLIST_KEY,
-    RECOVERY_MODE_ENV,
+    FEDERATION_POLICY_PENDING_DISCOVERIES_KEY, RECOVERY_MODE_ENV,
 };
 use crate::api::moderation_defaults::SYSTEM_DID;
 use crate::admin::audit_chain::{self, AppendEntryParams};
@@ -51,6 +51,10 @@ const ACTION_PEER_MODIFY_ABORTED: &str = "federation.peer_modify_aborted";
 // Audit source attribution (§6.1; memory-#18 translation #2).
 const SOURCE_MANUAL: &str = "manual";
 const SOURCE_DIAGNOSTIC: &str = "system_diagnostic";
+/// Phase C auto-accept additions (design §5.2 / commit 25). The §5.5.4 §6.4
+/// source-filter dropdown gains this value in Phase E (display-only filter, so
+/// emitting it now is forward-compatible — recon).
+const SOURCE_DISCOVERY: &str = "discovery";
 
 /// Typed error for the peer-CRUD surface. Carries the distinct HTTP error
 /// codes the handlers need (`rule_err` only maps 400/404, not the 503 cases).
@@ -68,6 +72,8 @@ pub enum FedPeerError {
     InvalidDid(String),
     /// URL not HTTPS.
     InvalidUrl(String),
+    /// Invalid discovery-mode value (Phase C `setDiscoveryMode`).
+    InvalidMode(String),
     /// Substrate failure (DB / serialization).
     Internal(String),
 }
@@ -107,6 +113,13 @@ impl FedPeerError {
                 "InvalidUrl",
                 format!("peer URL must be HTTPS: {url}"),
             ),
+            FedPeerError::InvalidMode(mode) => (
+                StatusCode::BAD_REQUEST,
+                "InvalidDiscoveryMode",
+                format!(
+                    "discovery mode must be allowlist-only | auto-accept | discovery-disabled: {mode}"
+                ),
+            ),
             FedPeerError::Internal(m) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", m)
             }
@@ -128,7 +141,7 @@ fn recovery_active() -> bool {
         .unwrap_or(false)
 }
 
-fn guard_recovery() -> FedResult<()> {
+pub(crate) fn guard_recovery() -> FedResult<()> {
     if recovery_active() {
         Err(FedPeerError::RecoveryMode)
     } else {
@@ -195,7 +208,7 @@ async fn write_allowlist(
 }
 
 /// Emit a federation audit-chain entry (pool-managed, post-mutation).
-async fn emit(
+pub(crate) async fn emit(
     ctx: &AppContext,
     actor: &str,
     action: &str,
@@ -223,7 +236,7 @@ async fn emit(
     .map_err(|e| FedPeerError::Internal(e.to_string()))
 }
 
-/// `addFederationPeer` — append a peer, CAS-bounded-retry, audit on success.
+/// `addFederationPeer` — operator-initiated add (SuperAdmin-gated at handler).
 pub async fn add_federation_peer(
     ctx: &AppContext,
     operator_did: &str,
@@ -233,38 +246,206 @@ pub async fn add_federation_peer(
     guard_recovery()?;
     validate_did(did)?;
     validate_https_url(url)?;
+    add_peer_internal(ctx, did, url, operator_did, SOURCE_MANUAL, "manual", None).await
+}
 
+/// Phase C auto-accept add (design §3.2). Substrate-driven during a discovery
+/// scan: no recovery/SuperAdmin gate, `source="discovery"`, scan_id in payload.
+/// Emits its own `peer_added` / `peer_add_aborted`.
+pub async fn add_discovered_peer(
+    ctx: &AppContext,
+    did: &str,
+    url: &str,
+    scan_id: &str,
+) -> FedResult<()> {
+    validate_did(did)?;
+    validate_https_url(url)?;
+    add_peer_internal(ctx, did, url, SYSTEM_DID, SOURCE_DISCOVERY, "discovery", Some(scan_id)).await
+}
+
+/// Shared add path: append to the allowlist, CAS-bounded-retry, audit on
+/// success. When the DID is also in the pending-discoveries surface, the
+/// allowlist add and the pending removal commit atomically in one transaction
+/// (design §3.4 cross-key atomicity; Phase A multi-key primary path — the
+/// per-key-sequential fallback is NOT used).
+async fn add_peer_internal(
+    ctx: &AppContext,
+    did: &str,
+    url: &str,
+    actor: &str,
+    source: &str,
+    base_origin: &str,
+    scan_id: Option<&str>,
+) -> FedResult<()> {
     for _ in 0..MAX_CAS_RETRIES {
-        let (mut peers, expected) = read_allowlist(ctx).await;
+        let (mut peers, peers_expected) = read_allowlist(ctx).await;
         if peers.iter().any(|p| p.did == did) {
             return Err(FedPeerError::DuplicateDid(did.to_string()));
         }
         peers.push(PeerEntry { did: did.to_string(), url: url.to_string() });
-        let new = serde_json::to_string(&peers)
+        let peers_new = serde_json::to_string(&peers)
             .map_err(|e| FedPeerError::Internal(e.to_string()))?;
-        if write_allowlist(ctx, expected.as_deref(), &new, operator_did).await? {
-            emit(
+
+        let pending_raw =
+            read_runtime_row_value(ctx, FEDERATION_POLICY_PENDING_DISCOVERIES_KEY).await;
+        let from_pending = pending_contains(&pending_raw, did);
+        let (wrote, origin) = if from_pending {
+            let pending_new = remove_pending_did(&pending_raw, did)?;
+            let ok = dual_write(
                 ctx,
-                operator_did,
-                ACTION_PEER_ADDED,
-                SOURCE_MANUAL,
-                serde_json::json!({ "did": did, "url": url, "origin": "manual" }),
-                "federation peer added",
+                peers_expected.as_deref(),
+                &peers_new,
+                pending_raw.as_deref(),
+                &pending_new,
+                actor,
             )
             .await?;
+            // Operator-accept of a pending entry is labelled distinctly; an
+            // auto-accept scan keeps "discovery" even when it clears pending.
+            let origin = if base_origin == "discovery" { "discovery" } else { "accepted_from_pending" };
+            (ok, origin)
+        } else {
+            (
+                write_allowlist(ctx, peers_expected.as_deref(), &peers_new, actor).await?,
+                base_origin,
+            )
+        };
+        if wrote {
+            let mut payload = serde_json::json!({ "did": did, "url": url, "origin": origin });
+            if let Some(sid) = scan_id {
+                payload["scan_id"] = serde_json::json!(sid);
+            }
+            emit(ctx, actor, ACTION_PEER_ADDED, source, payload, "federation peer added").await?;
             return Ok(());
         }
     }
+    let mut payload = serde_json::json!({ "did": did, "url": url, "reason": "cas_exhausted" });
+    if let Some(sid) = scan_id {
+        payload["scan_id"] = serde_json::json!(sid);
+    }
     emit(
         ctx,
-        operator_did,
+        actor,
         ACTION_PEER_ADD_ABORTED,
         SOURCE_DIAGNOSTIC,
-        serde_json::json!({ "did": did, "url": url, "reason": "cas_exhausted" }),
+        payload,
         "federation peer add aborted: CAS exhausted",
     )
     .await?;
     Err(FedPeerError::CasExhausted)
+}
+
+/// Whether the pending-discoveries JSON array contains an entry for `did`.
+fn pending_contains(raw: &Option<String>, did: &str) -> bool {
+    raw.as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+        .map(|arr| {
+            arr.iter()
+                .any(|e| e.get("did").and_then(|d| d.as_str()) == Some(did))
+        })
+        .unwrap_or(false)
+}
+
+/// The pending-discoveries array with `did` removed, re-serialized. Operates on
+/// generic `Value` to avoid coupling to the discovery module's entry type.
+fn remove_pending_did(raw: &Option<String>, did: &str) -> FedResult<String> {
+    let arr: Vec<serde_json::Value> = raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let filtered: Vec<serde_json::Value> = arr
+        .into_iter()
+        .filter(|e| e.get("did").and_then(|d| d.as_str()) != Some(did))
+        .collect();
+    serde_json::to_string(&filtered).map_err(|e| FedPeerError::Internal(e.to_string()))
+}
+
+/// Atomic dual-key write: allowlist + pending in one transaction. Both
+/// conditional writes must affect a row, else rollback (caller retries).
+async fn dual_write(
+    ctx: &AppContext,
+    peers_expected: Option<&str>,
+    peers_new: &str,
+    pending_expected: Option<&str>,
+    pending_new: &str,
+    actor: &str,
+) -> FedResult<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| FedPeerError::Internal(e.to_string()))?;
+    let peers_ok = conditional_write(
+        &mut tx,
+        FEDERATION_POLICY_PEER_ALLOWLIST_KEY,
+        peers_expected,
+        peers_new,
+        &now,
+        actor,
+    )
+    .await?;
+    let pending_ok = conditional_write(
+        &mut tx,
+        FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
+        pending_expected,
+        pending_new,
+        &now,
+        actor,
+    )
+    .await?;
+    if peers_ok && pending_ok {
+        tx.commit()
+            .await
+            .map_err(|e| FedPeerError::Internal(e.to_string()))?;
+        Ok(true)
+    } else {
+        tx.rollback()
+            .await
+            .map_err(|e| FedPeerError::Internal(e.to_string()))?;
+        Ok(false)
+    }
+}
+
+/// One conditional value-CAS (or insert-if-absent) inside a transaction.
+async fn conditional_write(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    key: &str,
+    expected: Option<&str>,
+    new: &str,
+    now: &str,
+    actor: &str,
+) -> FedResult<bool> {
+    let res = match expected {
+        Some(exp) => {
+            sqlx::query(
+                "UPDATE runtime_settings SET value = $1, last_modified = $2, last_modified_by = $3 \
+                 WHERE key = $4 AND value = $5",
+            )
+            .bind(new)
+            .bind(now)
+            .bind(actor)
+            .bind(key)
+            .bind(exp)
+            .execute(&mut **tx)
+            .await
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO runtime_settings (key, value, last_modified, last_modified_by) \
+                 SELECT $1, $2, $3, $4 \
+                 WHERE NOT EXISTS (SELECT 1 FROM runtime_settings WHERE key = $1)",
+            )
+            .bind(key)
+            .bind(new)
+            .bind(now)
+            .bind(actor)
+            .execute(&mut **tx)
+            .await
+        }
+    }
+    .map_err(|e| FedPeerError::Internal(e.to_string()))?;
+    Ok(res.rows_affected() >= 1)
 }
 
 /// `removeFederationPeer` — drop a peer, CAS-bounded-retry, audit on success.
@@ -424,19 +605,25 @@ pub async fn seed_peer_allowlist(ctx: &AppContext) {
     tracing::info!(count = peers.len(), "federation peer-allowlist seeded from config");
 }
 
+// Shared test fixtures for the federation surface (peers + discovery). Both
+// `federation_peers` and `federation_discovery` tests use the same context
+// builder + the same `serial()` lock, so the recovery-env-mutating test never
+// leaks into a concurrently-running discovery test (one process-wide lock).
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::config::*;
     use tempfile::tempdir;
 
-    async fn create_test_context_with(mutate: impl FnOnce(&mut ServerConfig)) -> AppContext {
+    pub(crate) async fn create_test_context_with(
+        mutate: impl FnOnce(&mut ServerConfig),
+    ) -> AppContext {
         build_ctx(tempdir().unwrap().keep(), mutate).await
     }
 
     // Build a context at an explicit data dir so a "reboot" can open a second
     // context over the same account_db (cross-boot persistence test).
-    async fn build_ctx(
+    pub(crate) async fn build_ctx(
         dir: std::path::PathBuf,
         mutate: impl FnOnce(&mut ServerConfig),
     ) -> AppContext {
@@ -532,7 +719,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn ctx_with_peers(dids: &[(&str, &str)]) -> AppContext {
+    pub(crate) async fn ctx_with_peers(dids: &[(&str, &str)]) -> AppContext {
         create_test_context_with(|c| {
             c.federation.peer_pds = dids
                 .iter()
@@ -544,14 +731,21 @@ mod tests {
 
     /// `RECOVERY_MODE_ENV` is process-global; the recovery test mutates it and
     /// would otherwise leak into tests running concurrently under cargo's
-    /// parallel harness. Every test holds this lock (`let _g = serial().await;`)
-    /// so they run one-at-a-time. A `tokio::sync::Mutex` (not `std`) so the
-    /// guard is held across `.await` without tripping `await_holding_lock`, and
-    /// it doesn't poison if a test panics.
-    fn serial() -> &'static tokio::sync::Mutex<()> {
+    /// parallel harness. Every federation test holds this lock
+    /// (`let _g = serial().lock().await;`) so they run one-at-a-time. A
+    /// `tokio::sync::Mutex` (not `std`) so the guard is held across `.await`
+    /// without tripping `await_holding_lock`, and it doesn't poison on panic.
+    pub(crate) fn serial() -> &'static tokio::sync::Mutex<()> {
         static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{build_ctx, ctx_with_peers, serial};
+    use super::*;
+    use tempfile::tempdir;
 
     /// Count audit-chain rows for a given action.
     async fn audit_count(ctx: &AppContext, action: &str) -> i64 {

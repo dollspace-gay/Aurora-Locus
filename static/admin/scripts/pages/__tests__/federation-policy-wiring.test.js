@@ -55,12 +55,31 @@ test('peer CRUD: recovery-mode lockout + 4xx-inline / 5xx-toast error split', ()
   assert.ok(/AuroraToast\.danger/.test(src), '5xx errors surface as toast');
 });
 
+// v0.9 Federation Pattern-1 Phase C (#353) — discovery modes + pending surface.
+test('discovery: 3-mode selector + auto-accept threat warning + setDiscoveryMode', () => {
+  assert.ok(/fed-discovery-mode/.test(src), 'discovery mode selector present');
+  assert.ok(/allowlist-only/.test(src) && /auto-accept/.test(src) && /discovery-disabled/.test(src), 'all 3 modes offered');
+  assert.ok(/ops\.setDiscoveryMode\(/.test(src), 'setDiscoveryMode wired');
+  assert.ok(/fed-discovery-warning/.test(src) && /toggleAutoAcceptWarning/.test(src), 'auto-accept threat-model warning (inline)');
+  assert.ok(/Switch to auto-accept\?/.test(src), 'auto-accept switch confirm modal');
+});
+
+test('discovery: pending list accept/dismiss wired + recovery-aware', () => {
+  assert.ok(/fed-pending-list/.test(src), 'pending list container');
+  assert.ok(/ops\.dismissPendingDiscovery\(/.test(src), 'dismiss wired');
+  assert.ok(/acceptPending/.test(src) && /addFederationPeer\(/.test(src), 'accept reuses addFederationPeer');
+  assert.ok(/No pending peer discoveries/.test(src), 'empty-state message');
+  assert.ok(/modeSel\.disabled = recoveryActive/.test(src), 'mode selector greyed in recovery');
+});
+
 test('endpoint wrappers exist + the stub row is removed', () => {
   const ep = read('../api/endpoints.js');
   assert.ok(/getFederationPolicy:\s*\(\)\s*=>/.test(ep), 'ops.getFederationPolicy wrapper');
   assert.ok(/addFederationPeer:\s*\(body\)\s*=>/.test(ep), 'ops.addFederationPeer wrapper');
   assert.ok(/removeFederationPeer:\s*\(body\)\s*=>/.test(ep), 'ops.removeFederationPeer wrapper');
   assert.ok(/modifyFederationPeer:\s*\(body\)\s*=>/.test(ep), 'ops.modifyFederationPeer wrapper');
+  assert.ok(/setDiscoveryMode:\s*\(body\)\s*=>/.test(ep), 'ops.setDiscoveryMode wrapper');
+  assert.ok(/dismissPendingDiscovery:\s*\(body\)\s*=>/.test(ep), 'ops.dismissPendingDiscovery wrapper');
   assert.ok(/describeFederationPosture:\s*\(\)\s*=>/.test(ep), 'atproto.describeFederationPosture wrapper');
   const stubs = read('ConfigStubs.js');
   assert.ok(!/key:\s*'configFederationPolicy'/.test(stubs), 'federation stub row removed');

@@ -83,6 +83,25 @@
         '  </fieldset>'
         : '') +
       '</section>' +
+      // v0.9 Phase C (#353) — discovery mode + pending-discovery surface.
+      '<hr class="config-section-divider">' +
+      '<section class="installed-themes-section">' +
+      '  <h3>Peer discovery <span class="role-tag">SuperAdmin only</span></h3>' +
+      '  <p class="settings-help">How peers discovered via relays are handled. <strong>Allowlist-only</strong>: surface for review below. <strong>Auto-accept</strong>: trust automatically. <strong>Disabled</strong>: skip scheduled scans.</p>' +
+      (isSuper ?
+        '  <label style="display:block;">Discovery mode ' +
+        '    <select id="fed-discovery-mode">' +
+        '      <option value="allowlist-only">Allowlist-only (surface for review)</option>' +
+        '      <option value="auto-accept">Auto-accept (trust discovered peers)</option>' +
+        '      <option value="discovery-disabled">Disabled (no scheduled discovery)</option>' +
+        '    </select></label>' +
+        '  <div id="fed-discovery-warning" style="display:none; padding:0.5rem; border-left:3px solid #b45309; background:#fef3c7; margin:0.4rem 0;">' +
+        '<strong>Auto-accept delegates trust to your relays.</strong> Any peer a relay reports will be trusted for federation without review. Use only with relays you fully trust.</div>'
+        : '  <p class="settings-help">SuperAdmin role required to manage discovery.</p>') +
+      '  <h4 style="margin-top:0.8rem;">Pending discoveries</h4>' +
+      '  <p class="settings-help">Peers seen during scans, awaiting review. Bounded to the 100 most-recently-seen.</p>' +
+      '  <div id="fed-pending-list">Loading…</div>' +
+      '</section>' +
       // Section 9 — what peers actually see (read from the public endpoints).
       '<hr class="config-section-divider">' +
       '<section class="installed-themes-section">' +
@@ -111,6 +130,8 @@
       if (save) save.addEventListener('click', savePeer);
       const cancel = document.getElementById('fed-peer-cancel');
       if (cancel) cancel.addEventListener('click', resetPeerForm);
+      const modeSel = document.getElementById('fed-discovery-mode');
+      if (modeSel) modeSel.addEventListener('change', onModeChange);
     }
     await loadAll();
     return {};
@@ -118,7 +139,7 @@
 
   async function loadAll() {
     await detectRecovery();
-    await Promise.all([loadPolicy(), loadPeerVisible()]);
+    await Promise.all([loadPolicy(), loadDiscovery(), loadPeerVisible()]);
   }
 
   // Recovery mode is detected via the substrate signal the moderation-mode
@@ -137,6 +158,8 @@
     if (form) {
       form.querySelectorAll('input,button').forEach(function (el) { el.disabled = recoveryActive; });
     }
+    const modeSel = document.getElementById('fed-discovery-mode');
+    if (modeSel) modeSel.disabled = recoveryActive;
   }
 
   // Sections 1-8 — the SuperAdmin full env view.
@@ -275,6 +298,108 @@
       await loadPolicy();
     } catch (e) {
       handlePeerError(e, 'Remove failed.');
+    }
+  }
+
+  // Phase C — discovery mode + pending-discovery surface, read via the generic
+  // getRuntimeSetting (the describe composite-load is Phase E's job).
+  async function loadDiscovery() {
+    const ep = global.AuroraEndpoints;
+    if (!ep || !isSuper) return;
+    let mode = 'allowlist-only';
+    try {
+      const d = await ep.admin.getRuntimeSetting('federation.policy.discovery-mode');
+      if (d && typeof d.value === 'string') mode = d.value;
+    } catch (e) { /* default */ }
+    const sel = document.getElementById('fed-discovery-mode');
+    if (sel) sel.value = mode;
+    toggleAutoAcceptWarning(mode);
+
+    let pending = [];
+    try {
+      const d = await ep.admin.getRuntimeSetting('federation.policy.pending-discoveries');
+      if (d && Array.isArray(d.value)) pending = d.value;
+    } catch (e) { /* empty */ }
+    renderPending(pending);
+  }
+
+  function toggleAutoAcceptWarning(mode) {
+    const warn = document.getElementById('fed-discovery-warning');
+    if (warn) warn.style.display = mode === 'auto-accept' ? '' : 'none';
+  }
+
+  function renderPending(pending) {
+    const host = document.getElementById('fed-pending-list');
+    if (!host) return;
+    if (!pending.length) { host.innerHTML = '<p class="settings-help">No pending peer discoveries.</p>'; return; }
+    if (!isSuper) {
+      host.innerHTML = '<ul>' + pending.map((p) => '<li><code>' + esc(p.did) + '</code> @ <code>' + esc(p.url) + '</code></li>').join('') + '</ul>';
+      return;
+    }
+    host.innerHTML = pending.map(function (p) {
+      return '<div class="hook-row" style="border-bottom:1px solid #ddd; padding:0.3rem 0;">' +
+        '<code>' + esc(p.did) + '</code> @ <code>' + esc(p.url) + '</code>' +
+        ' <span class="settings-help">first seen ' + esc(p.first_seen_at || '') + ', last seen ' + esc(p.last_seen_at || '') + '</span>' +
+        ' <button type="button" class="fed-pending-accept" data-did="' + esc(p.did) + '" data-url="' + esc(p.url) + '"' + (recoveryActive ? ' disabled' : '') + '>Accept</button>' +
+        ' <button type="button" class="fed-pending-dismiss" data-did="' + esc(p.did) + '"' + (recoveryActive ? ' disabled' : '') + '>Dismiss</button>' +
+        '</div>';
+    }).join('');
+    host.querySelectorAll('.fed-pending-accept').forEach(function (b) {
+      b.addEventListener('click', function () { acceptPending(b.getAttribute('data-did'), b.getAttribute('data-url')); });
+    });
+    host.querySelectorAll('.fed-pending-dismiss').forEach(function (b) {
+      b.addEventListener('click', function () { dismissPending(b.getAttribute('data-did')); });
+    });
+  }
+
+  async function onModeChange() {
+    if (recoveryActive) { global.AuroraToast.danger('Disabled during recovery mode.'); return; }
+    const sel = document.getElementById('fed-discovery-mode');
+    const mode = sel ? sel.value : 'allowlist-only';
+    // Confirm the trust-delegation risk when switching TO auto-accept.
+    if (mode === 'auto-accept') {
+      const r = await global.AuroraModal.destructiveConfirm({
+        heading: 'Switch to auto-accept?',
+        body: 'Auto-accept trusts any peer your relays report, without review. Use only with fully-trusted relays.',
+        confirmLabel: 'Enable auto-accept',
+      });
+      if (!r.confirmed) { await loadDiscovery(); return; }
+    }
+    try {
+      await global.AuroraEndpoints.ops.setDiscoveryMode({ mode: mode });
+      global.AuroraToast.success('Discovery mode updated.');
+      toggleAutoAcceptWarning(mode);
+    } catch (e) {
+      global.AuroraToast.danger('Mode change failed: ' + (e && e.message ? e.message : '') + ' — retry shortly.');
+      await loadDiscovery();
+    }
+  }
+
+  async function acceptPending(did, url) {
+    if (recoveryActive) { global.AuroraToast.danger('Disabled during recovery mode.'); return; }
+    try {
+      await global.AuroraEndpoints.ops.addFederationPeer({ did: did, url: url });
+      global.AuroraToast.success('Peer accepted into the allowlist.');
+      await Promise.all([loadPolicy(), loadDiscovery()]);
+    } catch (e) {
+      global.AuroraToast.danger('Accept failed: ' + (e && e.message ? e.message : ''));
+    }
+  }
+
+  async function dismissPending(did) {
+    if (recoveryActive) { global.AuroraToast.danger('Disabled during recovery mode.'); return; }
+    const r = await global.AuroraModal.destructiveConfirm({
+      heading: 'Dismiss pending discovery',
+      body: 'Remove ' + did + ' from the pending list? It may re-surface on a future scan.',
+      confirmLabel: 'Dismiss',
+    });
+    if (!r.confirmed) return;
+    try {
+      await global.AuroraEndpoints.ops.dismissPendingDiscovery({ did: did });
+      global.AuroraToast.success('Pending discovery dismissed.');
+      await loadDiscovery();
+    } catch (e) {
+      global.AuroraToast.danger('Dismiss failed: ' + (e && e.message ? e.message : ''));
     }
   }
 

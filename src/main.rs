@@ -118,6 +118,13 @@ async fn main() -> PdsResult<()> {
             // stay unset (Phases C/D seed them). Best-effort; never blocks boot.
             api::federation_peers::seed_peer_allowlist(&ctx).await;
 
+            // v0.9 Federation Pattern-1 Phase C (#353 / design §2.4) — boot-seed
+            // discovery-mode ("allowlist-only") + the empty pending-discoveries
+            // surface. Placed before JobScheduler::start() so the discovery
+            // scheduler reads the post-seed mode. Seed-if-absent + idempotent.
+            api::federation_discovery::seed_discovery_mode(&ctx).await;
+            api::federation_discovery::seed_pending_discoveries(&ctx).await;
+
             // Start background jobs
             let scheduler = std::sync::Arc::new(jobs::JobScheduler::new(Arc::clone(&ctx)));
             scheduler.start();
