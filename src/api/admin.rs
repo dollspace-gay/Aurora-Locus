@@ -413,6 +413,25 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(get_federation_policy),
             CapsBuilder::new(Family::Ops),
         )
+        // v0.9 Federation Pattern-1 Phase B (#352) — peer-allowlist CRUD.
+        // SuperAdmin-gated in-handler (the federation family lives under
+        // Family::Ops alongside getFederationPolicy); mutates the runtime
+        // federation.policy.peer-allowlist via CAS + audit emission.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.addFederationPeer",
+            post(add_federation_peer),
+            CapsBuilder::new(Family::Ops),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.removeFederationPeer",
+            post(remove_federation_peer),
+            CapsBuilder::new(Family::Ops),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.modifyFederationPeer",
+            post(modify_federation_peer),
+            CapsBuilder::new(Family::Ops),
+        )
         // ---- tools.aurora.moderator.* (chainlink #100 / Phase 3.3) ----
         //
         // Moderator-tier read endpoints. Five queries with shared
@@ -8476,6 +8495,65 @@ async fn get_federation_policy(
     }))
 }
 
+// v0.9 Federation Pattern-1 Phase B (#352) — peer-allowlist CRUD handlers.
+// SuperAdmin-gated; core logic + audit/CAS/recovery handling lives in
+// `crate::api::federation_peers`. Mutations round-trip through the
+// `getFederationPolicy` describe above (which reads `trusted_peers.snapshot()`).
+
+#[derive(Deserialize)]
+struct AddFederationPeerRequest {
+    did: String,
+    url: String,
+}
+
+async fn add_federation_peer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<AddFederationPeerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::federation_peers::add_federation_peer(&ctx, &auth.did, &req.did, &req.url)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "did": req.did })))
+}
+
+#[derive(Deserialize)]
+struct RemoveFederationPeerRequest {
+    did: String,
+}
+
+async fn remove_federation_peer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RemoveFederationPeerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::federation_peers::remove_federation_peer(&ctx, &auth.did, &req.did)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "did": req.did })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModifyFederationPeerRequest {
+    did: String,
+    new_url: String,
+}
+
+async fn modify_federation_peer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<ModifyFederationPeerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::federation_peers::modify_federation_peer(&ctx, &auth.did, &req.did, &req.new_url)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "did": req.did })))
+}
+
 /// Relay server info
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -10279,7 +10357,7 @@ mod tests {
             r#""listAppeals","#,
             r#""getAppeal""#,
             r#"],"#,
-            // tools.aurora.ops (43 endpoints)
+            // tools.aurora.ops (46 endpoints)
             r#""tools.aurora.ops":["#,
             r#""getStats","#,
             r#""listAccounts","#,
@@ -10314,6 +10392,9 @@ mod tests {
             r#""listKnownInstances","#,
             r#""triggerPdsDiscovery","#,
             r#""getFederationPolicy","#,
+            r#""addFederationPeer","#,
+            r#""removeFederationPeer","#,
+            r#""modifyFederationPeer","#,
             r#""triggerRotation","#,
             // v0.9 Arc D (#225) — kryphocron operator read cohort.
             r#""getSubstrateInfo","#,

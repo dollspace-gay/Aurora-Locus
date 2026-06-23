@@ -14,8 +14,14 @@
 //     themselves — com.atproto.server.describeServer (minimal) and
 //     com.aurora.federation.describePosture (richer) — so the SuperAdmin sees
 //     exactly what peers actually receive, not a client-side reconstruction.
-// Read-only: no setRuntimeSetting, no mutation. Manual Refresh (no auto-poll;
-// Operations → Federation owns live polling). Per-section reads isolated.
+// v0.9 Federation Pattern-1 Phase B (#352): the trusted peer allowlist is now
+// runtime-mutable. SuperAdmins get add / edit / remove affordances on the peer
+// section (tools.aurora.ops.{add,remove,modify}FederationPeer); all other
+// sections remain read-only env/restart config. Recovery mode greys the
+// mutation affordances (substrate refuses with 503 RecoveryModeActive).
+// 4xx validation errors surface inline near the form; 5xx (CAS-exhausted,
+// recovery) surface as a toast with retry guidance.
+// Manual Refresh (no auto-poll). Per-section reads isolated.
 
 (function (global) {
   'use strict';
@@ -24,6 +30,11 @@
     return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s);
   }
   function onoff(b) { return b ? 'Enabled' : 'Disabled'; }
+
+  // Page-scoped state resolved at mount/load: SuperAdmin can mutate; recovery
+  // mode locks mutations out.
+  let isSuper = false;
+  let recoveryActive = false;
 
   // A read-only status card: title, a value slot (filled by load), and a
   // how-to-change note.
@@ -36,6 +47,8 @@
   }
 
   async function mount({ container }) {
+    const session = global.AuroraSession;
+    isSuper = !!(session && session.hasRole('superadmin'));
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#configuration/general">Configuration</a> <span class="breadcrumb-sep">›</span> Federation policy</nav>' +
       '<header class="page-header"><div><h2>Federation policy</h2>' +
@@ -46,12 +59,30 @@
       card('Federation', 'fed-enabled', 'Set via <code>PDS_FEDERATION_ENABLED</code> at startup; restart required to change.') +
       card('Relay binding', 'fed-relays', 'Set via <code>PDS_FEDERATION_RELAY_URLS</code> (comma-separated) at startup; restart required. Live status: Operations → Federation.') +
       card('AppView URL', 'fed-appview', 'Set via <code>PDS_APPVIEW_URL</code> at startup.') +
-      card('Trusted peer allowlist', 'fed-peers', 'Set via <code>PDS_FEDERATION_PEER_PDS</code> (<code>did@url,…</code>) at startup; controls the trusted-issuer allowlist and discovery bootstrap. Restart required.') +
+      card('Trusted peer allowlist', 'fed-peers', 'Seeded at boot from <code>PDS_FEDERATION_PEER_PDS</code> (<code>did@url,…</code>); now runtime-mutable below (SuperAdmin). Controls the trusted-issuer allowlist and discovery bootstrap.') +
       card('Firehose', 'fed-firehose', 'Set via <code>PDS_FEDERATION_FIREHOSE_ENABLED</code> at startup.') +
       card('Relay crawl', 'fed-crawl', 'Set via <code>PDS_FEDERATION_CRAWL_ENABLED</code> at startup.') +
       card('Auto-stream events', 'fed-autostream', 'Set via <code>PDS_FEDERATION_AUTO_STREAM</code> at startup.') +
       card('Public URL', 'fed-public', 'Set via <code>PDS_PUBLIC_URL</code> at startup; this PDS\'s internet-reachable URL.') +
       '</div>' +
+      // v0.9 Phase B (#352) — runtime-mutable trusted-peer management.
+      '<hr class="config-section-divider">' +
+      '<section class="installed-themes-section">' +
+      '  <h3>Manage trusted peers <span class="role-tag">SuperAdmin only</span></h3>' +
+      '  <div id="fed-recovery-banner" style="display:none; padding:0.5rem; border-left:3px solid #b45309; background:#fef3c7; margin-bottom:0.6rem;">Federation policy mutations are disabled during recovery mode.</div>' +
+      '  <p class="settings-help">Add, edit, or remove trusted peer PDS entries. Changes take effect immediately (per-call freshness) and are written to the audit chain.</p>' +
+      '  <div id="fed-peers-manage">' + (isSuper ? 'Loading…' : '<p class="settings-help">SuperAdmin role required to manage trusted peers.</p>') + '</div>' +
+      (isSuper ?
+        '  <div id="fed-peer-error" style="margin:0.4rem 0;"></div>' +
+        '  <fieldset id="fed-peer-form" style="margin-top:0.5rem;"><legend id="fed-peer-legend">Add peer</legend>' +
+        '    <input type="hidden" id="fed-peer-edit-did" value="">' +
+        '    <label style="display:block;">DID <input type="text" id="fed-peer-did" placeholder="did:plc:…" style="width:100%;"></label>' +
+        '    <label style="display:block;">URL (https only) <input type="text" id="fed-peer-url" placeholder="https://…" style="width:100%;"></label>' +
+        '    <button type="button" class="btn-primary" id="fed-peer-save">Save peer</button>' +
+        '    <button type="button" id="fed-peer-cancel" style="display:none;">Cancel edit</button>' +
+        '  </fieldset>'
+        : '') +
+      '</section>' +
       // Section 9 — what peers actually see (read from the public endpoints).
       '<hr class="config-section-divider">' +
       '<section class="installed-themes-section">' +
@@ -70,17 +101,42 @@
       '<hr class="config-section-divider">' +
       '<section class="installed-themes-section">' +
       '  <h3>Coming in a future cycle</h3>' +
-      '  <p class="settings-help">Runtime-mutable federation policy (peer allow/deny lists, discovery mode, relay reconfiguration without restart) is reserved for a later release. This page surfaces the deployment-configured state; mutation requires editing environment variables and restarting the substrate.</p>' +
+      '  <p class="settings-help">Discovery mode (auto-accept vs allowlist-only) and runtime relay reconfiguration without restart are reserved for later phases of this cycle. The trusted-peer allowlist above is now runtime-mutable; the remaining federation policy still requires editing environment variables and restarting the substrate.</p>' +
       '</section>';
 
     const btn = document.getElementById('fed-refresh');
     if (btn) btn.addEventListener('click', loadAll);
+    if (isSuper) {
+      const save = document.getElementById('fed-peer-save');
+      if (save) save.addEventListener('click', savePeer);
+      const cancel = document.getElementById('fed-peer-cancel');
+      if (cancel) cancel.addEventListener('click', resetPeerForm);
+    }
     await loadAll();
     return {};
   }
 
   async function loadAll() {
+    await detectRecovery();
     await Promise.all([loadPolicy(), loadPeerVisible()]);
+  }
+
+  // Recovery mode is detected via the substrate signal the moderation-mode
+  // setting already exposes (source === 'RecoveryMode'), mirroring the
+  // Recovery-mode status page. When active, mutation affordances are greyed.
+  async function detectRecovery() {
+    recoveryActive = false;
+    if (!isSuper) return;
+    try {
+      const d = await global.AuroraEndpoints.admin.getRuntimeSetting('moderation-mode');
+      recoveryActive = !!(d && d.source === 'RecoveryMode');
+    } catch (e) { /* leave false; the substrate still enforces server-side */ }
+    const banner = document.getElementById('fed-recovery-banner');
+    if (banner) banner.style.display = recoveryActive ? '' : 'none';
+    const form = document.getElementById('fed-peer-form');
+    if (form) {
+      form.querySelectorAll('input,button').forEach(function (el) { el.disabled = recoveryActive; });
+    }
   }
 
   // Sections 1-8 — the SuperAdmin full env view.
@@ -105,10 +161,121 @@
     set('fed-peers', peers.length
       ? '<ul>' + peers.map((x) => '<li><code>' + esc(x.did) + '</code> @ <code>' + esc(x.url) + '</code></li>').join('') + '</ul>'
       : '<em>No trusted peers configured.</em>');
+    if (isSuper) renderPeerManagement(peers);
     set('fed-firehose', '<strong>' + esc(onoff(p.firehoseEnabled)) + '</strong>');
     set('fed-crawl', '<strong>' + esc(onoff(p.crawlEnabled)) + '</strong>');
     set('fed-autostream', '<strong>' + esc(onoff(p.autoStreamEvents)) + '</strong>');
     set('fed-public', p.publicUrl ? '<code>' + esc(p.publicUrl) + '</code>' : '<em>Not configured.</em>');
+  }
+
+  // Phase B — the SuperAdmin editable peer list with per-row edit/remove.
+  function renderPeerManagement(peers) {
+    const host = document.getElementById('fed-peers-manage');
+    if (!host) return;
+    if (!peers.length) { host.innerHTML = '<p class="settings-help">No trusted peers. Add one below.</p>'; return; }
+    host.innerHTML = peers.map(function (x) {
+      return '<div class="hook-row" style="border-bottom:1px solid #ddd; padding:0.3rem 0;">' +
+        '<code>' + esc(x.did) + '</code> @ <code>' + esc(x.url) + '</code>' +
+        ' <button type="button" class="fed-peer-edit" data-did="' + esc(x.did) + '" data-url="' + esc(x.url) + '"' + (recoveryActive ? ' disabled' : '') + '>Edit</button>' +
+        ' <button type="button" class="fed-peer-remove" data-did="' + esc(x.did) + '"' + (recoveryActive ? ' disabled' : '') + '>Remove</button>' +
+        '</div>';
+    }).join('');
+    host.querySelectorAll('.fed-peer-edit').forEach(function (b) {
+      b.addEventListener('click', function () { editPeer(b.getAttribute('data-did'), b.getAttribute('data-url')); });
+    });
+    host.querySelectorAll('.fed-peer-remove').forEach(function (b) {
+      b.addEventListener('click', function () { removePeer(b.getAttribute('data-did')); });
+    });
+  }
+
+  function clearPeerError() {
+    const el = document.getElementById('fed-peer-error');
+    if (el) el.innerHTML = '';
+  }
+
+  // 4xx validation errors render inline near the form (memory: error→inline);
+  // 5xx (CAS-exhausted, recovery 503) surface as a toast with retry guidance.
+  function handlePeerError(e, fallback) {
+    const status = e && e.status;
+    const msg = (e && e.message) ? e.message : fallback;
+    if (status && status >= 400 && status < 500) {
+      const el = document.getElementById('fed-peer-error');
+      if (el && global.AuroraInlineError) {
+        el.innerHTML = global.AuroraInlineError.render({ message: msg });
+      } else if (el) {
+        el.innerHTML = '<p class="settings-help" style="color:#b91c1c;">' + esc(msg) + '</p>';
+      } else {
+        global.AuroraToast.danger(msg);
+      }
+    } else {
+      global.AuroraToast.danger(msg + ' — retry shortly.');
+    }
+  }
+
+  function resetPeerForm() {
+    const did = document.getElementById('fed-peer-did');
+    const url = document.getElementById('fed-peer-url');
+    const editDid = document.getElementById('fed-peer-edit-did');
+    const legend = document.getElementById('fed-peer-legend');
+    const cancel = document.getElementById('fed-peer-cancel');
+    if (editDid) editDid.value = '';
+    if (legend) legend.textContent = 'Add peer';
+    if (cancel) cancel.style.display = 'none';
+    if (did) { did.value = ''; did.disabled = recoveryActive; }
+    if (url) url.value = '';
+    clearPeerError();
+  }
+
+  function editPeer(did, url) {
+    document.getElementById('fed-peer-edit-did').value = did;
+    document.getElementById('fed-peer-legend').textContent = 'Edit peer URL';
+    document.getElementById('fed-peer-cancel').style.display = '';
+    const didEl = document.getElementById('fed-peer-did');
+    didEl.value = did;
+    didEl.disabled = true; // DID is the key; only the URL is editable on modify.
+    document.getElementById('fed-peer-url').value = url;
+    clearPeerError();
+  }
+
+  async function savePeer() {
+    if (recoveryActive) { global.AuroraToast.danger('Disabled during recovery mode.'); return; }
+    const ep = global.AuroraEndpoints;
+    const editDid = document.getElementById('fed-peer-edit-did').value;
+    const did = document.getElementById('fed-peer-did').value.trim();
+    const url = document.getElementById('fed-peer-url').value.trim();
+    clearPeerError();
+    if (!url) { global.AuroraToast.warning('URL is required.'); return; }
+    try {
+      if (editDid) {
+        await ep.ops.modifyFederationPeer({ did: editDid, newUrl: url });
+        global.AuroraToast.success('Peer URL updated.');
+      } else {
+        if (!did) { global.AuroraToast.warning('DID is required.'); return; }
+        await ep.ops.addFederationPeer({ did: did, url: url });
+        global.AuroraToast.success('Peer added.');
+      }
+      resetPeerForm();
+      await loadPolicy();
+    } catch (e) {
+      handlePeerError(e, 'Save failed.');
+    }
+  }
+
+  async function removePeer(did) {
+    if (recoveryActive) { global.AuroraToast.danger('Disabled during recovery mode.'); return; }
+    const confirmResult = await global.AuroraModal.destructiveConfirm({
+      heading: 'Remove trusted peer',
+      body: 'Remove ' + did + ' from the trusted-peer allowlist? Federation trust stops immediately.',
+      confirmLabel: 'Remove peer',
+    });
+    if (!confirmResult.confirmed) return;
+    try {
+      await global.AuroraEndpoints.ops.removeFederationPeer({ did: did });
+      global.AuroraToast.success('Peer removed.');
+      await loadPolicy();
+    } catch (e) {
+      handlePeerError(e, 'Remove failed.');
+    }
   }
 
   // Section 9 — render the two public endpoints' actual responses (the

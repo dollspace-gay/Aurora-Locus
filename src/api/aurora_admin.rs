@@ -4152,8 +4152,45 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         MODERATION_REVIEWER_ROTATION_CURSOR_KEY
         | MODERATION_REVIEWER_MODE_VERSION_KEY
         | MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY => value.as_u64().is_some(),
+        // v0.9 Federation Pattern-1 Phase B (#352 / design §2.3, Step 4): the
+        // peer-allowlist tightens from Phase A's accept-any to the real shape.
+        // Runs on every CAS write (incl. boot-seed) so the runtime store stays
+        // well-formed even if env-var parsing has a bug. discovery-mode /
+        // relay-urls / pending-discoveries stay accept-any (Phase C/D tighten).
+        FEDERATION_POLICY_PEER_ALLOWLIST_KEY => is_valid_peer_allowlist(value),
         _ => true,
     }
+}
+
+/// v0.9 Federation Pattern-1 Phase B (#352) — peer-allowlist structural
+/// validator: a JSON array of objects with exactly `{did, url}`, DIDs
+/// `did:`-prefixed and unique across the array, URLs HTTPS-only.
+fn is_valid_peer_allowlist(value: &serde_json::Value) -> bool {
+    let Some(arr) = value.as_array() else {
+        return false;
+    };
+    let mut seen = std::collections::HashSet::new();
+    for el in arr {
+        let Some(obj) = el.as_object() else {
+            return false;
+        };
+        if obj.len() != 2 {
+            return false;
+        }
+        let (Some(did), Some(url)) = (
+            obj.get("did").and_then(|v| v.as_str()),
+            obj.get("url").and_then(|v| v.as_str()),
+        ) else {
+            return false;
+        };
+        if did.is_empty() || !did.starts_with("did:") || !url.starts_with("https://") {
+            return false;
+        }
+        if !seen.insert(did) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The ReportReason vocabulary (per Phase A recon — the lexicon's six).
