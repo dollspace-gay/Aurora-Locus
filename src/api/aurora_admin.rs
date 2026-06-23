@@ -810,6 +810,13 @@ pub async fn emit_event(
         {
             tracing::warn!(error = %e, action = action_str, "auto-label Pipeline B failed");
         }
+        // §5.5.4 Phase D: Pipeline B escalation rules (operator-action).
+        if let Err(e) =
+            crate::api::escalation_rules::evaluate_pipeline_b(&ctx, subject, action_str, &auth.did)
+                .await
+        {
+            tracing::warn!(error = %e, action = action_str, "escalation Pipeline B failed");
+        }
     }
 
     let snapshots = if input.snapshot_capture {

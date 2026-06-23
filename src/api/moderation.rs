@@ -191,6 +191,14 @@ async fn create_report(
             "auto-label Pipeline A failed on createReport intake"
         );
     }
+    // §5.5.4 Phase D: Pipeline A escalation rules. Best-effort.
+    if let Err(e) = crate::api::escalation_rules::evaluate_pipeline_a(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "escalation Pipeline A failed on createReport intake"
+        );
+    }
 
     // Build response subject
     let subject_json = match &req.subject {

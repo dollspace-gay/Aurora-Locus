@@ -759,6 +759,32 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(list_auto_label_rules),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // §5.5.4 Phase D (#348) — escalation rule CRUD + de-escalation (§5).
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.createEscalationRule",
+            post(create_escalation_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.editEscalationRule",
+            post(edit_escalation_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.deleteEscalationRule",
+            post(delete_escalation_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.listEscalationRules",
+            get(list_escalation_rules),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.clearEscalation",
+            post(clear_escalation),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // v0.9 (#329) — upload a login-splash branding asset (logo/banner)
         // directly; writes it under <data>/branding/ and repoints the
         // branding.login-* runtime setting. Raw-body upload (uploadBlob idiom).
@@ -1771,6 +1797,123 @@ async fn list_auto_label_rules(
         .await
         .map_err(rule_err)?;
     Ok(Json(serde_json::json!({ "rules": rules })))
+}
+
+// ---------------------------------------------------------------------------
+// §5.5.4 Phase D — escalation rule CRUD + clearEscalation (#348, §5). SuperAdmin.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateEscalationRuleRequest {
+    trigger_type: String,
+    trigger_params: serde_json::Value,
+    action_type: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn create_escalation_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<CreateEscalationRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let rule = crate::api::escalation_rules::create_rule(
+        &ctx,
+        &auth.did,
+        &req.trigger_type,
+        &req.trigger_params,
+        &req.action_type,
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "rule": rule })))
+}
+
+#[derive(Deserialize)]
+struct EditEscalationRuleRequest {
+    id: String,
+    trigger_type: String,
+    trigger_params: serde_json::Value,
+    action_type: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn edit_escalation_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<EditEscalationRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::escalation_rules::edit_rule(
+        &ctx,
+        &auth.did,
+        &req.id,
+        &req.trigger_type,
+        &req.trigger_params,
+        &req.action_type,
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+async fn delete_escalation_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<DeleteAutoLabelRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::escalation_rules::delete_rule(&ctx, &auth.did, &req.id)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+async fn list_escalation_rules(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(q): Query<ListAutoLabelRulesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let rules = crate::api::escalation_rules::list_rules(&ctx, q.include_deleted)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "rules": rules })))
+}
+
+#[derive(Deserialize)]
+struct ClearEscalationRequest {
+    item_id: String,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn clear_escalation(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<ClearEscalationRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("de-escalated by SuperAdmin");
+    crate::api::escalation_rules::clear_escalation(&ctx, &req.item_id, rationale, &auth.did)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "itemId": req.item_id })))
 }
 
 // ---------------------------------------------------------------------------
@@ -4101,6 +4244,14 @@ async fn submit_report(
             error = %e,
             report_id = report.id,
             "auto-label Pipeline A failed on submitReport intake"
+        );
+    }
+    // §5.5.4 Phase D: Pipeline A escalation rules. Best-effort.
+    if let Err(e) = crate::api::escalation_rules::evaluate_pipeline_a(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "escalation Pipeline A failed on submitReport intake"
         );
     }
 
@@ -9895,7 +10046,7 @@ mod tests {
             r#""getAccountOverrides","#,
             r#""setAccountOverride""#,
             r#"],"#,
-            // tools.aurora.superadmin (22 endpoints)
+            // tools.aurora.superadmin (27 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
@@ -9904,6 +10055,11 @@ mod tests {
             r#""editAutoLabelRule","#,
             r#""deleteAutoLabelRule","#,
             r#""listAutoLabelRules","#,
+            r#""createEscalationRule","#,
+            r#""editEscalationRule","#,
+            r#""deleteEscalationRule","#,
+            r#""listEscalationRules","#,
+            r#""clearEscalation","#,
             r#""uploadBrandingAsset","#,
             r#""preRebuildCheck","#,
             r#""rebuildRepo","#,

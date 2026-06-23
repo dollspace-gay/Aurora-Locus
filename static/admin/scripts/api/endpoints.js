@@ -142,6 +142,12 @@
     editAutoLabelRule: (body) => C().post('tools.aurora.superadmin.editAutoLabelRule', body),
     deleteAutoLabelRule: (body) => C().post('tools.aurora.superadmin.deleteAutoLabelRule', body),
     listAutoLabelRules: (params) => C().get('tools.aurora.superadmin.listAutoLabelRules', params || {}),
+    // §5.5.4 Phase D (#348) — escalation rule CRUD + de-escalation.
+    createEscalationRule: (body) => C().post('tools.aurora.superadmin.createEscalationRule', body),
+    editEscalationRule: (body) => C().post('tools.aurora.superadmin.editEscalationRule', body),
+    deleteEscalationRule: (body) => C().post('tools.aurora.superadmin.deleteEscalationRule', body),
+    listEscalationRules: (params) => C().get('tools.aurora.superadmin.listEscalationRules', params || {}),
+    clearEscalation: (body) => C().post('tools.aurora.superadmin.clearEscalation', body),
     // Repository rebuild (§7.4.1 / #286 + #290). preRebuildCheck: shallow
     // metadata preflight ({did}), or full reconstruction+verification
     // ({did, deep:true}). rebuildRepo: start a rebuild ({did, rationale}) →

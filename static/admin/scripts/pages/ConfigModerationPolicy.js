@@ -152,12 +152,65 @@
         '    </fieldset>'
         : '    <p class="settings-help">SuperAdmin role required to manage auto-label rules.</p>') +
       '  </div>' +
+      // §5.5.4 Phase D — escalation rules (§5).
+      '  <div class="settings-card">' +
+      '    <h3>Escalation rules <span class="role-tag">SuperAdmin only</span></h3>' +
+      '    <p class="settings-help">Rules that auto-escalate a queue item (status → escalated) on severity signals — in the <strong>Full</strong> tier only. Max 100 active. De-escalate from the queue page.</p>' +
+      '    <label><input type="checkbox" id="mod-esc-show-deleted"> Show deleted rules</label>' +
+      '    <div id="mod-esc-list" style="margin:0.5rem 0;">Loading…</div>' +
+      (isSuper ?
+        '    <fieldset><legend id="mod-esc-form-legend">Add rule</legend>' +
+        '      <input type="hidden" id="mod-esc-edit-id" value="">' +
+        '      <label style="display:block;">Trigger' +
+        '        <select id="mod-esc-trigger-type" style="display:block; margin-top:0.2rem;">' +
+        '          <option value="report-count">report-count</option>' +
+        '          <option value="operator-action">operator-action</option>' +
+        '          <option value="category-match">category-match</option>' +
+        '        </select></label>' +
+        '      <div id="mod-esc-params-report-count" class="mod-esc-params">' +
+        '        <label>category ' + categorySelect('mod-esc-rc-category') + '</label>' +
+        '        <label> threshold <input type="number" id="mod-esc-rc-threshold" min="1" style="width:5rem;"></label>' +
+        '        <label> window_days <input type="number" id="mod-esc-rc-window" min="1" max="365" style="width:5rem;"></label>' +
+        '      </div>' +
+        '      <div id="mod-esc-params-operator-action" class="mod-esc-params" style="display:none;">' +
+        '        <label>action_type ' + actionTypeSelect('mod-esc-oa-action') + '</label>' +
+        '        <label> threshold <input type="number" id="mod-esc-oa-threshold" min="1" style="width:5rem;"></label>' +
+        '        <label> window_days <input type="number" id="mod-esc-oa-window" min="1" max="365" style="width:5rem;"></label>' +
+        '      </div>' +
+        '      <div id="mod-esc-params-category-match" class="mod-esc-params" style="display:none;">' +
+        '        <label>category ' + categorySelect('mod-esc-cm-category') + '</label>' +
+        '      </div>' +
+        '      <label style="display:block; margin-top:0.4rem;">Action' +
+        '        <select id="mod-esc-action" style="display:block; margin-top:0.2rem;">' +
+        '          <option value="mark">mark (escalate in place)</option>' +
+        '          <option value="reassign-to-superadmin">reassign-to-superadmin</option>' +
+        '        </select></label>' +
+        '      <label style="display:block;"><input type="checkbox" id="mod-esc-enabled" checked> Enabled</label>' +
+        '      <label style="display:block;">Rationale <textarea id="mod-esc-rationale" rows="2" style="width:100%;"></textarea></label>' +
+        '      <button type="button" class="btn-primary" id="mod-esc-save">Save rule</button>' +
+        '      <button type="button" id="mod-esc-cancel" style="display:none;">Cancel edit</button>' +
+        '    </fieldset>'
+        : '    <p class="settings-help">SuperAdmin role required to manage escalation rules.</p>') +
+      '  </div>' +
       '</div>';
 
     await loadModerationMode();
     await loadModerationDefaults();
     await loadReviewerAssignment();
     await loadAutoLabelRules();
+    await loadEscalationRules();
+    if (isSuper) {
+      const escTrig = document.getElementById('mod-esc-trigger-type');
+      if (escTrig) escTrig.addEventListener('change', syncEscParamsVisibility);
+      const escSave = document.getElementById('mod-esc-save');
+      if (escSave) escSave.addEventListener('click', saveEscalationRule);
+      const escCancel = document.getElementById('mod-esc-cancel');
+      if (escCancel) escCancel.addEventListener('click', resetEscForm);
+    }
+    {
+      const escShowDel = document.getElementById('mod-esc-show-deleted');
+      if (escShowDel) escShowDel.addEventListener('change', loadEscalationRules);
+    }
     if (isSuper) {
       const saveBtn = document.getElementById('mod-mode-save');
       if (saveBtn) saveBtn.addEventListener('click', saveModerationMode);
@@ -574,6 +627,138 @@
       await global.AuroraEndpoints.admin.deleteAutoLabelRule({ id: id });
       global.AuroraToast.success('Rule deleted.');
       await loadAutoLabelRules();
+    } catch (e) {
+      global.AuroraToast.danger('Delete failed: ' + (e && e.message ? e.message : ''));
+    }
+  }
+
+  function syncEscParamsVisibility() {
+    const t = document.getElementById('mod-esc-trigger-type').value;
+    document.querySelectorAll('.mod-esc-params').forEach(function (el) { el.style.display = 'none'; });
+    const active = document.getElementById('mod-esc-params-' + t);
+    if (active) active.style.display = 'block';
+  }
+
+  function escSummary(r) {
+    const p = r.triggerParams || {};
+    let trig = r.triggerType;
+    if (r.triggerType === 'report-count') trig = 'report-count: ' + p.category + ' ≥' + p.threshold + ' / ' + p.window_days + 'd';
+    else if (r.triggerType === 'operator-action') trig = 'operator-action: ' + p.action_type + ' ≥' + p.threshold + ' / ' + p.window_days + 'd';
+    else if (r.triggerType === 'category-match') trig = 'category-match: ' + p.category;
+    return trig + ' → ' + r.actionType;
+  }
+
+  async function loadEscalationRules() {
+    const ep = global.AuroraEndpoints;
+    const list = document.getElementById('mod-esc-list');
+    if (!ep || !list) return;
+    const includeDeleted = !!(document.getElementById('mod-esc-show-deleted') || {}).checked;
+    try {
+      const data = await ep.admin.listEscalationRules({ includeDeleted: includeDeleted });
+      const rules = (data && data.rules) || [];
+      if (!rules.length) { list.textContent = 'No escalation rules.'; return; }
+      list.innerHTML = rules.map(function (r) {
+        const deleted = r.deletedAt ? ' <em>(deleted)</em>' : '';
+        const state = r.enabled ? 'enabled' : 'disabled';
+        return '<div class="mod-esc-row" style="border-bottom:1px solid #ddd; padding:0.3rem 0;">' +
+          esc(escSummary(r)) + ' [' + state + ']' + deleted +
+          (r.deletedAt ? '' :
+            ' <button type="button" class="mod-esc-edit" data-id="' + esc(r.id) + '">Edit</button>' +
+            ' <button type="button" class="mod-esc-del" data-id="' + esc(r.id) + '">Delete</button>') +
+          '</div>';
+      }).join('');
+      list.querySelectorAll('.mod-esc-del').forEach(function (b) {
+        b.addEventListener('click', function () { deleteEscalationRule(b.getAttribute('data-id')); });
+      });
+      list.querySelectorAll('.mod-esc-edit').forEach(function (b) {
+        b.addEventListener('click', function () { editEscalationRule(b.getAttribute('data-id'), rules); });
+      });
+    } catch (e) { list.textContent = 'Failed to load rules.'; }
+  }
+
+  function escParamsFromForm(triggerType) {
+    if (triggerType === 'report-count') {
+      return {
+        category: document.getElementById('mod-esc-rc-category').value,
+        threshold: parseInt(document.getElementById('mod-esc-rc-threshold').value, 10),
+        window_days: parseInt(document.getElementById('mod-esc-rc-window').value, 10),
+      };
+    }
+    if (triggerType === 'operator-action') {
+      return {
+        action_type: document.getElementById('mod-esc-oa-action').value,
+        threshold: parseInt(document.getElementById('mod-esc-oa-threshold').value, 10),
+        window_days: parseInt(document.getElementById('mod-esc-oa-window').value, 10),
+      };
+    }
+    return { category: document.getElementById('mod-esc-cm-category').value };
+  }
+
+  function resetEscForm() {
+    document.getElementById('mod-esc-edit-id').value = '';
+    document.getElementById('mod-esc-form-legend').textContent = 'Add rule';
+    document.getElementById('mod-esc-cancel').style.display = 'none';
+    document.getElementById('mod-esc-rationale').value = '';
+  }
+
+  function editEscalationRule(id, rules) {
+    const r = rules.filter(function (x) { return x.id === id; })[0];
+    if (!r) return;
+    document.getElementById('mod-esc-edit-id').value = id;
+    document.getElementById('mod-esc-form-legend').textContent = 'Edit rule';
+    document.getElementById('mod-esc-cancel').style.display = '';
+    document.getElementById('mod-esc-trigger-type').value = r.triggerType;
+    syncEscParamsVisibility();
+    const p = r.triggerParams || {};
+    if (r.triggerType === 'report-count') {
+      document.getElementById('mod-esc-rc-category').value = p.category;
+      document.getElementById('mod-esc-rc-threshold').value = p.threshold;
+      document.getElementById('mod-esc-rc-window').value = p.window_days;
+    } else if (r.triggerType === 'operator-action') {
+      document.getElementById('mod-esc-oa-action').value = p.action_type;
+      document.getElementById('mod-esc-oa-threshold').value = p.threshold;
+      document.getElementById('mod-esc-oa-window').value = p.window_days;
+    } else {
+      document.getElementById('mod-esc-cm-category').value = p.category;
+    }
+    document.getElementById('mod-esc-action').value = r.actionType;
+    document.getElementById('mod-esc-enabled').checked = r.enabled;
+  }
+
+  async function saveEscalationRule() {
+    const ep = global.AuroraEndpoints;
+    const triggerType = document.getElementById('mod-esc-trigger-type').value;
+    const rationale = document.getElementById('mod-esc-rationale').value.trim();
+    const body = {
+      triggerType: triggerType,
+      triggerParams: escParamsFromForm(triggerType),
+      actionType: document.getElementById('mod-esc-action').value,
+      enabled: document.getElementById('mod-esc-enabled').checked,
+      rationale: rationale,
+    };
+    const editId = document.getElementById('mod-esc-edit-id').value;
+    try {
+      if (editId) { body.id = editId; await ep.admin.editEscalationRule(body); }
+      else { await ep.admin.createEscalationRule(body); }
+      global.AuroraToast.success('Escalation rule saved.');
+      resetEscForm();
+      await loadEscalationRules();
+    } catch (e) {
+      global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));
+    }
+  }
+
+  async function deleteEscalationRule(id) {
+    const confirmResult = await global.AuroraModal.destructiveConfirm({
+      heading: 'Delete escalation rule',
+      body: 'Soft-delete this rule? It stops firing immediately; history is retained.',
+      confirmLabel: 'Delete rule',
+    });
+    if (!confirmResult.confirmed) return;
+    try {
+      await global.AuroraEndpoints.admin.deleteEscalationRule({ id: id });
+      global.AuroraToast.success('Rule deleted.');
+      await loadEscalationRules();
     } catch (e) {
       global.AuroraToast.danger('Delete failed: ' + (e && e.message ? e.message : ''));
     }

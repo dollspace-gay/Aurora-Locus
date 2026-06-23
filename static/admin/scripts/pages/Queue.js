@@ -95,6 +95,7 @@
       }
       const visible = new Set(items.map((i) => i.subjectDid || (i.subject && i.subject.did)).filter(Boolean));
       bulkSelected = new Set([...bulkSelected].filter((d) => visible.has(d)));
+      const isSuper = global.AuroraSession && global.AuroraSession.hasRole('superadmin');
       c.innerHTML = items.map((item) => {
         const subjDid = item.subjectDid || (item.subject && item.subject.did) || '';
         const checked = bulkSelected.has(subjDid) ? 'checked' : '';
@@ -102,6 +103,9 @@
         // Real per-item status (queue items are reports; status is "open"
         // for everything the queue returns) — not a hardcoded 'pending'.
         const itemStatus = item.status || 'open';
+        // §5.5.4 Phase D — escalated indicator + orphan affordance (§5.5 MD-43).
+        const isEscalated = itemStatus === 'escalated';
+        const isOrphan = isEscalated && !item.assignedOperatorDid;
         return '<div class="mod-item">' +
                '  <div class="mod-header">' +
                '    <input type="checkbox" class="bulk-select-mod" data-did="' + esc(subjDid) +
@@ -114,11 +118,16 @@
                '    ' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(itemStatus) : '<span class="status-badge status-' + esc(itemStatus) + '">' + esc(itemStatus) + '</span>') +
                '  </div>' +
                '  <div class="mod-content">' + esc(item.content || 'No content preview available') + '</div>' +
+               (isOrphan ? '  <div class="mod-orphan-marker" style="color:#c60; font-weight:600;">Escalated, awaiting assignment</div>' : '') +
                '  <div class="mod-actions">' +
                (subjDid ? '<a class="btn-sm btn-secondary" href="#ops/accounts/' + encodeURIComponent(subjDid) + '">Open account</a>' : '') +
+               (isEscalated && isSuper ? ' <button type="button" class="btn-sm mod-deescalate" data-id="' + esc(item.id) + '">De-escalate</button>' : '') +
                '  </div>' +
                '</div>';
       }).join('');
+      c.querySelectorAll('.mod-deescalate').forEach((b) => {
+        b.addEventListener('click', () => deescalate(b.getAttribute('data-id')));
+      });
       c.querySelectorAll('.bulk-select-mod').forEach((cb) => {
         cb.addEventListener('change', (e) => {
           const did = e.target.dataset.did;
@@ -174,5 +183,26 @@
   }
 
   function esc(s) { return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s); }
+  // §5.5.4 Phase D — de-escalate a queue item (SuperAdmin). Prompts for a
+  // rationale, calls clearEscalation, refreshes.
+  async function deescalate(itemId) {
+    const confirmResult = await global.AuroraModal.destructiveConfirm({
+      heading: 'De-escalate item',
+      body: 'Clear the escalation on this item? It returns to the queue (acknowledged) and re-routes per the current assignment mode.',
+      confirmLabel: 'De-escalate',
+      promptLabel: 'Rationale (required)',
+    });
+    if (!confirmResult.confirmed) return;
+    const rationale = (confirmResult.promptValue || '').trim();
+    if (!rationale) { global.AuroraToast.warning('Rationale is required.'); return; }
+    try {
+      await global.AuroraEndpoints.admin.clearEscalation({ itemId: itemId, rationale: rationale });
+      global.AuroraToast.success('Item de-escalated.');
+      refresh();
+    } catch (e) {
+      global.AuroraToast.danger('De-escalate failed: ' + (e && e.message ? e.message : ''));
+    }
+  }
+
   if (global.AuroraRouter) global.AuroraRouter.register('modQueue', { mount: mount });
 })(window);

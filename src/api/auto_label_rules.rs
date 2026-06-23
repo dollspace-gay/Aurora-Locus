@@ -53,7 +53,7 @@ const SOURCE_AUTO_LABEL_RULE: &str = "auto_label_rule";
 
 /// The 16 `emit_event` moderation action_types (`action_kind_str`) — the
 /// validation vocabulary for `operator-action` triggers (Decision 1 scope).
-const OPERATOR_ACTION_TYPES: &[&str] = &[
+pub(crate) const OPERATOR_ACTION_TYPES: &[&str] = &[
     "TakedownAccount",
     "SuspendAccount",
     "RestoreAccount",
@@ -74,7 +74,25 @@ const OPERATOR_ACTION_TYPES: &[&str] = &[
 
 const TRIGGER_TYPES: &[&str] = &["report-count", "operator-action", "account-age-activity"];
 const SUBJECT_SCOPES: &[&str] = &["post", "account", "both"];
-const REPORT_CATEGORIES: &[&str] = &["spam", "violation", "misleading", "sexual", "rude", "other"];
+pub(crate) const REPORT_CATEGORIES: &[&str] =
+    &["spam", "violation", "misleading", "sexual", "rude", "other"];
+
+/// Build a content [`Subject`] from a report's columns (record → `Record`,
+/// account-only → `Repo`). Shared with Phase D's escalation-audit subject
+/// normalization. Returns `None` when the report carries no subject.
+pub(crate) fn report_subject(report: &Report) -> Option<Subject> {
+    if let Some(uri) = report.subject_uri.as_deref() {
+        Some(Subject::Record {
+            uri: uri.to_string(),
+            cid: report.subject_cid.clone().unwrap_or_default(),
+        })
+    } else {
+        report
+            .subject_did
+            .as_deref()
+            .map(|d| Subject::Repo { did: d.to_string() })
+    }
+}
 
 // =====================================================================
 // Subject normalization (§5.9 — Pipeline B; Phase D reuses)
