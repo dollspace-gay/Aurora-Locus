@@ -108,6 +108,22 @@ async fn main() -> PdsResult<()> {
             // Best-effort; never blocks boot.
             api::lexicon_migration::run_lexicon_migration(&ctx).await;
 
+            // v0.9 Federation Pattern-1 Phase A (#351 / design §2.4) — boot-seed
+            // the federation.policy.* runtime keys. Placed after AppContext::new
+            // (audit-chain ready) and before serving (per §2.4: after audit-chain
+            // init, before request-handler acceptance). Phase A invokes it with
+            // an empty seed set: the multi-key transaction primitive runs as a
+            // no-op. Phases B+ pass the FederationConfig-derived seeds here.
+            if let Err(e) = federation::trusted_peer_set::seed_federation_policy(
+                &ctx.account_db,
+                &[],
+                "did:system:boot",
+            )
+            .await
+            {
+                tracing::error!(error = %e, "federation boot-seed failed");
+            }
+
             // Start background jobs
             let scheduler = std::sync::Arc::new(jobs::JobScheduler::new(Arc::clone(&ctx)));
             scheduler.start();

@@ -62,6 +62,12 @@ pub struct AppContext {
     // Relay client for federation
     pub relay_client: Option<Arc<tokio::sync::Mutex<RelayClient>>>,
     // Federation components
+    /// v0.9 Federation Pattern-1 (#351 / design §2.2): the runtime-backed
+    /// trusted-peer read-site. Consumers route trust reads through this rather
+    /// than `config.federation.peer_pds` directly, so phases B+ can make the
+    /// allowlist runtime-mutable without re-touching them. Phase A: the runtime
+    /// key is always unset, so it falls back to `peer_pds` (no behavior change).
+    pub trusted_peers: crate::federation::trusted_peer_set::TrustedPeerSet,
     pub federation_auth: Option<Arc<FederationAuthenticator>>,
     pub pds_discovery: Option<Arc<PdsDiscovery>>,
     pub federated_search: Option<Arc<FederatedSearch>>,
@@ -1122,9 +1128,18 @@ impl AppContext {
             Arc::new(reg)
         };
 
+        // v0.9 Federation Pattern-1 (#351): build the trusted-peer read-site
+        // before `config`/`account_db` are moved into the struct. Phase A seeds
+        // the fallback from the static `peer_pds`; the runtime key is unset.
+        let trusted_peers = crate::federation::trusted_peer_set::TrustedPeerSet::new(
+            account_db.clone(),
+            &config.federation.peer_pds,
+        );
+
         Ok(Self {
             config: Arc::new(config),
             account_db,
+            trusted_peers,
             account_manager,
             audience_oracle_activity: Arc::new(
                 crate::kryphocron_oracle_activity::AudienceOracleActivity::new(chrono::Utc::now()),

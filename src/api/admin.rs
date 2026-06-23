@@ -8452,6 +8452,11 @@ async fn get_federation_policy(
         ));
     }
     let fc = &ctx.config.federation;
+    // v0.9 Federation Pattern-1 (#351 / design §2.2): the describe surface reads
+    // the trusted-peer list through the runtime-backed snapshot rather than the
+    // static `fc.peer_pds`. Phase A: the runtime key is unset, so the snapshot
+    // is the `peer_pds` fallback (identical output to before).
+    let peer_snapshot = ctx.trusted_peers.snapshot().await;
     Ok(Json(FederationPolicyView {
         enabled: fc.enabled,
         relay_urls: fc.relay_urls.clone(),
@@ -8460,8 +8465,8 @@ async fn get_federation_policy(
         crawl_enabled: fc.crawl_enabled,
         public_url: fc.public_url.clone(),
         auto_stream_events: fc.auto_stream_events,
-        peer_pds: fc
-            .peer_pds
+        peer_pds: peer_snapshot
+            .peers
             .iter()
             .map(|p| PeerPdsConfigView {
                 did: p.did.clone(),

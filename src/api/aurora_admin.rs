@@ -3987,7 +3987,22 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY,
     MODERATION_LEXICON_ENUM_HASH_KEY,
     MODERATION_LEXICON_BANNER_KEY,
+    // Federation Pattern-1 Phase A (#351) — the four federation.policy.* keys
+    // (§2.1/§3.1/§4.1/§3.4). Registered now so phases B–E land boot-seed + CRUD
+    // without re-touching the registry; validators stay accept-any this phase
+    // (the `_ => true` arm), tightened per-key as each phase's CRUD lands.
+    FEDERATION_POLICY_PEER_ALLOWLIST_KEY,
+    FEDERATION_POLICY_DISCOVERY_MODE_KEY,
+    FEDERATION_POLICY_RELAY_URLS_KEY,
+    FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
 ];
+
+// Federation Pattern-1 Phase A (#351 / design §2.1, §3.1, §4.1, §3.4).
+pub const FEDERATION_POLICY_PEER_ALLOWLIST_KEY: &str = "federation.policy.peer-allowlist";
+pub const FEDERATION_POLICY_DISCOVERY_MODE_KEY: &str = "federation.policy.discovery-mode";
+pub const FEDERATION_POLICY_RELAY_URLS_KEY: &str = "federation.policy.relay-urls";
+pub const FEDERATION_POLICY_PENDING_DISCOVERIES_KEY: &str =
+    "federation.policy.pending-discoveries";
 pub const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
 /// Env-var override of the file-tier YAML path. Default is
@@ -4028,6 +4043,15 @@ fn default_for_key(key: &str) -> serde_json::Value {
         | MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY => serde_json::Value::from(0),
         MODERATION_LEXICON_ENUM_HASH_KEY | MODERATION_LEXICON_BANNER_KEY => {
             serde_json::Value::String(String::new())
+        }
+        // Federation Pattern-1 Phase A: empty defaults. The boot-seed (phase
+        // B+) populates peer-allowlist/relay-urls from FederationConfig; the
+        // runtime store is unset until then, so consumers fall back to config.
+        FEDERATION_POLICY_PEER_ALLOWLIST_KEY
+        | FEDERATION_POLICY_RELAY_URLS_KEY
+        | FEDERATION_POLICY_PENDING_DISCOVERIES_KEY => serde_json::json!([]),
+        FEDERATION_POLICY_DISCOVERY_MODE_KEY => {
+            serde_json::Value::String("allowlist-only".to_string())
         }
         _ => serde_json::Value::Null,
     }
