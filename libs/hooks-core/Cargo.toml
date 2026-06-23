@@ -1,0 +1,16 @@
+[package]
+name = "hooks-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Structurally-firewalled declaration logic for Aurora-Locus integration hooks. Layer 1 tripwire: this crate declares NO HTTP-client-exposing dependency, direct or transitive (verify: cargo tree --package hooks-core). Pure types + URL validation + netaddr SSRF predicates + event-class taxonomy; no I/O, no networking."
+
+# Layer 1 structural firewall (integration-hooks design addendum §3.2): the
+# dependency set here is deliberately minimal and HTTP-client-free. `url` is a
+# pure parser/IDNA crate (no networking); serde/serde_json are pure
+# serialization. Adding any HTTP-client crate (reqwest, hyper-client, surf, …)
+# here is the boundary violation the tripwire exists to prevent.
+[dependencies]
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

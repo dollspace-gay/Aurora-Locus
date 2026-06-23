@@ -13,15 +13,21 @@
   // (components/ListPage.js, #257). verifiedOnly is a boolean filter (applied
   // client-side post-fetch, below).
   const SCALAR_KEYS = ['actor', 'subject', 'subjectCid', 'action', 'source'];
-  const BOOL_KEYS = ['verifiedOnly', 'ruleManagement'];
+  const BOOL_KEYS = ['verifiedOnly', 'ruleManagement', 'hookManagement'];
 
   function applyFilters(vals) {
-    // §5.5.4 Phase E (MD-44): the source-field filter and the Operator
-    // rule-management filter are mutually exclusive — selecting one clears
-    // the other (precludes the always-empty source+rule-lifecycle combos).
     if (vals) {
-      if (vals.source && vals.ruleManagement) {
-        // Whichever the user just changed wins; default to source.
+      // Integration hooks (#350 / design-commit 26): the Integration-hook
+      // filter is a ONE-WAY-clear sibling — selecting it clears the §5.5.4
+      // source + rule-management filters; selecting a §5.5.4 filter does NOT
+      // clear it (asymmetric, so the empty-intersection case can arise).
+      const turnedOnHook = vals.hookManagement && !(lastFilters && lastFilters.hookManagement);
+      if (turnedOnHook) {
+        vals.source = '';
+        vals.ruleManagement = false;
+      } else if (vals.source && vals.ruleManagement) {
+        // §5.5.4 Phase E (MD-44): source vs rule-management stay mutually
+        // exclusive; hookManagement is left untouched here.
         vals.ruleManagement = false;
       }
     }
@@ -71,6 +77,8 @@
           ] },
           // §5.5.4 Phase E (MD-40): Operator rule-management (rule-lifecycle).
           { type: 'checkbox', id: 'ruleManagement', label: 'Operator rule management' },
+          // Integration hooks (#350): hook-lifecycle filter (one-way-clear sibling).
+          { type: 'checkbox', id: 'hookManagement', label: 'Integration hooks' },
           { type: 'checkbox', id: 'verifiedOnly', label: 'Verified only' },
           { type: 'dateRange', id: 'when', label: 'Date range' },
         ],
@@ -107,7 +115,10 @@
     if (lastFilters.subject) params.subjectDid = lastFilters.subject;
     if (lastFilters.subjectCid) params.subjectCid = lastFilters.subjectCid;
     if (lastFilters.action) params.action = lastFilters.action;
-    // §5.5.4 Phase E — mutually-exclusive source / rule-management filters.
+    // §5.5.4 Phase E — source / rule-management; Integration hooks (#350) —
+    // hook-management. hook-management ANDs with a §5.5.4 filter only via the
+    // asymmetric path (selecting a §5.5.4 filter while hook-management is on).
+    if (lastFilters.hookManagement) params.hookManagement = true;
     if (lastFilters.ruleManagement) params.ruleManagement = true;
     else if (lastFilters.source) params.source = lastFilters.source;
     if (cursor) params.cursor = cursor;
@@ -121,9 +132,16 @@
       renderChainIndicator(data);
       if (lastFilters.verifiedOnly) items = items.filter((e) => e.verified);
       if (items.length === 0) {
+        // Integration hooks (#350 / design-commit 34): explain the
+        // AND-intersection-empty case when the hook filter is combined with a
+        // §5.5.4 filter (reachable via the asymmetric one-way-clear).
+        const intersectionEmpty = lastFilters.hookManagement && (lastFilters.source || lastFilters.ruleManagement);
+        const primary = intersectionEmpty
+          ? 'No entries: the Integration-hook filter and the moderation-defaults filter are combined (AND), and their intersection is empty. Clear one filter to broaden.'
+          : 'No audit entries match these filters.';
         c.innerHTML = global.AuroraEmptyState
-          ? global.AuroraEmptyState.render({ icon: 'inbox', primary: 'No audit entries match these filters.' })
-          : '<p class="empty-state">No entries.</p>';
+          ? global.AuroraEmptyState.render({ icon: 'inbox', primary: primary })
+          : '<p class="empty-state">' + primary + '</p>';
         renderPagination();
         return;
       }

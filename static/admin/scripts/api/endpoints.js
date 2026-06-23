@@ -150,6 +150,12 @@
     clearEscalation: (body) => C().post('tools.aurora.superadmin.clearEscalation', body),
     // §5.5.4 Phase E (#349) — composite-load of all four sub-surfaces.
     getDefaultsState: () => C().get('tools.aurora.superadmin.getDefaultsState'),
+    // v0.9 Integration hooks Phase A (#350) — declaration CRUD + composite-load.
+    createHook: (body) => C().post('tools.aurora.superadmin.createHook', body),
+    editHook: (body) => C().post('tools.aurora.superadmin.editHook', body),
+    deleteHook: (body) => C().post('tools.aurora.superadmin.deleteHook', body),
+    listHooks: (params) => C().get('tools.aurora.superadmin.listHooks', params || {}),
+    getIntegrationHooksState: () => C().get('tools.aurora.superadmin.getIntegrationHooksState'),
     // Repository rebuild (§7.4.1 / #286 + #290). preRebuildCheck: shallow
     // metadata preflight ({did}), or full reconstruction+verification
     // ({did, deep:true}). rebuildRepo: start a rebuild ({did, rationale}) →

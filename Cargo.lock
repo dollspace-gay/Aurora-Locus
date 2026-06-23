@@ -255,6 +255,7 @@ dependencies = [
  "hex",
  "hickory-resolver",
  "hmac",
+ "hooks-core",
  "image",
  "jsonwebtoken",
  "k256",
@@ -2606,6 +2607,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
 dependencies = [
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "hooks-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]

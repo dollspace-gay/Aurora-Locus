@@ -794,6 +794,33 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(get_defaults_state),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // v0.9 Integration hooks Phase A (#350) — declaration CRUD +
+        // composite-load (declaration without execution).
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.createHook",
+            post(create_hook),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.editHook",
+            post(edit_hook),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.deleteHook",
+            post(delete_hook),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.listHooks",
+            get(list_hooks),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getIntegrationHooksState",
+            get(get_integration_hooks_state),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // v0.9 (#329) — upload a login-splash branding asset (logo/banner)
         // directly; writes it under <data>/branding/ and repoints the
         // branding.login-* runtime setting. Raw-body upload (uploadBlob idiom).
@@ -1978,6 +2005,117 @@ async fn get_defaults_state(
         "autoLabelRules": auto_label_rules,
         "escalationRules": escalation_rules,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// v0.9 Integration hooks Phase A (#350) — declaration CRUD. SuperAdmin.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateHookRequest {
+    name: String,
+    url: String,
+    event_classes: Vec<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn create_hook(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<CreateHookRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let hook = crate::api::integration_hooks::create_hook(
+        &ctx,
+        &auth.did,
+        &req.name,
+        &req.url,
+        &req.event_classes,
+        req.description.as_deref(),
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "hook": hook })))
+}
+
+#[derive(Deserialize)]
+struct EditHookRequest {
+    id: String,
+    expected_last_modified_at: String,
+    name: String,
+    url: String,
+    event_classes: Vec<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn edit_hook(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<EditHookRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::integration_hooks::edit_hook(
+        &ctx,
+        &auth.did,
+        &req.id,
+        &req.expected_last_modified_at,
+        &req.name,
+        &req.url,
+        &req.event_classes,
+        req.description.as_deref(),
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+async fn delete_hook(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<DeleteAutoLabelRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::integration_hooks::delete_hook(&ctx, &auth.did, &req.id)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+async fn list_hooks(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(q): Query<ListAutoLabelRulesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let hooks = crate::api::integration_hooks::list_hooks(&ctx, q.include_deleted)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "hooks": hooks })))
+}
+
+async fn get_integration_hooks_state(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let state = crate::api::integration_hooks::integration_hooks_state(&ctx)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(state))
 }
 
 // ---------------------------------------------------------------------------
@@ -10186,7 +10324,7 @@ mod tests {
             r#""getAccountOverrides","#,
             r#""setAccountOverride""#,
             r#"],"#,
-            // tools.aurora.superadmin (28 endpoints)
+            // tools.aurora.superadmin (33 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
@@ -10201,6 +10339,11 @@ mod tests {
             r#""listEscalationRules","#,
             r#""clearEscalation","#,
             r#""getDefaultsState","#,
+            r#""createHook","#,
+            r#""editHook","#,
+            r#""deleteHook","#,
+            r#""listHooks","#,
+            r#""getIntegrationHooksState","#,
             r#""uploadBrandingAsset","#,
             r#""preRebuildCheck","#,
             r#""rebuildRepo","#,

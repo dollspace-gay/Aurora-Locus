@@ -3395,6 +3395,12 @@ pub struct GetAuditTrailParams {
     /// mutually exclusive with `source` (MD-44). Additive.
     #[serde(default)]
     pub rule_management: Option<bool>,
+    /// Integration hooks Phase A (#350 / design-commit 26) — the
+    /// "Integration hook" filter: when true, restricts to the three
+    /// hook-lifecycle action names. UI-side one-way-clear sibling of the
+    /// §5.5.4 filters. Additive.
+    #[serde(default)]
+    pub hook_management: Option<bool>,
     #[serde(flatten)]
     pub pagination: PaginationParams,
 }
@@ -3596,6 +3602,13 @@ pub async fn get_audit_trail(
              'moderation_auto_label_rule_edited', 'moderation_auto_label_rule_deleted', \
              'moderation_escalation_rule_created', 'moderation_escalation_rule_edited', \
              'moderation_escalation_rule_deleted')",
+        );
+    }
+    // Integration hooks (#350 / design-commit 26): the hook-lifecycle filter.
+    if params.hook_management == Some(true) {
+        clauses.push(
+            "action IN ('moderation_integration_hook_created', \
+             'moderation_integration_hook_edited', 'moderation_integration_hook_deleted')",
         );
     }
     if let Some(c) = &cursor {
@@ -6795,6 +6808,7 @@ mod tests {
                 before_created: None,
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6858,6 +6872,7 @@ mod tests {
                         before_created: None,
                         source,
                         rule_management,
+                        hook_management: None,
                         pagination: PaginationParams::default(),
                     }),
                 )
@@ -6926,6 +6941,7 @@ mod tests {
                 after_created: None, before_created: None,
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7008,6 +7024,7 @@ mod tests {
                 before_created: None,
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7031,6 +7048,7 @@ mod tests {
                 before_created: None,
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7093,6 +7111,7 @@ mod tests {
                 before_created: None,
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7148,6 +7167,7 @@ mod tests {
                 before_created: None,
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7259,6 +7279,7 @@ mod tests {
             before_created: None,
             source: None,
             rule_management: None,
+            hook_management: None,
             pagination: PaginationParams { limit, cursor },
         }
     }
@@ -7364,6 +7385,7 @@ mod tests {
                 before_created: None,
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7442,6 +7464,7 @@ mod tests {
                 before_created: Some(timestamps[3].clone()),
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7663,6 +7686,7 @@ mod tests {
                 before_created: None,
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7726,6 +7750,7 @@ mod tests {
                 before_created: None,
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -8083,6 +8108,7 @@ mod tests {
                 before_created: None,
                 source: None,
                 rule_management: None,
+                hook_management: None,
                 pagination: PaginationParams::default(),
             }),
         )

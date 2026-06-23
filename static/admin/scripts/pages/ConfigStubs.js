@@ -44,14 +44,10 @@
     // defaults as an in-page in-development section.
     // configKryphocronPolicy retired in #227 (D-policy-page) — the real
     // page (ConfigKryphocronPolicy.js) registers that key now.
-    {
-      key: 'configIntegrationHooks',
-      domain: 'Configuration',
-      domainRoute: 'configuration/general',
-      title: 'Integration hooks',
-      blurb: 'Available when the integration-hooks backend ships. This page ' +
-             'will manage webhook configuration and external moderation pairing.',
-    },
+    // configIntegrationHooks retired in #350 — the real page
+    // (ConfigIntegrationHooks.js) registers that key now: the declaration-
+    // without-execution hook surface (CRUD over moderation_integration_hook
+    // + the honest "not yet executed" execution-status banner).
     // configObservability retired in #343 — the real page
     // (ConfigObservability.js) registers that key now; a read-only status/
     // overview surface (Recovery-Mode pattern) over the shipped observability

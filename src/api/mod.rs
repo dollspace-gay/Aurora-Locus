@@ -20,6 +20,7 @@ pub mod labels;
 pub mod middleware;
 pub mod auto_label_rules;
 pub mod escalation_rules;
+pub mod integration_hooks;
 pub mod lexicon_migration;
 pub mod moderation;
 pub mod moderation_defaults;
