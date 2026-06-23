@@ -225,6 +225,9 @@ pub async fn apply_report_default(ctx: &AppContext, report: &Report) -> PdsResul
                 HIDE_PENDING_LABEL,
                 SYSTEM_DID,
                 None,
+                // §3.8 provenance: substrate default-action label.
+                "default_action",
+                None,
             )
             .await?;
 

@@ -137,6 +137,11 @@
     revokeRole: (body) => C().post('tools.aurora.superadmin.revokeRole', body),
     // §5.5.4 Phase B (#346) — manual reviewer reassignment.
     assignReviewer: (body) => C().post('tools.aurora.superadmin.assignReviewer', body),
+    // §5.5.4 Phase C (#347) — auto-label rule CRUD.
+    createAutoLabelRule: (body) => C().post('tools.aurora.superadmin.createAutoLabelRule', body),
+    editAutoLabelRule: (body) => C().post('tools.aurora.superadmin.editAutoLabelRule', body),
+    deleteAutoLabelRule: (body) => C().post('tools.aurora.superadmin.deleteAutoLabelRule', body),
+    listAutoLabelRules: (params) => C().get('tools.aurora.superadmin.listAutoLabelRules', params || {}),
     // Repository rebuild (§7.4.1 / #286 + #290). preRebuildCheck: shallow
     // metadata preflight ({did}), or full reconstruction+verification
     // ({did, deep:true}). rebuildRepo: start a rebuild ({did, rationale}) →

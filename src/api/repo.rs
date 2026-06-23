@@ -497,6 +497,17 @@ async fn create_record(
         uri,
         cid
     );
+
+    // §5.5.4 Phase C: Pipeline C account-age-activity auto-label rules fire on
+    // post creation. Best-effort; scoped to feed posts (the activity signal).
+    if req.collection == "app.bsky.feed.post" {
+        if let Err(e) =
+            crate::api::auto_label_rules::evaluate_pipeline_c(&ctx, auth_did, &uri).await
+        {
+            tracing::warn!(error = %e, author = auth_did, "auto-label Pipeline C failed");
+        }
+    }
+
     Ok(Json(CreateRecordResponse { uri, cid }))
 }
 

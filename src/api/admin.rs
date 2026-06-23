@@ -738,6 +738,27 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(assign_reviewer),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // §5.5.4 Phase C (#347) — auto-label rule CRUD (§3.5).
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.createAutoLabelRule",
+            post(create_auto_label_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.editAutoLabelRule",
+            post(edit_auto_label_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.deleteAutoLabelRule",
+            post(delete_auto_label_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.listAutoLabelRules",
+            get(list_auto_label_rules),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // v0.9 (#329) — upload a login-splash branding asset (logo/banner)
         // directly; writes it under <data>/branding/ and repoints the
         // branding.login-* runtime setting. Raw-body upload (uploadBlob idiom).
@@ -1613,6 +1634,143 @@ async fn assign_reviewer(
         "assignedOperatorDid": req.operator_did,
         "auditEntryId": audit_entry_id.to_string(),
     })))
+}
+
+// ---------------------------------------------------------------------------
+// §5.5.4 Phase C — auto-label rule CRUD (#347, §3.5). SuperAdmin-gated.
+// ---------------------------------------------------------------------------
+
+/// Map the store layer's `(u16, String)` into a json_error response.
+fn rule_err((code, msg): (u16, String)) -> (StatusCode, Json<serde_json::Value>) {
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let label = if code == 400 {
+        "InvalidRequest"
+    } else if code == 404 {
+        "NotFound"
+    } else {
+        "InternalServerError"
+    };
+    json_error(status, label, msg)
+}
+
+fn require_superadmin(auth: &AdminAuthContext) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if auth.role.can_act_as(Role::SuperAdmin) {
+        Ok(())
+    } else {
+        Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("requires SuperAdmin role; have {}", auth.role.as_str()),
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateAutoLabelRuleRequest {
+    trigger_type: String,
+    trigger_params: serde_json::Value,
+    label_value: String,
+    subject_scope: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+async fn create_auto_label_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<CreateAutoLabelRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let rule = crate::api::auto_label_rules::create_rule(
+        &ctx,
+        &auth.did,
+        &req.trigger_type,
+        &req.trigger_params,
+        &req.label_value,
+        &req.subject_scope,
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "rule": rule })))
+}
+
+#[derive(Deserialize)]
+struct EditAutoLabelRuleRequest {
+    id: String,
+    trigger_type: String,
+    trigger_params: serde_json::Value,
+    label_value: String,
+    subject_scope: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn edit_auto_label_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<EditAutoLabelRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::auto_label_rules::edit_rule(
+        &ctx,
+        &auth.did,
+        &req.id,
+        &req.trigger_type,
+        &req.trigger_params,
+        &req.label_value,
+        &req.subject_scope,
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+#[derive(Deserialize)]
+struct DeleteAutoLabelRuleRequest {
+    id: String,
+}
+
+async fn delete_auto_label_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<DeleteAutoLabelRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::auto_label_rules::delete_rule(&ctx, &auth.did, &req.id)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+#[derive(Deserialize)]
+struct ListAutoLabelRulesQuery {
+    #[serde(default)]
+    include_deleted: bool,
+}
+
+async fn list_auto_label_rules(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(q): Query<ListAutoLabelRulesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let rules = crate::api::auto_label_rules::list_rules(&ctx, q.include_deleted)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "rules": rules })))
 }
 
 // ---------------------------------------------------------------------------
@@ -3767,6 +3925,8 @@ async fn apply_label(
         &req.val,
         &auth.did,
         expires_in,
+        "manual",
+        None,
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -3933,6 +4093,14 @@ async fn submit_report(
             error = %e,
             report_id = report.id,
             "reviewer-assignment consumer failed on submitReport intake"
+        );
+    }
+    // §5.5.4 Phase C: Pipeline A report-count auto-label rules. Best-effort.
+    if let Err(e) = crate::api::auto_label_rules::evaluate_pipeline_a(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "auto-label Pipeline A failed on submitReport intake"
         );
     }
 
@@ -9727,11 +9895,15 @@ mod tests {
             r#""getAccountOverrides","#,
             r#""setAccountOverride""#,
             r#"],"#,
-            // tools.aurora.superadmin (18 endpoints)
+            // tools.aurora.superadmin (22 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
             r#""assignReviewer","#,
+            r#""createAutoLabelRule","#,
+            r#""editAutoLabelRule","#,
+            r#""deleteAutoLabelRule","#,
+            r#""listAutoLabelRules","#,
             r#""uploadBrandingAsset","#,
             r#""preRebuildCheck","#,
             r#""rebuildRepo","#,

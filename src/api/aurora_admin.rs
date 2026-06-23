@@ -800,6 +800,18 @@ pub async fn emit_event(
         }
     }
 
+    // §5.5.4 Phase C: Pipeline B operator-action auto-label rules — fire
+    // post-commit, once per subject this operator moderation action touched.
+    // Best-effort; the audited action drove the trigger.
+    for subject in &input.subjects {
+        if let Err(e) =
+            crate::api::auto_label_rules::evaluate_pipeline_b(&ctx, subject, action_str, &auth.did)
+                .await
+        {
+            tracing::warn!(error = %e, action = action_str, "auto-label Pipeline B failed");
+        }
+    }
+
     let snapshots = if input.snapshot_capture {
         input
             .subjects
@@ -1054,6 +1066,8 @@ async fn dispatch_action<'tx>(
                 val,
                 &auth.did,
                 None,
+                "manual",
+                None,
             )
             .await?;
             Ok(DispatchEffects::default())
@@ -1088,6 +1102,8 @@ async fn dispatch_action<'tx>(
                 cid.as_deref(),
                 "!takedown",
                 &auth.did,
+                None,
+                "manual",
                 None,
             )
             .await?;

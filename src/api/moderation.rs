@@ -183,6 +183,14 @@ async fn create_report(
             "reviewer-assignment consumer failed on createReport intake"
         );
     }
+    // §5.5.4 Phase C: Pipeline A report-count auto-label rules. Best-effort.
+    if let Err(e) = crate::api::auto_label_rules::evaluate_pipeline_a(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "auto-label Pipeline A failed on createReport intake"
+        );
+    }
 
     // Build response subject
     let subject_json = match &req.subject {

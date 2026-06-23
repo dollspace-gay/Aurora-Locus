@@ -111,11 +111,53 @@
       (isSuper ? '<button type="button" class="btn-primary" id="mod-reviewer-save">Save assignment</button>' : '<p class="settings-help">SuperAdmin role required to change reviewer assignment.</p>') +
       '    </fieldset>' +
       '  </div>' +
+      // §5.5.4 Phase C — auto-label rules (§3).
+      '  <div class="settings-card">' +
+      '    <h3>Auto-label rules <span class="role-tag">SuperAdmin only</span></h3>' +
+      '    <p class="settings-help">Rules that auto-apply a label when a subject accrues reports, operator actions, or (for new accounts) posts — in the <strong>Full</strong> tier only. Max 100 active.</p>' +
+      '    <label><input type="checkbox" id="mod-rules-show-deleted"> Show deleted rules</label>' +
+      '    <div id="mod-rules-list" style="margin:0.5rem 0;">Loading…</div>' +
+      (isSuper ?
+        '    <fieldset><legend id="mod-rule-form-legend">Add rule</legend>' +
+        '      <input type="hidden" id="mod-rule-edit-id" value="">' +
+        '      <label style="display:block;">Trigger' +
+        '        <select id="mod-rule-trigger-type" style="display:block; margin-top:0.2rem;">' +
+        '          <option value="report-count">report-count</option>' +
+        '          <option value="operator-action">operator-action</option>' +
+        '          <option value="account-age-activity">account-age-activity</option>' +
+        '        </select></label>' +
+        '      <div id="mod-rule-params-report-count" class="mod-rule-params">' +
+        '        <label>category ' + categorySelect('mod-rule-rc-category') + '</label>' +
+        '        <label> threshold <input type="number" id="mod-rule-rc-threshold" min="1" style="width:5rem;"></label>' +
+        '        <label> window_days <input type="number" id="mod-rule-rc-window" min="1" max="365" style="width:5rem;"></label>' +
+        '      </div>' +
+        '      <div id="mod-rule-params-operator-action" class="mod-rule-params" style="display:none;">' +
+        '        <label>action_type ' + actionTypeSelect('mod-rule-oa-action') + '</label>' +
+        '        <label> threshold <input type="number" id="mod-rule-oa-threshold" min="1" style="width:5rem;"></label>' +
+        '        <label> window_days <input type="number" id="mod-rule-oa-window" min="1" max="365" style="width:5rem;"></label>' +
+        '      </div>' +
+        '      <div id="mod-rule-params-account-age-activity" class="mod-rule-params" style="display:none;">' +
+        '        <label>max_age_days <input type="number" id="mod-rule-aa-maxage" min="1" max="365" style="width:5rem;"></label>' +
+        '        <label> min_posts <input type="number" id="mod-rule-aa-minposts" min="1" style="width:5rem;"></label>' +
+        '      </div>' +
+        '      <label style="display:block; margin-top:0.4rem;">Label value <input type="text" id="mod-rule-label" placeholder="tools.aurora.ops.moderation.…" style="width:100%;"></label>' +
+        '      <label style="display:block;">Subject scope' +
+        '        <select id="mod-rule-scope" style="display:block; margin-top:0.2rem;">' +
+        '          <option value="account">account</option><option value="post">post</option><option value="both">both</option>' +
+        '        </select></label>' +
+        '      <label style="display:block;"><input type="checkbox" id="mod-rule-enabled" checked> Enabled</label>' +
+        '      <label style="display:block;">Rationale <textarea id="mod-rule-rationale" rows="2" style="width:100%;"></textarea></label>' +
+        '      <button type="button" class="btn-primary" id="mod-rule-save">Save rule</button>' +
+        '      <button type="button" id="mod-rule-cancel" style="display:none;">Cancel edit</button>' +
+        '    </fieldset>'
+        : '    <p class="settings-help">SuperAdmin role required to manage auto-label rules.</p>') +
+      '  </div>' +
       '</div>';
 
     await loadModerationMode();
     await loadModerationDefaults();
     await loadReviewerAssignment();
+    await loadAutoLabelRules();
     if (isSuper) {
       const saveBtn = document.getElementById('mod-mode-save');
       if (saveBtn) saveBtn.addEventListener('click', saveModerationMode);
@@ -130,8 +172,37 @@
       document.querySelectorAll('.mod-reviewer-pool').forEach(function (el) {
         el.addEventListener('input', syncReviewerEmptyWarning);
       });
+      const trig = document.getElementById('mod-rule-trigger-type');
+      if (trig) trig.addEventListener('change', syncRuleParamsVisibility);
+      const ruleSave = document.getElementById('mod-rule-save');
+      if (ruleSave) ruleSave.addEventListener('click', saveAutoLabelRule);
+      const ruleCancel = document.getElementById('mod-rule-cancel');
+      if (ruleCancel) ruleCancel.addEventListener('click', resetRuleForm);
     }
+    const showDel = document.getElementById('mod-rules-show-deleted');
+    if (showDel) showDel.addEventListener('change', loadAutoLabelRules);
     return {};
+  }
+
+  // The 16 emit_event moderation action_types (operator-action trigger).
+  var OPERATOR_ACTION_TYPES = ['TakedownAccount', 'SuspendAccount', 'RestoreAccount', 'DeleteAccount', 'ApplyLabel', 'RemoveLabel', 'TakedownRecord', 'QuarantineBlob', 'RestoreBlob', 'DeleteBlob', 'ResolveReport', 'DismissReport', 'ResolveAppeal', 'EscalateAppeal', 'SendEmail', 'UpdateSubjectStatus'];
+
+  function categorySelect(id) {
+    return '<select id="' + id + '">' + REPORT_CATEGORIES.map(function (c) {
+      return '<option value="' + c + '">' + c + '</option>';
+    }).join('') + '</select>';
+  }
+  function actionTypeSelect(id) {
+    return '<select id="' + id + '">' + OPERATOR_ACTION_TYPES.map(function (a) {
+      return '<option value="' + a + '">' + a + '</option>';
+    }).join('') + '</select>';
+  }
+
+  function syncRuleParamsVisibility() {
+    const t = document.getElementById('mod-rule-trigger-type').value;
+    document.querySelectorAll('.mod-rule-params').forEach(function (el) { el.style.display = 'none'; });
+    const active = document.getElementById('mod-rule-params-' + t);
+    if (active) active.style.display = 'block';
   }
 
   function reviewerMapRows(isSuper) {
@@ -372,6 +443,139 @@
       await loadReviewerAssignment();
     } catch (e) {
       global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));
+    }
+  }
+
+  function ruleSummary(r) {
+    const p = r.triggerParams || {};
+    if (r.triggerType === 'report-count') return 'report-count: ' + p.category + ' ≥' + p.threshold + ' / ' + p.window_days + 'd';
+    if (r.triggerType === 'operator-action') return 'operator-action: ' + p.action_type + ' ≥' + p.threshold + ' / ' + p.window_days + 'd';
+    if (r.triggerType === 'account-age-activity') return 'account-age-activity: <' + p.max_age_days + 'd, ≥' + p.min_posts + ' posts';
+    return r.triggerType;
+  }
+
+  async function loadAutoLabelRules() {
+    const ep = global.AuroraEndpoints;
+    const list = document.getElementById('mod-rules-list');
+    if (!ep || !list) return;
+    const includeDeleted = !!(document.getElementById('mod-rules-show-deleted') || {}).checked;
+    try {
+      const data = await ep.admin.listAutoLabelRules({ includeDeleted: includeDeleted });
+      const rules = (data && data.rules) || [];
+      if (!rules.length) { list.textContent = 'No auto-label rules.'; return; }
+      list.innerHTML = rules.map(function (r) {
+        const deleted = r.deletedAt ? ' <em>(deleted)</em>' : '';
+        const state = r.enabled ? 'enabled' : 'disabled';
+        return '<div class="mod-rule-row" style="border-bottom:1px solid #ddd; padding:0.3rem 0;">' +
+          '<strong>' + esc(r.labelValue) + '</strong> — ' + esc(ruleSummary(r)) + ' [' + esc(r.subjectScope) + ', ' + state + ']' + deleted +
+          (r.deletedAt ? '' :
+            ' <button type="button" class="mod-rule-edit" data-id="' + esc(r.id) + '">Edit</button>' +
+            ' <button type="button" class="mod-rule-del" data-id="' + esc(r.id) + '">Delete</button>') +
+          '</div>';
+      }).join('');
+      list.querySelectorAll('.mod-rule-del').forEach(function (b) {
+        b.addEventListener('click', function () { deleteAutoLabelRule(b.getAttribute('data-id')); });
+      });
+      list.querySelectorAll('.mod-rule-edit').forEach(function (b) {
+        b.addEventListener('click', function () { editAutoLabelRule(b.getAttribute('data-id'), rules); });
+      });
+    } catch (e) { list.textContent = 'Failed to load rules.'; }
+  }
+
+  function ruleParamsFromForm(triggerType) {
+    if (triggerType === 'report-count') {
+      return {
+        category: document.getElementById('mod-rule-rc-category').value,
+        threshold: parseInt(document.getElementById('mod-rule-rc-threshold').value, 10),
+        window_days: parseInt(document.getElementById('mod-rule-rc-window').value, 10),
+      };
+    }
+    if (triggerType === 'operator-action') {
+      return {
+        action_type: document.getElementById('mod-rule-oa-action').value,
+        threshold: parseInt(document.getElementById('mod-rule-oa-threshold').value, 10),
+        window_days: parseInt(document.getElementById('mod-rule-oa-window').value, 10),
+      };
+    }
+    return {
+      max_age_days: parseInt(document.getElementById('mod-rule-aa-maxage').value, 10),
+      min_posts: parseInt(document.getElementById('mod-rule-aa-minposts').value, 10),
+    };
+  }
+
+  function resetRuleForm() {
+    document.getElementById('mod-rule-edit-id').value = '';
+    document.getElementById('mod-rule-form-legend').textContent = 'Add rule';
+    document.getElementById('mod-rule-cancel').style.display = 'none';
+    document.getElementById('mod-rule-label').value = '';
+    document.getElementById('mod-rule-rationale').value = '';
+  }
+
+  function editAutoLabelRule(id, rules) {
+    const r = rules.filter(function (x) { return x.id === id; })[0];
+    if (!r) return;
+    document.getElementById('mod-rule-edit-id').value = id;
+    document.getElementById('mod-rule-form-legend').textContent = 'Edit rule';
+    document.getElementById('mod-rule-cancel').style.display = '';
+    document.getElementById('mod-rule-trigger-type').value = r.triggerType;
+    syncRuleParamsVisibility();
+    const p = r.triggerParams || {};
+    if (r.triggerType === 'report-count') {
+      document.getElementById('mod-rule-rc-category').value = p.category;
+      document.getElementById('mod-rule-rc-threshold').value = p.threshold;
+      document.getElementById('mod-rule-rc-window').value = p.window_days;
+    } else if (r.triggerType === 'operator-action') {
+      document.getElementById('mod-rule-oa-action').value = p.action_type;
+      document.getElementById('mod-rule-oa-threshold').value = p.threshold;
+      document.getElementById('mod-rule-oa-window').value = p.window_days;
+    } else {
+      document.getElementById('mod-rule-aa-maxage').value = p.max_age_days;
+      document.getElementById('mod-rule-aa-minposts').value = p.min_posts;
+    }
+    document.getElementById('mod-rule-label').value = r.labelValue;
+    document.getElementById('mod-rule-scope').value = r.subjectScope;
+    document.getElementById('mod-rule-enabled').checked = r.enabled;
+  }
+
+  async function saveAutoLabelRule() {
+    const ep = global.AuroraEndpoints;
+    const triggerType = document.getElementById('mod-rule-trigger-type').value;
+    const label = document.getElementById('mod-rule-label').value.trim();
+    if (!label) { global.AuroraToast.warning('Label value is required.'); return; }
+    const rationale = document.getElementById('mod-rule-rationale').value.trim();
+    const body = {
+      triggerType: triggerType,
+      triggerParams: ruleParamsFromForm(triggerType),
+      labelValue: label,
+      subjectScope: document.getElementById('mod-rule-scope').value,
+      enabled: document.getElementById('mod-rule-enabled').checked,
+      rationale: rationale,
+    };
+    const editId = document.getElementById('mod-rule-edit-id').value;
+    try {
+      if (editId) { body.id = editId; await ep.admin.editAutoLabelRule(body); }
+      else { await ep.admin.createAutoLabelRule(body); }
+      global.AuroraToast.success('Auto-label rule saved.');
+      resetRuleForm();
+      await loadAutoLabelRules();
+    } catch (e) {
+      global.AuroraToast.danger('Save failed: ' + (e && e.message ? e.message : ''));
+    }
+  }
+
+  async function deleteAutoLabelRule(id) {
+    const confirmResult = await global.AuroraModal.destructiveConfirm({
+      heading: 'Delete auto-label rule',
+      body: 'Soft-delete this rule? It stops firing immediately; history is retained.',
+      confirmLabel: 'Delete rule',
+    });
+    if (!confirmResult.confirmed) return;
+    try {
+      await global.AuroraEndpoints.admin.deleteAutoLabelRule({ id: id });
+      global.AuroraToast.success('Rule deleted.');
+      await loadAutoLabelRules();
+    } catch (e) {
+      global.AuroraToast.danger('Delete failed: ' + (e && e.message ? e.message : ''));
     }
   }
 

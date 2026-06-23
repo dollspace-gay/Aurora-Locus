@@ -35,6 +35,15 @@ pub struct LabelApplication {
     /// matching non-negated label already existed (no row inserted —
     /// the returned `label` is the pre-existing row).
     pub issued: bool,
+    /// §5.5.4 §3.8 (Phase C, #347): when `issued == false`, the
+    /// `rule_id` of the pre-existing active label, or `None` if it was
+    /// not applied by an auto-label rule (manual / default-action /
+    /// pre-Phase-C row). Always `None` on a fresh issue.
+    pub existing_rule_id: Option<String>,
+    /// §3.8 provenance of the pre-existing active label
+    /// (`default_action | auto_label_rule | manual | stale_expiration`),
+    /// or `None` for pre-Phase-C rows. Always `None` on a fresh issue.
+    pub existing_source: Option<String>,
 }
 
 /// Label manager
@@ -59,6 +68,7 @@ impl LabelManager {
         expires_in: Option<chrono::Duration>,
     ) -> PdsResult<Label> {
         let mut tx = self.db.begin().await?;
+        // Pool-API manual apply — provenance is operator-driven.
         let label = Self::apply_label_in_tx(
             &mut tx,
             &self.server_did,
@@ -67,6 +77,8 @@ impl LabelManager {
             val,
             created_by,
             expires_in,
+            "manual",
+            None,
         )
         .await?
         .label;
@@ -91,6 +103,13 @@ impl LabelManager {
         val: &str,
         created_by: &str,
         expires_in: Option<chrono::Duration>,
+        // §5.5.4 §3.8 (Phase C): decision provenance for the label —
+        // `default_action | auto_label_rule | manual | stale_expiration`.
+        // Distinct from the `src` (labeling-authority DID) column.
+        source: &str,
+        // The auto-label rule that applied this label, when source is
+        // `auto_label_rule`; `None` otherwise.
+        rule_id: Option<&str>,
     ) -> PdsResult<LabelApplication> {
         // §2.4 dedup: an ACTIVE non-negated label with the same (uri,
         // val) makes this apply a no-op — return the existing row with
@@ -103,7 +122,7 @@ impl LabelManager {
         // `applied` field; manual callers ignore it via `.label`.
         let existing = sqlx::query(
             r#"
-            SELECT id, cid, src, created_at, created_by, expires_at
+            SELECT id, cid, src, created_at, created_by, expires_at, rule_id, source
             FROM label l
             WHERE l.uri = $1 AND l.val = $2 AND l.neg = FALSE
               AND NOT EXISTS (
@@ -119,9 +138,16 @@ impl LabelManager {
         .fetch_optional(&mut **tx)
         .await?;
         if let Some(row) = existing {
+            // §3.8: surface the pre-existing label's provenance so the
+            // auto-label dedup contract can attribute it. NULL on
+            // pre-Phase-C rows → None.
+            let existing_rule_id: Option<String> = row.try_get("rule_id").ok().flatten();
+            let existing_source: Option<String> = row.try_get("source").ok().flatten();
             return Ok(LabelApplication {
                 label: Self::label_from_row(&row, uri, val, false)?,
                 issued: false,
+                existing_rule_id,
+                existing_source,
             });
         }
 
@@ -130,8 +156,8 @@ impl LabelManager {
 
         let id: i64 = sqlx::query_scalar(
             r#"
-            INSERT INTO label (uri, cid, val, neg, src, created_at, created_by, expires_at)
-            VALUES ($1, $2, $3, FALSE, $4, $5, $6, $7)
+            INSERT INTO label (uri, cid, val, neg, src, created_at, created_by, expires_at, source, rule_id)
+            VALUES ($1, $2, $3, FALSE, $4, $5, $6, $7, $8, $9)
             RETURNING id
             "#,
         )
@@ -142,6 +168,8 @@ impl LabelManager {
         .bind(now.to_rfc3339())
         .bind(created_by)
         .bind(expires_at.map(|dt| dt.to_rfc3339()))
+        .bind(source)
+        .bind(rule_id)
         .fetch_one(&mut **tx)
         .await?;
 
@@ -159,6 +187,8 @@ impl LabelManager {
                 sig: None,
             },
             issued: true,
+            existing_rule_id: None,
+            existing_source: None,
         })
     }
 
@@ -323,7 +353,9 @@ mod tests {
                 created_at TEXT NOT NULL,
                 created_by TEXT NOT NULL,
                 expires_at TEXT,
-                sig BLOB
+                sig BLOB,
+                rule_id TEXT,
+                source TEXT
             )",
         )
         .execute(&pool)
@@ -348,6 +380,8 @@ mod tests {
                 None,
                 "spam",
                 "did:plc:moderator",
+                None,
+                "manual",
                 None,
             )
             .await
@@ -376,6 +410,8 @@ mod tests {
             Some("bafkreitest"),
             "spam",
             "did:plc:moderator",
+            None,
+            "manual",
             None,
         )
         .await
