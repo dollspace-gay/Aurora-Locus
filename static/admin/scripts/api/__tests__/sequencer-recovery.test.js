@@ -47,6 +47,22 @@ test('the page dispatches the validate operation', () => {
   assert.match(PAGE, /runSequencerRecovery\(\{\s*operation:\s*'validate'\s*\}\)/);
 });
 
+test('the page dispatches the route_malformed operation with a rationale (slice 2 / #357)', () => {
+  assert.match(PAGE, /operation:\s*'route_malformed'/);
+  assert.match(PAGE, /rationale:\s*res\.rationale/);
+});
+
+test('the report surfaces the complete affected-DID set and links each to repo-rebuild', () => {
+  // Reads the wire field added in the substrate commit, not the 50-capped sample.
+  assert.match(PAGE, /r\.affectedDids/);
+  assert.match(PAGE, /#ops\/repo-rebuild\//);
+});
+
+test('the routing affordance goes through a typed destructive-confirm', () => {
+  assert.match(PAGE, /AuroraModal\.destructiveConfirm/);
+  assert.match(PAGE, /typedConfirmGate:\s*'REBUILD'/);
+});
+
 test('the page registers the opsSequencerRecovery route handler', () => {
   assert.match(PAGE, /AuroraRouter\.register\('opsSequencerRecovery'/);
 });

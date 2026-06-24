@@ -310,7 +310,15 @@
     "col_did": "Account",
     "col_event_type": "Event type",
     "col_rev": "Rev",
-    "col_prev_rev": "Prior rev"
+    "col_prev_rev": "Prior rev",
+    "affected_heading": "Affected accounts",
+    "affected_help": "{count} account(s) have at least one malformed event. Each can be repaired by rebuilding its repository from history (§7.4.1). Open any account to rebuild it individually, or route all of them below.",
+    "route_button": "Rebuild affected accounts",
+    "route_confirm_heading": "Rebuild malformed-event accounts?",
+    "route_confirm_body": "This queues a repository rebuild for {count} affected account(s), re-deriving each repo from its sequencer history. Each rebuild is destructive (atomic swap) and audited. Accounts with a rebuild already in flight are skipped.",
+    "route_confirm_button": "Rebuild affected accounts",
+    "route_started": "Routing complete: {queued} rebuild(s) queued, {skipped} skipped (already in flight).",
+    "route_unavailable": "Nothing to route — run a deep validation that finds malformed events first."
   },
   "sessions": {
     "menu": "Sessions",

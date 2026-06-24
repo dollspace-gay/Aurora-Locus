@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Encryption-at-rest for private-tier posts — encoded on write and transparently decoded for authorized readers — with a standard rotation oracle, automatic re-encoding on key rotation, and operator read endpoints
 - Admin authentication: refresh-token flow with rotation on use, and per-operator session management with a Sessions page to view and revoke active sessions
 - SuperAdmin can revoke all of an operator's active sessions in one action (for suspected compromise or operator departure), audited with rationale
-- Recovery surfaces: recovery-mode status display, single-repository rebuild, bulk repository repair, and sequencer integrity validation
+- Recovery surfaces: recovery-mode status display, single-repository rebuild, bulk repository repair, and sequencer integrity validation — which can now route the accounts it flags with malformed events straight to a per-account rebuild
 - Blocking a subject now also removes them from the blocker's audiences, with an audit log of the cascade
 - Moderation list pages (Reports, Appeals, Events, Audit) share unified pagination and filtering behavior
 - The moderation queue can be filtered by report status (open, acknowledged, escalated, resolved, or all), with the selection preserved in the URL across navigation and reload

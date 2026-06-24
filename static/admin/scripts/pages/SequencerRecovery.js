@@ -118,6 +118,11 @@
       (p && p.report ? reportHtml(p) : '');
     const b = el('sr-run');
     if (b) b.addEventListener('click', doRun);
+    const rb = el('sr-route');
+    if (rb) {
+      const affected = (p && p.report && p.report.affectedDids) || [];
+      rb.addEventListener('click', () => doRouteMalformed(affected.length));
+    }
   }
 
   function reportHtml(p) {
@@ -144,6 +149,17 @@
         malformed.map((m) => '<tr><td>' + esc(String(m.seq)) + '</td><td><code>' +
           esc(m.did) + '</code></td><td>' + esc(m.eventType) + '</td></tr>').join('') +
         '</tbody></table>';
+    }
+    const affected = r.affectedDids || [];
+    if (affected.length) {
+      html += '<h5>' + esc(t('seqRecovery.affected_heading')) + '</h5>' +
+        '<p class="settings-help">' + esc(t('seqRecovery.affected_help', { count: affected.length })) + '</p>' +
+        '<ul class="did-list">' +
+        affected.map((d) => '<li><a href="#ops/repo-rebuild/' + encodeURIComponent(d) +
+          '"><code>' + esc(d) + '</code></a></li>').join('') +
+        '</ul>' +
+        '<div class="form-actions"><button class="btn btn-danger" id="sr-route">' +
+          esc(t('seqRecovery.route_button')) + '</button></div>';
     }
     if (nonMono.length) {
       html += '<h5>' + esc(t('seqRecovery.non_monotonic_heading')) + '</h5>' +
@@ -194,6 +210,37 @@
     } catch (e) {
       if (e && e.status === 409) {
         global.AuroraToast.danger(t('seqRecovery.run_in_progress'));
+        renderOp();
+      } else {
+        global.AuroraToast.danger(t('common.error', { message: (e && e.message) || '' }));
+      }
+    }
+  }
+
+  // Route the malformed-event accounts to per-account repository rebuild
+  // (§7.4.1). Destructive (fans out N rebuilds), so it goes through the typed
+  // destructive-confirm + a required rationale, mirroring the repo-rebuild page.
+  async function doRouteMalformed(affectedCount) {
+    const res = await global.AuroraModal.destructiveConfirm({
+      heading: t('seqRecovery.route_confirm_heading'),
+      body: t('seqRecovery.route_confirm_body', { count: affectedCount }),
+      rationaleRequired: true,
+      typedConfirmGate: 'REBUILD',
+      confirmLabel: t('seqRecovery.route_confirm_button'),
+    });
+    if (!res.confirmed) return;
+    try {
+      const out = await EP().runSequencerRecovery({
+        operation: 'route_malformed',
+        rationale: res.rationale || '',
+      });
+      const queued = (out && out.queued && out.queued.length) || 0;
+      const skipped = (out && out.skipped && out.skipped.length) || 0;
+      global.AuroraToast.success(t('seqRecovery.route_started', { queued: queued, skipped: skipped }));
+      renderOp();
+    } catch (e) {
+      if (e && e.status === 400) {
+        global.AuroraToast.danger(t('seqRecovery.route_unavailable'));
         renderOp();
       } else {
         global.AuroraToast.danger(t('common.error', { message: (e && e.message) || '' }));
