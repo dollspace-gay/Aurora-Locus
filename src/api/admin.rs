@@ -3114,8 +3114,30 @@ async fn sequencer_recovery_options(
             "malformedCount": r.malformed_count,
             "nonMonotonicCount": r.non_monotonic_count,
             "rowsScanned": r.rows_scanned,
+            "affectedDids": r.affected_dids,
         })
     });
+    // The routing op is offered only once a validate has flagged malformed
+    // events (it routes from that report's affected-DID set).
+    let affected_count = last.report.as_ref().map(|r| r.affected_dids.len()).unwrap_or(0);
+    let mut operations = vec![serde_json::json!({
+        "id": crate::sequencer_recovery::OP_VALIDATE,
+        "label": "Deep integrity validation",
+        "destructive": false,
+        "available": true,
+        "description": "Walk the live sequencer log, decoding every event \
+            and checking per-DID rev monotonicity. Read-only.",
+    })];
+    operations.push(serde_json::json!({
+        "id": crate::sequencer_recovery::OP_ROUTE_MALFORMED,
+        "label": "Rebuild malformed-event accounts",
+        "destructive": true,
+        "available": affected_count > 0,
+        "affectedCount": affected_count,
+        "description": "Rebuild every account the most recent validation flagged \
+            with a malformed event, by re-deriving its repo from history (§7.4.1). \
+            Requires a completed validation that found malformed events.",
+    }));
     Ok(Json(serde_json::json!({
         "state": {
             "totalRows": counts.total_rows,
@@ -3123,16 +3145,7 @@ async fn sequencer_recovery_options(
             "headSeq": counts.head_seq,
             "minSeq": counts.min_seq,
         },
-        "operations": [
-            {
-                "id": crate::sequencer_recovery::OP_VALIDATE,
-                "label": "Deep integrity validation",
-                "destructive": false,
-                "available": true,
-                "description": "Walk the live sequencer log, decoding every event \
-                    and checking per-DID rev monotonicity. Read-only.",
-            }
-        ],
+        "operations": operations,
         "running": last.running,
         "lastValidation": last_validation,
     })))
@@ -3141,10 +3154,10 @@ async fn sequencer_recovery_options(
 #[derive(Deserialize)]
 struct RunSequencerRecoveryRequest {
     operation: String,
-    /// Accepted but unused for the read-only `validate` operation; reserved for
-    /// future destructive recovery operations.
+    /// Ignored by the read-only `validate` operation; REQUIRED by the
+    /// destructive `route_malformed` operation (it is carried into each fanned
+    /// per-account `RepoRebuilt` audit).
     #[serde(default)]
-    #[allow(dead_code)]
     rationale: Option<String>,
 }
 
@@ -3180,6 +3193,61 @@ async fn run_sequencer_recovery(
                     "a sequencer recovery operation is already in progress".to_string(),
                 )),
             }
+        }
+        crate::sequencer_recovery::OP_ROUTE_MALFORMED => {
+            // Each fanned rebuild is a high-impact destructive op, so rationale
+            // is required (it is carried into every per-account RepoRebuilt
+            // audit). Reject blank before queuing anything.
+            let rationale = req
+                .rationale
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required")
+                })?;
+
+            // Route from the most-recent validate report (in-memory on the job).
+            let prog = ctx.sequencer_recovery_job.progress();
+            let dids = crate::sequencer_recovery::dids_to_route(&prog).map_err(|e| {
+                json_error(StatusCode::BAD_REQUEST, "InvalidRequest", e.message().to_string())
+            })?;
+            let validate_job = prog.job_id.clone().unwrap_or_default();
+
+            // Fan a per-account rebuild over the COMPLETE affected set. The
+            // RebuildRegistry's per-DID single-flight is the guard: a DID with a
+            // rebuild already in flight is skipped (not double-queued), not
+            // failed. No new audit variant — each rebuild emits RepoRebuilt with
+            // the routing rationale, which is the trail.
+            let mut queued: Vec<serde_json::Value> = Vec::new();
+            let mut skipped: Vec<serde_json::Value> = Vec::new();
+            for did in &dids {
+                let per_rationale = format!(
+                    "routed from sequencer validation (job {validate_job}) — malformed event(s): {rationale}"
+                );
+                match ctx.rebuild_registry.start(
+                    ctx.clone(),
+                    did.clone(),
+                    auth.did.clone(),
+                    per_rationale,
+                ) {
+                    Ok(job_id) => queued.push(serde_json::json!({ "did": did, "jobId": job_id })),
+                    Err(PdsError::Conflict(_)) => skipped.push(serde_json::json!({
+                        "did": did, "reason": "rebuild_already_in_flight",
+                    })),
+                    Err(e) => {
+                        skipped.push(serde_json::json!({ "did": did, "reason": e.to_string() }))
+                    }
+                }
+            }
+
+            Ok(Json(serde_json::json!({
+                "operation": crate::sequencer_recovery::OP_ROUTE_MALFORMED,
+                "status": "routed",
+                "totalAffected": dids.len(),
+                "queued": queued,
+                "skipped": skipped,
+            })))
         }
         other => Err(json_error(
             StatusCode::BAD_REQUEST,
@@ -13831,12 +13899,68 @@ mod tests {
             .expect("options")
             .0;
         let ops = out["operations"].as_array().unwrap();
-        assert_eq!(ops.len(), 1);
+        assert_eq!(ops.len(), 2);
         assert_eq!(ops[0]["id"], "validate");
         assert_eq!(ops[0]["destructive"], false);
+        // The routing op is advertised but unavailable until a validate flags
+        // malformed events (fresh ctx → no report).
+        assert_eq!(ops[1]["id"], "route_malformed");
+        assert_eq!(ops[1]["destructive"], true);
+        assert_eq!(ops[1]["available"], false);
+        assert_eq!(ops[1]["affectedCount"], 0);
         // Empty test sequencer → zero rows, no head.
         assert_eq!(out["state"]["totalRows"], 0);
         assert_eq!(out["state"]["invalidatedRows"], 0);
+    }
+
+    #[tokio::test]
+    async fn route_malformed_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = run_sequencer_recovery(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            Json(RunSequencerRecoveryRequest {
+                operation: "route_malformed".into(),
+                rationale: Some("fix them".into()),
+            }),
+        )
+        .await
+        .expect_err("Admin (not SuperAdmin) must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn route_malformed_requires_rationale() {
+        let ctx = create_test_context().await;
+        let err = run_sequencer_recovery(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RunSequencerRecoveryRequest {
+                operation: "route_malformed".into(),
+                rationale: Some("   ".into()),
+            }),
+        )
+        .await
+        .expect_err("blank rationale → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_malformed_without_a_report_is_400() {
+        // A SuperAdmin with a valid rationale, but no validate has run → there
+        // is no report to route from (400, not a 500 or a silent no-op).
+        let ctx = create_test_context().await;
+        let err = run_sequencer_recovery(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RunSequencerRecoveryRequest {
+                operation: "route_malformed".into(),
+                rationale: Some("route the malformed accounts".into()),
+            }),
+        )
+        .await
+        .expect_err("no report → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

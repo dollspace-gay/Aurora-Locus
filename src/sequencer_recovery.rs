@@ -45,8 +45,53 @@ use crate::admin::events::{LogEventParams, ModerationEventLogger, ModerationEven
 use crate::context::AppContext;
 use crate::sequencer::IntegrityReport;
 
-/// The wire id of the one shipped recovery operation.
+/// The wire id of the read-only deep-validation operation.
 pub const OP_VALIDATE: &str = "validate";
+
+/// The wire id of the malformed→rebuild routing operation (slice 2 / #357):
+/// fan a per-account repository rebuild (§7.4.1) over the accounts the most
+/// recent validate flagged as having malformed events. Composes the two shipped
+/// surfaces — it introduces no new sequencer mutation (the validator detects;
+/// the rebuild repairs by re-deriving canonical bytes from the actor repo).
+pub const OP_ROUTE_MALFORMED: &str = "route_malformed";
+
+/// Why a malformed-routing op has nothing to dispatch (→ operator-facing 400).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteMalformedError {
+    /// No validate has produced a report since startup (reports are in-memory,
+    /// not persisted) — there is nothing to route from.
+    NoReport,
+    /// The most recent validate found no malformed events.
+    NothingToRoute,
+}
+
+impl RouteMalformedError {
+    /// Operator-facing message for the 400 response.
+    pub fn message(self) -> &'static str {
+        match self {
+            RouteMalformedError::NoReport => {
+                "no sequencer validation report available — run a deep validation first"
+            }
+            RouteMalformedError::NothingToRoute => {
+                "the most recent sequencer validation found no malformed events to route"
+            }
+        }
+    }
+}
+
+/// Decide which DIDs a malformed-routing op should rebuild, from the most-recent
+/// validate report carried on `progress`. Pure — the caller performs the
+/// fan-out through the rebuild registry. Returns the COMPLETE affected-DID set
+/// (`IntegrityReport::affected_dids`, not the 50-capped sample), so every
+/// affected account is rebuilt. A cancelled (partial) report is still routable:
+/// the DIDs it found are genuinely affected.
+pub fn dids_to_route(progress: &RecoveryProgress) -> Result<Vec<String>, RouteMalformedError> {
+    let report = progress.report.as_ref().ok_or(RouteMalformedError::NoReport)?;
+    if report.affected_dids.is_empty() {
+        return Err(RouteMalformedError::NothingToRoute);
+    }
+    Ok(report.affected_dids.clone())
+}
 
 /// Terminal outcome of a recovery run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,5 +329,61 @@ mod tests {
 
         assert!(job.request_cancel());
         assert!(job.progress().cancel_requested);
+    }
+
+    fn report_with(affected: Vec<String>) -> IntegrityReport {
+        IntegrityReport {
+            total_rows: 0,
+            invalidated_rows: 0,
+            head_seq: None,
+            min_seq: None,
+            rows_scanned: 0,
+            malformed_count: affected.len() as u64,
+            malformed: Vec::new(),
+            non_monotonic_count: 0,
+            non_monotonic: Vec::new(),
+            affected_dids: affected,
+        }
+    }
+
+    fn progress_with(report: Option<IntegrityReport>) -> RecoveryProgress {
+        RecoveryProgress {
+            running: false,
+            operation: None,
+            job_id: Some("job-1".to_string()),
+            rows_scanned: 0,
+            started_at: None,
+            finished_at: None,
+            cancel_requested: false,
+            last_outcome: Some("completed"),
+            report,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn dids_to_route_errors_without_a_report() {
+        // No validate has run → nothing to route from.
+        assert_eq!(
+            dids_to_route(&progress_with(None)),
+            Err(RouteMalformedError::NoReport)
+        );
+    }
+
+    #[test]
+    fn dids_to_route_errors_when_validation_found_no_malformed() {
+        assert_eq!(
+            dids_to_route(&progress_with(Some(report_with(vec![])))),
+            Err(RouteMalformedError::NothingToRoute)
+        );
+    }
+
+    #[test]
+    fn dids_to_route_returns_the_complete_affected_set() {
+        let dids = vec!["did:plc:a".to_string(), "did:plc:b".to_string()];
+        assert_eq!(
+            dids_to_route(&progress_with(Some(report_with(dids.clone())))),
+            Ok(dids)
+        );
     }
 }
