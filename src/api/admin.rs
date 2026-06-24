@@ -444,6 +444,22 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(dismiss_pending_discovery),
             CapsBuilder::new(Family::Ops),
         )
+        // v0.9 Federation Pattern-1 Phase D (#354) — relay runtime-switch.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.addRelayUrl",
+            post(add_relay_url),
+            CapsBuilder::new(Family::Ops),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.removeRelayUrl",
+            post(remove_relay_url),
+            CapsBuilder::new(Family::Ops),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.setFederationRelays",
+            post(set_federation_relays),
+            CapsBuilder::new(Family::Ops),
+        )
         // ---- tools.aurora.moderator.* (chainlink #100 / Phase 3.3) ----
         //
         // Moderator-tier read endpoints. Five queries with shared
@@ -8453,6 +8469,10 @@ struct FederationPolicyView {
     public_url: Option<String>,
     auto_stream_events: bool,
     peer_pds: Vec<PeerPdsConfigView>,
+    /// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A2 M2-4) — the
+    /// boot-seed-failure state, so the operator can diagnose the refusal without
+    /// grepping the audit log.
+    boot_seed_status: BootSeedStatus,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -8460,6 +8480,15 @@ struct FederationPolicyView {
 struct PeerPdsConfigView {
     did: String,
     url: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BootSeedStatus {
+    boot_seed_failed: bool,
+    failed_keys: Vec<String>,
+    seeded_keys: Vec<String>,
+    failure_reasons: std::collections::HashMap<String, String>,
 }
 
 /// `tools.aurora.ops.getFederationPolicy` (#344) — SuperAdmin read of the full
@@ -8488,9 +8517,43 @@ async fn get_federation_policy(
     // static `fc.peer_pds`. Phase A: the runtime key is unset, so the snapshot
     // is the `peer_pds` fallback (identical output to before).
     let peer_snapshot = ctx.trusted_peers.snapshot().await;
+    // Phase D (#354 / addendum §A2 H-2): relay_urls reads the runtime store
+    // (federation.policy.relay-urls) with a fallback to the static config, so the
+    // describe reflects runtime relay switches — paralleling peer_pds.
+    let relay_urls = {
+        let v = crate::api::aurora_admin::resolve_runtime_setting(
+            &ctx,
+            crate::api::aurora_admin::FEDERATION_POLICY_RELAY_URLS_KEY,
+        )
+        .await;
+        match serde_json::from_value::<Vec<String>>(v) {
+            Ok(urls) if !urls.is_empty() => urls,
+            _ => fc.relay_urls.clone(),
+        }
+    };
+    // Phase D (#354 / addendum M2-4): surface the boot-seed-failure state.
+    let boot_seed_status = {
+        use std::sync::atomic::Ordering;
+        let failed = ctx.boot_seed_failed.load(Ordering::Acquire);
+        let details = ctx.boot_seed_failure_details.read().await.clone();
+        match details {
+            Some(d) => BootSeedStatus {
+                boot_seed_failed: failed,
+                failed_keys: d.failed_keys,
+                seeded_keys: d.seeded_keys,
+                failure_reasons: d.failure_reasons,
+            },
+            None => BootSeedStatus {
+                boot_seed_failed: failed,
+                failed_keys: vec![],
+                seeded_keys: vec![],
+                failure_reasons: std::collections::HashMap::new(),
+            },
+        }
+    };
     Ok(Json(FederationPolicyView {
         enabled: fc.enabled,
-        relay_urls: fc.relay_urls.clone(),
+        relay_urls,
         appview_url: fc.appview_url.clone(),
         firehose_enabled: fc.firehose_enabled,
         crawl_enabled: fc.crawl_enabled,
@@ -8504,6 +8567,7 @@ async fn get_federation_policy(
                 url: p.url.clone(),
             })
             .collect(),
+        boot_seed_status,
     }))
 }
 
@@ -8523,6 +8587,7 @@ async fn add_federation_peer(
     auth: AdminAuthContext,
     Json(req): Json<AddFederationPeerRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
     require_superadmin(&auth)?;
     crate::api::federation_peers::add_federation_peer(&ctx, &auth.did, &req.did, &req.url)
         .await
@@ -8540,6 +8605,7 @@ async fn remove_federation_peer(
     auth: AdminAuthContext,
     Json(req): Json<RemoveFederationPeerRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
     require_superadmin(&auth)?;
     crate::api::federation_peers::remove_federation_peer(&ctx, &auth.did, &req.did)
         .await
@@ -8559,6 +8625,7 @@ async fn modify_federation_peer(
     auth: AdminAuthContext,
     Json(req): Json<ModifyFederationPeerRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
     require_superadmin(&auth)?;
     crate::api::federation_peers::modify_federation_peer(&ctx, &auth.did, &req.did, &req.new_url)
         .await
@@ -8579,6 +8646,7 @@ async fn set_discovery_mode(
     auth: AdminAuthContext,
     Json(req): Json<SetDiscoveryModeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
     require_superadmin(&auth)?;
     crate::api::federation_discovery::set_discovery_mode(&ctx, &auth.did, &req.mode)
         .await
@@ -8596,11 +8664,82 @@ async fn dismiss_pending_discovery(
     auth: AdminAuthContext,
     Json(req): Json<DismissPendingDiscoveryRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
     require_superadmin(&auth)?;
     crate::api::federation_discovery::dismiss_pending_discovery(&ctx, &auth.did, &req.did)
         .await
         .map_err(|e| e.into_http())?;
     Ok(Json(serde_json::json!({ "success": true, "did": req.did })))
+}
+
+// v0.9 Federation Pattern-1 Phase D (#354) — relay runtime-switch. SuperAdmin-
+// gated; boot-seed-failure-flag-gated; core logic + CAS/reconfigure/audit in
+// `crate::api::federation_relays`.
+
+#[derive(Deserialize)]
+struct AddRelayUrlRequest {
+    url: String,
+}
+
+async fn add_relay_url(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<AddRelayUrlRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_relays::add_relay_url(&ctx, &auth.did, &req.url)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "url": req.url })))
+}
+
+#[derive(Deserialize)]
+struct RemoveRelayUrlRequest {
+    url: String,
+}
+
+async fn remove_relay_url(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RemoveRelayUrlRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_relays::remove_relay_url(&ctx, &auth.did, &req.url)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "url": req.url })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetFederationRelaysRequest {
+    relay_urls: Vec<String>,
+    #[serde(default = "default_transition_mode")]
+    transition_mode: String,
+}
+
+fn default_transition_mode() -> String {
+    "graceful".to_string()
+}
+
+async fn set_federation_relays(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SetFederationRelaysRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_relays::set_federation_relays(
+        &ctx,
+        &auth.did,
+        req.relay_urls.clone(),
+        &req.transition_mode,
+    )
+    .await
+    .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "relayUrls": req.relay_urls })))
 }
 
 /// Relay server info
@@ -10414,7 +10553,7 @@ mod tests {
             r#""listAppeals","#,
             r#""getAppeal""#,
             r#"],"#,
-            // tools.aurora.ops (48 endpoints)
+            // tools.aurora.ops (51 endpoints)
             r#""tools.aurora.ops":["#,
             r#""getStats","#,
             r#""listAccounts","#,
@@ -10454,6 +10593,9 @@ mod tests {
             r#""modifyFederationPeer","#,
             r#""setDiscoveryMode","#,
             r#""dismissPendingDiscovery","#,
+            r#""addRelayUrl","#,
+            r#""removeRelayUrl","#,
+            r#""setFederationRelays","#,
             r#""triggerRotation","#,
             // v0.9 Arc D (#225) — kryphocron operator read cohort.
             r#""getSubstrateInfo","#,

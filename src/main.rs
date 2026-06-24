@@ -116,14 +116,15 @@ async fn main() -> PdsResult<()> {
             // Seed-if-absent + idempotent: a prior boot's runtime contents stay
             // authoritative. discovery-mode / relay-urls / pending-discoveries
             // stay unset (Phases C/D seed them). Best-effort; never blocks boot.
-            api::federation_peers::seed_peer_allowlist(&ctx).await;
-
-            // v0.9 Federation Pattern-1 Phase C (#353 / design §2.4) — boot-seed
-            // discovery-mode ("allowlist-only") + the empty pending-discoveries
-            // surface. Placed before JobScheduler::start() so the discovery
-            // scheduler reads the post-seed mode. Seed-if-absent + idempotent.
-            api::federation_discovery::seed_discovery_mode(&ctx).await;
-            api::federation_discovery::seed_pending_discoveries(&ctx).await;
+            // v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — boot-seed
+            // all four federation.policy.* keys (peer-allowlist, discovery-mode,
+            // pending-discoveries, relay-urls) via independent seed-if-absent
+            // wrappers. relay-urls is gated on federation.enabled. If any seed
+            // fails, emits federation.boot_seed_failed + sets the boot-seed
+            // refusal flag (the 8 mutation XRPCs + the discovery scheduler then
+            // 503/skip). Placed before JobScheduler::start() so the scheduler
+            // reads the post-seed mode + flag.
+            api::federation_peers::run_federation_boot_seed(&ctx).await;
 
             // Start background jobs
             let scheduler = std::sync::Arc::new(jobs::JobScheduler::new(Arc::clone(&ctx)));

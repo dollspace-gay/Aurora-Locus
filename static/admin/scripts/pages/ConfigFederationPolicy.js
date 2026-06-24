@@ -102,6 +102,28 @@
       '  <p class="settings-help">Peers seen during scans, awaiting review. Bounded to the 100 most-recently-seen.</p>' +
       '  <div id="fed-pending-list">Loading…</div>' +
       '</section>' +
+      // v0.9 Phase D (#354) — runtime-mutable relay set.
+      '<hr class="config-section-divider">' +
+      '<section class="installed-themes-section">' +
+      '  <h3>Relay servers <span class="role-tag">SuperAdmin only</span></h3>' +
+      '  <div id="fed-bootseed-banner" style="display:none; padding:0.5rem; border-left:3px solid #b91c1c; background:#fee2e2; margin-bottom:0.6rem;"></div>' +
+      '  <p class="settings-help">The relays this PDS connects to for the firehose. Changes take effect immediately (the firehose respawns against the new set). At least 1, at most 10.</p>' +
+      '  <div id="fed-relays-manage">' + (isSuper ? 'Loading…' : '<p class="settings-help">SuperAdmin role required to manage relays.</p>') + '</div>' +
+      (isSuper ?
+        '  <div id="fed-relay-error" style="margin:0.4rem 0;"></div>' +
+        '  <fieldset id="fed-relay-form" style="margin-top:0.5rem;"><legend>Add relay</legend>' +
+        '    <label style="display:block;">URL (https only) <input type="text" id="fed-relay-url" placeholder="https://…" style="width:100%;"></label>' +
+        '    <button type="button" class="btn-primary" id="fed-relay-add">Add relay</button>' +
+        '  </fieldset>' +
+        '  <fieldset id="fed-relay-switch-form" style="margin-top:0.5rem;"><legend>Replace entire relay set</legend>' +
+        '    <label style="display:block;">Relay URLs (one per line) <textarea id="fed-relay-switch-list" rows="3" style="width:100%;" placeholder="https://relay1\\nhttps://relay2"></textarea></label>' +
+        '    <label style="display:block;">Transition mode ' +
+        '      <select id="fed-relay-transition"><option value="graceful">graceful</option><option value="abrupt">abrupt</option></select></label>' +
+        '    <p class="settings-help" title="In v0.9 both modes perform the same firehose-respawn switch; your selection is recorded in the audit log. Reserved for future connection-draining work.">Transition mode is recorded in the audit log; both modes behave identically in v0.9.</p>' +
+        '    <button type="button" class="btn-primary" id="fed-relay-switch">Replace relay set</button>' +
+        '  </fieldset>'
+        : '') +
+      '</section>' +
       // Section 9 — what peers actually see (read from the public endpoints).
       '<hr class="config-section-divider">' +
       '<section class="installed-themes-section">' +
@@ -120,7 +142,7 @@
       '<hr class="config-section-divider">' +
       '<section class="installed-themes-section">' +
       '  <h3>Coming in a future cycle</h3>' +
-      '  <p class="settings-help">Discovery mode (auto-accept vs allowlist-only) and runtime relay reconfiguration without restart are reserved for later phases of this cycle. The trusted-peer allowlist above is now runtime-mutable; the remaining federation policy still requires editing environment variables and restarting the substrate.</p>' +
+      '  <p class="settings-help">A runtime-mutable federation <code>enabled</code> toggle, relay health monitoring, and peer reputation are reserved for a later release. The trusted-peer allowlist, discovery mode, and relay set above are all now runtime-mutable; the remaining federation flags still require editing environment variables and restarting the substrate.</p>' +
       '</section>';
 
     const btn = document.getElementById('fed-refresh');
@@ -132,6 +154,10 @@
       if (cancel) cancel.addEventListener('click', resetPeerForm);
       const modeSel = document.getElementById('fed-discovery-mode');
       if (modeSel) modeSel.addEventListener('change', onModeChange);
+      const relayAdd = document.getElementById('fed-relay-add');
+      if (relayAdd) relayAdd.addEventListener('click', addRelay);
+      const relaySwitch = document.getElementById('fed-relay-switch');
+      if (relaySwitch) relaySwitch.addEventListener('click', switchRelays);
     }
     await loadAll();
     return {};
@@ -160,6 +186,10 @@
     }
     const modeSel = document.getElementById('fed-discovery-mode');
     if (modeSel) modeSel.disabled = recoveryActive;
+    ['fed-relay-form', 'fed-relay-switch-form'].forEach(function (id) {
+      const f = document.getElementById(id);
+      if (f) f.querySelectorAll('input,button,textarea,select').forEach(function (el) { el.disabled = recoveryActive; });
+    });
   }
 
   // Sections 1-8 — the SuperAdmin full env view.
@@ -189,6 +219,102 @@
     set('fed-crawl', '<strong>' + esc(onoff(p.crawlEnabled)) + '</strong>');
     set('fed-autostream', '<strong>' + esc(onoff(p.autoStreamEvents)) + '</strong>');
     set('fed-public', p.publicUrl ? '<code>' + esc(p.publicUrl) + '</code>' : '<em>Not configured.</em>');
+    if (isSuper) {
+      renderRelayManagement(relays);
+      renderBootSeedBanner(p.bootSeedStatus);
+    }
+  }
+
+  // Phase D — the SuperAdmin editable relay list + boot-seed-failure banner.
+  function renderRelayManagement(relays) {
+    const host = document.getElementById('fed-relays-manage');
+    if (!host) return;
+    if (!relays.length) { host.innerHTML = '<p class="settings-help">No relays bound.</p>'; return; }
+    host.innerHTML = relays.map(function (u) {
+      return '<div class="hook-row" style="border-bottom:1px solid #ddd; padding:0.3rem 0;">' +
+        '<code>' + esc(u) + '</code>' +
+        ' <button type="button" class="fed-relay-remove" data-url="' + esc(u) + '"' + (recoveryActive ? ' disabled' : '') + '>Remove</button>' +
+        '</div>';
+    }).join('');
+    host.querySelectorAll('.fed-relay-remove').forEach(function (b) {
+      b.addEventListener('click', function () { removeRelay(b.getAttribute('data-url')); });
+    });
+    // Pre-fill the switch textarea with the current set for convenience.
+    const ta = document.getElementById('fed-relay-switch-list');
+    if (ta && !ta.value) ta.value = relays.join('\n');
+  }
+
+  function renderBootSeedBanner(status) {
+    const banner = document.getElementById('fed-bootseed-banner');
+    if (!banner) return;
+    if (status && status.bootSeedFailed) {
+      const keys = (status.failedKeys || []).map(esc).join(', ');
+      banner.innerHTML = '<strong>Boot-seed failure — federation policy mutations are disabled.</strong> ' +
+        'Failed keys: <code>' + keys + '</code>. Inspect the audit log, correct configuration, and restart the substrate.';
+      banner.style.display = '';
+    } else {
+      banner.style.display = 'none';
+    }
+  }
+
+  function clearRelayError() {
+    const el = document.getElementById('fed-relay-error');
+    if (el) el.innerHTML = '';
+  }
+
+  function handleRelayError(e, fallback) {
+    const status = e && e.status;
+    const msg = (e && e.message) ? e.message : fallback;
+    if (status && status >= 400 && status < 500) {
+      const el = document.getElementById('fed-relay-error');
+      if (el && global.AuroraInlineError) { el.innerHTML = global.AuroraInlineError.render({ message: msg }); }
+      else if (el) { el.innerHTML = '<p class="settings-help" style="color:#b91c1c;">' + esc(msg) + '</p>'; }
+      else { global.AuroraToast.danger(msg); }
+    } else {
+      global.AuroraToast.danger(msg + ' — retry shortly.');
+    }
+  }
+
+  async function addRelay() {
+    if (recoveryActive) { global.AuroraToast.danger('Disabled during recovery mode.'); return; }
+    const url = (document.getElementById('fed-relay-url').value || '').trim();
+    clearRelayError();
+    if (!url) { global.AuroraToast.warning('URL is required.'); return; }
+    try {
+      await global.AuroraEndpoints.ops.addRelayUrl({ url: url });
+      global.AuroraToast.success('Relay added; firehose respawning.');
+      document.getElementById('fed-relay-url').value = '';
+      await loadPolicy();
+    } catch (e) { handleRelayError(e, 'Add failed.'); }
+  }
+
+  async function removeRelay(url) {
+    if (recoveryActive) { global.AuroraToast.danger('Disabled during recovery mode.'); return; }
+    const r = await global.AuroraModal.destructiveConfirm({
+      heading: 'Remove relay',
+      body: 'Remove ' + url + ' from the relay set? The firehose will respawn against the remaining relays.',
+      confirmLabel: 'Remove relay',
+    });
+    if (!r.confirmed) return;
+    try {
+      await global.AuroraEndpoints.ops.removeRelayUrl({ url: url });
+      global.AuroraToast.success('Relay removed.');
+      await loadPolicy();
+    } catch (e) { handleRelayError(e, 'Remove failed.'); }
+  }
+
+  async function switchRelays() {
+    if (recoveryActive) { global.AuroraToast.danger('Disabled during recovery mode.'); return; }
+    const raw = (document.getElementById('fed-relay-switch-list').value || '').trim();
+    const mode = (document.getElementById('fed-relay-transition') || {}).value || 'graceful';
+    clearRelayError();
+    const urls = raw.split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
+    if (!urls.length) { global.AuroraToast.warning('At least 1 relay URL is required.'); return; }
+    try {
+      await global.AuroraEndpoints.ops.setFederationRelays({ relayUrls: urls, transitionMode: mode });
+      global.AuroraToast.success('Relay set replaced; firehose respawning.');
+      await loadPolicy();
+    } catch (e) { handleRelayError(e, 'Replace failed.'); }
   }
 
   // Phase B — the SuperAdmin editable peer list with per-row edit/remove.

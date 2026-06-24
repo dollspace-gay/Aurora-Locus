@@ -4164,8 +4164,35 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
             .as_str()
             .is_some_and(|s| matches!(s, "allowlist-only" | "auto-accept" | "discovery-disabled")),
         FEDERATION_POLICY_PENDING_DISCOVERIES_KEY => is_valid_pending_discoveries(value),
+        // v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — relay-urls
+        // tightens from accept-any: JSON array, HTTPS, no-dup, 1..=10 entries.
+        FEDERATION_POLICY_RELAY_URLS_KEY => is_valid_relay_urls(value),
         _ => true,
     }
+}
+
+/// v0.9 Federation Pattern-1 Phase D (#354) — relay-urls structural validator:
+/// a JSON array of 1..=10 unique HTTPS URL strings.
+fn is_valid_relay_urls(value: &serde_json::Value) -> bool {
+    let Some(arr) = value.as_array() else {
+        return false;
+    };
+    if arr.is_empty() || arr.len() > 10 {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for el in arr {
+        let Some(url) = el.as_str() else {
+            return false;
+        };
+        if !url.starts_with("https://") {
+            return false;
+        }
+        if !seen.insert(url) {
+            return false;
+        }
+    }
+    true
 }
 
 /// v0.9 Federation Pattern-1 Phase C (#353) — pending-discoveries structural

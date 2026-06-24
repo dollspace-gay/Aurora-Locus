@@ -72,6 +72,22 @@ test('discovery: pending list accept/dismiss wired + recovery-aware', () => {
   assert.ok(/modeSel\.disabled = recoveryActive/.test(src), 'mode selector greyed in recovery');
 });
 
+// v0.9 Federation Pattern-1 Phase D (#354) — relay runtime-switch wiring.
+test('relays: add/remove/replace affordances call the three relay ops XRPCs', () => {
+  assert.ok(/fed-relays-manage/.test(src), 'relay list container');
+  assert.ok(/ops\.addRelayUrl\(/.test(src), 'addRelayUrl wired');
+  assert.ok(/ops\.removeRelayUrl\(/.test(src), 'removeRelayUrl wired');
+  assert.ok(/ops\.setFederationRelays\(/.test(src), 'setFederationRelays wired');
+  assert.ok(/transitionMode/.test(src), 'transition_mode carried on the switch');
+});
+
+test('relays: boot-seed banner + recovery greying + 4xx-inline / 5xx-toast', () => {
+  assert.ok(/fed-bootseed-banner/.test(src) && /renderBootSeedBanner/.test(src), 'boot-seed-failure banner');
+  assert.ok(/bootSeedFailed/.test(src), 'reads bootSeedStatus from describe');
+  assert.ok(/fed-relay-form/.test(src) && /el\.disabled = recoveryActive/.test(src), 'relay affordances greyed in recovery');
+  assert.ok(/status >= 400 && status < 500/.test(src), 'relay 4xx → inline (shared split)');
+});
+
 test('endpoint wrappers exist + the stub row is removed', () => {
   const ep = read('../api/endpoints.js');
   assert.ok(/getFederationPolicy:\s*\(\)\s*=>/.test(ep), 'ops.getFederationPolicy wrapper');
@@ -80,6 +96,9 @@ test('endpoint wrappers exist + the stub row is removed', () => {
   assert.ok(/modifyFederationPeer:\s*\(body\)\s*=>/.test(ep), 'ops.modifyFederationPeer wrapper');
   assert.ok(/setDiscoveryMode:\s*\(body\)\s*=>/.test(ep), 'ops.setDiscoveryMode wrapper');
   assert.ok(/dismissPendingDiscovery:\s*\(body\)\s*=>/.test(ep), 'ops.dismissPendingDiscovery wrapper');
+  assert.ok(/addRelayUrl:\s*\(body\)\s*=>/.test(ep), 'ops.addRelayUrl wrapper');
+  assert.ok(/removeRelayUrl:\s*\(body\)\s*=>/.test(ep), 'ops.removeRelayUrl wrapper');
+  assert.ok(/setFederationRelays:\s*\(body\)\s*=>/.test(ep), 'ops.setFederationRelays wrapper');
   assert.ok(/describeFederationPosture:\s*\(\)\s*=>/.test(ep), 'atproto.describeFederationPosture wrapper');
   const stubs = read('ConfigStubs.js');
   assert.ok(!/key:\s*'configFederationPolicy'/.test(stubs), 'federation stub row removed');

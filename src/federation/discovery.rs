@@ -46,7 +46,10 @@ pub struct PdsInstance {
 pub struct PdsDiscovery {
     http_client: Client,
     known_instances: Arc<RwLock<HashMap<String, PdsInstance>>>,
-    relay_servers: Vec<String>,
+    /// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A5): the relay list
+    /// is runtime-mutable now, so it is read fresh (snapshot-clone) per scan and
+    /// swapped by `refresh_relay_list` on an operator relay switch.
+    relay_servers: Arc<RwLock<Vec<String>>>,
 }
 
 impl PdsDiscovery {
@@ -58,15 +61,31 @@ impl PdsDiscovery {
                 .build()
                 .unwrap(),
             known_instances: Arc::new(RwLock::new(HashMap::new())),
-            relay_servers,
+            relay_servers: Arc::new(RwLock::new(relay_servers)),
         }
+    }
+
+    /// v0.9 Federation Pattern-1 Phase D (#354) — swap the relay list used by
+    /// subsequent discovery scans. Called from the relay-switch primitive after
+    /// the CAS-write succeeds. Write-lock held only for the swap.
+    pub async fn refresh_relay_list(&self, new_relays: &[String]) -> PdsResult<()> {
+        let mut current = self.relay_servers.write().await;
+        *current = new_relays.to_vec();
+        Ok(())
     }
 
     /// Discover PDS instances from relay servers
     pub async fn discover_from_relays(&self) -> PdsResult<Vec<PdsInstance>> {
         let mut all_instances = Vec::new();
 
-        for relay_url in &self.relay_servers {
+        // Snapshot-clone the relay list under a brief read-lock, then iterate the
+        // clone — the per-relay HTTP awaits must NOT hold the lock (would starve
+        // `refresh_relay_list` writers). Mirrors the TrustedPeerSet snapshot.
+        let relay_servers = {
+            let guard = self.relay_servers.read().await;
+            guard.clone()
+        };
+        for relay_url in &relay_servers {
             match self.fetch_instances_from_relay(relay_url).await {
                 Ok(instances) => {
                     info!(
@@ -291,10 +310,28 @@ mod tests {
             "https://relay2.example.com".to_string(),
         ]);
 
-        assert_eq!(discovery.relay_servers.len(), 2);
+        assert_eq!(discovery.relay_servers.read().await.len(), 2);
 
         let instances = discovery.get_known_instances().await;
         assert_eq!(instances.len(), 0); // No instances discovered yet
+    }
+
+    /// v0.9 Federation Pattern-1 Phase D (#354) — `refresh_relay_list` swaps the
+    /// relay list used by subsequent scans.
+    #[tokio::test]
+    async fn refresh_relay_list_swaps_relays() {
+        let discovery = PdsDiscovery::new(vec!["https://r1.example".to_string()]);
+        assert_eq!(discovery.relay_servers.read().await.len(), 1);
+        discovery
+            .refresh_relay_list(&[
+                "https://r2.example".to_string(),
+                "https://r3.example".to_string(),
+            ])
+            .await
+            .unwrap();
+        let current = discovery.relay_servers.read().await;
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[0], "https://r2.example");
     }
 
     #[tokio::test]

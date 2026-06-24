@@ -84,6 +84,10 @@
     // v0.9 Federation Pattern-1 Phase C (#353) — discovery mode + pending dismissal.
     setDiscoveryMode: (body) => C().post('tools.aurora.ops.setDiscoveryMode', body),
     dismissPendingDiscovery: (body) => C().post('tools.aurora.ops.dismissPendingDiscovery', body),
+    // v0.9 Federation Pattern-1 Phase D (#354) — relay runtime-switch (SuperAdmin).
+    addRelayUrl: (body) => C().post('tools.aurora.ops.addRelayUrl', body),
+    removeRelayUrl: (body) => C().post('tools.aurora.ops.removeRelayUrl', body),
+    setFederationRelays: (body) => C().post('tools.aurora.ops.setFederationRelays', body),
     getVersionInfo: () => C().get('tools.aurora.ops.getVersionInfo'),
     listBlobs: (params) => C().get('tools.aurora.ops.listBlobs', params || {}),
     getBlobStatistics: () => C().get('tools.aurora.ops.getBlobStatistics'),

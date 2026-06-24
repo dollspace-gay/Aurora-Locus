@@ -544,6 +544,19 @@ impl JobScheduler {
         loop {
             interval.tick().await;
 
+            // v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6 M-5): skip
+            // the scan while the boot-seed-failure flag is set — state-mutating
+            // discovery (pending upsert / auto-accept) would be incoherent with
+            // the refused operator mutation XRPCs.
+            if scheduler
+                .context
+                .boot_seed_failed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                debug!("Skipping discovery scan: boot_seed_failed flag is set");
+                continue;
+            }
+
             // v0.9 Federation Pattern-1 Phase C (#353 / design §3.2): read the
             // discovery mode once at scan-start. `discovery-disabled` skips the
             // scan entirely (no fetch, no scheduled_discovery_ran audit).

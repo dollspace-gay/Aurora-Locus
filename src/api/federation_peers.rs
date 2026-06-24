@@ -27,9 +27,10 @@
 
 use crate::api::aurora_admin::{
     cas_runtime_setting, read_runtime_row_value, FEDERATION_POLICY_PEER_ALLOWLIST_KEY,
-    FEDERATION_POLICY_PENDING_DISCOVERIES_KEY, RECOVERY_MODE_ENV,
+    FEDERATION_POLICY_PENDING_DISCOVERIES_KEY, FEDERATION_POLICY_RELAY_URLS_KEY, RECOVERY_MODE_ENV,
 };
 use crate::api::moderation_defaults::SYSTEM_DID;
+use crate::error::PdsError;
 use crate::admin::audit_chain::{self, AppendEntryParams};
 use crate::context::AppContext;
 use crate::federation::trusted_peer_set::PeerEntry;
@@ -47,6 +48,15 @@ const ACTION_PEER_SEEDED: &str = "federation.peer_seeded";
 const ACTION_PEER_ADD_ABORTED: &str = "federation.peer_add_aborted";
 const ACTION_PEER_REMOVE_ABORTED: &str = "federation.peer_remove_aborted";
 const ACTION_PEER_MODIFY_ABORTED: &str = "federation.peer_modify_aborted";
+// Phase D (#354 / addendum §A4, §A7) — relay-switch audit names.
+pub(crate) const ACTION_RELAY_ADDED: &str = "federation.relay_added";
+pub(crate) const ACTION_RELAY_REMOVED: &str = "federation.relay_removed";
+pub(crate) const ACTION_RELAY_SWITCHED: &str = "federation.relay_switched";
+const ACTION_RELAY_SEEDED: &str = "federation.relay_seeded";
+pub(crate) const ACTION_RELAY_ADD_ABORTED: &str = "federation.relay_add_aborted";
+pub(crate) const ACTION_RELAY_REMOVE_ABORTED: &str = "federation.relay_remove_aborted";
+pub(crate) const ACTION_RELAY_SWITCH_ABORTED: &str = "federation.relay_switch_aborted";
+const ACTION_BOOT_SEED_FAILED: &str = "federation.boot_seed_failed";
 
 // Audit source attribution (§6.1; memory-#18 translation #2).
 const SOURCE_MANUAL: &str = "manual";
@@ -74,6 +84,16 @@ pub enum FedPeerError {
     InvalidUrl(String),
     /// Invalid discovery-mode value (Phase C `setDiscoveryMode`).
     InvalidMode(String),
+    /// v0.9 Phase D (#354): boot-seed failed at startup; mutations refused until
+    /// the operator corrects config + restarts. (Design `FederationError`
+    /// translated onto this enum — there is no separate `FederationError` in AL.)
+    BootSeedFailureActive,
+    /// Phase D: the 60s relay-switch lock-acquisition timeout fired.
+    LockAcquisitionTimeout,
+    /// Phase D: `RelayClient::reconfigure` failed after the CAS-write succeeded.
+    ReconfigureFailed(String),
+    /// Phase D: relay operation requested but no relay client is configured.
+    NoRelayClient,
     /// Substrate failure (DB / serialization).
     Internal(String),
 }
@@ -120,6 +140,28 @@ impl FedPeerError {
                     "discovery mode must be allowlist-only | auto-accept | discovery-disabled: {mode}"
                 ),
             ),
+            FedPeerError::BootSeedFailureActive => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BootSeedFailureActive",
+                "federation policy mutations are disabled: a boot-seed failed; \
+                 inspect the audit log, correct configuration, and restart"
+                    .to_string(),
+            ),
+            FedPeerError::LockAcquisitionTimeout => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "LockAcquisitionTimeout",
+                "relay-switch lock acquisition timed out; retry shortly".to_string(),
+            ),
+            FedPeerError::ReconfigureFailed(m) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ReconfigureFailed",
+                format!("relay reconfigure failed: {m}; runtime store updated, retry or restart"),
+            ),
+            FedPeerError::NoRelayClient => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "NoRelayClient",
+                "no relay client configured (federation may be disabled)".to_string(),
+            ),
             FedPeerError::Internal(m) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", m)
             }
@@ -133,6 +175,20 @@ impl FedPeerError {
 
 type FedResult<T> = Result<T, FedPeerError>;
 
+/// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — outcome of a
+/// boot-seed wrapper, so `main.rs`'s boot-completion check can tell seeded from
+/// already-seeded from skipped without inspecting the DB again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// The key was unset and is now seeded with `entries_seeded` entries.
+    Seeded { entries_seeded: usize },
+    /// The key was already set on a prior boot; runtime contents preserved.
+    AlreadySeeded,
+    /// Seed skipped because there is no fallback to seed from (relay-urls when
+    /// `federation.enabled = false`). Not a failure.
+    SkippedNoFallback,
+}
+
 /// True when the PDS is in recovery mode (env-gated, mirrors the
 /// moderation-mode read override at `aurora_admin.rs`).
 fn recovery_active() -> bool {
@@ -144,6 +200,19 @@ fn recovery_active() -> bool {
 pub(crate) fn guard_recovery() -> FedResult<()> {
     if recovery_active() {
         Err(FedPeerError::RecoveryMode)
+    } else {
+        Ok(())
+    }
+}
+
+/// Phase D (#354 / addendum §A6) — refuse federation-policy mutations when a
+/// boot-seed failed. Called first at each of the 8 mutation XRPC handlers
+/// (before superadmin/recovery/validation), so no state mutates while the
+/// substrate is in the boot-seed-failure refusal state.
+pub(crate) fn guard_boot_seed(ctx: &AppContext) -> FedResult<()> {
+    use std::sync::atomic::Ordering;
+    if ctx.boot_seed_failed.load(Ordering::Acquire) {
+        Err(FedPeerError::BootSeedFailureActive)
     } else {
         Ok(())
     }
@@ -545,20 +614,17 @@ pub async fn modify_federation_peer(
 /// so the first CRUD CAS has a row) and emit one `federation.peer_seeded` per
 /// peer (`system_diagnostic`). When already set, preserve runtime contents and
 /// ignore the static config — the runtime store is the request-time truth (§1).
-/// Idempotent across reboots (seed-if-absent). Best-effort; never blocks boot.
-pub async fn seed_peer_allowlist(ctx: &AppContext) {
+/// Idempotent across reboots (seed-if-absent). Phase D (#354): returns a typed
+/// `SeedOutcome` so `main.rs` can drive the boot-seed-failure flag; a genuine DB
+/// error now propagates as `Err` instead of being swallowed.
+pub async fn seed_peer_allowlist(ctx: &AppContext) -> Result<SeedOutcome, PdsError> {
     // Already seeded? Leave runtime contents authoritative.
     let exists = sqlx::query("SELECT 1 FROM runtime_settings WHERE key = $1")
         .bind(FEDERATION_POLICY_PEER_ALLOWLIST_KEY)
         .fetch_optional(&ctx.account_db)
-        .await;
-    match exists {
-        Ok(Some(_)) => return,
-        Ok(None) => {}
-        Err(e) => {
-            tracing::error!(error = %e, "peer-allowlist seed: existence probe failed");
-            return;
-        }
+        .await?;
+    if exists.is_some() {
+        return Ok(SeedOutcome::AlreadySeeded);
     }
 
     let peers: Vec<PeerEntry> = ctx
@@ -568,26 +634,14 @@ pub async fn seed_peer_allowlist(ctx: &AppContext) {
         .iter()
         .map(|p| PeerEntry { did: p.did.clone(), url: p.url.clone() })
         .collect();
-    let value = match serde_json::to_value(&peers) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(error = %e, "peer-allowlist seed: encode failed");
-            return;
-        }
-    };
+    let value = serde_json::to_value(&peers).map_err(|e| PdsError::Internal(e.to_string()))?;
     // Reuse the Phase A multi-key seed-if-absent primitive (single key here).
-    // The pre-check above gates audit emission; the primitive's seed-if-absent
-    // semantic keeps a concurrent booter from double-writing the row.
-    if let Err(e) = crate::federation::trusted_peer_set::seed_federation_policy(
+    crate::federation::trusted_peer_set::seed_federation_policy(
         &ctx.account_db,
         &[(FEDERATION_POLICY_PEER_ALLOWLIST_KEY.to_string(), value)],
         SYSTEM_DID,
     )
-    .await
-    {
-        tracing::error!(error = %e, "peer-allowlist seed: insert failed");
-        return;
-    }
+    .await?;
     for p in &peers {
         if let Err(e) = emit(
             ctx,
@@ -603,6 +657,124 @@ pub async fn seed_peer_allowlist(ctx: &AppContext) {
         }
     }
     tracing::info!(count = peers.len(), "federation peer-allowlist seeded from config");
+    Ok(SeedOutcome::Seeded { entries_seeded: peers.len() })
+}
+
+/// Phase D (#354 / addendum §A6) — boot-seed `federation.policy.relay-urls` from
+/// `FederationConfig.relay_urls`. Gated on `federation_enabled`: a disabled
+/// deployment skips (the empty relay set is its correct steady state); an enabled
+/// deployment with no configured relays is a real error (min-1 invariant) that
+/// raises the boot-seed-failure flag. Idempotent (seed-if-absent).
+pub async fn seed_relay_urls(
+    ctx: &AppContext,
+    federation_enabled: bool,
+) -> Result<SeedOutcome, PdsError> {
+    if !federation_enabled {
+        return Ok(SeedOutcome::SkippedNoFallback);
+    }
+    let relays = ctx.config.federation.relay_urls.clone();
+    if relays.is_empty() {
+        return Err(PdsError::SeedFailedMinimumViolation {
+            key: FEDERATION_POLICY_RELAY_URLS_KEY.to_string(),
+            reason: "federation enabled but FederationConfig.relay_urls is empty".to_string(),
+        });
+    }
+
+    let exists = sqlx::query("SELECT 1 FROM runtime_settings WHERE key = $1")
+        .bind(FEDERATION_POLICY_RELAY_URLS_KEY)
+        .fetch_optional(&ctx.account_db)
+        .await?;
+    if exists.is_some() {
+        return Ok(SeedOutcome::AlreadySeeded);
+    }
+
+    let value = serde_json::to_value(&relays).map_err(|e| PdsError::Internal(e.to_string()))?;
+    crate::federation::trusted_peer_set::seed_federation_policy(
+        &ctx.account_db,
+        &[(FEDERATION_POLICY_RELAY_URLS_KEY.to_string(), value)],
+        SYSTEM_DID,
+    )
+    .await?;
+    for url in &relays {
+        if let Err(e) = emit(
+            ctx,
+            SYSTEM_DID,
+            ACTION_RELAY_SEEDED,
+            SOURCE_DIAGNOSTIC,
+            serde_json::json!({ "url": url }),
+            "federation relay seeded from config at boot",
+        )
+        .await
+        {
+            tracing::error!(error = ?e, url = %url, "relay-urls seed: audit emit failed");
+        }
+    }
+    tracing::info!(count = relays.len(), "federation relay-urls seeded from config");
+    Ok(SeedOutcome::Seeded { entries_seeded: relays.len() })
+}
+
+/// Phase D (#354 / addendum §A6) — boot-seed orchestrator. Runs the four
+/// independent seed wrappers in sequence, and if ANY returns `Err`, emits
+/// `federation.boot_seed_failed`, sets the `boot_seed_failed` flag, and records
+/// the details for the describe surface. Independent seeds: a failure in one key
+/// does NOT roll back the others (operators keep partial functionality while
+/// diagnosing). Called from `main.rs` after audit-chain init, before serving.
+pub async fn run_federation_boot_seed(ctx: &AppContext) {
+    use crate::context::BootSeedFailureDetails;
+    use std::sync::atomic::Ordering;
+
+    let mut seeded_keys: Vec<String> = Vec::new();
+    let mut failed_keys: Vec<String> = Vec::new();
+    let mut failure_reasons: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    let mut record = |key: &str, outcome: Result<SeedOutcome, PdsError>| match outcome {
+        Ok(SeedOutcome::Seeded { .. }) | Ok(SeedOutcome::AlreadySeeded) => {
+            seeded_keys.push(key.to_string());
+        }
+        Ok(SeedOutcome::SkippedNoFallback) => { /* not seeded, not failed */ }
+        Err(e) => {
+            failed_keys.push(key.to_string());
+            failure_reasons.insert(key.to_string(), e.to_string());
+            tracing::error!(key, error = %e, "federation boot-seed failed");
+        }
+    };
+
+    record(FEDERATION_POLICY_PEER_ALLOWLIST_KEY, seed_peer_allowlist(ctx).await);
+    record(
+        crate::api::aurora_admin::FEDERATION_POLICY_DISCOVERY_MODE_KEY,
+        crate::api::federation_discovery::seed_discovery_mode(ctx).await,
+    );
+    record(
+        FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
+        crate::api::federation_discovery::seed_pending_discoveries(ctx).await,
+    );
+    record(
+        FEDERATION_POLICY_RELAY_URLS_KEY,
+        seed_relay_urls(ctx, ctx.config.federation.enabled).await,
+    );
+
+    if !failed_keys.is_empty() {
+        let _ = emit(
+            ctx,
+            SYSTEM_DID,
+            ACTION_BOOT_SEED_FAILED,
+            SOURCE_DIAGNOSTIC,
+            serde_json::json!({
+                "failed_keys": failed_keys,
+                "seeded_keys": seeded_keys,
+                "failure_reasons": failure_reasons,
+            }),
+            "federation boot-seed failed: federation-policy mutations refused until corrected",
+        )
+        .await;
+        ctx.boot_seed_failed.store(true, Ordering::Release);
+        *ctx.boot_seed_failure_details.write().await = Some(BootSeedFailureDetails {
+            failed_keys,
+            seeded_keys,
+            failure_reasons,
+        });
+    }
 }
 
 // Shared test fixtures for the federation surface (peers + discovery). Both
@@ -849,12 +1021,12 @@ mod tests {
             ("did:plc:b", "https://b.example"),
         ])
         .await;
-        seed_peer_allowlist(&ctx).await;
+        seed_peer_allowlist(&ctx).await.unwrap();
         let snap = ctx.trusted_peers.snapshot().await;
         assert_eq!(snap.peers.len(), 2);
         assert_eq!(audit_count(&ctx, ACTION_PEER_SEEDED).await, 2);
         // Idempotent: a second seed does not re-write or re-audit.
-        seed_peer_allowlist(&ctx).await;
+        seed_peer_allowlist(&ctx).await.unwrap();
         assert_eq!(audit_count(&ctx, ACTION_PEER_SEEDED).await, 2);
     }
 
@@ -878,14 +1050,75 @@ mod tests {
     async fn seed_then_runtime_contents_authoritative_over_config() {
         let _g = serial().lock().await;
         let ctx = ctx_with_peers(&[("did:plc:cfg", "https://cfg.example")]).await;
-        seed_peer_allowlist(&ctx).await;
+        seed_peer_allowlist(&ctx).await.unwrap();
         // A runtime mutation diverges from config.
         add_federation_peer(&ctx, "did:plc:op", "did:plc:runtime", "https://rt.example")
             .await
             .unwrap();
         // Re-seed (simulating a reboot with the same config) must NOT clobber.
-        seed_peer_allowlist(&ctx).await;
+        seed_peer_allowlist(&ctx).await.unwrap();
         assert!(ctx.trusted_peers.is_trusted("did:plc:runtime").await);
         assert!(ctx.trusted_peers.is_trusted("did:plc:cfg").await);
+    }
+
+    // --- Phase D (#354) boot-seed-failure architecture ---
+
+    #[tokio::test]
+    async fn seed_relay_urls_enabled_gate() {
+        let _g = serial().lock().await;
+        // Disabled → skipped, no error (the empty relay set is the steady state).
+        let ctx = test_support::create_test_context_with(|c| {
+            c.federation.enabled = false;
+            c.federation.relay_urls = vec![];
+        })
+        .await;
+        assert_eq!(
+            seed_relay_urls(&ctx, false).await.unwrap(),
+            SeedOutcome::SkippedNoFallback
+        );
+
+        // Enabled but no relays configured → real error (min-1 violation).
+        assert!(matches!(
+            seed_relay_urls(&ctx, true).await,
+            Err(PdsError::SeedFailedMinimumViolation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn boot_seed_failure_sets_flag_and_audit() {
+        let _g = serial().lock().await;
+        // Federation enabled with NO relays → relay-urls seed fails → flag set.
+        let ctx = test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+            c.federation.relay_urls = vec![];
+        })
+        .await;
+        run_federation_boot_seed(&ctx).await;
+        use std::sync::atomic::Ordering;
+        assert!(ctx.boot_seed_failed.load(Ordering::Acquire));
+        let details = ctx.boot_seed_failure_details.read().await.clone().unwrap();
+        assert!(details.failed_keys.contains(&FEDERATION_POLICY_RELAY_URLS_KEY.to_string()));
+        // The other three keys still seeded (independent-seed robustness).
+        assert!(details.seeded_keys.contains(&FEDERATION_POLICY_PEER_ALLOWLIST_KEY.to_string()));
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = 'federation.boot_seed_failed'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+        // The flag refuses operator mutations.
+        assert!(matches!(guard_boot_seed(&ctx), Err(FedPeerError::BootSeedFailureActive)));
+    }
+
+    #[tokio::test]
+    async fn boot_seed_clean_leaves_flag_unset() {
+        let _g = serial().lock().await;
+        // Federation disabled → no relay-urls failure → flag stays unset.
+        let ctx = ctx_with_peers(&[]).await;
+        run_federation_boot_seed(&ctx).await;
+        use std::sync::atomic::Ordering;
+        assert!(!ctx.boot_seed_failed.load(Ordering::Acquire));
+        assert!(guard_boot_seed(&ctx).is_ok());
     }
 }

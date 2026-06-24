@@ -25,7 +25,18 @@ use crate::{
     read_after_write::LocalRecordsCache,
     sequencer::{Sequencer, SequencerConfig},
 };
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+/// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — details of a
+/// boot-seed failure, surfaced in the `getFederationPolicy` describe so the
+/// operator can diagnose the refusal state without grepping the audit log.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BootSeedFailureDetails {
+    pub failed_keys: Vec<String>,
+    pub seeded_keys: Vec<String>,
+    pub failure_reasons: std::collections::HashMap<String, String>,
+}
 
 /// Application context holding all shared services
 #[derive(Clone)]
@@ -68,6 +79,14 @@ pub struct AppContext {
     /// allowlist runtime-mutable without re-touching them. Phase A: the runtime
     /// key is always unset, so it falls back to `peer_pds` (no behavior change).
     pub trusted_peers: crate::federation::trusted_peer_set::TrustedPeerSet,
+    /// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — set true by the
+    /// `main.rs` boot-completion check when any federation seed failed. Gates the
+    /// 8 federation-policy mutation XRPCs + the discovery scheduler (503/skip).
+    /// `Arc<AtomicBool>` so it shares across `AppContext` clones and stays
+    /// `Clone`-compatible.
+    pub boot_seed_failed: Arc<AtomicBool>,
+    /// Details of the boot-seed failure (if any), for the describe surface.
+    pub boot_seed_failure_details: Arc<tokio::sync::RwLock<Option<BootSeedFailureDetails>>>,
     pub federation_auth: Option<Arc<FederationAuthenticator>>,
     pub pds_discovery: Option<Arc<PdsDiscovery>>,
     pub federated_search: Option<Arc<FederatedSearch>>,
@@ -1140,6 +1159,8 @@ impl AppContext {
             config: Arc::new(config),
             account_db,
             trusted_peers,
+            boot_seed_failed: Arc::new(AtomicBool::new(false)),
+            boot_seed_failure_details: Arc::new(tokio::sync::RwLock::new(None)),
             account_manager,
             audience_oracle_activity: Arc::new(
                 crate::kryphocron_oracle_activity::AudienceOracleActivity::new(chrono::Utc::now()),

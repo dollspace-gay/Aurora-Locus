@@ -29,6 +29,12 @@ pub enum PdsError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// v0.9 Federation Pattern-1 Phase D (#354) — a boot-seed wrapper rejected
+    /// its seed value at boot (e.g. relay-urls min-1 with federation enabled).
+    /// Drives the `federation.boot_seed_failed` flag.
+    #[error("seed failed for {key}: {reason}")]
+    SeedFailedMinimumViolation { key: String, reason: String },
+
     /// Repository errors
     #[error("Repository error: {0}")]
     #[allow(dead_code)] // Future repository errors

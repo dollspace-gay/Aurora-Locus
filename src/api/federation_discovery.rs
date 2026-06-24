@@ -29,7 +29,8 @@ use crate::api::aurora_admin::{
     cas_runtime_setting, read_runtime_row_value, resolve_runtime_setting,
     FEDERATION_POLICY_DISCOVERY_MODE_KEY, FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
 };
-use crate::api::federation_peers::{emit, guard_recovery, FedPeerError};
+use crate::api::federation_peers::{emit, guard_recovery, FedPeerError, SeedOutcome};
+use crate::error::PdsError;
 use crate::api::moderation_defaults::SYSTEM_DID;
 use crate::context::AppContext;
 use crate::federation::discovery::PdsInstance;
@@ -313,8 +314,9 @@ pub async fn process_scan(
 }
 
 /// Boot-seed `federation.policy.discovery-mode` to `allowlist-only` when unset
-/// (design §2.4 / commit 9). Idempotent; emits `discovery_mode_seeded`.
-pub async fn seed_discovery_mode(ctx: &AppContext) {
+/// (design §2.4 / commit 9). Idempotent; emits `discovery_mode_seeded`. Phase D
+/// (#354): typed `SeedOutcome` so `main.rs` drives the boot-seed-failure flag.
+pub async fn seed_discovery_mode(ctx: &AppContext) -> Result<SeedOutcome, PdsError> {
     seed_scalar_if_absent(
         ctx,
         FEDERATION_POLICY_DISCOVERY_MODE_KEY,
@@ -323,12 +325,14 @@ pub async fn seed_discovery_mode(ctx: &AppContext) {
         serde_json::json!({ "mode": MODE_ALLOWLIST_ONLY }),
         "discovery mode seeded at boot",
     )
-    .await;
+    .await
 }
 
 /// Boot-seed `federation.policy.pending-discoveries` to `[]` when unset.
-/// Idempotent; emits `pending_discoveries_seeded`.
-pub async fn seed_pending_discoveries(ctx: &AppContext) {
+/// Idempotent; emits `pending_discoveries_seeded`. It actively seeds the empty
+/// array, so its outcome is `Seeded { entries_seeded: 0 }` / `AlreadySeeded` —
+/// never skipped (addendum R2 M2-2).
+pub async fn seed_pending_discoveries(ctx: &AppContext) -> Result<SeedOutcome, PdsError> {
     seed_scalar_if_absent(
         ctx,
         FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
@@ -337,11 +341,12 @@ pub async fn seed_pending_discoveries(ctx: &AppContext) {
         serde_json::json!({ "initial_count": 0 }),
         "pending-discoveries surface seeded at boot",
     )
-    .await;
+    .await
 }
 
-/// Seed-if-absent for a single runtime key + a one-shot seed audit. Best-effort;
-/// never blocks boot.
+/// Seed-if-absent for a single scalar runtime key + a one-shot seed audit.
+/// Phase D (#354): returns a typed `SeedOutcome`; a genuine DB error propagates.
+/// A single scalar entry seeds as `entries_seeded: 1`.
 async fn seed_scalar_if_absent(
     ctx: &AppContext,
     key: &str,
@@ -349,26 +354,15 @@ async fn seed_scalar_if_absent(
     audit_action: &str,
     audit_payload: serde_json::Value,
     rationale: &str,
-) {
+) -> Result<SeedOutcome, PdsError> {
     let exists = sqlx::query("SELECT 1 FROM runtime_settings WHERE key = $1")
         .bind(key)
         .fetch_optional(&ctx.account_db)
-        .await;
-    match exists {
-        Ok(Some(_)) => return,
-        Ok(None) => {}
-        Err(e) => {
-            tracing::error!(error = %e, key, "discovery seed: existence probe failed");
-            return;
-        }
+        .await?;
+    if exists.is_some() {
+        return Ok(SeedOutcome::AlreadySeeded);
     }
-    let encoded = match serde_json::to_string(&value) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, key, "discovery seed: encode failed");
-            return;
-        }
-    };
+    let encoded = serde_json::to_string(&value).map_err(|e| PdsError::Internal(e.to_string()))?;
     let inserted = sqlx::query(
         "INSERT INTO runtime_settings (key, value, last_modified, last_modified_by) \
          SELECT $1, $2, $3, $4 \
@@ -379,25 +373,15 @@ async fn seed_scalar_if_absent(
     .bind(now())
     .bind(SYSTEM_DID)
     .execute(&ctx.account_db)
-    .await;
-    match inserted {
-        Ok(res) if res.rows_affected() >= 1 => {
-            if let Err(e) = emit(
-                ctx,
-                SYSTEM_DID,
-                audit_action,
-                SOURCE_DIAGNOSTIC,
-                audit_payload,
-                rationale,
-            )
+    .await?;
+    if inserted.rows_affected() >= 1 {
+        if let Err(e) = emit(ctx, SYSTEM_DID, audit_action, SOURCE_DIAGNOSTIC, audit_payload, rationale)
             .await
-            {
-                tracing::error!(error = ?e, key, "discovery seed: audit emit failed");
-            }
+        {
+            tracing::error!(error = ?e, key, "discovery seed: audit emit failed");
         }
-        Ok(_) => {}
-        Err(e) => tracing::error!(error = %e, key, "discovery seed: insert failed"),
     }
+    Ok(SeedOutcome::Seeded { entries_seeded: 1 })
 }
 
 /// `setDiscoveryMode` core (design §3.3). SuperAdmin gating is at the handler;
@@ -561,14 +545,14 @@ mod tests {
     async fn seed_then_mode_is_allowlist_only_and_pending_empty() {
         let _g = crate::api::federation_peers::test_support::serial().lock().await;
         let ctx = crate::api::federation_peers::test_support::ctx_with_peers(&[]).await;
-        seed_discovery_mode(&ctx).await;
-        seed_pending_discoveries(&ctx).await;
+        seed_discovery_mode(&ctx).await.unwrap();
+        seed_pending_discoveries(&ctx).await.unwrap();
         assert_eq!(current_mode(&ctx).await, DiscoveryMode::AllowlistOnly);
         assert_eq!(read_pending(&ctx).await.len(), 0);
         assert_eq!(audit_count(&ctx, ACTION_MODE_SEEDED).await, 1);
         assert_eq!(audit_count(&ctx, ACTION_PENDING_SEEDED).await, 1);
         // Idempotent.
-        seed_discovery_mode(&ctx).await;
+        seed_discovery_mode(&ctx).await.unwrap();
         assert_eq!(audit_count(&ctx, ACTION_MODE_SEEDED).await, 1);
     }
 
@@ -576,7 +560,7 @@ mod tests {
     async fn set_mode_changes_value_and_audits() {
         let _g = crate::api::federation_peers::test_support::serial().lock().await;
         let ctx = crate::api::federation_peers::test_support::ctx_with_peers(&[]).await;
-        seed_discovery_mode(&ctx).await;
+        seed_discovery_mode(&ctx).await.unwrap();
         set_discovery_mode(&ctx, "did:plc:op", "auto-accept").await.unwrap();
         assert_eq!(current_mode(&ctx).await, DiscoveryMode::AutoAccept);
         assert_eq!(audit_count(&ctx, ACTION_MODE_CHANGED).await, 1);
@@ -599,7 +583,7 @@ mod tests {
     async fn allowlist_only_scan_surfaces_to_pending() {
         let _g = crate::api::federation_peers::test_support::serial().lock().await;
         let ctx = crate::api::federation_peers::test_support::ctx_with_peers(&[]).await;
-        seed_pending_discoveries(&ctx).await;
+        seed_pending_discoveries(&ctx).await.unwrap();
         let instances = [inst("did:plc:a", "https://a.example")];
         process_scan(&ctx, &instances, DiscoveryMode::AllowlistOnly, true).await;
         let pending = read_pending(&ctx).await;
@@ -630,7 +614,7 @@ mod tests {
     async fn rediscovery_updates_last_seen_no_duplicate() {
         let _g = crate::api::federation_peers::test_support::serial().lock().await;
         let ctx = crate::api::federation_peers::test_support::ctx_with_peers(&[]).await;
-        seed_pending_discoveries(&ctx).await;
+        seed_pending_discoveries(&ctx).await.unwrap();
         let instances = [inst("did:plc:a", "https://a.example")];
         let o1 = upsert_pending_discovery(&ctx, &instances[0], "scan1").await.unwrap();
         let o2 = upsert_pending_discovery(&ctx, &instances[0], "scan2").await.unwrap();
@@ -694,7 +678,7 @@ mod tests {
     async fn dismiss_removes_and_audits() {
         let _g = crate::api::federation_peers::test_support::serial().lock().await;
         let ctx = crate::api::federation_peers::test_support::ctx_with_peers(&[]).await;
-        seed_pending_discoveries(&ctx).await;
+        seed_pending_discoveries(&ctx).await.unwrap();
         upsert_pending_discovery(&ctx, &inst("did:plc:a", "https://a.example"), "s").await.unwrap();
         dismiss_pending_discovery(&ctx, "did:plc:op", "did:plc:a").await.unwrap();
         assert_eq!(read_pending(&ctx).await.len(), 0);
@@ -710,7 +694,7 @@ mod tests {
     async fn disabled_mode_per_peer_noop() {
         let _g = crate::api::federation_peers::test_support::serial().lock().await;
         let ctx = crate::api::federation_peers::test_support::ctx_with_peers(&[]).await;
-        seed_pending_discoveries(&ctx).await;
+        seed_pending_discoveries(&ctx).await.unwrap();
         process_scan(&ctx, &[inst("did:plc:a", "https://a.example")], DiscoveryMode::DiscoveryDisabled, false).await;
         assert_eq!(read_pending(&ctx).await.len(), 0);
         assert!(!ctx.trusted_peers.is_trusted("did:plc:a").await);
@@ -720,8 +704,8 @@ mod tests {
     async fn recovery_mode_blocks_both_discovery_xrpcs() {
         let _g = crate::api::federation_peers::test_support::serial().lock().await;
         let ctx = crate::api::federation_peers::test_support::ctx_with_peers(&[]).await;
-        seed_discovery_mode(&ctx).await;
-        seed_pending_discoveries(&ctx).await;
+        seed_discovery_mode(&ctx).await.unwrap();
+        seed_pending_discoveries(&ctx).await.unwrap();
         upsert_pending_discovery(&ctx, &inst("did:plc:a", "https://a.example"), "s").await.unwrap();
         std::env::set_var(
             crate::api::aurora_admin::RECOVERY_MODE_ENV,
@@ -741,8 +725,8 @@ mod tests {
     async fn mode_change_does_not_retroactively_accept_pending() {
         let _g = crate::api::federation_peers::test_support::serial().lock().await;
         let ctx = crate::api::federation_peers::test_support::ctx_with_peers(&[]).await;
-        seed_discovery_mode(&ctx).await;
-        seed_pending_discoveries(&ctx).await;
+        seed_discovery_mode(&ctx).await.unwrap();
+        seed_pending_discoveries(&ctx).await.unwrap();
         // allowlist-only surfaces a peer to pending.
         process_scan(&ctx, &[inst("did:plc:a", "https://a.example")], DiscoveryMode::AllowlistOnly, false).await;
         // Switch to auto-accept; the existing pending entry is NOT retroactively trusted.
