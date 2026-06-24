@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The deployment moderation tier (full, reduced, disabled) is now set on the Moderation policy page instead of UI & modes; switching to the disabled tier requires a typed confirmation
 - Kryphocron is now enabled by default on fresh deployments; operators can disable it by setting PDS_KRYPHOCRON_ENABLED=false
 - Operator role changes now take effect on the next request, without requiring re-login
+- proto-blue dependency pin updated to 0.3.3 to match the already-resolved version (no API impact)
 
 ### Fixed
 - Kryphocron Policy settings now save instead of erroring (new-account access, default audience mode, deployment process-shape, and per-account cadence range); the process-shape declaration drives the Overview's single-/multi-process mismatch warning

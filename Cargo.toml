@@ -16,7 +16,7 @@ members = ["libs/hooks-core"]
 
 [dependencies]
 # AT Protocol SDK (published crate, replaces the previously vendored ./Rust-Atproto-SDK)
-proto-blue = "0.3.1"
+proto-blue = "0.3.3"
 
 # v0.9 Integration hooks (#350) — structurally-firewalled declaration logic
 # (hook types, URL validation, netaddr SSRF predicates, event-class taxonomy).
