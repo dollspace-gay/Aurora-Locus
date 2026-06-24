@@ -3401,6 +3401,12 @@ pub struct GetAuditTrailParams {
     /// §5.5.4 filters. Additive.
     #[serde(default)]
     pub hook_management: Option<bool>,
+    /// Federation Pattern-1 Phase E (#355 / design §5.3 + commit 32) — the
+    /// "Federation management" filter: when true, restricts to the `federation.*`
+    /// action namespace (all peer/relay/discovery/boot-seed audit names). UI-side
+    /// one-way-clear sibling of the §5.5.4 filters, mirroring `hook_management`.
+    #[serde(default)]
+    pub federation_management: Option<bool>,
     #[serde(flatten)]
     pub pagination: PaginationParams,
 }
@@ -3610,6 +3616,13 @@ pub async fn get_audit_trail(
             "action IN ('moderation_integration_hook_created', \
              'moderation_integration_hook_edited', 'moderation_integration_hook_deleted')",
         );
+    }
+    // Federation Pattern-1 Phase E (#355 / design §5.3): the federation-management
+    // filter — the whole `federation.*` action namespace via a prefix LIKE
+    // (robust to the ~26 federation audit names without a static IN-clause; the
+    // literal `.` and trailing `%` carry no `?` so renumbering is unaffected).
+    if params.federation_management == Some(true) {
+        clauses.push("action LIKE 'federation.%'");
     }
     if let Some(c) = &cursor {
         clauses.push("(created_at < ? OR (created_at = ? AND id < ?))");
@@ -6938,6 +6951,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7002,6 +7016,7 @@ mod tests {
                         source,
                         rule_management,
                         hook_management: None,
+                        federation_management: None,
                         pagination: PaginationParams::default(),
                     }),
                 )
@@ -7021,6 +7036,67 @@ mod tests {
         assert_eq!(rm[0].action, "moderation_auto_label_rule_created");
         // source='manual' → both manual entries (incl. the rule-lifecycle one).
         assert_eq!(query(Some("manual"), None).await.len(), 2);
+    }
+
+    // Federation Pattern-1 Phase E (#355 / §5.3) — federation-management filter:
+    // the whole federation.* namespace via the prefix LIKE.
+    #[tokio::test]
+    async fn get_audit_trail_federation_management_filter() {
+        let ctx = create_test_context().await;
+        let ins = |source: &'static str, action: &'static str| {
+            let db = ctx.account_db.clone();
+            let backend = ctx.config.database.backend;
+            async move {
+                crate::admin::audit_chain::insert_chain_entry_pool(
+                    &db,
+                    backend,
+                    crate::admin::audit_chain::AppendEntryParams {
+                        source,
+                        payload: None,
+                        actor_did: "did:plc:m1",
+                        action,
+                        subject: Some(&repo_subject("did:plc:s1")),
+                        rationale: "r",
+                        snapshot_id: None,
+                        event_id: None,
+                        cascade_subjects: &[],
+                        cascade_snapshot_ids: &[],
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+        // Three federation.* entries (peer / relay / discovery) + one non-federation.
+        ins("manual", "federation.peer_added").await;
+        ins("manual", "federation.relay_switched").await;
+        ins("manual", "federation.discovery_mode_changed").await;
+        ins("manual", "role.grant").await;
+
+        let resp = get_audit_trail(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: None,
+                subject_uri: None,
+                subject_cid: None,
+                after_created: None,
+                before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: Some(true),
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        // Exactly the three federation.* entries; the role.grant is excluded.
+        assert_eq!(resp.items.len(), 3);
+        assert!(resp.items.iter().all(|e| e.action.starts_with("federation.")));
     }
 
     #[tokio::test]
@@ -7071,6 +7147,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7154,6 +7231,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7178,6 +7256,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7241,6 +7320,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7297,6 +7377,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7409,6 +7490,7 @@ mod tests {
             source: None,
             rule_management: None,
             hook_management: None,
+            federation_management: None,
             pagination: PaginationParams { limit, cursor },
         }
     }
@@ -7515,6 +7597,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7594,6 +7677,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7816,6 +7900,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -7880,6 +7965,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -8238,6 +8324,7 @@ mod tests {
                 source: None,
                 rule_management: None,
                 hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )

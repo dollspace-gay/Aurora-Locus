@@ -8473,6 +8473,23 @@ struct FederationPolicyView {
     /// boot-seed-failure state, so the operator can diagnose the refusal without
     /// grepping the audit log.
     boot_seed_status: BootSeedStatus,
+    /// v0.9 Federation Pattern-1 Phase E (#355 / design §6.4) — composite-load:
+    /// the live discovery mode + pending-discovery surface, so external operator
+    /// tooling reads all runtime federation policy in one call (the page already
+    /// renders these via getRuntimeSetting).
+    discovery_mode: String,
+    pending_discoveries: Vec<PendingDiscoveryView>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingDiscoveryView {
+    did: String,
+    url: String,
+    first_seen_at: String,
+    last_seen_at: String,
+    first_scan_id: String,
+    last_seen_scan_id: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -8551,6 +8568,30 @@ async fn get_federation_policy(
             },
         }
     };
+    // Phase E (#355 / §6.4): composite-load discovery-mode + pending-discoveries.
+    let discovery_mode = crate::api::federation_discovery::current_mode(&ctx)
+        .await
+        .as_str()
+        .to_string();
+    let pending_discoveries = {
+        let v = crate::api::aurora_admin::resolve_runtime_setting(
+            &ctx,
+            crate::api::aurora_admin::FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
+        )
+        .await;
+        serde_json::from_value::<Vec<crate::api::federation_discovery::PendingEntry>>(v)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| PendingDiscoveryView {
+                did: e.did,
+                url: e.url,
+                first_seen_at: e.first_seen_at,
+                last_seen_at: e.last_seen_at,
+                first_scan_id: e.first_scan_id,
+                last_seen_scan_id: e.last_seen_scan_id,
+            })
+            .collect()
+    };
     Ok(Json(FederationPolicyView {
         enabled: fc.enabled,
         relay_urls,
@@ -8568,6 +8609,8 @@ async fn get_federation_policy(
             })
             .collect(),
         boot_seed_status,
+        discovery_mode,
+        pending_discoveries,
     }))
 }
 
@@ -9221,6 +9264,12 @@ mod tests {
         assert_eq!(view.peer_pds.len(), 1);
         assert_eq!(view.peer_pds[0].did, "did:plc:peer");
         assert_eq!(view.peer_pds[0].url, "https://peer.example");
+        // Phase E (#355) composite-load: discovery-mode + pending-discoveries +
+        // boot-seed status all surface in the one read. Unseeded runtime →
+        // discovery_mode resolves to the default; pending list empty; not failed.
+        assert_eq!(view.discovery_mode, "allowlist-only");
+        assert!(view.pending_discoveries.is_empty());
+        assert!(!view.boot_seed_status.boot_seed_failed);
     }
 
     // §5.5.4 Phase E — composite-load gating + section composition.

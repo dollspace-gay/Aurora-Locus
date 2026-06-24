@@ -13,16 +13,18 @@
   // (components/ListPage.js, #257). verifiedOnly is a boolean filter (applied
   // client-side post-fetch, below).
   const SCALAR_KEYS = ['actor', 'subject', 'subjectCid', 'action', 'source'];
-  const BOOL_KEYS = ['verifiedOnly', 'ruleManagement', 'hookManagement'];
+  const BOOL_KEYS = ['verifiedOnly', 'ruleManagement', 'hookManagement', 'federationManagement'];
 
   function applyFilters(vals) {
     if (vals) {
-      // Integration hooks (#350 / design-commit 26): the Integration-hook
-      // filter is a ONE-WAY-clear sibling — selecting it clears the §5.5.4
-      // source + rule-management filters; selecting a §5.5.4 filter does NOT
-      // clear it (asymmetric, so the empty-intersection case can arise).
+      // Integration hooks (#350 / design-commit 26) + Federation Pattern-1
+      // Phase E (#355 / design §5.3): the Integration-hook and Federation-
+      // management filters are ONE-WAY-clear siblings — selecting either clears
+      // the §5.5.4 source + rule-management filters; selecting a §5.5.4 filter
+      // does NOT clear them (asymmetric, so the empty-intersection case arises).
       const turnedOnHook = vals.hookManagement && !(lastFilters && lastFilters.hookManagement);
-      if (turnedOnHook) {
+      const turnedOnFed = vals.federationManagement && !(lastFilters && lastFilters.federationManagement);
+      if (turnedOnHook || turnedOnFed) {
         vals.source = '';
         vals.ruleManagement = false;
       } else if (vals.source && vals.ruleManagement) {
@@ -74,11 +76,16 @@
             { value: 'escalation', label: 'Escalation' },
             { value: 'system_diagnostic', label: 'System diagnostic' },
             { value: 'manual', label: 'Manual (operator)' },
+            // Federation Pattern-1 Phase C/E (#353/#355): auto-accept-mode peer
+            // additions during a discovery scan carry source=discovery.
+            { value: 'discovery', label: 'Discovery (auto-accept)' },
           ] },
           // §5.5.4 Phase E (MD-40): Operator rule-management (rule-lifecycle).
           { type: 'checkbox', id: 'ruleManagement', label: 'Operator rule management' },
           // Integration hooks (#350): hook-lifecycle filter (one-way-clear sibling).
           { type: 'checkbox', id: 'hookManagement', label: 'Integration hooks' },
+          // Federation Pattern-1 Phase E (#355): federation.* filter (sibling).
+          { type: 'checkbox', id: 'federationManagement', label: 'Federation management' },
           { type: 'checkbox', id: 'verifiedOnly', label: 'Verified only' },
           { type: 'dateRange', id: 'when', label: 'Date range' },
         ],
@@ -119,6 +126,7 @@
     // hook-management. hook-management ANDs with a §5.5.4 filter only via the
     // asymmetric path (selecting a §5.5.4 filter while hook-management is on).
     if (lastFilters.hookManagement) params.hookManagement = true;
+    if (lastFilters.federationManagement) params.federationManagement = true;
     if (lastFilters.ruleManagement) params.ruleManagement = true;
     else if (lastFilters.source) params.source = lastFilters.source;
     if (cursor) params.cursor = cursor;
@@ -135,9 +143,12 @@
         // Integration hooks (#350 / design-commit 34): explain the
         // AND-intersection-empty case when the hook filter is combined with a
         // §5.5.4 filter (reachable via the asymmetric one-way-clear).
-        const intersectionEmpty = lastFilters.hookManagement && (lastFilters.source || lastFilters.ruleManagement);
+        const mgmtAnd5554 = (lastFilters.hookManagement || lastFilters.federationManagement) &&
+          (lastFilters.source || lastFilters.ruleManagement);
+        const hookAndFed = lastFilters.hookManagement && lastFilters.federationManagement;
+        const intersectionEmpty = mgmtAnd5554 || hookAndFed;
         const primary = intersectionEmpty
-          ? 'No entries: the Integration-hook filter and the moderation-defaults filter are combined (AND), and their intersection is empty. Clear one filter to broaden.'
+          ? 'No entries: a management filter (Integration hooks / Federation management) is combined (AND) with another filter, and their intersection is empty. Clear one filter to broaden.'
           : 'No audit entries match these filters.';
         c.innerHTML = global.AuroraEmptyState
           ? global.AuroraEmptyState.render({ icon: 'inbox', primary: primary })
