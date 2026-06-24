@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The audit log can be filtered to federation activity (a "Federation management" filter), and federation peers added automatically in auto-accept mode are tagged with a "Discovery" source you can filter on
 - All federation-policy changes are blocked while the deployment is in recovery mode, consistent with the rest of the admin surface
 - UI building blocks: loading skeletons, spinners, inline errors, error boundaries, consistent timestamps, source-tier indicators, and a save-with-rationale confirmation
+- The repository-rebuild deep preflight now reports how many times an account has rotated its signing key (read from the full PLC audit-log history), giving operators forensic visibility into rotated accounts before a rebuild
 
 ### Changed
 - The deployment moderation tier (full, reduced, disabled) is now set on the Moderation policy page instead of UI & modes; switching to the disabled tier requires a typed confirmation

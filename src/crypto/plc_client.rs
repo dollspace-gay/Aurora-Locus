@@ -3,9 +3,11 @@
 //! Provides high-level interface for interacting with the PLC directory,
 //! including fetching DID documents, comparing keys, and updating signing keys.
 
+use chrono::{DateTime, Utc};
+
 use crate::identity::did_document::DidDocument;
 use crate::{
-    crypto::plc::{register_plc_did, PlcOperationBuilder, PlcSigner},
+    crypto::plc::{register_plc_did, PlcOperation, PlcOperationBuilder, PlcSigner},
     error::{PdsError, PdsResult},
 };
 
@@ -33,6 +35,110 @@ impl Default for PlcClientConfig {
 pub struct PlcClient {
     config: PlcClientConfig,
     http_client: reqwest::Client,
+}
+
+/// One accepted PLC operation in a DID's signing-key history (key-rotation arc
+/// #366 Phase A1). The full ordered list (from [`PlcClient::get_op_history`]) is
+/// the canonical key history the history-aware verifier resolves each commit's
+/// signing key against.
+///
+/// `op_cid` is kept as a `String` to match [`PlcClient::get_last_op`]'s CID
+/// convention (the design's `Cid` placeholder is not load-bearing — the windowing
+/// in Phase A2 keys off `accepted_at` + `signing_did_key`). `accepted_at` is the
+/// operation's `createdAt`, which is the validity-window boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlcOpHistoryEntry {
+    /// CID of the PLC operation.
+    pub op_cid: String,
+    /// The operation's accepted-at timestamp (`createdAt`) — the validity-window
+    /// boundary for the key this operation publishes.
+    pub accepted_at: DateTime<Utc>,
+    /// The `atproto` signing key this operation publishes, in did:key form.
+    pub signing_did_key: String,
+}
+
+/// Parse a PLC `/log/audit` response array into the ordered signing-key history.
+///
+/// Pure (no I/O) so the parse contract is unit-testable without an HTTP layer.
+/// The audit-log shape (per `@did-plc/lib`, documented at `get_last_op`) is an
+/// oldest-first array of `{cid, did, operation, nullified, createdAt}`; this
+/// function is the multi-entry generalization of `get_last_op`'s per-entry
+/// extraction (which already iterates the full array reading `nullified`, so the
+/// homogeneous-entry shape is established by the existing parser, not assumed).
+///
+/// Skips nullified entries and tombstone operations (no `atproto` key). Fails
+/// closed (`PdsError::IdentityResolution`) on a malformed entry rather than
+/// silently dropping it — an incomplete history would resolve commits against the
+/// wrong key in Phase A2.
+fn parse_op_history(did: &str, entries: &[serde_json::Value]) -> PdsResult<Vec<PlcOpHistoryEntry>> {
+    let mut history = Vec::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        // Skip nullified (rejected) ops — accepted history only.
+        if entry.get("nullified").and_then(|n| n.as_bool()).unwrap_or(false) {
+            continue;
+        }
+
+        let created_at_str = entry.get("createdAt").and_then(|v| v.as_str()).ok_or_else(|| {
+            PdsError::IdentityResolution(format!(
+                "PLC audit-log entry {} for {} missing createdAt",
+                idx, did
+            ))
+        })?;
+        let accepted_at = DateTime::parse_from_rfc3339(created_at_str)
+            .map_err(|e| {
+                PdsError::IdentityResolution(format!(
+                    "PLC audit-log entry {} for {} has unparseable createdAt '{}': {}",
+                    idx, did, created_at_str, e
+                ))
+            })?
+            .with_timezone(&Utc);
+
+        let op_cid = entry
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                PdsError::IdentityResolution(format!(
+                    "PLC audit-log entry {} for {} missing cid",
+                    idx, did
+                ))
+            })?
+            .to_string();
+
+        let op_value = entry.get("operation").ok_or_else(|| {
+            PdsError::IdentityResolution(format!(
+                "PLC audit-log entry {} for {} missing operation",
+                idx, did
+            ))
+        })?;
+
+        // A tombstone op publishes no signing key — it terminates the DID; skip
+        // it (the windows before it stand). Detect by type before the full parse
+        // so a tombstone's shape never trips the parse-fail-closed path.
+        if op_value.get("type").and_then(|v| v.as_str()) == Some("plc_tombstone") {
+            continue;
+        }
+
+        let op: PlcOperation = serde_json::from_value(op_value.clone()).map_err(|e| {
+            PdsError::IdentityResolution(format!(
+                "PLC audit-log entry {} for {}: unparseable operation: {}",
+                idx, did, e
+            ))
+        })?;
+
+        let signing_did_key = op.verification_methods.get("atproto").ok_or_else(|| {
+            PdsError::IdentityResolution(format!(
+                "PLC audit-log entry {} for {}: operation has no atproto verification method",
+                idx, did
+            ))
+        })?;
+
+        history.push(PlcOpHistoryEntry {
+            op_cid,
+            accepted_at,
+            signing_did_key: signing_did_key.clone(),
+        });
+    }
+    Ok(history)
 }
 
 impl PlcClient {
@@ -149,6 +255,59 @@ impl PlcClient {
             })?;
 
         Ok((op, cid))
+    }
+
+    /// Fetch the full ordered history of accepted PLC operations for `did` from
+    /// the directory's audit log (Arc 13 / key-rotation arc #366 Phase A1).
+    ///
+    /// Where [`Self::get_last_op`] returns only the last accepted entry, this
+    /// returns every accepted (non-nullified) operation that publishes an
+    /// `atproto` signing key, oldest-first — the key history a commit chain that
+    /// spans rotations must be verified against (consumed by Phase A2's
+    /// history-aware verifier).
+    ///
+    /// Each entry carries the operation CID, its `createdAt` timestamp (the
+    /// validity-window boundary), and the `atproto` signing key did:key the
+    /// operation publishes. Tombstone operations (no `atproto` key) and
+    /// nullified entries are skipped.
+    ///
+    /// Errors (`PdsError::IdentityResolution`): network failure, non-2xx from the
+    /// directory, malformed audit-log JSON.
+    pub async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>> {
+        if !did.starts_with("did:plc:") {
+            return Err(PdsError::Validation(
+                "Only did:plc identifiers are supported".to_string(),
+            ));
+        }
+
+        let url = format!(
+            "{}/{}/log/audit",
+            self.config.plc_url.trim_end_matches('/'),
+            did
+        );
+
+        let response = self.http_client.get(&url).send().await.map_err(|e| {
+            PdsError::IdentityResolution(format!("Failed to fetch PLC audit log: {}", e))
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(PdsError::IdentityResolution(format!(
+                "PLC audit log returned error {}: {}",
+                status, error_body
+            )));
+        }
+
+        let entries: Vec<serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| PdsError::IdentityResolution(format!("Invalid PLC audit log JSON: {}", e)))?;
+
+        parse_op_history(did, &entries)
     }
 
     /// Fetch DID document from PLC directory
@@ -330,5 +489,106 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("did:plc"));
+    }
+
+    // ---- parse_op_history (Phase A1 / #367) ----
+
+    /// Build one audit-log entry. A `None` atproto key produces a tombstone op.
+    fn audit_entry(cid: &str, created_at: &str, atproto: Option<&str>, nullified: bool) -> serde_json::Value {
+        let operation = match atproto {
+            Some(key) => serde_json::json!({
+                "type": "plc_operation",
+                "rotationKeys": ["did:key:zRotation"],
+                "verificationMethods": { "atproto": key },
+                "alsoKnownAs": ["at://alice.example"],
+                "services": {},
+            }),
+            None => serde_json::json!({
+                "type": "plc_tombstone",
+                "rotationKeys": [],
+                "verificationMethods": {},
+                "alsoKnownAs": [],
+                "services": {},
+            }),
+        };
+        serde_json::json!({
+            "cid": cid,
+            "did": "did:plc:alice",
+            "operation": operation,
+            "nullified": nullified,
+            "createdAt": created_at,
+        })
+    }
+
+    #[test]
+    fn parse_op_history_single_entry() {
+        let entries = vec![audit_entry("cidA", "2026-01-01T00:00:00Z", Some("did:key:zK1"), false)];
+        let h = parse_op_history("did:plc:alice", &entries).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].op_cid, "cidA");
+        assert_eq!(h[0].signing_did_key, "did:key:zK1");
+        assert_eq!(h[0].accepted_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_op_history_three_entries_ascending() {
+        // PLC returns oldest-first; we preserve that order.
+        let entries = vec![
+            audit_entry("cid1", "2026-01-01T00:00:00Z", Some("did:key:zK1"), false),
+            audit_entry("cid2", "2026-02-01T00:00:00Z", Some("did:key:zK2"), false),
+            audit_entry("cid3", "2026-03-01T00:00:00Z", Some("did:key:zK3"), false),
+        ];
+        let h = parse_op_history("did:plc:alice", &entries).unwrap();
+        assert_eq!(h.len(), 3);
+        assert_eq!(
+            h.iter().map(|e| e.signing_did_key.as_str()).collect::<Vec<_>>(),
+            vec!["did:key:zK1", "did:key:zK2", "did:key:zK3"]
+        );
+        assert!(h[0].accepted_at < h[1].accepted_at && h[1].accepted_at < h[2].accepted_at);
+    }
+
+    #[test]
+    fn parse_op_history_skips_nullified() {
+        let entries = vec![
+            audit_entry("cid1", "2026-01-01T00:00:00Z", Some("did:key:zK1"), false),
+            audit_entry("cidX", "2026-01-15T00:00:00Z", Some("did:key:zBad"), true), // rejected
+            audit_entry("cid2", "2026-02-01T00:00:00Z", Some("did:key:zK2"), false),
+        ];
+        let h = parse_op_history("did:plc:alice", &entries).unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].signing_did_key, "did:key:zK1");
+        assert_eq!(h[1].signing_did_key, "did:key:zK2");
+    }
+
+    #[test]
+    fn parse_op_history_skips_tombstone() {
+        let entries = vec![
+            audit_entry("cid1", "2026-01-01T00:00:00Z", Some("did:key:zK1"), false),
+            audit_entry("cidT", "2026-02-01T00:00:00Z", None, false), // tombstone
+        ];
+        let h = parse_op_history("did:plc:alice", &entries).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].signing_did_key, "did:key:zK1");
+    }
+
+    #[test]
+    fn parse_op_history_fails_closed_on_bad_timestamp() {
+        let entries = vec![audit_entry("cidA", "not-a-timestamp", Some("did:key:zK1"), false)];
+        let err = parse_op_history("did:plc:alice", &entries).unwrap_err();
+        assert!(err.to_string().contains("createdAt"));
+    }
+
+    #[test]
+    fn parse_op_history_fails_closed_on_missing_cid() {
+        let mut e = audit_entry("cidA", "2026-01-01T00:00:00Z", Some("did:key:zK1"), false);
+        e.as_object_mut().unwrap().remove("cid");
+        let err = parse_op_history("did:plc:alice", &[e]).unwrap_err();
+        assert!(err.to_string().contains("cid"));
+    }
+
+    #[test]
+    fn parse_op_history_empty_array_is_empty_history() {
+        let h = parse_op_history("did:plc:alice", &[]).unwrap();
+        assert!(h.is_empty());
     }
 }

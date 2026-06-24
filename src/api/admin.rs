@@ -2573,6 +2573,36 @@ async fn pre_rebuild_check(
                 obj.insert("deepError".into(), serde_json::Value::String(e.to_string()));
             }
         }
+
+        // Signing-key history (key-rotation arc #366 Phase A1 / #367). Surface
+        // how many times the account has rotated its signing key — an account
+        // with rotation history is exactly the case a post-#367 history-aware
+        // rebuild verify must handle (Phase A2/A3). Non-fatal: a PLC fetch
+        // failure surfaces as `keyHistoryError` rather than failing the
+        // preflight (mirrors the `deepError` posture above), so the cheap
+        // structural signal is never blocked by PLC reachability.
+        use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
+        let plc = PlcClient::new(PlcClientConfig {
+            plc_url: ctx.config.identity.did_plc_url.clone(),
+            timeout_secs: 30,
+        });
+        match plc {
+            Ok(plc) => match plc.get_op_history(&params.did).await {
+                Ok(history) => {
+                    obj.insert("keyHistoryEntries".into(), serde_json::json!(history.len()));
+                    obj.insert(
+                        "rotatedKeysCount".into(),
+                        serde_json::json!(history.len().saturating_sub(1)),
+                    );
+                }
+                Err(e) => {
+                    obj.insert("keyHistoryError".into(), serde_json::Value::String(e.to_string()));
+                }
+            },
+            Err(e) => {
+                obj.insert("keyHistoryError".into(), serde_json::Value::String(e.to_string()));
+            }
+        }
     }
 
     Ok(Json(body))
@@ -9241,7 +9271,12 @@ mod tests {
                 oauth_features: Default::default(),
             },
             identity: IdentityConfig {
-                did_plc_url: "https://plc.directory".to_string(),
+                // Non-routable fail-fast URL: unit tests must not dial the real
+                // PLC directory. PLC-touching handlers (rotation, preRebuildCheck
+                // deep key-history) get a fast connection-refused they degrade on,
+                // instead of a network round-trip / 30s timeout against
+                // plc.directory.
+                did_plc_url: "http://127.0.0.1:1".to_string(),
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
@@ -13583,6 +13618,21 @@ mod tests {
         assert!(
             resp.0["deepError"].is_string(),
             "the verification failure must be surfaced as a diagnostic"
+        );
+        // Wiring assertion (#367): deep mode also runs the signing-key-history
+        // consumer. The test PLC URL is non-routable, so it degrades to
+        // `keyHistoryError` (non-fatal) rather than 500ing or blocking — proving
+        // the `get_op_history` consumer is wired into the deep path. (The happy
+        // path — keyHistoryEntries / rotatedKeysCount on a real multi-entry PLC
+        // history — is covered by the `parse_op_history` unit tests; a live count
+        // needs real-binary, as there is no mock-PLC unit harness.)
+        assert!(
+            resp.0["keyHistoryError"].is_string(),
+            "deep mode must run the key-history consumer and degrade gracefully when PLC is unreachable"
+        );
+        assert!(
+            resp.0.get("keyHistoryEntries").is_none(),
+            "no counts when the PLC fetch failed"
         );
     }
 
