@@ -161,6 +161,13 @@
           global.AuroraStatusBadge.render('takedown', t('rebuild.deep_failed')));
         blocked = t('rebuild.deep_blocked', { message: r.deepError || '—' });
       }
+      // Signing-key rotation history (#367). Surfaced on the deep preflight: an
+      // account that has rotated keys carries multi-key commit history.
+      if (r.rotatedKeysCount != null) {
+        html += kv(t('rebuild.key_rotations'), esc(String(r.rotatedKeysCount)));
+      } else if (r.keyHistoryError) {
+        html += kv(t('rebuild.key_rotations'), esc(t('rebuild.key_history_unavailable')));
+      }
     }
     html += '</dl>';
     if (blocked) {

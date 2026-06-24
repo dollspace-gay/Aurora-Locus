@@ -189,6 +189,8 @@
     "deep_ok": "Reconstructed and verified",
     "deep_failed": "Reconstruction failed verification",
     "deep_blocked": "Rebuild is blocked until verification passes. Diagnostic: {message}",
+    "key_rotations": "Signing-key rotations",
+    "key_history_unavailable": "unavailable (PLC history fetch failed)",
     "no_history": "No sequencer history for this account — nothing to rebuild.",
     "action_heading": "Rebuild repository",
     "action_intro": "Reconstructs the repository in memory and atomically swaps it in. The original is untouched unless the swap succeeds.",

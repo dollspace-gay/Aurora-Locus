@@ -57,6 +57,13 @@ test('routes.js wires the rebuild routes (SuperAdmin) + a sidebar entry', () => 
   assert.match(ROUTES, /label:\s*'Repository rebuild',\s*route:\s*'ops\/repo-rebuild'[^}]*requires:\s*'superadmin'/);
 });
 
+test('deep preflight renders the signing-key rotation count (#367)', () => {
+  // Reads the keyHistory fields the A1 preRebuildCheck deep mode adds.
+  assert.match(PAGE, /r\.rotatedKeysCount/, 'page must render rotatedKeysCount');
+  assert.match(PAGE, /r\.keyHistoryError/, 'page must handle keyHistoryError fallback');
+  assert.match(PAGE, /t\('rebuild\.key_rotations'\)/, 'page must use the key_rotations label');
+});
+
 test('every rebuild.* i18n key the page references exists in en.json', () => {
   // Literal t('rebuild.<key>') references.
   const keys = new Set();
