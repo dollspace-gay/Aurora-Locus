@@ -732,7 +732,7 @@ impl Sequencer {
         cancel: &std::sync::atomic::AtomicBool,
         scanned: &std::sync::atomic::AtomicU64,
     ) -> PdsResult<IntegrityReport> {
-        use std::collections::HashMap;
+        use std::collections::{BTreeSet, HashMap};
         use std::sync::atomic::Ordering;
 
         const SAMPLE_CAP: usize = 50;
@@ -749,8 +749,12 @@ impl Sequencer {
             malformed: Vec::new(),
             non_monotonic_count: 0,
             non_monotonic: Vec::new(),
+            affected_dids: Vec::new(),
         };
 
+        // The COMPLETE affected-DID set (not sample-bounded like `malformed`),
+        // for the slice-2 routing affordance. BTreeSet → deduped + sorted.
+        let mut affected: BTreeSet<String> = BTreeSet::new();
         let mut last_rev: HashMap<String, String> = HashMap::new();
         let mut cursor = 0i64;
         loop {
@@ -771,6 +775,7 @@ impl Sequencer {
                 match self.decode_event(row) {
                     Err(_) => {
                         report.malformed_count += 1;
+                        affected.insert(did.clone());
                         if report.malformed.len() < SAMPLE_CAP {
                             report.malformed.push(MalformedRow { seq, did, event_type });
                         }
@@ -795,6 +800,7 @@ impl Sequencer {
                 }
             }
         }
+        report.affected_dids = affected.into_iter().collect();
         Ok(report)
     }
 }
@@ -855,6 +861,13 @@ pub struct IntegrityReport {
     pub malformed: Vec<MalformedRow>,
     pub non_monotonic_count: u64,
     pub non_monotonic: Vec<NonMonotonicCommit>,
+    /// Every distinct DID with at least one malformed (undecodable) event row,
+    /// deduped + sorted. Unlike `malformed` (a 50-capped sample), this is the
+    /// COMPLETE set — the routing affordance (slice 2 / #357) fans a per-account
+    /// repository rebuild (§7.4.1) over it, so it must not be sample-bounded.
+    /// The DID is the `repo_seq.did` column, available regardless of whether the
+    /// event blob decodes.
+    pub affected_dids: Vec<String>,
 }
 
 #[cfg(test)]
@@ -971,6 +984,63 @@ mod tests {
         assert_eq!(r.non_monotonic[0].rev, "3aaa");
         assert_eq!(r.malformed_count, 1, "the undecodable blob is flagged");
         assert_eq!(r.malformed[0].did, "did:plc:bad");
+        assert_eq!(
+            r.affected_dids,
+            vec!["did:plc:bad".to_string()],
+            "the malformed row's DID is surfaced for routing"
+        );
+    }
+
+    /// `affected_dids` is the COMPLETE deduped+sorted set, NOT bounded by the
+    /// 50-row malformed sample cap — the routing affordance must rebuild every
+    /// affected account, not just the first 50 sampled rows.
+    #[tokio::test]
+    async fn validate_integrity_affected_dids_complete_and_deduped() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (seq, db) = sequencer_with_pool().await;
+
+        // 55 distinct DIDs (crosses SAMPLE_CAP = 50), plus a duplicate of one of
+        // them — so the malformed SAMPLE is capped but the affected-DID SET is
+        // complete and deduped.
+        let total_malformed = 55usize;
+        for i in 0..total_malformed {
+            sqlx::query(
+                "INSERT INTO repo_seq (did, event_type, event, sequenced_at) VALUES ($1,$2,$3,$4)",
+            )
+            .bind(format!("did:plc:bad{:03}", i))
+            .bind("commit")
+            .bind(vec![0xff_u8, 0x00, 0xff])
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        // A second malformed row for an already-seen DID (proves dedup).
+        sqlx::query("INSERT INTO repo_seq (did, event_type, event, sequenced_at) VALUES ($1,$2,$3,$4)")
+            .bind("did:plc:bad000")
+            .bind("commit")
+            .bind(vec![0x00_u8])
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let scanned = AtomicU64::new(0);
+        let r = seq.validate_integrity(&cancel, &scanned).await.unwrap();
+
+        assert_eq!(r.malformed_count, total_malformed as u64 + 1, "every malformed row counted");
+        assert_eq!(r.malformed.len(), 50, "the row SAMPLE is capped at 50");
+        assert_eq!(
+            r.affected_dids.len(),
+            total_malformed,
+            "the affected-DID SET is complete (55 distinct) and deduped, NOT sample-bounded"
+        );
+        // BTreeSet → sorted; and the duplicate collapsed.
+        assert_eq!(r.affected_dids[0], "did:plc:bad000");
+        let mut sorted = r.affected_dids.clone();
+        sorted.sort();
+        assert_eq!(sorted, r.affected_dids, "affected_dids is sorted");
     }
 
     #[tokio::test]

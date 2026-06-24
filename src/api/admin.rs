@@ -3213,6 +3213,9 @@ fn sequencer_recovery_progress_json(
             "nonMonotonic": r.non_monotonic.iter().map(|n| serde_json::json!({
                 "did": n.did, "seq": n.seq, "rev": n.rev, "prevRev": n.prev_rev,
             })).collect::<Vec<_>>(),
+            // The COMPLETE affected-DID set (not sample-bounded) — drives the
+            // slice-2 malformed→rebuild routing affordance (#357).
+            "affectedDids": r.affected_dids,
         })
     });
     serde_json::json!({
