@@ -483,30 +483,40 @@ impl PlcClientApi for PlcClient {
 /// field).
 #[cfg(test)]
 pub(crate) struct MockPlcClient {
-    op_histories: std::collections::HashMap<String, Vec<PlcOpHistoryEntry>>,
+    // Interior-mutable (Mutex) so `update_signing_key` — which the trait gives
+    // `&self` — can record the published key + append to op-history, letting
+    // round-trip tests (#376 / C1) observe rotations accumulate across mixed
+    // entry points without a live PLC.
+    op_histories: std::sync::Mutex<std::collections::HashMap<String, Vec<PlcOpHistoryEntry>>>,
     /// Per-DID current signing key in multibase form (the bare `z...`, no
     /// `did:key:` prefix) — what `get_document` + `get_signing_key` surface.
-    current_signing_keys: std::collections::HashMap<String, String>,
+    current_signing_keys: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 #[cfg(test)]
 impl MockPlcClient {
     pub(crate) fn new() -> Self {
         Self {
-            op_histories: std::collections::HashMap::new(),
-            current_signing_keys: std::collections::HashMap::new(),
+            op_histories: std::sync::Mutex::new(std::collections::HashMap::new()),
+            current_signing_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
-    pub(crate) fn with_op_history(mut self, did: &str, history: Vec<PlcOpHistoryEntry>) -> Self {
-        self.op_histories.insert(did.to_string(), history);
+    pub(crate) fn with_op_history(self, did: &str, history: Vec<PlcOpHistoryEntry>) -> Self {
+        self.op_histories
+            .lock()
+            .unwrap()
+            .insert(did.to_string(), history);
         self
     }
     /// Configure the DID's currently-published signing key. Accepts either
     /// `did:key:z...` or bare `z...`; stored as the bare multibase form that
-    /// `get_signing_key` returns.
-    pub(crate) fn with_current_signing_key(mut self, did: &str, key: &str) -> Self {
+    /// `get_signing_key` surfaces.
+    pub(crate) fn with_current_signing_key(self, did: &str, key: &str) -> Self {
         let multibase = key.strip_prefix("did:key:").unwrap_or(key).to_string();
-        self.current_signing_keys.insert(did.to_string(), multibase);
+        self.current_signing_keys
+            .lock()
+            .unwrap()
+            .insert(did.to_string(), multibase);
         self
     }
 }
@@ -516,14 +526,22 @@ impl MockPlcClient {
 impl PlcClientApi for MockPlcClient {
     async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>> {
         self.op_histories
+            .lock()
+            .unwrap()
             .get(did)
             .cloned()
             .ok_or_else(|| PdsError::NotFound(format!("mock: no op history configured for {did}")))
     }
     async fn get_document(&self, did: &str) -> PdsResult<DidDocument> {
-        let multibase = self.current_signing_keys.get(did).ok_or_else(|| {
-            PdsError::Internal(format!("mock: no current signing key configured for {did}"))
-        })?;
+        let multibase = self
+            .current_signing_keys
+            .lock()
+            .unwrap()
+            .get(did)
+            .cloned()
+            .ok_or_else(|| {
+                PdsError::Internal(format!("mock: no current signing key configured for {did}"))
+            })?;
         Ok(DidDocument {
             context: None,
             id: did.to_string(),
@@ -533,7 +551,7 @@ impl PlcClientApi for MockPlcClient {
                 id: format!("{did}#atproto"),
                 key_type: "Multikey".to_string(),
                 controller: did.to_string(),
-                public_key_multibase: Some(multibase.clone()),
+                public_key_multibase: Some(multibase),
             }],
         })
     }
@@ -550,10 +568,33 @@ impl PlcClientApi for MockPlcClient {
     }
     async fn update_signing_key(
         &self,
-        _did: &str,
-        _new_signing_key: &str,
+        did: &str,
+        new_signing_key: &str,
         _rotation_key_signer: &PlcSigner,
     ) -> PdsResult<()> {
+        // Record the new published key (what get_document/get_signing_key now
+        // surface) and append a history entry so get_op_history reflects the
+        // rotation. accepted_at is a synthetic monotonic stamp (base + N hours,
+        // N = prior history length) so accumulated entries stay strictly ordered.
+        let multibase = new_signing_key
+            .strip_prefix("did:key:")
+            .unwrap_or(new_signing_key)
+            .to_string();
+        self.current_signing_keys
+            .lock()
+            .unwrap()
+            .insert(did.to_string(), multibase);
+        let mut histories = self.op_histories.lock().unwrap();
+        let entry_vec = histories.entry(did.to_string()).or_default();
+        let n = entry_vec.len() as i64;
+        let base = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("static base timestamp")
+            .with_timezone(&Utc);
+        entry_vec.push(PlcOpHistoryEntry {
+            op_cid: format!("bafymock-append-{did}-{n}"),
+            accepted_at: base + chrono::Duration::hours(n),
+            signing_did_key: new_signing_key.to_string(),
+        });
         Ok(())
     }
 }

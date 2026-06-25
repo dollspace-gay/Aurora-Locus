@@ -563,4 +563,202 @@ mod tests {
         .expect_err("operator-supplied keypair with >1 DID is rejected");
         assert!(matches!(err, PdsError::Validation(_)), "got {err:?}");
     }
+
+    // ===== Phase C (#376): cross-entry-point round-trip + gate-off immutability
+    // + recovery-mode. These compose the B-phase substrate rather than add to it.
+
+    // C1 — a mixed CLI → admin-XRPC → CLI rotation sequence on one account
+    // accumulates correctly in the shared state: each entry point writes the
+    // same plc_keys via the same writer, and all three publishes land in the
+    // (shared, injected) mock PLC's op-history in order. Proves the two entry
+    // points are mutually consistent and don't interfere.
+    #[tokio::test]
+    async fn phase_c_mixed_entry_point_rotations_accumulate() {
+        use crate::account::ValidatedSession;
+        use crate::admin::roles::Role;
+        use crate::api::admin::{update_account_signing_key, UpdateAccountSigningKeyRequest};
+        use crate::auth::AdminAuthContext;
+        use axum::extract::State;
+        use axum::Json;
+
+        let mut ctx = create_test_context_with(|_| {}).await;
+        set_gate(&ctx, true).await; // for the operator-supplied step (3)
+        let did = seed_account(&ctx, "croundtrip").await;
+        // One shared mock is the PLC for BOTH entry points (CLI takes it as a
+        // param, the XRPC handler reads it off ctx.plc_client). Its current key
+        // is a placeholder so no rotation no-ops; update_signing_key records the
+        // new key + appends op-history.
+        ctx.plc_client = std::sync::Arc::new(
+            MockPlcClient::new().with_current_signing_key(&did, "zPlaceholderInitial"),
+        );
+
+        // (1) CLI rotation, PDS-generated.
+        let rotated =
+            rotate_key_for_did(&ctx, &did, ctx.plc_client.as_ref(), &signer(&ctx), None, None)
+                .await
+                .unwrap();
+        assert!(rotated);
+        let k2 = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+
+        // (2) admin XRPC rotation, PDS-generated — the OTHER entry point, same
+        // shared plc_keys + same shared mock PLC.
+        let auth = AdminAuthContext {
+            did: "did:plc:superadmin".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:superadmin".to_string(),
+                session_id: "sid".to_string(),
+                is_app_password: false,
+            },
+            role: Role::SuperAdmin,
+        };
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            auth,
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: None,
+                operator_keypair: None,
+            }),
+        )
+        .await
+        .expect("xrpc rotation succeeds")
+        .0;
+        let k3_pub = serde_json::to_value(&resp).unwrap()["newSigningKey"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let k3 = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_ne!(k2, k3, "the XRPC rotation changed the key the CLI had set");
+
+        // (3) CLI rotation, operator-supplied (gate on).
+        let k4 = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let supplied = OperatorSuppliedKeypair {
+            public_did_key: k4.public_did_key.clone(),
+            private_key_hex: hex::encode(&k4.private_key_bytes),
+        };
+        let rotated = rotate_key_for_did(
+            &ctx,
+            &did,
+            ctx.plc_client.as_ref(),
+            &signer(&ctx),
+            Some(&supplied),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(rotated);
+        let k4_stored = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(k4_stored, k4.private_key_bytes, "final stored key is operator-supplied K4");
+
+        // The shared mock PLC accumulated all three publishes, in order.
+        let history = ctx.plc_client.get_op_history(&did).await.unwrap();
+        let keys: Vec<String> = history.iter().map(|e| e.signing_did_key.clone()).collect();
+        assert_eq!(keys.len(), 3, "three rotations published, got {keys:?}");
+        assert_eq!(keys[1], k3_pub, "middle publish is the XRPC rotation");
+        assert_eq!(keys[2], k4.public_did_key, "last publish is operator-supplied K4");
+        assert!(
+            history[0].accepted_at < history[1].accepted_at
+                && history[1].accepted_at < history[2].accepted_at,
+            "op-history is strictly ordered"
+        );
+    }
+
+    // C2 — gate-off rejection of an operator-supplied CLI rotation leaves NO
+    // trace: plc_keys unchanged, no PLC publish (mock op-history untouched), no
+    // audit entry. (B4 asserted plc_keys-unchanged; this adds the no-publish +
+    // no-audit immutability assertions.)
+    #[tokio::test]
+    async fn phase_c_cli_gate_off_no_publish_no_audit() {
+        let ctx = create_test_context_with(|_| {}).await; // gate OFF (default)
+        let did = seed_account(&ctx, "cgateoffimmut").await;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let kp = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let supplied = OperatorSuppliedKeypair {
+            public_did_key: kp.public_did_key.clone(),
+            private_key_hex: hex::encode(&kp.private_key_bytes),
+        };
+        let mock = std::sync::Arc::new(
+            MockPlcClient::new().with_current_signing_key(&did, "zPlaceholder"),
+        );
+        let err = rotate_key_for_did(&ctx, &did, mock.as_ref(), &signer(&ctx), Some(&supplied), None)
+            .await
+            .expect_err("gate off rejects operator-supplied");
+        assert!(matches!(err, PdsError::Validation(_)), "got {err:?}");
+        // (a) plc_keys unchanged.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(before, after);
+        // (b) no PLC publish — the mock never recorded an op-history entry.
+        assert!(
+            mock.get_op_history(&did).await.is_err(),
+            "rejection before publish → no op-history appended"
+        );
+        // (c) no audit entry emitted.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1",
+        )
+        .bind("account.update_signing_key")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "no audit emitted on gate-off rejection");
+    }
+
+    // C3 — recovery mode (AURORA_RECOVERY_MODE) does not change rotation: a CLI
+    // PDS rotation still updates plc_keys + emits audit, and the
+    // operator-supplied gate is still enforced (the gate read is
+    // recovery-independent — recovery override only affects per-write kryphocron
+    // auth, and the empty-commit advance has no writes). Serialized against other
+    // env-mutating tests via the shared lock; env removed on drop even on panic.
+    #[tokio::test]
+    async fn phase_c_recovery_mode_cli_rotation_works_and_respects_gate() {
+        use crate::api::aurora_admin::RECOVERY_MODE_ENV;
+        use crate::api::federation_peers::test_support::serial;
+
+        struct EnvGuard(&'static str);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+
+        let _serial = serial().lock().await;
+        let _env = EnvGuard(RECOVERY_MODE_ENV);
+        std::env::set_var(RECOVERY_MODE_ENV, "true");
+
+        let ctx = create_test_context_with(|_| {}).await; // gate OFF
+        let did = seed_account(&ctx, "crecovery").await;
+        let mock = std::sync::Arc::new(
+            MockPlcClient::new().with_current_signing_key(&did, "zPlaceholderRec"),
+        );
+
+        // (1) PDS rotation under recovery mode: still rotates + audits.
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let rotated =
+            rotate_key_for_did(&ctx, &did, mock.as_ref(), &signer(&ctx), None, None)
+                .await
+                .unwrap();
+        assert!(rotated);
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_ne!(before, after, "recovery-mode rotation still updates plc_keys");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1",
+        )
+        .bind("account.update_signing_key")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "recovery-mode rotation still emits audit");
+
+        // (2) operator-supplied + gate OFF → still rejected. Recovery mode is NOT
+        // a substrate-gate bypass.
+        let kp = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let supplied = OperatorSuppliedKeypair {
+            public_did_key: kp.public_did_key.clone(),
+            private_key_hex: hex::encode(&kp.private_key_bytes),
+        };
+        let err = rotate_key_for_did(&ctx, &did, mock.as_ref(), &signer(&ctx), Some(&supplied), None)
+            .await
+            .expect_err("operator-supplied gate still enforced in recovery mode");
+        assert!(matches!(err, PdsError::Validation(_)), "got {err:?}");
+    }
 }

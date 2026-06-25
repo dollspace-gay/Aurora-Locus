@@ -3987,25 +3987,25 @@ async fn admin_delete_account(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UpdateAccountSigningKeyRequest {
+pub(crate) struct UpdateAccountSigningKeyRequest {
     /// DID of the account whose signing key is being rotated.
-    did: String,
+    pub(crate) did: String,
     /// Operator rationale, recorded in the rotation audit entry.
     #[serde(default)]
-    rationale: Option<String>,
+    pub(crate) rationale: Option<String>,
     /// Operator-supplied keypair (the gated path, §4.2.1 Path B). Absent → the
     /// PDS generates a fresh per-account keypair (Path A). Present → validated
     /// (derive-public-from-private + compare) and gated on
     /// `key_rotation.operator_supplied_keys_enabled`.
     #[serde(default)]
-    operator_keypair: Option<crate::account::OperatorSuppliedKeypair>,
+    pub(crate) operator_keypair: Option<crate::account::OperatorSuppliedKeypair>,
 }
 
 /// How the new per-account signing key was produced — the load-bearing forensic
 /// record in the rotation audit (§4.2.6). Serializes to the design's snake-case
 /// wire values (`"pds"` / `"operator_supplied"`).
 #[derive(Debug, Clone, Copy, Serialize)]
-enum KeyGenerationSource {
+pub(crate) enum KeyGenerationSource {
     #[serde(rename = "pds")]
     PdsGenerated,
     #[serde(rename = "operator_supplied")]
@@ -4014,7 +4014,7 @@ enum KeyGenerationSource {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UpdateAccountSigningKeyResponse {
+pub(crate) struct UpdateAccountSigningKeyResponse {
     did: String,
     /// The account's new (or, on a no-op, current) atproto signing key, did:key form.
     new_signing_key: String,
@@ -4045,7 +4045,7 @@ struct UpdateAccountSigningKeyResponse {
 ///
 /// No request-supplied `signingKey` and no single-operator-key strict check:
 /// per-account keys are the model now (the strict check + its TODO are removed).
-async fn update_account_signing_key(
+pub(crate) async fn update_account_signing_key(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<UpdateAccountSigningKeyRequest>,
@@ -10376,6 +10376,50 @@ mod tests {
         .expect_err("unknown account → 404 at the plc_keys write");
         let (status, _body) = read_response_body(resp).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // Phase C / C2 (#376) — XRPC-side gate-off immutability: an operator-supplied
+    // rotation rejected by the gate leaves plc_keys unchanged AND emits no audit
+    // entry (the rejection precedes any PLC publish, DB write, or audit). Pairs
+    // with the CLI-side phase_c_cli_gate_off_no_publish_no_audit in rotate_keys.
+    #[tokio::test]
+    async fn phase_c_xrpc_gate_off_no_audit_state_unchanged() {
+        let ctx = create_test_context().await; // gate OFF (default)
+        let did = seed_rotatable_account(&ctx, "cxrpcimmut", "cx@example.com").await;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let kp = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: None,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: kp.public_did_key.clone(),
+                    private_key_hex: hex::encode(&kp.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("gate off rejects operator-supplied");
+        let (status, body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"],
+            "OperatorSuppliedKeysDisabled"
+        );
+        // plc_keys unchanged.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(before, after, "gate-off rejection must not rotate");
+        // No audit entry emitted.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1",
+        )
+        .bind("account.update_signing_key")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "no audit emitted on gate-off rejection");
     }
 
     #[tokio::test]
