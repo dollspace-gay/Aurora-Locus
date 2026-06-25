@@ -168,6 +168,24 @@
       } else if (r.keyHistoryError) {
         html += kv(t('rebuild.key_rotations'), esc(t('rebuild.key_history_unavailable')));
       }
+      // History-aware verify (#368): did every commit verify against the key
+      // valid at its rev? A failure is a significant signal — the account has a
+      // verification anomaly across its key history.
+      const hv = r.historyAwareVerifyResult;
+      if (hv && hv.verified === true) {
+        html += kv(t('rebuild.history_verify'),
+          global.AuroraStatusBadge.render('verified',
+            t('rebuild.history_verify_ok', { commits: hv.commitsVerified, keys: hv.keysUsed })));
+      } else if (hv && hv.verified === false) {
+        const f = hv.failure || {};
+        html += kv(t('rebuild.history_verify'),
+          global.AuroraStatusBadge.render('takedown',
+            t('rebuild.history_verify_failed', { commit: shortCid(f.commitCid), reason: f.reason || '—' })));
+        blocked = t('rebuild.history_verify_blocked');
+      } else if (r.historyAwareVerifyError) {
+        html += kv(t('rebuild.history_verify'),
+          esc(t('rebuild.history_verify_unavailable', { error: r.historyAwareVerifyError })));
+      }
     }
     html += '</dl>';
     if (blocked) {

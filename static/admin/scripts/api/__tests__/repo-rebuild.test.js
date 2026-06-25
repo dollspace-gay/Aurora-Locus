@@ -64,6 +64,14 @@ test('deep preflight renders the signing-key rotation count (#367)', () => {
   assert.match(PAGE, /t\('rebuild\.key_rotations'\)/, 'page must use the key_rotations label');
 });
 
+test('deep preflight renders history-aware verify result (#368)', () => {
+  assert.match(PAGE, /r\.historyAwareVerifyResult/, 'page must read historyAwareVerifyResult');
+  assert.match(PAGE, /hv\.verified === true/, 'page must render the verified verdict');
+  assert.match(PAGE, /hv\.verified === false/, 'page must render the failed verdict');
+  assert.match(PAGE, /r\.historyAwareVerifyError/, 'page must handle the can\'t-run error');
+  assert.match(PAGE, /t\('rebuild\.history_verify_ok'/, 'page must use the history_verify_ok label');
+});
+
 test('every rebuild.* i18n key the page references exists in en.json', () => {
   // Literal t('rebuild.<key>') references.
   const keys = new Set();

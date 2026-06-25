@@ -2549,18 +2549,19 @@ async fn pre_rebuild_check(
     if params.deep {
         let obj = body.as_object_mut().expect("json! built a map above");
         // Structural-only (signing_did_key = None); full signature verification
-        // is part of the destructive rebuild (#290).
+        // is part of the destructive rebuild (#290). Capture the reconstructed
+        // block set + root so the A2 history-aware verify below can re-run over
+        // it (key-rotation arc #366 / #368).
+        let mut reconstructed: Option<(proto_blue::repo::BlockMap, proto_blue::lex_data::Cid)> =
+            None;
         match crate::rebuild::reconstruct_and_verify(&ctx.sequencer, &params.did, None).await {
             Ok(Some(vr)) => {
+                let head = vr.commit_cid.to_string();
+                let rev = vr.rev().to_string();
                 obj.insert("deepVerified".into(), serde_json::Value::Bool(true));
-                obj.insert(
-                    "reconstructedHeadCid".into(),
-                    serde_json::Value::String(vr.commit_cid.to_string()),
-                );
-                obj.insert(
-                    "reconstructedRev".into(),
-                    serde_json::Value::String(vr.rev().to_string()),
-                );
+                obj.insert("reconstructedHeadCid".into(), serde_json::Value::String(head));
+                obj.insert("reconstructedRev".into(), serde_json::Value::String(rev));
+                reconstructed = Some((vr.blocks, vr.commit_cid));
             }
             // No history despite a preflight: treat as not-verifiable rather than 500.
             Ok(None) => {
@@ -2574,19 +2575,16 @@ async fn pre_rebuild_check(
             }
         }
 
-        // Signing-key history (key-rotation arc #366 Phase A1 / #367). Surface
-        // how many times the account has rotated its signing key — an account
-        // with rotation history is exactly the case a post-#367 history-aware
-        // rebuild verify must handle (Phase A2/A3). Non-fatal: a PLC fetch
-        // failure surfaces as `keyHistoryError` rather than failing the
-        // preflight (mirrors the `deepError` posture above), so the cheap
-        // structural signal is never blocked by PLC reachability.
+        // Signing-key history (Phase A1 / #367). Surface how many times the
+        // account has rotated — an account with rotation history is exactly the
+        // case a history-aware verify must handle. Non-fatal: a PLC fetch failure
+        // surfaces as `keyHistoryError` (mirrors the `deepError` posture).
         use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
         let plc = PlcClient::new(PlcClientConfig {
             plc_url: ctx.config.identity.did_plc_url.clone(),
             timeout_secs: 30,
         });
-        match plc {
+        let history = match plc {
             Ok(plc) => match plc.get_op_history(&params.did).await {
                 Ok(history) => {
                     obj.insert("keyHistoryEntries".into(), serde_json::json!(history.len()));
@@ -2594,13 +2592,76 @@ async fn pre_rebuild_check(
                         "rotatedKeysCount".into(),
                         serde_json::json!(history.len().saturating_sub(1)),
                     );
+                    Some(history)
                 }
                 Err(e) => {
                     obj.insert("keyHistoryError".into(), serde_json::Value::String(e.to_string()));
+                    None
                 }
             },
             Err(e) => {
                 obj.insert("keyHistoryError".into(), serde_json::Value::String(e.to_string()));
+                None
+            }
+        };
+
+        // History-aware verify (Phase A2 / #368) — the in-bin consumer of
+        // `verify_repo_with_history`. Runs only when BOTH reconstruction and the
+        // PLC history are available; checks every commit against the key valid at
+        // its rev. `historyAwareVerifyResult` carries the verdict + stats; a
+        // can't-even-run condition surfaces as `historyAwareVerifyError`
+        // (distinct from a ran-and-failed verdict), mirroring the keyHistoryError
+        // posture. A3 makes this the production rebuild gate; here it is
+        // preflight-only.
+        if let (Some((blocks, root)), Some(hist)) = (reconstructed, history) {
+            use crate::crypto::verify_history::{verify_repo_with_history, VerifyError};
+            match verify_repo_with_history(blocks, &root, Some(&params.did), &hist) {
+                Ok(out) => {
+                    obj.insert(
+                        "historyAwareVerifyResult".into(),
+                        serde_json::json!({
+                            "verified": true,
+                            "commitsVerified": out.commits_verified,
+                            "keysUsed": out.keys_used,
+                            // The head the history-aware verify resolved — should
+                            // equal reconstructedHeadCid (both from the same
+                            // reconstruction); surfaced so an operator can confirm
+                            // the two verify paths agree.
+                            "verifiedHeadCid": out.repo.commit_cid.to_string(),
+                        }),
+                    );
+                }
+                // The verify ran and found a bad/unmappable commit — a verdict
+                // (verified:false), not a can't-run.
+                Err(VerifyError::CommitVerifyFailed { commit_cid, rev, reason, .. }) => {
+                    obj.insert(
+                        "historyAwareVerifyResult".into(),
+                        serde_json::json!({
+                            "verified": false,
+                            "failure": { "commitCid": commit_cid, "rev": rev, "reason": reason },
+                        }),
+                    );
+                }
+                Err(VerifyError::CommitBeforeGenesis { commit_cid, rev, .. }) => {
+                    obj.insert(
+                        "historyAwareVerifyResult".into(),
+                        serde_json::json!({
+                            "verified": false,
+                            "failure": {
+                                "commitCid": commit_cid,
+                                "rev": rev,
+                                "reason": "commit predates the genesis PLC op",
+                            },
+                        }),
+                    );
+                }
+                // EmptyHistory / PlcFetch / ProtoBlueRepo — couldn't run the verify.
+                Err(other) => {
+                    obj.insert(
+                        "historyAwareVerifyError".into(),
+                        serde_json::Value::String(other.to_string()),
+                    );
+                }
             }
         }
     }
@@ -13633,6 +13694,20 @@ mod tests {
         assert!(
             resp.0.get("keyHistoryEntries").is_none(),
             "no counts when the PLC fetch failed"
+        );
+        // Wiring assertion (#368): history-aware verify (Phase A2) runs ONLY when
+        // BOTH reconstruction and PLC history are available. Here reconstruction
+        // failed (broken repo) so the A2 consumer is correctly skipped — neither
+        // the verdict nor the can't-run error appears. (The live verdict path
+        // needs a real PLC + a reconstructable repo → real-binary; the verifier
+        // itself is covered by the crypto::verify_history unit tests.)
+        assert!(
+            resp.0.get("historyAwareVerifyResult").is_none(),
+            "A2 verify must not run when reconstruction failed"
+        );
+        assert!(
+            resp.0.get("historyAwareVerifyError").is_none(),
+            "A2 verify must not even attempt when reconstruction failed"
         );
     }
 

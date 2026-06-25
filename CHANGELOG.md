@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All federation-policy changes are blocked while the deployment is in recovery mode, consistent with the rest of the admin surface
 - UI building blocks: loading skeletons, spinners, inline errors, error boundaries, consistent timestamps, source-tier indicators, and a save-with-rationale confirmation
 - The repository-rebuild deep preflight now reports how many times an account has rotated its signing key (read from the full PLC audit-log history), giving operators forensic visibility into rotated accounts before a rebuild
+- The repository-rebuild deep preflight now runs history-aware verification — every commit is checked against the signing key that was valid at its revision per the account's PLC key history — so an operator sees whether a rotated account verifies cleanly across its full history before triggering a rebuild
 
 ### Changed
 - The deployment moderation tier (full, reduced, disabled) is now set on the Moderation policy page instead of UI & modes; switching to the disabled tier requires a typed confirmation
