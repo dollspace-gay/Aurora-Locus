@@ -421,34 +421,11 @@ impl PlcClient {
         Ok(())
     }
 
-    /// Check if key rotation is needed
-    ///
-    /// Compares current PLC key with desired key
-    pub async fn needs_rotation(&self, did: &str, desired_key: &str) -> PdsResult<bool> {
-        let doc = self.get_document(did).await?;
-        let current_key = self.get_signing_key(&doc)?;
-
-        Ok(!self.keys_match(&current_key, desired_key))
-    }
-
-    /// Rotate signing key if needed
-    ///
-    /// Convenience method that checks if rotation is needed and performs it
-    pub async fn rotate_key_if_needed(
-        &self,
-        did: &str,
-        new_signing_key: &str,
-        rotation_key_signer: &PlcSigner,
-    ) -> PdsResult<bool> {
-        if !self.needs_rotation(did, new_signing_key).await? {
-            tracing::debug!(did = %did, "Key rotation not needed - keys match");
-            return Ok(false);
-        }
-
-        self.update_signing_key(did, new_signing_key, rotation_key_signer)
-            .await?;
-        Ok(true)
-    }
+    // `needs_rotation` + `rotate_key_if_needed` were removed in B4 (#375): the
+    // CLI was their sole consumer, and the B4 reshape replaced that
+    // rotate-if-needed flow with the explicit no-op check + per-account-key
+    // publish that mirrors the admin handler. The current-vs-desired comparison
+    // they provided is now done inline via get_document/get_signing_key/keys_match.
 }
 
 /// The PLC-directory operations that rotation + rebuild flows reach through
@@ -457,8 +434,8 @@ impl PlcClient {
 /// holds `Arc<dyn PlcClientApi>`.
 ///
 /// Only the ctx-reached methods are here. `PlcClient`'s other inherent methods
-/// (`get_last_op`, `needs_rotation`, `rotate_key_if_needed`) stay inherent for
-/// the ad-hoc callers (identity / dev_routes) that hold a concrete `PlcClient`.
+/// (e.g. `get_last_op`) stay inherent for the ad-hoc callers (identity /
+/// dev_routes) that hold a concrete `PlcClient`.
 #[async_trait]
 pub trait PlcClientApi: Send + Sync {
     async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>>;

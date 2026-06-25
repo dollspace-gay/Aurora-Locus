@@ -240,8 +240,27 @@ async fn main() -> PdsResult<()> {
             cli::publish_identity::publish_identity_from_file(&ctx, &file, delay).await?;
         }
 
-        Some(Commands::RotateKeys { dids, concurrency }) => {
-            cli::rotate_keys::rotate_keys(&ctx, dids.clone(), concurrency).await?;
+        Some(Commands::RotateKeys {
+            dids,
+            concurrency,
+            rationale,
+            public_key,
+            private_key_hex,
+        }) => {
+            // clap `requires` guarantees both-or-neither; assemble the
+            // operator-supplied keypair (gated + single-DID enforced in
+            // rotate_keys) only when both halves are present.
+            let operator_keypair = match (public_key, private_key_hex) {
+                (Some(public_did_key), Some(private_key_hex)) => {
+                    Some(crate::account::OperatorSuppliedKeypair {
+                        public_did_key,
+                        private_key_hex,
+                    })
+                }
+                _ => None,
+            };
+            cli::rotate_keys::rotate_keys(&ctx, dids, concurrency, rationale, operator_keypair)
+                .await?;
         }
 
         Some(Commands::RotateKeysFile { file, concurrency }) => {
