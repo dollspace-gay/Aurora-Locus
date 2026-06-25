@@ -3,6 +3,7 @@
 //! Provides high-level interface for interacting with the PLC directory,
 //! including fetching DID documents, comparing keys, and updating signing keys.
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::identity::did_document::DidDocument;
@@ -450,9 +451,141 @@ impl PlcClient {
     }
 }
 
+/// The PLC-directory operations that rotation + rebuild flows reach through
+/// `AppContext` (key-rotation arc #372 / B1). Behind a trait so unit tests can
+/// substitute [`MockPlcClient`]. `PlcClient` is the production impl; `AppContext`
+/// holds `Arc<dyn PlcClientApi>`.
+///
+/// Only the ctx-reached methods are here. `PlcClient`'s other inherent methods
+/// (`get_last_op`, `needs_rotation`, `rotate_key_if_needed`) stay inherent for
+/// the ad-hoc callers (identity / dev_routes) that hold a concrete `PlcClient`.
+#[async_trait]
+pub trait PlcClientApi: Send + Sync {
+    async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>>;
+    async fn get_document(&self, did: &str) -> PdsResult<DidDocument>;
+    fn get_signing_key(&self, doc: &DidDocument) -> PdsResult<String>;
+    fn keys_match(&self, key1: &str, key2: &str) -> bool;
+    async fn update_signing_key(
+        &self,
+        did: &str,
+        new_signing_key: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()>;
+}
+
+#[async_trait]
+impl PlcClientApi for PlcClient {
+    async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>> {
+        // Fully-qualified to call the inherent method (not recurse into the trait).
+        PlcClient::get_op_history(self, did).await
+    }
+    async fn get_document(&self, did: &str) -> PdsResult<DidDocument> {
+        PlcClient::get_document(self, did).await
+    }
+    fn get_signing_key(&self, doc: &DidDocument) -> PdsResult<String> {
+        PlcClient::get_signing_key(self, doc)
+    }
+    fn keys_match(&self, key1: &str, key2: &str) -> bool {
+        PlcClient::keys_match(self, key1, key2)
+    }
+    async fn update_signing_key(
+        &self,
+        did: &str,
+        new_signing_key: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        PlcClient::update_signing_key(self, did, new_signing_key, rotation_key_signer).await
+    }
+}
+
+/// Test-only mock of [`PlcClientApi`] (key-rotation arc #372 / B1). Returns
+/// pre-configured op-histories; the other methods are minimal stubs B3 extends
+/// when the rotation write-path needs `update_signing_key` responses mocked.
+/// Tests inject it by reassigning `AppContext::plc_client` (a `pub` field).
+#[cfg(test)]
+pub(crate) struct MockPlcClient {
+    op_histories: std::collections::HashMap<String, Vec<PlcOpHistoryEntry>>,
+}
+
+#[cfg(test)]
+impl MockPlcClient {
+    pub(crate) fn new() -> Self {
+        Self { op_histories: std::collections::HashMap::new() }
+    }
+    pub(crate) fn with_op_history(mut self, did: &str, history: Vec<PlcOpHistoryEntry>) -> Self {
+        self.op_histories.insert(did.to_string(), history);
+        self
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl PlcClientApi for MockPlcClient {
+    async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>> {
+        self.op_histories
+            .get(did)
+            .cloned()
+            .ok_or_else(|| PdsError::NotFound(format!("mock: no op history configured for {did}")))
+    }
+    async fn get_document(&self, _did: &str) -> PdsResult<DidDocument> {
+        Err(PdsError::Internal("mock: get_document not configured".into()))
+    }
+    fn get_signing_key(&self, _doc: &DidDocument) -> PdsResult<String> {
+        Err(PdsError::Internal("mock: get_signing_key not configured".into()))
+    }
+    fn keys_match(&self, key1: &str, key2: &str) -> bool {
+        key1 == key2
+    }
+    async fn update_signing_key(
+        &self,
+        _did: &str,
+        _new_signing_key: &str,
+        _rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        Ok(())
+    }
+}
+
+/// Build a mock PLC op-history from `(signing_did_key, accepted_at_rfc3339)`
+/// pairs, ascending. CIDs are test-fake (derived from the key string).
+#[cfg(test)]
+pub(crate) fn mock_op_history(entries: &[(&str, &str)]) -> Vec<PlcOpHistoryEntry> {
+    entries
+        .iter()
+        .map(|(key, at)| PlcOpHistoryEntry {
+            op_cid: format!("bafymock-{key}"),
+            accepted_at: DateTime::parse_from_rfc3339(at)
+                .expect("test op-history timestamp is valid RFC3339")
+                .with_timezone(&Utc),
+            signing_did_key: (*key).to_string(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mock_plc_client_returns_configured_op_history() {
+        let mock = MockPlcClient::new().with_op_history(
+            "did:plc:a",
+            mock_op_history(&[
+                ("did:key:zK1", "2026-01-01T00:00:00Z"),
+                ("did:key:zK2", "2026-02-01T00:00:00Z"),
+            ]),
+        );
+        // Exercise through the trait object (the shape AppContext uses).
+        let api: &dyn PlcClientApi = &mock;
+        let h = api.get_op_history("did:plc:a").await.unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].signing_did_key, "did:key:zK1");
+        assert!(h[0].accepted_at < h[1].accepted_at);
+        assert!(
+            api.get_op_history("did:plc:unconfigured").await.is_err(),
+            "unconfigured DID errors (no silent empty history)"
+        );
+    }
 
     #[test]
     fn test_plc_client_creation() {
