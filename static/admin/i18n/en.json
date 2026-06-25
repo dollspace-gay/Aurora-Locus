@@ -1,6 +1,9 @@
 {
   "_test": {
-    "plural": { "one": "1 thing", "other": "{count} things" }
+    "plural": {
+      "one": "1 thing",
+      "other": "{count} things"
+    }
   },
   "common": {
     "save": "Save",
@@ -405,16 +408,35 @@
     "bulk_disable": "Disable selected"
   },
   "ops": {
-    "sequencer": { "title": "Sequencer", "subtitle": "Position, lag, recent events" },
-    "federation": { "title": "Federation", "subtitle": "Relays, peers, federation activity" },
-    "blobOps": { "title": "Blob ops", "subtitle": "Storage and blob lifecycle" },
-    "rateLimits": { "title": "Rate limits", "subtitle": "Per-endpoint configuration and current state" },
-    "systemHealth": { "title": "System health", "subtitle": "Subsystem status, jobs, validation", "open_sequencer": "Open Sequencer →" }
+    "sequencer": {
+      "title": "Sequencer",
+      "subtitle": "Position, lag, recent events"
+    },
+    "federation": {
+      "title": "Federation",
+      "subtitle": "Relays, peers, federation activity"
+    },
+    "blobOps": {
+      "title": "Blob ops",
+      "subtitle": "Storage and blob lifecycle"
+    },
+    "rateLimits": {
+      "title": "Rate limits",
+      "subtitle": "Per-endpoint configuration and current state"
+    },
+    "systemHealth": {
+      "title": "System health",
+      "subtitle": "Subsystem status, jobs, validation",
+      "open_sequencer": "Open Sequencer →"
+    }
   },
   "settings": {
     "title": "Settings",
     "subtitle": "Configure your PDS instance",
-    "general": { "title": "General settings", "subtitle": "Server identity and basic configuration" },
+    "general": {
+      "title": "General settings",
+      "subtitle": "Server identity and basic configuration"
+    },
     "ui_modes_title": "UI & modes",
     "ui_modes_subtitle": "Theme, language, deployment moderation mode.",
     "theme_label": "Theme",
@@ -471,7 +493,10 @@
       "grant_success": "Granted {role} role to {did}.",
       "grant_failed": "Grant failed."
     },
-    "capabilities": { "title": "Capabilities", "subtitle": "Aurora-Locus features exposed by this deployment" }
+    "capabilities": {
+      "title": "Capabilities",
+      "subtitle": "Aurora-Locus features exposed by this deployment"
+    }
   },
   "kryphocron": {
     "overview": {
@@ -672,6 +697,20 @@
       "audit_pivot": "View override history",
       "saved": "Per-account override saved.",
       "save_failed": "Could not save override"
+    }
+  },
+  "keyRotation": {
+    "policy": {
+      "title": "Key rotation policy",
+      "subtitle": "Deployment policy for per-account signing-key rotation.",
+      "operator_supplied_title": "Operator-supplied rotation keys",
+      "operator_supplied_help": "When enabled, an operator may supply their own keypair for a rotation (for HSM-backed, pre-generated, or compliance-required keys) instead of having the PDS generate one. The private key travels in the request body over TLS. Off by default — rotations accept only PDS-generated keys.",
+      "operator_supplied_label": "Allow operator-supplied keypairs in rotation requests",
+      "enable_heading": "Enable operator-supplied rotation keys?",
+      "enable_body": "This permits operators to supply their own private keypair when rotating an account's signing key. The private key is transmitted in the request body. Only enable this for HSM-backed or pre-generated key workflows.",
+      "disable_heading": "Disable operator-supplied rotation keys?",
+      "disable_body": "Rotations will accept only PDS-generated keys. Operator-supplied keypairs will be rejected before any state change.",
+      "save_success": "Key rotation policy updated"
     }
   },
   "actions": {

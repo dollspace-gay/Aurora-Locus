@@ -2670,12 +2670,21 @@ async fn pre_rebuild_check(
 // Rotation dry-run validation (key-rotation arc #372 / B1 §4.2.1)
 // ---------------------------------------------------------------------------
 
-/// The `key_rotation.operator_supplied_keys_enabled` gate — STUB returning
-/// `false` until B2 wires the runtime setting. Deliberately a function (not a
-/// `const false`) so the gate-on branch stays reachable for the compiler; B2
-/// swaps this body for the runtime-settings read.
-fn operator_supplied_keys_gate_enabled() -> bool {
-    false
+/// The `key_rotation.operator_supplied_keys_enabled` gate (B2 / #373 / §4.6).
+/// Reads the runtime setting through the standard three-tier resolution
+/// (runtime row → file-tier → compiled default). Fail-closed: an absent or
+/// non-boolean value resolves to `false` (disabled), so a malformed setting can
+/// never silently open the operator-supplied path. `resolve_runtime_setting`
+/// never errors (a DB read failure falls through to file/default), so this
+/// returns a bare bool rather than a `Result`.
+async fn operator_supplied_keys_gate_enabled(ctx: &AppContext) -> bool {
+    crate::api::aurora_admin::resolve_runtime_setting(
+        ctx,
+        crate::api::aurora_admin::KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY,
+    )
+    .await
+    .as_bool()
+    .unwrap_or(false)
 }
 
 #[derive(Deserialize)]
@@ -2759,7 +2768,7 @@ async fn dry_run_rotation_validation(
                     "operator keypair decoded to empty private key material",
                 ));
             }
-            if !operator_supplied_keys_gate_enabled() {
+            if !operator_supplied_keys_gate_enabled(&ctx).await {
                 return Err(json_error(
                     StatusCode::BAD_REQUEST,
                     "OperatorSuppliedKeysDisabled",
@@ -13920,6 +13929,84 @@ mod tests {
         )
         .await
         .expect_err("mismatched keypair → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"], "InvalidRequest");
+    }
+
+    // B2 (#373 / §4.6) — flip the operator-supplied-keys gate ON by writing the
+    // runtime-settings row directly (value is the JSON-encoded bool the
+    // three-tier resolver parses + `as_bool()`s). Direct insert keeps the test
+    // independent of the set_runtime_setting handler's auth/audit machinery.
+    async fn set_operator_supplied_gate(ctx: &AppContext, enabled: bool) {
+        sqlx::query(
+            "INSERT INTO runtime_settings (key, value, last_modified, last_modified_by) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(crate::api::aurora_admin::KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY)
+        .bind(if enabled { "true" } else { "false" })
+        .bind("2026-06-25T00:00:00Z")
+        .bind("did:plc:super")
+        .execute(&ctx.account_db)
+        .await
+        .expect("seed gate runtime_settings row");
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_operator_gate_on_valid_accepts() {
+        let ctx = create_test_context().await;
+        set_operator_supplied_gate(&ctx, true).await;
+        let acc = ctx
+            .account_manager
+            .create_account("dryrun4".into(), Some("d4@example.com".into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        let did = acc.did;
+        let gen = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let resp = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest {
+                did: did.clone(),
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: gen.public_did_key.clone(),
+                    private_key_hex: hex::encode(&gen.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect("gate on + valid pair → accepted")
+        .0;
+        assert_eq!(resp["path"], "operatorSuppliedValidation");
+        assert_eq!(resp["resultingPublicDidKey"], gen.public_did_key);
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_operator_gate_on_mismatch_still_rejects() {
+        // Validate-first holds regardless of gate state: with the gate ON, a
+        // mismatched pair surfaces the validation error (not a gate error).
+        let ctx = create_test_context().await;
+        set_operator_supplied_gate(&ctx, true).await;
+        let acc = ctx
+            .account_manager
+            .create_account("dryrun5".into(), Some("d5@example.com".into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        let did = acc.did;
+        let gen = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let other = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let err = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest {
+                did,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: other.public_did_key.clone(),
+                    private_key_hex: hex::encode(&gen.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("gate on + mismatch → still a validation error");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1 .0["error"], "InvalidRequest");
     }

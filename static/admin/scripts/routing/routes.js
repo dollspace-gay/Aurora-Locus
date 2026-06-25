@@ -74,6 +74,10 @@
     { pattern: 'configuration/registration-policy', page: 'configRegistrationPolicy', requires: 'superadmin' },
     { pattern: 'configuration/moderation-policy', page: 'configModerationPolicy', requires: 'superadmin' },
     { pattern: 'configuration/kryphocron-policy', page: 'configKryphocronPolicy', requires: 'superadmin' },
+    // Key-rotation arc B2 (#373 / §4.6). SuperAdmin; the operator-supplied-keys
+    // feature gate for per-account signing-key rotation. Own page (not folded
+    // into Kryphocron policy) — signing-key rotation ≠ the at-rest codec layer.
+    { pattern: 'configuration/key-rotation-policy', page: 'configKeyRotationPolicy', requires: 'superadmin' },
     { pattern: 'configuration/integration-hooks', page: 'configIntegrationHooks', requires: 'superadmin' },
     { pattern: 'configuration/observability', page: 'configObservability', requires: 'superadmin' },
     { pattern: 'configuration/roles', page: 'configRoles', requires: 'moderator' },
@@ -184,6 +188,7 @@
         { label: 'Registration policy', route: 'configuration/registration-policy', icon: 'inbox', requires: 'superadmin' },
         { label: 'Moderation policy', route: 'configuration/moderation-policy', icon: 'shield-check', requires: 'superadmin' },
         { label: 'Kryphocron policy', route: 'configuration/kryphocron-policy', icon: 'eye-off', requires: 'superadmin' },
+        { label: 'Key rotation policy', route: 'configuration/key-rotation-policy', icon: 'refresh-cw', requires: 'superadmin' },
         { label: 'Integration hooks', route: 'configuration/integration-hooks', icon: 'external-link', requires: 'superadmin' },
         { label: 'Observability', route: 'configuration/observability', icon: 'eye', requires: 'superadmin' },
         { label: 'Roles', route: 'configuration/roles', icon: 'key', requires: 'moderator' },

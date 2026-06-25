@@ -4008,6 +4008,8 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     FEDERATION_POLICY_DISCOVERY_MODE_KEY,
     FEDERATION_POLICY_RELAY_URLS_KEY,
     FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
+    // Key-rotation arc B2 (#373 / §4.6) — operator-supplied-keys feature gate.
+    KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY,
 ];
 
 // Federation Pattern-1 Phase A (#351 / design §2.1, §3.1, §4.1, §3.4).
@@ -4016,6 +4018,18 @@ pub const FEDERATION_POLICY_DISCOVERY_MODE_KEY: &str = "federation.policy.discov
 pub const FEDERATION_POLICY_RELAY_URLS_KEY: &str = "federation.policy.relay-urls";
 pub const FEDERATION_POLICY_PENDING_DISCOVERIES_KEY: &str =
     "federation.policy.pending-discoveries";
+
+/// Key-rotation arc B2 (#373 / design §4.6) — gates the operator-supplied
+/// signing-key path in account-key rotation. `false` (default) means the
+/// rotation flow only accepts PDS-generated keys; `true` permits an operator
+/// to supply their own (publicDidKey, privateKeyHex) pair (HSM-backed /
+/// pre-generated / compliance-required paths). Read fail-closed (absent or
+/// non-bool → disabled) by the dry-run XRPC gate-check and, in B3, by the
+/// rotation handler + CLI. SuperAdmin-mutable; flip is audit-chained for free
+/// via `set_runtime_setting`.
+pub const KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY: &str =
+    "key_rotation.operator_supplied_keys_enabled";
+
 pub const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
 /// Env-var override of the file-tier YAML path. Default is
@@ -4066,6 +4080,8 @@ fn default_for_key(key: &str) -> serde_json::Value {
         FEDERATION_POLICY_DISCOVERY_MODE_KEY => {
             serde_json::Value::String("allowlist-only".to_string())
         }
+        // Key-rotation arc B2 (#373 / §4.6) — operator-supplied keys off by default.
+        KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY => serde_json::Value::Bool(false),
         _ => serde_json::Value::Null,
     }
 }
@@ -4180,6 +4196,10 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         // v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — relay-urls
         // tightens from accept-any: JSON array, HTTPS, no-dup, 1..=10 entries.
         FEDERATION_POLICY_RELAY_URLS_KEY => is_valid_relay_urls(value),
+        // Key-rotation arc B2 (#373 / §4.6) — a strict bool. Rejects strings
+        // ("true"), numbers (1), and any non-boolean shape so the gate-check's
+        // `as_bool()` read is unambiguous.
+        KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY => value.is_boolean(),
         _ => true,
     }
 }
@@ -4890,6 +4910,17 @@ pub async fn set_runtime_setting(
             "invalid value for runtime setting '{}'",
             input.key
         )));
+    }
+    // Key-rotation arc B2 (#373 / §4.6) — the operator-supplied-keys gate is a
+    // strict bool; reject non-boolean input at the boundary so a stray "true"
+    // string never persists and the gate-check's `as_bool()` read can't silently
+    // fall to the disabled default on a malformed value.
+    if input.key == KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY
+        && !validate_runtime_value(&input.key, &input.value)
+    {
+        return Err(validation(
+            "key_rotation.operator_supplied_keys_enabled must be a boolean (true or false)",
+        ));
     }
     // Read previous value for the diff returned in output.
     let prev_row = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
@@ -8965,6 +8996,79 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(audit_count, 1);
+    }
+
+    // ---- key-rotation arc B2 (#373 / §4.6) operator-supplied-keys gate ----
+
+    #[test]
+    fn key_rotation_gate_registered_and_defaults_false() {
+        assert!(
+            KNOWN_RUNTIME_KEYS.contains(&KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY),
+            "the gate key must be in the known-keys registry so setRuntimeSetting accepts it"
+        );
+        assert_eq!(
+            default_for_key(KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY),
+            serde_json::Value::Bool(false),
+            "operator-supplied keys must default OFF (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn key_rotation_gate_validates_as_strict_bool() {
+        let k = KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY;
+        assert!(validate_runtime_value(k, &serde_json::json!(true)));
+        assert!(validate_runtime_value(k, &serde_json::json!(false)));
+        // Non-boolean shapes are rejected so the gate read is unambiguous.
+        assert!(!validate_runtime_value(k, &serde_json::json!("true")));
+        assert!(!validate_runtime_value(k, &serde_json::json!(1)));
+        assert!(!validate_runtime_value(k, &serde_json::json!(null)));
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_key_rotation_gate_accepts_bool() {
+        let ctx = create_test_context().await;
+        let resp = set_runtime_setting(
+            State(ctx.clone()),
+            super_admin_auth(),
+            Json(SetRuntimeSettingInput {
+                key: KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY.to_string(),
+                value: serde_json::Value::Bool(true),
+                rationale: "enable operator-supplied keys for the HSM rotation path".to_string(),
+            }),
+        )
+        .await
+        .expect("a bool value is accepted")
+        .0;
+        assert_eq!(resp.previous_value, serde_json::Value::Bool(false));
+        assert_eq!(resp.new_value, serde_json::Value::Bool(true));
+        // The flip is audit-chained for free via write_runtime_setting_audited.
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1 AND rationale LIKE $2",
+        )
+        .bind("SetRuntimeSetting")
+        .bind("key_rotation.operator_supplied_keys_enabled%")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 1, "flipping the gate must land a SetRuntimeSetting audit entry");
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_key_rotation_gate_rejects_non_bool() {
+        let ctx = create_test_context().await;
+        // A string "true" must be rejected at the boundary, not coerced.
+        let err = set_runtime_setting(
+            State(ctx),
+            super_admin_auth(),
+            Json(SetRuntimeSettingInput {
+                key: KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY.to_string(),
+                value: serde_json::Value::String("true".to_string()),
+                rationale: "trying to set a string".to_string(),
+            }),
+        )
+        .await
+        .expect_err("non-boolean value must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     // ---- uploadBrandingAsset / serve_branding_asset (#329) ----
