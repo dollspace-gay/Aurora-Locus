@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The repository-rebuild deep preflight now reports how many times an account has rotated its signing key (read from the full PLC audit-log history), giving operators forensic visibility into rotated accounts before a rebuild
 - The repository-rebuild deep preflight now runs history-aware verification — every commit is checked against the signing key that was valid at its revision per the account's PLC key history — so an operator sees whether a rotated account verifies cleanly across its full history before triggering a rebuild
 - Repository rebuild (and bulk repo-repair, which repairs through the same path) now verifies the reconstructed repo history-aware — every commit against the key valid at its revision from PLC history — instead of checking only the head commit against the current key
+- A new SuperAdmin dry-run endpoint lets operators validate a signing-key rotation before committing to it — reporting the key the PDS would generate, or checking an operator-supplied keypair (and catching mismatched keys) — without mutating anything or publishing to PLC
 
 ### Changed
 - The deployment moderation tier (full, reduced, disabled) is now set on the Moderation policy page instead of UI & modes; switching to the disabled tier requires a typed confirmation

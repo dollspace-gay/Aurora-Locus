@@ -903,6 +903,14 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(cancel_rebuild),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // Rotation dry-run validation (key-rotation arc #372 / B1): read-only —
+        // validate an operator-supplied keypair or report what the PDS would
+        // generate, without mutating state or publishing to PLC.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.dryRunRotationValidation",
+            post(dry_run_rotation_validation),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // Bulk repository repair — scan substrate (§7.4.3 / #291): start an
         // across-accounts inconsistency scan, poll its progress, cancel it,
         // and read the persisted findings.
@@ -2656,6 +2664,118 @@ async fn pre_rebuild_check(
     }
 
     Ok(Json(body))
+}
+
+// ---------------------------------------------------------------------------
+// Rotation dry-run validation (key-rotation arc #372 / B1 §4.2.1)
+// ---------------------------------------------------------------------------
+
+/// The `key_rotation.operator_supplied_keys_enabled` gate — STUB returning
+/// `false` until B2 wires the runtime setting. Deliberately a function (not a
+/// `const false`) so the gate-on branch stays reachable for the compiler; B2
+/// swaps this body for the runtime-settings read.
+fn operator_supplied_keys_gate_enabled() -> bool {
+    false
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DryRunRotationValidationRequest {
+    did: String,
+    /// Present → validate the operator-supplied keypair (gated); absent →
+    /// simulate PDS generation (no storage).
+    #[serde(default)]
+    operator_keypair: Option<crate::account::OperatorSuppliedKeypair>,
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.dryRunRotationValidation` — read-only
+/// dry-run of a signing-key rotation (#372 / B1). With no `operatorKeypair`,
+/// reports the public did:key the PDS WOULD generate; with one, validates it
+/// (derive-public-from-private + compare) and reports whether it would be
+/// accepted. Never persists, never publishes to PLC, never returns or logs a
+/// private key. SuperAdmin; 404 on unknown DID. The in-bin consumer of
+/// `generate_rotation_keypair` + `validate_operator_keypair`.
+async fn dry_run_rotation_validation(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<DryRunRotationValidationRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "dryRunRotationValidation requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    // The dry-run is "for this account" — confirm it exists.
+    ctx.account_manager.get_account(&req.did).await.map_err(|e| {
+        if matches!(e, PdsError::NotFound(_)) {
+            json_error(StatusCode::NOT_FOUND, "NotFound", format!("account not found: {}", req.did))
+        } else {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        }
+    })?;
+
+    match req.operator_keypair {
+        // Path A — PDS generation (default): report what would be generated.
+        None => {
+            let kp = ctx.account_manager.generate_rotation_keypair().map_err(|e| {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+            })?;
+            // Sanity guard: a generated keypair must carry private material (the
+            // rotation signing key B3 will use). Never exposed or logged.
+            if kp.private_key_bytes.is_empty() {
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    "key generation produced empty private key material",
+                ));
+            }
+            Ok(Json(serde_json::json!({
+                "did": req.did,
+                "path": "pdsGeneration",
+                "resultingPublicDidKey": kp.public_did_key,
+                "wouldProceedSummary":
+                    format!("would rotate {} to a PDS-generated key ({})", req.did, kp.public_did_key),
+            })))
+        }
+        // Path B — operator-supplied (gated): validate FIRST so a mismatched or
+        // malformed pair surfaces even when the gate is off, THEN enforce the gate.
+        Some(supplied) => {
+            let validated =
+                ctx.account_manager.validate_operator_keypair(&supplied).map_err(|e| {
+                    json_error(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string())
+                })?;
+            // Sanity guard: a validated keypair carries the decoded private
+            // material. Never exposed or logged.
+            if validated.private_key_bytes.is_empty() {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "operator keypair decoded to empty private key material",
+                ));
+            }
+            if !operator_supplied_keys_gate_enabled() {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "OperatorSuppliedKeysDisabled",
+                    "operator-supplied rotation keys are disabled on this deployment \
+                     (set key_rotation.operator_supplied_keys_enabled to enable)",
+                ));
+            }
+            Ok(Json(serde_json::json!({
+                "did": req.did,
+                "path": "operatorSuppliedValidation",
+                "resultingPublicDidKey": validated.public_did_key,
+                "wouldProceedSummary":
+                    format!("would rotate {} to operator-supplied key ({})", req.did, validated.public_did_key),
+            })))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9310,11 +9430,12 @@ mod tests {
             },
             identity: IdentityConfig {
                 // Non-routable fail-fast URL: unit tests must not dial the real
-                // PLC directory. PLC-touching handlers (rotation, preRebuildCheck
-                // deep key-history) get a fast connection-refused they degrade on,
-                // instead of a network round-trip / 30s timeout against
-                // plc.directory.
-                did_plc_url: "http://127.0.0.1:1".to_string(),
+                // PLC directory. Port 0 is doubly useful — it triggers
+                // generate_plc_did's #[cfg(test)] short-circuit (so create_account
+                // works in admin tests) AND, being an invalid connect target, it
+                // fails fast for real PLC fetches (rotation, preRebuildCheck deep
+                // key-history) instead of a network round-trip / timeout.
+                did_plc_url: "http://127.0.0.1:0".to_string(),
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
@@ -10829,6 +10950,7 @@ mod tests {
             r#""rebuildRepo","#,
             r#""getRebuildProgress","#,
             r#""cancelRebuild","#,
+            r#""dryRunRotationValidation","#,
             r#""scanReposForInconsistencies","#,
             r#""getScanProgress","#,
             r#""cancelScan","#,
@@ -13686,6 +13808,120 @@ mod tests {
             resp.0.get("historyAwareVerifyError").is_none(),
             "A2 verify must not even attempt when reconstruction failed"
         );
+    }
+
+    // ---------- key-rotation arc #372 / B1 dry-run validation XRPC ----------
+
+    #[tokio::test]
+    async fn dry_run_rotation_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            Json(DryRunRotationValidationRequest { did: "did:plc:x".into(), operator_keypair: None }),
+        )
+        .await
+        .expect_err("Admin (not SuperAdmin) must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_unknown_did_404() {
+        let ctx = create_test_context().await;
+        let err = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest {
+                did: "did:plc:nonexistent".into(),
+                operator_keypair: None,
+            }),
+        )
+        .await
+        .expect_err("unknown DID → 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_pds_generation_is_read_only() {
+        let ctx = create_test_context().await;
+        let acc = ctx
+            .account_manager
+            .create_account("dryrun".into(), Some("d@example.com".into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        let did = acc.did;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+
+        let resp = dry_run_rotation_validation(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest { did: did.clone(), operator_keypair: None }),
+        )
+        .await
+        .expect("dry-run succeeds")
+        .0;
+        assert_eq!(resp["path"], "pdsGeneration");
+        assert!(resp["resultingPublicDidKey"].as_str().unwrap().starts_with("did:key:"));
+
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(before, after, "dry-run must NOT mutate plc_keys");
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_operator_valid_but_gate_off_rejects() {
+        let ctx = create_test_context().await;
+        let acc = ctx
+            .account_manager
+            .create_account("dryrun2".into(), Some("d2@example.com".into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        let did = acc.did;
+        let gen = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let err = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest {
+                did,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: gen.public_did_key.clone(),
+                    private_key_hex: hex::encode(&gen.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("a valid pair still rejects while the gate is off (B1 stub)");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"], "OperatorSuppliedKeysDisabled");
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_operator_mismatch_surfaces_before_gate() {
+        let ctx = create_test_context().await;
+        let acc = ctx
+            .account_manager
+            .create_account("dryrun3".into(), Some("d3@example.com".into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        let did = acc.did;
+        let gen = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let other = ctx.account_manager.generate_rotation_keypair().unwrap();
+        // Wrong public key for the private bytes → mismatch, surfaced before the
+        // gate check (validate-first).
+        let err = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest {
+                did,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: other.public_did_key.clone(),
+                    private_key_hex: hex::encode(&gen.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("mismatched keypair → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"], "InvalidRequest");
     }
 
     // ---------- §7.4.1 / #290 destructive rebuild XRPCs ----------
