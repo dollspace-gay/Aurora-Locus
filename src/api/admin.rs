@@ -3986,34 +3986,70 @@ async fn admin_delete_account(
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateAccountSigningKeyRequest {
-    /// DID of the account whose signing key is being updated
+    /// DID of the account whose signing key is being rotated.
     did: String,
-    /// New signing key in did:key: format (per the lexicon)
-    signing_key: String,
+    /// Operator rationale, recorded in the rotation audit entry.
+    #[serde(default)]
+    rationale: Option<String>,
+    /// Operator-supplied keypair (the gated path, §4.2.1 Path B). Absent → the
+    /// PDS generates a fresh per-account keypair (Path A). Present → validated
+    /// (derive-public-from-private + compare) and gated on
+    /// `key_rotation.operator_supplied_keys_enabled`.
+    #[serde(default)]
+    operator_keypair: Option<crate::account::OperatorSuppliedKeypair>,
 }
 
-/// Update an account's signing key in the PLC directory
+/// How the new per-account signing key was produced — the load-bearing forensic
+/// record in the rotation audit (§4.2.6). Serializes to the design's snake-case
+/// wire values (`"pds"` / `"operator_supplied"`).
+#[derive(Debug, Clone, Copy, Serialize)]
+enum KeyGenerationSource {
+    #[serde(rename = "pds")]
+    PdsGenerated,
+    #[serde(rename = "operator_supplied")]
+    OperatorSupplied,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateAccountSigningKeyResponse {
+    did: String,
+    /// The account's new (or, on a no-op, current) atproto signing key, did:key form.
+    new_signing_key: String,
+    generation_source: KeyGenerationSource,
+    /// CID of the empty-commit advance signed with the new per-account key.
+    /// Absent on the idempotent no-op short-circuit (no commit produced).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    empty_commit_cid: Option<String>,
+    /// The PLC operation CID. Currently always absent: the substrate's
+    /// `PlcClient::update_signing_key` does not surface the op CID (see the
+    /// TODO at plc_client.rs — PLC op CIDs aren't computed yet). Modelled as
+    /// optional so it populates once the substrate returns it, without another
+    /// contract change. Flagged on #374 for design.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plc_op_cid: Option<String>,
+}
+
+/// Rotate an account's atproto signing key (`com.atproto.admin.updateAccountSigningKey`).
 ///
-/// Implements `com.atproto.admin.updateAccountSigningKey`. Submits a PLC
-/// operation rotating the `verificationMethods.atproto` entry to the supplied
-/// did:key value, then advances the repository commit chain with an empty
-/// commit and sequences an identity event so federation peers learn of the
-/// change.
+/// Key-rotation arc B3 (#374, design §4.2.0-§4.2.6 / §4.3). The PDS generates a
+/// fresh per-account keypair by default; an operator may supply their own
+/// keypair when the `key_rotation.operator_supplied_keys_enabled` runtime gate
+/// is on (§4.6). The flow: pick/validate the keypair → publish the new public
+/// key to PLC → write the new private key to `plc_keys` → advance the repo with
+/// an empty commit signed by the **new per-account key** (not the PDS-wide repo
+/// key — the R2.1 contradiction fix) → sequence an identity event → emit the
+/// rotation audit recording the generation source and old/new public keys.
 ///
-/// Aurora-Locus runs in a single-operator-key model: the operator's
-/// `authentication.repo_signing_key` is the only private key the PDS can sign
-/// commits with. Rotating to any other public key would leave the account
-/// unable to produce new commits, so this handler enforces strict-mode
-/// validation: the supplied `signingKey` must match the operator's configured
-/// key. The lexicon contract permits arbitrary `signingKey` values; the
-/// strict-mode check is an Aurora-architecture safety constraint.
+/// No request-supplied `signingKey` and no single-operator-key strict check:
+/// per-account keys are the model now (the strict check + its TODO are removed).
 async fn update_account_signing_key(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<UpdateAccountSigningKeyRequest>,
-) -> Result<StatusCode, axum::response::Response> {
+) -> Result<Json<UpdateAccountSigningKeyResponse>, axum::response::Response> {
     use crate::actor_store::repository::RepositoryManager;
     use crate::crypto::{plc::PlcSigner, proto_blue_signer::RepoSigner};
     use crate::sequencer::events::IdentityEvent;
@@ -4043,40 +4079,41 @@ async fn update_account_signing_key(
             "did must be a did:plc identifier",
         ));
     }
-    if !req.signing_key.starts_with("did:key:") {
-        return Err(plain_err(
-            StatusCode::BAD_REQUEST,
-            "signingKey must be in did:key: format",
-        ));
-    }
 
-    // Strict-mode validation: the supplied signingKey must match the operator's
-    // configured repo_signing_key. Aurora-Locus has a single operator-level
-    // private key; any other rotation target would leave the account unable to
-    // sign new commits.
-    //
-    // TODO: Relax this check when Aurora-Locus supports per-account signing
-    // keys. The lexicon contract permits arbitrary signingKey values; this
-    // strict-mode validation is a safety check appropriate to Aurora's
-    // current single-key architecture.
-    let repo_signer = PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key)
-        .map_err(|e| {
-            plain_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Operator repo signing key not configured: {}", e),
+    // §4.2.1 — pick the new per-account keypair. Path A (no operator_keypair):
+    // PDS generation. Path B (operator-supplied): validate FIRST so a mismatched
+    // or malformed pair surfaces regardless of gate state (B1/B2 ordering), THEN
+    // enforce the operator-supplied-keys gate. Same gate-read as the dry-run.
+    let (rotation_keypair, generation_source) = match &req.operator_keypair {
+        None => (
+            ctx.account_manager.generate_rotation_keypair().map_err(|e| {
+                plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?,
+            KeyGenerationSource::PdsGenerated,
+        ),
+        Some(supplied) => {
+            let validated = ctx
+                .account_manager
+                .validate_operator_keypair(supplied)
+                .map_err(|e| xrpc_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()))?;
+            let gate_on = crate::api::aurora_admin::resolve_runtime_setting(
+                &ctx,
+                crate::api::aurora_admin::KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY,
             )
-        })?;
-    let operator_did_key = repo_signer.public_key_did_key();
-    if req.signing_key != operator_did_key {
-        return Err(xrpc_err(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "signingKey does not match operator's configured signing key. \
-             Aurora-Locus uses a single operator-level signing key model; \
-             the provided signingKey must match the operator's \
-             repo_signing_key config.",
-        ));
-    }
+            .await
+            .as_bool()
+            .unwrap_or(false);
+            if !gate_on {
+                return Err(xrpc_err(
+                    StatusCode::BAD_REQUEST,
+                    "OperatorSuppliedKeysDisabled",
+                    "operator-supplied rotation keys are disabled on this deployment \
+                     (set key_rotation.operator_supplied_keys_enabled to enable)",
+                ));
+            }
+            (validated, KeyGenerationSource::OperatorSupplied)
+        }
+    };
 
     // Threaded shared PLC client (#371 / A3b) — no ad-hoc construction.
     let plc_client = &ctx.plc_client;
@@ -4089,10 +4126,11 @@ async fn update_account_signing_key(
             )
         })?;
 
-    // Compare against the current PLC document. Aurora's PlcClient::get_signing_key
-    // returns multibase form (the bare `z...` prefix); the request's signingKey is
-    // in did:key form. Strip the prefix for comparison so we don't submit a no-op
-    // PLC operation when the keys already match.
+    // §4.2.2 / §4.3 no-op short-circuit (preserved as-is; scope narrowed by
+    // R2.1). Compare the would-be-published key against the current PLC key;
+    // skip if they already match. Vestigial on Path A (a freshly-generated key
+    // never matches), meaningful on Path B when the operator supplies the
+    // already-current key (the genuine idempotent no-op).
     let current_doc = plc_client.get_document(&req.did).await.map_err(|e| {
         if matches!(e, PdsError::IdentityResolution(_)) {
             plain_err(
@@ -4106,28 +4144,55 @@ async fn update_account_signing_key(
     let current_key_multibase = plc_client
         .get_signing_key(&current_doc)
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let new_key_multibase = req
-        .signing_key
+    let new_key_multibase = rotation_keypair
+        .public_did_key
         .strip_prefix("did:key:")
-        .unwrap_or(&req.signing_key);
+        .unwrap_or(&rotation_keypair.public_did_key);
 
     if plc_client.keys_match(&current_key_multibase, new_key_multibase) {
-        tracing::debug!(did = %req.did, "Signing key already up to date; skipping PLC submission");
-        return Ok(StatusCode::OK);
+        tracing::debug!(did = %req.did, "Signing key already up to date; skipping rotation (no-op)");
+        return Ok(Json(UpdateAccountSigningKeyResponse {
+            did: req.did,
+            new_signing_key: rotation_keypair.public_did_key,
+            generation_source,
+            empty_commit_cid: None,
+            plc_op_cid: None,
+        }));
     }
 
-    // Submit PLC update with the did:key form so the entry stores the canonical
-    // verificationMethods.atproto value.
+    // §4.2.3 — publish the new public key to PLC with the PDS-wide rotation key.
     plc_client
-        .update_signing_key(&req.did, &req.signing_key, &rotation_signer)
+        .update_signing_key(&req.did, &rotation_keypair.public_did_key, &rotation_signer)
         .await
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Advance the repository commit chain with an empty commit so the rotation
-    // is reflected in repository state, not just the DID document. Mirrors the
-    // CLI rotation flow in src/cli/rotate_keys.rs. Strict-mode validation
-    // guarantees the operator's repo_signing_key matches the new PLC entry, so
-    // the commit signature will verify against the newly-installed key.
+    // §4.2.4 — write the new private key to plc_keys; capture the old keys for
+    // the audit. NotFound (no plc_keys row) → 404.
+    let old_keys = ctx
+        .account_manager
+        .update_atproto_signing_key(&req.did, &rotation_keypair.private_key_bytes)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                plain_err(StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+            } else {
+                plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+    // Defensive invariant: a rotation must have had a real prior key (the writer
+    // already errors on a malformed/empty prior key; this guards the contract
+    // and reads old_private_key_bytes so the field is never dead).
+    if old_keys.old_private_key_bytes.is_empty() {
+        return Err(plain_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rotation produced no prior signing key to record",
+        ));
+    }
+
+    // §4.2.5 — advance the repo with an empty commit signed by the NEW
+    // per-account private key (the R2.1 contradiction fix: was the PDS-wide
+    // repo_signing_key). The commit now verifies against the key PLC just
+    // published — internally consistent.
     let repo_mgr = RepositoryManager::with_sequencer(
         req.did.clone(),
         (*ctx.actor_store).clone(),
@@ -4135,16 +4200,10 @@ async fn update_account_signing_key(
     )
     .with_blob_store(ctx.blob_store.clone());
     let repo_signer_pb: std::sync::Arc<dyn proto_blue::crypto::Signer> = {
-        let key_bytes = hex::decode(&ctx.config.authentication.repo_signing_key).map_err(|e| {
+        let s = RepoSigner::from_bytes(&rotation_keypair.private_key_bytes).map_err(|e| {
             plain_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Invalid hex repo signing key: {}", e),
-            )
-        })?;
-        let s = RepoSigner::from_bytes(&key_bytes).map_err(|e| {
-            plain_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to build repo signer: {}", e),
+                format!("Failed to build repo signer from new per-account key: {}", e),
             )
         })?;
         std::sync::Arc::new(s)
@@ -4181,21 +4240,31 @@ async fn update_account_signing_key(
         .await
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // §4.2.6 — emit the rotation audit. The forensic record (old/new public
+    // did:keys, generation source, empty-commit CID) rides the structured
+    // payload; the operator rationale is the rationale column. Private key
+    // material NEVER appears — only public did:keys.
     let subject = Subject::Repo {
         did: req.did.clone(),
     };
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rationale = format!("rotate signing key to {}", req.signing_key);
+    let rationale = req
+        .rationale
+        .clone()
+        .unwrap_or_else(|| "rotate account signing key".to_string());
+    let payload = serde_json::json!({
+        "old_atproto_signing_key": old_keys.old_public_did_key,
+        "new_atproto_signing_key": rotation_keypair.public_did_key,
+        "generation_source": generation_source,
+        "empty_commit_cid": commit_cid.to_string(),
+    });
 
     // LB-1 Session 12 / chainlink #129: signing-key rotation's actor
-    // mutations live in actor_store (separate DB) and the PLC
-    // directory (HTTP), with the operator's repo_signing_key as the
-    // only signing material in account_db (read-only here). The chain
-    // entry is the only account_db write and the tx wrapper is
-    // structurally consistent with the rest of Session 12 (no other
-    // writes share the tx).
+    // mutations live in actor_store (separate DB) and the PLC directory
+    // (HTTP). The chain entry is the only account_db write and the tx wrapper
+    // is structurally consistent with the rest of Session 12.
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
     let mut tx = ctx
         .account_db
@@ -4207,7 +4276,7 @@ async fn update_account_signing_key(
         ctx.config.database.backend,
         AppendEntryParams {
             source: "manual",
-            payload: None,
+            payload: Some(payload),
             actor_did: &auth.did,
             action: "account.update_signing_key",
             subject: Some(&subject),
@@ -4227,10 +4296,16 @@ async fn update_account_signing_key(
     tracing::info!(
         admin = %auth.did,
         did = %req.did,
-        "Updated account signing key via XRPC"
+        "Rotated account signing key via XRPC"
     );
 
-    Ok(StatusCode::OK)
+    Ok(Json(UpdateAccountSigningKeyResponse {
+        did: req.did,
+        new_signing_key: rotation_keypair.public_did_key,
+        generation_source,
+        empty_commit_cid: Some(commit_cid.to_string()),
+        plc_op_cid: None,
+    }))
 }
 
 // ============================================================================
@@ -10029,14 +10104,52 @@ mod tests {
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
+    // ---------- key-rotation arc B3 (#374): rotation handler reshape ----------
+
+    use crate::crypto::plc_client::MockPlcClient;
+    use std::sync::Arc as TestArc;
+
+    // A mock PLC whose published key for `did` is `current` (so the no-op
+    // short-circuit compares against a known value) and whose update/publish is
+    // a no-op Ok.
+    fn mock_plc_with_current(did: &str, current: &str) -> TestArc<dyn crate::crypto::plc_client::PlcClientApi> {
+        TestArc::new(MockPlcClient::new().with_current_signing_key(did, current))
+    }
+
+    // Create an account AND initialize its actor-store repo (genesis commit) so
+    // the rotation's empty-commit advance (apply_writes) has a repo to append to
+    // — account_manager.create_account writes the DB rows only; the genesis repo
+    // comes from create_account_emit_sequence (the real createAccount flow).
+    async fn seed_rotatable_account(ctx: &AppContext, handle: &str, email: &str) -> String {
+        let acc = ctx
+            .account_manager
+            .create_account(handle.into(), Some(email.into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        // Mirror the real createAccount flow: initialize the actor-store repo
+        // namespace, then emit the genesis commit. Without initialize() the
+        // genesis put_block 404s ("Actor repository not found").
+        let repo_mgr = crate::actor_store::RepositoryManager::with_validation_mode(
+            acc.did.clone(),
+            (*ctx.actor_store).clone(),
+            ctx.config.validation_mode,
+        );
+        repo_mgr.initialize().await.expect("initialize actor repo");
+        let h = acc.handle.clone().unwrap_or_else(|| handle.to_string());
+        crate::api::account_emit::create_account_emit_sequence(ctx, &acc.did, &h)
+            .await
+            .expect("seed genesis repo for rotation");
+        acc.did
+    }
+
     #[tokio::test]
-    async fn test_update_account_signing_key_rejects_non_plc_did() {
+    async fn update_signing_key_rejects_non_plc_did() {
         let ctx = create_test_context().await;
         let req = UpdateAccountSigningKeyRequest {
             did: "did:web:example.com".to_string(),
-            signing_key: "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH".to_string(),
+            rationale: None,
+            operator_keypair: None,
         };
-
         let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
             .await
             .expect_err("non-did:plc DID should be rejected");
@@ -10045,86 +10158,224 @@ mod tests {
         assert!(body.contains("did:plc"));
     }
 
-    #[tokio::test]
-    async fn test_update_account_signing_key_rejects_non_did_key_signing_key() {
-        let ctx = create_test_context().await;
-        let req = UpdateAccountSigningKeyRequest {
-            did: "did:plc:abcdefghijklmnop".to_string(),
-            signing_key: "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH".to_string(),
-        };
-
-        let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
-            .await
-            .expect_err("bare multibase signingKey should be rejected");
-        let (status, body) = read_response_body(resp).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("did:key"));
+    #[test]
+    fn update_signing_key_request_rejects_legacy_signing_key_field() {
+        // §4.5: the contract dropped `signingKey`; deny_unknown_fields makes a
+        // stale caller's `signingKey` a hard deserialize error, not a silent
+        // ignore that would PDS-generate a key they didn't ask for.
+        let json = serde_json::json!({"did": "did:plc:x", "signingKey": "did:key:zABC"});
+        let r: Result<UpdateAccountSigningKeyRequest, _> = serde_json::from_value(json);
+        assert!(r.is_err(), "legacy signingKey field must be rejected");
     }
 
     #[tokio::test]
-    async fn test_update_account_signing_key_rejects_mismatched_signing_key() {
-        use crate::crypto::plc::PlcSigner;
+    async fn update_signing_key_pds_generated_rotates_and_audits() {
+        let mut ctx = create_test_context().await;
+        let did = seed_rotatable_account(&ctx, "rotpds", "rp@example.com").await;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        // Current PLC key differs from any freshly generated key → no no-op.
+        ctx.plc_client = mock_plc_with_current(&did, "zCurrentPlaceholderNotMatchingNew");
 
-        let ctx = create_test_context().await;
-        // Sanity-check: derive the operator's did:key so we know what would be
-        // accepted, then submit something different.
-        let operator_signer =
-            PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key).unwrap();
-        let operator_did_key = operator_signer.public_key_did_key();
-        let mismatching_did_key = "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme";
-        assert_ne!(operator_did_key, mismatching_did_key);
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: Some("scheduled rotation".into()),
+                operator_keypair: None,
+            }),
+        )
+        .await
+        .expect("pds-generated rotation succeeds")
+        .0;
 
-        let req = UpdateAccountSigningKeyRequest {
-            did: "did:plc:abcdefghijklmnop".to_string(),
-            signing_key: mismatching_did_key.to_string(),
-        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["generationSource"], "pds");
+        assert!(v["newSigningKey"].as_str().unwrap().starts_with("did:key:"));
+        assert!(v["emptyCommitCid"].is_string(), "real rotation carries an empty-commit CID");
+        assert!(v.get("plcOpCid").is_none(), "plc op CID is not surfaced by the substrate yet");
 
-        let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
-            .await
-            .expect_err("mismatched signingKey should be rejected by strict-mode");
-        let (status, body) = read_response_body(resp).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
-        assert_eq!(parsed["error"], "InvalidRequest");
-        assert!(parsed["message"]
-            .as_str()
-            .unwrap()
-            .contains("operator's configured signing key"));
+        // The stored private key actually changed.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_ne!(before, after, "signing key rotated");
+
+        // Audit landed, records generation_source=pds, and never leaks private bytes.
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM audit_chain_entry WHERE action = $1",
+        )
+        .bind("account.update_signing_key")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert!(payload.contains("\"generation_source\":\"pds\""), "got {payload}");
+        assert!(
+            !payload.contains(&hex::encode(&after)),
+            "private key material must never appear in the audit payload"
+        );
     }
 
     #[tokio::test]
-    async fn test_update_account_signing_key_accepts_matching_signing_key() {
-        use crate::crypto::plc::PlcSigner;
+    async fn update_signing_key_pds_generated_is_non_idempotent() {
+        let mut ctx = create_test_context().await;
+        let did = seed_rotatable_account(&ctx, "rotnoidem", "ni@example.com").await;
+        ctx.plc_client = mock_plc_with_current(&did, "zCurrentPlaceholderNotMatchingNew");
 
-        let ctx = create_test_context().await;
-        let operator_signer =
-            PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key).unwrap();
-        let operator_did_key = operator_signer.public_key_did_key();
-
-        let req = UpdateAccountSigningKeyRequest {
-            did: "did:plc:abcdefghijklmnop".to_string(),
-            signing_key: operator_did_key.clone(),
-        };
-
-        // A matching signingKey passes strict-mode validation; the handler
-        // then proceeds to fetch the PLC document, which fails in the test
-        // environment because the configured PLC URL is plc.directory and
-        // the DID is fictitious. We assert that the failure is *not* the
-        // strict-mode 400 InvalidRequest — i.e., strict-mode let us through.
-        let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
+        let mk = |did: String| UpdateAccountSigningKeyRequest { did, rationale: None, operator_keypair: None };
+        let _ = update_account_signing_key(State(ctx.clone()), admin_test_auth(), Json(mk(did.clone())))
             .await
-            .expect_err("PLC document fetch will fail in test env");
+            .expect("first rotation");
+        let after_first = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let _ = update_account_signing_key(State(ctx.clone()), admin_test_auth(), Json(mk(did.clone())))
+            .await
+            .expect("second rotation");
+        let after_second = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_ne!(after_first, after_second, "each PDS rotation produces a fresh distinct key");
+    }
+
+    #[tokio::test]
+    async fn update_signing_key_operator_supplied_gate_off_rejects() {
+        let ctx = create_test_context().await; // gate defaults OFF
+        let did = seed_rotatable_account(&ctx, "rotgateoff", "go@example.com").await;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let kp = ctx.account_manager.generate_rotation_keypair().unwrap();
+
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: None,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: kp.public_did_key.clone(),
+                    private_key_hex: hex::encode(&kp.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("operator-supplied rejected while gate is off");
         let (status, body) = read_response_body(resp).await;
-        if status == StatusCode::BAD_REQUEST {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&body).expect("BAD_REQUEST body must be JSON in this path");
-            assert_ne!(
-                parsed["error"], "InvalidRequest",
-                "strict-mode incorrectly rejected matching signingKey"
-            );
-        }
-        // Otherwise we hit a downstream failure (network, NOT_FOUND from
-        // PLC, etc.) — which is expected and confirms strict-mode passed.
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "OperatorSuppliedKeysDisabled");
+        // Critical: no state mutation.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(before, after, "gate-off rejection must not rotate");
+    }
+
+    #[tokio::test]
+    async fn update_signing_key_operator_supplied_mismatch_rejects_before_gate() {
+        let ctx = create_test_context().await; // gate OFF — mismatch still surfaces first
+        let did = seed_rotatable_account(&ctx, "rotmis", "mis@example.com").await;
+        let gen = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let other = ctx.account_manager.generate_rotation_keypair().unwrap();
+
+        let resp = update_account_signing_key(
+            State(ctx),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did,
+                rationale: None,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: other.public_did_key.clone(),
+                    private_key_hex: hex::encode(&gen.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("mismatched pair rejected before the gate check");
+        let (status, body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "InvalidRequest", "validate-first: mismatch, not gate");
+    }
+
+    #[tokio::test]
+    async fn update_signing_key_operator_supplied_gate_on_rotates() {
+        let mut ctx = create_test_context().await;
+        set_operator_supplied_gate(&ctx, true).await;
+        let did = seed_rotatable_account(&ctx, "rotgateon", "gon@example.com").await;
+        let kp = ctx.account_manager.generate_rotation_keypair().unwrap();
+        ctx.plc_client = mock_plc_with_current(&did, "zCurrentPlaceholderNotMatchingNew");
+
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: Some("HSM key".into()),
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: kp.public_did_key.clone(),
+                    private_key_hex: hex::encode(&kp.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect("operator-supplied rotation succeeds with gate on")
+        .0;
+
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["generationSource"], "operator_supplied");
+        assert_eq!(v["newSigningKey"], kp.public_did_key);
+        // The stored private key is exactly what the operator supplied.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(after, kp.private_key_bytes, "stored key is the operator-supplied one");
+    }
+
+    #[tokio::test]
+    async fn update_signing_key_no_op_when_operator_key_already_current() {
+        let mut ctx = create_test_context().await;
+        set_operator_supplied_gate(&ctx, true).await;
+        let did = seed_rotatable_account(&ctx, "rotnoop", "noop@example.com").await;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let kp = ctx.account_manager.generate_rotation_keypair().unwrap();
+        // Current published key == the operator-supplied key → idempotent no-op.
+        ctx.plc_client = mock_plc_with_current(&did, &kp.public_did_key);
+
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: None,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: kp.public_did_key.clone(),
+                    private_key_hex: hex::encode(&kp.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect("no-op short-circuit returns OK")
+        .0;
+
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["generationSource"], "operator_supplied");
+        assert!(v.get("emptyCommitCid").is_none(), "no commit on the no-op path");
+        // plc_keys row unchanged — no rotation happened.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(before, after, "no-op must not mutate the stored key");
+    }
+
+    #[tokio::test]
+    async fn update_signing_key_unknown_account_404() {
+        let mut ctx = create_test_context().await;
+        let unknown = "did:plc:unknownrotationtarget0000";
+        // Configure a current key so the flow passes the no-op check and reaches
+        // the plc_keys writer, which 404s on the missing row.
+        ctx.plc_client = mock_plc_with_current(unknown, "zSomeCurrentKey");
+
+        let resp = update_account_signing_key(
+            State(ctx),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: unknown.to_string(),
+                rationale: None,
+                operator_keypair: None,
+            }),
+        )
+        .await
+        .expect_err("unknown account → 404 at the plc_keys write");
+        let (status, _body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

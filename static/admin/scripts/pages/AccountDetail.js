@@ -414,23 +414,54 @@
   }
 
   async function updateSigningKey() {
+    // Key-rotation arc B3 (#374): the PDS generates a fresh per-account key by
+    // default. An operator may supply their own keypair only when the runtime
+    // gate key_rotation.operator_supplied_keys_enabled is on (§4.6) — the
+    // keypair fields are shown only then. The form no longer takes a bare
+    // signingKey (the old single-operator-key contract is gone).
+    let gateOn = false;
+    try {
+      const g = await global.AuroraEndpoints.admin.getRuntimeSetting('key_rotation.operator_supplied_keys_enabled');
+      const raw = g && (g.value !== undefined ? g.value : g);
+      gateOn = raw === true || raw === 'true';
+    } catch (e) { /* gate read failed → treat as off (PDS-generated only) */ }
+
+    const fields = [
+      { name: 'rationale', label: 'Rationale (recorded in audit log)', type: 'textarea', required: true },
+    ];
+    if (gateOn) {
+      fields.push({ name: 'publicDidKey', label: 'Operator public key (did:key, optional)', type: 'text', required: false });
+      fields.push({ name: 'privateKeyHex', label: 'Operator private key (hex, optional)', type: 'text', required: false });
+    }
+
     const result = await global.AuroraModal.form({
-      heading: 'Update signing key',
-      body: 'Updates the account\'s signing key. Affects identity verification across federation.',
-      fields: [
-        { name: 'didKey', label: 'New signing key (DID-key form)', type: 'text', required: true },
-        { name: 'rationale', label: 'Rationale (recorded in audit log)', type: 'textarea', required: true },
-      ],
-      submitLabel: 'Update signing key',
+      heading: 'Rotate signing key',
+      body: gateOn
+        ? 'Rotates the account\'s signing key. Leave the operator key fields blank to have the PDS generate a fresh key, or supply your own keypair (HSM-backed / pre-generated). Affects identity verification across federation.'
+        : 'Rotates the account\'s signing key to a freshly generated per-account key. Affects identity verification across federation.',
+      fields: fields,
+      submitLabel: 'Rotate signing key',
     });
     if (!result.submitted) return;
+
+    const payload = { did: currentDid };
+    if (result.values.rationale) payload.rationale = result.values.rationale;
+    if (gateOn) {
+      const pub = (result.values.publicDidKey || '').trim();
+      const priv = (result.values.privateKeyHex || '').trim();
+      if (pub && priv) {
+        payload.operatorKeypair = { publicDidKey: pub, privateKeyHex: priv };
+      } else if (pub || priv) {
+        global.AuroraToast.warning('Supply both the public and private key, or leave both blank for PDS generation.');
+        return;
+      }
+    }
+
     try {
-      await global.AuroraClient.post('com.atproto.admin.updateAccountSigningKey', {
-        did: currentDid, signingKey: result.values.didKey,
-      });
-      global.AuroraToast.success('Signing key updated.');
+      await global.AuroraClient.post('com.atproto.admin.updateAccountSigningKey', payload);
+      global.AuroraToast.success('Signing key rotated.');
     } catch (e) {
-      global.AuroraToast.danger('Update failed: ' + (e && e.message ? e.message : ''));
+      global.AuroraToast.danger('Rotation failed: ' + (e && e.message ? e.message : ''));
     }
   }
 

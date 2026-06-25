@@ -498,22 +498,38 @@ impl PlcClientApi for PlcClient {
     }
 }
 
-/// Test-only mock of [`PlcClientApi`] (key-rotation arc #372 / B1). Returns
-/// pre-configured op-histories; the other methods are minimal stubs B3 extends
-/// when the rotation write-path needs `update_signing_key` responses mocked.
-/// Tests inject it by reassigning `AppContext::plc_client` (a `pub` field).
+/// Test-only mock of [`PlcClientApi`] (key-rotation arc #372 / B1, extended B3
+/// / #374). Returns pre-configured op-histories and, for the rotation
+/// write-path, a pre-configured current signing key per DID (so the no-op
+/// short-circuit comparison and the published-key flow can be exercised without
+/// a live PLC). Tests inject it by reassigning `AppContext::plc_client` (a `pub`
+/// field).
 #[cfg(test)]
 pub(crate) struct MockPlcClient {
     op_histories: std::collections::HashMap<String, Vec<PlcOpHistoryEntry>>,
+    /// Per-DID current signing key in multibase form (the bare `z...`, no
+    /// `did:key:` prefix) — what `get_document` + `get_signing_key` surface.
+    current_signing_keys: std::collections::HashMap<String, String>,
 }
 
 #[cfg(test)]
 impl MockPlcClient {
     pub(crate) fn new() -> Self {
-        Self { op_histories: std::collections::HashMap::new() }
+        Self {
+            op_histories: std::collections::HashMap::new(),
+            current_signing_keys: std::collections::HashMap::new(),
+        }
     }
     pub(crate) fn with_op_history(mut self, did: &str, history: Vec<PlcOpHistoryEntry>) -> Self {
         self.op_histories.insert(did.to_string(), history);
+        self
+    }
+    /// Configure the DID's currently-published signing key. Accepts either
+    /// `did:key:z...` or bare `z...`; stored as the bare multibase form that
+    /// `get_signing_key` returns.
+    pub(crate) fn with_current_signing_key(mut self, did: &str, key: &str) -> Self {
+        let multibase = key.strip_prefix("did:key:").unwrap_or(key).to_string();
+        self.current_signing_keys.insert(did.to_string(), multibase);
         self
     }
 }
@@ -527,11 +543,30 @@ impl PlcClientApi for MockPlcClient {
             .cloned()
             .ok_or_else(|| PdsError::NotFound(format!("mock: no op history configured for {did}")))
     }
-    async fn get_document(&self, _did: &str) -> PdsResult<DidDocument> {
-        Err(PdsError::Internal("mock: get_document not configured".into()))
+    async fn get_document(&self, did: &str) -> PdsResult<DidDocument> {
+        let multibase = self.current_signing_keys.get(did).ok_or_else(|| {
+            PdsError::Internal(format!("mock: no current signing key configured for {did}"))
+        })?;
+        Ok(DidDocument {
+            context: None,
+            id: did.to_string(),
+            also_known_as: vec![],
+            service: vec![],
+            verification_method: vec![crate::identity::did_document::VerificationMethod {
+                id: format!("{did}#atproto"),
+                key_type: "Multikey".to_string(),
+                controller: did.to_string(),
+                public_key_multibase: Some(multibase.clone()),
+            }],
+        })
     }
-    fn get_signing_key(&self, _doc: &DidDocument) -> PdsResult<String> {
-        Err(PdsError::Internal("mock: get_signing_key not configured".into()))
+    fn get_signing_key(&self, doc: &DidDocument) -> PdsResult<String> {
+        doc.verification_method
+            .iter()
+            .find_map(|m| m.public_key_multibase.clone())
+            .ok_or_else(|| {
+                PdsError::IdentityResolution("mock: no signing key in document".to_string())
+            })
     }
     fn keys_match(&self, key1: &str, key2: &str) -> bool {
         key1 == key2
