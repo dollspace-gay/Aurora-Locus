@@ -50,6 +50,10 @@ pub struct AppContext {
     pub actor_store: Arc<ActorStore>,
     pub blob_store: Arc<BlobStore>,
     pub identity_resolver: Arc<dyn IdentityResolverApi>,
+    /// Shared PLC directory client (key-rotation arc #371 / A3b). Threaded so
+    /// PLC-touching paths (rotation, repo-rebuild history-aware verify,
+    /// preRebuildCheck) consume one client instead of constructing ad-hoc.
+    pub plc_client: Arc<crate::crypto::plc_client::PlcClient>,
     // Admin & Moderation
     pub admin_role_manager: Arc<AdminRoleManager>,
     /// Per-operator session store (§8.1.7 / #271): backs admin session
@@ -1155,9 +1159,19 @@ impl AppContext {
             &config.federation.peer_pds,
         );
 
+        // Shared PLC client (#371 / A3b). Constructed once from the configured
+        // directory URL; PLC-touching paths consume this instead of ad-hoc.
+        let plc_client = Arc::new(crate::crypto::plc_client::PlcClient::new(
+            crate::crypto::plc_client::PlcClientConfig {
+                plc_url: config.identity.did_plc_url.clone(),
+                timeout_secs: 30,
+            },
+        )?);
+
         Ok(Self {
             config: Arc::new(config),
             account_db,
+            plc_client,
             trusted_peers,
             boot_seed_failed: Arc::new(AtomicBool::new(false)),
             boot_seed_failure_details: Arc::new(tokio::sync::RwLock::new(None)),

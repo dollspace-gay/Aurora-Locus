@@ -500,16 +500,7 @@ impl RebuildJob {
         // their full key history. PLC is the canonical key source (design §1.3),
         // so this drops the prior `plc_keys`-derived single-key resolution.
         self.set_phase(RebuildPhase::Verifying);
-        let plc = match crate::crypto::plc_client::PlcClient::new(
-            crate::crypto::plc_client::PlcClientConfig {
-                plc_url: ctx.config.identity.did_plc_url.clone(),
-                timeout_secs: 30,
-            },
-        ) {
-            Ok(p) => p,
-            Err(e) => return RebuildOutcome::Failed(format!("PLC client init failed: {e}")),
-        };
-        let plc_history = match plc.get_op_history(&self.did).await {
+        let plc_history = match ctx.plc_client.get_op_history(&self.did).await {
             Ok(h) => h,
             Err(e) => return RebuildOutcome::Failed(format!("PLC history fetch failed: {e}")),
         };

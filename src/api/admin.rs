@@ -2579,26 +2579,15 @@ async fn pre_rebuild_check(
         // account has rotated — an account with rotation history is exactly the
         // case a history-aware verify must handle. Non-fatal: a PLC fetch failure
         // surfaces as `keyHistoryError` (mirrors the `deepError` posture).
-        use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
-        let plc = PlcClient::new(PlcClientConfig {
-            plc_url: ctx.config.identity.did_plc_url.clone(),
-            timeout_secs: 30,
-        });
-        let history = match plc {
-            Ok(plc) => match plc.get_op_history(&params.did).await {
-                Ok(history) => {
-                    obj.insert("keyHistoryEntries".into(), serde_json::json!(history.len()));
-                    obj.insert(
-                        "rotatedKeysCount".into(),
-                        serde_json::json!(history.len().saturating_sub(1)),
-                    );
-                    Some(history)
-                }
-                Err(e) => {
-                    obj.insert("keyHistoryError".into(), serde_json::Value::String(e.to_string()));
-                    None
-                }
-            },
+        let history = match ctx.plc_client.get_op_history(&params.did).await {
+            Ok(history) => {
+                obj.insert("keyHistoryEntries".into(), serde_json::json!(history.len()));
+                obj.insert(
+                    "rotatedKeysCount".into(),
+                    serde_json::json!(history.len().saturating_sub(1)),
+                );
+                Some(history)
+            }
             Err(e) => {
                 obj.insert("keyHistoryError".into(), serde_json::Value::String(e.to_string()));
                 None
@@ -3897,11 +3886,7 @@ async fn update_account_signing_key(
     Json(req): Json<UpdateAccountSigningKeyRequest>,
 ) -> Result<StatusCode, axum::response::Response> {
     use crate::actor_store::repository::RepositoryManager;
-    use crate::crypto::{
-        plc::PlcSigner,
-        plc_client::{PlcClient, PlcClientConfig},
-        proto_blue_signer::RepoSigner,
-    };
+    use crate::crypto::{plc::PlcSigner, proto_blue_signer::RepoSigner};
     use crate::sequencer::events::IdentityEvent;
     use axum::response::IntoResponse;
 
@@ -3964,16 +3949,8 @@ async fn update_account_signing_key(
         ));
     }
 
-    let plc_client = PlcClient::new(PlcClientConfig {
-        plc_url: ctx.config.identity.did_plc_url.clone(),
-        timeout_secs: 30,
-    })
-    .map_err(|e| {
-        plain_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("PLC client init failed: {}", e),
-        )
-    })?;
+    // Threaded shared PLC client (#371 / A3b) — no ad-hoc construction.
+    let plc_client = &ctx.plc_client;
 
     let rotation_signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)
         .map_err(|e| {
