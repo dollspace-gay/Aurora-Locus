@@ -442,12 +442,6 @@ impl RebuildJob {
             self.state.write().expect("rebuild state lock not poisoned").head_before = Some(h.clone());
         }
 
-        // Full signature verification needs the account's published signing key
-        // (the same resolution `importRepo` uses for `verify_diff_car`).
-        let signing_key = match public_did_key_for(ctx, &self.did).await {
-            Ok(k) => k,
-            Err(e) => return RebuildOutcome::Failed(format!("signing-key resolution failed: {e}")),
-        };
 
         // The commit total (for "walking N/M") — the cheap metadata preflight,
         // distinct from the block-decoding accumulation walk below.
@@ -496,10 +490,40 @@ impl RebuildJob {
             return RebuildOutcome::Cancelled;
         }
 
-        // Phase 2: verify (full signature check with the resolved key).
+        // Phase 2: history-aware verify (key-rotation arc #369). Every commit is
+        // checked against the signing key valid at its rev, resolved from the
+        // account's PLC op history — not just the head against the current key.
+        // This is the production verification gate; bulk repo-repair flows through
+        // this same RebuildJob path (via the registry), so it inherits history-
+        // aware verify too. The PLC history's latest entry carries the current
+        // key, so the head still verifies; rotated accounts now verify across
+        // their full key history. PLC is the canonical key source (design §1.3),
+        // so this drops the prior `plc_keys`-derived single-key resolution.
         self.set_phase(RebuildPhase::Verifying);
-        let verified = match verify_reconstructed(blocks, &head, &self.did, Some(&signing_key)) {
-            Ok(v) => v,
+        let plc = match crate::crypto::plc_client::PlcClient::new(
+            crate::crypto::plc_client::PlcClientConfig {
+                plc_url: ctx.config.identity.did_plc_url.clone(),
+                timeout_secs: 30,
+            },
+        ) {
+            Ok(p) => p,
+            Err(e) => return RebuildOutcome::Failed(format!("PLC client init failed: {e}")),
+        };
+        let plc_history = match plc.get_op_history(&self.did).await {
+            Ok(h) => h,
+            Err(e) => return RebuildOutcome::Failed(format!("PLC history fetch failed: {e}")),
+        };
+        let root = match Cid::from_str(&head) {
+            Ok(r) => r,
+            Err(e) => return RebuildOutcome::Failed(format!("malformed head commit CID: {e}")),
+        };
+        let verified = match crate::crypto::verify_history::verify_repo_with_history(
+            blocks,
+            &root,
+            Some(&self.did),
+            &plc_history,
+        ) {
+            Ok(out) => out.repo,
             Err(e) => return RebuildOutcome::Failed(e.to_string()),
         };
 
@@ -630,22 +654,6 @@ async fn emit_repo_rebuilt(
             "repo rebuild audit-chain emit failed (moderation_event still recorded)",
         );
     }
-}
-
-/// Resolve `did`'s published signing key as a `did:key:z...` string — the same
-/// `plc_keys.atproto_signing_key` → `did:key` conversion `importRepo` uses for
-/// `verify_diff_car`'s `signing_did_key`. Used to verify the reconstructed
-/// head commit's signature during a rebuild.
-async fn public_did_key_for(ctx: &AppContext, did: &str) -> PdsResult<String> {
-    use proto_blue::crypto::Keypair as _;
-    let key_bytes = ctx.account_manager.get_atproto_signing_key_bytes(did).await?;
-    let kp = proto_blue::crypto::K256Keypair::from_private_key(&key_bytes).map_err(|e| {
-        PdsError::Internal(format!(
-            "rebuild: did:key construction failed for {}: {}",
-            did, e
-        ))
-    })?;
-    Ok(kp.did())
 }
 
 /// Interior of [`RebuildRegistry`]. `by_id` retains jobs (including terminal
