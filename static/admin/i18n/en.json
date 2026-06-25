@@ -710,7 +710,16 @@
       "enable_body": "This permits operators to supply their own private keypair when rotating an account's signing key. The private key is transmitted in the request body. Only enable this for HSM-backed or pre-generated key workflows.",
       "disable_heading": "Disable operator-supplied rotation keys?",
       "disable_body": "Rotations will accept only PDS-generated keys. Operator-supplied keypairs will be rejected before any state change.",
-      "save_success": "Key rotation policy updated"
+      "save_success": "Key rotation policy updated",
+      "migration_title": "Signing-key migration check",
+      "migration_help": "Verifies that every account's locally-stored signing key matches the key PLC currently publishes. Read-only; expected to find no divergences.",
+      "migration_run": "Run migration check",
+      "migration_summary": "Checked {checked} account(s): {aligned} aligned, {divergent} divergent, {unresolvable} unresolvable.",
+      "migration_pass": "No divergences detected — migration check passed.",
+      "migration_divergent": "Divergent accounts (stored key ≠ published key)",
+      "migration_stored": "stored",
+      "migration_published": "published",
+      "migration_unresolvable": "Unresolvable accounts (could not verify)"
     }
   },
   "actions": {

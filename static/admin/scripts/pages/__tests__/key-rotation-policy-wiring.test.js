@@ -76,10 +76,33 @@ test('i18n keys the page reads exist', () => {
     'title', 'subtitle', 'operator_supplied_title', 'operator_supplied_help',
     'operator_supplied_label', 'enable_heading', 'enable_body',
     'disable_heading', 'disable_body', 'save_success',
+    // C4 migration-check keys.
+    'migration_title', 'migration_help', 'migration_run', 'migration_summary',
+    'migration_pass', 'migration_divergent', 'migration_stored',
+    'migration_published', 'migration_unresolvable',
   ]) {
     assert.ok(
       en.keyRotation && en.keyRotation.policy && en.keyRotation.policy[k],
       'en.json has keyRotation.policy.' + k,
     );
   }
+});
+
+// C4 (#376) — the migration-check button calls the SuperAdmin XRPC and renders
+// the report inline.
+test('migration check button calls the SuperAdmin XRPC', () => {
+  assert.ok(
+    src.includes('tools.aurora.superadmin.runSigningKeyMigrationCheck'),
+    'posts the migration-check NSID',
+  );
+  assert.ok(src.includes('kr-run-migration-check'), 'has the run button');
+  assert.ok(
+    src.includes('renderMigrationReport') && src.includes('kr-migration-result'),
+    'renders the report inline',
+  );
+  // Reads camelCase fields from the report JSON.
+  assert.ok(
+    src.includes('storedPublicDidKey') && src.includes('publishedPublicDidKey'),
+    'reads the divergence key fields',
+  );
 });

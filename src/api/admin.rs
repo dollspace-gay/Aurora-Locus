@@ -911,6 +911,14 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(dry_run_rotation_validation),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // Signing-key migration check (key-rotation arc Phase C / #376 / §5.3):
+        // read-only diagnostic — confirm every account's locally-stored signing
+        // key matches what PLC publishes; report divergences for operator review.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.runSigningKeyMigrationCheck",
+            post(run_signing_key_migration_check),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // Bulk repository repair — scan substrate (§7.4.3 / #291): start an
         // across-accounts inconsistency scan, poll its progress, cancel it,
         // and read the persisted findings.
@@ -2785,6 +2793,35 @@ async fn dry_run_rotation_validation(
             })))
         }
     }
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.runSigningKeyMigrationCheck` — read-only
+/// (key-rotation arc Phase C / #376 / §5.3). Runs the signing-key migration
+/// check across all accounts and returns the report (aligned count + any
+/// divergent / unresolvable accounts). SuperAdmin; no request body; no state
+/// mutation. The divergence set is expected empty.
+async fn run_signing_key_migration_check(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<crate::admin::migration_check::MigrationCheckReport>, (StatusCode, Json<serde_json::Value>)>
+{
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "runSigningKeyMigrationCheck requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let report = crate::admin::migration_check::run_signing_key_migration_check(&ctx)
+        .await
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?;
+    Ok(Json(report))
 }
 
 // ---------------------------------------------------------------------------
@@ -11255,6 +11292,7 @@ mod tests {
             r#""getRebuildProgress","#,
             r#""cancelRebuild","#,
             r#""dryRunRotationValidation","#,
+            r#""runSigningKeyMigrationCheck","#,
             r#""scanReposForInconsistencies","#,
             r#""getScanProgress","#,
             r#""cancelScan","#,

@@ -12,6 +12,7 @@ pub mod defs;
 pub mod events;
 pub mod invites;
 pub mod labels;
+pub mod migration_check;
 pub mod moderation;
 pub mod operator_session;
 pub mod reports;
