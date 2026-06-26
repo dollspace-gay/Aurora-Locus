@@ -186,5 +186,8 @@
     post: post,
     postRaw: postRaw,
     apiBase: API_BASE,
+    // Canonical auth-header builder (#360). capabilities.js routes through
+    // this instead of carrying its own copy — single token-read path.
+    authHeaders: authHeaders,
   };
 })(window);

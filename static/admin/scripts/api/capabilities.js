@@ -135,17 +135,12 @@
     }
   }
 
-  // §8.1.4 — read the token from AuroraSession (the single source of
-  // truth) rather than reaching into localStorage directly, so this
-  // helper no longer diverges from client.js's. Falls back to the new
-  // localStorage key only if AuroraSession somehow isn't loaded.
+  // §8.1.4 / #360 — route through the canonical builder in client.js (the
+  // single token-read path: AuroraSession → localStorage fallback) rather
+  // than carrying a divergent copy. Preserves the JSON Content-Type this
+  // module's capability calls expect.
   function authHeaders() {
-    const token = global.AuroraSession
-      ? global.AuroraSession.token()
-      : localStorage.getItem('aurora-admin-token');
-    const headers = { 'Content-Type': 'application/json' };
-    if (token) headers.Authorization = 'Bearer ' + token;
-    return headers;
+    return global.AuroraClient.authHeaders({ 'Content-Type': 'application/json' });
   }
 
   // Fetch fresh capabilities from the server. Returns a promise that
