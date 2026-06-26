@@ -41,16 +41,14 @@
   }
 
   // The com.atproto.admin.listRoles handler returns a flat array of
-  // active assignment rows: {roles: [{did, role, granted_by, ...}, ...]}.
-  // The page renders authority *tiers* (Moderators/Administrators/
-  // SuperAdmins) with their members, so group the flat assignments by
-  // role tier here. If the server ever pre-groups (members[] present on
-  // the first entry), pass it through unchanged.
+  // active assignment rows: {roles: [{did, role, granted_by, ...}, ...]}
+  // in snake_case (src/admin/roles.rs AdminRole). The page renders authority
+  // *tiers* (Moderators/Administrators/SuperAdmins) with their members, so
+  // group the flat assignments by role tier here. The backend never sends a
+  // pre-grouped (members[]) shape — #362.2 dropped the dead pass-through
+  // branch that guarded for it.
   function groupRoles(data) {
     const flat = (data && Array.isArray(data.roles)) ? data.roles : [];
-    if (flat.length > 0 && Array.isArray(flat[0].members)) {
-      return flat;
-    }
     const tiers = [
       { key: 'moderator', name: 'Moderators', description: 'Acts on subjects-as-content', members: [] },
       { key: 'admin', name: 'Administrators', description: 'Acts on accounts-as-infrastructure', members: [] },
@@ -75,11 +73,15 @@
     c.innerHTML = roles.map((role) => {
       const members = Array.isArray(role.members) ? role.members : [];
       const memberCount = members.length;
-      // Slug stays English-derived (groupRoles' role.name is the stable
-      // English label) so detail-page routing is unaffected by display
-      // localization; only the rendered NAME/description route through t().
-      const memberSlug = String(role.name || role.role || '').toLowerCase().replace(/\s+/g, '-');
-      const displayName = role.key ? T('settings.roles.tier_' + role.key) : (role.name || role.role || 'Role');
+      // Slug stays English-derived (the tier's `name` is the stable English
+      // label) so detail-page routing is unaffected by display localization;
+      // only the rendered NAME/description route through t(). renderRoles is
+      // always fed groupRoles' tier objects, whose canonical field is `name`
+      // — #362.2 dropped the `|| role.role` hedge (that read an AdminRole
+      // field this object never carries; the genuine `.role` reads live in
+      // groupRoles + ConfigRolesMembers and are already clean snake_case).
+      const memberSlug = String(role.name || '').toLowerCase().replace(/\s+/g, '-');
+      const displayName = role.key ? T('settings.roles.tier_' + role.key) : (role.name || 'Role');
       const displayDesc = role.key ? T('settings.roles.desc_' + role.key) : role.description;
       return '<div class="role-card">' +
              '  <h3>' + esc(displayName) + ' <small style="font-weight:normal; color: var(--color-text-secondary);">[' + esc(T('settings.roles.member_count', { count: memberCount })) + ']</small></h3>' +
