@@ -59,6 +59,9 @@
     // the handler fixes a 30-day UTC window. Admin+.
     getAccountGrowth: () => C().get('tools.aurora.admin.getAccountGrowth'),
     getAuditTrail: (params) => C().get('tools.aurora.admin.getAuditTrail', params || { limit: 25 }),
+    // #359 — single audit-chain entry by id or current_hash (the walk-to-
+    // previous path). Replaces the page-scoped window._auditCache.
+    getAuditEntry: (params) => C().get('tools.aurora.admin.getAuditEntry', params || {}),
     triggerPasswordReset: (body) => C().post('tools.aurora.admin.triggerPasswordReset', body),
     exportAccountForensicRaw: (body) => C().postRaw('tools.aurora.admin.exportAccountForensic', body),
     getRuntimeSetting: (key) => C().get('tools.aurora.admin.getRuntimeSetting', { key: key }),

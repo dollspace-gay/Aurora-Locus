@@ -160,9 +160,9 @@
       let html = '<table class="data-table"><thead><tr>' +
                  '<th>Seq</th><th>When</th><th>Actor</th><th>Action</th><th>Subject</th><th>Verified</th><th></th>' +
                  '</tr></thead><tbody>';
-      window._auditCache = window._auditCache || {};
+      // #359: no more window._auditCache — the detail page fetches each entry
+      // server-side via getAuditEntry, so the list no longer seeds a global.
       for (const e of items) {
-        window._auditCache[e.id] = e;
         const subj = e.subjectRef ? (e.subjectRef.did || e.subjectRef.uri || e.subjectRef.cid || '—') : '—';
         const verifiedBadge = e.verified
           ? '<span class="status-badge status-verified" title="Hash matches stored chain hash">✓ verified</span>'

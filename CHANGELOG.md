@@ -55,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Admin password override, email change, and handle change now record the operator's rationale in the audit chain. The Account Detail page already collected this rationale; it is now transmitted and stored (previously these three actions logged a generic descriptive entry regardless of what the operator typed)
 
 ### Changed
+- Audit entries are now individually addressable: a direct link to an audit entry (or a page refresh) loads it from the server, and the "walk to previous" control follows the hash chain across the whole log rather than only the entries currently on screen
 - The deployment moderation tier (full, reduced, disabled) is now set on the Moderation policy page instead of UI & modes; switching to the disabled tier requires a typed confirmation
 - Kryphocron is now enabled by default on fresh deployments; operators can disable it by setting PDS_KRYPHOCRON_ENABLED=false
 - Operator role changes now take effect on the next request, without requiring re-login
