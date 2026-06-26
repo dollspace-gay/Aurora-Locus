@@ -34,6 +34,11 @@
 
   let pollHandle = null;
   let metricsTimeRange = 'last_30d';
+  // #361 account-growth block state. growthMode is intentionally NOT persisted
+  // across loads (design pin): mount() resets it to per-day. growthData caches
+  // the last fetch so the toggle re-renders without a round-trip.
+  let growthMode = 'perDay';
+  let growthData = null;
 
   function T(key, params) { return global.t ? global.t(key, params) : key; }
 
@@ -237,6 +242,35 @@
       },
     },
     {
+      // #361 — real account-growth visual off actor.created_at. A fixed
+      // 30-day, per-day window; the header toggle picks whether the sparkline
+      // shows new-accounts-per-day (default) or the cumulative deployment
+      // total. One fetch serves both modes (each point carries both fields);
+      // toggling re-renders from the cached series with no re-fetch.
+      id: 'accountgrowth',
+      visible: (c) => c.isAdmin && c.notDisabled,
+      html: () =>
+        '<section class="dash-block activity-card" id="dash-accountgrowth">' +
+        '  <div class="metrics-header">' +
+        '    <h3>' + esc(T('dashboard.growth_title')) + '</h3>' +
+        '    <label class="metrics-range-label" for="dash-growth-mode">' + esc(T('dashboard.growth_mode')) +
+        '      <select id="dash-growth-mode" class="metrics-range-select">' +
+        '        <option value="perDay" selected>' + esc(T('dashboard.growth_per_day')) + '</option>' +
+        '        <option value="cumulative">' + esc(T('dashboard.growth_cumulative')) + '</option>' +
+        '      </select>' +
+        '    </label>' +
+        '  </div>' +
+        '  <div id="dash-growth-body">' + loadingState() + '</div>' +
+        '</section>',
+      refresh: async (ep) => {
+        wireGrowthMode();
+        try {
+          growthData = await ep.admin.getAccountGrowth();
+        } catch (e) { return; /* keep last paint */ }
+        renderGrowth();
+      },
+    },
+    {
       id: 'health',
       visible: (c) => c.isAdmin && c.notDisabled,
       html: () =>
@@ -393,6 +427,9 @@
 
   function mount({ container }) {
     const c = ctx();
+    // Reset the account-growth toggle to its default each load (no persistence).
+    growthMode = 'perDay';
+    growthData = null;
     activeBlocks = BLOCKS.filter((b) => b.visible(c));
     container.innerHTML =
       '<header class="page-header"><div>' +
@@ -472,6 +509,58 @@
     }
     html += '</tbody></table>';
     c.innerHTML = html;
+  }
+
+  function wireGrowthMode() {
+    const sel = document.getElementById('dash-growth-mode');
+    if (!sel || sel.dataset.wired === 'true') return;
+    sel.dataset.wired = 'true';
+    sel.value = growthMode;
+    sel.addEventListener('change', () => {
+      growthMode = sel.value;
+      renderGrowth(); // re-render from the cached series — no re-fetch
+    });
+  }
+
+  // Renders the account-growth sparkline for the current toggle mode from the
+  // cached series. Reuses the TierActivity CSS-bar idiom (no chart dependency).
+  function renderGrowth() {
+    const c = document.getElementById('dash-growth-body');
+    if (!c) return;
+    const points = (growthData && Array.isArray(growthData.points)) ? growthData.points : [];
+    if (!points.length) {
+      c.innerHTML = global.AuroraEmptyState
+        ? global.AuroraEmptyState.render({ icon: 'inbox', primary: T('dashboard.growth_none') })
+        : '<p class="empty-state">' + esc(T('dashboard.growth_none')) + '</p>';
+      return;
+    }
+    const cumulative = growthMode === 'cumulative';
+    const field = cumulative ? 'cumulativeAccounts' : 'newAccounts';
+    const values = points.map((p) => (p[field] || 0));
+    const max = Math.max.apply(null, values.concat([1]));
+    const bars = points.map((p) => {
+      const v = p[field] || 0;
+      const h = Math.max(2, Math.round((v / max) * 48));
+      return '<span class="spark-bar" style="height:' + h + 'px" title="' +
+        esc(p.day + ': ' + v) + '"></span>';
+    }).join('');
+    // Headline: deployment size (cumulative) or new-in-window total (per-day).
+    let headline;
+    if (cumulative) {
+      const last = points[points.length - 1];
+      headline = T('dashboard.growth_total_accounts', { count: (last && last.cumulativeAccounts) || 0 });
+    } else {
+      const sum = values.reduce((s, v) => s + v, 0);
+      headline = T('dashboard.growth_new_in_window', { count: sum });
+    }
+    c.innerHTML =
+      '<p class="dash-growth-headline stat-value">' + esc(headline) + '</p>' +
+      '<div class="sparkline sparkline-tall">' + bars + '</div>' +
+      '<p class="page-subtitle dash-growth-range">' +
+        esc(T('dashboard.growth_window', {
+          start: (growthData && growthData.windowStart) || '',
+          end: (growthData && growthData.windowEnd) || '',
+        })) + '</p>';
   }
 
   if (global.AuroraRouter) global.AuroraRouter.register('dashboard', { mount: mount });

@@ -630,6 +630,14 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(crate::api::aurora_admin::get_moderation_metrics),
             CapsBuilder::new(Family::Admin).extensions(["moderation-metrics-v1"]),
         )
+        // #361 — account-growth metric backing the Dashboard sparkline.
+        // Admin+ at the handler; read-only; no capability extension (a basic
+        // dashboard read, gated by role like getReport).
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.getAccountGrowth",
+            get(crate::api::aurora_admin::get_account_growth),
+            CapsBuilder::new(Family::Admin),
+        )
         // Phase 3.8 (chainlink #105) — hash-chained audit trail.
         // Auth: AdminModeration scope, Moderator+ role at handler.
         // Per design doc §8.4: cursor-paginated newest-first; verified
@@ -11175,7 +11183,7 @@ mod tests {
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
-            // tools.aurora.admin (19 endpoints)
+            // tools.aurora.admin (20 endpoints)
             r#""tools.aurora.admin":["#,
             r#""emitEvent","#,
             r#""batchTakedownAccounts","#,
@@ -11187,6 +11195,7 @@ mod tests {
             r#""triggerPasswordReset","#,
             r#""getQueueStats","#,
             r#""getModerationMetrics","#,
+            r#""getAccountGrowth","#,
             r#""getAuditTrail","#,
             r#""getReport","#,
             r#""exportAccountForensic","#,

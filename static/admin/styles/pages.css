@@ -206,6 +206,46 @@
   font-size: var(--font-size-sm);
 }
 
+/* Inline CSS-bar sparkline (Kryphocron Tier activity + Dashboard
+ * account-growth, #361). Bars sit in a flex row aligned to a shared
+ * baseline; each carries an explicit pixel height. inline elements ignore
+ * height, so the bars are flex items here. No chart dependency. */
+.sparkline {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 26px;
+  min-width: 1px;
+}
+
+.sparkline-tall {
+  display: flex;
+  height: 52px;
+  margin: var(--space-2) 0;
+}
+
+.spark-bar {
+  flex: 1 1 auto;
+  min-width: 2px;
+  background: var(--color-accent-primary);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  opacity: 0.85;
+}
+
+.spark-empty {
+  color: var(--color-text-secondary);
+}
+
+/* Dashboard account-growth block (#361). */
+.dash-growth-headline {
+  margin: 0 0 var(--space-1);
+}
+
+.dash-growth-range {
+  margin: var(--space-1) 0 0;
+  font-size: var(--font-size-sm);
+}
+
 /* Configuration → Themes (§11.10.2 / B-themes-page) — single-column row list
  * (one row per installed theme). No card chrome; a hairline divider and the
  * row's own spacing carry the structure. The active (deployment-default) row

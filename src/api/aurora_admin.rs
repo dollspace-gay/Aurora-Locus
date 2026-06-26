@@ -2959,6 +2959,154 @@ fn internal_pds(e: PdsError) -> (StatusCode, Json<serde_json::Value>) {
 }
 
 // ===========================================================================
+// getAccountGrowth — Dashboard account-growth visual (#361)
+// ===========================================================================
+//
+// A real account-growth metric off `actor.created_at` — no new
+// instrumentation. The window is a fixed 30 trailing UTC calendar days; each
+// point carries both `newAccounts` (rows created that day) and
+// `cumulativeAccounts` (true deployment size through that day =
+// `accountsBeforeWindow` + running sum). One call serves both the per-day and
+// cumulative Dashboard toggle states without a re-fetch.
+//
+// Dual-backend-safe: rather than a SQLite-vs-Postgres-divergent `date()`
+// GROUP BY, we fetch the windowed `created_at` strings and bucket per-day in
+// Rust — the same parse-and-bucket shape `compute_metric` uses for the
+// moderation-metrics series.
+
+/// Number of trailing UTC calendar days the account-growth window spans.
+const ACCOUNT_GROWTH_WINDOW_DAYS: i64 = 30;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountGrowthPoint {
+    /// UTC calendar day, `YYYY-MM-DD`.
+    pub day: String,
+    /// Accounts whose `created_at` falls on this day.
+    pub new_accounts: i64,
+    /// Total deployment account count through the end of this day
+    /// (`accountsBeforeWindow` + running sum of `newAccounts`).
+    pub cumulative_accounts: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAccountGrowthOutput {
+    /// Inclusive first day of the window, `YYYY-MM-DD`.
+    pub window_start: String,
+    /// Inclusive last day of the window (today, UTC), `YYYY-MM-DD`.
+    pub window_end: String,
+    /// Accounts created strictly before the window start — the cumulative
+    /// baseline so the cumulative series reflects true deployment size, not
+    /// just within-window accumulation.
+    pub accounts_before_window: i64,
+    /// One entry per UTC calendar day, oldest first.
+    pub points: Vec<AccountGrowthPoint>,
+}
+
+/// `GET /xrpc/tools.aurora.admin.getAccountGrowth` — account-growth metric
+/// backing the Dashboard sparkline (#361). Admin+; read-only.
+pub async fn get_account_growth(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<GetAccountGrowthOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::Admin) {
+        return Err(forbidden(&format!(
+            "getAccountGrowth requires Admin+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+
+    let (points, accounts_before_window, window_start_date, window_end_date) =
+        compute_account_growth(&ctx, chrono::Utc::now())
+            .await
+            .map_err(internal_pds)?;
+
+    Ok(Json(GetAccountGrowthOutput {
+        window_start: window_start_date.format("%Y-%m-%d").to_string(),
+        window_end: window_end_date.format("%Y-%m-%d").to_string(),
+        accounts_before_window,
+        points,
+    }))
+}
+
+/// Compute the per-day account-growth series ending on `now`'s UTC calendar
+/// day. Split out from the handler so tests can pin a fixed `now`. Returns
+/// `(points, accounts_before_window, window_start_date, window_end_date)`.
+async fn compute_account_growth(
+    ctx: &AppContext,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<
+    (
+        Vec<AccountGrowthPoint>,
+        i64,
+        chrono::NaiveDate,
+        chrono::NaiveDate,
+    ),
+    PdsError,
+> {
+    use sqlx::Row as _;
+
+    let window_end_date = now.date_naive();
+    let window_start_date =
+        window_end_date - chrono::Duration::days(ACCOUNT_GROWTH_WINDOW_DAYS - 1);
+    // Window start as an RFC3339 instant at UTC midnight — the shared lower
+    // bound for the baseline count and the windowed fetch.
+    let window_start_instant = window_start_date
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time")
+        .and_utc();
+    let window_start_rfc3339 = window_start_instant.to_rfc3339();
+
+    // Baseline: accounts created strictly before the window.
+    let accounts_before_window: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM actor WHERE created_at < $1")
+            .bind(&window_start_rfc3339)
+            .fetch_one(&ctx.account_db)
+            .await?;
+
+    // Windowed rows, bucketed per UTC calendar day in Rust (no date-SQL).
+    let bucket_count = ACCOUNT_GROWTH_WINDOW_DAYS as usize;
+    let mut new_per_day: Vec<i64> = vec![0; bucket_count];
+    let rows = sqlx::query("SELECT created_at FROM actor WHERE created_at >= $1")
+        .bind(&window_start_rfc3339)
+        .fetch_all(&ctx.account_db)
+        .await?;
+    for row in &rows {
+        let ts_str: String = row.try_get("created_at").map_err(PdsError::Database)?;
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&ts_str) {
+            let day = ts.with_timezone(&chrono::Utc).date_naive();
+            let idx = (day - window_start_date).num_days();
+            // Guard discards future-dated rows (clock skew) past the window.
+            if (0..bucket_count as i64).contains(&idx) {
+                new_per_day[idx as usize] += 1;
+            }
+        }
+    }
+
+    // Accumulate cumulative from the baseline forward, oldest day first.
+    let mut cumulative = accounts_before_window;
+    let mut points = Vec::with_capacity(bucket_count);
+    for (i, &new_accounts) in new_per_day.iter().enumerate() {
+        cumulative += new_accounts;
+        let day = window_start_date + chrono::Duration::days(i as i64);
+        points.push(AccountGrowthPoint {
+            day: day.format("%Y-%m-%d").to_string(),
+            new_accounts,
+            cumulative_accounts: cumulative,
+        });
+    }
+
+    Ok((
+        points,
+        accounts_before_window,
+        window_start_date,
+        window_end_date,
+    ))
+}
+
+// ===========================================================================
 // exportAccountForensic — §8.7 (Phase 3.8)
 // ===========================================================================
 //
@@ -6751,6 +6899,70 @@ mod tests {
             err.contains("start") && err.contains("end") && err.contains("both"),
             "error must explain that legacy requires both 'start' and 'end'; got: {err}"
         );
+    }
+
+    /// #361: account-growth buckets per UTC calendar day, carries the
+    /// before-window baseline, and accumulates cumulative from it. Seeds
+    /// actors at controlled `created_at`s and pins a fixed `now` so the
+    /// 30-day window is deterministic.
+    #[tokio::test]
+    async fn account_growth_buckets_per_day_with_baseline_and_cumulative() {
+        async fn seed_at(ctx: &AppContext, did: &str, created_at: &str) {
+            sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+                .bind(did)
+                .bind(did)
+                .bind(created_at)
+                .execute(&ctx.account_db)
+                .await
+                .expect("seed actor");
+        }
+
+        let ctx = create_test_context().await;
+        // Fixed anchor: window_end = 2026-06-15, window_start = 2026-05-17
+        // (30 trailing days inclusive).
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Two accounts strictly before the window (one on the eve, one far
+        // earlier) — the cumulative baseline.
+        seed_at(&ctx, "did:plc:old1", "2025-12-01T00:00:00Z").await;
+        seed_at(&ctx, "did:plc:eve", "2026-05-16T23:59:59Z").await;
+        // Two on the first window day (2026-05-17), different hours.
+        seed_at(&ctx, "did:plc:d0a", "2026-05-17T03:00:00Z").await;
+        seed_at(&ctx, "did:plc:d0b", "2026-05-17T20:00:00Z").await;
+        // One on the last window day (today, 2026-06-15).
+        seed_at(&ctx, "did:plc:d29", "2026-06-15T08:00:00Z").await;
+        // One future-dated (clock skew) past the window — must be discarded,
+        // not counted in any bucket nor the baseline.
+        seed_at(&ctx, "did:plc:future", "2026-06-20T00:00:00Z").await;
+
+        let (points, baseline, start_date, end_date) =
+            compute_account_growth(&ctx, now).await.expect("compute");
+
+        assert_eq!(baseline, 2, "two accounts created before the window");
+        assert_eq!(points.len(), ACCOUNT_GROWTH_WINDOW_DAYS as usize);
+        assert_eq!(start_date.format("%Y-%m-%d").to_string(), "2026-05-17");
+        assert_eq!(end_date.format("%Y-%m-%d").to_string(), "2026-06-15");
+
+        // Day 0: two new, cumulative = baseline (2) + 2 = 4.
+        assert_eq!(points[0].day, "2026-05-17");
+        assert_eq!(points[0].new_accounts, 2);
+        assert_eq!(points[0].cumulative_accounts, 4);
+
+        // Interior days are empty and hold the cumulative flat at 4.
+        for p in &points[1..29] {
+            assert_eq!(p.new_accounts, 0);
+            assert_eq!(p.cumulative_accounts, 4);
+        }
+
+        // Day 29 (today): one new, cumulative = 5. Future-dated row excluded.
+        assert_eq!(points[29].day, "2026-06-15");
+        assert_eq!(points[29].new_accounts, 1);
+        assert_eq!(points[29].cumulative_accounts, 5);
+
+        let total_new: i64 = points.iter().map(|p| p.new_accounts).sum();
+        assert_eq!(total_new, 3, "future-skew row is excluded from the window");
     }
 
     /// Sub-3c: GetQueueStatsOutput's retyped fields serialize as

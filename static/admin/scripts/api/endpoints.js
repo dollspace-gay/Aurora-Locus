@@ -43,6 +43,9 @@
     // ride the query string — `metrics` is a repeated key (client.get expands
     // arrays), which the handler's axum_extra Query requires.
     getModerationMetrics: (params) => C().get('tools.aurora.admin.getModerationMetrics', params),
+    // #361 — account-growth series backing the Dashboard sparkline. No params;
+    // the handler fixes a 30-day UTC window. Admin+.
+    getAccountGrowth: () => C().get('tools.aurora.admin.getAccountGrowth'),
     getAuditTrail: (params) => C().get('tools.aurora.admin.getAuditTrail', params || { limit: 25 }),
     triggerPasswordReset: (body) => C().post('tools.aurora.admin.triggerPasswordReset', body),
     exportAccountForensicRaw: (body) => C().postRaw('tools.aurora.admin.exportAccountForensic', body),
