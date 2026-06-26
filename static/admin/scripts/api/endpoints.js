@@ -28,6 +28,18 @@
     createInviteCode: (body) => C().post('com.atproto.admin.createInviteCode', body),
     disableInviteCode: (body) => C().post('com.atproto.admin.disableInviteCode', body),
     disableInviteCodes: (body) => C().post('com.atproto.admin.disableInviteCodes', body),
+    // Account-mutation surface for the Account Detail page (#362.1). These were
+    // direct AuroraClient.post() calls bypassing the registry; routing them here
+    // keeps every account mutation discoverable in one place. Each body shape is
+    // the handler's request struct (did + the field(s) being changed; rationale
+    // when the handler records one — see #362.5).
+    updateAccountPassword: (body) => C().post('com.atproto.admin.updateAccountPassword', body),
+    updateAccountEmail: (body) => C().post('com.atproto.admin.updateAccountEmail', body),
+    updateAccountHandle: (body) => C().post('com.atproto.admin.updateAccountHandle', body),
+    updateAccountSigningKey: (body) => C().post('com.atproto.admin.updateAccountSigningKey', body),
+    enableAccountInvites: (body) => C().post('com.atproto.admin.enableAccountInvites', body),
+    disableAccountInvites: (body) => C().post('com.atproto.admin.disableAccountInvites', body),
+    deleteAccount: (body) => C().post('com.atproto.admin.deleteAccount', body),
     listRecentEvents: (params) => C().get('com.atproto.admin.listRecentEvents', params || { limit: 20 }),
     getRecord: (params) => C().get('com.atproto.repo.getRecord', params),
     getReport: (params) => C().get('tools.aurora.admin.getReport', params || {}),

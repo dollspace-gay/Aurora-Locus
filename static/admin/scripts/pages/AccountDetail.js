@@ -404,7 +404,7 @@
     });
     if (!result.submitted) return;
     try {
-      await global.AuroraClient.post('com.atproto.admin.updateAccountPassword', {
+      await global.AuroraEndpoints.atproto.updateAccountPassword({
         did: currentDid, password: result.values.newPwd,
       });
       global.AuroraToast.success('Password override applied.');
@@ -458,7 +458,7 @@
     }
 
     try {
-      await global.AuroraClient.post('com.atproto.admin.updateAccountSigningKey', payload);
+      await global.AuroraEndpoints.atproto.updateAccountSigningKey(payload);
       global.AuroraToast.success('Signing key rotated.');
     } catch (e) {
       global.AuroraToast.danger('Rotation failed: ' + (e && e.message ? e.message : ''));
@@ -471,7 +471,7 @@
     const rationale = await promptRationale('Update email to ' + newEmail + '?', null, 'Update email');
     if (rationale == null) return;
     try {
-      await global.AuroraClient.post('com.atproto.admin.updateAccountEmail', {
+      await global.AuroraEndpoints.atproto.updateAccountEmail({
         did: currentDid, email: newEmail,
       });
       global.AuroraToast.success('Email updated.');
@@ -487,7 +487,7 @@
     const rationale = await promptRationale('Update handle to @' + newHandle + '?', null, 'Update handle');
     if (rationale == null) return;
     try {
-      await global.AuroraClient.post('com.atproto.admin.updateAccountHandle', {
+      await global.AuroraEndpoints.atproto.updateAccountHandle({
         did: currentDid, handle: newHandle,
       });
       global.AuroraToast.success('Handle updated.');
@@ -529,10 +529,10 @@
     if (!result.submitted) return;
     const enable = result.values.state === 'enabled';
     try {
-      const ep = enable
-        ? 'com.atproto.admin.enableAccountInvites'
-        : 'com.atproto.admin.disableAccountInvites';
-      await global.AuroraClient.post(ep, { account: currentDid, note: result.values.rationale });
+      const toggle = enable
+        ? global.AuroraEndpoints.atproto.enableAccountInvites
+        : global.AuroraEndpoints.atproto.disableAccountInvites;
+      await toggle({ account: currentDid, note: result.values.rationale });
       global.AuroraToast.success((enable ? 'Enabled' : 'Disabled') + ' invites.');
     } catch (e) {
       global.AuroraToast.danger('Toggle failed: ' + (e && e.message ? e.message : ''));
@@ -551,7 +551,7 @@
     });
     if (!result.confirmed) return;
     try {
-      await global.AuroraClient.post('com.atproto.admin.deleteAccount', {
+      await global.AuroraEndpoints.atproto.deleteAccount({
         did: currentDid,
       });
       global.AuroraToast.success('Account deleted.');
@@ -751,6 +751,11 @@
   async function loadRecords() {
     try {
       const repo = currentDid;
+      // #362.1: left as a direct AuroraClient call by the judgment rule — a
+      // single-page, read-only diagnostic (the "records authored" rail preview),
+      // not an account mutation and not reused elsewhere, so it earns no
+      // registry wrapper. The mutations on this page were routed through
+      // AuroraEndpoints.atproto.*.
       const data = await global.AuroraClient.get('com.atproto.repo.listRecords', {
         repo: repo, collection: 'app.bsky.feed.post', limit: 5,
       });
@@ -799,7 +804,7 @@
 
   async function loadInvites() {
     try {
-      const data = await global.AuroraClient.get('com.atproto.admin.getInviteCodes', { did: currentDid, limit: 10 });
+      const data = await global.AuroraEndpoints.atproto.getInviteCodes({ did: currentDid, limit: 10 });
       const codes = (data && (data.codes || data.inviteCodes)) || [];
       if (codes.length === 0) {
         setRailBody('invite-lineage', '<p class="empty-state">No invite codes for this account.</p>');
