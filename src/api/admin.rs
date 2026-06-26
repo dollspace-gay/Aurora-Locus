@@ -647,6 +647,14 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(crate::api::aurora_admin::get_audit_trail),
             CapsBuilder::new(Family::Admin).extensions(["audit-trail-v1"]),
         )
+        // #359 — single audit-entry fetch by id or current_hash. Moderator+ at
+        // the handler; no capability extension (a basic read, like getReport).
+        // Retires the page-scoped window._auditCache the detail page relied on.
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.getAuditEntry",
+            get(crate::api::aurora_admin::get_audit_entry),
+            CapsBuilder::new(Family::Admin),
+        )
         // #302 — single-report fetch for the report-detail page. The store
         // method existed; this HTTP surface was never registered (the UI 404'd
         // on the legacy com.atproto.admin.getReport NSID). Moderator+; no
@@ -11213,7 +11221,7 @@ mod tests {
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
-            // tools.aurora.admin (20 endpoints)
+            // tools.aurora.admin (21 endpoints)
             r#""tools.aurora.admin":["#,
             r#""emitEvent","#,
             r#""batchTakedownAccounts","#,
@@ -11227,6 +11235,7 @@ mod tests {
             r#""getModerationMetrics","#,
             r#""getAccountGrowth","#,
             r#""getAuditTrail","#,
+            r#""getAuditEntry","#,
             r#""getReport","#,
             r#""exportAccountForensic","#,
             r#""subscribeModEvents","#,

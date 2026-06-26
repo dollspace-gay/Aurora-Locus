@@ -3900,6 +3900,84 @@ pub async fn get_audit_trail(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAuditEntryParams {
+    /// Fetch by audit-chain entry id. Mutually exclusive with `hash`.
+    pub id: Option<i64>,
+    /// Fetch by the entry's `current_hash`. The detail page's "walk to
+    /// previous" affordance knows only the prior entry's hash, not its id,
+    /// so it resolves the previous entry this way. Mutually exclusive with `id`.
+    pub hash: Option<String>,
+}
+
+/// `tools.aurora.admin.getAuditEntry` (#359) — fetch a single audit-chain
+/// entry by id or by `current_hash`. Moderator+ (mirrors `getAuditTrail`); no
+/// capability extension (a basic role-gated read, like `getReport`).
+///
+/// This retires the page-scoped `window._auditCache` the audit detail page
+/// used to lean on: a cache miss degraded to a "narrow with filters" message,
+/// and the chain-walk could only reach entries already in the loaded page. The
+/// per-row `verified` flag is recomputed exactly as in `getAuditTrail` (the
+/// shared `audit_entry_from_row` helper).
+pub async fn get_audit_entry(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    axum::extract::Query(params): axum::extract::Query<GetAuditEntryParams>,
+) -> Result<Json<audit_chain::AuditEntry>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::Moderator) {
+        return Err(forbidden(&format!(
+            "getAuditEntry requires Moderator+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+
+    // Same column projection `audit_entry_from_row` expects, single-row.
+    const SELECT_COLS: &str =
+        "SELECT id, sequence, created_at, actor_did, action, subject_did, subject_uri, \
+                subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
+                cascade_subjects, cascade_snapshot_ids FROM audit_chain_entry";
+
+    let row = match (params.id, params.hash.as_deref()) {
+        (Some(id), None) => {
+            sqlx::query(&format!("{SELECT_COLS} WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(&ctx.account_db)
+                .await
+        }
+        (None, Some(hash)) => {
+            sqlx::query(&format!("{SELECT_COLS} WHERE current_hash = $1"))
+                .bind(hash)
+                .fetch_optional(&ctx.account_db)
+                .await
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "InvalidRequest",
+                    "message": "exactly one of `id` or `hash` is required",
+                })),
+            ));
+        }
+    }
+    .map_err(internal)?;
+
+    let row = row.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "AuditEntryNotFound",
+                "message": "no audit entry matches the given id or hash",
+            })),
+        )
+    })?;
+
+    let entry = audit_chain::audit_entry_from_row(&row).map_err(internal)?;
+    Ok(Json(entry))
+}
+
 // ===========================================================================
 // getRuntimeSetting / setRuntimeSetting — §8.16 (Phase 3.10)
 // ===========================================================================
@@ -7207,6 +7285,107 @@ mod tests {
         assert_eq!(entry.actor_did, "did:plc:moderator");
         assert_eq!(entry.action, "TakedownAccount");
         assert!(entry.snapshot_id.is_some());
+    }
+
+    /// #359: getAuditEntry resolves a single entry by id and by current_hash
+    /// (the chain-walk path), 404s on an unknown id, and 400s when neither or
+    /// both selectors are given. Replaces the page-scoped _auditCache.
+    #[tokio::test]
+    async fn get_audit_entry_by_id_and_hash_with_404_and_400() {
+        let ctx = create_test_context().await;
+        crate::admin::audit_chain::insert_chain_entry_pool(
+            &ctx.account_db,
+            ctx.config.database.backend,
+            crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
+                actor_did: "did:plc:auditor",
+                action: "account.update_email",
+                subject: Some(&repo_subject("did:plc:subj")),
+                rationale: "support ticket #99",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .expect("seed audit entry");
+
+        let (id, hash): (i64, String) = sqlx::query_as(
+            "SELECT id, current_hash FROM audit_chain_entry \
+             WHERE action = 'account.update_email'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+
+        // By id.
+        let by_id = get_audit_entry(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditEntryParams {
+                id: Some(id),
+                hash: None,
+            }),
+        )
+        .await
+        .expect("fetch by id")
+        .0;
+        assert_eq!(by_id.action, "account.update_email");
+        assert_eq!(by_id.rationale, "support ticket #99");
+        assert_eq!(by_id.current_hash, hash);
+        assert!(by_id.verified, "row-local hash recompute should verify");
+
+        // By hash → resolves the same entry (the walk-to-previous path).
+        let by_hash = get_audit_entry(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditEntryParams {
+                id: None,
+                hash: Some(hash.clone()),
+            }),
+        )
+        .await
+        .expect("fetch by hash")
+        .0;
+        assert_eq!(by_hash.id, by_id.id);
+
+        // Unknown id → 404.
+        let missing = get_audit_entry(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditEntryParams {
+                id: Some(9_999_999),
+                hash: None,
+            }),
+        )
+        .await;
+        assert_eq!(missing.unwrap_err().0, StatusCode::NOT_FOUND);
+
+        // Neither selector → 400.
+        let neither = get_audit_entry(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditEntryParams {
+                id: None,
+                hash: None,
+            }),
+        )
+        .await;
+        assert_eq!(neither.unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        // Both selectors → 400 (mutually exclusive).
+        let both = get_audit_entry(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditEntryParams {
+                id: Some(id),
+                hash: Some(hash),
+            }),
+        )
+        .await;
+        assert_eq!(both.unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 
     // §5.5.4 Phase E (§6.4 / MD-40) — source filter + rule-management filter.
