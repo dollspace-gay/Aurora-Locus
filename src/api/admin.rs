@@ -3708,6 +3708,12 @@ struct UpdateAccountEmailRequest {
     did: Option<String>,
     /// New email address
     email: String,
+    /// Operator rationale recorded in the audit chain (#362.5). Optional on
+    /// the wire (the canonical lexicon doesn't define it — these structs carry
+    /// no `deny_unknown_fields`, so it's an additive local field); when absent
+    /// the handler falls back to the descriptive default.
+    #[serde(default)]
+    rationale: Option<String>,
 }
 
 /// Update account email address
@@ -3743,7 +3749,12 @@ async fn update_account_email(
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rationale = format!("change email to {}", req.email);
+    // #362.5: record the operator's rationale when supplied; otherwise fall
+    // back to the descriptive default (mirrors the B3 signing-key pattern).
+    let rationale = req
+        .rationale
+        .clone()
+        .unwrap_or_else(|| format!("change email to {}", req.email));
 
     // LB-1 / chainlink #128: the email UPDATE and chain entry land
     // in one transaction. Multi-store side effects (token store
@@ -3803,6 +3814,10 @@ struct UpdateAccountHandleRequest {
     did: String,
     /// New handle
     handle: String,
+    /// Operator rationale recorded in the audit chain (#362.5). Optional;
+    /// falls back to the descriptive default when absent.
+    #[serde(default)]
+    rationale: Option<String>,
 }
 
 /// Update account handle
@@ -3827,7 +3842,11 @@ async fn update_account_handle(
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rationale = format!("change handle to {}", req.handle);
+    // #362.5: operator rationale when supplied, else the descriptive default.
+    let rationale = req
+        .rationale
+        .clone()
+        .unwrap_or_else(|| format!("change handle to {}", req.handle));
 
     // LB-1 Session 12 / chainlink #129: handle UPDATE + chain entry
     // in one transaction so a crash between the two leaves neither row.
@@ -3882,6 +3901,11 @@ struct UpdateAccountPasswordRequest {
     did: String,
     /// New password
     password: String,
+    /// Operator rationale recorded in the audit chain (#362.5). This is
+    /// operator-typed justification text — distinct from `password`, which
+    /// never reaches the chain. Optional; falls back to the fixed default.
+    #[serde(default)]
+    rationale: Option<String>,
 }
 
 /// Update account password (admin override)
@@ -3903,14 +3927,20 @@ async fn update_account_password(
         ));
     }
 
-    // Rationale is fixed text — under no circumstances does the password
-    // value (raw or otherwise) get committed to the chain.
+    // #362.5: the chain records the operator's rationale when supplied, else
+    // fixed default text. Under no circumstances does the password value (raw
+    // or otherwise) get committed to the chain — `rationale` is a separate
+    // operator-typed field, never derived from `password`.
     let subject = Subject::Repo {
         did: req.did.clone(),
     };
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rationale = req
+        .rationale
+        .clone()
+        .unwrap_or_else(|| "reset account password".to_string());
 
     // LB-1 Session 12 / chainlink #129: password UPDATE +
     // session/refresh_token DELETE + chain entry in one transaction.
@@ -3941,7 +3971,7 @@ async fn update_account_password(
             actor_did: &auth.did,
             action: "account.reset_password",
             subject: Some(&subject),
-            rationale: "reset account password",
+            rationale: &rationale,
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
@@ -12258,6 +12288,7 @@ mod tests {
             account: None,
             did: Some("did:plc:emailchain".to_string()),
             email: "new@example.org".to_string(),
+            rationale: None,
         };
         let status = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -12267,6 +12298,67 @@ mod tests {
             count_chain_rows(&ctx, "account.update_email", Some("did:plc:emailchain"))
                 .await,
             1
+        );
+    }
+
+    /// #362.5: the operator-supplied rationale is what lands in the chain
+    /// `rationale` column; when omitted, the handler's descriptive default is
+    /// recorded instead. Guards that the new Option field is actually threaded
+    /// to the audit (a wiring tripwire, not just "logic works when set").
+    #[tokio::test]
+    async fn update_account_email_records_operator_rationale_else_default() {
+        async fn chain_rationale(ctx: &AppContext, did: &str) -> String {
+            sqlx::query_scalar(
+                "SELECT rationale FROM audit_chain_entry \
+                 WHERE action = ? AND subject_did = ?",
+            )
+            .bind("account.update_email")
+            .bind(did)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+        }
+
+        // Supplied rationale → recorded verbatim.
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:emailrat", "er.test", Some("a@b.com")).await;
+        update_account_email(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountEmailRequest {
+                account: None,
+                did: Some("did:plc:emailrat".to_string()),
+                email: "new@example.org".to_string(),
+                rationale: Some("support ticket #4821".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            chain_rationale(&ctx, "did:plc:emailrat").await,
+            "support ticket #4821",
+            "operator rationale must be recorded verbatim",
+        );
+
+        // Omitted rationale → descriptive default.
+        let ctx2 = create_test_context().await;
+        seed_test_account(&ctx2, "did:plc:emaildef", "ed.test", Some("a@b.com")).await;
+        update_account_email(
+            State(ctx2.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountEmailRequest {
+                account: None,
+                did: Some("did:plc:emaildef".to_string()),
+                email: "fresh@example.org".to_string(),
+                rationale: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            chain_rationale(&ctx2, "did:plc:emaildef").await,
+            "change email to fresh@example.org",
+            "absent rationale falls back to the descriptive default",
         );
     }
 
@@ -12283,6 +12375,7 @@ mod tests {
             account: None,
             did: Some("did:plc:colontest".to_string()),
             email: "did:foo@example.com".to_string(),
+            rationale: None,
         };
         let err = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -12415,6 +12508,7 @@ mod tests {
             account: Some("email.test".to_string()),
             did: None,
             email: "new@example.com".to_string(),
+            rationale: None,
         };
         let status = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -12435,6 +12529,7 @@ mod tests {
             account: None,
             did: Some("did:plc:legacyemail".to_string()),
             email: "back@compat.com".to_string(),
+            rationale: None,
         };
         let status = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -13643,6 +13738,7 @@ mod tests {
             account: Some("did:plc:x".to_string()),
             did: Some("did:plc:x".to_string()),
             email: "x@y.com".to_string(),
+            rationale: None,
         };
         let err = update_account_email(State(ctx), admin_test_auth(), Json(req))
             .await

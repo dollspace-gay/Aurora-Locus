@@ -405,7 +405,8 @@
     if (!result.submitted) return;
     try {
       await global.AuroraEndpoints.atproto.updateAccountPassword({
-        did: currentDid, password: result.values.newPwd,
+        // #362.5: transmit the audit rationale the form already collects.
+        did: currentDid, password: result.values.newPwd, rationale: result.values.rationale,
       });
       global.AuroraToast.success('Password override applied.');
     } catch (e) {
@@ -472,7 +473,8 @@
     if (rationale == null) return;
     try {
       await global.AuroraEndpoints.atproto.updateAccountEmail({
-        did: currentDid, email: newEmail,
+        // #362.5: transmit the rationale promptRationale already collected.
+        did: currentDid, email: newEmail, rationale: rationale,
       });
       global.AuroraToast.success('Email updated.');
       currentAccount.email = newEmail;
@@ -488,7 +490,8 @@
     if (rationale == null) return;
     try {
       await global.AuroraEndpoints.atproto.updateAccountHandle({
-        did: currentDid, handle: newHandle,
+        // #362.5: transmit the rationale promptRationale already collected.
+        did: currentDid, handle: newHandle, rationale: rationale,
       });
       global.AuroraToast.success('Handle updated.');
       currentAccount.handle = newHandle;
