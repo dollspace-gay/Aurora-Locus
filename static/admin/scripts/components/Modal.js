@@ -62,6 +62,14 @@
 
     const titleId = modal.getAttribute('aria-labelledby');
     const title = spec.title || '';
+    // XSS contract (#358 audit): `title` is escaped below; but a STRING
+    // `body`/`footer` is inserted RAW (see body.innerHTML / footer.innerHTML
+    // below) — the documented `htmlString | Node` API. Callers passing a
+    // string MUST pre-escape any user-controlled content (or pass a Node,
+    // which is appended, not innerHTML'd). Audit result: the only string-body
+    // caller is ConfigThemes' validation-errors dialog, which esc()'s each
+    // error; every other caller passes a createElement Node. The .form() /
+    // .destructiveConfirm() helpers esc() all interpolations internally.
     const bodyHtml = (typeof spec.body === 'string') ? spec.body : '';
     const footerHtml = (typeof spec.footer === 'string') ? spec.footer : '';
 

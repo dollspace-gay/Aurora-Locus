@@ -9,6 +9,11 @@
   'use strict';
 
   // render({ container, prevDisabled, nextDisabled, info?, onPrev, onNext })
+  //
+  // XSS contract (#358 audit): the buttons are static; `spec.info` is the only
+  // dynamic field and is inserted RAW. No caller passes `info` today (Sessions
+  // is the sole consumer and omits it). A caller supplying `info` MUST
+  // pre-escape it (or this should esc() it).
   function render(spec) {
     if (!spec || !spec.container) return;
     const c = spec.container;
