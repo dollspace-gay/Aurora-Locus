@@ -76,27 +76,40 @@ async fn upsert_result_row(
     Ok(())
 }
 
-/// Update one account's did:plc service endpoint (E2's per-account body; also the
-/// unit E4's per-account retry will call). Compare-and-skip first (M-3): if the
-/// published endpoint already matches, record `aligned` without republishing.
-/// Otherwise publish via the PDS-wide signer, audit the change AFTER the PLC
-/// call (M-4 — the guard never spans the network), and record `aligned`.
-async fn update_one_account(
+/// The run-invariant inputs to a single-account update — built once per run (or
+/// per retry) and shared across the per-account calls. Bundled to keep
+/// `run_per_account_diddoc_update`'s arity sane.
+struct DidDocUpdateRun<'a> {
+    new_endpoint: &'a str,
+    signer: &'a PlcSigner,
+    service_did: &'a str,
+    run_id: &'a str,
+    started_at: &'a str,
+    /// `BulkServiceUrlUpdate` for the automatic run; `RetryBulkServiceUrlUpdate`
+    /// for an operator retry.
+    audit_action: &'a str,
+}
+
+/// v0.9 Federation runtime-mutability arc §2.3 (#399/#400) — update one account's
+/// did:plc service endpoint. The single source of truth for the update, shared by
+/// E2's per-account loop and E4's retry path.
+///
+/// Compare-and-skip first (M-3): if the published endpoint already matches,
+/// record `aligned` without republishing. Otherwise publish via the PDS-wide
+/// signer, audit the change AFTER the PLC call (M-4 — the guard never spans the
+/// network), and record `aligned`.
+async fn run_per_account_diddoc_update(
     ctx: &AppContext,
     did: &str,
-    new_endpoint: &str,
-    signer: &PlcSigner,
-    service_did: &str,
-    run_id: &str,
-    started_at: &str,
+    run: &DidDocUpdateRun<'_>,
 ) -> PdsResult<()> {
     let current = ctx.plc_client.get_document(did).await?.get_service_endpoint();
-    if current.as_deref() == Some(new_endpoint) {
+    if current.as_deref() == Some(run.new_endpoint) {
         upsert_result_row(
             &ctx.account_db,
             did,
-            run_id,
-            started_at,
+            run.run_id,
+            run.started_at,
             "aligned",
             Some("already at target endpoint (no-op)"),
         )
@@ -104,27 +117,27 @@ async fn update_one_account(
         return Ok(());
     }
     ctx.plc_client
-        .update_service_endpoint(did, new_endpoint, signer)
+        .update_service_endpoint(did, run.new_endpoint, run.signer)
         .await?;
     // M-4: short guard-held audit tx AFTER the PLC publish, never across it.
     audit_chain::insert_chain_entry_pool(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
-            actor_did: service_did,
-            action: "BulkServiceUrlUpdate",
+            actor_did: run.service_did,
+            action: run.audit_action,
             source: "system_diagnostic",
             payload: Some(serde_json::json!({
                 "did": did,
                 "old_endpoint": current.clone(),
-                "new_endpoint": new_endpoint,
-                "run_id": run_id,
+                "new_endpoint": run.new_endpoint,
+                "run_id": run.run_id,
             })),
             subject: Some(&Subject::Repo { did: did.to_string() }),
             rationale: &format!(
                 "bulk did:plc service-url update: {} → {}",
                 current.as_deref().unwrap_or("<none>"),
-                new_endpoint
+                run.new_endpoint
             ),
             snapshot_id: None,
             event_id: None,
@@ -133,7 +146,7 @@ async fn update_one_account(
         },
     )
     .await?;
-    upsert_result_row(&ctx.account_db, did, run_id, started_at, "aligned", None).await?;
+    upsert_result_row(&ctx.account_db, did, run.run_id, run.started_at, "aligned", None).await?;
     Ok(())
 }
 
@@ -165,11 +178,17 @@ pub async fn run_bulk_diddoc_update(
         .filter_map(|r| r.try_get::<String, _>("did").ok())
         .collect();
 
+    let run = DidDocUpdateRun {
+        new_endpoint: &new_endpoint,
+        signer: &signer,
+        service_did: &service_did,
+        run_id,
+        started_at,
+        audit_action: "BulkServiceUrlUpdate",
+    };
     let (mut aligned, mut failed) = (0usize, 0usize);
     for did in &dids {
-        match update_one_account(ctx, did, &new_endpoint, &signer, &service_did, run_id, started_at)
-            .await
-        {
+        match run_per_account_diddoc_update(ctx, did, &run).await {
             Ok(()) => aligned += 1,
             Err(e) => {
                 failed += 1;
@@ -193,6 +212,56 @@ pub async fn run_bulk_diddoc_update(
     .await?;
     tracing::info!(run_id, total = dids.len(), aligned, failed, "bulk did:plc service-url update complete");
     Ok(())
+}
+
+/// Outcome of a single-account retry — the terminal status the row landed on and
+/// any failure reason, surfaced to the operator by the retry XRPC.
+pub struct BulkRetryOutcome {
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+/// v0.9 Federation runtime-mutability arc §2.3 (#400) — re-run the did:plc update
+/// for ONE account (the "Retry" control on a failed result row). Targets the
+/// current effective public URL (same as E2's run), audits as
+/// `RetryBulkServiceUrlUpdate`, and upserts the row to its new terminal status.
+/// `Ok(failed)` (not `Err`) when the PLC operation fails — the failure is the
+/// result the operator triages, not an XRPC error.
+pub async fn retry_one_account(
+    ctx: &AppContext,
+    did: &str,
+    run_id: &str,
+) -> PdsResult<BulkRetryOutcome> {
+    use sqlx::Row as _;
+    let new_endpoint = ctx.config.service.effective_public_url();
+    let signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)?;
+    let service_did = ctx.service_did().to_string();
+
+    // All rows of a run share started_at; reuse it so the upsert keeps the run's
+    // recency key. Fall back to now() only if the run has no rows yet.
+    let started_at: String = sqlx::query("SELECT started_at FROM bulk_diddoc_update_result WHERE run_id = $1 LIMIT 1")
+        .bind(run_id)
+        .fetch_optional(&ctx.account_db)
+        .await?
+        .and_then(|r| r.try_get::<String, _>("started_at").ok())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+    let run = DidDocUpdateRun {
+        new_endpoint: &new_endpoint,
+        signer: &signer,
+        service_did: &service_did,
+        run_id,
+        started_at: &started_at,
+        audit_action: "RetryBulkServiceUrlUpdate",
+    };
+    match run_per_account_diddoc_update(ctx, did, &run).await {
+        Ok(()) => Ok(BulkRetryOutcome { status: "aligned".to_string(), reason: None }),
+        Err(e) => {
+            let reason = e.to_string();
+            upsert_result_row(&ctx.account_db, did, run_id, &started_at, "failed", Some(&reason)).await?;
+            Ok(BulkRetryOutcome { status: "failed".to_string(), reason: Some(reason) })
+        }
+    }
 }
 
 #[cfg(test)]

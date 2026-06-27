@@ -5946,6 +5946,183 @@ pub async fn trigger_restart(
     }))
 }
 
+// ===========================================================================
+// v0.9 Federation runtime-mutability arc §2.3 (#400 / E4) — bulk did:plc update
+// result surface: read the most-recent run + retry a single account.
+// ===========================================================================
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkResultRowView {
+    pub did: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkResultCounts {
+    pub pending: i64,
+    pub aligned: i64,
+    pub failed: i64,
+    pub unresolvable: i64,
+    pub skipped_did_web: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBulkDidDocUpdateLatestOutput {
+    pub run_id: Option<String>,
+    pub started_at: Option<String>,
+    pub counts: Option<BulkResultCounts>,
+    pub rows: Vec<BulkResultRowView>,
+}
+
+/// `tools.aurora.superadmin.getBulkDidDocUpdateLatest` (§2.3 result surface) —
+/// the most-recent bulk did:plc update run (by `started_at`, NOT `run_id`, per
+/// R3 H-2), its per-account rows (triage-needed first), and aggregate counts.
+/// SuperAdmin-gated, read-only. Empty (all-null) when no run has ever happened.
+pub async fn get_bulk_diddoc_update_latest(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<GetBulkDidDocUpdateLatestOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    use sqlx::Row as _;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "getBulkDidDocUpdateLatest requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+
+    // Most-recent run by recency (started_at), not the lexicographic UUID.
+    let latest = sqlx::query(
+        "SELECT run_id, started_at FROM bulk_diddoc_update_result ORDER BY started_at DESC LIMIT 1",
+    )
+    .fetch_optional(&ctx.account_db)
+    .await
+    .map_err(internal)?;
+    let Some(latest) = latest else {
+        return Ok(Json(GetBulkDidDocUpdateLatestOutput {
+            run_id: None,
+            started_at: None,
+            counts: None,
+            rows: vec![],
+        }));
+    };
+    let run_id: String = latest.try_get("run_id").map_err(internal)?;
+    let started_at: String = latest.try_get("started_at").map_err(internal)?;
+
+    // Rows for that run — failed / unresolvable first so triage is on top.
+    let rows = sqlx::query(
+        "SELECT did, status, reason, updated_at FROM bulk_diddoc_update_result \
+         WHERE run_id = $1 \
+         ORDER BY CASE status \
+           WHEN 'failed' THEN 0 WHEN 'unresolvable' THEN 1 WHEN 'pending' THEN 2 \
+           WHEN 'aligned' THEN 3 ELSE 4 END, did",
+    )
+    .bind(&run_id)
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(internal)?
+    .into_iter()
+    .map(|r| {
+        Ok(BulkResultRowView {
+            did: r.try_get("did").map_err(internal)?,
+            status: r.try_get("status").map_err(internal)?,
+            reason: r.try_get("reason").map_err(internal)?,
+            updated_at: r.try_get("updated_at").map_err(internal)?,
+        })
+    })
+    .collect::<Result<Vec<_>, (StatusCode, Json<serde_json::Value>)>>()?;
+
+    // Aggregate counts for the run.
+    let mut counts = BulkResultCounts::default();
+    let count_rows = sqlx::query(
+        "SELECT status, COUNT(*) AS n FROM bulk_diddoc_update_result WHERE run_id = $1 GROUP BY status",
+    )
+    .bind(&run_id)
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(internal)?;
+    for cr in count_rows {
+        let status: String = cr.try_get("status").map_err(internal)?;
+        let n: i64 = cr.try_get("n").map_err(internal)?;
+        match status.as_str() {
+            "pending" => counts.pending = n,
+            "aligned" => counts.aligned = n,
+            "failed" => counts.failed = n,
+            "unresolvable" => counts.unresolvable = n,
+            "skipped_did_web" => counts.skipped_did_web = n,
+            _ => {}
+        }
+    }
+
+    Ok(Json(GetBulkDidDocUpdateLatestOutput {
+        run_id: Some(run_id),
+        started_at: Some(started_at),
+        counts: Some(counts),
+        rows,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryBulkDidDocUpdateInput {
+    pub did: String,
+    pub run_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryBulkDidDocUpdateOutput {
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+/// `tools.aurora.superadmin.retryBulkDidDocUpdateForDid` (§2.3) — re-run the
+/// did:plc update for a single account (the "Retry" control on a failed row).
+/// SuperAdmin-gated; audited as `RetryBulkServiceUrlUpdate` (inside the shared
+/// per-account helper). A PLC failure returns `{status:"failed"}`, not an XRPC
+/// error — the failure is the operator-triaged result.
+pub async fn retry_bulk_diddoc_update_for_did(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<RetryBulkDidDocUpdateInput>,
+) -> Result<Json<RetryBulkDidDocUpdateOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "retryBulkDidDocUpdateForDid requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    // v0.9: only did:plc accounts exist (#381); did:web is a v0.10 path.
+    if !input.did.starts_with("did:plc:") {
+        return Err(validation(format!(
+            "only did:plc accounts can be re-pointed; got '{}'",
+            input.did
+        )));
+    }
+    let exists = sqlx::query("SELECT 1 FROM actor WHERE did = $1")
+        .bind(&input.did)
+        .fetch_optional(&ctx.account_db)
+        .await
+        .map_err(internal)?;
+    if exists.is_none() {
+        return Err(validation(format!("account not found: {}", input.did)));
+    }
+
+    let outcome = crate::api::bulk_diddoc_result::retry_one_account(&ctx, &input.did, &input.run_id)
+        .await
+        .map_err(internal_pds)?;
+    Ok(Json(RetryBulkDidDocUpdateOutput {
+        status: outcome.status,
+        reason: outcome.reason,
+    }))
+}
+
 /// Query params for `uploadBrandingAsset`: which asset, + an optional rationale.
 /// camelCase on the wire (`assetType`) per the atproto convention the admin
 /// client sends.
@@ -6876,6 +7053,135 @@ mod tests {
             1
         );
         assert_eq!(count_bulk_rows(&ctx, None).await, 0);
+    }
+
+    // v0.9 Federation runtime-mutability arc §2.3 (#400 / E4) — bulk-update
+    // result surface XRPCs.
+
+    async fn insert_bulk_row(ctx: &AppContext, did: &str, run_id: &str, started_at: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO bulk_diddoc_update_result \
+             (did, run_id, started_at, status, reason, updated_at) VALUES ($1,$2,$3,$4,NULL,$5)",
+        )
+        .bind(did)
+        .bind(run_id)
+        .bind(started_at)
+        .bind(status)
+        .bind(started_at)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bulk_latest_empty_when_no_runs() {
+        let ctx = create_test_context().await;
+        let out = get_bulk_diddoc_update_latest(State(ctx.clone()), c4_super()).await.unwrap().0;
+        assert!(out.run_id.is_none());
+        assert!(out.counts.is_none());
+        assert!(out.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_latest_returns_run_rows_and_counts_triage_first() {
+        let ctx = create_test_context().await;
+        insert_bulk_row(&ctx, "did:plc:a", "run-1", "2026-06-27T01:00:00Z", "aligned").await;
+        insert_bulk_row(&ctx, "did:plc:b", "run-1", "2026-06-27T01:00:00Z", "failed").await;
+        let out = get_bulk_diddoc_update_latest(State(ctx.clone()), c4_super()).await.unwrap().0;
+        assert_eq!(out.run_id.as_deref(), Some("run-1"));
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(out.rows[0].status, "failed", "triage-needed rows sort first");
+        let counts = out.counts.unwrap();
+        assert_eq!(counts.aligned, 1);
+        assert_eq!(counts.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_latest_picks_most_recent_run_by_started_at_not_run_id() {
+        let ctx = create_test_context().await;
+        // "zzz-old" sorts later lexically but is the OLDER run by started_at.
+        insert_bulk_row(&ctx, "did:plc:a", "zzz-old", "2026-06-27T01:00:00Z", "aligned").await;
+        // "aaa-new" sorts earlier lexically but is the NEWER run.
+        insert_bulk_row(&ctx, "did:plc:b", "aaa-new", "2026-06-27T02:00:00Z", "aligned").await;
+        let out = get_bulk_diddoc_update_latest(State(ctx.clone()), c4_super()).await.unwrap().0;
+        assert_eq!(
+            out.run_id.as_deref(),
+            Some("aaa-new"),
+            "recency is by started_at, not MAX(run_id) (R3 H-2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_publishes_and_records_aligned_with_retry_audit() {
+        let mut ctx = create_test_context().await;
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1,$2,$3)")
+            .bind("did:plc:a")
+            .bind("a.test")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        insert_bulk_row(&ctx, "did:plc:a", "run-1", "2026-06-27T01:00:00Z", "failed").await;
+        let mock = std::sync::Arc::new(
+            crate::crypto::plc_client::MockPlcClient::new().with_current_signing_key("did:plc:a", "zKEY"),
+        );
+        ctx.plc_client = mock.clone();
+
+        let out = retry_bulk_diddoc_update_for_did(
+            State(ctx.clone()),
+            c4_super(),
+            Json(RetryBulkDidDocUpdateInput {
+                did: "did:plc:a".to_string(),
+                run_id: "run-1".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out.status, "aligned");
+        assert_eq!(
+            mock.published_service_endpoint("did:plc:a").as_deref(),
+            Some(ctx.config.service.effective_public_url().as_str())
+        );
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = 'RetryBulkServiceUrlUpdate'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(audits, 1, "retry audited as RetryBulkServiceUrlUpdate");
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM bulk_diddoc_update_result WHERE did = 'did:plc:a' AND run_id = 'run-1'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(status, "aligned", "failed row advanced to aligned");
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_unknown_and_did_web() {
+        let ctx = create_test_context().await;
+        let unknown = retry_bulk_diddoc_update_for_did(
+            State(ctx.clone()),
+            c4_super(),
+            Json(RetryBulkDidDocUpdateInput {
+                did: "did:plc:nope".to_string(),
+                run_id: "run-1".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(unknown.unwrap_err().0, StatusCode::BAD_REQUEST, "unknown did:plc → 400");
+        let web = retry_bulk_diddoc_update_for_did(
+            State(ctx.clone()),
+            c4_super(),
+            Json(RetryBulkDidDocUpdateInput {
+                did: "did:web:example.com".to_string(),
+                run_id: "run-1".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(web.unwrap_err().0, StatusCode::BAD_REQUEST, "did:web → 400 (v0.10 path)");
     }
 
     #[tokio::test]

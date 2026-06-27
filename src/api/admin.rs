@@ -815,6 +815,18 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(crate::api::aurora_admin::trigger_restart),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // v0.9 Federation runtime-mutability arc §2.3 (#400) — bulk did:plc update
+        // result surface: read the latest run + retry a single failed account.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getBulkDidDocUpdateLatest",
+            get(crate::api::aurora_admin::get_bulk_diddoc_update_latest),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.retryBulkDidDocUpdateForDid",
+            post(crate::api::aurora_admin::retry_bulk_diddoc_update_for_did),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // §5.5.4 Phase B (#346) — SuperAdmin manual reviewer reassignment
         // (§4.7): set a queue item's assignee with assignment_source =
         // 'manual_override'. Covers orphan-and-escalated recovery.
@@ -11356,6 +11368,8 @@ mod tests {
             r#""deleteRuntimeSetting","#,
             r#""listPendingRestartActions","#,
             r#""triggerRestart","#,
+            r#""getBulkDidDocUpdateLatest","#,
+            r#""retryBulkDidDocUpdateForDid","#,
             r#""assignReviewer","#,
             r#""createAutoLabelRule","#,
             r#""editAutoLabelRule","#,

@@ -137,6 +137,16 @@
       '      <pre id="fed-describe-posture" class="chain-indicator-cmd">Loading…</pre></div>' +
       '  </div>' +
       '</section>' +
+      // v0.9 Federation runtime-mutability arc §2.3 (#400) — bulk did:plc update
+      // result surface. After a Public URL change the post-restart task re-points
+      // every account's DID document; this surfaces the most-recent run + retry.
+      '<hr class="config-section-divider">' +
+      '<section class="installed-themes-section">' +
+      '  <h3>Recent DID-document update <span class="role-tag">SuperAdmin only</span></h3>' +
+      '  <p class="settings-help">After a Public URL change, every account\'s DID document is re-pointed on PLC once the substrate restarts. The most-recent run is shown here; retry any per-account failures.</p>' +
+      (isSuper ? '  <button type="button" class="btn-secondary" id="fed-bulk-refresh">Refresh</button>' : '') +
+      '  <div id="fed-bulk-result">' + (isSuper ? 'Loading…' : '<p class="settings-help">SuperAdmin role required to view bulk-update results.</p>') + '</div>' +
+      '</section>' +
       // Future-cycle pointer — honest deferral framing (#342/#343 shape).
       '<hr class="config-section-divider">' +
       '<section class="installed-themes-section">' +
@@ -157,6 +167,8 @@
       if (relayAdd) relayAdd.addEventListener('click', addRelay);
       const relaySwitch = document.getElementById('fed-relay-switch');
       if (relaySwitch) relaySwitch.addEventListener('click', switchRelays);
+      const bulkRefresh = document.getElementById('fed-bulk-refresh');
+      if (bulkRefresh) bulkRefresh.addEventListener('click', loadBulkUpdate);
     }
     await loadAll();
     return {};
@@ -164,7 +176,67 @@
 
   async function loadAll() {
     await detectRecovery();
-    await Promise.all([loadPolicy(), loadDiscovery(), loadPeerVisible()]);
+    await Promise.all([loadPolicy(), loadDiscovery(), loadPeerVisible(), loadBulkUpdate()]);
+  }
+
+  // v0.9 Federation runtime-mutability arc §2.3 (#400) — render the most-recent
+  // bulk did:plc DID-document update run + per-account retry controls.
+  async function loadBulkUpdate() {
+    if (!isSuper) return;
+    const el = document.getElementById('fed-bulk-result');
+    if (!el) return;
+    let data;
+    try {
+      data = await global.AuroraEndpoints.superadmin.getBulkDidDocUpdateLatest();
+    } catch (e) {
+      el.innerHTML = '<p class="settings-help">Unable to load bulk-update results.</p>';
+      return;
+    }
+    if (!data || !data.runId) {
+      el.innerHTML = '<p class="settings-help">No bulk DID-document updates have run yet. The bulk update runs automatically after a Public URL change.</p>';
+      return;
+    }
+    el.innerHTML = renderBulkResult(data);
+    el.querySelectorAll('button[data-retry-did]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        retryBulk(b.getAttribute('data-retry-did'), data.runId);
+      });
+    });
+  }
+
+  function renderBulkResult(data) {
+    const c = data.counts || {};
+    const summary = '<p class="settings-help">Run started ' + esc(data.startedAt || '') +
+      ' · <code>' + esc(String(data.runId || '').slice(0, 12)) + '…</code> · ' +
+      (c.aligned || 0) + ' aligned, ' + (c.failed || 0) + ' failed, ' +
+      (c.unresolvable || 0) + ' unresolvable, ' + (c.pending || 0) + ' pending</p>';
+    const rows = (data.rows || []).map(function (r) {
+      const retriable = (r.status === 'failed' || r.status === 'unresolvable');
+      const retryBtn = retriable
+        ? '<button type="button" class="btn-secondary" data-retry-did="' + esc(r.did) + '">Retry</button>'
+        : '';
+      return '<tr>' +
+        '<td><code title="' + esc(r.did) + '">' + esc(String(r.did).slice(0, 20)) + '…</code></td>' +
+        '<td>' + esc(r.status) + '</td>' +
+        '<td>' + esc(r.reason || '') + '</td>' +
+        '<td>' + esc(r.updatedAt || '') + '</td>' +
+        '<td>' + retryBtn + '</td>' +
+        '</tr>';
+    }).join('');
+    return summary +
+      '<table class="settings-table"><thead><tr><th>DID</th><th>Status</th><th>Reason</th><th>Updated</th><th></th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table>';
+  }
+
+  async function retryBulk(did, runId) {
+    if (!global.confirm('Re-run DID-document update for ' + did + '?')) return;
+    try {
+      await global.AuroraEndpoints.superadmin.retryBulkDidDocUpdateForDid({ did: did, runId: runId });
+    } catch (e) {
+      global.alert('Retry failed: ' + (e && e.message ? e.message : 'unknown error'));
+      return;
+    }
+    await loadBulkUpdate();
   }
 
   // Recovery mode is detected via the substrate signal the moderation-mode

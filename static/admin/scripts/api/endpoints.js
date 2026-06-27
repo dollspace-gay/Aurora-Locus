@@ -164,6 +164,10 @@
   const superadminTools = {
     grantRole: (body) => C().post('tools.aurora.superadmin.grantRole', body),
     revokeRole: (body) => C().post('tools.aurora.superadmin.revokeRole', body),
+    // v0.9 Federation runtime-mutability arc §2.3 (#400) — bulk did:plc update
+    // result surface: latest run + per-account retry.
+    getBulkDidDocUpdateLatest: () => C().get('tools.aurora.superadmin.getBulkDidDocUpdateLatest'),
+    retryBulkDidDocUpdateForDid: (body) => C().post('tools.aurora.superadmin.retryBulkDidDocUpdateForDid', body),
     // §5.5.4 Phase B (#346) — manual reviewer reassignment.
     assignReviewer: (body) => C().post('tools.aurora.superadmin.assignReviewer', body),
     // §5.5.4 Phase C (#347) — auto-label rule CRUD.
