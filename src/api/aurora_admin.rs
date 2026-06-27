@@ -4239,6 +4239,9 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     FEDERATION_APPVIEW_URL_KEY,
     FEDERATION_FIREHOSE_ENABLED_KEY,
     FEDERATION_CRAWL_ENABLED_KEY,
+    // v0.9 Federation runtime-mutability arc §2.1/§2.2 — restart-required fields.
+    FEDERATION_ENABLED_KEY,
+    SERVICE_PUBLIC_URL_KEY,
     // Key-rotation arc B2 (#373 / §4.6) — operator-supplied-keys feature gate.
     KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY,
 ];
@@ -4262,6 +4265,14 @@ pub const FEDERATION_FIREHOSE_ENABLED_KEY: &str = "federation.firehose_enabled";
 // `crawl_enabled` (#388) — describe-only advertised relay-may-crawl hint (recon:
 // no crawler subsystem reads it; `describeServer` + admin describe only).
 pub const FEDERATION_CRAWL_ENABLED_KEY: &str = "federation.crawl_enabled";
+// v0.9 Federation runtime-mutability arc §2.1/§2.2 (#393/#395) — the two
+// restart-required fields' resolver registration (design §2.1/§2.2 "registered in
+// KNOWN_RUNTIME_KEYS like the Pattern-1 fields"). C4 needs them allowlisted to
+// support delete/revert; C6 reads `federation.enabled` for the request-layer
+// short-circuit. The save HANDLERS (modal, restart trigger, boot-seed, consumer
+// switch) land in the D-phase; here we register the keys only.
+pub const FEDERATION_ENABLED_KEY: &str = "federation.enabled";
+pub const SERVICE_PUBLIC_URL_KEY: &str = "service.public_url";
 
 /// Key-rotation arc B2 (#373 / design §4.6) — gates the operator-supplied
 /// signing-key path in account-key rotation. `false` (default) means the
@@ -4335,6 +4346,11 @@ fn default_for_key(key: &str) -> serde_json::Value {
         FEDERATION_FIREHOSE_ENABLED_KEY => serde_json::Value::Bool(false),
         // Phase A (#388) — crawl_enabled compiled default is `false`.
         FEDERATION_CRAWL_ENABLED_KEY => serde_json::Value::Bool(false),
+        // §2.1 (#393/#395) — federation.enabled compiled default is `false`
+        // (fail-safe per design §2.1; the consumer reads config as the real
+        // fallback). service.public_url has no compiled value (env-seeded).
+        FEDERATION_ENABLED_KEY => serde_json::Value::Bool(false),
+        SERVICE_PUBLIC_URL_KEY => serde_json::Value::Null,
         _ => serde_json::Value::Null,
     }
 }
@@ -4462,6 +4478,10 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         FEDERATION_FIREHOSE_ENABLED_KEY => value.is_boolean(),
         // Phase A (#388) — describe-only advertised flag; strict bool.
         FEDERATION_CRAWL_ENABLED_KEY => value.is_boolean(),
+        // §2.1/§2.2 (#393/#395) — federation.enabled is a strict bool;
+        // service.public_url must be a non-empty http(s) URL (like appview_url).
+        FEDERATION_ENABLED_KEY => value.is_boolean(),
+        SERVICE_PUBLIC_URL_KEY => value.as_str().is_some_and(is_valid_http_url),
         _ => true,
     }
 }
@@ -5045,6 +5065,34 @@ pub async fn resolve_federation_flag(ctx: &AppContext, key: &str, fallback: bool
     }
 }
 
+/// v0.9 Federation runtime-mutability arc §3.7 (#395) — request-layer
+/// short-circuit decision for inbound federation endpoints. Resolves
+/// `federation.enabled` (runtime override → `FederationConfig.enabled` fallback)
+/// on EVERY call (uncached per-request DB read; the cost is budgeted in §7.1 —
+/// an AtomicBool mirror is a v0.10 optimization). Returns `Some(503)` to refuse
+/// the request when federation is disabled, `None` to let it proceed.
+///
+/// Scope is inbound only — outbound federation operations continue until the
+/// subsystem is torn down at restart. The `federation_enabled_gate` middleware
+/// applies this to the federation operational endpoints.
+pub async fn federation_inbound_gate_503(
+    ctx: &AppContext,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let enabled =
+        resolve_federation_flag(ctx, FEDERATION_ENABLED_KEY, ctx.config.federation.enabled).await;
+    if enabled {
+        None
+    } else {
+        Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "FederationDisabled",
+                "message": "Federation is currently disabled on this deployment"
+            })),
+        ))
+    }
+}
+
 /// Compare-and-swap a runtime setting's stored value (§5.5.4 §4.7 cursor
 /// advance — the substrate-general optimistic-concurrency primitive). Sets
 /// `key`'s value to `new` iff its current stored value equals `expected`
@@ -5404,6 +5452,241 @@ async fn runtime_setting_row_writes(
     .await
     .map_err(internal_pds)?;
     Ok(audit_entry_id)
+}
+
+// ===========================================================================
+// v0.9 Federation runtime-mutability arc §3.4 (#393) — deleteRuntimeSetting
+// (revert-to-default), and §3.8 (#396) — listPendingRestartActions.
+// ===========================================================================
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRuntimeSettingInput {
+    pub key: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRuntimeSettingOutput {
+    pub audit_entry_id: String,
+}
+
+/// `tools.aurora.superadmin.deleteRuntimeSetting` (§3.4) — delete a runtime row
+/// so the field reverts to its env-config default (consumer-side fallback).
+/// SuperAdmin-gated, rationale required, allowlist-checked. For restart-required
+/// keys the deletion ALSO sets the appropriate `pending_restart_action`
+/// marker(s) in the SAME outer transaction (M-6): reverting `federation.enabled`
+/// queues the federation-enabled restart; reverting `service.public_url` queues
+/// BOTH the public-url restart and the bulk DID-doc update (the revert un-aligns
+/// DID docs exactly as a forward change would).
+pub async fn delete_runtime_setting(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<DeleteRuntimeSettingInput>,
+) -> Result<Json<DeleteRuntimeSettingOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "deleteRuntimeSetting requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    if !KNOWN_RUNTIME_KEYS.contains(&input.key.as_str()) {
+        return Err(validation(format!(
+            "unknown runtime setting key '{}'; known keys: {:?}",
+            input.key, KNOWN_RUNTIME_KEYS,
+        )));
+    }
+
+    let markers = restart_markers_for_revert(&input.key);
+    let audit_entry_id = if markers.is_empty() {
+        // Runtime-mutable key: self-managed delete + audit, no markers.
+        delete_runtime_setting_with_tx(&ctx, &input.key, &auth.did, &input.rationale, None, false)
+            .await?
+    } else {
+        // Restart-required key: delete + audit + marker(s) atomically. The guard
+        // is held by THIS caller from before begin() until after commit (§3.5).
+        let _guard = audit_chain::AppendChainGuard::acquire().await;
+        let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+        let id = delete_runtime_setting_with_tx(
+            &ctx,
+            &input.key,
+            &auth.did,
+            &input.rationale,
+            Some(&mut tx),
+            true,
+        )
+        .await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for (action, payload) in &markers {
+            crate::api::pending_restart::upsert_marker(&mut tx, action, payload, &now)
+                .await
+                .map_err(internal_pds)?;
+        }
+        tx.commit().await.map_err(internal)?;
+        id
+    };
+
+    Ok(Json(DeleteRuntimeSettingOutput {
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// Restart-coordination markers a revert (delete) of `key` must set, per §3.4 +
+/// M-6. Runtime-mutable keys need none. `federation.enabled` queues its restart
+/// marker; `service.public_url` ALSO queues `bulk-diddoc-update` (sharing a fresh
+/// run_id + started_at) because the revert un-aligns DID docs the same way a
+/// forward URL change does (§2.2).
+fn restart_markers_for_revert(key: &str) -> Vec<(&'static str, String)> {
+    match key {
+        FEDERATION_ENABLED_KEY => vec![(
+            crate::api::pending_restart::ACTION_RESTART_FEDERATION_ENABLED,
+            r#"{"version":1}"#.to_string(),
+        )],
+        SERVICE_PUBLIC_URL_KEY => {
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let started_at = chrono::Utc::now().to_rfc3339();
+            let payload = serde_json::json!({
+                "version": 1,
+                "run_id": run_id,
+                "started_at": started_at,
+            })
+            .to_string();
+            vec![
+                (
+                    crate::api::pending_restart::ACTION_RESTART_SERVICE_PUBLIC_URL,
+                    payload.clone(),
+                ),
+                (crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE, payload),
+            ]
+        }
+        _ => vec![],
+    }
+}
+
+/// Outer-tx-aware row deletion + audit append, mirroring
+/// [`write_runtime_setting_audited_with_tx`]'s mode contract. `(None, false)` is
+/// self-managed (own guard + tx + commit); `(Some(tx), true)` writes into the
+/// caller's tx and does not commit (the caller holds the guard across its own
+/// commit per §3.5). Returns the audit entry id.
+async fn delete_runtime_setting_with_tx(
+    ctx: &AppContext,
+    key: &str,
+    actor_did: &str,
+    rationale: &str,
+    outer_tx: Option<&mut sqlx::Transaction<'_, sqlx::Any>>,
+    guard_already_held: bool,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    if outer_tx.is_some() != guard_already_held {
+        return Err(internal(
+            "delete_runtime_setting_with_tx: outer_tx and guard_already_held must be set together",
+        ));
+    }
+    let _owned_guard = if guard_already_held {
+        None
+    } else {
+        Some(audit_chain::AppendChainGuard::acquire().await)
+    };
+    match outer_tx {
+        Some(tx) => delete_runtime_setting_row_writes(tx, ctx, key, actor_did, rationale).await,
+        None => {
+            let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+            let id = delete_runtime_setting_row_writes(&mut tx, ctx, key, actor_did, rationale).await?;
+            tx.commit().await.map_err(internal)?;
+            Ok(id)
+        }
+    }
+}
+
+/// DELETE the runtime row + append the audit-chain entry within a caller-owned
+/// transaction. Returns the chain entry id. A delete of an absent row is a no-op
+/// on the row but still records the operator's revert intent in the chain.
+async fn delete_runtime_setting_row_writes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ctx: &AppContext,
+    key: &str,
+    actor_did: &str,
+    rationale: &str,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    sqlx::query("DELETE FROM runtime_settings WHERE key = $1")
+        .bind(key)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut *tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            actor_did,
+            source: "manual",
+            payload: None,
+            action: "DeleteRuntimeSetting",
+            subject: None,
+            rationale: &format!("{} (revert to default): {}", key, rationale),
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
+    Ok(audit_entry_id)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRestartActionView {
+    pub action: String,
+    pub created_at: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPendingRestartActionsOutput {
+    pub pending_actions: Vec<PendingRestartActionView>,
+}
+
+/// `tools.aurora.superadmin.listPendingRestartActions` (§3.8) — read endpoint for
+/// the queued-change banner (F3). `pending_restart_action` is intentionally off
+/// the runtime-settings XRPC surface (H-3), so the banner reads here. SuperAdmin-
+/// gated, read-only (no audit). Ordered by `created_at` ascending (queue order).
+/// Unknown-version payloads are returned unchanged for forward compatibility.
+pub async fn list_pending_restart_actions(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<ListPendingRestartActionsOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    use sqlx::Row as _;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "listPendingRestartActions requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    let rows = sqlx::query(
+        "SELECT action, payload, created_at FROM pending_restart_action ORDER BY created_at ASC",
+    )
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(internal)?;
+    let pending_actions = rows
+        .into_iter()
+        .map(|row| {
+            let action: String = row.try_get("action").map_err(internal)?;
+            let payload_str: String = row.try_get("payload").map_err(internal)?;
+            let created_at: String = row.try_get("created_at").map_err(internal)?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+            Ok(PendingRestartActionView { action, created_at, payload })
+        })
+        .collect::<Result<Vec<_>, (StatusCode, Json<serde_json::Value>)>>()?;
+    Ok(Json(ListPendingRestartActionsOutput { pending_actions }))
 }
 
 /// Query params for `uploadBrandingAsset`: which asset, + an optional rationale.
@@ -5893,6 +6176,219 @@ mod tests {
         assert!(id > 0, "returns the audit entry id");
         assert_eq!(count_runtime_rows(&ctx, key).await, 1);
         assert_eq!(count_audit_for(&ctx, key).await, 1);
+    }
+
+    // v0.9 Federation runtime-mutability arc §3.4/§3.7/§3.8 (#393/#395/#396) —
+    // deleteRuntimeSetting (revert), the federation.enabled request-gate, and
+    // listPendingRestartActions.
+
+    fn c4_super() -> AdminAuthContext {
+        AdminAuthContext {
+            did: "did:plc:superadmin".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:superadmin".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role: Role::SuperAdmin,
+        }
+    }
+
+    fn c4_admin() -> AdminAuthContext {
+        AdminAuthContext {
+            did: "did:plc:admin".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:admin".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        }
+    }
+
+    async fn count_markers(ctx: &AppContext, action: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM pending_restart_action WHERE action = $1")
+            .bind(action)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+    }
+
+    async fn count_audit_action(ctx: &AppContext, action: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1")
+            .bind(action)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+    }
+
+    fn del_input(key: &str, rationale: &str) -> DeleteRuntimeSettingInput {
+        DeleteRuntimeSettingInput { key: key.to_string(), rationale: rationale.to_string() }
+    }
+
+    #[tokio::test]
+    async fn delete_runtime_mutable_key_removes_row_and_audits() {
+        let ctx = create_test_context().await;
+        let key = FEDERATION_APPVIEW_URL_KEY;
+        write_runtime_setting_audited(&ctx, key, &serde_json::json!("https://x.example"), "op", "set")
+            .await
+            .unwrap();
+        assert_eq!(count_runtime_rows(&ctx, key).await, 1);
+        let _ = delete_runtime_setting(State(ctx.clone()), c4_super(), Json(del_input(key, "revert")))
+            .await
+            .expect("delete ok");
+        assert_eq!(count_runtime_rows(&ctx, key).await, 0, "row deleted");
+        assert!(count_audit_action(&ctx, "DeleteRuntimeSetting").await >= 1, "audit recorded");
+        // No markers for a runtime-mutable key.
+        let markers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_restart_action")
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap();
+        assert_eq!(markers, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_federation_enabled_queues_restart_marker() {
+        let ctx = create_test_context().await;
+        let _ = delete_runtime_setting(State(ctx.clone()), c4_super(), Json(del_input(FEDERATION_ENABLED_KEY, "revert")))
+            .await
+            .expect("delete ok");
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_RESTART_FEDERATION_ENABLED).await,
+            1,
+            "federation-enabled restart marker queued"
+        );
+        assert!(count_audit_action(&ctx, "DeleteRuntimeSetting").await >= 1);
+    }
+
+    #[tokio::test]
+    async fn delete_service_public_url_queues_both_markers() {
+        let ctx = create_test_context().await;
+        let _ = delete_runtime_setting(State(ctx.clone()), c4_super(), Json(del_input(SERVICE_PUBLIC_URL_KEY, "revert")))
+            .await
+            .expect("delete ok");
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_RESTART_SERVICE_PUBLIC_URL).await,
+            1,
+            "public-url restart marker queued"
+        );
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE).await,
+            1,
+            "bulk-diddoc-update marker queued (revert un-aligns DID docs)"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_key_rejected() {
+        let ctx = create_test_context().await;
+        let r = delete_runtime_setting(State(ctx.clone()), c4_super(), Json(del_input("nope.unknown", "x")))
+            .await;
+        assert_eq!(r.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_requires_rationale_and_superadmin() {
+        let ctx = create_test_context().await;
+        // Empty rationale → 400.
+        let r1 = delete_runtime_setting(State(ctx.clone()), c4_super(), Json(del_input(FEDERATION_APPVIEW_URL_KEY, "  ")))
+            .await;
+        assert_eq!(r1.unwrap_err().0, StatusCode::BAD_REQUEST);
+        // Non-SuperAdmin → 403.
+        let r2 = delete_runtime_setting(State(ctx.clone()), c4_admin(), Json(del_input(FEDERATION_APPVIEW_URL_KEY, "revert")))
+            .await;
+        assert_eq!(r2.unwrap_err().0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn federation_gate_proceeds_when_enabled() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+        })
+        .await;
+        assert!(
+            federation_inbound_gate_503(&ctx).await.is_none(),
+            "enabled → request proceeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_gate_503_on_runtime_disable_no_cache() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+        })
+        .await;
+        // Operator flips the runtime override off (incident response).
+        write_runtime_setting_audited(&ctx, FEDERATION_ENABLED_KEY, &serde_json::json!(false), "op", "incident")
+            .await
+            .unwrap();
+        let gate = federation_inbound_gate_503(&ctx).await;
+        assert!(gate.is_some(), "runtime-disabled → 503 immediately (no cache window)");
+        assert_eq!(gate.unwrap().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn federation_gate_503_when_config_disabled_and_no_row() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = false;
+        })
+        .await;
+        // No runtime row → config fallback (false) → 503.
+        assert!(federation_inbound_gate_503(&ctx).await.is_some());
+    }
+
+    async fn insert_marker_raw(ctx: &AppContext, action: &str, payload: &str, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO pending_restart_action (action, payload, created_at) VALUES ($1, $2, $3)",
+        )
+        .bind(action)
+        .bind(payload)
+        .bind(created_at)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_pending_empty_when_none() {
+        let ctx = create_test_context().await;
+        let out = list_pending_restart_actions(State(ctx.clone()), c4_super())
+            .await
+            .expect("ok");
+        assert!(out.0.pending_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_pending_returns_markers_in_queue_order() {
+        let ctx = create_test_context().await;
+        // Insert out of chronological order; expect created_at-ascending output.
+        insert_marker_raw(&ctx, "b-action", r#"{"version":1}"#, "2026-06-27T02:00:00Z").await;
+        insert_marker_raw(&ctx, "a-action", r#"{"version":1}"#, "2026-06-27T01:00:00Z").await;
+        let out = list_pending_restart_actions(State(ctx.clone()), c4_super())
+            .await
+            .expect("ok");
+        assert_eq!(out.0.pending_actions.len(), 2);
+        assert_eq!(out.0.pending_actions[0].created_at, "2026-06-27T01:00:00Z", "queue order");
+        assert_eq!(out.0.pending_actions[1].created_at, "2026-06-27T02:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn list_pending_returns_unknown_version_unchanged() {
+        let ctx = create_test_context().await;
+        insert_marker_raw(&ctx, "future-action", r#"{"version":99,"x":1}"#, "2026-06-27T01:00:00Z")
+            .await;
+        let out = list_pending_restart_actions(State(ctx.clone()), c4_super())
+            .await
+            .expect("ok");
+        assert_eq!(out.0.pending_actions.len(), 1);
+        assert_eq!(out.0.pending_actions[0].payload["version"], 99);
+    }
+
+    #[tokio::test]
+    async fn list_pending_forbidden_for_non_superadmin() {
+        let ctx = create_test_context().await;
+        let r = list_pending_restart_actions(State(ctx.clone()), c4_admin()).await;
+        assert_eq!(r.unwrap_err().0, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

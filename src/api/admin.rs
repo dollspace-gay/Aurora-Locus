@@ -793,6 +793,20 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(revoke_role),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // v0.9 Federation runtime-mutability arc §3.4 (#393) — revert-to-default:
+        // delete a runtime row (and, for restart-required keys, queue the restart
+        // marker(s) atomically). §3.8 (#396) — read the queued restart markers for
+        // the queued-change banner (F3). Both SuperAdmin-gated.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.deleteRuntimeSetting",
+            post(crate::api::aurora_admin::delete_runtime_setting),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.listPendingRestartActions",
+            get(crate::api::aurora_admin::list_pending_restart_actions),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // §5.5.4 Phase B (#346) — SuperAdmin manual reviewer reassignment
         // (§4.7): set a queue item's assignee with assignment_source =
         // 'manual_override'. Covers orphan-and-escalated recovery.
@@ -11330,6 +11344,8 @@ mod tests {
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
+            r#""deleteRuntimeSetting","#,
+            r#""listPendingRestartActions","#,
             r#""assignReviewer","#,
             r#""createAutoLabelRule","#,
             r#""editAutoLabelRule","#,

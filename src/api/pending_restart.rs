@@ -99,6 +99,32 @@ pub async fn process_pending_restart_actions(ctx: &AppContext) -> PdsResult<()> 
     Ok(())
 }
 
+/// Upsert a marker into a caller-owned transaction (§3.5 / M-1). Composed into
+/// the SAME outer tx as the triggering runtime-settings write so the value
+/// change and the restart record land atomically. `INSERT ... ON CONFLICT(action)
+/// DO UPDATE` so re-queuing (or reverting) an already-pending field amends the
+/// payload rather than colliding on the `action` primary key. Used by the
+/// delete/revert path (C4) and the D-phase save handlers.
+pub async fn upsert_marker(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    action: &str,
+    payload: &str,
+    created_at: &str,
+) -> PdsResult<()> {
+    sqlx::query(
+        "INSERT INTO pending_restart_action (action, payload, created_at) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT(action) DO UPDATE SET payload = excluded.payload, \
+         created_at = excluded.created_at",
+    )
+    .bind(action)
+    .bind(payload)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Delete a marker by its `action` key. Used by the boot hook (and, in later
 /// phases, by the bulk-update task on completion).
 pub async fn clear_marker(pool: &sqlx::AnyPool, action: &str) -> PdsResult<()> {

@@ -1,6 +1,9 @@
 /// HTTP server setup and routing
 use crate::{
-    api::middleware::{check_account_moderation, jwt_deprecation_headers, namespace_scope_check},
+    api::middleware::{
+        check_account_moderation, federation_enabled_gate, jwt_deprecation_headers,
+        namespace_scope_check,
+    },
     context::AppContext,
     error::{PdsError, PdsResult},
     metrics,
@@ -94,6 +97,11 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
             ctx.clone(),
             namespace_scope_check,
         ))
+        // v0.9 Federation runtime-mutability arc §3.7 (#395) — request-layer
+        // short-circuit: 503 the inbound federation operational endpoints when
+        // federation.enabled resolves false (incident response, effective before
+        // restart). No-op (path check only) for every other route.
+        .layer(middleware::from_fn_with_state(ctx.clone(), federation_enabled_gate))
         // Apply rate limiting middleware (after state so it can access AppContext)
         .layer(middleware::from_fn_with_state(ctx.clone(), rate_limit_middleware))
         // JWT-deprecation observability per Arc 6 Step 8: emits
