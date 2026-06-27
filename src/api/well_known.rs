@@ -246,7 +246,6 @@ mod tests {
                 firehose_enabled: false,
                 crawl_enabled: false,
                 public_url: None,
-                auto_stream_events: false,
                 peer_pds: vec![],
             },
             validation_mode: crate::validation::ValidationMode::Optimistic,

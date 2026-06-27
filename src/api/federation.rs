@@ -60,8 +60,7 @@ pub fn routes() -> Router<AppContext> {
 /// discover capabilities without credentials.
 ///
 /// Intentionally excludes `peer_pds` (the trusted-issuer allowlist — disclosing
-/// who this PDS trusts invites adversarial probing) and `auto_stream_events`
-/// (internal operational choice peers don't need). When federation is off, only
+/// who this PDS trusts invites adversarial probing). When federation is off, only
 /// `enabled` + `auroraVersion` are emitted.
 async fn describe_posture(State(ctx): State<AppContext>) -> Json<FederationDescribePosture> {
     let fc = &ctx.config.federation;
@@ -382,8 +381,6 @@ mod tests {
         for forbidden in [
             "peerPds",
             "peer_pds",
-            "autoStreamEvents",
-            "auto_stream_events",
             "did",
             "availableUserDomains",
             "links",

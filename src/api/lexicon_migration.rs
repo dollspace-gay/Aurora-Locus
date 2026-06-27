@@ -204,7 +204,7 @@ mod tests {
             invites: InviteConfig { required: false, interval: 604800, epoch: "2024-01-01T00:00:00Z".to_string() },
             rate_limit: RateLimitConfig { enabled: false, global_requests_per_minute: 3000, exempt_admin_assets: true, buckets_retention_days: 7 },
             logging: LoggingConfig { level: "info".to_string() },
-            federation: FederationConfig { enabled: false, relay_urls: vec![], appview_url: None, firehose_enabled: false, crawl_enabled: false, public_url: Some("http://localhost:2583".to_string()), auto_stream_events: false, peer_pds: vec![] },
+            federation: FederationConfig { enabled: false, relay_urls: vec![], appview_url: None, firehose_enabled: false, crawl_enabled: false, public_url: Some("http://localhost:2583".to_string()), peer_pds: vec![] },
             validation_mode: crate::validation::ValidationMode::Required,
             distributed_state_mode: Default::default(), maintenance_pool: Default::default(), gc_sweep: Default::default(),
             bind_audit_orphan_marker: Default::default(), blob_metadata: Default::default(), entryway: None,

@@ -62,7 +62,6 @@
       card('Trusted peer allowlist', 'fed-peers', 'Seeded at boot from <code>PDS_FEDERATION_PEER_PDS</code> (<code>did@url,…</code>); now runtime-mutable below (SuperAdmin). Controls the trusted-issuer allowlist and discovery bootstrap.') +
       card('Firehose', 'fed-firehose', 'Set via <code>PDS_FEDERATION_FIREHOSE_ENABLED</code> at startup.') +
       card('Relay crawl', 'fed-crawl', 'Set via <code>PDS_FEDERATION_CRAWL_ENABLED</code> at startup.') +
-      card('Auto-stream events', 'fed-autostream', 'Set via <code>PDS_FEDERATION_AUTO_STREAM</code> at startup.') +
       card('Public URL', 'fed-public', 'Set via <code>PDS_PUBLIC_URL</code> at startup; this PDS\'s internet-reachable URL.') +
       '</div>' +
       // v0.9 Phase B (#352) — runtime-mutable trusted-peer management.
@@ -199,7 +198,7 @@
     try {
       p = await global.AuroraEndpoints.ops.getFederationPolicy();
     } catch (e) {
-      for (const id of ['fed-enabled', 'fed-relays', 'fed-appview', 'fed-peers', 'fed-firehose', 'fed-crawl', 'fed-autostream', 'fed-public']) {
+      for (const id of ['fed-enabled', 'fed-relays', 'fed-appview', 'fed-peers', 'fed-firehose', 'fed-crawl', 'fed-public']) {
         set(id, '<strong>Unavailable</strong>');
       }
       return;
@@ -217,7 +216,6 @@
     if (isSuper) renderPeerManagement(peers);
     set('fed-firehose', '<strong>' + esc(onoff(p.firehoseEnabled)) + '</strong>');
     set('fed-crawl', '<strong>' + esc(onoff(p.crawlEnabled)) + '</strong>');
-    set('fed-autostream', '<strong>' + esc(onoff(p.autoStreamEvents)) + '</strong>');
     set('fed-public', p.publicUrl ? '<code>' + esc(p.publicUrl) + '</code>' : '<em>Not configured.</em>');
     if (isSuper) {
       renderRelayManagement(relays);

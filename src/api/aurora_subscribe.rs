@@ -1036,7 +1036,6 @@ mod tests {
                 firehose_enabled: false,
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
-                auto_stream_events: false,
                 peer_pds: vec![],
             },
             validation_mode: PathBuf::from("required")

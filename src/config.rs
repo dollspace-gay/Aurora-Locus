@@ -1513,8 +1513,6 @@ pub struct FederationConfig {
     pub crawl_enabled: bool,
     /// Public URL for this PDS (must be accessible from internet)
     pub public_url: Option<String>,
-    /// Enable automatic event streaming to relay
-    pub auto_stream_events: bool,
     /// Trusted peer PDS list (Arc 12 §5.3.2 Gap 2 + §5.3.7
     /// env-var parser). Populated from
     /// `PDS_FEDERATION_PEER_PDS=did1@url1,did2@url2,...` at
@@ -1925,10 +1923,6 @@ impl ServerConfig {
             .parse()
             .unwrap_or(false);
         let public_url = env::var("PDS_PUBLIC_URL").ok();
-        let auto_stream_events = env::var("PDS_FEDERATION_AUTO_STREAM")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false);
 
         // Arc 12 §5.3.2 Gap 2 + §5.3.7: peer-PDS env-var parser
         // with all-or-nothing validation per §5.4 Step 1.2.
@@ -2113,7 +2107,6 @@ impl ServerConfig {
                 firehose_enabled,
                 crawl_enabled,
                 public_url,
-                auto_stream_events,
                 peer_pds,
             },
             validation_mode,

@@ -8880,8 +8880,8 @@ async fn get_federation_status(
 /// The full deployment federation config (#344) — the env-view the
 /// Configuration → Federation policy page renders. Unlike the public describe
 /// endpoints, this is the SuperAdmin's *complete* view: it includes the
-/// trusted-issuer peer allowlist and the internal auto-stream toggle, which the
-/// peer-facing describes omit. Read-only; all fields come straight from
+/// trusted-issuer peer allowlist, which the peer-facing describes omit.
+/// Read-only; all fields come straight from
 /// `FederationConfig` (env/startup config), so the page is honest that mutation
 /// is a restart-time deployment change, not a runtime setting.
 #[derive(Debug, serde::Serialize)]
@@ -8893,7 +8893,6 @@ struct FederationPolicyView {
     firehose_enabled: bool,
     crawl_enabled: bool,
     public_url: Option<String>,
-    auto_stream_events: bool,
     peer_pds: Vec<PeerPdsConfigView>,
     /// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A2 M2-4) — the
     /// boot-seed-failure state, so the operator can diagnose the refusal without
@@ -8936,9 +8935,9 @@ struct BootSeedStatus {
 
 /// `tools.aurora.ops.getFederationPolicy` (#344) — SuperAdmin read of the full
 /// deployment federation config for the Federation policy page. SuperAdmin-only
-/// because it surfaces the trusted-issuer peer allowlist (who this PDS trusts)
-/// and the auto-stream toggle — the same security-adjacent fields the public
-/// `describeServer` / `describePosture` endpoints intentionally exclude.
+/// because it surfaces the trusted-issuer peer allowlist (who this PDS trusts) —
+/// a security-adjacent field the public `describeServer` / `describePosture`
+/// endpoints intentionally exclude.
 /// Read-only; no mutation.
 async fn get_federation_policy(
     State(ctx): State<AppContext>,
@@ -9043,7 +9042,6 @@ async fn get_federation_policy(
         firehose_enabled,
         crawl_enabled,
         public_url: fc.public_url.clone(),
-        auto_stream_events: fc.auto_stream_events,
         peer_pds: peer_snapshot
             .peers
             .iter()
@@ -9648,7 +9646,6 @@ mod tests {
                 firehose_enabled: false,
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
-                auto_stream_events: false,
                 peer_pds: vec![],
             },
             validation_mode: crate::validation::ValidationMode::Required,
@@ -9678,13 +9675,11 @@ mod tests {
     #[tokio::test]
     async fn get_federation_policy_superadmin_only_full_view() {
         // #344 — SuperAdmin-only; returns the FULL env config including the
-        // peer allowlist + auto-stream toggle (the security-adjacent fields the
-        // public describes omit).
+        // peer allowlist (a security-adjacent field the public describes omit).
         use crate::admin::roles::Role;
         let ctx = create_test_context_with(|c| {
             c.federation.enabled = true;
             c.federation.appview_url = Some("https://api.example".to_string());
-            c.federation.auto_stream_events = true;
             c.federation.peer_pds = vec![crate::config::PeerPdsConfig {
                 did: "did:plc:peer".to_string(),
                 url: "https://peer.example".to_string(),
@@ -9703,14 +9698,13 @@ mod tests {
         // Non-SuperAdmin → 403.
         let forbidden = get_federation_policy(State(ctx.clone()), mk(Role::Admin)).await;
         assert_eq!(forbidden.unwrap_err().0, StatusCode::FORBIDDEN);
-        // SuperAdmin → full view incl peer_pds + auto_stream_events.
+        // SuperAdmin → full view incl peer_pds.
         let view = get_federation_policy(State(ctx.clone()), mk(Role::SuperAdmin))
             .await
             .expect("superadmin gets the policy view")
             .0;
         assert!(view.enabled);
         assert_eq!(view.appview_url.as_deref(), Some("https://api.example"));
-        assert!(view.auto_stream_events);
         assert_eq!(view.peer_pds.len(), 1);
         assert_eq!(view.peer_pds[0].did, "did:plc:peer");
         assert_eq!(view.peer_pds[0].url, "https://peer.example");

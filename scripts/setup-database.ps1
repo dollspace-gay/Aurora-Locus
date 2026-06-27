@@ -157,7 +157,6 @@ PDS_FEDERATION_ENABLED=false
 PDS_FEDERATION_FIREHOSE_ENABLED=true
 PDS_FEDERATION_CRAWL_ENABLED=true
 # PDS_FEDERATION_PUBLIC_URL=https://your-pds.example.com
-PDS_FEDERATION_AUTO_STREAM_EVENTS=false
 "@
 
     Set-Content -Path ".env" -Value $envContent
