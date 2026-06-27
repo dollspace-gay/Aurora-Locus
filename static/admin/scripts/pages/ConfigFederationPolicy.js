@@ -56,13 +56,13 @@
       '<button type="button" class="btn-secondary" id="fed-refresh">Refresh</button></header>' +
       '<p class="settings-help">For live federation status (peer count, recent events, last activity), see <a href="#ops/federation">Operations → Federation</a>.</p>' +
       '<div class="settings-grid">' +
-      card('Federation', 'fed-enabled', 'Set via <code>PDS_FEDERATION_ENABLED</code> at startup; restart required to change.') +
-      card('Relay binding', 'fed-relays', 'Set via <code>PDS_FEDERATION_RELAY_URLS</code> (comma-separated) at startup; restart required. Live status: Operations → Federation.') +
-      card('AppView URL', 'fed-appview', 'Set via <code>PDS_APPVIEW_URL</code> at startup.') +
+      card('Federation', 'fed-enabled', 'The master federation switch (seeded from <code>PDS_FEDERATION_ENABLED</code>). Restart-required: saving records the change; restart to apply it. Disabling also refuses inbound federation requests immediately, before the restart.') +
+      card('Relay binding (boot seed)', 'fed-relays', 'The boot-time relay set, used at first startup when no runtime relay configuration exists. The <strong>live</strong> relay set is managed at <a href="#ops/federation">Operations → Federation</a>, where changes take effect without a restart. To change the boot default, set <code>PDS_FEDERATION_RELAY_URLS</code> and restart — this only affects fresh deployments with no runtime relay set.') +
+      card('AppView URL', 'fed-appview', 'Upstream AppView base URL (seeded from <code>PDS_APPVIEW_URL</code>). Editable; takes effect immediately on save.') +
       card('Trusted peer allowlist', 'fed-peers', 'Seeded at boot from <code>PDS_FEDERATION_PEER_PDS</code> (<code>did@url,…</code>); now runtime-mutable below (SuperAdmin). Controls the trusted-issuer allowlist and discovery bootstrap.') +
-      card('Firehose', 'fed-firehose', 'Set via <code>PDS_FEDERATION_FIREHOSE_ENABLED</code> at startup.') +
-      card('Relay crawl', 'fed-crawl', 'Set via <code>PDS_FEDERATION_CRAWL_ENABLED</code> at startup.') +
-      card('Public URL', 'fed-public', 'Set via <code>PDS_PUBLIC_URL</code> at startup; this PDS\'s internet-reachable URL.') +
+      card('Firehose', 'fed-firehose', 'Advertised firehose flag (seeded from <code>PDS_FEDERATION_FIREHOSE_ENABLED</code>). Editable; takes effect immediately on save.') +
+      card('Relay crawl', 'fed-crawl', 'Advertised relay-may-crawl hint (seeded from <code>PDS_FEDERATION_CRAWL_ENABLED</code>). Editable; takes effect immediately on save.') +
+      card('Public URL', 'fed-public', 'This PDS\'s internet-reachable URL (seeded from <code>PDS_SERVICE_PUBLIC_URL</code>). Restart-required: changing it re-points every account\'s DID document on PLC after restart.') +
       '</div>' +
       // v0.9 Phase B (#352) — runtime-mutable trusted-peer management.
       '<hr class="config-section-divider">' +
@@ -151,7 +151,7 @@
       '<hr class="config-section-divider">' +
       '<section class="installed-themes-section">' +
       '  <h3>Coming in a future cycle</h3>' +
-      '  <p class="settings-help">A runtime-mutable federation <code>enabled</code> toggle, relay health monitoring, and peer reputation are reserved for a later release. The trusted-peer allowlist, discovery mode, and relay set above are all now runtime-mutable; the remaining federation flags still require editing environment variables and restarting the substrate.</p>' +
+      '  <p class="settings-help">Relay health monitoring, relay redundancy/failover, and peer reputation are reserved for a later release. Every federation policy field above is now operator-editable from this page — the runtime-mutable fields take effect immediately; <code>federation.enabled</code> and the public URL save through a restart-required flow.</p>' +
       '</section>';
 
     const btn = document.getElementById('fed-refresh');
@@ -275,23 +275,145 @@
       }
       return;
     }
-    set('fed-enabled', '<strong>' + esc(onoff(p.enabled)) + '</strong>');
     const relays = Array.isArray(p.relayUrls) ? p.relayUrls : [];
     set('fed-relays', relays.length
       ? '<ul>' + relays.map((u) => '<li><code>' + esc(u) + '</code></li>').join('') + '</ul>'
       : '<em>No relays bound.</em>');
-    set('fed-appview', p.appviewUrl ? '<code>' + esc(p.appviewUrl) + '</code>' : '<em>Not configured.</em>');
     const peers = Array.isArray(p.peerPds) ? p.peerPds : [];
     set('fed-peers', peers.length
       ? '<ul>' + peers.map((x) => '<li><code>' + esc(x.did) + '</code> @ <code>' + esc(x.url) + '</code></li>').join('') + '</ul>'
       : '<em>No trusted peers configured.</em>');
     if (isSuper) renderPeerManagement(peers);
-    set('fed-firehose', '<strong>' + esc(onoff(p.firehoseEnabled)) + '</strong>');
-    set('fed-crawl', '<strong>' + esc(onoff(p.crawlEnabled)) + '</strong>');
-    set('fed-public', p.publicUrl ? '<code>' + esc(p.publicUrl) + '</code>' : '<em>Not configured.</em>');
+    // v0.9 Federation runtime-mutability arc §2.1/§2.2/§4 (#404) — the migrated
+    // fields are now editable cards: value (effective, from getFederationPolicy)
+    // + source badge (getRuntimeSetting) + edit control + revert-to-default.
+    await Promise.all(['fed-appview', 'fed-firehose', 'fed-crawl', 'fed-enabled', 'fed-public']
+      .map(function (id) { return renderEditableField(id, p); }));
     if (isSuper) {
       renderRelayManagement(relays);
       renderBootSeedBanner(p.bootSeedStatus);
+    }
+  }
+
+  // v0.9 Federation runtime-mutability arc §2 / §4 (#404) — editable field cards.
+  // Effective value comes from getFederationPolicy (the resolved consumer value);
+  // source + last-modified come from getRuntimeSetting. The Public URL card edits
+  // `service.public_url` (§2.9) — getFederationPolicy doesn't surface it, so its
+  // value comes from the runtime row (blank when unset / hostname-derived).
+  const EDITABLE_FIELDS = {
+    'fed-appview':  { key: 'federation.appview_url',      label: 'AppView URL',        type: 'text', envVar: 'PDS_APPVIEW_URL',                restart: false, val: function (p) { return p.appviewUrl; } },
+    'fed-firehose': { key: 'federation.firehose_enabled', label: 'Firehose',           type: 'bool', envVar: 'PDS_FEDERATION_FIREHOSE_ENABLED', restart: false, val: function (p) { return p.firehoseEnabled; } },
+    'fed-crawl':    { key: 'federation.crawl_enabled',    label: 'Relay crawl',        type: 'bool', envVar: 'PDS_FEDERATION_CRAWL_ENABLED',   restart: false, val: function (p) { return p.crawlEnabled; } },
+    'fed-enabled':  { key: 'federation.enabled',          label: 'Federation enabled', type: 'bool', envVar: 'PDS_FEDERATION_ENABLED',         restart: true,  val: function (p) { return p.enabled; } },
+    'fed-public':   { key: 'service.public_url',          label: 'Public URL',         type: 'text', envVar: 'PDS_SERVICE_PUBLIC_URL',         restart: true,  val: null },
+  };
+
+  function asBool(v) { return v === true || v === 'true'; }
+
+  async function renderEditableField(slotId, p) {
+    const f = EDITABLE_FIELDS[slotId];
+    const el = document.getElementById(slotId);
+    if (!el || !f) return;
+    let source = 'Default';
+    let lastMod = null;
+    let lastModBy = null;
+    let rowValue = null;
+    try {
+      const rs = await global.AuroraEndpoints.admin.getRuntimeSetting(f.key);
+      if (rs) {
+        source = rs.source || 'Default';
+        rowValue = rs.value;
+        lastMod = rs.lastModified;
+        lastModBy = rs.lastModifiedBy;
+      }
+    } catch (e) { /* fall through to Default-tier render */ }
+
+    const effective = f.val ? f.val(p) : rowValue;
+    const badge = global.AuroraSourceTier.badge(source, {
+      envVar: f.envVar, envValue: effective, lastModified: lastMod, lastModifiedBy: lastModBy,
+    });
+    const display = f.type === 'bool'
+      ? '<strong>' + esc(onoff(asBool(effective))) + '</strong>'
+      : (effective ? '<code>' + esc(effective) + '</code>' : '<em>Not configured.</em>');
+
+    let html = '<div class="fed-field-value">' + display + ' ' + badge + '</div>';
+    if (isSuper) {
+      if (f.type === 'bool') {
+        html += '<div class="fed-field-edit"><button type="button" class="btn-primary" id="' +
+          esc(slotId) + '-act">' + (asBool(effective) ? 'Disable' : 'Enable') + '</button></div>';
+      } else {
+        html += '<div class="fed-field-edit"><input type="text" id="' + esc(slotId) +
+          '-inp" value="' + esc(effective == null ? '' : effective) + '" placeholder="https://…"> ' +
+          '<button type="button" class="btn-primary" id="' + esc(slotId) + '-act">Save</button></div>';
+      }
+      if (source === 'Runtime') {
+        html += '<div><button type="button" class="btn-secondary" id="' + esc(slotId) +
+          '-rev">Revert to default</button></div>';
+      }
+    }
+    el.innerHTML = html;
+
+    if (isSuper) {
+      const act = document.getElementById(slotId + '-act');
+      if (act) {
+        act.addEventListener('click', function () {
+          if (f.type === 'bool') saveField(f, !asBool(effective));
+          else {
+            const inp = document.getElementById(slotId + '-inp');
+            saveField(f, inp ? inp.value : '');
+          }
+        });
+      }
+      if (source === 'Runtime') {
+        const rev = document.getElementById(slotId + '-rev');
+        if (rev) rev.addEventListener('click', function () { revertField(f); });
+      }
+    }
+  }
+
+  async function saveField(f, value) {
+    if (f.restart) {
+      const isUrl = f.type === 'text';
+      const spec = {
+        heading: 'Save ' + f.label + '?',
+        body: isUrl
+          ? 'Restart-required change affecting deployment identity. After restart, the PDS updates all did:plc account DID documents on PLC to reference the new URL — this runs in the background and may take longer on large deployments; progress is shown in the "Recent DID-document update" card below. did:web accounts (if any) need account-holder action via self-service.'
+          : 'Restart-required change. The save is recorded now and takes effect on the next restart — use the pending-restart banner at the top of the page to restart now, or leave it queued for the next supervisor restart.',
+        rationaleRequired: true,
+        confirmLabel: 'Save',
+      };
+      if (isUrl) {
+        spec.ackCheckbox = 'Yes, I understand changing the public URL affects deployment identity and will update all account DID documents on PLC after restart.';
+      }
+      const res = await global.AuroraModal.destructiveConfirm(spec);
+      if (!res || !res.confirmed) return;
+      try {
+        await global.AuroraEndpoints.admin.setRuntimeSetting({ key: f.key, value: value, rationale: res.rationale || '' });
+        global.AuroraToast.success(f.label + ' saved; restart to apply.');
+        if (global.AuroraQueuedChangeBanner) global.AuroraQueuedChangeBanner.refresh();
+      } catch (e) {
+        global.AuroraToast.danger('Save failed: ' + ((e && e.message) || ''));
+        return;
+      }
+      await loadPolicy();
+    } else {
+      const r = await global.AuroraAuditedSave.run({
+        heading: 'Save ' + f.label + '?',
+        body: 'This takes effect immediately on save.',
+        settings: [{ key: f.key, value: value }],
+        successMessage: f.label + ' updated.',
+      });
+      if (r && r.saved) await loadPolicy();
+    }
+  }
+
+  async function revertField(f) {
+    const r = await global.AuroraRevertToDefault.run({
+      key: f.key, label: f.label, envVar: f.envVar, isRestartRequired: f.restart,
+    });
+    if (r && r.reverted) {
+      global.AuroraToast.success(f.label + ' reverted to default.');
+      await loadPolicy();
     }
   }
 

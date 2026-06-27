@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The repository-rebuild deep preflight reports how many times an account has rotated its signing key, read from the full PLC audit-log history — giving operators forensic visibility into rotated accounts before a rebuild
 - A new SuperAdmin dry-run endpoint lets operators validate a signing-key rotation before committing — reporting the key the PDS would generate, or checking an operator-supplied keypair (catching mismatched keys) — without mutating anything or publishing to PLC
 - A new SuperAdmin "Key rotation policy" page with a "Run migration check" button: verifies that every account's locally-stored signing key matches what PLC publishes, reporting any divergences for review. Read-only; expected to find none
+- Every federation policy field is now editable from the Federation policy page. The AppView URL and the advertised firehose/relay-crawl flags take effect immediately on save; enabling or disabling federation, and changing the deployment's public URL, save through a restart-required flow — the change is recorded, a pending-restart banner appears across the admin pages, and the operator restarts now or leaves it for the next supervisor restart. Each field shows whether its value is environment-seeded (Default) or operator-set (Runtime), with one-click revert-to-default
+- When the deployment's public URL changes, the PDS automatically re-points every account's did:plc DID document on PLC to the new URL after restart; the Federation policy page shows per-account progress and offers a retry control for any accounts that failed
+- Disabling federation now also refuses inbound federation requests immediately — before the restart that fully tears the federation subsystem down — for incident response
 
 ### Changed
 
@@ -54,6 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The deployment moderation tier (full, reduced, disabled) is now set on the Moderation policy page instead of UI & modes; switching to the disabled tier requires a typed confirmation
 - Kryphocron is now enabled by default on fresh deployments; operators can disable it by setting `PDS_KRYPHOCRON_ENABLED=false`
 - Operator role changes now take effect on the next request, without requiring re-login
+- The Federation policy page distinguishes immediately-editable fields from restart-required fields, each with its own save flow; the "Relay binding" card is reframed as the boot seed (the live relay set is managed at Operations → Federation)
+- The audit log now records operator-triggered restarts, the automatic bulk DID-document update, and per-account DID-document retries
+
+### Deprecated
+
+- `PDS_PUBLIC_URL` is deprecated, ignored at runtime, and now logs a startup warning. Configure the deployment's public URL via `PDS_SERVICE_PUBLIC_URL` (now editable from the Federation policy page); `PDS_PUBLIC_URL` is removed in a future version
+
+### Removed
+
+- The unused `PDS_FEDERATION_AUTO_STREAM` setting and its `auto_stream_events` field are retired — the flag governed no behavior
 
 ### Security
 

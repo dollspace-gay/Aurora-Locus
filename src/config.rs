@@ -1923,6 +1923,20 @@ impl ServerConfig {
             .parse()
             .unwrap_or(false);
         let public_url = env::var("PDS_PUBLIC_URL").ok();
+        // v0.9 Federation runtime-mutability arc §2.9 (#404 / G2) — PDS_PUBLIC_URL
+        // is vestigial (federation.public_url has no functional consumer; the
+        // deployment's real public URL is PDS_SERVICE_PUBLIC_URL → service.public_url).
+        // It still parses for backward compatibility in v0.9 but is removed in
+        // v0.10; warn operators to migrate. Tracing is initialised before
+        // `from_env` runs (see `main.rs`), so this reaches the log.
+        if public_url.is_some() {
+            tracing::warn!(
+                "PDS_PUBLIC_URL is deprecated and will be removed in v0.10. The \
+                 deployment's public URL is configured via PDS_SERVICE_PUBLIC_URL \
+                 (service.public_url, now editable from the Federation policy page). \
+                 Remove PDS_PUBLIC_URL from your environment."
+            );
+        }
 
         // Arc 12 §5.3.2 Gap 2 + §5.3.7: peer-PDS env-var parser
         // with all-or-nothing validation per §5.4 Step 1.2.
