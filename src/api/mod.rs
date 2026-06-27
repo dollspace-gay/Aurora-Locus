@@ -8,6 +8,7 @@ pub mod extractors;
 pub mod aurora_moderator;
 pub mod aurora_subscribe;
 pub mod blob;
+pub mod bulk_diddoc_result;
 #[cfg(debug_assertions)]
 pub mod dev_routes;
 pub mod federation;
