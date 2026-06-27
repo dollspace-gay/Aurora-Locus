@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 
 use crate::identity::did_document::DidDocument;
 use crate::{
-    crypto::plc::{register_plc_did, PlcOperation, PlcOperationBuilder, PlcSigner},
+    crypto::plc::{register_plc_did, PlcOperation, PlcOperationBuilder, PlcSigner, ServiceEntry},
     error::{PdsError, PdsResult},
 };
 
@@ -421,6 +421,50 @@ impl PlcClient {
         Ok(())
     }
 
+    /// v0.9 Federation runtime-mutability arc §2.3 (#399) — publish a
+    /// service-endpoint update to the PLC directory, re-pointing the account's
+    /// `AtprotoPersonalDataServer` service at `new_endpoint`. Used by the
+    /// post-restart bulk did:plc update (Phase E2) after a `service.public_url`
+    /// change.
+    ///
+    /// Signed with the PDS-wide rotation key (`plc_rotation_key`), NOT a
+    /// per-account rotation key — that column was dropped in migration 0009
+    /// (LB-2). Mirrors [`update_signing_key`](Self::update_signing_key): a diff
+    /// op carrying only the `atproto_pds` service. (Like `update_signing_key`,
+    /// this operates against a weak-mode directory; the snapshot-mutator refactor
+    /// that carries all fields forward is the same future Arc 13 Step 1.2 work
+    /// both methods await.)
+    pub async fn update_service_endpoint(
+        &self,
+        did: &str,
+        new_endpoint: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        // Fetch current doc (mirrors update_signing_key; prev handling matches —
+        // left to the directory pending the snapshot-mutator refactor).
+        let _current_doc = self.get_document(did).await?;
+
+        // Diff op: only the atproto_pds service, with the new endpoint. The
+        // service key is `atproto_pds`; the type is `AtprotoPersonalDataServer`.
+        let mut services = std::collections::BTreeMap::new();
+        services.insert(
+            "atproto_pds".to_string(),
+            ServiceEntry {
+                type_: "AtprotoPersonalDataServer".to_string(),
+                endpoint: new_endpoint.to_string(),
+            },
+        );
+        let operation = PlcOperationBuilder::new().services(services).build()?;
+
+        // Sign with the PDS-wide rotation key and submit.
+        let signed_operation = rotation_key_signer.sign_operation(operation)?;
+        register_plc_did(&self.config.plc_url, did, signed_operation).await?;
+
+        tracing::info!(did = %did, endpoint = %new_endpoint, "Successfully updated service endpoint in PLC directory");
+
+        Ok(())
+    }
+
     // `needs_rotation` + `rotate_key_if_needed` were removed in B4 (#375): the
     // CLI was their sole consumer, and the B4 reshape replaced that
     // rotate-if-needed flow with the explicit no-op check + per-account-key
@@ -448,6 +492,15 @@ pub trait PlcClientApi: Send + Sync {
         new_signing_key: &str,
         rotation_key_signer: &PlcSigner,
     ) -> PdsResult<()>;
+    /// v0.9 Federation runtime-mutability arc §2.3 (#399) — re-point the PDS
+    /// service endpoint. Composed by Phase E2's bulk did:plc update via
+    /// `ctx.plc_client`.
+    async fn update_service_endpoint(
+        &self,
+        did: &str,
+        new_endpoint: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()>;
 }
 
 #[async_trait]
@@ -473,6 +526,14 @@ impl PlcClientApi for PlcClient {
     ) -> PdsResult<()> {
         PlcClient::update_signing_key(self, did, new_signing_key, rotation_key_signer).await
     }
+    async fn update_service_endpoint(
+        &self,
+        did: &str,
+        new_endpoint: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        PlcClient::update_service_endpoint(self, did, new_endpoint, rotation_key_signer).await
+    }
 }
 
 /// Test-only mock of [`PlcClientApi`] (key-rotation arc #372 / B1, extended B3
@@ -491,6 +552,10 @@ pub(crate) struct MockPlcClient {
     /// Per-DID current signing key in multibase form (the bare `z...`, no
     /// `did:key:` prefix) — what `get_document` + `get_signing_key` surface.
     current_signing_keys: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Per-DID last published service endpoint (#399) — what
+    /// `update_service_endpoint` records, so bulk-update tests can observe the
+    /// re-point without a live PLC.
+    published_service_endpoints: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -499,7 +564,18 @@ impl MockPlcClient {
         Self {
             op_histories: std::sync::Mutex::new(std::collections::HashMap::new()),
             current_signing_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
+            published_service_endpoints: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The endpoint last published for `did` via `update_service_endpoint`
+    /// (#399), or `None` if the bulk update never touched it.
+    pub(crate) fn published_service_endpoint(&self, did: &str) -> Option<String> {
+        self.published_service_endpoints
+            .lock()
+            .unwrap()
+            .get(did)
+            .cloned()
     }
     pub(crate) fn with_op_history(self, did: &str, history: Vec<PlcOpHistoryEntry>) -> Self {
         self.op_histories
@@ -595,6 +671,20 @@ impl PlcClientApi for MockPlcClient {
             accepted_at: base + chrono::Duration::hours(n),
             signing_did_key: new_signing_key.to_string(),
         });
+        Ok(())
+    }
+    async fn update_service_endpoint(
+        &self,
+        did: &str,
+        new_endpoint: &str,
+        _rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        // Record the published endpoint so bulk-update tests can assert the
+        // re-point happened (no live PLC, no network).
+        self.published_service_endpoints
+            .lock()
+            .unwrap()
+            .insert(did.to_string(), new_endpoint.to_string());
         Ok(())
     }
 }
@@ -776,5 +866,26 @@ mod tests {
     fn parse_op_history_empty_array_is_empty_history() {
         let h = parse_op_history("did:plc:alice", &[]).unwrap();
         assert!(h.is_empty());
+    }
+
+    // v0.9 Federation runtime-mutability arc §2.3 (#399) — update_service_endpoint
+    // via the trait double (no live PLC). The mock ignores the signer, so any
+    // valid PlcSigner suffices (scalar 1).
+    #[tokio::test]
+    async fn mock_update_service_endpoint_records_publish() {
+        let signer = PlcSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let mock = MockPlcClient::new();
+        assert!(mock.published_service_endpoint("did:plc:x").is_none());
+        PlcClientApi::update_service_endpoint(&mock, "did:plc:x", "https://new.example.com", &signer)
+            .await
+            .unwrap();
+        assert_eq!(
+            mock.published_service_endpoint("did:plc:x").as_deref(),
+            Some("https://new.example.com"),
+            "mock recorded the re-pointed endpoint"
+        );
     }
 }

@@ -80,13 +80,32 @@ pub async fn process_pending_restart_actions(ctx: &AppContext) -> PdsResult<()> 
                 );
             }
             MarkerDisposition::SpawnBulkUpdate => {
-                // Phase E2 lands `run_bulk_diddoc_update` and replaces this arm
-                // with a `tokio::spawn(...)`. Until then, leave the marker in
-                // place so the post-restart bulk update isn't silently lost.
-                tracing::warn!(
-                    action = %action,
-                    "bulk-diddoc-update marker present; handler lands in Phase E2; leaving marker"
-                );
+                // §2.3 (#399 / E3) — spawn the post-restart bulk did:plc update.
+                // The task clears the marker on completion; an interruption leaves
+                // it set so the next boot re-runs (idempotent via compare-and-skip).
+                let run_id = payload
+                    .get("run_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let started_at = payload
+                    .get("started_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let ctx_owned = ctx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::api::bulk_diddoc_result::run_bulk_diddoc_update(
+                        &ctx_owned,
+                        &run_id,
+                        &started_at,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, "bulk did:plc update task failed");
+                    }
+                });
+                tracing::info!(action = %action, "spawned post-restart bulk did:plc update task");
             }
             MarkerDisposition::Leave => {
                 tracing::warn!(
