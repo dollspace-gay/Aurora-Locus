@@ -168,6 +168,11 @@
     // result surface: latest run + per-account retry.
     getBulkDidDocUpdateLatest: () => C().get('tools.aurora.superadmin.getBulkDidDocUpdateLatest'),
     retryBulkDidDocUpdateForDid: (body) => C().post('tools.aurora.superadmin.retryBulkDidDocUpdateForDid', body),
+    // v0.9 Federation runtime-mutability arc F-phase (#401/#402/#403) — runtime
+    // setting revert (C4), queued restart markers (C7), operator restart (D1).
+    deleteRuntimeSetting: (body) => C().post('tools.aurora.superadmin.deleteRuntimeSetting', body),
+    listPendingRestartActions: () => C().get('tools.aurora.superadmin.listPendingRestartActions'),
+    triggerRestart: (body) => C().post('tools.aurora.superadmin.triggerRestart', body),
     // §5.5.4 Phase B (#346) — manual reviewer reassignment.
     assignReviewer: (body) => C().post('tools.aurora.superadmin.assignReviewer', body),
     // §5.5.4 Phase C (#347) — auto-label rule CRUD.

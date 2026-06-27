@@ -20,6 +20,10 @@
 <body>
   <a href="#content" class="skip-to-content">Skip to content</a>
 
+  <!-- v0.9 Federation runtime-mutability arc §4.4 (#403) — pending-restart banner;
+       mounted by app.js, persists across router navigation (sibling of #content). -->
+  <div id="restart-banner-root"></div>
+
   <div class="admin-container">
     <aside class="sidebar" id="sidebar" aria-label="Primary navigation">
       <!-- Sidebar mounts here via app.js -->
@@ -63,6 +67,8 @@
   <script src="/admin/scripts/components/AuroraSkeleton.js"></script>
   <script src="/admin/scripts/components/AuroraSpinner.js"></script>
   <script src="/admin/scripts/components/AuroraAuditedSave.js"></script>
+  <script src="/admin/scripts/components/AuroraRevertToDefault.js"></script>
+  <script src="/admin/scripts/components/QueuedChangeBanner.js"></script>
   <script src="/admin/scripts/components/AuroraLazySection.js"></script>
   <script src="/admin/scripts/components/EntityRef.js"></script>
   <script src="/admin/scripts/components/Modal.js"></script>

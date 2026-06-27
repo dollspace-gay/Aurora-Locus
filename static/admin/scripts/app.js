@@ -81,6 +81,16 @@
       global.AuroraRouter.start();
     }
 
+    // v0.9 Federation runtime-mutability arc §4.4 (#403) — mount the
+    // pending-restart banner in the shell so it shows on every admin page (a
+    // queued change activates on the next restart for any reason). SuperAdmin-
+    // gated server-side (403 → empty); refreshed after restart-required
+    // saves/reverts and re-checked on full page reload after a restart.
+    if (global.AuroraQueuedChangeBanner) {
+      const bannerRoot = document.getElementById('restart-banner-root');
+      if (bannerRoot) global.AuroraQueuedChangeBanner.load(bannerRoot);
+    }
+
     // Command palette global keybinding.
     if (global.AuroraCommandPalette) global.AuroraCommandPalette.start();
 
