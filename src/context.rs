@@ -42,6 +42,14 @@ pub struct BootSeedFailureDetails {
 #[derive(Clone)]
 pub struct AppContext {
     pub config: Arc<ServerConfig>,
+    /// v0.9 Federation runtime-mutability arc §3.1 (#390) — the internal
+    /// graceful-shutdown trigger. `serve` subscribes receivers from this sender
+    /// to drive `with_graceful_shutdown` + the post-signal drain watchdog; the
+    /// save-and-restart handlers landing in the D-phase (`federation.enabled` /
+    /// `service.public_url`) call `shutdown_trigger.send(())` to request a
+    /// restart. `Arc<watch::Sender<()>>` so it shares across `AppContext` clones
+    /// and stays `Clone`-compatible; the channel is created once in `new`.
+    pub shutdown_trigger: Arc<tokio::sync::watch::Sender<()>>,
     /// Shared-database pool for account, sequencer, OAuth tables, etc.
     /// Backend is selected by `config.database.backend` (SQLite or
     /// Postgres). `AnyPool` makes the dispatch transparent to consumers.
@@ -1169,8 +1177,16 @@ impl AppContext {
                 },
             )?);
 
+        // v0.9 Federation runtime-mutability arc §3.1 (#390) — graceful-shutdown
+        // trigger. Created here so the field is always populated (no before-move
+        // ordering hazard in `serve`); receivers are derived via `.subscribe()`.
+        // The throwaway receiver is dropped: `serve` subscribes fresh ones, and
+        // the watch channel stays open as long as this sender lives.
+        let (shutdown_trigger, _) = tokio::sync::watch::channel(());
+
         Ok(Self {
             config: Arc::new(config),
+            shutdown_trigger: Arc::new(shutdown_trigger),
             account_db,
             plc_client,
             trusted_peers,
