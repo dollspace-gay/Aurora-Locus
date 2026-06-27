@@ -9018,12 +9018,30 @@ async fn get_federation_policy(
             })
             .collect()
     };
+    // v0.9 Federation runtime-mutability arc Phase A (#386): appview_url reflects
+    // the runtime override (→ env-config fallback), paralleling relay_urls above
+    // so the policy view shows the effective value, not the static env seed.
+    let appview_url = crate::api::aurora_admin::resolve_appview_url(&ctx).await;
+    // Phase A (#387): firehose_enabled reflects the runtime override (→ config).
+    let firehose_enabled = crate::api::aurora_admin::resolve_federation_flag(
+        &ctx,
+        crate::api::aurora_admin::FEDERATION_FIREHOSE_ENABLED_KEY,
+        fc.firehose_enabled,
+    )
+    .await;
+    // Phase A (#388): crawl_enabled reflects the runtime override (→ config).
+    let crawl_enabled = crate::api::aurora_admin::resolve_federation_flag(
+        &ctx,
+        crate::api::aurora_admin::FEDERATION_CRAWL_ENABLED_KEY,
+        fc.crawl_enabled,
+    )
+    .await;
     Ok(Json(FederationPolicyView {
         enabled: fc.enabled,
         relay_urls,
-        appview_url: fc.appview_url.clone(),
-        firehose_enabled: fc.firehose_enabled,
-        crawl_enabled: fc.crawl_enabled,
+        appview_url,
+        firehose_enabled,
+        crawl_enabled,
         public_url: fc.public_url.clone(),
         auto_stream_events: fc.auto_stream_events,
         peer_pds: peer_snapshot

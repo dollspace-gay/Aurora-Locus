@@ -26,8 +26,10 @@
 //!   helper exists; `RECOVERY_MODE_ENV` is read at handler entry → 503.
 
 use crate::api::aurora_admin::{
-    cas_runtime_setting, read_runtime_row_value, FEDERATION_POLICY_PEER_ALLOWLIST_KEY,
-    FEDERATION_POLICY_PENDING_DISCOVERIES_KEY, FEDERATION_POLICY_RELAY_URLS_KEY, RECOVERY_MODE_ENV,
+    cas_runtime_setting, read_runtime_row_value, FEDERATION_APPVIEW_URL_KEY,
+    FEDERATION_CRAWL_ENABLED_KEY, FEDERATION_FIREHOSE_ENABLED_KEY,
+    FEDERATION_POLICY_PEER_ALLOWLIST_KEY, FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
+    FEDERATION_POLICY_RELAY_URLS_KEY, RECOVERY_MODE_ENV,
 };
 use crate::api::moderation_defaults::SYSTEM_DID;
 use crate::error::PdsError;
@@ -719,6 +721,78 @@ pub async fn seed_relay_urls(
 /// the details for the describe surface. Independent seeds: a failure in one key
 /// does NOT roll back the others (operators keep partial functionality while
 /// diagnosing). Called from `main.rs` after audit-chain init, before serving.
+/// v0.9 Federation runtime-mutability arc Phase A (#386 / locked design §2.4) —
+/// boot-seed `federation.appview_url` from `FederationConfig.appview_url`.
+/// Seed-if-absent (idempotent re-boot). Skipped when no env value is configured:
+/// there's nothing to seed and the consumer falls back to `None` anyway.
+pub async fn seed_appview_url(ctx: &AppContext) -> Result<SeedOutcome, PdsError> {
+    let Some(appview_url) = ctx.config.federation.appview_url.clone() else {
+        return Ok(SeedOutcome::SkippedNoFallback);
+    };
+    let exists = sqlx::query("SELECT 1 FROM runtime_settings WHERE key = $1")
+        .bind(FEDERATION_APPVIEW_URL_KEY)
+        .fetch_optional(&ctx.account_db)
+        .await?;
+    if exists.is_some() {
+        return Ok(SeedOutcome::AlreadySeeded);
+    }
+    let value = serde_json::Value::String(appview_url);
+    crate::federation::trusted_peer_set::seed_federation_policy(
+        &ctx.account_db,
+        &[(FEDERATION_APPVIEW_URL_KEY.to_string(), value)],
+        SYSTEM_DID,
+    )
+    .await?;
+    tracing::info!("federation.appview_url seeded from config at boot");
+    Ok(SeedOutcome::Seeded { entries_seeded: 1 })
+}
+
+/// v0.9 Federation runtime-mutability arc Phase A (#387/#388) — boot-seed a
+/// federation boolean describe-flag from its `FederationConfig` value.
+/// Seed-if-absent (idempotent re-boot). Always seeds (bool always has a value),
+/// so the runtime row materializes the config bool at first boot.
+async fn seed_federation_bool(
+    ctx: &AppContext,
+    key: &str,
+    value: bool,
+) -> Result<SeedOutcome, PdsError> {
+    let exists = sqlx::query("SELECT 1 FROM runtime_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(&ctx.account_db)
+        .await?;
+    if exists.is_some() {
+        return Ok(SeedOutcome::AlreadySeeded);
+    }
+    crate::federation::trusted_peer_set::seed_federation_policy(
+        &ctx.account_db,
+        &[(key.to_string(), serde_json::Value::Bool(value))],
+        SYSTEM_DID,
+    )
+    .await?;
+    tracing::info!(key, value, "federation describe-flag seeded from config at boot");
+    Ok(SeedOutcome::Seeded { entries_seeded: 1 })
+}
+
+/// Phase A (#387) — boot-seed `federation.firehose_enabled`.
+pub async fn seed_firehose_enabled(ctx: &AppContext) -> Result<SeedOutcome, PdsError> {
+    seed_federation_bool(
+        ctx,
+        FEDERATION_FIREHOSE_ENABLED_KEY,
+        ctx.config.federation.firehose_enabled,
+    )
+    .await
+}
+
+/// Phase A (#388) — boot-seed `federation.crawl_enabled`.
+pub async fn seed_crawl_enabled(ctx: &AppContext) -> Result<SeedOutcome, PdsError> {
+    seed_federation_bool(
+        ctx,
+        FEDERATION_CRAWL_ENABLED_KEY,
+        ctx.config.federation.crawl_enabled,
+    )
+    .await
+}
+
 pub async fn run_federation_boot_seed(ctx: &AppContext) {
     use crate::context::BootSeedFailureDetails;
     use std::sync::atomic::Ordering;
@@ -753,6 +827,12 @@ pub async fn run_federation_boot_seed(ctx: &AppContext) {
         FEDERATION_POLICY_RELAY_URLS_KEY,
         seed_relay_urls(ctx, ctx.config.federation.enabled).await,
     );
+    // v0.9 Federation runtime-mutability arc Phase A (#386) — appview_url.
+    record(FEDERATION_APPVIEW_URL_KEY, seed_appview_url(ctx).await);
+    // Phase A (#387) — firehose_enabled.
+    record(FEDERATION_FIREHOSE_ENABLED_KEY, seed_firehose_enabled(ctx).await);
+    // Phase A (#388) — crawl_enabled.
+    record(FEDERATION_CRAWL_ENABLED_KEY, seed_crawl_enabled(ctx).await);
 
     if !failed_keys.is_empty() {
         let _ = emit(

@@ -1332,6 +1332,22 @@ struct DescribeServerLinks {
 /// Returns server metadata, DID, and available authentication methods.
 /// This is a public endpoint used for federation discovery.
 async fn describe_server(State(ctx): State<AppContext>) -> PdsResult<Json<DescribeServerResponse>> {
+    // v0.9 Federation runtime-mutability arc Phase A (#387): firehose_enabled
+    // resolves the runtime override (→ env-config fallback) so the advertised
+    // describe flag reflects operator changes without a restart.
+    let firehose_enabled = crate::api::aurora_admin::resolve_federation_flag(
+        &ctx,
+        crate::api::aurora_admin::FEDERATION_FIREHOSE_ENABLED_KEY,
+        ctx.config.federation.firehose_enabled,
+    )
+    .await;
+    // Phase A (#388): crawl_enabled resolves the runtime override (→ config).
+    let crawl_enabled = crate::api::aurora_admin::resolve_federation_flag(
+        &ctx,
+        crate::api::aurora_admin::FEDERATION_CRAWL_ENABLED_KEY,
+        ctx.config.federation.crawl_enabled,
+    )
+    .await;
     Ok(Json(DescribeServerResponse {
         did: ctx.config.service.service_did.clone(),
         available_user_domains: ctx.config.identity.service_handle_domains.clone(),
@@ -1343,8 +1359,8 @@ async fn describe_server(State(ctx): State<AppContext>) -> PdsResult<Json<Descri
             // enabled always present; flags only when on (off-posture = enabled:false alone).
             Some(FederationDescribe {
                 enabled: fc.enabled,
-                firehose_enabled: fc.enabled.then_some(fc.firehose_enabled),
-                crawl_enabled: fc.enabled.then_some(fc.crawl_enabled),
+                firehose_enabled: fc.enabled.then_some(firehose_enabled),
+                crawl_enabled: fc.enabled.then_some(crawl_enabled),
             })
         },
     }))

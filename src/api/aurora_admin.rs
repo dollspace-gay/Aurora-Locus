@@ -4234,6 +4234,11 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     FEDERATION_POLICY_DISCOVERY_MODE_KEY,
     FEDERATION_POLICY_RELAY_URLS_KEY,
     FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
+    // v0.9 Federation runtime-mutability arc Phase A (#386/#387/#388) —
+    // env-frozen federation fields migrated to runtime settings.
+    FEDERATION_APPVIEW_URL_KEY,
+    FEDERATION_FIREHOSE_ENABLED_KEY,
+    FEDERATION_CRAWL_ENABLED_KEY,
     // Key-rotation arc B2 (#373 / §4.6) — operator-supplied-keys feature gate.
     KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY,
 ];
@@ -4244,6 +4249,19 @@ pub const FEDERATION_POLICY_DISCOVERY_MODE_KEY: &str = "federation.policy.discov
 pub const FEDERATION_POLICY_RELAY_URLS_KEY: &str = "federation.policy.relay-urls";
 pub const FEDERATION_POLICY_PENDING_DISCOVERIES_KEY: &str =
     "federation.policy.pending-discoveries";
+
+// v0.9 Federation runtime-mutability arc Phase A (#386/#387/#388 / locked design
+// §2.4) — three env-frozen federation fields migrated to runtime settings via the
+// Pattern-1 recipe. Consumers read the runtime row with env-config fallback (see
+// `read_runtime_row_value` + the per-field resolvers); `default_for_key` carries
+// the compiled default since it has no `AppContext` to reach the env value.
+pub const FEDERATION_APPVIEW_URL_KEY: &str = "federation.appview_url";
+// `firehose_enabled` (#387) — describe-only advertised flag (recon: gates no
+// route/subscription; surfaces in `describeServer` + admin describe only).
+pub const FEDERATION_FIREHOSE_ENABLED_KEY: &str = "federation.firehose_enabled";
+// `crawl_enabled` (#388) — describe-only advertised relay-may-crawl hint (recon:
+// no crawler subsystem reads it; `describeServer` + admin describe only).
+pub const FEDERATION_CRAWL_ENABLED_KEY: &str = "federation.crawl_enabled";
 
 /// Key-rotation arc B2 (#373 / design §4.6) — gates the operator-supplied
 /// signing-key path in account-key rotation. `false` (default) means the
@@ -4308,6 +4326,15 @@ fn default_for_key(key: &str) -> serde_json::Value {
         }
         // Key-rotation arc B2 (#373 / §4.6) — operator-supplied keys off by default.
         KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY => serde_json::Value::Bool(false),
+        // v0.9 Federation runtime-mutability arc Phase A (#386) — appview_url has
+        // no compiled value (env-seeded `Option<String>`; the read site falls back
+        // to `FederationConfig.appview_url`). Null here mirrors that "unset".
+        FEDERATION_APPVIEW_URL_KEY => serde_json::Value::Null,
+        // Phase A (#387) — firehose_enabled compiled default is `false`
+        // (`FederationConfig.firehose_enabled` defaults false; env can override).
+        FEDERATION_FIREHOSE_ENABLED_KEY => serde_json::Value::Bool(false),
+        // Phase A (#388) — crawl_enabled compiled default is `false`.
+        FEDERATION_CRAWL_ENABLED_KEY => serde_json::Value::Bool(false),
         _ => serde_json::Value::Null,
     }
 }
@@ -4426,8 +4453,27 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         // ("true"), numbers (1), and any non-boolean shape so the gate-check's
         // `as_bool()` read is unambiguous.
         KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY => value.is_boolean(),
+        // v0.9 Federation runtime-mutability arc Phase A (#386) — appview_url must
+        // be a non-empty, well-formed http(s) URL. "Revert to default" is a row
+        // delete (Phase F2), not an empty string, so empty is rejected here.
+        FEDERATION_APPVIEW_URL_KEY => value.as_str().is_some_and(is_valid_http_url),
+        // Phase A (#387) — describe-only advertised flag; strict bool so the
+        // describe-payload `as_bool()` read is unambiguous.
+        FEDERATION_FIREHOSE_ENABLED_KEY => value.is_boolean(),
+        // Phase A (#388) — describe-only advertised flag; strict bool.
+        FEDERATION_CRAWL_ENABLED_KEY => value.is_boolean(),
         _ => true,
     }
+}
+
+/// v0.9 Federation runtime-mutability arc Phase A (#386) — accept a non-empty,
+/// parseable `http`/`https` URL. Used to validate `federation.appview_url`
+/// runtime-setting writes at the API boundary and file-tier load.
+fn is_valid_http_url(s: &str) -> bool {
+    if s.trim().is_empty() {
+        return false;
+    }
+    url::Url::parse(s).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
 }
 
 /// v0.9 Federation Pattern-1 Phase D (#354) — relay-urls structural validator:
@@ -4960,6 +5006,43 @@ pub async fn read_runtime_row_value(ctx: &AppContext, key: &str) -> Option<Strin
         .ok()
         .flatten()
         .and_then(|r| r.try_get::<String, _>("value").ok())
+}
+
+/// v0.9 Federation runtime-mutability arc Phase A (#386 / locked design §2.4) —
+/// resolve the effective AppView base URL: the `federation.appview_url` runtime
+/// override row if set to a non-blank string, else the env-seeded
+/// `FederationConfig.appview_url`.
+///
+/// Direct runtime-row read (mirrors `TrustedPeerSet::resolve`), NOT
+/// [`resolve_runtime_setting`] — the latter collapses "unset" into the compiled
+/// `default_for_key` (`Null`) and so cannot express the config fallback. A row
+/// holding a blank string is treated as unset.
+pub async fn resolve_appview_url(ctx: &AppContext) -> Option<String> {
+    if let Some(raw) = read_runtime_row_value(ctx, FEDERATION_APPVIEW_URL_KEY).await {
+        if let Ok(s) = serde_json::from_str::<String>(&raw) {
+            if !s.trim().is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    ctx.config.federation.appview_url.clone()
+}
+
+/// v0.9 Federation runtime-mutability arc Phase A (#387/#388 / locked design
+/// §2.5–2.6) — resolve a federation boolean describe-flag
+/// (`firehose_enabled` / `crawl_enabled`): the runtime override row if set to a
+/// bool, else the env-seeded `fallback`.
+///
+/// Direct runtime-row read (mirrors `TrustedPeerSet::resolve`), NOT
+/// [`resolve_runtime_setting`]: the compiled `default_for_key` for these keys is
+/// `false`, so a resolver read can't tell "unset" from an explicit `false` and
+/// would mask an env-set `true`. The presence check here preserves the env
+/// fallback. A row holding a non-bool value falls back to `fallback`.
+pub async fn resolve_federation_flag(ctx: &AppContext, key: &str, fallback: bool) -> bool {
+    match read_runtime_row_value(ctx, key).await {
+        Some(raw) => serde_json::from_str::<bool>(&raw).unwrap_or(fallback),
+        None => fallback,
+    }
 }
 
 /// Compare-and-swap a runtime setting's stored value (§5.5.4 §4.7 cursor
@@ -9527,6 +9610,57 @@ mod tests {
             default_for_key(KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY),
             json!("weekly-to-daily")
         );
+    }
+
+    #[test]
+    fn federation_appview_url_registered_and_validated() {
+        // v0.9 Federation runtime-mutability arc Phase A (#386): appview_url must
+        // be allowlisted (so setRuntimeSetting stops 400ing), default to Null
+        // (unset → consumer falls back to env-config), and validate as an http(s) URL.
+        use serde_json::json;
+        assert!(
+            KNOWN_RUNTIME_KEYS.contains(&FEDERATION_APPVIEW_URL_KEY),
+            "appview_url must be allowlisted"
+        );
+        assert_eq!(default_for_key(FEDERATION_APPVIEW_URL_KEY), json!(null));
+        // Accept well-formed http(s) URLs.
+        assert!(validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("https://api.bsky.app")));
+        assert!(validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("http://localhost:2584")));
+        // Reject empty, non-URL, wrong-scheme, and non-string shapes.
+        assert!(!validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("")));
+        assert!(!validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("   ")));
+        assert!(!validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("not a url")));
+        assert!(!validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("ftp://example.com")));
+        assert!(!validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!(42)));
+    }
+
+    #[test]
+    fn federation_firehose_enabled_registered_and_validated() {
+        // v0.9 Federation runtime-mutability arc Phase A (#387): firehose_enabled
+        // must be allowlisted, default to false (compiled default), and validate
+        // as a strict bool.
+        use serde_json::json;
+        assert!(KNOWN_RUNTIME_KEYS.contains(&FEDERATION_FIREHOSE_ENABLED_KEY));
+        assert_eq!(default_for_key(FEDERATION_FIREHOSE_ENABLED_KEY), json!(false));
+        assert!(validate_runtime_value(FEDERATION_FIREHOSE_ENABLED_KEY, &json!(true)));
+        assert!(validate_runtime_value(FEDERATION_FIREHOSE_ENABLED_KEY, &json!(false)));
+        // Reject non-bool shapes (string "true", number, null).
+        assert!(!validate_runtime_value(FEDERATION_FIREHOSE_ENABLED_KEY, &json!("true")));
+        assert!(!validate_runtime_value(FEDERATION_FIREHOSE_ENABLED_KEY, &json!(1)));
+        assert!(!validate_runtime_value(FEDERATION_FIREHOSE_ENABLED_KEY, &json!(null)));
+    }
+
+    #[test]
+    fn federation_crawl_enabled_registered_and_validated() {
+        // v0.9 Federation runtime-mutability arc Phase A (#388): crawl_enabled
+        // must be allowlisted, default to false, and validate as a strict bool.
+        use serde_json::json;
+        assert!(KNOWN_RUNTIME_KEYS.contains(&FEDERATION_CRAWL_ENABLED_KEY));
+        assert_eq!(default_for_key(FEDERATION_CRAWL_ENABLED_KEY), json!(false));
+        assert!(validate_runtime_value(FEDERATION_CRAWL_ENABLED_KEY, &json!(true)));
+        assert!(validate_runtime_value(FEDERATION_CRAWL_ENABLED_KEY, &json!(false)));
+        assert!(!validate_runtime_value(FEDERATION_CRAWL_ENABLED_KEY, &json!("true")));
+        assert!(!validate_runtime_value(FEDERATION_CRAWL_ENABLED_KEY, &json!(0)));
     }
 
     #[test]

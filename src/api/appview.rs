@@ -162,12 +162,9 @@ where
         read_after_write::LocalRecords,
     ) -> PdsResult<serde_json::Value>,
 {
-    // Get AppView URL from config
-    let appview_url = ctx
-        .config
-        .federation
-        .appview_url
-        .as_ref()
+    // Resolve the AppView URL (runtime override → env-config fallback).
+    let appview_url = crate::api::aurora_admin::resolve_appview_url(ctx)
+        .await
         .ok_or_else(|| PdsError::Internal("AppView URL not configured".to_string()))?;
 
     // Build request URL
@@ -259,7 +256,9 @@ where
         Arc::clone(&ctx.actor_store),
         // Arc 12 §5.3.2 Gap 1: localhost-aware self-URL.
         ctx.service_url(),
-        ctx.config.federation.appview_url.clone(),
+        // Reuse the URL resolved above (runtime override → env-config); avoids a
+        // second runtime-row read in the read-after-write path.
+        Some(appview_url.clone()),
     );
 
     // Merge local records into response
@@ -274,11 +273,8 @@ async fn proxy_to_appview<P: Serialize>(
     method: &str,
     params: P,
 ) -> PdsResult<Response> {
-    let appview_url = ctx
-        .config
-        .federation
-        .appview_url
-        .as_ref()
+    let appview_url = crate::api::aurora_admin::resolve_appview_url(ctx)
+        .await
         .ok_or_else(|| PdsError::Internal("AppView URL not configured".to_string()))?;
 
     let url = format!("{}/xrpc/{}", appview_url, method);
