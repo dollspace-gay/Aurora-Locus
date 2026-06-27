@@ -5289,13 +5289,89 @@ async fn write_runtime_setting_audited(
     actor_did: &str,
     rationale: &str,
 ) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    // Self-managed mode: own guard, own transaction (existing behaviour). All
+    // current callers route through here unchanged.
+    write_runtime_setting_audited_with_tx(ctx, key, value, actor_did, rationale, None, false).await
+}
+
+/// v0.9 Federation runtime-mutability arc §3.5 (#392) — the outer-tx-aware form
+/// of [`write_runtime_setting_audited`]. Writes the `runtime_settings` row + its
+/// audit-chain entry either in its own transaction (self-managed) or into a
+/// caller-provided outer transaction so the value-change can compose atomically
+/// with sibling writes (the restart marker, bulk-update result rows).
+///
+/// `outer_tx` and `guard_already_held` MUST be set together:
+/// - `(None, false)` — self-managed: acquires its own [`audit_chain::AppendChainGuard`],
+///   opens and commits its own transaction.
+/// - `(Some(tx), true)` — outer-tx mode: the caller acquired the guard BEFORE
+///   `begin()` and holds it until AFTER its own `commit()` (the R3-verified §3.5
+///   chain-linearity contract). This function does NOT acquire a second guard and
+///   does NOT commit — the caller composes further writes and commits the outer
+///   tx, dropping the guard after.
+///
+/// Any mismatched combination is a programming error and returns 500 rather than
+/// silently violating the guard contract.
+async fn write_runtime_setting_audited_with_tx(
+    ctx: &AppContext,
+    key: &str,
+    value: &serde_json::Value,
+    actor_did: &str,
+    rationale: &str,
+    outer_tx: Option<&mut sqlx::Transaction<'_, sqlx::Any>>,
+    guard_already_held: bool,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    if outer_tx.is_some() != guard_already_held {
+        return Err(internal(
+            "write_runtime_setting_audited_with_tx: outer_tx and guard_already_held \
+             must be set together (caller owns both, or neither)",
+        ));
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let value_json = serde_json::to_string(value).map_err(internal)?;
-    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+
+    // Acquire the chain guard only in self-managed mode. In outer-tx mode the
+    // caller holds it across its own begin()..commit() per the §3.5 contract.
+    let _owned_guard = if guard_already_held {
+        None
+    } else {
+        Some(audit_chain::AppendChainGuard::acquire().await)
+    };
+
+    match outer_tx {
+        Some(tx) => {
+            // Write into the caller's transaction; the caller commits (and drops
+            // its guard) after composing the marker / result-row writes.
+            runtime_setting_row_writes(tx, ctx, key, &value_json, &now, actor_did, rationale).await
+        }
+        None => {
+            let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+            let audit_entry_id = runtime_setting_row_writes(
+                &mut tx, ctx, key, &value_json, &now, actor_did, rationale,
+            )
+            .await?;
+            tx.commit().await.map_err(internal)?;
+            Ok(audit_entry_id)
+        }
+    }
+}
+
+/// The DELETE-then-INSERT of the runtime row plus the audit-chain append, all
+/// within a single (caller-owned) transaction. Returns the chain entry id.
+/// Cross-process serialization on Postgres is handled inside
+/// [`audit_chain::insert_chain_entry`] (a `pg_advisory_xact_lock` bound to this
+/// tx); in-process serialization is the caller-held [`audit_chain::AppendChainGuard`].
+async fn runtime_setting_row_writes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ctx: &AppContext,
+    key: &str,
+    value_json: &str,
+    now: &str,
+    actor_did: &str,
+    rationale: &str,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
     sqlx::query("DELETE FROM runtime_settings WHERE key = $1")
         .bind(key)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(internal)?;
     sqlx::query(
@@ -5303,14 +5379,14 @@ async fn write_runtime_setting_audited(
          VALUES ($1, $2, $3, $4)",
     )
     .bind(key)
-    .bind(&value_json)
-    .bind(&now)
+    .bind(value_json)
+    .bind(now)
     .bind(actor_did)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(internal)?;
     let audit_entry_id = audit_chain::insert_chain_entry(
-        &mut tx,
+        &mut *tx,
         ctx.config.database.backend,
         AppendEntryParams {
             actor_did,
@@ -5327,7 +5403,6 @@ async fn write_runtime_setting_audited(
     )
     .await
     .map_err(internal_pds)?;
-    tx.commit().await.map_err(internal)?;
     Ok(audit_entry_id)
 }
 
@@ -5679,6 +5754,145 @@ mod tests {
         Subject::Repo {
             did: did.to_string(),
         }
+    }
+
+    // v0.9 Federation runtime-mutability arc §3.5 (#392) — outer-tx refactor of
+    // write_runtime_setting_audited. The new code path is `_with_tx` in outer-tx
+    // mode; these pin its atomicity + guard contract.
+
+    async fn count_runtime_rows(ctx: &AppContext, key: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM runtime_settings WHERE key = $1")
+            .bind(key)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+    }
+
+    async fn count_audit_for(ctx: &AppContext, key_fragment: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = 'SetRuntimeSetting' \
+             AND rationale LIKE $1",
+        )
+        .bind(format!("%{key_fragment}%"))
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn audited_write_outer_tx_commit_lands_row_and_audit() {
+        let ctx = create_test_context().await;
+        let key = "test.c3.commit";
+        // Caller owns the guard (acquired BEFORE begin) and the transaction.
+        let _guard = audit_chain::AppendChainGuard::acquire().await;
+        let mut tx = ctx.account_db.begin().await.unwrap();
+        write_runtime_setting_audited_with_tx(
+            &ctx,
+            key,
+            &serde_json::json!("v1"),
+            "did:plc:op",
+            "commit-test",
+            Some(&mut tx),
+            true,
+        )
+        .await
+        .expect("outer-tx write succeeds");
+        // A sibling write composes in the SAME tx (mirrors the D-phase marker).
+        sqlx::query(
+            "INSERT INTO pending_restart_action (action, payload, created_at) VALUES ($1, $2, $3)",
+        )
+        .bind("restart-required-for-federation-enabled")
+        .bind(r#"{"version":1}"#)
+        .bind("2026-06-27T00:00:00Z")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        drop(_guard);
+        assert_eq!(count_runtime_rows(&ctx, key).await, 1, "runtime row committed");
+        assert_eq!(count_audit_for(&ctx, key).await, 1, "audit entry committed");
+        let markers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_restart_action")
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap();
+        assert_eq!(markers, 1, "sibling marker committed atomically");
+    }
+
+    #[tokio::test]
+    async fn audited_write_outer_tx_rollback_discards_both() {
+        let ctx = create_test_context().await;
+        let key = "test.c3.rollback";
+        let _guard = audit_chain::AppendChainGuard::acquire().await;
+        let mut tx = ctx.account_db.begin().await.unwrap();
+        write_runtime_setting_audited_with_tx(
+            &ctx,
+            key,
+            &serde_json::json!("v1"),
+            "did:plc:op",
+            "rollback-test",
+            Some(&mut tx),
+            true,
+        )
+        .await
+        .expect("outer-tx write succeeds");
+        tx.rollback().await.unwrap();
+        drop(_guard);
+        // Atomicity: neither the runtime row nor the audit entry survive.
+        assert_eq!(count_runtime_rows(&ctx, key).await, 0, "runtime row rolled back");
+        assert_eq!(count_audit_for(&ctx, key).await, 0, "audit entry rolled back");
+    }
+
+    #[tokio::test]
+    async fn audited_write_guard_tx_mismatch_errors() {
+        let ctx = create_test_context().await;
+        // Claims guard held but provides no outer tx → error, no write.
+        let r1 = write_runtime_setting_audited_with_tx(
+            &ctx,
+            "test.c3.bad1",
+            &serde_json::json!("v"),
+            "did:plc:op",
+            "bad",
+            None,
+            true,
+        )
+        .await;
+        assert!(r1.is_err(), "None + guard_already_held=true must error");
+        // Provides an outer tx but claims no guard → error.
+        let mut tx = ctx.account_db.begin().await.unwrap();
+        let r2 = write_runtime_setting_audited_with_tx(
+            &ctx,
+            "test.c3.bad2",
+            &serde_json::json!("v"),
+            "did:plc:op",
+            "bad",
+            Some(&mut tx),
+            false,
+        )
+        .await;
+        assert!(r2.is_err(), "Some(tx) + guard_already_held=false must error");
+        drop(tx);
+        assert_eq!(count_runtime_rows(&ctx, "test.c3.bad1").await, 0);
+        assert_eq!(count_runtime_rows(&ctx, "test.c3.bad2").await, 0);
+    }
+
+    #[tokio::test]
+    async fn audited_write_self_managed_still_works() {
+        // Backward-compat: the original wrapper signature is unchanged and lands
+        // the row + audit entry in its own guard + transaction.
+        let ctx = create_test_context().await;
+        let key = "test.c3.selfmanaged";
+        let id = write_runtime_setting_audited(
+            &ctx,
+            key,
+            &serde_json::json!("v1"),
+            "did:plc:op",
+            "self-managed",
+        )
+        .await
+        .expect("self-managed write succeeds");
+        assert!(id > 0, "returns the audit entry id");
+        assert_eq!(count_runtime_rows(&ctx, key).await, 1);
+        assert_eq!(count_audit_for(&ctx, key).await, 1);
     }
 
     #[tokio::test]
