@@ -126,6 +126,14 @@ async fn main() -> PdsResult<()> {
             // reads the post-seed mode + flag.
             api::federation_peers::run_federation_boot_seed(&ctx).await;
 
+            // v0.9 Federation runtime-mutability arc §3.3 (#391) — process any
+            // pending restart-coordination markers left by a save-and-restart
+            // flow before this boot. Best-effort: a failure logs and boot
+            // continues (markers are coordination, not a boot prerequisite).
+            if let Err(e) = api::pending_restart::process_pending_restart_actions(&ctx).await {
+                tracing::error!(error = %e, "pending-restart-action boot hook failed");
+            }
+
             // Start background jobs
             let scheduler = std::sync::Arc::new(jobs::JobScheduler::new(Arc::clone(&ctx)));
             scheduler.start();

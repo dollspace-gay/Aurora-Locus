@@ -30,6 +30,7 @@ pub mod moderation_defaults;
 pub mod reviewer_assignment;
 pub mod oauth_admin;
 pub mod oauth_server;
+pub mod pending_restart;
 pub mod kryphocron_endpoints;
 pub mod registry;
 pub mod repo;
