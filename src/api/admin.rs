@@ -807,6 +807,14 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(crate::api::aurora_admin::list_pending_restart_actions),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // v0.9 Federation runtime-mutability arc §2.1 (#397) — operator-driven
+        // restart for the "Restart now" save-modal choice. Audited; fires the
+        // graceful-shutdown trigger.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.triggerRestart",
+            post(crate::api::aurora_admin::trigger_restart),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // §5.5.4 Phase B (#346) — SuperAdmin manual reviewer reassignment
         // (§4.7): set a queue item's assignee with assignment_source =
         // 'manual_override'. Covers orphan-and-escalated recovery.
@@ -6137,7 +6145,7 @@ async fn ops_get_instance_metrics(
     };
 
     let federation_health = OpsFederationHealth {
-        federation_enabled: ctx.config.federation.enabled,
+        federation_enabled: ctx.federation_enabled, // §2.1 (#397) effective gate
         relay_connected: ctx.relay_client.is_some(),
         known_instances,
     };
@@ -7472,7 +7480,7 @@ async fn get_system_health(
 
     // Check optional services
     let relay_connected = ctx.relay_client.is_some();
-    let federation_enabled = ctx.config.federation.enabled;
+    let federation_enabled = ctx.federation_enabled; // §2.1 (#397) effective gate
 
     // Determine overall health
     let status = if db_healthy && sequencer_healthy {
@@ -7744,7 +7752,7 @@ async fn get_version_info(
         "rust_version": env!("CARGO_PKG_RUST_VERSION"),
         "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
         "features": {
-            "federation": ctx.config.federation.enabled,
+            "federation": ctx.federation_enabled, // §2.1 (#397) effective gate
             "invites_required": ctx.config.invites.required,
             "rate_limiting": ctx.config.rate_limit.enabled,
             "email": ctx.config.email.is_some(),
@@ -9050,7 +9058,8 @@ async fn get_federation_policy(
     )
     .await;
     Ok(Json(FederationPolicyView {
-        enabled: fc.enabled,
+        // §2.1 (#397): effective gate (runtime override resolved at boot).
+        enabled: ctx.federation_enabled,
         relay_urls,
         appview_url,
         firehose_enabled,
@@ -11346,6 +11355,7 @@ mod tests {
             r#""revokeRole","#,
             r#""deleteRuntimeSetting","#,
             r#""listPendingRestartActions","#,
+            r#""triggerRestart","#,
             r#""assignReviewer","#,
             r#""createAutoLabelRule","#,
             r#""editAutoLabelRule","#,

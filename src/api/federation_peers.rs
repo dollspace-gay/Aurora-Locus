@@ -27,7 +27,7 @@
 
 use crate::api::aurora_admin::{
     cas_runtime_setting, read_runtime_row_value, FEDERATION_APPVIEW_URL_KEY,
-    FEDERATION_CRAWL_ENABLED_KEY, FEDERATION_FIREHOSE_ENABLED_KEY,
+    FEDERATION_CRAWL_ENABLED_KEY, FEDERATION_ENABLED_KEY, FEDERATION_FIREHOSE_ENABLED_KEY,
     FEDERATION_POLICY_PEER_ALLOWLIST_KEY, FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
     FEDERATION_POLICY_RELAY_URLS_KEY, RECOVERY_MODE_ENV,
 };
@@ -793,6 +793,15 @@ pub async fn seed_crawl_enabled(ctx: &AppContext) -> Result<SeedOutcome, PdsErro
     .await
 }
 
+/// v0.9 Federation runtime-mutability arc §2.1 (#397) — boot-seed
+/// `federation.enabled` from `FederationConfig.enabled` (seed-if-absent). The
+/// master-gate consumer in `AppContext::new` reads this row on subsequent boots;
+/// on the very first boot the row is absent and the consumer falls back to the
+/// env config (this seed then materializes it).
+pub async fn seed_federation_enabled(ctx: &AppContext) -> Result<SeedOutcome, PdsError> {
+    seed_federation_bool(ctx, FEDERATION_ENABLED_KEY, ctx.config.federation.enabled).await
+}
+
 pub async fn run_federation_boot_seed(ctx: &AppContext) {
     use crate::context::BootSeedFailureDetails;
     use std::sync::atomic::Ordering;
@@ -833,6 +842,8 @@ pub async fn run_federation_boot_seed(ctx: &AppContext) {
     record(FEDERATION_FIREHOSE_ENABLED_KEY, seed_firehose_enabled(ctx).await);
     // Phase A (#388) — crawl_enabled.
     record(FEDERATION_CRAWL_ENABLED_KEY, seed_crawl_enabled(ctx).await);
+    // §2.1 (#397) — federation.enabled (master gate).
+    record(FEDERATION_ENABLED_KEY, seed_federation_enabled(ctx).await);
 
     if !failed_keys.is_empty() {
         let _ = emit(

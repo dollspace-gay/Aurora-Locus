@@ -64,7 +64,8 @@ pub fn routes() -> Router<AppContext> {
 /// `enabled` + `auroraVersion` are emitted.
 async fn describe_posture(State(ctx): State<AppContext>) -> Json<FederationDescribePosture> {
     let fc = &ctx.config.federation;
-    let on = fc.enabled;
+    // §2.1 (#397): effective gate (runtime override → config), not raw env.
+    let on = ctx.federation_enabled;
     Json(FederationDescribePosture {
         enabled: on,
         appview_url: if on { fc.appview_url.clone() } else { None },
@@ -103,7 +104,8 @@ struct FederationDescribePosture {
 
 /// Get federation status (public endpoint)
 async fn federation_status(State(ctx): State<AppContext>) -> Json<FederationStatusResponse> {
-    let enabled = ctx.config.federation.enabled;
+    // §2.1 (#397): effective gate (runtime override → config), not raw env.
+    let enabled = ctx.federation_enabled;
     let relay_connected = ctx.relay_client.is_some();
     let discovery_active = ctx.pds_discovery.is_some();
     let auth_active = ctx.federation_auth.is_some();

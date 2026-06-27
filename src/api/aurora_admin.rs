@@ -5065,6 +5065,28 @@ pub async fn resolve_federation_flag(ctx: &AppContext, key: &str, fallback: bool
     }
 }
 
+/// v0.9 Federation runtime-mutability arc §2.1 (#397) — boot-time read of
+/// `federation.enabled` directly from the pool. `AppContext::new` resolves the
+/// master federation gate BEFORE any `AppContext` exists, so the ctx-based
+/// resolvers can't be used; this takes the `account_db` pool directly. Mirrors
+/// [`resolve_federation_flag`]'s runtime-row → env-config fallback (row-only, no
+/// file tier — consistent with the other federation consumers). Migrations have
+/// already run by the call site, so `runtime_settings` is present.
+pub async fn read_federation_enabled_at_boot(pool: &sqlx::AnyPool, fallback: bool) -> bool {
+    use sqlx::Row as _;
+    let row: Option<String> = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(FEDERATION_ENABLED_KEY)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("value").ok());
+    match row {
+        Some(v) => serde_json::from_str::<bool>(&v).unwrap_or(fallback),
+        None => fallback,
+    }
+}
+
 /// v0.9 Federation runtime-mutability arc §3.7 (#395) — request-layer
 /// short-circuit decision for inbound federation endpoints. Resolves
 /// `federation.enabled` (runtime override → `FederationConfig.enabled` fallback)
@@ -5292,9 +5314,27 @@ pub async fn set_runtime_setting(
     } else {
         default_for_key(&input.key)
     };
-    let audit_entry_id =
+    // v0.9 Federation runtime-mutability arc §2.1 (#397) — for the
+    // restart-required `federation.enabled` key the value-write + audit entry +
+    // restart marker land atomically (R3-verified §3.5 outer-tx + guard
+    // lifetime). The operator's "Restart now / Queue for later" choice is a
+    // separate `triggerRestart` call; the marker drives the post-restart action
+    // either way. All other keys use the self-managed write unchanged.
+    let audit_entry_id = if input.key == FEDERATION_ENABLED_KEY {
+        save_runtime_setting_with_restart_marker(
+            &ctx,
+            &input.key,
+            &input.value,
+            &auth.did,
+            &input.rationale,
+            crate::api::pending_restart::ACTION_RESTART_FEDERATION_ENABLED,
+            r#"{"version":1}"#,
+        )
+        .await?
+    } else {
         write_runtime_setting_audited(&ctx, &input.key, &input.value, &auth.did, &input.rationale)
-            .await?;
+            .await?
+    };
 
     // v0.9 Arc D (#223) — propagate a cadence change to the live
     // aurora-locus-standard rotation oracle, so it takes effect on the next
@@ -5687,6 +5727,113 @@ pub async fn list_pending_restart_actions(
         })
         .collect::<Result<Vec<_>, (StatusCode, Json<serde_json::Value>)>>()?;
     Ok(Json(ListPendingRestartActionsOutput { pending_actions }))
+}
+
+/// v0.9 Federation runtime-mutability arc §2.1 (#397) — save a restart-required
+/// runtime setting so its value-write, audit-chain entry, and restart marker land
+/// in ONE transaction. Follows the R3-verified §3.5 caller pattern: the guard is
+/// acquired before `begin()` and held until after `commit()`, and the audited
+/// write runs in outer-tx mode (no nested guard/commit).
+async fn save_runtime_setting_with_restart_marker(
+    ctx: &AppContext,
+    key: &str,
+    value: &serde_json::Value,
+    actor_did: &str,
+    rationale: &str,
+    marker_action: &str,
+    marker_payload: &str,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    let _audit_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut outer_tx = ctx.account_db.begin().await.map_err(internal)?;
+    let audit_entry_id = write_runtime_setting_audited_with_tx(
+        ctx,
+        key,
+        value,
+        actor_did,
+        rationale,
+        Some(&mut outer_tx),
+        true,
+    )
+    .await?;
+    crate::api::pending_restart::upsert_marker(
+        &mut outer_tx,
+        marker_action,
+        marker_payload,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .await
+    .map_err(internal_pds)?;
+    outer_tx.commit().await.map_err(internal)?;
+    // _audit_guard drops here, AFTER commit per the §3.5 contract.
+    Ok(audit_entry_id)
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerRestartInput {
+    pub rationale: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerRestartOutput {
+    pub audit_entry_id: String,
+}
+
+/// `tools.aurora.superadmin.triggerRestart` (§2.1) — operator-driven restart for
+/// the "Restart now" choice in the save modal. Records the audited intent, then
+/// fires the graceful-shutdown trigger (C1): `serve`'s `with_graceful_shutdown`
+/// drains in-flight connections and the watchdog force-exits past the deadline;
+/// the supervisor relaunches with config + runtime overrides re-read at boot.
+/// Returns BEFORE the process actually exits (the UI shows a restarting state).
+/// SuperAdmin-gated; rationale required.
+pub async fn trigger_restart(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<TriggerRestartInput>,
+) -> Result<Json<TriggerRestartOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "triggerRestart requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    // Record the operator's restart intent in the audit chain.
+    let audit_entry_id = {
+        let _guard = audit_chain::AppendChainGuard::acquire().await;
+        let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+        let id = audit_chain::insert_chain_entry(
+            &mut tx,
+            ctx.config.database.backend,
+            AppendEntryParams {
+                actor_did: &auth.did,
+                source: "manual",
+                payload: None,
+                action: "TriggerRestart",
+                subject: None,
+                rationale: &input.rationale,
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .map_err(internal_pds)?;
+        tx.commit().await.map_err(internal)?;
+        id
+    };
+    // Fire the graceful-shutdown signal (C1). `send` errors only if no receivers
+    // exist (e.g. a test without a running `serve`); the restart intent is
+    // already audited, so ignore that case.
+    let _ = ctx.shutdown_trigger.send(());
+    Ok(Json(TriggerRestartOutput {
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
 }
 
 /// Query params for `uploadBrandingAsset`: which asset, + an optional rationale.
@@ -6389,6 +6536,111 @@ mod tests {
         let ctx = create_test_context().await;
         let r = list_pending_restart_actions(State(ctx.clone()), c4_admin()).await;
         assert_eq!(r.unwrap_err().0, StatusCode::FORBIDDEN);
+    }
+
+    // v0.9 Federation runtime-mutability arc §2.1 (#397) — federation.enabled
+    // save-and-restart flow, consumer switch, triggerRestart.
+
+    #[tokio::test]
+    async fn boot_read_federation_enabled_row_or_config_fallback() {
+        let ctx = create_test_context().await;
+        // No row → env-config fallback.
+        assert!(read_federation_enabled_at_boot(&ctx.account_db, true).await);
+        assert!(!read_federation_enabled_at_boot(&ctx.account_db, false).await);
+        // Runtime row overrides the fallback in both directions.
+        write_runtime_setting_audited(&ctx, FEDERATION_ENABLED_KEY, &serde_json::json!(false), "op", "x")
+            .await
+            .unwrap();
+        assert!(!read_federation_enabled_at_boot(&ctx.account_db, true).await);
+        write_runtime_setting_audited(&ctx, FEDERATION_ENABLED_KEY, &serde_json::json!(true), "op", "x")
+            .await
+            .unwrap();
+        assert!(read_federation_enabled_at_boot(&ctx.account_db, false).await);
+    }
+
+    #[tokio::test]
+    async fn consumer_switch_gates_subsystems_on_boot() {
+        // No runtime row → the master gate falls back to env config, and the
+        // federation subsystems are built (or not) accordingly.
+        let on = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+        })
+        .await;
+        assert!(on.federation_enabled);
+        assert!(on.federation_auth.is_some(), "subsystems up when enabled");
+        let off = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = false;
+        })
+        .await;
+        assert!(!off.federation_enabled);
+        assert!(off.federation_auth.is_none(), "subsystems down when disabled");
+    }
+
+    #[tokio::test]
+    async fn save_federation_enabled_writes_row_marker_audit_atomically() {
+        let ctx = create_test_context().await;
+        let _ = set_runtime_setting(
+            State(ctx.clone()),
+            c4_super(),
+            Json(SetRuntimeSettingInput {
+                key: FEDERATION_ENABLED_KEY.to_string(),
+                value: serde_json::json!(false),
+                rationale: "incident".to_string(),
+            }),
+        )
+        .await
+        .expect("save ok");
+        assert_eq!(count_runtime_rows(&ctx, FEDERATION_ENABLED_KEY).await, 1, "runtime row written");
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_RESTART_FEDERATION_ENABLED).await,
+            1,
+            "restart marker written in the same tx"
+        );
+        assert!(count_audit_action(&ctx, "SetRuntimeSetting").await >= 1, "audit recorded");
+    }
+
+    #[tokio::test]
+    async fn trigger_restart_fires_shutdown_signal_and_audits() {
+        let ctx = create_test_context().await;
+        let rx = ctx.shutdown_trigger.subscribe();
+        assert!(!rx.has_changed().unwrap(), "no signal before triggerRestart");
+        let _ = trigger_restart(
+            State(ctx.clone()),
+            c4_super(),
+            Json(TriggerRestartInput { rationale: "restart now".to_string() }),
+        )
+        .await
+        .expect("trigger ok");
+        assert!(rx.has_changed().unwrap(), "shutdown signal fired");
+        assert!(count_audit_action(&ctx, "TriggerRestart").await >= 1, "restart audited");
+    }
+
+    #[tokio::test]
+    async fn save_federation_disabled_composes_with_request_gate() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+        })
+        .await;
+        // Before the save the gate lets federation requests through.
+        assert!(federation_inbound_gate_503(&ctx).await.is_none());
+        // Operator disables federation at runtime (incident response).
+        let _ = set_runtime_setting(
+            State(ctx.clone()),
+            c4_super(),
+            Json(SetRuntimeSettingInput {
+                key: FEDERATION_ENABLED_KEY.to_string(),
+                value: serde_json::json!(false),
+                rationale: "incident".to_string(),
+            }),
+        )
+        .await
+        .expect("save ok");
+        // C6 short-circuit catches the saved value immediately — before any
+        // restart tears the subsystem down.
+        assert!(
+            federation_inbound_gate_503(&ctx).await.is_some(),
+            "request gate 503s on the saved value before restart"
+        );
     }
 
     #[tokio::test]

@@ -96,25 +96,25 @@ impl JobScheduler {
         tokio::spawn(Self::metrics_collection_job(Arc::clone(&self)));
 
         // Spawn federation jobs (Phase 1)
-        if self.context.config.federation.enabled && self.context.pds_discovery.is_some() {
+        if self.context.federation_enabled && self.context.pds_discovery.is_some() {
             tokio::spawn(Self::pds_discovery_refresh_job(Arc::clone(&self)));
             info!("Federation discovery job started");
         }
 
         // Spawn relay firehose subscription job (Phase 3)
-        if self.context.config.federation.enabled && self.context.relay_client.is_some() {
+        if self.context.federation_enabled && self.context.relay_client.is_some() {
             tokio::spawn(Self::relay_firehose_subscription_job(Arc::clone(&self)));
             info!("Relay firehose subscription job started");
         }
 
         // Spawn nonce cleanup job (Phase 4)
-        if self.context.config.federation.enabled && self.context.nonce_store.is_some() {
+        if self.context.federation_enabled && self.context.nonce_store.is_some() {
             tokio::spawn(Self::nonce_cleanup_job(Arc::clone(&self)));
             info!("Nonce cleanup job started");
         }
 
         // Spawn DPoP nonce cleanup job (Phase 4)
-        if self.context.config.federation.enabled && self.context.dpop_nonce_store.is_some() {
+        if self.context.federation_enabled && self.context.dpop_nonce_store.is_some() {
             tokio::spawn(Self::dpop_nonce_cleanup_job(Arc::clone(&self)));
             info!("DPoP nonce cleanup job started");
         }

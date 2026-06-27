@@ -50,6 +50,16 @@ pub struct AppContext {
     /// restart. `Arc<watch::Sender<()>>` so it shares across `AppContext` clones
     /// and stays `Clone`-compatible; the channel is created once in `new`.
     pub shutdown_trigger: Arc<tokio::sync::watch::Sender<()>>,
+    /// v0.9 Federation runtime-mutability arc §2.1 (#397) — the master federation
+    /// gate, resolved ONCE at boot from the `federation.enabled` runtime row
+    /// (env-config fallback) BEFORE the federation subsystems are constructed.
+    /// This is the value the `Option<Arc<…>>` federation subsystems were built
+    /// against, so it equals "are the subsystems up". Describe surfaces and the
+    /// job scheduler read THIS (not `config.federation.enabled`) so they report
+    /// and gate on the effective post-restart state. The request-layer
+    /// short-circuit (§3.7) instead reads the runtime row LIVE for incident-
+    /// response immediacy before a restart.
+    pub federation_enabled: bool,
     /// Shared-database pool for account, sequencer, OAuth tables, etc.
     /// Backend is selected by `config.database.backend` (SQLite or
     /// Postgres). `AnyPool` makes the dispatch transparent to consumers.
@@ -611,9 +621,22 @@ impl AppContext {
         let oauth_client_manager = Arc::new(ClientManager::new(account_db.clone(), vec![]));
         let oauth_device_manager = Arc::new(DeviceManager::new(account_db.clone()));
 
+        // v0.9 Federation runtime-mutability arc §2.1 (#397) — resolve the master
+        // federation gate from the runtime override (federation.enabled row →
+        // env-config fallback) so a save-and-restart toggle takes effect on this
+        // boot. Read directly from the pool: there is no AppContext yet, and
+        // migrations have already run above so runtime_settings is present. Every
+        // federation subsystem below, the describe surfaces, and the job
+        // scheduler gate on THIS value (stored on the context) rather than the
+        // immutable env config.
+        let federation_enabled = crate::api::aurora_admin::read_federation_enabled_at_boot(
+            &account_db,
+            config.federation.enabled,
+        )
+        .await;
+
         // Initialize relay client first (optional - only if relay servers configured and federation enabled)
-        let relay_client = if config.federation.enabled && !config.federation.relay_urls.is_empty()
-        {
+        let relay_client = if federation_enabled && !config.federation.relay_urls.is_empty() {
             tracing::info!(
                 "Federation enabled with {} relay server(s)",
                 config.federation.relay_urls.len()
@@ -632,7 +655,7 @@ impl AppContext {
         };
 
         // Initialize federation components (Phase 1)
-        let (federation_auth, pds_discovery) = if config.federation.enabled {
+        let (federation_auth, pds_discovery) = if federation_enabled {
             tracing::info!("Initializing federation authenticator and PDS discovery");
 
             // Federation authenticator for cross-PDS authentication
@@ -672,7 +695,7 @@ impl AppContext {
         };
 
         // Initialize federated search (Phase 2)
-        let federated_search = if config.federation.enabled {
+        let federated_search = if federation_enabled {
             if let Some(ref discovery) = pds_discovery {
                 tracing::info!("Initializing federated search (max_concurrent: 10, timeout: 30s)");
                 Some(Arc::new(FederatedSearch::new(
@@ -688,7 +711,7 @@ impl AppContext {
         };
 
         // Initialize nonce store for service auth (Phase 4)
-        let nonce_store = if config.federation.enabled {
+        let nonce_store = if federation_enabled {
             tracing::info!("Initializing nonce store for replay prevention (retention: 120s)");
             Some(Arc::new(NonceStore::new()))
         } else {
@@ -718,7 +741,7 @@ impl AppContext {
                 store
             }
         };
-        let dpop_nonce_store: Option<Arc<DPopNonceStore>> = if config.federation.enabled {
+        let dpop_nonce_store: Option<Arc<DPopNonceStore>> = if federation_enabled {
             tracing::info!(
                 "Initializing DPoP §8 nonce challenge store (federation enabled)"
             );
@@ -1187,6 +1210,7 @@ impl AppContext {
         Ok(Self {
             config: Arc::new(config),
             shutdown_trigger: Arc::new(shutdown_trigger),
+            federation_enabled,
             account_db,
             plc_client,
             trusted_peers,

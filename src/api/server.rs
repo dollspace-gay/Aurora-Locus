@@ -1355,12 +1355,15 @@ async fn describe_server(State(ctx): State<AppContext>) -> PdsResult<Json<Descri
         phone_verification_required: Some(false), // Not implemented yet
         links: None,                              // TODO: Add from config if available
         federation: {
-            let fc = &ctx.config.federation;
+            // §2.1 (#397): report the effective gate (runtime override resolved
+            // at boot), not the immutable env config, so describeServer matches
+            // actual subsystem posture after a save-and-restart toggle.
+            let on = ctx.federation_enabled;
             // enabled always present; flags only when on (off-posture = enabled:false alone).
             Some(FederationDescribe {
-                enabled: fc.enabled,
-                firehose_enabled: fc.enabled.then_some(firehose_enabled),
-                crawl_enabled: fc.enabled.then_some(crawl_enabled),
+                enabled: on,
+                firehose_enabled: on.then_some(firehose_enabled),
+                crawl_enabled: on.then_some(crawl_enabled),
             })
         },
     }))
