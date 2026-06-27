@@ -400,7 +400,7 @@ impl AppContext {
     /// — the empty registry is fine for non-`describe_capabilities`
     /// code paths.
     pub async fn new(
-        config: ServerConfig,
+        mut config: ServerConfig,
         route_registry: Arc<crate::api::registry::RouteRegistry>,
     ) -> PdsResult<Self> {
         // Validate configuration
@@ -634,6 +634,19 @@ impl AppContext {
             config.federation.enabled,
         )
         .await;
+
+        // v0.9 Federation runtime-mutability arc §2.2 (#398) — bake the
+        // `service.public_url` runtime override into the config BEFORE it is
+        // shared, so the sync `effective_public_url()` accessor (and every URL it
+        // builds — DID docs, OAuth issuer, service URL) returns the operator's
+        // value on this boot. The change is restart-required precisely so this
+        // single boot-time swap is the clean event boundary; the post-restart
+        // bulk did:plc update (Phase E2) re-points existing DID documents.
+        if let Some(url) =
+            crate::api::aurora_admin::read_service_public_url_at_boot(&account_db).await
+        {
+            config.service.public_url = Some(url);
+        }
 
         // Initialize relay client first (optional - only if relay servers configured and federation enabled)
         let relay_client = if federation_enabled && !config.federation.relay_urls.is_empty() {

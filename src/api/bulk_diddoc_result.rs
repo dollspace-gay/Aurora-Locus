@@ -8,8 +8,39 @@
 //! surfaces the most-recent run (`ORDER BY started_at DESC LIMIT 1` — the recency
 //! key is `started_at`, NOT the UUID `run_id`, per R3 H-2).
 //!
-//! C5 ships the schema only. The row read/write helpers land with E2/E4; this
-//! module documents the table and pins its constraints under test.
+//! C5 shipped the schema. D2 (#398) adds the initial-pending-row writer the
+//! save handler composes into its outer tx; the per-account update + result
+//! queries land with E2/E4.
+
+use crate::error::PdsResult;
+
+/// v0.9 Federation runtime-mutability arc §2.2/§3.6 (#398) — write one `pending`
+/// row per account for a bulk did:plc update run, into the caller's transaction
+/// (so they commit atomically with the `service.public_url` value + markers).
+/// `updated_at` starts equal to `started_at`; E2 advances each row to a terminal
+/// status. Idempotent re-runs are E2's concern (it upserts); at save-time the
+/// rows are fresh for a newly-generated `run_id`.
+pub async fn write_initial_pending_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    dids: &[String],
+    run_id: &str,
+    started_at: &str,
+) -> PdsResult<()> {
+    for did in dids {
+        sqlx::query(
+            "INSERT INTO bulk_diddoc_update_result \
+             (did, run_id, started_at, status, reason, updated_at) \
+             VALUES ($1, $2, $3, 'pending', NULL, $4)",
+        )
+        .bind(did)
+        .bind(run_id)
+        .bind(started_at)
+        .bind(started_at)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

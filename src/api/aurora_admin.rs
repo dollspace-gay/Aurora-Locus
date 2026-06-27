@@ -5087,6 +5087,30 @@ pub async fn read_federation_enabled_at_boot(pool: &sqlx::AnyPool, fallback: boo
     }
 }
 
+/// v0.9 Federation runtime-mutability arc §2.2 (#398) — boot-time read of the
+/// `service.public_url` runtime override directly from the pool. Returns the row
+/// value (a non-blank string) if set, else `None` (no override). `AppContext::new`
+/// uses this to bake the override into `config.service.public_url` BEFORE the
+/// config is shared, so the sync `effective_public_url()` accessor — and every
+/// caller of it — sees the new URL on this boot without an async ripple. Row-only
+/// read (no file tier), consistent with the other federation consumers.
+pub async fn read_service_public_url_at_boot(pool: &sqlx::AnyPool) -> Option<String> {
+    use sqlx::Row as _;
+    let raw: String = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(SERVICE_PUBLIC_URL_KEY)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("value").ok())?;
+    let parsed = serde_json::from_str::<String>(&raw).ok()?;
+    if parsed.trim().is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
 /// v0.9 Federation runtime-mutability arc §3.7 (#395) — request-layer
 /// short-circuit decision for inbound federation endpoints. Resolves
 /// `federation.enabled` (runtime override → `FederationConfig.enabled` fallback)
@@ -5331,6 +5355,11 @@ pub async fn set_runtime_setting(
             r#"{"version":1}"#,
         )
         .await?
+    } else if input.key == SERVICE_PUBLIC_URL_KEY {
+        // §2.2 — public-URL change additionally queues the bulk did:plc update
+        // (two markers + initial pending result rows, one run_id).
+        save_service_public_url_with_bulk_update(&ctx, &input.value, &auth.did, &input.rationale)
+            .await?
     } else {
         write_runtime_setting_audited(&ctx, &input.key, &input.value, &auth.did, &input.rationale)
             .await?
@@ -5763,6 +5792,87 @@ async fn save_runtime_setting_with_restart_marker(
     )
     .await
     .map_err(internal_pds)?;
+    outer_tx.commit().await.map_err(internal)?;
+    // _audit_guard drops here, AFTER commit per the §3.5 contract.
+    Ok(audit_entry_id)
+}
+
+/// v0.9 Federation runtime-mutability arc §2.2 (#398) — save the
+/// restart-required `service.public_url`. Beyond the value + audit + restart
+/// marker, a public-URL change requires re-pointing every account's did:plc DID
+/// document after restart, so this also queues the `bulk-diddoc-update` marker
+/// and writes one `pending` result row per account — all in ONE outer
+/// transaction (R3-verified §3.5 guard lifetime). A fresh `run_id` + `started_at`
+/// are generated once and carried through both markers and the result rows so
+/// E2/E4 can correlate the run. Phase E2 reads the marker on boot and executes
+/// the per-account PLC operations.
+async fn save_service_public_url_with_bulk_update(
+    ctx: &AppContext,
+    value: &serde_json::Value,
+    actor_did: &str,
+    rationale: &str,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let started_at = chrono::Utc::now().to_rfc3339();
+
+    let _audit_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut outer_tx = ctx.account_db.begin().await.map_err(internal)?;
+
+    let audit_entry_id = write_runtime_setting_audited_with_tx(
+        ctx,
+        SERVICE_PUBLIC_URL_KEY,
+        value,
+        actor_did,
+        rationale,
+        Some(&mut outer_tx),
+        true,
+    )
+    .await?;
+
+    // Both markers share one run_id + started_at (§2.2). The bulk-update marker
+    // drives E2 on the next boot; the restart marker is a no-op clear.
+    let payload = serde_json::json!({
+        "version": 1,
+        "run_id": run_id,
+        "started_at": started_at,
+    })
+    .to_string();
+    crate::api::pending_restart::upsert_marker(
+        &mut outer_tx,
+        crate::api::pending_restart::ACTION_RESTART_SERVICE_PUBLIC_URL,
+        &payload,
+        &started_at,
+    )
+    .await
+    .map_err(internal_pds)?;
+    crate::api::pending_restart::upsert_marker(
+        &mut outer_tx,
+        crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE,
+        &payload,
+        &started_at,
+    )
+    .await
+    .map_err(internal_pds)?;
+
+    // Initial pending result rows, one per account. v0.9: all accounts are
+    // did:plc (#381 Outcome A), so no did_method filter; v0.10 filters here.
+    let dids: Vec<String> = sqlx::query("SELECT did FROM actor")
+        .fetch_all(&mut *outer_tx)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .filter_map(|r| r.try_get::<String, _>("did").ok())
+        .collect();
+    crate::api::bulk_diddoc_result::write_initial_pending_rows(
+        &mut outer_tx,
+        &dids,
+        &run_id,
+        &started_at,
+    )
+    .await
+    .map_err(internal_pds)?;
+
     outer_tx.commit().await.map_err(internal)?;
     // _audit_guard drops here, AFTER commit per the §3.5 contract.
     Ok(audit_entry_id)
@@ -6641,6 +6751,131 @@ mod tests {
             federation_inbound_gate_503(&ctx).await.is_some(),
             "request gate 503s on the saved value before restart"
         );
+    }
+
+    // v0.9 Federation runtime-mutability arc §2.2 (#398) — service.public_url
+    // save-and-restart flow (two markers + initial pending result rows).
+
+    async fn count_bulk_rows(ctx: &AppContext, status: Option<&str>) -> i64 {
+        match status {
+            Some(s) => sqlx::query_scalar(
+                "SELECT COUNT(*) FROM bulk_diddoc_update_result WHERE status = $1",
+            )
+            .bind(s)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap(),
+            None => sqlx::query_scalar("SELECT COUNT(*) FROM bulk_diddoc_update_result")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap(),
+        }
+    }
+
+    async fn save_public_url(ctx: &AppContext, url: &str) {
+        let _ = set_runtime_setting(
+            State(ctx.clone()),
+            c4_super(),
+            Json(SetRuntimeSettingInput {
+                key: SERVICE_PUBLIC_URL_KEY.to_string(),
+                value: serde_json::json!(url),
+                rationale: "migrate".to_string(),
+            }),
+        )
+        .await
+        .expect("save ok");
+    }
+
+    #[tokio::test]
+    async fn boot_read_service_public_url_override() {
+        let ctx = create_test_context().await;
+        assert!(
+            read_service_public_url_at_boot(&ctx.account_db).await.is_none(),
+            "no row → no override"
+        );
+        write_runtime_setting_audited(&ctx, SERVICE_PUBLIC_URL_KEY, &serde_json::json!("https://new.example.com"), "op", "x")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_service_public_url_at_boot(&ctx.account_db).await.as_deref(),
+            Some("https://new.example.com")
+        );
+        // Blank stored value → treated as no override.
+        write_runtime_setting_audited(&ctx, SERVICE_PUBLIC_URL_KEY, &serde_json::json!("   "), "op", "x")
+            .await
+            .unwrap();
+        assert!(read_service_public_url_at_boot(&ctx.account_db).await.is_none(), "blank → none");
+    }
+
+    #[tokio::test]
+    async fn save_service_public_url_writes_value_markers_and_pending_rows() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:a", "a.test").await;
+        seed_actor(&ctx, "did:plc:b", "b.test").await;
+        seed_actor(&ctx, "did:plc:c", "c.test").await;
+        save_public_url(&ctx, "https://new.example.com").await;
+        assert_eq!(count_runtime_rows(&ctx, SERVICE_PUBLIC_URL_KEY).await, 1, "value row");
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_RESTART_SERVICE_PUBLIC_URL).await,
+            1,
+            "restart marker"
+        );
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE).await,
+            1,
+            "bulk-update marker"
+        );
+        assert!(count_audit_action(&ctx, "SetRuntimeSetting").await >= 1, "audit recorded");
+        assert_eq!(count_bulk_rows(&ctx, Some("pending")).await, 3, "one pending row per account");
+        assert_eq!(count_bulk_rows(&ctx, None).await, 3, "no rows in a terminal state at save");
+    }
+
+    #[tokio::test]
+    async fn save_service_public_url_run_id_and_started_at_consistent() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:a", "a.test").await;
+        save_public_url(&ctx, "https://new.example.com").await;
+        let restart_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM pending_restart_action WHERE action = $1",
+        )
+        .bind(crate::api::pending_restart::ACTION_RESTART_SERVICE_PUBLIC_URL)
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        let bulk_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM pending_restart_action WHERE action = $1",
+        )
+        .bind(crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE)
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(restart_payload, bulk_payload, "both markers share one run_id + started_at");
+        let pv: serde_json::Value = serde_json::from_str(&bulk_payload).unwrap();
+        let run_id = pv["run_id"].as_str().unwrap();
+        let started_at = pv["started_at"].as_str().unwrap();
+        let row_run: String = sqlx::query_scalar("SELECT run_id FROM bulk_diddoc_update_result LIMIT 1")
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap();
+        let row_started: String =
+            sqlx::query_scalar("SELECT started_at FROM bulk_diddoc_update_result LIMIT 1")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(row_run, run_id, "result row run_id matches the marker");
+        assert_eq!(row_started, started_at, "result row started_at matches the marker");
+    }
+
+    #[tokio::test]
+    async fn save_service_public_url_with_zero_accounts_ok() {
+        // No accounts → markers written, zero result rows, no error.
+        let ctx = create_test_context().await;
+        save_public_url(&ctx, "https://new.example.com").await;
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE).await,
+            1
+        );
+        assert_eq!(count_bulk_rows(&ctx, None).await, 0);
     }
 
     #[tokio::test]

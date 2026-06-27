@@ -29,7 +29,7 @@ use crate::api::aurora_admin::{
     cas_runtime_setting, read_runtime_row_value, FEDERATION_APPVIEW_URL_KEY,
     FEDERATION_CRAWL_ENABLED_KEY, FEDERATION_ENABLED_KEY, FEDERATION_FIREHOSE_ENABLED_KEY,
     FEDERATION_POLICY_PEER_ALLOWLIST_KEY, FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
-    FEDERATION_POLICY_RELAY_URLS_KEY, RECOVERY_MODE_ENV,
+    FEDERATION_POLICY_RELAY_URLS_KEY, RECOVERY_MODE_ENV, SERVICE_PUBLIC_URL_KEY,
 };
 use crate::api::moderation_defaults::SYSTEM_DID;
 use crate::error::PdsError;
@@ -802,6 +802,33 @@ pub async fn seed_federation_enabled(ctx: &AppContext) -> Result<SeedOutcome, Pd
     seed_federation_bool(ctx, FEDERATION_ENABLED_KEY, ctx.config.federation.enabled).await
 }
 
+/// v0.9 Federation runtime-mutability arc §2.2 (#398) — boot-seed
+/// `service.public_url` from `ServiceConfig.public_url` (seed-if-absent). Skipped
+/// when the env config has no explicit public URL (the deployment relies on the
+/// hostname-derived default; there's nothing to seed and the consumer leaves
+/// `config.service.public_url` as-is). By seed time the boot consumer switch has
+/// already baked any existing override into the config, so this is a no-op then.
+pub async fn seed_service_public_url(ctx: &AppContext) -> Result<SeedOutcome, PdsError> {
+    let Some(public_url) = ctx.config.service.public_url.clone() else {
+        return Ok(SeedOutcome::SkippedNoFallback);
+    };
+    let exists = sqlx::query("SELECT 1 FROM runtime_settings WHERE key = $1")
+        .bind(SERVICE_PUBLIC_URL_KEY)
+        .fetch_optional(&ctx.account_db)
+        .await?;
+    if exists.is_some() {
+        return Ok(SeedOutcome::AlreadySeeded);
+    }
+    crate::federation::trusted_peer_set::seed_federation_policy(
+        &ctx.account_db,
+        &[(SERVICE_PUBLIC_URL_KEY.to_string(), serde_json::Value::String(public_url))],
+        SYSTEM_DID,
+    )
+    .await?;
+    tracing::info!("service.public_url seeded from config at boot");
+    Ok(SeedOutcome::Seeded { entries_seeded: 1 })
+}
+
 pub async fn run_federation_boot_seed(ctx: &AppContext) {
     use crate::context::BootSeedFailureDetails;
     use std::sync::atomic::Ordering;
@@ -844,6 +871,8 @@ pub async fn run_federation_boot_seed(ctx: &AppContext) {
     record(FEDERATION_CRAWL_ENABLED_KEY, seed_crawl_enabled(ctx).await);
     // §2.1 (#397) — federation.enabled (master gate).
     record(FEDERATION_ENABLED_KEY, seed_federation_enabled(ctx).await);
+    // §2.2 (#398) — service.public_url.
+    record(SERVICE_PUBLIC_URL_KEY, seed_service_public_url(ctx).await);
 
     if !failed_keys.is_empty() {
         let _ = emit(
