@@ -92,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cosmetic settings such as the theme save with a lighter confirmation instead of requiring a typed rationale
 - Account search now filters by the search term instead of returning every account
 - Restored the installed-themes listing to the server's advertised capabilities
+- Audit-chain verification no longer reports entries written before the v0.9 hash-format change as tampered. The verifier now recognizes the pre-v0.9 canonical form, marks those rows verified, and keeps the per-row badge and chain banner green where they belong; the CLI chain report annotates how many entries (and which sequence range) verified under the legacy format. Only an entry matching neither the current nor the legacy form — a genuine tamper — halts the chain walk, and linkage is still checked across the format boundary
 - Hardened intermittent time- and ordering-sensitive test failures
 
 ### Dependencies

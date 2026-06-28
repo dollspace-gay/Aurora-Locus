@@ -3618,6 +3618,11 @@ pub struct GetAuditTrailOutput {
     pub cursor: Option<String>,
     pub chain_verified: bool,
     pub chain_verified_through: i64,
+    /// Count of entries in the verified window that matched only the
+    /// pre-v0.9 legacy hash form (sealed before the #345 source/payload
+    /// bump). These are honestly-sealed, untampered rows — surfaced so the
+    /// UI can annotate the format boundary rather than imply tamper.
+    pub chain_legacy_count: i64,
 }
 
 /// Query params for `tools.aurora.admin.getReport` — the single report id.
@@ -3883,13 +3888,16 @@ pub async fn get_audit_trail(
     // edge case where seq=1 itself failed (nothing was verified
     // through; chain_verified_through = 0 is correct).
     let verification_result = if head_seq == 0 {
-        Ok(())
+        Ok(audit_chain::ChainVerificationSummary::default())
     } else {
         audit_chain::verify_chain_range(&ctx.account_db, 1, head_seq).await
     };
-    let (chain_verified, chain_verified_through) = match verification_result {
-        Ok(()) => (true, head_seq),
-        Err(e) => (false, e.failing_sequence.saturating_sub(1)),
+    // A clean walk (Ok) means tamper-free even when some entries matched
+    // only the pre-v0.9 legacy form; `chain_legacy_count` carries that
+    // boundary detail to the UI so it annotates rather than alarms.
+    let (chain_verified, chain_verified_through, chain_legacy_count) = match verification_result {
+        Ok(summary) => (true, head_seq, summary.legacy_count as i64),
+        Err(e) => (false, e.failing_sequence.saturating_sub(1), 0),
     };
 
     Ok(Json(GetAuditTrailOutput {
@@ -3897,6 +3905,7 @@ pub async fn get_audit_trail(
         cursor: next_cursor,
         chain_verified,
         chain_verified_through,
+        chain_legacy_count,
     }))
 }
 

@@ -539,6 +539,9 @@ async fn fetch_new_chain_entries(
             .unwrap_or_else(|_| "manual".to_string());
         let payload_str: Option<String> = row.try_get("payload").ok().flatten();
 
+        // Verified if the row matches the current v0.9 canonical form OR the
+        // pre-v0.9 legacy form (pre-#345 source/payload bump). Both are
+        // honestly-sealed rows; only matching neither marks it unverified.
         let verified = crate::admin::audit_chain::verify_entry(
             sequence,
             &created_at_str,
@@ -555,6 +558,21 @@ async fn fetch_new_chain_entries(
             cascade_snapshot_ids_str.as_deref(),
             &source,
             payload_str.as_deref(),
+            &current_hash,
+        ) || crate::admin::audit_chain::verify_entry_legacy(
+            sequence,
+            &created_at_str,
+            &actor_did,
+            &action,
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+            &rationale,
+            snapshot_id,
+            event_id,
+            previous_hash.as_deref(),
+            cascade_str.as_deref(),
+            cascade_snapshot_ids_str.as_deref(),
             &current_hash,
         );
 

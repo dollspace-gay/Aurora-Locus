@@ -236,6 +236,21 @@
         '<p><strong>Chain verified.</strong> The hash chain from sequence 1 ' +
         'through sequence ' + esc(through) + ' has been re-verified end-to-end ' +
         'on this request. Per-row hash and per-row linkage both match.</p>';
+      // Annotate the v0.8→v0.9 format boundary, if present. chainLegacyCount
+      // counts honestly-sealed entries that predate the #345 hash bump
+      // (source/payload added to the canonical hash); they re-verify under
+      // the prior form. This is NOT tamper — surface it as informational so
+      // an operator reading a clean chain isn't left wondering why some rows
+      // used an older format. Missing field (older server) → treated as 0.
+      const legacyCount = typeof data.chainLegacyCount === 'number' ? data.chainLegacyCount : 0;
+      if (legacyCount > 0) {
+        const legacyLabel = legacyCount === 1 ? 'entry' : 'entries';
+        detailHtml +=
+          '<p class="chain-legacy-note">' + esc(String(legacyCount)) + ' ' + legacyLabel +
+          ' verified under the legacy (pre-v0.9) hash format, sealed before the ' +
+          'source/payload format change. These are untampered rows predating the ' +
+          'format bump; linkage holds across the boundary.</p>';
+      }
     } else if (through > 0) {
       badgeClass = 'chain-indicator-warn';
       icon = '⚠';
