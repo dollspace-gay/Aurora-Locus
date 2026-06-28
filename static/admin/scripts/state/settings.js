@@ -5,11 +5,11 @@
 // runtime settings and is cached here.
 //
 // Keys:
-//   ui.theme    — a named theme id ('dark' | 'light' | 'stack-classic' |
+//   ui.theme    — a named theme id ('dark' | 'light' | 'aurora-classic' |
 //                 …installed) OR the sentinel 'default' = "follow the
 //                 deployment-default theme". (B-themes-page §11.10.2/§5.5.3.)
 //                 Legacy 'light'/'dark'/'system' mode-words and the old
-//                 'aurora-*' slugs are migrated on read.
+//                 'aurora-*' / 'stack-classic' slugs are migrated on read.
 //   ui.language — BCP 47 tag (default 'en')
 //
 // A named theme is applied by pointing the #theme-tokens / #theme-effects
@@ -23,7 +23,7 @@
 
   let modMode = 'full';
   let modModeRedirect = '';
-  let deploymentDefault = 'stack-classic';
+  let deploymentDefault = 'aurora-classic';
   let installedThemes = [];
   const subscribers = new Set();
 
@@ -31,7 +31,9 @@
   // mode-words map to the new slugs ('system', OS-driven, maps to the closest
   // new affordance: follow the deployment default); the pre-rename 'aurora-*'
   // slugs map to their renamed equivalents (aurora-default/-dark merged into
-  // the single 'dark' root).
+  // the single 'dark' root). 'stack-classic' (and its old 'aurora-' slug) maps
+  // to the renamed 'aurora-classic' (#406) so operators carrying that personal
+  // preference are migrated forward on the next read.
   const LEGACY_THEME = {
     light: 'light',
     dark: 'dark',
@@ -39,7 +41,8 @@
     'aurora-default': 'dark',
     'aurora-dark': 'dark',
     'aurora-light': 'light',
-    'aurora-stack-classic': 'stack-classic',
+    'stack-classic': 'aurora-classic',
+    'aurora-stack-classic': 'aurora-classic',
   };
 
   function theme() {

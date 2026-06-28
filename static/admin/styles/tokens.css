@@ -98,11 +98,17 @@
   /* Stronger border (distinct from the required border tokens) */
   --border-color-strong: #cbd5e1;
 
-  /* Sidebar */
-  --sidebar-bg: #1e293b;
-  --sidebar-text: #cbd5e1;
-  --sidebar-active: #3b82f6;
-  --sidebar-hover: #334155;
+  /* Sidebar — derived from each theme's own surface/text tokens so the rail
+   * coheres with the active palette instead of a fixed slate (recon #406).
+   * The whole family is plumbed through tokens that the WCAG gate already
+   * certifies (text-primary on surface-secondary ≥ 7:1, on surface-tertiary
+   * ≥ 4.5:1 — see themes/contrast.rs), so sidebar contrast holds by
+   * construction for every theme. Every theme defines these surface tokens,
+   * so no per-theme --sidebar-* override is needed; they move as a family. */
+  --sidebar-bg: var(--color-surface-secondary);
+  --sidebar-text: var(--color-text-primary);
+  --sidebar-active: var(--color-surface-tertiary);
+  --sidebar-hover: var(--color-surface-tertiary);
 
   /* Status badge backgrounds (soft tints) */
   --status-active-bg: #dcfce7;
@@ -213,10 +219,9 @@
   --primary-light: #93c5fd;
   --border-color-strong: #475569;
 
-  --sidebar-bg: #0a0e14;
-  --sidebar-text: #cbd5e1;
-  --sidebar-active: #3b82f6;
-  --sidebar-hover: #1c242e;
+  /* --sidebar-* removed here: the family now derives from the surface and
+   * text tokens in :root, so dark coheres through its own surface tokens
+   * like every other theme (auto-derivation, no bespoke override — #406). */
 
   --status-active-bg: #064e3b;
   --status-active-fg: #6ee7b7;

@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1.0",
-  "themeId": "stack-classic",
-  "themeName": "Stack Classic",
+  "themeId": "aurora-classic",
+  "themeName": "Aurora Classic",
   "themeVersion": "1.0.0",
   "substrateVersion": "1.0",
   "extends": "dark",

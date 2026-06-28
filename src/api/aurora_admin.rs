@@ -4121,7 +4121,7 @@ pub const MODERATION_LEXICON_BANNER_KEY: &str = "moderation.lexicon.migration-ba
 /// SuperAdmin-only (via `setRuntimeSetting` + rationale); read is allowed at
 /// any role since every operator's UI applies it at boot. The value is a
 /// theme id, validated here only as a non-empty string — existence/validity
-/// is resolved at theme-apply time, falling back to `stack-classic`.
+/// is resolved at theme-apply time, falling back to `aurora-classic`.
 const THEME_DEPLOYMENT_DEFAULT_KEY: &str = "theme.deployment-default";
 
 /// v0.9 Arc D (#223) — deployment Laquna rotation cadence (§6.4.2). One of
@@ -4304,7 +4304,7 @@ fn default_for_key(key: &str) -> serde_json::Value {
     match key {
         MODERATION_MODE_KEY => serde_json::Value::String("full".to_string()),
         MODERATION_MODE_REDIRECT_KEY => serde_json::Value::String(String::new()),
-        THEME_DEPLOYMENT_DEFAULT_KEY => serde_json::Value::String("stack-classic".to_string()),
+        THEME_DEPLOYMENT_DEFAULT_KEY => serde_json::Value::String("aurora-classic".to_string()),
         LAQUNA_ROTATION_CADENCE_KEY => serde_json::Value::String("daily".to_string()),
         BRANDING_LOGIN_LOGO_KEY
         | BRANDING_LOGIN_BANNER_KEY
@@ -4663,7 +4663,7 @@ pub async fn serve_active_theme_css(
 }
 
 /// Read the deployment-default theme id from the runtime-settings tiers
-/// (runtime row → file tier → compiled default `stack-classic`). Used by the
+/// (runtime row → file tier → compiled default `aurora-classic`). Used by the
 /// unauthenticated active-theme serve routes when no `?id` is given; never
 /// errors — falls back to the inheritance root on any DB error.
 async fn deployment_default_theme(ctx: &AppContext) -> String {

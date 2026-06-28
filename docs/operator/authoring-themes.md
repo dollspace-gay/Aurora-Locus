@@ -31,7 +31,7 @@ mkdir -p "$PDS_DATA_DIRECTORY/themes"
 ```
 
 The four bundled themes (`aurora-default`, `aurora-light`, `aurora-dark`,
-`aurora-stack-classic`) ship inside the binary's static assets and are always
+`aurora-classic`) ship inside the binary's static assets and are always
 available as inheritance parents — you don't need to copy them to customize.
 
 ### 1.2 Copy a bundled theme as a starting point
@@ -344,7 +344,7 @@ live in `effects.css`.
 
 In `aurora-default` the decorative classes are intentionally trivial (the class
 exists but renders nothing) so the sober baseline stays sober. `aurora-dark` and
-`aurora-stack-classic` override several with gradients and glows — read their
+`aurora-classic` override several with gradients and glows — read their
 `effects.css` for worked examples.
 
 ### 5.3 Overriding a substrate effect class
@@ -636,7 +636,7 @@ inherited. This is the `minimal-accent-override` example.
 
 ### 8.3 Extending a bundled reference theme
 
-Set `extends` to `aurora-light`, `aurora-dark`, or `aurora-stack-classic` to
+Set `extends` to `aurora-light`, `aurora-dark`, or `aurora-classic` to
 inherit more than structure — a light base, a richer dark base, or the classic
 identity (fonts, gradient wordmark, lit-up effects). You then tweak from there.
 

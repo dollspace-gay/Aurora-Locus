@@ -128,7 +128,7 @@
 
     let html = '';
     // §11.11.3 / §4.6 — the wordmark carries .heading-aurora so a theme can
-    // paint it as a gradient logo (stack-classic does); the sober themes
+    // paint it as a gradient logo (aurora-classic does); the sober themes
     // leave it plain. Dormant until a theme styling it is served (B-themes-page).
     html += '<div class="logo">' +
             '  <h1 class="heading-aurora">Aurora Locus</h1>' +
@@ -234,7 +234,7 @@
   // AuroraSettings cache. Populates the theme picker and lets a 'follow
   // default' preference resolve to the deployment-default. Best-effort: on
   // failure the picker shows only 'Follow deployment default' and the cached
-  // default ('stack-classic') stands.
+  // default ('aurora-classic') stands.
   async function loadThemeRegistry() {
     if (!global.AuroraEndpoints || !global.AuroraSettings) return;
     try {
@@ -248,7 +248,7 @@
       if (d && typeof d.value === 'string' && d.value.trim()) {
         global.AuroraSettings.setDeploymentDefaultCache(d.value.trim());
       }
-    } catch (e) { /* cached default ('stack-classic') stands */ }
+    } catch (e) { /* cached default ('aurora-classic') stands */ }
   }
 
   // Rebuild the whole sidebar (nav + footer) and re-apply the active

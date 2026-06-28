@@ -455,7 +455,7 @@ impl ThemeRegistry {
 }
 
 /// Hoist `@import` statements to the top of a concatenated stylesheet. A
-/// theme's `tokens.css` may carry an `@import` (stack-classic loads
+/// theme's `tokens.css` may carry an `@import` (aurora-classic loads
 /// Google Fonts), but the chain concatenates leaf-last, so a leaf's `@import`
 /// lands mid-file where browsers ignore it (CSS requires `@import` before all
 /// other rules). This moves every line-leading `@import` to the front in source
@@ -1108,7 +1108,7 @@ mod tests {
         // The shipped themes must enumerate and pass the full validation
         // contract (steps 1–9) against the real on-disk files — this is the
         // accessibility/structure guard for the bundled palettes. The full
-        // v0.9 cohort: dark root + light + stack-classic + the 7 showcase
+        // v0.9 cohort: dark root + light + aurora-classic + the 7 showcase
         // themes (ember, emerald, glacier, meridian, high-contrast-dark,
         // high-contrast-light, pride).
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
@@ -1125,7 +1125,7 @@ mod tests {
 
         // The classic theme's gradient wordmark + resolved chain are present.
         let classic = reg
-            .resolve_effect_css("stack-classic")
+            .resolve_effect_css("aurora-classic")
             .expect("classic effects resolve");
         assert!(classic.contains(".heading-aurora"));
         assert!(classic.contains(".effect-focus-ring"), "inherits required focus-ring");
@@ -1167,13 +1167,13 @@ mod tests {
 
     #[test]
     fn classic_tokens_hoist_import_to_top() {
-        // stack-classic's @import is in its (leaf) tokens.css, so the
+        // aurora-classic's @import is in its (leaf) tokens.css, so the
         // root→leaf concatenation puts it mid-file; hoisting must lift it back
         // to the top where browsers honor it.
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
         let reg = ThemeRegistry::build(&bundled, Path::new("/nonexistent/operator"));
         let css = reg
-            .resolve_token_css("stack-classic")
+            .resolve_token_css("aurora-classic")
             .expect("classic resolves");
         // The Google Fonts @import (the only `@import url(...)`; the header
         // comment mentions the word in prose) must lead the stylesheet and
@@ -1185,6 +1185,59 @@ mod tests {
         let import_pos = css.find("@import url").expect("has the fonts import");
         let root_pos = css.find(":root").expect("has a :root block");
         assert!(import_pos < root_pos, "@import precedes the first :root rule");
+    }
+
+    #[test]
+    fn aurora_classic_replaces_stack_classic_in_registry() {
+        // #406 rename: the bundled classic theme is `aurora-classic`; the old
+        // `stack-classic` id must be gone (no stale dir, no stale manifest id),
+        // and aurora-classic must still resolve its signature gradient wordmark.
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
+        let reg = ThemeRegistry::build(&bundled, Path::new("/nonexistent/operator"));
+        let ids: Vec<String> = reg.list().into_iter().map(|m| m.theme_id).collect();
+        assert!(
+            ids.iter().any(|id| id == "aurora-classic"),
+            "aurora-classic present; got {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "stack-classic"),
+            "stack-classic fully renamed; got {ids:?}"
+        );
+        let classic = reg
+            .resolve_effect_css("aurora-classic")
+            .expect("aurora-classic effects resolve");
+        assert!(classic.contains(".heading-aurora"), "keeps the gradient wordmark");
+    }
+
+    #[test]
+    fn sidebar_tokens_derive_from_theme_surfaces() {
+        // #406: the sidebar token family is plumbed through each theme's own
+        // surface/text tokens in base tokens.css :root (so the rail coheres with
+        // the active palette), and the former hardcoded [data-theme="dark"]
+        // sidebar override is removed (auto-derivation, no bespoke). This guards
+        // the coherence contract structurally; actual contrast is guaranteed by
+        // wcag_certification_report (text-primary on surface-secondary/-tertiary).
+        let tokens = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/styles/tokens.css"),
+        )
+        .expect("base tokens.css readable");
+        for (token, anchor) in [
+            ("--sidebar-bg", "var(--color-surface-secondary)"),
+            ("--sidebar-text", "var(--color-text-primary)"),
+            ("--sidebar-active", "var(--color-surface-tertiary)"),
+            ("--sidebar-hover", "var(--color-surface-tertiary)"),
+        ] {
+            assert!(
+                tokens.contains(&format!("{token}: {anchor};")),
+                "{token} must derive from {anchor}"
+            );
+        }
+        // No hardcoded hex sidebar value survives (the slate default + the dark
+        // override are both gone — the family is purely derived now).
+        assert!(
+            !tokens.contains("--sidebar-bg: #"),
+            "no hardcoded --sidebar-bg hex remains"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@
     return global.AuroraDom ? global.AuroraDom.esc(s) : String(s);
   }
 
-  let currentDefault = 'stack-classic';
+  let currentDefault = 'aurora-classic';
   let listEl = null;
   let superFlag = false;
 

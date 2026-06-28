@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Admin UI reorganized into four domains (Moderation, Operations, Configuration, Kryphocron) with role-tiered dashboards, role- and mode-based visibility, and a reshaped sidebar, breadcrumbs, and routing
 - Customizable theming with manifest-based inheritance, a design-token contract, WCAG 2.2 contrast checking, an effect-class library, and theme selection in UI settings
-- Ten bundled themes — Dark, Light, Stack Classic (default), Ember, Emerald, Glacier, Meridian, Pride, and High Contrast Dark/Light — five dark and five light. All ten pass WCAG 2.2 AA contrast checks via the substrate's verifier; High Contrast Dark and Light clear AAA for text (7:1). Programmatic contrast only — not a full accessibility audit
+- Ten bundled themes — Dark, Light, Aurora Classic (default), Ember, Emerald, Glacier, Meridian, Pride, and High Contrast Dark/Light — five dark and five light. All ten pass WCAG 2.2 AA contrast checks via the substrate's verifier; High Contrast Dark and Light clear AAA for text (7:1). Programmatic contrast only — not a full accessibility audit
 - Login page now matches the deployment-default theme
 - Operator-customizable login splash branding: logo, banner, title, subtitle, and text colors, with a live preview
 - Theme extension points — themes can declare and provide named extension points that surfaces opt into at runtime
@@ -59,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator role changes now take effect on the next request, without requiring re-login
 - The Federation policy page distinguishes immediately-editable fields from restart-required fields, each with its own save flow; the "Relay binding" card is reframed as the boot seed (the live relay set is managed at Operations → Federation)
 - The audit log now records operator-triggered restarts, the automatic bulk DID-document update, and per-account DID-document retries
+- The bundled theme `stack-classic` is renamed to `aurora-classic` for brand coherence with the other Aurora-prefixed themes; its display name is now "Aurora Classic". It remains the deployment default. Operators with `stack-classic` as their preferred or deployment-default theme are migrated to `aurora-classic` automatically — personal preferences on next load, the deployment-default runtime setting by migration
 
 ### Deprecated
 
@@ -93,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Account search now filters by the search term instead of returning every account
 - Restored the installed-themes listing to the server's advertised capabilities
 - Audit-chain verification no longer reports entries written before the v0.9 hash-format change as tampered. The verifier now recognizes the pre-v0.9 canonical form, marks those rows verified, and keeps the per-row badge and chain banner green where they belong; the CLI chain report annotates how many entries (and which sequence range) verified under the legacy format. Only an entry matching neither the current nor the legacy form — a genuine tamper — halts the chain walk, and linkage is still checked across the format boundary
+- Admin UI sidebar background now matches each theme's palette. Previously the sidebar tokens were defined only in base CSS with a single `[data-theme="dark"]` override, so every non-dark theme rendered the sidebar with a cool-slate fallback regardless of palette. The sidebar token family now derives from each theme's surface and text tokens, so every theme — light, ember, emerald, glacier, meridian, pride, aurora-classic, high-contrast-light, high-contrast-dark — renders a sidebar that matches its palette and preserves WCAG AA contrast (the derived foreground/background pairs are ones the substrate's contrast gate already certifies)
 - Hardened intermittent time- and ordering-sensitive test failures
 
 ### Dependencies

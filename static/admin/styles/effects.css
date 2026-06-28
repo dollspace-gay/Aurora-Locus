@@ -19,7 +19,7 @@
  * but existing component markup is not yet rewired to consume it — surfaces
  * adopt effect classes incrementally as the bundled themes and Themes page land
  * (#216 / #217). Decorative effects are intentionally trivial here (the class
- * exists so surfaces applying it don't break); `aurora-stack-classic` lights
+ * exists so surfaces applying it don't break); `aurora-classic` lights
  * them up.
  */
 
@@ -142,8 +142,8 @@
   background-image: none;
 }
 
-/* The signature Aurora-Stack glow — off-by-default here (§11.9.2);
- * `aurora-stack-classic` overrides this with the full treatment. */
+/* The signature aurora glow — off-by-default here (§11.9.2);
+ * `aurora-classic` overrides this with the full treatment. */
 .effect-aurora-glow {
   box-shadow: none;
 }
