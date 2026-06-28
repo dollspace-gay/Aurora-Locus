@@ -260,14 +260,20 @@
     markActive((window.location.hash || '').replace(/^#\/?/, ''));
   }
 
-  // Mark the nav entry (item or group label) matching the current hash.
-  // Mirrors the router's own updateSidebarActive so a mode-driven
-  // re-render without navigation doesn't drop the highlight.
+  // Mark the nav entry (item or group label) matching the current hash. Shares
+  // the router's exact "longest matching route wins" resolution so a child page
+  // lights only its own entry, not a shorter sibling that shares its prefix
+  // (#411), and so a mode-driven re-render without navigation keeps the same
+  // highlight the router would set. Router loads before app.js (index.html), so
+  // the helper is present; absent it, nothing is marked rather than mis-marked.
   function markActive(hashPath) {
-    document.querySelectorAll('.sidebar [data-route]').forEach((el) => {
-      const r = el.dataset.route;
-      const active = (r === hashPath) || (r && hashPath.indexOf(r + '/') === 0);
-      el.classList.toggle('active', active);
+    const items = document.querySelectorAll('.sidebar [data-route]');
+    const routes = [];
+    items.forEach((el) => routes.push(el.dataset.route));
+    const resolve = global.AuroraRouter && global.AuroraRouter.resolveActiveRoute;
+    const best = resolve ? resolve(hashPath, routes) : null;
+    items.forEach((el) => {
+      el.classList.toggle('active', el.dataset.route === best);
     });
   }
 

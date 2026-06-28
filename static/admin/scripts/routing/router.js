@@ -244,12 +244,33 @@
     ]);
   }
 
+  // Pure: among `routes`, return the longest one that is `hashPath` itself or a
+  // true ancestor of it (a prefix at a '/' boundary), or null if none match.
+  // "Longest wins" is what makes a child page light only its own nav entry: on
+  // `ops/sequencer/recovery` both `ops/sequencer` (ancestor) and
+  // `ops/sequencer/recovery` (exact) match, and the exact, longer one wins — so
+  // the shorter sibling no longer lights alongside it (#411). A detail page with
+  // no nav entry of its own (e.g. `ops/accounts/<did>`) still lights its parent,
+  // since the parent is then the only — hence longest — match.
+  function resolveActiveRoute(hashPath, routes) {
+    let best = null;
+    for (const r of routes) {
+      if (r === hashPath || hashPath.startsWith(r + '/')) {
+        if (best === null || r.length > best.length) {
+          best = r;
+        }
+      }
+    }
+    return best;
+  }
+
   function updateSidebarActive(hashPath) {
     const items = document.querySelectorAll('.sidebar [data-route]');
+    const routes = [];
+    items.forEach((el) => routes.push(el.dataset.route));
+    const best = resolveActiveRoute(hashPath, routes);
     items.forEach((el) => {
-      const r = el.dataset.route;
-      const active = (r === hashPath) || hashPath.startsWith(r + '/');
-      el.classList.toggle('active', active);
+      el.classList.toggle('active', el.dataset.route === best);
     });
   }
 
@@ -272,6 +293,7 @@
     navigate: navigate,
     dispatch: dispatch,
     resolve: resolve,
+    resolveActiveRoute: resolveActiveRoute,
     start: start,
   };
 })(window);
