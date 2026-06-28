@@ -60,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Federation policy page distinguishes immediately-editable fields from restart-required fields, each with its own save flow; the "Relay binding" card is reframed as the boot seed (the live relay set is managed at Operations → Federation)
 - The audit log now records operator-triggered restarts, the automatic bulk DID-document update, and per-account DID-document retries
 - The bundled theme `stack-classic` is renamed to `aurora-classic` for brand coherence with the other Aurora-prefixed themes; its display name is now "Aurora Classic". It remains the deployment default. Operators with `stack-classic` as their preferred or deployment-default theme are migrated to `aurora-classic` automatically — personal preferences on next load, the deployment-default runtime setting by migration
+- The Aurora Classic theme now carries its Aurora Prism heritage identity instead of reading near-identical to Dark: a teal-forward tri-accent palette (teal `#00F5D4` primary, green `#9AEF82` secondary, purple `#B900F5` decoration), a teal→green→purple heading gradient, a diagonal body surface gradient, an ambient aurora-wave backdrop, teal accent glow on the primary action and dashboard cards, and a left-border-and-glow sidebar active state. Motion (the wave, hover lifts) is disabled under `prefers-reduced-motion`, and the theme still certifies WCAG 2.2 AA. The previous values were an authored approximation; these are drawn from the canonical Aurora Prism source
 
 ### Deprecated
 

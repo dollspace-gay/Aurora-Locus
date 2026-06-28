@@ -1241,6 +1241,36 @@ mod tests {
     }
 
     #[test]
+    fn aurora_classic_carries_prism_teal_identity() {
+        // #409 Prism-fidelity: aurora-classic's identity is the teal-forward
+        // tri-accent + the teal→green→purple heading gradient + the heritage
+        // treatments (ambient wave, left-border sidebar active). Lock the
+        // canonical Prism values so a future edit can't silently revert the
+        // accent or drop the heritage layer. (WCAG AA is covered separately by
+        // wcag_certification_report.)
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
+        let reg = ThemeRegistry::build(&bundled, Path::new("/nonexistent/operator"));
+        let tokens = reg.resolve_token_css("aurora-classic").expect("tokens resolve");
+        assert!(
+            tokens.contains("--color-accent-primary: #00f5d4"),
+            "primary accent is Prism teal"
+        );
+        assert!(
+            tokens.contains("--color-accent-secondary: #9aef82"),
+            "secondary accent is Prism green"
+        );
+        let effects = reg.resolve_effect_css("aurora-classic").expect("effects resolve");
+        for hue in ["#00f5d4", "#9aef82", "#b900f5"] {
+            assert!(effects.contains(hue), "heading gradient carries {hue}");
+        }
+        assert!(effects.contains("aurora-rotate"), "ambient aurora wave present");
+        assert!(
+            effects.contains("[data-theme=\"aurora-classic\"] .nav-item.active"),
+            "Prism left-border sidebar active state present"
+        );
+    }
+
+    #[test]
     fn version_gt_basics() {
         assert!(version_gt("1.1", "1.0"));
         assert!(version_gt("2.0", "1.9"));

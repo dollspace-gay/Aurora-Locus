@@ -1,24 +1,39 @@
 /*
- * aurora-classic — effect overrides + the gradient wordmark (§11.11.3).
+ * aurora-classic — effect overrides, the gradient wordmark, and the Aurora
+ * Prism heritage treatments (§11.11.3 / recon #409).
  *
- * The full Aurora effect library lit up: a visible aurora-glow, the pronounced
- * gradient-plus-blur frosted glass (§11.6.3), real decorative textures, and the
- * signature gradient wordmark (.heading-aurora — a theme-specific class the
- * sidebar applies, no-op under the sober themes). Required classes (focus-ring,
- * surface-elevation) are inherited from dark.
+ * Two layers:
+ *  1. Effect-class library overrides (.heading-aurora, .effect-*) — opt-in
+ *     classes the substrate surfaces consume; the sober themes leave them flat.
+ *  2. Theme-scoped Prism heritage — [data-theme="aurora-classic"] rules that
+ *     retreat Prism's body gradient, ambient aurora wave, accent glow, and
+ *     left-border sidebar active state onto aurora-locus's real selectors.
+ *     They are [data-theme]-scoped because this file (active-effects.css) loads
+ *     BEFORE base.css/components.css, so the prefix is what wins specificity
+ *     over the base component rules — source order alone would lose.
+ *
+ * Motion: the framework-wide prefers-reduced-motion block in tokens.css collapses
+ * every animation/transition to instant, so the aurora wave goes static there
+ * automatically; the explicit reduced-motion rule below additionally removes the
+ * hover-lift displacement (transform), which that block does not cover.
+ *
+ * Required classes (focus-ring, surface-elevation) are inherited from dark.
  */
 
-/* The signature gradient wordmark. The sidebar <h1> carries .heading-aurora;
- * only this theme paints it (dark/light leave it plain). */
+/* The signature gradient wordmark — Aurora Prism teal→green→purple. The sidebar
+ * <h1> carries .heading-aurora; only this theme paints it. Verify: this is text
+ * via background-clip, so the mid-gradient hues must stay legible on surface —
+ * teal/green/purple are all bright on the deep-space-blue surface. */
 .heading-aurora {
-  background: linear-gradient(135deg, #6c7cff 0%, #a06cff 50%, #4cc9f0 100%);
+  background: linear-gradient(90deg, #00f5d4 0%, #9aef82 50%, #b900f5 100%);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
   color: transparent;
 }
 
-/* Pronounced frosted glass — gradient + saturated blur (§11.6.3 classic). */
+/* Pronounced frosted glass — gradient + saturated blur (§11.6.3 classic).
+ * Accent-driven, so it tracks the teal accent automatically. */
 .effect-frosted-glass {
   background: linear-gradient(
     135deg,
@@ -30,19 +45,19 @@
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 10%, transparent);
 }
 
-/* The signature aurora glow — a visible multi-hue backdrop halo. */
+/* The signature aurora glow — a visible teal+purple multi-hue backdrop halo. */
 .effect-aurora-glow {
   box-shadow:
     0 0 40px color-mix(in srgb, var(--color-accent-primary) 30%, transparent),
-    0 0 80px color-mix(in srgb, #a06cff 18%, transparent);
+    0 0 80px color-mix(in srgb, #b900f5 18%, transparent);
 }
 
-/* Richer accent gradient. */
+/* Richer accent gradient — teal into purple. */
 .effect-gradient-accent {
   background: linear-gradient(
     135deg,
     color-mix(in srgb, var(--color-surface-secondary) 80%, var(--color-accent-primary) 20%),
-    color-mix(in srgb, var(--color-surface-secondary) 88%, #a06cff 12%)
+    color-mix(in srgb, var(--color-surface-secondary) 88%, #b900f5 12%)
   );
 }
 
@@ -70,4 +85,101 @@
     linear-gradient(color-mix(in srgb, var(--color-accent-primary) 6%, transparent) 1px, transparent 1px),
     linear-gradient(90deg, color-mix(in srgb, var(--color-accent-primary) 6%, transparent) 1px, transparent 1px);
   background-size: 24px 24px;
+}
+
+/* ==================================================================== *
+ * Aurora Prism heritage — theme-scoped (Prism §3–§7)
+ * ==================================================================== */
+
+/* §3 Body surface gradient — diagonal between surface-primary and -secondary
+ * (the two-tier surface rule). Fixed attachment so it spans the viewport. */
+[data-theme="aurora-classic"] body {
+  background: linear-gradient(
+    135deg,
+    var(--color-surface-primary) 0%,
+    var(--color-surface-secondary) 100%
+  );
+  background-attachment: fixed;
+}
+
+/* §6 Ambient aurora wave — a slow-rotating radial teal halo behind content.
+ * z-index:-1 paints it above the body background but below in-flow content.
+ * Oversized (200%, offset -50%) so the rotation never reveals a corner.
+ * Motion is gated by the framework-wide reduced-motion block (tokens.css). */
+[data-theme="aurora-classic"] body::before {
+  content: "";
+  position: fixed;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(0, 245, 212, 0.08) 0%,
+    transparent 70%
+  );
+  animation: aurora-rotate 20s linear infinite;
+}
+
+@keyframes aurora-rotate {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* §4 Primary CTA glow — teal halo at rest, intensifying + lifting on hover.
+ * The button is already teal-filled with dark text via the accent token. */
+[data-theme="aurora-classic"] .btn-primary {
+  box-shadow: 0 0 12px rgba(0, 245, 212, 0.6);
+}
+
+[data-theme="aurora-classic"] .btn-primary:hover {
+  box-shadow: 0 0 20px rgba(0, 245, 212, 0.8);
+  transform: translateY(-2px);
+}
+
+/* §5 Sidebar active item — Prism's left-border + glow, NOT a fill block. Teal
+ * text on a faint teal wash; every nav item reserves a 2px transparent left
+ * border so active/inactive don't shift. Teal-on-wash measures ~10:1 (AA). */
+[data-theme="aurora-classic"] .nav-item {
+  border-left: 2px solid transparent;
+}
+
+[data-theme="aurora-classic"] .nav-item.active {
+  background: rgba(0, 245, 212, 0.1);
+  color: var(--color-accent-primary);
+  border-left: 2px solid var(--color-accent-primary);
+  box-shadow: inset 0 0 16px rgba(0, 245, 212, 0.3);
+}
+
+/* §4 Card hover — teal border + glow + lift on the dashboard display cards.
+ * Scoped to the showcase surfaces (stat/chart/activity/table); dense form
+ * panels (settings-card) are left calm so frequent interaction doesn't jitter. */
+[data-theme="aurora-classic"] .stat-card,
+[data-theme="aurora-classic"] .chart-card,
+[data-theme="aurora-classic"] .activity-card,
+[data-theme="aurora-classic"] .table-card {
+  transition: border-color 200ms ease, box-shadow 200ms ease, transform 200ms ease;
+}
+
+[data-theme="aurora-classic"] .stat-card:hover,
+[data-theme="aurora-classic"] .chart-card:hover,
+[data-theme="aurora-classic"] .activity-card:hover,
+[data-theme="aurora-classic"] .table-card:hover {
+  border-color: rgba(0, 245, 212, 0.4);
+  box-shadow: 0 0 16px rgba(0, 245, 212, 0.4);
+  transform: translateY(-4px);
+}
+
+/* §7 Reduced-motion — remove the hover-lift displacement (the framework block
+ * only collapses duration, not the transform itself). */
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="aurora-classic"] .btn-primary:hover,
+  [data-theme="aurora-classic"] .stat-card:hover,
+  [data-theme="aurora-classic"] .chart-card:hover,
+  [data-theme="aurora-classic"] .activity-card:hover,
+  [data-theme="aurora-classic"] .table-card:hover {
+    transform: none;
+  }
 }
