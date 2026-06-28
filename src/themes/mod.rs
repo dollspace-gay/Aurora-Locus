@@ -928,7 +928,7 @@ mod tests {
     /// white, every color foreground is black (21:1), and non-color tokens get
     /// a placeholder. Keeps validation fixtures valid under step 9.
     fn all_required_css() -> String {
-        REQUIRED_TOKENS
+        let mut css = REQUIRED_TOKENS
             .iter()
             .map(|t| {
                 let val = match *t {
@@ -942,7 +942,12 @@ mod tests {
                 format!("{t}: {val};")
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        // --color-link / --color-link-hover are contrast-gated (link-as-text on
+        // surface-primary) but not required tokens; supply them as black
+        // foregrounds so the white surface fixtures clear AA (#410).
+        css.push_str("\n--color-link: #000000;\n--color-link-hover: #000000;");
+        css
     }
 
     fn tmp(tag: &str) -> PathBuf {
@@ -1267,6 +1272,37 @@ mod tests {
         assert!(
             effects.contains("[data-theme=\"aurora-classic\"] .nav-item.active"),
             "Prism left-border sidebar active state present"
+        );
+    }
+
+    #[test]
+    fn inline_links_route_through_theme_link_token() {
+        // #410: the global `a` rule derives from --color-link (defaulted to the
+        // accent in the dark root, overridden by pride where the accent reads
+        // too light as text). WCAG AA on link-as-text is enforced for all 10
+        // themes by wcag_certification_report via the --color-link cert pairs;
+        // this locks the CSS wiring + the token definitions.
+        let base = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/styles/base.css"),
+        )
+        .expect("base.css readable");
+        assert!(base.contains("color: var(--color-link)"), "a routes through --color-link");
+        assert!(
+            base.contains("color: var(--color-link-hover)"),
+            "a:hover routes through --color-link-hover"
+        );
+        for carve in [".btn-primary", ".nav-item", ".stat-card-link"] {
+            assert!(base.contains(carve), "link carve-out {carve} present");
+        }
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/admin/themes");
+        let reg = ThemeRegistry::build(&bundled, Path::new("/nonexistent/operator"));
+        assert!(
+            reg.resolve_token_css("dark").unwrap().contains("--color-link:"),
+            "dark root defines --color-link (inherited by every theme)"
+        );
+        assert!(
+            reg.resolve_token_css("pride").unwrap().contains("--color-link: #a8155a"),
+            "pride overrides --color-link to an AA-safe value"
         );
     }
 

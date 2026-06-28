@@ -46,6 +46,11 @@
   --color-accent-primary-active: #1d4ed8;
   --color-accent-secondary: #64748b;   /* secondary interactive */
 
+  /* Inline-link color (#410) — default before the active theme's tokens load;
+   * the active theme (always extends dark, which redefines these) overrides. */
+  --color-link: var(--color-accent-primary);
+  --color-link-hover: var(--color-accent-primary-hover);
+
   /* Status (4) */
   --color-status-success: #10b981;
   --color-status-warning: #f59e0b;

@@ -26,6 +26,13 @@
   --color-accent-primary-active: #4f7adb;
   --color-accent-secondary: #828b9c;
 
+  /* Inline-link color (#410). Defined on the root so every theme inherits it;
+   * defaults to the interactive accent. A theme whose accent is too light as
+   * body-sized text on its surface overrides these (see pride). The WCAG gate
+   * checks both against surface-primary at 4.5:1. */
+  --color-link: var(--color-accent-primary);
+  --color-link-hover: var(--color-accent-primary-hover);
+
   /* Status */
   --color-status-success: #4ade80;
   --color-status-warning: #fbbf24;

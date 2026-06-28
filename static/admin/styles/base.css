@@ -19,6 +19,53 @@ body {
   line-height: var(--line-height-normal);
 }
 
+/* Inline links (#410) — route through each theme's link token so every theme
+ * renders contextual <a> in its own palette instead of the browser default.
+ * --color-link defaults to the interactive accent (dark root); pride overrides
+ * it to clear AA as text. Underlined per WCAG 1.4.1 (distinguishable by more
+ * than colour). Anchors styled as buttons / nav / row-wrappers opt out below. */
+a {
+  color: var(--color-link);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  transition: color var(--transition-fast, 150ms ease);
+}
+
+a:hover {
+  color: var(--color-link-hover);
+}
+
+a:active {
+  color: var(--color-accent-primary-active);
+}
+
+a:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Carve-outs: anchors that are buttons, sidebar nav, or whole-row/card wrappers
+ * carry their own colour and must not be underlined. (.toast-action and
+ * .entity-ref already style themselves as accent links and are intentionally
+ * left alone.) */
+.btn-primary,
+.btn-secondary,
+.btn-logout,
+.nav-item,
+.nav-section-link,
+.stat-card-link,
+.activity-item {
+  text-decoration: none;
+}
+
+.nav-section-link,
+.stat-card-link,
+.activity-item {
+  color: inherit;
+}
+
 /* Layout */
 .admin-container {
   display: flex;

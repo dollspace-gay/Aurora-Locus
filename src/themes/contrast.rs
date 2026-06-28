@@ -23,6 +23,13 @@ const CONTRAST_PAIRS: &[(&str, &str, f64)] = &[
     ("--color-text-secondary", "--color-surface-secondary", 4.5),
     ("--color-text-tertiary", "--color-surface-primary", 3.0),
     ("--color-text-inverted", "--color-accent-primary", 4.5),
+    // Inline links render the accent as TEXT on the page surface — a distinct
+    // role from the accent-as-fill pair above, so it carries its own 4.5 text
+    // check (#410). `--color-link` defaults to `--color-accent-primary`; a theme
+    // whose accent reads too light as text (e.g. pride) overrides `--color-link`
+    // to a darker AA-safe value without disturbing its button-fill accent.
+    ("--color-link", "--color-surface-primary", 4.5),
+    ("--color-link-hover", "--color-surface-primary", 4.5),
     ("--color-border-focus", "--color-surface-primary", 3.0),
     ("--color-border-focus", "--color-surface-secondary", 3.0),
     ("--color-status-success", "--color-surface-primary", 3.0),

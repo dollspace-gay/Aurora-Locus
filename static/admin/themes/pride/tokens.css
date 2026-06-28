@@ -33,6 +33,12 @@
   --color-accent-primary-active: #a8155a;
   --color-accent-secondary: #857b68;
 
+  /* The flag-pink accent reads at 4.41:1 as body-sized link text on the cream
+   * surface — just under AA. Links override to deeper pinks that clear 4.5:1
+   * (5.95:1 / 8.0:1) without changing the button-fill accent above (#410). */
+  --color-link: #a8155a;
+  --color-link-hover: #851146;
+
   /* Status — redone for the cream base (deepened so they clear contrast on the
    * darker-than-white surfaces). */
   --color-status-success: #1f7a3f;
