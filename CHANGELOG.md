@@ -7,13 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.0] - 2026-06-19
+## [0.9.0] - 2026-06-28
 
 ### Added
 
 - Admin UI reorganized into four domains (Moderation, Operations, Configuration, Kryphocron) with role-tiered dashboards, role- and mode-based visibility, and a reshaped sidebar, breadcrumbs, and routing
 - Customizable theming with manifest-based inheritance, a design-token contract, WCAG 2.2 contrast checking, an effect-class library, and theme selection in UI settings
-- Ten bundled themes — Dark, Light, Aurora Classic (default), Ember, Emerald, Glacier, Meridian, Pride, and High Contrast Dark/Light — five dark and five light. All ten pass WCAG 2.2 AA contrast checks via the substrate's verifier; High Contrast Dark and Light clear AAA for text (7:1). Programmatic contrast only — not a full accessibility audit
+- Ten bundled themes — Dark, Light, Aurora Classic (default), Ember, Emerald, Glacier, Meridian, Pride, High Contrast Dark, and High Contrast Light. All ten pass WCAG 2.2 AA contrast checks via the substrate's verifier; High Contrast Dark and Light clear AAA for text (7:1). Programmatic contrast only — not a full accessibility audit
 - Login page now matches the deployment-default theme
 - Operator-customizable login splash branding: logo, banner, title, subtitle, and text colors, with a live preview
 - Theme extension points — themes can declare and provide named extension points that surfaces opt into at runtime
@@ -60,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Federation policy page distinguishes immediately-editable fields from restart-required fields, each with its own save flow; the "Relay binding" card is reframed as the boot seed (the live relay set is managed at Operations → Federation)
 - The audit log now records operator-triggered restarts, the automatic bulk DID-document update, and per-account DID-document retries
 - The bundled theme `stack-classic` is renamed to `aurora-classic` for brand coherence with the other Aurora-prefixed themes; its display name is now "Aurora Classic". It remains the deployment default. Operators with `stack-classic` as their preferred or deployment-default theme are migrated to `aurora-classic` automatically — personal preferences on next load, the deployment-default runtime setting by migration
-- The Aurora Classic theme now carries its Aurora Prism heritage identity instead of reading near-identical to Dark: a teal-forward tri-accent palette (teal `#00F5D4` primary, green `#9AEF82` secondary, purple `#B900F5` decoration), a teal→green→purple heading gradient, a diagonal body surface gradient, an ambient aurora-wave backdrop, teal accent glow on the primary action and dashboard cards, and a left-border-and-glow sidebar active state. Motion (the wave, hover lifts) is disabled under `prefers-reduced-motion`, and the theme still certifies WCAG 2.2 AA. The previous values were an authored approximation; these are drawn from the canonical Aurora Prism source
+- The Aurora Classic theme now carries an Aurora color scheme instead of reading near-identical to Dark: a teal-forward tri-accent palette (teal `#00F5D4` primary, green `#9AEF82` secondary, purple `#B900F5` decoration), a teal→green→purple heading gradient, a diagonal body surface gradient, an ambient aurora-wave backdrop, teal accent glow on the primary action and dashboard cards, and a left-border-and-glow sidebar active state. Motion (the wave, hover lifts) is disabled under `prefers-reduced-motion`, and the theme still certifies WCAG 2.2 AA
 
 ### Deprecated
 
@@ -98,7 +98,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Admin UI sidebar background now matches each theme's palette. Previously the sidebar tokens were defined only in base CSS with a single `[data-theme="dark"]` override, so every non-dark theme rendered the sidebar with a cool-slate fallback regardless of palette. The sidebar token family now derives from each theme's surface and text tokens, so every theme — light, ember, emerald, glacier, meridian, pride, aurora-classic, high-contrast-light, high-contrast-dark — renders a sidebar that matches its palette and preserves WCAG AA contrast (the derived foreground/background pairs are ones the substrate's contrast gate already certifies)
 - Inline links throughout the admin UI now render in each theme's palette instead of falling through to the browser-default dim purple. Link colour derives from a new `--color-link` token (defaulted to the theme's interactive accent), so all ten themes get coherent, underlined links without per-theme work; anchors styled as buttons, sidebar nav, or row wrappers keep their own styling. Link-as-text contrast is now part of the substrate's WCAG gate — every theme is certified AA for links against its page surface, and the one theme whose accent read too light as text (Pride) gets a slightly deeper link colour that clears AA
 - Sidebar nav items now use exact "longest matching route wins" matching for their active state. Previously, opening Sequencer recovery (route `ops/sequencer/recovery`) lit both the Sequencer item and the Sequencer recovery item, because a nav item also lit whenever the current path was nested under its route. Now a page lights only its own nav entry, while a detail page with no nav entry of its own (e.g. an account-detail page) still lights its parent
-- Hardened intermittent time- and ordering-sensitive test failures
 
 ### Dependencies
 
