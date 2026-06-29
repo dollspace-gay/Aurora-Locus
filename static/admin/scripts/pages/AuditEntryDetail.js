@@ -9,26 +9,34 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#mod/audit">Moderation</a> <span class="breadcrumb-sep">›</span> <a href="#mod/audit">Audit</a> <span class="breadcrumb-sep">›</span> #' + esc(id) + '</nav>' +
       '<header class="page-header"><div><h2>Audit entry #' + esc(id) + '</h2></div></header>' +
-      '<div id="aed-body"><p class="empty-state">Loading…</p></div>';
+      '<div id="aed-body">' + global.AuroraSkeleton.lines(4) + '</div>';
 
-    const cached = (window._auditCache || {})[id];
-    if (cached) renderBody(cached);
-    else {
-      try {
-        // Server-side getAuditEntry would ideally exist; fall back to
-        // listing first 25 with the id filter and matching client-side.
-        const data = await global.AuroraEndpoints.admin.getAuditTrail({ limit: 100 });
-        const items = (data && data.items) || [];
-        const entry = items.find((e) => String(e.id) === String(id));
-        if (entry) renderBody(entry);
-        else document.getElementById('aed-body').innerHTML =
-          '<p class="empty-state">Entry not in current page. Use Audit page filters to narrow.</p>';
-      } catch (e) {
-        document.getElementById('aed-body').innerHTML =
-          '<p class="empty-state">Could not load entry: ' + esc(e && e.message) + '</p>';
-      }
-    }
+    // #359: always fetch from the server (getAuditEntry). The page no longer
+    // depends on a list-populated window._auditCache, so a deep link or a
+    // refresh resolves the entry directly rather than degrading on a miss.
+    await loadEntry(id);
     return {};
+  }
+
+  async function loadEntry(id) {
+    const body = document.getElementById('aed-body');
+    if (!body) return;
+    body.innerHTML = global.AuroraSkeleton.lines(4);
+    try {
+      const entry = await global.AuroraEndpoints.admin.getAuditEntry({ id: id });
+      renderBody(entry);
+    } catch (e) {
+      // A 404 (entry id doesn't exist) is a distinct, expected outcome from a
+      // transport failure — surface it as an empty state, not a retry boundary.
+      if (e && e.status === 404) {
+        body.innerHTML = '<p class="empty-state">No audit entry #' + esc(id) + '.</p>';
+        return;
+      }
+      global.AuroraErrorBoundary.mount(body, {
+        message: 'Could not load entry: ' + ((e && e.message) || ''),
+        onRetry: function () { loadEntry(id); },
+      });
+    }
   }
 
   function renderBody(e) {
@@ -46,7 +54,7 @@
       '  <h3>Entry detail</h3>' +
       '  <dl style="font-size: 0.875rem;">' +
       '    <dt>Sequence</dt><dd>' + esc(e.sequence) + '</dd>' +
-      '    <dt>Timestamp</dt><dd>' + esc(fmt ? fmt.date(e.timestamp, 'medium') : e.timestamp) + '</dd>' +
+      '    <dt>Timestamp</dt><dd>' + global.AuroraTimestamp.render({ value: e.timestamp, context: 'forensic' }) + '</dd>' +
       '    <dt>Actor DID</dt><dd>' + (e.actorDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(e.actorDid) : '<code>' + esc(e.actorDid) + '</code>') : '—') + '</dd>' +
       '    <dt>Action</dt><dd>' + esc(e.action) + '</dd>' +
       '    <dt>Rationale</dt><dd>' + esc(e.rationale) + '</dd>' +
@@ -93,14 +101,25 @@
            '<ul class="audit-cascade-list">' + items + '</ul>';
   }
 
-  function walkChainTo(prevHash) {
-    const items = window._auditCache || {};
-    const target = Object.values(items).find((e) => e.currentHash === prevHash);
-    if (target) {
-      if (global.AuroraRouter) global.AuroraRouter.navigate('mod/audit/' + encodeURIComponent(target.id));
-      return;
+  // #359: resolve the previous entry server-side by its hash (getAuditEntry's
+  // `hash` selector) and navigate to it — no longer bounded to entries already
+  // in a page cache, so the walk reaches arbitrarily far back.
+  async function walkChainTo(prevHash) {
+    if (!prevHash) return;
+    try {
+      const target = await global.AuroraEndpoints.admin.getAuditEntry({ hash: prevHash });
+      if (target && target.id != null && global.AuroraRouter) {
+        global.AuroraRouter.navigate('mod/audit/' + encodeURIComponent(target.id));
+      }
+    } catch (e) {
+      if (global.AuroraToast) {
+        global.AuroraToast.warning(
+          e && e.status === 404
+            ? 'Previous entry not found (it may have been pruned).'
+            : 'Could not load the previous entry: ' + ((e && e.message) || ''),
+        );
+      }
     }
-    if (global.AuroraToast) global.AuroraToast.warning('Previous entry not in current page cache. Use filters to narrow to the previous range.');
   }
 
   function esc(s) { return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s); }

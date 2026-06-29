@@ -13,29 +13,38 @@
       '  <p class="meta"><code>' + esc(cid) + '</code></p>' +
       '</header>' +
       '<div class="detail-layout">' +
-      '  <div class="detail-primary" id="bd-primary"><p class="empty-state">Loading…</p></div>' +
+      '  <div class="detail-primary" id="bd-primary">' + global.AuroraSkeleton.lines(4) + '</div>' +
       '  <aside class="detail-rail" aria-label="Context">' +
-      '    <div class="rail-card" id="bd-owner"><h4>Owning account</h4><p class="empty-state">Loading…</p></div>' +
-      '    <div class="rail-card"><h4>References</h4><p class="empty-state" id="bd-references">Loading…</p></div>' +
+      '    <div class="rail-card" id="bd-owner"><h4>Owning account</h4>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '    <div class="rail-card"><h4>References</h4><div id="bd-references">' + global.AuroraSkeleton.lines(2) + '</div></div>' +
       '  </aside>' +
       '</div>';
+    await loadBlob(cid);
+    return {};
+  }
+
+  async function loadBlob(cid) {
+    const primary = document.getElementById('bd-primary');
+    if (!primary) return;
+    primary.innerHTML = global.AuroraSkeleton.lines(4);
     try {
       const data = await global.AuroraEndpoints.ops.listBlobs({ cid: cid, limit: 1 });
       const blobs = (data && data.blobs) || [];
       const blob = blobs[0];
       if (!blob) {
-        document.getElementById('bd-primary').innerHTML = '<p class="empty-state">Blob not found on this PDS.</p>';
-        return {};
+        primary.innerHTML = '<p class="empty-state">Blob not found on this PDS.</p>';
+        return;
       }
       renderPrimary(blob, cid);
       renderOwner(blob.did);
       document.getElementById('bd-references').textContent =
         (blob.referenceCount != null ? String(blob.referenceCount) + ' references' : 'Reference count unavailable.');
     } catch (e) {
-      document.getElementById('bd-primary').innerHTML =
-        '<p class="empty-state">Could not load blob: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(primary, {
+        message: 'Could not load blob: ' + ((e && e.message) || ''),
+        onRetry: function () { loadBlob(cid); },
+      });
     }
-    return {};
   }
 
   function renderPrimary(blob, cid) {
@@ -51,7 +60,7 @@
       '  <p><strong>CID:</strong> <code>' + esc(cid) + '</code></p>' +
       '  <p><strong>Mime:</strong> ' + esc(blob.mimeType || 'unknown') + '</p>' +
       '  <p><strong>Size:</strong> ' + esc(fmt ? fmt.bytes(blob.size) : (blob.size || '')) + '</p>' +
-      '  <p><strong>Created:</strong> ' + esc(fmt ? fmt.date(blob.createdAt, 'medium') : blob.createdAt || '') + '</p>' +
+      '  <p><strong>Created:</strong> ' + global.AuroraTimestamp.render({ value: blob.createdAt, context: 'detail' }) + '</p>' +
       '</div>' +
       (previewSrc ? '<div class="settings-card" style="margin-top: 1rem;">' +
         '<h3>Preview</h3>' +

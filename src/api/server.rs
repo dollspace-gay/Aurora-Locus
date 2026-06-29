@@ -253,6 +253,31 @@ async fn create_account(
         }
     }
 
+    // Default audience auto-create (#334 / §6.6.2 item 2 / §7.3.3): when the
+    // deployment's default-audience-mode is a participating mode, author a
+    // policy.audience record on the new account carrying that initial mode (the
+    // holder populates its members later). The `nobody` default authors nothing
+    // (the prior behavior). Best-effort: a failure is logged but never fails
+    // account creation — the account and its repo already exist.
+    if let Some(mode) = crate::kryphocron_policy::default_audience_mode(&ctx.account_db).await {
+        match crate::api::kryphocron_endpoints::author_default_audience(&ctx, &account.did, &mode)
+            .await
+        {
+            Ok(uri) => tracing::info!(
+                did = %account.did,
+                mode = %mode,
+                uri = %uri,
+                "create_account: authored default policy.audience"
+            ),
+            Err(e) => tracing::warn!(
+                did = %account.did,
+                mode = %mode,
+                error = %e,
+                "create_account: default audience auto-create failed (account created OK)"
+            ),
+        }
+    }
+
     // Generate and send email verification token if email was provided
     if let Some(email_val) = &email {
         if ctx.mailer.is_configured() {
@@ -377,6 +402,19 @@ async fn get_session(
     let unified = middleware::require_auth_forwarded(State(ctx.clone()), headers.clone()).await?;
     let did = unified.did().to_string();
 
+    // #297 — the caller's operator role, for the admin UI's live tier
+    // resolution. Looked up locally from `admin_roles` regardless of entryway
+    // mode (the role table is this PDS's, not the entryway's); `None` for
+    // regular accounts → the field is omitted (standard session shape). Fail
+    // soft: a lookup error degrades to no role rather than failing the session.
+    let role = ctx
+        .admin_role_manager
+        .get_role(&did)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.role.as_str().to_string());
+
     // Arc 12 §5.3.8 mint-pattern forward. Entryway is the canonical
     // source of session info in entryway mode (it owns the account
     // identity).
@@ -384,13 +422,16 @@ async fn get_session(
         let fwd_headers = ctx
             .entryway_auth_headers(&did, "com.atproto.server.getSession")
             .await?;
-        let resp: SessionInfo = entryway
+        let mut resp: SessionInfo = entryway
             .xrpc_get_json("com.atproto.server.getSession", fwd_headers, &[])
             .await?;
+        // The entryway owns identity but not this PDS's operator roles — graft
+        // the locally-resolved role onto the forwarded session.
+        resp.role = role;
         return Ok(Json(resp));
     }
 
-    // Standalone path (unchanged).
+    // Standalone path.
     let account = ctx.account_manager.get_account(&did).await?;
 
     Ok(Json(SessionInfo {
@@ -398,6 +439,7 @@ async fn get_session(
         handle: account.handle.unwrap_or_default(),
         email: account.email,
         email_confirmed: Some(account.email_confirmed_at.is_some()),
+        role,
     }))
 }
 
@@ -1250,6 +1292,30 @@ struct DescribeServerResponse {
     /// Links (e.g., privacy policy, terms of service)
     #[serde(skip_serializing_if = "Option::is_none")]
     links: Option<DescribeServerLinks>,
+    /// Aurora-Locus additive extension (#344): minimal federation posture for
+    /// any ATProto peer. NOT part of upstream's canonical describeServer —
+    /// Bluesky's spec does not define this field; Aurora-Locus declares it
+    /// (response-additive, so clients that don't know it ignore it). It always
+    /// reflects the substrate's *enforced* federation state; future
+    /// runtime-mutable federation policy won't change this field's semantic. If
+    /// upstream ever adds a `federation` field with a different shape, realign.
+    /// Richer Aurora-aware posture (relay URLs, appview/public URL) lives on the
+    /// federation-scoped `com.aurora.federation.describePosture`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    federation: Option<FederationDescribe>,
+}
+
+/// The `federation` extension block on `describeServer` (#344). Minimal by
+/// design: when federation is off, only `enabled: false` is emitted (URLs and
+/// flags are omitted — the off-posture is itself the information a peer needs).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FederationDescribe {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    firehose_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crawl_enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1266,12 +1332,40 @@ struct DescribeServerLinks {
 /// Returns server metadata, DID, and available authentication methods.
 /// This is a public endpoint used for federation discovery.
 async fn describe_server(State(ctx): State<AppContext>) -> PdsResult<Json<DescribeServerResponse>> {
+    // v0.9 Federation runtime-mutability arc Phase A (#387): firehose_enabled
+    // resolves the runtime override (→ env-config fallback) so the advertised
+    // describe flag reflects operator changes without a restart.
+    let firehose_enabled = crate::api::aurora_admin::resolve_federation_flag(
+        &ctx,
+        crate::api::aurora_admin::FEDERATION_FIREHOSE_ENABLED_KEY,
+        ctx.config.federation.firehose_enabled,
+    )
+    .await;
+    // Phase A (#388): crawl_enabled resolves the runtime override (→ config).
+    let crawl_enabled = crate::api::aurora_admin::resolve_federation_flag(
+        &ctx,
+        crate::api::aurora_admin::FEDERATION_CRAWL_ENABLED_KEY,
+        ctx.config.federation.crawl_enabled,
+    )
+    .await;
     Ok(Json(DescribeServerResponse {
         did: ctx.config.service.service_did.clone(),
         available_user_domains: ctx.config.identity.service_handle_domains.clone(),
         invite_code_required: Some(ctx.config.invites.required),
         phone_verification_required: Some(false), // Not implemented yet
         links: None,                              // TODO: Add from config if available
+        federation: {
+            // §2.1 (#397): report the effective gate (runtime override resolved
+            // at boot), not the immutable env config, so describeServer matches
+            // actual subsystem posture after a save-and-restart toggle.
+            let on = ctx.federation_enabled;
+            // enabled always present; flags only when on (off-posture = enabled:false alone).
+            Some(FederationDescribe {
+                enabled: on,
+                firehose_enabled: on.then_some(firehose_enabled),
+                crawl_enabled: on.then_some(crawl_enabled),
+            })
+        },
     }))
 }
 
@@ -1795,4 +1889,41 @@ async fn reserve_signing_key(
     );
 
     Ok(Json(ReserveSigningKeyResponse { signing_key }))
+}
+
+#[cfg(test)]
+mod describe_server_federation_tests {
+    use super::*;
+
+    // #344 — the describeServer `federation` extension wire shape. When
+    // federation is off, the block is `{enabled: false}` alone (flags omitted —
+    // the off-posture is itself the signal a peer needs).
+    #[test]
+    fn federation_off_emits_enabled_false_only() {
+        let v = serde_json::to_value(FederationDescribe {
+            enabled: false,
+            firehose_enabled: None,
+            crawl_enabled: None,
+        })
+        .unwrap();
+        assert_eq!(v["enabled"], false);
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            1,
+            "off-posture is enabled:false alone: {v}"
+        );
+    }
+
+    #[test]
+    fn federation_on_emits_camelcase_flags() {
+        let v = serde_json::to_value(FederationDescribe {
+            enabled: true,
+            firehose_enabled: Some(true),
+            crawl_enabled: Some(false),
+        })
+        .unwrap();
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["firehoseEnabled"], true);
+        assert_eq!(v["crawlEnabled"], false);
+    }
 }

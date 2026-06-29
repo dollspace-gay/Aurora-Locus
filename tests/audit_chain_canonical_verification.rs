@@ -44,10 +44,12 @@ fn compute_canonical_hash(row: &Row) -> String {
         "cascade_snapshot_ids": row.cascade_snapshot_ids_json,
         "cascade_subjects": row.cascade_subjects_json,
         "event_id": row.event_id,
+        "payload": row.payload,
         "previous_hash": row.previous_hash,
         "rationale": row.rationale,
         "sequence": row.sequence,
         "snapshot_id": row.snapshot_id,
+        "source": row.source,
         "subject_cid": row.subject_cid,
         "subject_did": row.subject_did,
         "subject_uri": row.subject_uri,
@@ -76,6 +78,10 @@ struct Row {
     previous_hash: Option<String>,
     cascade_subjects_json: Option<String>,
     cascade_snapshot_ids_json: Option<String>,
+    // v0.9 format bump (#345): source discriminator (NOT NULL) +
+    // action-scalar payload (nullable JSON string), both in the canon.
+    source: String,
+    payload: Option<String>,
     current_hash: String,
 }
 
@@ -84,7 +90,7 @@ async fn fetch_row(db: &AnyPool, sequence: i64) -> Row {
     let r = sqlx::query(
         "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                 subject_cid, rationale, snapshot_id, event_id, previous_hash, \
-                cascade_subjects, cascade_snapshot_ids, current_hash \
+                cascade_subjects, cascade_snapshot_ids, source, payload, current_hash \
          FROM audit_chain_entry WHERE sequence = $1",
     )
     .bind(sequence)
@@ -107,6 +113,8 @@ async fn fetch_row(db: &AnyPool, sequence: i64) -> Row {
         cascade_snapshot_ids_json: r
             .try_get::<Option<String>, _>("cascade_snapshot_ids")
             .unwrap_or(None),
+        source: r.try_get("source").unwrap(),
+        payload: r.try_get::<Option<String>, _>("payload").unwrap_or(None),
         current_hash: r.try_get("current_hash").unwrap(),
     }
 }
@@ -138,6 +146,8 @@ async fn open_pool() -> AnyPool {
             previous_hash TEXT,
             cascade_subjects TEXT,
             cascade_snapshot_ids TEXT,
+            source TEXT NOT NULL DEFAULT 'manual',
+            payload TEXT,
             UNIQUE(sequence)
         )",
     )
@@ -203,6 +213,8 @@ async fn canonical_form_matches_for_repo_ref_subject() {
         &db,
         aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:moderator",
             action: "TakedownAccount",
             subject: Some(&subject),
@@ -229,6 +241,8 @@ async fn canonical_form_matches_for_strong_ref_subject() {
         &db,
         aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:moderator",
             action: "TakedownRecord",
             subject: Some(&subject),
@@ -256,6 +270,8 @@ async fn canonical_form_matches_for_repo_blob_ref_subject_with_record_uri() {
         &db,
         aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:moderator",
             action: "TakedownBlob",
             subject: Some(&subject),
@@ -283,6 +299,8 @@ async fn canonical_form_matches_for_repo_blob_ref_subject_without_record_uri() {
         &db,
         aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:moderator",
             action: "TakedownBlob",
             subject: Some(&subject),
@@ -317,6 +335,8 @@ async fn canonical_form_matches_for_batch_with_cascades() {
         &db,
         aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:moderator",
             action: "BatchTakedownAccounts",
             subject: None,
@@ -346,6 +366,8 @@ async fn canonical_form_matches_for_genesis_entry() {
         &db,
         aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:bootstrap",
             action: "BootstrapGrant",
             subject: Some(&subject),
@@ -407,6 +429,8 @@ fn fixed_row(
     previous_hash: Option<&str>,
     cascade_subjects_json: Option<&str>,
     cascade_snapshot_ids_json: Option<&str>,
+    source: &str,
+    payload: Option<&str>,
 ) -> Row {
     Row {
         sequence,
@@ -422,6 +446,8 @@ fn fixed_row(
         previous_hash: previous_hash.map(String::from),
         cascade_subjects_json: cascade_subjects_json.map(String::from),
         cascade_snapshot_ids_json: cascade_snapshot_ids_json.map(String::from),
+        source: source.to_string(),
+        payload: payload.map(String::from),
         current_hash: String::new(), // computed, not asserted against
     }
 }
@@ -449,11 +475,13 @@ fn worked_example_1_repo_ref_genesis() {
             r#"[{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:test1234567890abcdef"}]"#,
         ),
         None,
+        "manual",
+        None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "3e5c0aca41c91b941e7382218fb063be599a9f50266aee7a188991096a2450bc",
+        "f51dd8d375762a1e22954eec59af4972efeea5847ff427eaeaee1aaee5ce24ca",
         "Section D Example 1 hash mismatch — update the doc OR fix the side-script"
     );
 }
@@ -477,11 +505,13 @@ fn worked_example_2_strong_ref() {
             r#"[{"$type":"com.atproto.repo.strongRef","uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc","cid":"bafyreidemorecord"}]"#,
         ),
         None,
+        "manual",
+        None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "5815a391b016fd4ac25f5ec6070a136971f5c91c93d145fecf3615fdebae1f20",
+        "16555784f242d5951a46de0ab23d47f0cf061c8651b221900b8995f039e2f9ba",
         "Section D Example 2 hash mismatch"
     );
 }
@@ -505,11 +535,13 @@ fn worked_example_3_repo_blob_ref_with_record_uri() {
             r#"[{"$type":"com.atproto.admin.defs#repoBlobRef","did":"did:plc:test1234567890abcdef","cid":"bafyreidemoblob","record_uri":"at://did:plc:test1234567890abcdef/app.bsky.feed.post/1abc"}]"#,
         ),
         None,
+        "manual",
+        None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "39ec7c56b387f34c36798f7165a538b588581419bd51f6e9c8b09bbd92def49a",
+        "95a66f39bec9238cca0dd3554de615e222ec6470cf7753cd5068cc5c0591c54e",
         "Section D Example 3 hash mismatch"
     );
 }
@@ -534,11 +566,13 @@ fn worked_example_4_repo_blob_ref_without_record_uri() {
             r#"[{"$type":"com.atproto.admin.defs#repoBlobRef","did":"did:plc:test1234567890abcdef","cid":"bafyreidemoblob"}]"#,
         ),
         None,
+        "manual",
+        None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "2b8e88caa44c1b4fefe3f7790dbf8161a50c1f0c1298ec678c0a47641254a842",
+        "3b9f4b0f5b0c93ba166217f19bfb46ddd1354cf4a74e85bd0810d6e88c39159a",
         "Section D Example 4 hash mismatch"
     );
 }
@@ -563,11 +597,13 @@ fn worked_example_5_batch_with_cascades() {
             r#"[{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:victim1"},{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:victim2"},{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:victim3"}]"#,
         ),
         Some("[7,null,12]"),
+        "manual",
+        None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "f0465eef6ef0318ae497e97d5fe7adf76143090f577266bfd812e6b7f4739d27",
+        "2f8145772ef1a1972482d1416634921edd358bb1580ca400e7da08c6ea539a3c",
         "Section D Example 5 hash mismatch"
     );
 }
@@ -589,17 +625,56 @@ fn worked_example_6_second_entry_with_previous_hash() {
         "appeal granted",
         None,
         None,
-        Some("3e5c0aca41c91b941e7382218fb063be599a9f50266aee7a188991096a2450bc"),
+        Some("f51dd8d375762a1e22954eec59af4972efeea5847ff427eaeaee1aaee5ce24ca"),
         Some(
             r#"[{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:test1234567890abcdef"}]"#,
         ),
+        None,
+        "manual",
         None,
     );
     let hash = compute_canonical_hash(&row);
     assert_eq!(
         hash,
-        "92ad90ef72ec8b8af22478c325ed8b3514166169fd2f244279dc47138b9c43b7",
+        "95d85237bd7c8e5469d648fa854628bf3ef414c2cd651e614972332754c6b1b3",
         "Section D Example 6 hash mismatch"
+    );
+}
+
+#[test]
+fn worked_example_7_substrate_source_with_payload() {
+    // Section D Example 7 (v0.9 format bump, #345): a substrate-emitted
+    // entry — `source = "auto_label_rule"` (not the operator default
+    // "manual") carrying an action-scalar `payload` of {"applied":true}.
+    // The other six examples all use the "manual" source and a null
+    // payload (the pre-v0.9 shape, now with the two new canonical keys
+    // taking their default values). This example is the only one that
+    // varies both new fields, so external verifiers can confirm they
+    // fold `source`/`payload` into the canon at the right positions
+    // (between snapshot_id/subject_cid and event_id/previous_hash
+    // respectively). The payload string is hashed verbatim — keys must
+    // already be in their stored serialized form.
+    let row = fixed_row(
+        1,
+        "did:system",
+        "moderation_auto_label_applied",
+        Some("did:plc:test1234567890abcdef"),
+        None,
+        None,
+        "auto-label rule matched report category",
+        None,
+        None,
+        None,
+        Some(r#"[{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:test1234567890abcdef"}]"#),
+        None,
+        "auto_label_rule",
+        Some(r#"{"applied":true}"#),
+    );
+    let hash = compute_canonical_hash(&row);
+    assert_eq!(
+        hash,
+        "168054b81407fe774f080bdc2dfece49183d249f90c20c237c12006e47fb6d6b",
+        "Section D Example 7 hash mismatch"
     );
 }
 
@@ -625,6 +700,8 @@ async fn canonical_form_matches_for_single_subject_with_cascade_per_arc4() {
         &db,
         aurora_locus::config::DatabaseBackend::Sqlite,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:moderator",
             action: "TakedownRecord",
             subject: Some(&subject),
@@ -661,6 +738,8 @@ async fn canonical_form_matches_for_second_entry_with_previous_hash() {
             &db,
             aurora_locus::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:moderator",
                 action: "TakedownAccount",
                 subject: Some(&subject),

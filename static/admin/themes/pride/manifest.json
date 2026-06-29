@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "pride",
+  "themeName": "Pride",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "dark",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "Light warm-tinted base with structural rainbow on borders, dividers, and focus; Intersex-Inclusive Progress representation, year-round.",
+  "files": {
+    "tokens": "tokens.css",
+    "effects": "effects.css"
+  }
+}

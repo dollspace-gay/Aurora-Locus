@@ -1,0 +1,40 @@
+/*
+ * high-contrast — an AAA-grade reference palette.
+ *
+ * Near-black surfaces with white text push every text pair well past AAA (7:1).
+ * The accent is light enough that black inverted text clears AA on fills with
+ * room to spare, and status/border-focus colors are bright on the dark surface.
+ * Typography, sizing, motion, and the effect library are inherited from
+ * aurora-default. A good starting point for an accessibility-first theme.
+ */
+
+:root {
+  /* Surfaces — near-black */
+  --color-surface-primary: #000000;
+  --color-surface-secondary: #0a0a0a;
+  --color-surface-tertiary: #141414;
+  --color-surface-overlay: rgba(0, 0, 0, 0.7);
+
+  /* Text — white to light grey (all > 7:1 on the surfaces above) */
+  --color-text-primary: #ffffff;
+  --color-text-secondary: #d4d4d4;
+  --color-text-tertiary: #a3a3a3;
+  --color-text-inverted: #000000;
+
+  /* Accent — light blue; black inverted text clears ~10:1 on it */
+  --color-accent-primary: #8ab4ff;
+  --color-accent-primary-hover: #a5c6ff;
+  --color-accent-primary-active: #6f9ff0;
+  --color-accent-secondary: #c0c0c0;
+
+  /* Status — bright on black */
+  --color-status-success: #34d399;
+  --color-status-warning: #fbbf24;
+  --color-status-danger: #f87171;
+  --color-status-info: #60a5fa;
+
+  /* Borders */
+  --color-border-primary: rgba(255, 255, 255, 0.24);
+  --color-border-secondary: rgba(255, 255, 255, 0.12);
+  --color-border-focus: var(--color-accent-primary);
+}

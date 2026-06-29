@@ -1,0 +1,41 @@
+/*
+ * meridian — token overrides. Extends dark.
+ *
+ * Structured editorial light theme: warm cream surfaces (not pure white), a
+ * single disciplined slate-ink accent used precisely, and crisp hairline
+ * borders so grid lines and alignment read as part of the aesthetic. The
+ * distinctiveness is structural, not chromatic. Accent is dark so inverted
+ * (light) text clears AA on fills; status colors are deepened for cream.
+ * Typography, sizing, motion, and the effect library are inherited from dark.
+ */
+
+:root {
+  /* Surfaces — warm cream, not pure white */
+  --color-surface-primary: #faf7f1;
+  --color-surface-secondary: #f0ece2;
+  --color-surface-tertiary: #e6e0d3;
+  --color-surface-overlay: rgba(40, 35, 28, 0.4);
+
+  /* Text — disciplined dark on cream */
+  --color-text-primary: #1b1814;
+  --color-text-secondary: #4a443b;
+  --color-text-tertiary: #6f6859;
+  --color-text-inverted: #faf7f1;
+
+  /* Accent — a single precise slate-ink */
+  --color-accent-primary: #355070;
+  --color-accent-primary-hover: #2b4360;
+  --color-accent-primary-active: #22364d;
+  --color-accent-secondary: #6a6456;
+
+  /* Status — deepened for cream surfaces */
+  --color-status-success: #1a7a3c;
+  --color-status-warning: #9a5512;
+  --color-status-danger: #b3261e;
+  --color-status-info: #355070;
+
+  /* Borders — crisp editorial hairlines (the grid is part of the look) */
+  --color-border-primary: rgba(40, 35, 28, 0.16);
+  --color-border-secondary: rgba(40, 35, 28, 0.08);
+  --color-border-focus: var(--color-accent-primary);
+}

@@ -1,0 +1,157 @@
+/*
+ * pride — rainbow structural effects. Extends dark.
+ *
+ * The identity claim made structural: the rainbow is the actual color of the
+ * UI's structural elements — card / panel / modal borders, button borders
+ * (with a random rainbow fill per hover), the sidebar active-page indicator,
+ * major section dividers, and focus rings. The work surface (text, content,
+ * control interiors) is deliberately left alone so readability holds; rainbow
+ * never lands on body text or background surfaces. The rainbow structural
+ * color carries the identity on its own — no separate chrome motif.
+ *
+ * Everything is scoped under [data-theme="pride"] (set on <html> by the theme
+ * applier). That confines these rules to when Pride is active AND gives them
+ * the specificity to win over the base stylesheets, which load after the
+ * theme-served effects.css. Rounded rainbow borders use the
+ * padding-box/border-box double-background technique so corner radii survive.
+ *
+ * Effect classes and the token palette are inherited from the dark root and
+ * pride/tokens.css; this file is purely the rainbow layer.
+ */
+
+[data-theme="pride"] {
+  /* Standard 6-stripe Pride rainbow, as gradients reused below. The conic
+   * (--pride-angle is rotated on hover for the subtle button shift) wraps the
+   * rainbow around a border; the linear variants run a flag along a line. */
+  --pride-angle: 0deg;
+  --pride-rainbow: linear-gradient(90deg, #E40303, #FF8C00, #FFED00, #008026, #004CFF, #732982);
+  --pride-rainbow-vert: linear-gradient(180deg, #E40303, #FF8C00, #FFED00, #008026, #004CFF, #732982);
+  --pride-rainbow-ring: conic-gradient(from var(--pride-angle), #E40303, #FF8C00, #FFED00, #008026, #004CFF, #732982, #E40303);
+}
+
+/* ------------------------------------------------------------------ *
+ * 1. Card / panel / modal borders → rainbow gradient (corners preserved).
+ *    Includes the login splash card so the pre-auth page carries the rainbow.
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] .settings-card,
+[data-theme="pride"] .modal,
+[data-theme="pride"] .login-card {
+  border: 2px solid transparent;
+  background-image:
+    linear-gradient(var(--color-surface-secondary), var(--color-surface-secondary)),
+    var(--pride-rainbow-ring);
+  background-origin: border-box;
+  background-clip: padding-box, border-box;
+}
+
+/* ------------------------------------------------------------------ *
+ * 2. Button borders → rainbow. Every action-button variant gets the SAME
+ *    resting treatment: an opaque near-white (lightest-surface) interior with
+ *    dark text + the 2px rainbow gradient border. Uniform on purpose — no
+ *    per-variant fill.
+ *
+ *    The interior layer MUST be opaque: it is painted over the rainbow
+ *    border-box layer and clipped to the padding box, so it is what hides the
+ *    rainbow everywhere except the border. A transparent interior (the old
+ *    .btn-secondary, and the bug this fixes) lets the border-box rainbow show
+ *    through and fill the whole button — which is what the dashboard pills
+ *    (Details / Open Kryphocron / Audit trail — all .btn-secondary) were doing.
+ *    Semantic danger/success fills are dropped here too for the one consistent
+ *    Pride button; the destructive affordance still lives in the typed-confirm
+ *    modals (#326).
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] .btn-primary,
+[data-theme="pride"] .btn-secondary,
+[data-theme="pride"] .btn-danger,
+[data-theme="pride"] .btn-success {
+  border: 2px solid transparent;
+  background-origin: border-box;
+  background-clip: padding-box, border-box;
+  background-image:
+    linear-gradient(var(--color-surface-primary), var(--color-surface-primary)),
+    var(--pride-rainbow-ring);
+  color: var(--color-text-primary);
+}
+/* Disabled: muted gray-tint + neutral border (no rainbow), all variants. */
+[data-theme="pride"] .btn-primary:disabled,
+[data-theme="pride"] .btn-primary[disabled],
+[data-theme="pride"] .btn-secondary:disabled,
+[data-theme="pride"] .btn-secondary[disabled],
+[data-theme="pride"] .btn-danger:disabled,
+[data-theme="pride"] .btn-danger[disabled],
+[data-theme="pride"] .btn-success:disabled,
+[data-theme="pride"] .btn-success[disabled] {
+  background-image: none;
+  background-color: var(--color-surface-tertiary);
+  border-color: var(--color-border-primary);
+  color: var(--color-text-tertiary);
+}
+/* Random rainbow hover (#325): every action button takes a random 6-stripe
+ * rainbow color as its interior fill on hover, with the AA-paired text color —
+ * both set per-hover by the pride-gated shim (PrideHover.js), since CSS cannot
+ * randomize. The rainbow border stays and its angle rotates. The fallbacks (no
+ * pointer, or JS disabled) keep the flag-pink fill + inverted text. */
+[data-theme="pride"] .btn-primary:hover,
+[data-theme="pride"] .btn-secondary:hover,
+[data-theme="pride"] .btn-danger:hover,
+[data-theme="pride"] .btn-success:hover {
+  --pride-angle: 90deg;
+  background-image:
+    linear-gradient(var(--pride-hover-fill, var(--color-accent-primary)), var(--pride-hover-fill, var(--color-accent-primary))),
+    var(--pride-rainbow-ring);
+  color: var(--pride-hover-text, var(--color-text-inverted));
+}
+[data-theme="pride"] .btn-primary:active,
+[data-theme="pride"] .btn-secondary:active,
+[data-theme="pride"] .btn-danger:active,
+[data-theme="pride"] .btn-success:active {
+  filter: brightness(0.92);
+}
+
+/* ------------------------------------------------------------------ *
+ * 3. Sidebar active-page indicator → a rainbow left-edge bar + subtle tint,
+ *    replacing the solid accent fill.
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] .nav-item.active {
+  background: color-mix(in srgb, var(--color-accent-primary) 14%, transparent);
+  color: var(--sidebar-text);
+  position: relative;
+}
+[data-theme="pride"] .nav-item.active::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  width: 4px;
+  border-radius: 0 2px 2px 0;
+  background: var(--pride-rainbow-vert);
+}
+
+/* ------------------------------------------------------------------ *
+ * 4. Major section dividers → rainbow line. Within-section dividers (the
+ *    per-row hairlines in Installed Themes) stay neutral — not touched here.
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] .config-section-divider {
+  border: none;
+  height: 2px;
+  background: var(--pride-rainbow);
+}
+
+/* ------------------------------------------------------------------ *
+ * 5. Focus rings → tight concentric rainbow halo (≈3px), every focusable.
+ * ------------------------------------------------------------------ */
+[data-theme="pride"] *:focus-visible,
+[data-theme="pride"] input:focus-visible,
+[data-theme="pride"] select:focus-visible,
+[data-theme="pride"] textarea:focus-visible,
+[data-theme="pride"] .effect-focus-ring:focus-visible {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  box-shadow:
+    0 0 0 0.5px #E40303,
+    0 0 0 1px #FF8C00,
+    0 0 0 1.5px #FFED00,
+    0 0 0 2px #008026,
+    0 0 0 2.5px #004CFF,
+    0 0 0 3px #732982;
+}

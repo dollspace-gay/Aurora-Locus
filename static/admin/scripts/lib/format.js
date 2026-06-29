@@ -98,12 +98,43 @@
     return activeLocale().startsWith('en-US') ? 0 : 1;
   }
 
+  // Locale-aware list joiner (§10.3.4 / §16 D3) — "A, B, and C" / "… or C".
+  // Wraps Intl.ListFormat with an English comma+conjunction fallback so a
+  // missing-API environment still reads naturally.
+  function formatList(items, type) {
+    const arr = Array.isArray(items) ? items.map((x) => String(x == null ? '' : x)) : [];
+    try {
+      return new Intl.ListFormat(activeLocale(), { style: 'long', type: type || 'conjunction' }).format(arr);
+    } catch (e) {
+      if (arr.length <= 1) return arr.join('');
+      const conj = (type === 'disjunction') ? 'or' : 'and';
+      return arr.slice(0, -1).join(', ') + (arr.length > 2 ? ',' : '') + ' ' + conj + ' ' + arr[arr.length - 1];
+    }
+  }
+
+  // Locale-aware plural category (§10.3.4 / §16 D3) — wraps
+  // Intl.PluralRules and returns the CLDR category ('one' | 'other' for
+  // English; the full range — 'zero'/'two'/'few'/'many'/'other' — for
+  // locales that need it). Mirrors formatList: locale defaults to the
+  // current resolved locale, with an English fallback if the API is
+  // unavailable. i18n.js's t() consumes this for sub-key plural keys.
+  function resolvePlural(count, locale) {
+    const n = Number(count);
+    try {
+      return new Intl.PluralRules(locale || activeLocale()).select(n);
+    } catch (e) {
+      return n === 1 ? 'one' : 'other';
+    }
+  }
+
   global.AuroraFormat = {
     date: formatDate,
     number: formatNumber,
     relativeTime: formatRelativeTime,
     durationCompact: formatDurationCompact,
     bytes: formatBytes,
+    list: formatList,
+    resolvePlural: resolvePlural,
     firstDayOfWeek: firstDayOfWeek,
   };
 })(window);

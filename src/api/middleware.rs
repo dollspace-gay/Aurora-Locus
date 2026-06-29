@@ -880,6 +880,37 @@ pub async fn namespace_scope_check(
     }
 }
 
+/// v0.9 Federation runtime-mutability arc §3.7 (#395) — request-layer
+/// short-circuit. Refuses the inbound federation OPERATIONAL endpoints with 503
+/// when `federation.enabled` resolves false (runtime override → config fallback),
+/// effective immediately for incident response — before any restart tears the
+/// subsystem down.
+///
+/// The `status` / `describePosture` posture endpoints are intentionally NOT gated
+/// (they must keep reporting the off-state so peers can discover it), and
+/// `com.aurora.dpop.getNonce` is excluded (DPoP is also OAuth's, not federation-
+/// only). The per-request `resolve` DB read happens ONLY for the gated paths.
+/// Scope is inbound only; outbound federation operations continue until restart.
+pub async fn federation_enabled_gate(
+    State(ctx): State<AppContext>,
+    req: Request,
+    next: Next,
+) -> Response {
+    const GATED: &[&str] = &[
+        "/xrpc/com.aurora.federation.listInstances",
+        "/xrpc/com.aurora.federation.refreshDiscovery",
+        "/xrpc/com.aurora.federation.aggregateTimeline",
+    ];
+    if GATED.contains(&req.uri().path()) {
+        if let Some((status, body)) =
+            crate::api::aurora_admin::federation_inbound_gate_503(&ctx).await
+        {
+            return (status, body).into_response();
+        }
+    }
+    next.run(req).await
+}
+
 #[cfg(test)]
 mod namespace_scope_tests {
     use super::*;

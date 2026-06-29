@@ -1,0 +1,30 @@
+/*
+ * effect-class-customization — effect overrides.
+ *
+ * Redefines three effect classes aurora-default keeps minimal or trivial. The
+ * four required classes (effect-focus-ring, effect-surface-elevation-1/2/3) and
+ * every other effect are inherited from aurora-default, so this theme stays
+ * valid while reshaping only the treatments it cares about. Every value derives
+ * from the inherited token contract, so the overrides remain theme-portable.
+ */
+
+/* A gradient frosted glass instead of aurora-default's flat translucent panel. */
+.effect-frosted-glass {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--color-surface-secondary) 94%, var(--color-accent-primary) 6%),
+    var(--color-surface-secondary)
+  );
+  backdrop-filter: blur(10px) saturate(1.1);
+  -webkit-backdrop-filter: blur(10px) saturate(1.1);
+}
+
+/* A stronger hover glow for emphasized actions. */
+.effect-hover-glow:hover {
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-accent-primary) 30%, transparent);
+}
+
+/* aurora-default leaves aurora-glow off; light it up subtly here. */
+.effect-aurora-glow {
+  box-shadow: 0 0 28px color-mix(in srgb, var(--color-accent-primary) 22%, transparent);
+}

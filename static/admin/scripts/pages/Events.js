@@ -9,6 +9,20 @@
   let lastFilters = {};
   let subscription = null;
 
+  // url-state wiring (§5.7.5) — the shared shape lives in AuroraListPage
+  // (components/ListPage.js, #257).
+  const SCALAR_KEYS = ['actor', 'subject', 'eventType'];
+  const BOOL_KEYS = [];
+
+  function applyFilters(vals) {
+    global.AuroraListPage.applyFilters(SCALAR_KEYS, BOOL_KEYS, vals, lastFilters && lastFilters.when, function (v) {
+      lastFilters = v;
+      cursorStack = [];
+      nextCursor = null;
+      refresh(null);
+    });
+  }
+
   async function mount({ container }) {
     container.innerHTML =
       '<header class="page-header">' +
@@ -16,11 +30,12 @@
       '  <div id="events-rt-indicator" class="rt-indicator-slot"></div>' +
       '</header>' +
       '<div id="events-filter"></div>' +
+      '<p class="filter-url-hint">' + (global.t ? global.t('common.filters_in_url') : '') + '</p>' +
       '<div id="events-table-container"></div>' +
       '<div id="events-pagination"></div>';
     cursorStack = [];
     nextCursor = null;
-    lastFilters = {};
+    lastFilters = global.AuroraListPage.readFilters(SCALAR_KEYS, BOOL_KEYS, {});
     if (global.AuroraFilterStrip) {
       global.AuroraFilterStrip.build({
         container: document.getElementById('events-filter'),
@@ -30,7 +45,8 @@
           { type: 'text', id: 'eventType', placeholder: 'Filter by event type' },
           { type: 'dateRange', id: 'when', label: 'Date range' },
         ],
-        onApply: (vals) => { lastFilters = vals; cursorStack = []; nextCursor = null; refresh(null); },
+        initial: lastFilters,
+        onApply: applyFilters,
       });
     }
     await refresh(null);
@@ -44,12 +60,13 @@
 
   function startSubscription() {
     if (subscription || !global.AuroraSubscription) return;
-    const indicator = document.getElementById('events-rt-indicator');
-    subscription = global.AuroraSubscription.subscribe('subscribe-mod-events', {}, {
-      onEvent: (event) => prependLive(event),
-      onError: (e) => console.warn('subscribeModEvents error:', e),
-    });
-    if (indicator) global.AuroraSubscription.attachIndicator(indicator, subscription);
+    subscription = global.AuroraListPage.subscribeModEvents(
+      document.getElementById('events-rt-indicator'),
+      {
+        onEvent: (event) => prependLive(event),
+        onError: (e) => console.warn('subscribeModEvents error:', e),
+      },
+    );
   }
 
   function prependLive(event) {
@@ -64,7 +81,7 @@
     if (event.subjectDid) subj = global.AuroraEntityRef ? global.AuroraEntityRef.account(event.subjectDid) : 'repo: ' + event.subjectDid;
     else if (event.subjectUri) subj = global.AuroraEntityRef ? global.AuroraEntityRef.record(event.subjectUri) : 'record: ' + event.subjectUri;
     tr.innerHTML =
-      '<td>' + esc(fmt ? fmt.date(event.createdAt, 'short') : event.createdAt) + '</td>' +
+      '<td>' + global.AuroraTimestamp.render({ value: event.createdAt, context: 'detail' }) + '</td>' +
       '<td>' + esc(event.eventType) + '</td>' +
       '<td>' + (actor ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(actor) : esc(actor)) : '—') + '</td>' +
       '<td>' + subj + '</td>' +
@@ -84,7 +101,7 @@
     if (cursor) params.cursor = cursor;
     if (lastFilters.when && lastFilters.when.start) params.since = lastFilters.when.start.toISOString();
     if (lastFilters.when && lastFilters.when.end) params.until = lastFilters.when.end.toISOString();
-    c.innerHTML = '<p class="empty-state">Loading…</p>';
+    c.innerHTML = global.AuroraSkeleton.cards(3);
     try {
       const data = await ep.moderator.queryEvents(params);
       const items = (data && data.items) || [];
@@ -104,7 +121,7 @@
         let subj = '—';
         if (e.subject) subj = global.AuroraEntityRef ? global.AuroraEntityRef.fromSubject(e.subject) : esc(JSON.stringify(e.subject));
         html += '<tr>' +
-                '<td>' + esc(fmt ? fmt.date(e.createdAt, 'short') : e.createdAt) + '</td>' +
+                '<td>' + global.AuroraTimestamp.render({ value: e.createdAt, context: 'detail' }) + '</td>' +
                 '<td>' + esc(e.eventType) + '</td>' +
                 '<td>' + (actor ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(actor, e.actorHandle) : esc(actor)) : '—') + '</td>' +
                 '<td>' + subj + '</td>' +
@@ -115,25 +132,19 @@
       c.innerHTML = html;
       renderPagination();
     } catch (e) {
-      c.innerHTML = '<p class="empty-state">Could not load events: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(c, {
+        message: 'Could not load events: ' + ((e && e.message) || ''),
+        onRetry: function () { refresh(cursor); },
+      });
     }
   }
 
   function renderPagination() {
-    const c = document.getElementById('events-pagination');
-    if (!c || !global.AuroraPagination) return;
-    global.AuroraPagination.render({
-      container: c,
-      prevDisabled: cursorStack.length === 0,
-      nextDisabled: !nextCursor,
-      onPrev: () => {
-        if (cursorStack.length > 1) {
-          cursorStack.pop();
-          const p = cursorStack[cursorStack.length - 1] || null;
-          refresh(p);
-        } else if (cursorStack.length === 1) { cursorStack = []; refresh(null); }
-      },
-      onNext: () => { if (nextCursor) { cursorStack.push(nextCursor); refresh(nextCursor); } },
+    global.AuroraListPage.renderPagination({
+      container: document.getElementById('events-pagination'),
+      cursorStack: cursorStack,
+      nextCursor: nextCursor,
+      refresh: refresh,
     });
   }
 

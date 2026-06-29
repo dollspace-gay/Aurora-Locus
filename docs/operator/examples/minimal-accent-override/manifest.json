@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "minimal-accent-override",
+  "themeName": "Minimal Accent Override",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "aurora-default",
+  "themeAuthor": "Aurora-Locus examples",
+  "themeDescription": "The minimum-viable theme: a teal accent over aurora-default, inheriting everything else.",
+  "files": {
+    "tokens": "tokens.css"
+  }
+}

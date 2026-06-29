@@ -189,6 +189,45 @@ pub enum ModerationEventType {
     /// initiating handler + orphan-sweep infrastructure that
     /// triggers this event is post-arc-2 work.
     KryphocronSystemCleanup,
+
+    /// Arc H §7.4.1 — a SuperAdmin rebuilt an account's repository from
+    /// its sequencer history via `tools.aurora.superadmin.rebuildRepo`.
+    /// Host vocabulary (§16 D1): a high-impact destructive operator
+    /// action, audited in the host event log on the successful atomic
+    /// swap. `actor_did` is the triggering operator, `subject_did` the
+    /// rebuilt account, `subject_cid` the post-swap head commit CID;
+    /// `details` carries `rebuiltCommitCount` / `headCommitCidBefore` /
+    /// `headCommitCidAfter` / `rationale`. Emitted in its own short
+    /// transaction after the swap commits (Category C — the rebuild is
+    /// not itself a record-write, so there is no shared tx to join).
+    RepoRebuilt,
+
+    /// Arc H §7.4.3 — a SuperAdmin bulk repository-inconsistency scan finished
+    /// (`tools.aurora.superadmin.scanReposForInconsistencies`). Host vocabulary
+    /// (§16 D1): `actor_did` is the triggering operator; `details` carries
+    /// `scanId` / `outcome` / `accountsScanned` plus the per-severity findings
+    /// breakdown (`findingsHigh` / `findingsMedium` / `findingsLow` /
+    /// `findingsTotal`). Emitted by the scan job in its own short transaction on
+    /// completion (Category C — the scan is read-only, no record write to join).
+    ScanCompleted,
+
+    /// Arc H §7.4.3 — a SuperAdmin started a bulk repository repair
+    /// (`tools.aurora.superadmin.repairRepos`). The envelope event for a batch:
+    /// `actor_did` is the triggering operator; `details` carries `batchId` /
+    /// `targetCount` / the `targetDids` list / `rationale`. Per-account repairs
+    /// emit standalone [`RepoRebuilt`](Self::RepoRebuilt) events (correlate by
+    /// the `targetDids` list); this envelope is not threaded into them. Emitted
+    /// at batch start in its own short transaction (Category C).
+    BulkRepairInitiated,
+
+    /// Arc H §7.4.2 — a SuperAdmin ran the sequencer deep integrity validation
+    /// (`tools.aurora.superadmin.runSequencerRecovery` with the `validate`
+    /// operation). Host vocabulary (§16 D1): `actor_did` is the triggering
+    /// operator; `details` carries `jobId` / `outcome` / `rowsScanned` /
+    /// `totalRows` / `invalidatedRows` / `headSeq` / `malformedCount` /
+    /// `nonMonotonicCount`. Read-only diagnostic; emitted on completion in its
+    /// own short transaction (Category C).
+    SequencerValidated,
 }
 
 impl ModerationEventType {
@@ -221,6 +260,10 @@ impl ModerationEventType {
             ModerationEventType::KryphocronFallback => "kryphocron_fallback",
             ModerationEventType::KryphocronRecoveryWrite => "kryphocron_recovery_write",
             ModerationEventType::KryphocronSystemCleanup => "kryphocron_system_cleanup",
+            ModerationEventType::RepoRebuilt => "repo_rebuilt",
+            ModerationEventType::ScanCompleted => "scan_completed",
+            ModerationEventType::BulkRepairInitiated => "bulk_repair_initiated",
+            ModerationEventType::SequencerValidated => "sequencer_validated",
         }
     }
 }
@@ -259,6 +302,10 @@ impl FromStr for ModerationEventType {
             "kryphocron_fallback" => Ok(ModerationEventType::KryphocronFallback),
             "kryphocron_recovery_write" => Ok(ModerationEventType::KryphocronRecoveryWrite),
             "kryphocron_system_cleanup" => Ok(ModerationEventType::KryphocronSystemCleanup),
+            "repo_rebuilt" => Ok(ModerationEventType::RepoRebuilt),
+            "scan_completed" => Ok(ModerationEventType::ScanCompleted),
+            "bulk_repair_initiated" => Ok(ModerationEventType::BulkRepairInitiated),
+            "sequencer_validated" => Ok(ModerationEventType::SequencerValidated),
             _ => Err(PdsError::Validation(format!("Invalid event type: {}", s))),
         }
     }

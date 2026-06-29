@@ -1,21 +1,38 @@
 [package]
 name = "aurora-locus"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["Aurora Locus Contributors"]
 description = "ATProto Personal Data Server implementation in Rust"
 license = "MIT OR Apache-2.0"
 
+# v0.9 Integration hooks Phase A (#350) — Aurora-Locus becomes a Cargo
+# workspace so the declaration logic lives in a structurally-firewalled
+# companion crate (Layer 1 per the integration-hooks design addendum §3).
+# `hooks-core` declares NO HTTP-client crate, direct or transitive — verify
+# with `cargo tree --package hooks-core`. The root package is itself a member.
+[workspace]
+members = ["libs/hooks-core"]
+
 [dependencies]
 # AT Protocol SDK (published crate, replaces the previously vendored ./Rust-Atproto-SDK)
-proto-blue = "0.3.1"
+proto-blue = "0.3.3"
 
-# kryphocron substrate (v0.7 integration). v0.2.0 of both crates is
-# published on crates.io; kryphocron-lexicons is brought in
-# transitively via kryphocron but is also declared directly so we can
-# refer to the registry and tier vocabulary by name.
-kryphocron = "0.2"
-kryphocron-lexicons = "0.2"
+# v0.9 Integration hooks (#350) — structurally-firewalled declaration logic
+# (hook types, URL validation, netaddr SSRF predicates, event-class taxonomy).
+hooks-core = { path = "libs/hooks-core" }
+
+# kryphocron substrate. v0.9 Arc D (#222) upgrades 0.2 → 0.3: the 0.3
+# at-rest seam (AtRestHooks / ContentCodec / RotationOracle, Laquna as the
+# default codec) + the lexicons 0.3 shape changes (postPrivate.audienceList
+# object→string). kryphocron-lexicons is brought in transitively via
+# kryphocron but is also declared directly so we can refer to the registry
+# and tier vocabulary by name.
+# v0.9 Arc D (#237a) bumps to 0.3.1: host-constructible at-rest decode
+# inputs (EncodedRecord::new / DecodeContext::new) + kryphocron::VERSION +
+# audit::AUDIT_EVENT_TYPES. Purely additive; #[non_exhaustive] preserved.
+kryphocron = "0.3.1"
+kryphocron-lexicons = "0.3"
 
 # Argon2id password hashing (vendored from the old SDK's server_auth module)
 argon2 = { version = "0.5", features = ["std"] }

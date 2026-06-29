@@ -71,6 +71,24 @@ impl ReportStatus {
             ReportStatus::Escalated => "escalated",
         }
     }
+
+    /// Resolve the moderation-queue `status` query parameter to a report-status
+    /// filter (#209). The queue header's status filter restores against this:
+    ///
+    /// - **absent** → `Some(Open)`: the queue's prior hardcoded open-only view
+    ///   and the design default (§5.3.1, "open reports … needing attention"),
+    ///   so a bare call to the endpoint behaves exactly as before this param;
+    /// - the literal **`all`** → `None`: no filter, every status (the
+    ///   FilterStrip "All" option);
+    /// - **any other value** → parsed as a [`ReportStatus`], or a validation
+    ///   error the handler maps to `400` (no silently-ignored garbage).
+    pub fn queue_filter_from_param(param: Option<&str>) -> PdsResult<Option<ReportStatus>> {
+        match param {
+            None => Ok(Some(ReportStatus::Open)),
+            Some(s) if s.eq_ignore_ascii_case("all") => Ok(None),
+            Some(s) => s.parse::<ReportStatus>().map(Some),
+        }
+    }
 }
 
 impl FromStr for ReportStatus {
@@ -105,6 +123,24 @@ pub struct Report {
     pub reviewed_by: Option<String>,
     pub reviewed_at: Option<DateTime<Utc>>,
     pub resolution: Option<String>,
+    /// §5.5.4 Phase B (#346): operator this queue item is routed to, or
+    /// `None` when unassigned (manual mode / pre-Phase-B rows / reset).
+    #[serde(default)]
+    pub assigned_operator_did: Option<String>,
+    /// Provenance of the assignment: `auto` (substrate routing) |
+    /// `manual_override` (SuperAdmin reassignment). `None` when unassigned.
+    #[serde(default)]
+    pub assignment_source: Option<String>,
+}
+
+/// §5.5.4 §4.5 queue-scope selector for [`ReportManager::list_reports_scoped`].
+#[derive(Debug, Clone, Copy)]
+pub enum AssignmentScope<'a> {
+    /// Every item, no assignment predicate (SuperAdmin view).
+    All,
+    /// Items assigned to this operator OR unassigned (`assigned_operator_did
+    /// IS NULL`) — the per-operator queue view.
+    AssignedTo(&'a str),
 }
 
 /// Report manager
@@ -167,6 +203,8 @@ impl ReportManager {
             reviewed_by: None,
             reviewed_at: None,
             resolution: None,
+            assigned_operator_did: None,
+            assignment_source: None,
         })
     }
 
@@ -250,39 +288,61 @@ impl ReportManager {
         status: Option<ReportStatus>,
         limit: Option<i64>,
     ) -> PdsResult<Vec<Report>> {
-        let query = if let Some(status) = status {
-            sqlx::query(
-                r#"
-                SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason,
-                       reported_by, reported_at, status, reviewed_by, reviewed_at, resolution
-                FROM report
-                WHERE status = $1
-                ORDER BY reported_at DESC
-                LIMIT $2
-                "#,
-            )
-            .bind(status.as_str())
-            .bind(limit.unwrap_or(100))
-        } else {
-            sqlx::query(
-                r#"
-                SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason,
-                       reported_by, reported_at, status, reviewed_by, reviewed_at, resolution
-                FROM report
-                ORDER BY reported_at DESC
-                LIMIT $1
-                "#,
-            )
-            .bind(limit.unwrap_or(100))
-        };
+        self.list_reports_scoped(status, limit, AssignmentScope::All)
+            .await
+    }
+
+    /// List reports with the §5.5.4 §4.5 per-operator queue scope applied.
+    /// `AssignmentScope::All` returns every item (SuperAdmin view, and the
+    /// `list_reports` back-compat shape); `AssignedTo(did)` returns items
+    /// assigned to that operator OR unassigned (`assigned_operator_did
+    /// IS NULL`). Combines with the optional status filter. Built dynamically
+    /// so the WHERE clause carries only the active predicates; binds are
+    /// positional ($1, $2, …) in clause order, then the LIMIT.
+    pub async fn list_reports_scoped(
+        &self,
+        status: Option<ReportStatus>,
+        limit: Option<i64>,
+        scope: AssignmentScope<'_>,
+    ) -> PdsResult<Vec<Report>> {
+        let mut sql = String::from(
+            "SELECT id, subject_did, subject_uri, subject_cid, reason_type, reason, \
+             reported_by, reported_at, status, reviewed_by, reviewed_at, resolution, \
+             assigned_operator_did, assignment_source FROM report",
+        );
+        let mut clauses: Vec<String> = Vec::new();
+        let mut pos = 1;
+        if status.is_some() {
+            clauses.push(format!("status = ${}", pos));
+            pos += 1;
+        }
+        if let AssignmentScope::AssignedTo(_) = scope {
+            clauses.push(format!(
+                "(assigned_operator_did = ${} OR assigned_operator_did IS NULL)",
+                pos
+            ));
+            pos += 1;
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(&format!(" ORDER BY reported_at DESC LIMIT ${}", pos));
+
+        let mut query = sqlx::query(&sql);
+        if let Some(s) = status {
+            query = query.bind(s.as_str());
+        }
+        if let AssignmentScope::AssignedTo(did) = scope {
+            query = query.bind(did);
+        }
+        query = query.bind(limit.unwrap_or(100));
 
         let rows = query.fetch_all(&self.db).await?;
-
         let mut reports = Vec::new();
         for row in rows {
             reports.push(self.parse_report(row)?);
         }
-
         Ok(reports)
     }
 
@@ -317,6 +377,8 @@ impl ReportManager {
             reviewed_by: row.get("reviewed_by"),
             reviewed_at,
             resolution: row.get("resolution"),
+            assigned_operator_did: row.try_get("assigned_operator_did").ok().flatten(),
+            assignment_source: row.try_get("assignment_source").ok().flatten(),
         })
     }
 }
@@ -348,7 +410,9 @@ mod tests {
                 status TEXT NOT NULL,
                 reviewed_by TEXT,
                 reviewed_at TEXT,
-                resolution TEXT
+                resolution TEXT,
+                assigned_operator_did TEXT,
+                assignment_source TEXT
             )
             "#,
         )
@@ -393,5 +457,101 @@ mod tests {
         let post = manager.get_report(report.id).await.unwrap().unwrap();
         assert_eq!(post.status, ReportStatus::Open);
         assert!(post.resolution.is_none());
+    }
+
+    // #209: the queue header status filter resolves through
+    // ReportStatus::queue_filter_from_param. Pins the three branches the
+    // get_moderation_queue handler depends on.
+    #[test]
+    fn queue_filter_absent_defaults_to_open() {
+        // No param → open-only, preserving the queue's prior hardcoded view.
+        assert_eq!(
+            ReportStatus::queue_filter_from_param(None).unwrap(),
+            Some(ReportStatus::Open)
+        );
+    }
+
+    #[test]
+    fn queue_filter_all_is_unfiltered() {
+        // The FilterStrip "All" option (case-insensitive) clears the filter.
+        assert_eq!(
+            ReportStatus::queue_filter_from_param(Some("all")).unwrap(),
+            None
+        );
+        assert_eq!(
+            ReportStatus::queue_filter_from_param(Some("ALL")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn queue_filter_parses_known_statuses() {
+        assert_eq!(
+            ReportStatus::queue_filter_from_param(Some("escalated")).unwrap(),
+            Some(ReportStatus::Escalated)
+        );
+        assert_eq!(
+            ReportStatus::queue_filter_from_param(Some("resolved")).unwrap(),
+            Some(ReportStatus::Resolved)
+        );
+    }
+
+    #[test]
+    fn queue_filter_rejects_unknown_value() {
+        // Drives the handler's 400 — no silently-ignored garbage filter.
+        assert!(ReportStatus::queue_filter_from_param(Some("garbage")).is_err());
+    }
+
+    // #209: list_reports actually narrows by status, so the resolved filter
+    // changes the queue result set (not just the param plumbing).
+    #[tokio::test]
+    async fn list_reports_status_filter_narrows_result_set() {
+        let db = open_test_pool().await;
+        let manager = ReportManager::new(db.clone());
+
+        // Two open reports; one then escalated.
+        let r1 = manager
+            .submit_report(
+                Some("did:plc:a"),
+                None,
+                None,
+                ReportReason::Spam,
+                Some("one"),
+                "did:plc:reporter",
+            )
+            .await
+            .unwrap();
+        manager
+            .submit_report(
+                Some("did:plc:b"),
+                None,
+                None,
+                ReportReason::Spam,
+                Some("two"),
+                "did:plc:reporter",
+            )
+            .await
+            .unwrap();
+        manager
+            .update_status(r1.id, ReportStatus::Escalated, "did:plc:mod", None)
+            .await
+            .unwrap();
+
+        let open = manager
+            .list_reports(Some(ReportStatus::Open), None)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1, "one report remains open");
+        assert_eq!(open[0].subject_did.as_deref(), Some("did:plc:b"));
+
+        let escalated = manager
+            .list_reports(Some(ReportStatus::Escalated), None)
+            .await
+            .unwrap();
+        assert_eq!(escalated.len(), 1, "one report escalated");
+        assert_eq!(escalated[0].subject_did.as_deref(), Some("did:plc:a"));
+
+        let all = manager.list_reports(None, None).await.unwrap();
+        assert_eq!(all.len(), 2, "no filter returns the full set");
     }
 }

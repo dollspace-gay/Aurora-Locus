@@ -18,19 +18,19 @@
 .detail-header .meta {
   margin-top: var(--space-2);
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 .detail-header .meta code {
-  font-family: var(--font-mono);
-  background: var(--background);
+  font-family: var(--font-family-mono);
+  background: var(--color-surface-primary);
   padding: 0.125rem 0.25rem;
   border-radius: 4px;
 }
 
 /* Roles cards */
 .role-card {
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   padding: var(--space-6);
   box-shadow: var(--shadow-sm);
@@ -54,7 +54,7 @@
 
 /* Operations sub-page common layout */
 .ops-section {
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   padding: var(--space-6);
   box-shadow: var(--shadow-sm);
@@ -79,26 +79,26 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  font-family: var(--font-mono);
+  font-family: var(--font-family-mono);
   font-size: var(--font-size-sm);
 }
 
-.capability-list .cap-yes { color: var(--success-color); }
-.capability-list .cap-no { color: var(--text-tertiary); }
+.capability-list .cap-yes { color: var(--color-status-success); }
+.capability-list .cap-no { color: var(--color-text-tertiary); }
 
 .capability-meta {
   margin-top: var(--space-3);
   padding-top: var(--space-3);
-  border-top: 1px solid var(--border-color);
+  border-top: 1px solid var(--color-border-primary);
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 /* Settings — source-tier suffix (Runtime/File/Default/RecoveryMode)
  * per Arc 6 Step 2 §5.2.1/§5.3.5. Visually subdued; placed inline
  * after the setting label without distracting from the form. */
 .settings-source-tag {
-  color: var(--text-tertiary);
+  color: var(--color-text-tertiary);
   font-style: italic;
   margin-left: var(--space-2);
   font-weight: normal;
@@ -132,38 +132,38 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   padding: var(--space-1) var(--space-2);
   font-size: var(--font-size-sm);
   cursor: pointer;
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 .chain-indicator-badge:hover {
-  background: var(--background);
+  background: var(--color-surface-primary);
 }
 
-.chain-indicator-ok .chain-indicator-icon  { color: var(--success-color); }
-.chain-indicator-warn .chain-indicator-icon { color: var(--warning-color); }
-.chain-indicator-bad .chain-indicator-icon { color: var(--danger-color); }
+.chain-indicator-ok .chain-indicator-icon  { color: var(--color-status-success); }
+.chain-indicator-warn .chain-indicator-icon { color: var(--color-status-warning); }
+.chain-indicator-bad .chain-indicator-icon { color: var(--color-status-danger); }
 
 .chain-indicator-ok {
-  border-color: var(--success-color);
+  border-color: var(--color-status-success);
 }
 
 .chain-indicator-warn {
-  border-color: var(--warning-color);
+  border-color: var(--color-status-warning);
 }
 
 .chain-indicator-bad {
-  border-color: var(--danger-color);
+  border-color: var(--color-status-danger);
 }
 
 .chain-indicator-detail {
-  background: var(--surface);
-  border: 1px solid var(--border-color);
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-md);
   padding: var(--space-4);
   margin-bottom: var(--space-4);
@@ -171,11 +171,11 @@
 }
 
 .chain-indicator-cmd {
-  background: var(--background);
-  border: 1px solid var(--border-color);
+  background: var(--color-surface-primary);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   padding: var(--space-2) var(--space-3);
-  font-family: var(--font-mono);
+  font-family: var(--font-family-mono);
   font-size: var(--font-size-sm);
   overflow-x: auto;
 }
@@ -199,9 +199,279 @@
   align-items: center;
   gap: var(--space-2);
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 .metrics-range-select {
   font-size: var(--font-size-sm);
+}
+
+/* Inline CSS-bar sparkline (Kryphocron Tier activity + Dashboard
+ * account-growth, #361). Bars sit in a flex row aligned to a shared
+ * baseline; each carries an explicit pixel height. inline elements ignore
+ * height, so the bars are flex items here. No chart dependency. */
+.sparkline {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 26px;
+  min-width: 1px;
+}
+
+.sparkline-tall {
+  display: flex;
+  height: 52px;
+  margin: var(--space-2) 0;
+}
+
+.spark-bar {
+  flex: 1 1 auto;
+  min-width: 2px;
+  background: var(--color-accent-primary);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  opacity: 0.85;
+}
+
+.spark-empty {
+  color: var(--color-text-secondary);
+}
+
+/* Dashboard account-growth block (#361). */
+.dash-growth-headline {
+  margin: 0 0 var(--space-1);
+}
+
+.dash-growth-range {
+  margin: var(--space-1) 0 0;
+  font-size: var(--font-size-sm);
+}
+
+/* Configuration → Themes (§11.10.2 / B-themes-page) — single-column row list
+ * (one row per installed theme). No card chrome; a hairline divider and the
+ * row's own spacing carry the structure. The active (deployment-default) row
+ * takes a left-border accent + a subtle wash so the default reads at a glance.
+ * The validation-errors modal list styles follow. */
+.theme-list {
+  display: flex;
+  flex-direction: column;
+}
+.theme-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4);
+  border-block-end: 1px solid var(--color-border-secondary);
+  border-inline-start: 3px solid transparent;
+}
+.theme-row:last-child {
+  border-block-end: none;
+}
+.theme-row.is-active {
+  border-inline-start-color: var(--color-accent-primary);
+  background: var(--color-surface-secondary);
+}
+.theme-row-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.theme-row-name {
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+}
+.theme-row-desc {
+  margin-block: var(--space-1) 0;
+  color: var(--color-text-secondary);
+}
+.theme-row-ext {
+  margin-block: var(--space-1) 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-tertiary);
+}
+.theme-row-action {
+  flex-shrink: 0;
+}
+/* Small annotation pills on a theme row. Mode is a muted neutral chip; AAA is
+ * an accent chip surfaced only on the high-contrast themes; Active marks the
+ * current deployment default. */
+.theme-mode-pill,
+.theme-aaa-pill,
+.theme-active-pill {
+  display: inline-block;
+  padding: 0.0625rem 0.4375rem;
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  vertical-align: middle;
+}
+.theme-mode-pill {
+  background: var(--color-surface-tertiary);
+  color: var(--color-text-secondary);
+}
+.theme-aaa-pill {
+  background: color-mix(in srgb, var(--color-accent-primary) 18%, transparent);
+  color: var(--color-accent-primary);
+}
+.theme-active-pill {
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
+}
+/* Divider + heading for the Installed Themes section folded into UI & modes
+ * (#322) — sits below the personal-preference controls. */
+.config-section-divider {
+  margin-block: var(--space-6);
+  border: none;
+  border-block-start: 1px solid var(--color-border-primary);
+}
+.installed-themes-section > h3 {
+  margin-block: 0 var(--space-3);
+}
+/* Branding section (UI & modes) — login-splash assets: upload + URL + clear +
+ * preview per asset (#328 URL fields, #329 upload). */
+.branding-section > h3 {
+  margin-block: 0 var(--space-2);
+}
+.branding-asset {
+  margin-block: var(--space-4);
+}
+.branding-asset-label {
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+  margin-block-end: var(--space-1);
+}
+.branding-controls {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+.branding-controls .branding-url {
+  flex: 1;
+  min-width: 220px;
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface-primary);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--radius-sm);
+}
+.branding-controls .branding-file {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+.branding-row2 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-block-start: var(--space-2);
+  min-height: var(--space-4);
+}
+.branding-thumb {
+  max-height: 48px;
+  max-width: 160px;
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-tertiary);
+}
+.branding-status {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+.branding-status.is-error {
+  color: var(--color-status-danger);
+}
+/* Branding text + color override groups + live preview (#331). */
+.branding-field-group {
+  margin-block: var(--space-4);
+}
+.branding-text-input,
+.branding-color-hex {
+  flex: 1;
+  min-width: 160px;
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface-primary);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--radius-sm);
+}
+.branding-color-hex {
+  flex: 0 1 12ch;
+  min-width: 10ch;
+  font-family: var(--font-family-mono);
+}
+.branding-color-picker {
+  width: 2.5rem;
+  height: 2.25rem;
+  padding: 0;
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--radius-sm);
+  background: none;
+  cursor: pointer;
+}
+.branding-swatch {
+  display: inline-block;
+  width: 1.5rem;
+  height: 1.5rem;
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--radius-sm);
+  vertical-align: middle;
+}
+.branding-preview-card {
+  margin-block-start: var(--space-2);
+  padding: var(--space-6) var(--space-4);
+  text-align: center;
+  background-color: var(--color-surface-secondary);
+  background-size: cover;
+  background-position: center;
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--radius-md);
+}
+.branding-preview-logo img {
+  max-height: 40px;
+  max-width: 120px;
+  margin-block-end: var(--space-2);
+}
+.branding-preview-title {
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+}
+.branding-preview-subtitle {
+  font-size: var(--font-size-sm);
+  margin-block-start: var(--space-1);
+}
+/* Per-account kryphocron override drawer controls (#316). */
+.ad-ov-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin-block: var(--space-2);
+}
+.ad-ov-rationale {
+  display: block;
+  margin-block: var(--space-2);
+}
+.ad-ov-rationale textarea {
+  display: block;
+  width: 100%;
+  margin-block-start: var(--space-1);
+  padding: var(--space-2);
+  background: var(--color-surface-primary);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--radius-sm);
+}
+.ad-ov-actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-block-start: var(--space-2);
+}
+.theme-validation-errors {
+  margin: 0;
+  padding-inline-start: var(--space-5);
+}
+.theme-validation-errors li {
+  color: var(--color-status-danger);
+  margin-block: var(--space-1);
 }

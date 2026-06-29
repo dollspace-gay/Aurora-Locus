@@ -210,6 +210,8 @@ async fn perform_grant(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: CLI_GRANT_ACTOR_DID,
             action: GRANT_ACTION,
             subject: Some(&subject),

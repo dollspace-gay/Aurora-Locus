@@ -8,17 +8,34 @@
   let nextCursor = null;
   let lastFilters = {};
 
+  // url-state wiring (§5.7.5) — the shared shape lives in AuroraListPage
+  // (components/ListPage.js, #257). Scalar filters round-trip via the hash
+  // query; `when` via since/until ISO scalars. applyFilters writes the query →
+  // remount → readFilters re-seeds. These keys parameterize the helpers.
+  const SCALAR_KEYS = ['status', 'appellant', 'reviewer'];
+  const BOOL_KEYS = [];
+
+  function applyFilters(vals) {
+    global.AuroraListPage.applyFilters(SCALAR_KEYS, BOOL_KEYS, vals, lastFilters && lastFilters.when, function (v) {
+      lastFilters = v;
+      cursorStack = [];
+      nextCursor = null;
+      refresh(null);
+    });
+  }
+
   async function mount({ container }) {
     container.innerHTML =
       '<header class="page-header">' +
       '  <div><h2>Appeals</h2><p class="page-subtitle">Cross-instance appeals via tools.aurora.moderator.listAppeals</p></div>' +
       '</header>' +
       '<div id="appeals-filter"></div>' +
+      '<p class="filter-url-hint">' + (global.t ? global.t('common.filters_in_url') : '') + '</p>' +
       '<div id="appeals-table-container"></div>' +
       '<div id="appeals-pagination"></div>';
     cursorStack = [];
     nextCursor = null;
-    lastFilters = {};
+    lastFilters = global.AuroraListPage.readFilters(SCALAR_KEYS, BOOL_KEYS, {});
     if (global.AuroraFilterStrip) {
       global.AuroraFilterStrip.build({
         container: document.getElementById('appeals-filter'),
@@ -35,7 +52,8 @@
           { type: 'text', id: 'reviewer', placeholder: 'Filter by reviewer DID' },
           { type: 'dateRange', id: 'when', label: 'Date range' },
         ],
-        onApply: (vals) => { lastFilters = vals; cursorStack = []; nextCursor = null; refresh(null); },
+        initial: lastFilters,
+        onApply: applyFilters,
       });
     }
     await refresh(null);
@@ -54,7 +72,7 @@
     if (lastFilters.when && lastFilters.when.start) params.since = lastFilters.when.start.toISOString();
     if (lastFilters.when && lastFilters.when.end) params.until = lastFilters.when.end.toISOString();
 
-    c.innerHTML = '<p class="empty-state">Loading…</p>';
+    c.innerHTML = global.AuroraSkeleton.cards(3);
     try {
       const data = await ep.moderator.listAppeals(params);
       const items = (data && data.items) || [];
@@ -78,7 +96,7 @@
              (a.originalActionSummary.summary || ''))
           : '—';
         html += '<tr>' +
-                '<td>' + esc(fmt ? fmt.date(a.submittedAt, 'short') : a.submittedAt || '') + '</td>' +
+                '<td>' + global.AuroraTimestamp.render({ value: a.submittedAt, context: 'detail' }) + '</td>' +
                 '<td>' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(a.status, a.status) : esc(a.status)) + '</td>' +
                 '<td>' + (a.submitterDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(a.submitterDid, a.submitterHandle) : esc(a.submitterDid)) : '—') + '</td>' +
                 '<td>' + subjStr + '</td>' +
@@ -91,7 +109,10 @@
       c.innerHTML = html;
       renderPagination();
     } catch (e) {
-      c.innerHTML = '<p class="empty-state">Could not load appeals: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(c, {
+        message: 'Could not load appeals: ' + ((e && e.message) || ''),
+        onRetry: function () { refresh(cursor); },
+      });
     }
   }
 
@@ -101,20 +122,11 @@
   }
 
   function renderPagination() {
-    const c = document.getElementById('appeals-pagination');
-    if (!c || !global.AuroraPagination) return;
-    global.AuroraPagination.render({
-      container: c,
-      prevDisabled: cursorStack.length === 0,
-      nextDisabled: !nextCursor,
-      onPrev: () => {
-        if (cursorStack.length > 1) {
-          cursorStack.pop();
-          const p = cursorStack[cursorStack.length - 1] || null;
-          refresh(p);
-        } else if (cursorStack.length === 1) { cursorStack = []; refresh(null); }
-      },
-      onNext: () => { if (nextCursor) { cursorStack.push(nextCursor); refresh(nextCursor); } },
+    global.AuroraListPage.renderPagination({
+      container: document.getElementById('appeals-pagination'),
+      cursorStack: cursorStack,
+      nextCursor: nextCursor,
+      refresh: refresh,
     });
   }
 

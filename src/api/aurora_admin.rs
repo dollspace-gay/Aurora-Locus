@@ -769,6 +769,8 @@ pub async fn emit_event(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: action_str,
             subject: chain_subject,
@@ -795,6 +797,25 @@ pub async fn emit_event(
                     );
                 }
             }
+        }
+    }
+
+    // §5.5.4 Phase C: Pipeline B operator-action auto-label rules — fire
+    // post-commit, once per subject this operator moderation action touched.
+    // Best-effort; the audited action drove the trigger.
+    for subject in &input.subjects {
+        if let Err(e) =
+            crate::api::auto_label_rules::evaluate_pipeline_b(&ctx, subject, action_str, &auth.did)
+                .await
+        {
+            tracing::warn!(error = %e, action = action_str, "auto-label Pipeline B failed");
+        }
+        // §5.5.4 Phase D: Pipeline B escalation rules (operator-action).
+        if let Err(e) =
+            crate::api::escalation_rules::evaluate_pipeline_b(&ctx, subject, action_str, &auth.did)
+                .await
+        {
+            tracing::warn!(error = %e, action = action_str, "escalation Pipeline B failed");
         }
     }
 
@@ -1052,6 +1073,8 @@ async fn dispatch_action<'tx>(
                 val,
                 &auth.did,
                 None,
+                "manual",
+                None,
             )
             .await?;
             Ok(DispatchEffects::default())
@@ -1086,6 +1109,8 @@ async fn dispatch_action<'tx>(
                 cid.as_deref(),
                 "!takedown",
                 &auth.did,
+                None,
+                "manual",
                 None,
             )
             .await?;
@@ -1701,6 +1726,8 @@ pub async fn batch_takedown_accounts(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.batch_takedown",
             subject: None,
@@ -1793,6 +1820,8 @@ pub async fn batch_suspend_accounts(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.batch_suspend",
             subject: None,
@@ -1871,6 +1900,8 @@ pub async fn batch_restore_accounts(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.batch_restore",
             subject: None,
@@ -1961,6 +1992,8 @@ pub async fn batch_takedown_records(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "record.batch_takedown",
             subject: None,
@@ -2074,6 +2107,8 @@ pub async fn batch_apply_label(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "label.batch_apply",
             subject: None,
@@ -2234,6 +2269,8 @@ pub async fn batch_remove_label(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "label.batch_remove",
             subject: None,
@@ -2351,6 +2388,8 @@ pub async fn trigger_password_reset(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.trigger_password_reset",
             subject: Some(&subject),
@@ -2920,6 +2959,154 @@ fn internal_pds(e: PdsError) -> (StatusCode, Json<serde_json::Value>) {
 }
 
 // ===========================================================================
+// getAccountGrowth — Dashboard account-growth visual (#361)
+// ===========================================================================
+//
+// A real account-growth metric off `actor.created_at` — no new
+// instrumentation. The window is a fixed 30 trailing UTC calendar days; each
+// point carries both `newAccounts` (rows created that day) and
+// `cumulativeAccounts` (true deployment size through that day =
+// `accountsBeforeWindow` + running sum). One call serves both the per-day and
+// cumulative Dashboard toggle states without a re-fetch.
+//
+// Dual-backend-safe: rather than a SQLite-vs-Postgres-divergent `date()`
+// GROUP BY, we fetch the windowed `created_at` strings and bucket per-day in
+// Rust — the same parse-and-bucket shape `compute_metric` uses for the
+// moderation-metrics series.
+
+/// Number of trailing UTC calendar days the account-growth window spans.
+const ACCOUNT_GROWTH_WINDOW_DAYS: i64 = 30;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountGrowthPoint {
+    /// UTC calendar day, `YYYY-MM-DD`.
+    pub day: String,
+    /// Accounts whose `created_at` falls on this day.
+    pub new_accounts: i64,
+    /// Total deployment account count through the end of this day
+    /// (`accountsBeforeWindow` + running sum of `newAccounts`).
+    pub cumulative_accounts: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAccountGrowthOutput {
+    /// Inclusive first day of the window, `YYYY-MM-DD`.
+    pub window_start: String,
+    /// Inclusive last day of the window (today, UTC), `YYYY-MM-DD`.
+    pub window_end: String,
+    /// Accounts created strictly before the window start — the cumulative
+    /// baseline so the cumulative series reflects true deployment size, not
+    /// just within-window accumulation.
+    pub accounts_before_window: i64,
+    /// One entry per UTC calendar day, oldest first.
+    pub points: Vec<AccountGrowthPoint>,
+}
+
+/// `GET /xrpc/tools.aurora.admin.getAccountGrowth` — account-growth metric
+/// backing the Dashboard sparkline (#361). Admin+; read-only.
+pub async fn get_account_growth(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<GetAccountGrowthOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::Admin) {
+        return Err(forbidden(&format!(
+            "getAccountGrowth requires Admin+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+
+    let (points, accounts_before_window, window_start_date, window_end_date) =
+        compute_account_growth(&ctx, chrono::Utc::now())
+            .await
+            .map_err(internal_pds)?;
+
+    Ok(Json(GetAccountGrowthOutput {
+        window_start: window_start_date.format("%Y-%m-%d").to_string(),
+        window_end: window_end_date.format("%Y-%m-%d").to_string(),
+        accounts_before_window,
+        points,
+    }))
+}
+
+/// Compute the per-day account-growth series ending on `now`'s UTC calendar
+/// day. Split out from the handler so tests can pin a fixed `now`. Returns
+/// `(points, accounts_before_window, window_start_date, window_end_date)`.
+async fn compute_account_growth(
+    ctx: &AppContext,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<
+    (
+        Vec<AccountGrowthPoint>,
+        i64,
+        chrono::NaiveDate,
+        chrono::NaiveDate,
+    ),
+    PdsError,
+> {
+    use sqlx::Row as _;
+
+    let window_end_date = now.date_naive();
+    let window_start_date =
+        window_end_date - chrono::Duration::days(ACCOUNT_GROWTH_WINDOW_DAYS - 1);
+    // Window start as an RFC3339 instant at UTC midnight — the shared lower
+    // bound for the baseline count and the windowed fetch.
+    let window_start_instant = window_start_date
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time")
+        .and_utc();
+    let window_start_rfc3339 = window_start_instant.to_rfc3339();
+
+    // Baseline: accounts created strictly before the window.
+    let accounts_before_window: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM actor WHERE created_at < $1")
+            .bind(&window_start_rfc3339)
+            .fetch_one(&ctx.account_db)
+            .await?;
+
+    // Windowed rows, bucketed per UTC calendar day in Rust (no date-SQL).
+    let bucket_count = ACCOUNT_GROWTH_WINDOW_DAYS as usize;
+    let mut new_per_day: Vec<i64> = vec![0; bucket_count];
+    let rows = sqlx::query("SELECT created_at FROM actor WHERE created_at >= $1")
+        .bind(&window_start_rfc3339)
+        .fetch_all(&ctx.account_db)
+        .await?;
+    for row in &rows {
+        let ts_str: String = row.try_get("created_at").map_err(PdsError::Database)?;
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&ts_str) {
+            let day = ts.with_timezone(&chrono::Utc).date_naive();
+            let idx = (day - window_start_date).num_days();
+            // Guard discards future-dated rows (clock skew) past the window.
+            if (0..bucket_count as i64).contains(&idx) {
+                new_per_day[idx as usize] += 1;
+            }
+        }
+    }
+
+    // Accumulate cumulative from the baseline forward, oldest day first.
+    let mut cumulative = accounts_before_window;
+    let mut points = Vec::with_capacity(bucket_count);
+    for (i, &new_accounts) in new_per_day.iter().enumerate() {
+        cumulative += new_accounts;
+        let day = window_start_date + chrono::Duration::days(i as i64);
+        points.push(AccountGrowthPoint {
+            day: day.format("%Y-%m-%d").to_string(),
+            new_accounts,
+            cumulative_accounts: cumulative,
+        });
+    }
+
+    Ok((
+        points,
+        accounts_before_window,
+        window_start_date,
+        window_end_date,
+    ))
+}
+
+// ===========================================================================
 // exportAccountForensic — §8.7 (Phase 3.8)
 // ===========================================================================
 //
@@ -3088,11 +3275,69 @@ pub async fn export_account_forensic(
         ));
     }
 
-    // Manifest with per-file hashes. include_repo / include_blobs
-    // accepted but their contents land in v0.3 (streaming CAR +
-    // bounded-blob serialization is non-trivial under AnyPool); the
-    // manifest records the deferral so consumers know the bundle is
-    // metadata-only for v0.2.
+    // #339 — repo CAR (§8.7 bundle structure: `repo.car` at root when
+    // include_repo). Composed from the same full-repo serialization federation
+    // uses (`export_repo_to_car` → `get_all_blocks` + `blocks_to_car`), so the
+    // bundle is parseable offline with standard atproto tooling and tamper-
+    // evident against the repo's commit history. The per-file hash loop below
+    // covers it for §3.4 chain-of-custody. Best-effort: an account with no
+    // resolvable repo (e.g. fully deleted) records a repo status note rather
+    // than failing the whole bundle. Admin+ (not SuperAdmin) per §8.7 — repo +
+    // blobs are the "basic" export; only metadata + audit_chain are gated above.
+    let repo_status: serde_json::Value = if input.include_repo {
+        match crate::actor_store::car::export_repo_to_car(&ctx.actor_store, &input.did, None).await {
+            Ok(car) => {
+                files.push(("repo.car".to_string(), car));
+                serde_json::json!({ "included": true })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "aurora_locus::forensic",
+                    did = %input.did,
+                    error = %e,
+                    "forensic export: repo CAR unavailable; bundle continues without repo.car",
+                );
+                serde_json::json!({ "included": false, "reason": e.to_string() })
+            }
+        }
+    } else {
+        serde_json::Value::Null
+    };
+
+    // #339 — blobs (§8.7: `blobs/<cid>.bin` when include_blobs). Every blob the
+    // account uploaded (`creator_did`), each fetched and packaged. A
+    // referenced-but-missing blob is recorded in the manifest, not fatal. The
+    // count is capped defensively; the manifest flags if the cap was hit.
+    const FORENSIC_BLOB_LIMIT: i64 = 100_000;
+    let blobs_status: serde_json::Value = if input.include_blobs {
+        let metas = ctx
+            .blob_store
+            .list_for_user(&input.did, FORENSIC_BLOB_LIMIT)
+            .await
+            .map_err(internal_pds)?;
+        let mut included: u64 = 0;
+        let mut missing: Vec<String> = Vec::new();
+        for m in &metas {
+            match ctx.blob_store.get(&m.cid).await.map_err(internal_pds)? {
+                Some((bytes, _mime)) => {
+                    files.push((format!("blobs/{}.bin", m.cid), bytes));
+                    included += 1;
+                }
+                None => missing.push(m.cid.clone()),
+            }
+        }
+        serde_json::json!({
+            "included": included,
+            "missing": missing,
+            "capped": metas.len() as i64 >= FORENSIC_BLOB_LIMIT,
+        })
+    } else {
+        serde_json::Value::Null
+    };
+
+    // Manifest with per-file hashes — covers repo.car + every blobs/<cid>.bin
+    // added above (they are in `files`), so the chain-of-custody hash commits to
+    // the full content, not just the metadata JSON.
     use sha2::{Digest, Sha256};
     let mut file_hashes: serde_json::Map<String, serde_json::Value> = Default::default();
     for (name, bytes) in &files {
@@ -3122,11 +3367,14 @@ pub async fn export_account_forensic(
             "includeAuditChain": input.include_audit_chain,
         },
         "fileHashes": file_hashes,
-        "deferredContents": {
-            "repoCar": input.include_repo,
-            "blobs": input.include_blobs,
-            "note": "v0.2 forensic bundles ship metadata only; CAR + blob streaming remains a v0.5+ candidate"
-        },
+        // #339 — repo.car + blobs/ now ship in-bundle (§8.7). These record what
+        // was actually included: `repo.included` (+ `reason` when a repo wasn't
+        // resolvable), and the blob `included` count (+ any `missing` cids, +
+        // `capped` if the blob count hit the export limit). The bundle is
+        // assembled in-memory and shipped as one response body per §8.7;
+        // streaming for very large bundles remains a separate future item.
+        "repo": repo_status,
+        "blobs": blobs_status,
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(internal)?;
 
@@ -3203,6 +3451,8 @@ pub async fn export_account_forensic(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "ForensicExport",
             subject: Some(&subject),
@@ -3283,6 +3533,28 @@ pub struct GetAuditTrailParams {
     pub after_created: Option<String>,
     #[serde(default)]
     pub before_created: Option<String>,
+    /// §5.5.4 Phase E (§6.4) — additive source-discriminator filter
+    /// (`default_action | auto_label_rule | stale_expiration |
+    /// operator_removal | escalation | system_diagnostic | manual`).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// §5.5.4 Phase E (MD-40) — the "Operator rule management" filter:
+    /// when true, restricts to the six rule-lifecycle action names. UI-side
+    /// mutually exclusive with `source` (MD-44). Additive.
+    #[serde(default)]
+    pub rule_management: Option<bool>,
+    /// Integration hooks Phase A (#350 / design-commit 26) — the
+    /// "Integration hook" filter: when true, restricts to the three
+    /// hook-lifecycle action names. UI-side one-way-clear sibling of the
+    /// §5.5.4 filters. Additive.
+    #[serde(default)]
+    pub hook_management: Option<bool>,
+    /// Federation Pattern-1 Phase E (#355 / design §5.3 + commit 32) — the
+    /// "Federation management" filter: when true, restricts to the `federation.*`
+    /// action namespace (all peer/relay/discovery/boot-seed audit names). UI-side
+    /// one-way-clear sibling of the §5.5.4 filters, mirroring `hook_management`.
+    #[serde(default)]
+    pub federation_management: Option<bool>,
     #[serde(flatten)]
     pub pagination: PaginationParams,
 }
@@ -3346,6 +3618,86 @@ pub struct GetAuditTrailOutput {
     pub cursor: Option<String>,
     pub chain_verified: bool,
     pub chain_verified_through: i64,
+    /// Count of entries in the verified window that matched only the
+    /// pre-v0.9 legacy hash form (sealed before the #345 source/payload
+    /// bump). These are honestly-sealed, untampered rows — surfaced so the
+    /// UI can annotate the format boundary rather than imply tamper.
+    pub chain_legacy_count: i64,
+}
+
+/// Query params for `tools.aurora.admin.getReport` — the single report id.
+#[derive(serde::Deserialize)]
+pub struct GetReportParams {
+    pub id: i64,
+}
+
+/// Wire shape for `getReport`. A camelCase re-projection of
+/// [`crate::admin::reports::Report`] (whose own `Serialize` is snake_case and
+/// consumed internally) — the admin UI's ReportDetail page reads `subjectDid`,
+/// `reportedBy`, `reasonType`, etc. (#302).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetReportOutput {
+    pub id: i64,
+    pub subject_did: Option<String>,
+    pub subject_uri: Option<String>,
+    pub subject_cid: Option<String>,
+    pub reason_type: crate::admin::reports::ReportReason,
+    pub reason: Option<String>,
+    pub reported_by: String,
+    pub reported_at: chrono::DateTime<chrono::Utc>,
+    pub status: crate::admin::reports::ReportStatus,
+    pub reviewed_by: Option<String>,
+    pub reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub resolution: Option<String>,
+}
+
+impl From<crate::admin::reports::Report> for GetReportOutput {
+    fn from(r: crate::admin::reports::Report) -> Self {
+        Self {
+            id: r.id,
+            subject_did: r.subject_did,
+            subject_uri: r.subject_uri,
+            subject_cid: r.subject_cid,
+            reason_type: r.reason_type,
+            reason: r.reason,
+            reported_by: r.reported_by,
+            reported_at: r.reported_at,
+            status: r.status,
+            reviewed_by: r.reviewed_by,
+            reviewed_at: r.reviewed_at,
+            resolution: r.resolution,
+        }
+    }
+}
+
+/// `tools.aurora.admin.getReport` — fetch a single moderation report by id
+/// (#302). Moderator+. The `get_report` store method already existed; this is
+/// the HTTP surface that was never registered (the admin UI's report-detail
+/// page 404'd on the legacy `com.atproto.admin.getReport` NSID).
+pub async fn get_report(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    axum::extract::Query(params): axum::extract::Query<GetReportParams>,
+) -> Result<Json<GetReportOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::Moderator) {
+        return Err(forbidden(&format!(
+            "getReport requires Moderator+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+    let mgr = crate::admin::reports::ReportManager::new(ctx.account_db.clone());
+    let report = mgr.get_report(params.id).await.map_err(internal_pds)?.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "ReportNotFound",
+                "message": format!("report {} not found", params.id),
+            })),
+        )
+    })?;
+    Ok(Json(GetReportOutput::from(report)))
 }
 
 pub async fn get_audit_trail(
@@ -3395,6 +3747,35 @@ pub async fn get_audit_trail(
     if let Some(b) = &params.before_created {
         clauses.push("created_at <= ?");
         binds.push(b.clone());
+    }
+    // §5.5.4 Phase E (§6.4): source-discriminator filter.
+    if let Some(s) = &params.source {
+        clauses.push("source = ?");
+        binds.push(s.clone());
+    }
+    // §5.5.4 Phase E (MD-40): the Operator rule-management filter — the six
+    // rule-lifecycle action names. A static IN-clause (no binds).
+    if params.rule_management == Some(true) {
+        clauses.push(
+            "action IN ('moderation_auto_label_rule_created', \
+             'moderation_auto_label_rule_edited', 'moderation_auto_label_rule_deleted', \
+             'moderation_escalation_rule_created', 'moderation_escalation_rule_edited', \
+             'moderation_escalation_rule_deleted')",
+        );
+    }
+    // Integration hooks (#350 / design-commit 26): the hook-lifecycle filter.
+    if params.hook_management == Some(true) {
+        clauses.push(
+            "action IN ('moderation_integration_hook_created', \
+             'moderation_integration_hook_edited', 'moderation_integration_hook_deleted')",
+        );
+    }
+    // Federation Pattern-1 Phase E (#355 / design §5.3): the federation-management
+    // filter — the whole `federation.*` action namespace via a prefix LIKE
+    // (robust to the ~26 federation audit names without a static IN-clause; the
+    // literal `.` and trailing `%` carry no `?` so renumbering is unaffected).
+    if params.federation_management == Some(true) {
+        clauses.push("action LIKE 'federation.%'");
     }
     if let Some(c) = &cursor {
         clauses.push("(created_at < ? OR (created_at = ? AND id < ?))");
@@ -3507,13 +3888,16 @@ pub async fn get_audit_trail(
     // edge case where seq=1 itself failed (nothing was verified
     // through; chain_verified_through = 0 is correct).
     let verification_result = if head_seq == 0 {
-        Ok(())
+        Ok(audit_chain::ChainVerificationSummary::default())
     } else {
         audit_chain::verify_chain_range(&ctx.account_db, 1, head_seq).await
     };
-    let (chain_verified, chain_verified_through) = match verification_result {
-        Ok(()) => (true, head_seq),
-        Err(e) => (false, e.failing_sequence.saturating_sub(1)),
+    // A clean walk (Ok) means tamper-free even when some entries matched
+    // only the pre-v0.9 legacy form; `chain_legacy_count` carries that
+    // boundary detail to the UI so it annotates rather than alarms.
+    let (chain_verified, chain_verified_through, chain_legacy_count) = match verification_result {
+        Ok(summary) => (true, head_seq, summary.legacy_count as i64),
+        Err(e) => (false, e.failing_sequence.saturating_sub(1), 0),
     };
 
     Ok(Json(GetAuditTrailOutput {
@@ -3521,7 +3905,86 @@ pub async fn get_audit_trail(
         cursor: next_cursor,
         chain_verified,
         chain_verified_through,
+        chain_legacy_count,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAuditEntryParams {
+    /// Fetch by audit-chain entry id. Mutually exclusive with `hash`.
+    pub id: Option<i64>,
+    /// Fetch by the entry's `current_hash`. The detail page's "walk to
+    /// previous" affordance knows only the prior entry's hash, not its id,
+    /// so it resolves the previous entry this way. Mutually exclusive with `id`.
+    pub hash: Option<String>,
+}
+
+/// `tools.aurora.admin.getAuditEntry` (#359) — fetch a single audit-chain
+/// entry by id or by `current_hash`. Moderator+ (mirrors `getAuditTrail`); no
+/// capability extension (a basic role-gated read, like `getReport`).
+///
+/// This retires the page-scoped `window._auditCache` the audit detail page
+/// used to lean on: a cache miss degraded to a "narrow with filters" message,
+/// and the chain-walk could only reach entries already in the loaded page. The
+/// per-row `verified` flag is recomputed exactly as in `getAuditTrail` (the
+/// shared `audit_entry_from_row` helper).
+pub async fn get_audit_entry(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    axum::extract::Query(params): axum::extract::Query<GetAuditEntryParams>,
+) -> Result<Json<audit_chain::AuditEntry>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::Moderator) {
+        return Err(forbidden(&format!(
+            "getAuditEntry requires Moderator+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+
+    // Same column projection `audit_entry_from_row` expects, single-row.
+    const SELECT_COLS: &str =
+        "SELECT id, sequence, created_at, actor_did, action, subject_did, subject_uri, \
+                subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
+                cascade_subjects, cascade_snapshot_ids FROM audit_chain_entry";
+
+    let row = match (params.id, params.hash.as_deref()) {
+        (Some(id), None) => {
+            sqlx::query(&format!("{SELECT_COLS} WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(&ctx.account_db)
+                .await
+        }
+        (None, Some(hash)) => {
+            sqlx::query(&format!("{SELECT_COLS} WHERE current_hash = $1"))
+                .bind(hash)
+                .fetch_optional(&ctx.account_db)
+                .await
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "InvalidRequest",
+                    "message": "exactly one of `id` or `hash` is required",
+                })),
+            ));
+        }
+    }
+    .map_err(internal)?;
+
+    let row = row.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "AuditEntryNotFound",
+                "message": "no audit entry matches the given id or hash",
+            })),
+        )
+    })?;
+
+    let entry = audit_chain::audit_entry_from_row(&row).map_err(internal)?;
+    Ok(Json(entry))
 }
 
 // ===========================================================================
@@ -3602,8 +4065,138 @@ impl Serialize for SettingSource {
     }
 }
 
-const MODERATION_MODE_KEY: &str = "moderation-mode";
+pub const MODERATION_MODE_KEY: &str = "moderation-mode";
 const MODERATION_MODE_REDIRECT_KEY: &str = "moderation-mode-redirect-url";
+/// §5.5.4 Phase A (#345) — default action applied to a report on intake.
+/// `acknowledge` | `hide-pending-review` | `auto-resolve-by-category`.
+/// Consulted live by the report-intake consumer; full tier only (§2.7).
+pub const MODERATION_DEFAULTS_REPORT_ACTION_KEY: &str = "moderation.defaults.report-action";
+/// §5.5.4 §2.3 — per-report-category action override map (JSON object).
+/// Keys ∈ the `ReportReason` vocabulary; values ∈ `acknowledge` |
+/// `hide-pending-review`. Consulted when report-action is
+/// `auto-resolve-by-category`. Default `{}`.
+pub const MODERATION_DEFAULTS_CATEGORY_MAP_KEY: &str =
+    "moderation.defaults.report-action-category-map";
+/// §5.5.4 §2.5 — age in days after which a substrate-applied
+/// hide-pending label is treated as stale and lazily auto-removed.
+/// `1..=365`, default 90.
+pub const MODERATION_DEFAULTS_STALE_DAYS_KEY: &str =
+    "moderation.defaults.hide-pending-review-stale-days";
+// §5.5.4 Phase B (#346) — reviewer assignment (§4).
+/// Assignment mode: `manual` | `round-robin` | `load-balanced` |
+/// `category-routed`. Default `manual`. Full tier only.
+pub const MODERATION_REVIEWER_MODE_KEY: &str =
+    "moderation.defaults.reviewer-assignment-mode";
+/// §4.3 per-category routing pool: object keyed on the ReportReason
+/// vocabulary, values are arrays of operator DIDs. Default `{}`.
+pub const MODERATION_REVIEWER_CATEGORY_MAP_KEY: &str =
+    "moderation.defaults.reviewer-routing-category-map";
+/// §4.7 round-robin rotation cursor (integer ≥ 0). Seeded by migration;
+/// advanced via the value-CAS primitive.
+pub const MODERATION_REVIEWER_ROTATION_CURSOR_KEY: &str =
+    "moderation.defaults.reviewer-rotation-cursor";
+/// §4.7 per-category rotation cursors: object keyed on the ReportReason
+/// vocabulary, values are integers ≥ 0. Seeded `{}` by migration.
+pub const MODERATION_REVIEWER_CATEGORY_CURSORS_KEY: &str =
+    "moderation.defaults.reviewer-category-rotation-cursors";
+/// §4.5 monotonically-incrementing mode-change version (integer ≥ 0),
+/// drives the per-operator mode-change banner dismissal key. Seeded 0.
+pub const MODERATION_REVIEWER_MODE_VERSION_KEY: &str =
+    "moderation.defaults.reviewer-mode-version";
+/// §4.5/§2.6 forward-compat: the §5 escalation SuperAdmin cursor. Phase D
+/// activates it; Phase B pre-registers (seeded 0) so the operator-set-change
+/// cursor-reset hook is uniform across all three cursor keys.
+pub const MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY: &str =
+    "moderation.defaults.escalation-superadmin-cursor";
+// §5.5.4 Phase E (#349) — lexicon-migration state.
+/// SHA-256 of the last-seen ReportReason category set; the boot-time
+/// change witness (§6.7 #1).
+pub const MODERATION_LEXICON_ENUM_HASH_KEY: &str =
+    "moderation.lexicon.report-category-enum-hash";
+/// JSON banner content set when a boot migration runs (pruned keys + flagged
+/// rule ids); the UI shows it until per-operator localStorage dismissal.
+pub const MODERATION_LEXICON_BANNER_KEY: &str = "moderation.lexicon.migration-banner";
+/// v0.9 Arc B (§11.10.2): the deployment-default theme id — what fresh
+/// sessions and operators without a personal preference render. Set is
+/// SuperAdmin-only (via `setRuntimeSetting` + rationale); read is allowed at
+/// any role since every operator's UI applies it at boot. The value is a
+/// theme id, validated here only as a non-empty string — existence/validity
+/// is resolved at theme-apply time, falling back to `aurora-classic`.
+const THEME_DEPLOYMENT_DEFAULT_KEY: &str = "theme.deployment-default";
+
+/// v0.9 Arc D (#223) — deployment Laquna rotation cadence (§6.4.2). One of
+/// `hourly` / `daily` / `weekly` / `manual-only`; consulted live by the
+/// `aurora-locus-standard` rotation oracle (a `setRuntimeSetting` write
+/// propagates to the oracle's in-memory cadence cell, so the change takes
+/// effect on the next encode without a restart).
+const LAQUNA_ROTATION_CADENCE_KEY: &str = "kryphocron.laquna.rotation-cadence";
+
+// v0.9 Arc D (#334) — the Kryphocron Policy page's deployment settings
+// (§6.6.2 / §7.3.3 / §8.3.4). Registered so `setRuntimeSetting` accepts them
+// (the live page was 400ing on save). Each is consumed at its decision point,
+// except where the substrate has nothing to act on yet (see per-key notes).
+
+/// New-account access to private-tier writes (§6.6.2 item 1): `immediate`
+/// (write at once) or `delayed` (an N-day host-side guard before the kryphocron
+/// capability is issued). `earned` is a backend-prereq (§7) and is rejected.
+/// Consumed by [`crate::kryphocron_policy`] at the dedicated-write chokepoint.
+pub const KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY: &str = "kryphocron.policy.new-account-access";
+/// The N (in days) for `delayed` access — a positive integer (default 7).
+pub const KRYPHOCRON_ACCESS_DELAY_DAYS_KEY: &str = "kryphocron.policy.access-delay-days";
+
+/// Initial `mode` of the `policy.audience` record Aurora-Locus auto-creates for
+/// a new account (§6.6.2 item 2 / §7.3.3). One of the five kryphocron audience
+/// modes; `nobody` (default) authors no record at all — the account
+/// participates nowhere until its holder opts in. Consumed by
+/// [`crate::kryphocron_policy`] at account creation.
+pub const KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY: &str = "kryphocron.policy.default-audience-mode";
+
+/// Deployment process-shape declaration (§8.3.4): `single-process` (the
+/// standard oracle) or `multi-process` (an operator-coordinated oracle). Pure
+/// host-side bookkeeping — it installs no oracle; it drives a mismatch *warning*
+/// on Kryphocron Overview when the declaration disagrees with the oracle
+/// actually installed (always the standard one in v0.9, so `multi-process`
+/// always warns). The operator-supplied-oracle install path is out of scope
+/// (design-unspecified; a code-execution surface — cf. §11.8 hook deferral).
+const KRYPHOCRON_PROCESS_SHAPE_KEY: &str = "kryphocron.deployment.process-shape";
+
+/// Per-account rotation-cadence override bounds (§6.6.2 item 5):
+/// `weekly-to-daily` / `weekly-to-hourly` / `no-override`. Store-only in v0.9 —
+/// per-account cadence overrides don't exist (the laquna slug is
+/// deployment-wide; #316 found per-account cadence substrate-incoherent), so
+/// there is nothing to bound yet. Registered to back the page; the value
+/// records the operator's intent for when a per-account mechanism lands.
+const KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY: &str = "kryphocron.laquna.account-cadence-range";
+
+/// v0.9 — operator login-splash branding. URLs the (theme-aware) login page
+/// renders: the logo image at the top of the splash card, and a banner image
+/// behind it. Both default to empty (the built-in stack icon + the theme's
+/// surface, no banner). Operators host the assets themselves (drop in
+/// `static/branding/` and reference `/static/branding/<file>`, or any external
+/// URL). Read unauthenticated by the login page via `serve_login_branding`.
+const BRANDING_LOGIN_LOGO_KEY: &str = "branding.login-logo-url";
+const BRANDING_LOGIN_BANNER_KEY: &str = "branding.login-banner-image-url";
+
+/// v0.9 — login-splash text + color overrides, so operators can pair a custom
+/// banner with readable foreground. Each defaults to empty: the title/subtitle
+/// fall back to the built-in wordmark, and the colors fall back to the theme's
+/// text tokens. Text is length-capped to keep the splash from breaking; colors
+/// are `#RRGGBB` (or empty). Read unauthenticated via `serve_login_branding`.
+const BRANDING_LOGIN_TITLE_TEXT_KEY: &str = "branding.login-title-text";
+const BRANDING_LOGIN_SUBTITLE_TEXT_KEY: &str = "branding.login-subtitle-text";
+const BRANDING_LOGIN_TITLE_COLOR_KEY: &str = "branding.login-title-color";
+const BRANDING_LOGIN_SUBTITLE_COLOR_KEY: &str = "branding.login-subtitle-color";
+const BRANDING_LOGIN_TITLE_MAX: usize = 64;
+const BRANDING_LOGIN_SUBTITLE_MAX: usize = 128;
+
+/// `#RRGGBB` (6-digit hex, no 3-digit shorthand) or empty (= use the theme
+/// token). The branding color settings' value contract.
+fn is_branding_color_value(s: &str) -> bool {
+    s.is_empty()
+        || (s.len() == 7
+            && s.as_bytes()[0] == b'#'
+            && s[1..].bytes().all(|b| b.is_ascii_hexdigit()))
+}
 
 /// Allowlist of runtime-setting keys this build accepts. Per CR-2 /
 /// chainlink #119, `setRuntimeSetting` rejects any other key with
@@ -3618,8 +4211,90 @@ const MODERATION_MODE_REDIRECT_KEY: &str = "moderation-mode-redirect-url";
 pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     MODERATION_MODE_KEY,
     MODERATION_MODE_REDIRECT_KEY,
+    THEME_DEPLOYMENT_DEFAULT_KEY,
+    LAQUNA_ROTATION_CADENCE_KEY,
+    BRANDING_LOGIN_LOGO_KEY,
+    BRANDING_LOGIN_BANNER_KEY,
+    BRANDING_LOGIN_TITLE_TEXT_KEY,
+    BRANDING_LOGIN_SUBTITLE_TEXT_KEY,
+    BRANDING_LOGIN_TITLE_COLOR_KEY,
+    BRANDING_LOGIN_SUBTITLE_COLOR_KEY,
+    KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY,
+    KRYPHOCRON_ACCESS_DELAY_DAYS_KEY,
+    KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY,
+    KRYPHOCRON_PROCESS_SHAPE_KEY,
+    KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY,
+    MODERATION_DEFAULTS_REPORT_ACTION_KEY,
+    MODERATION_DEFAULTS_CATEGORY_MAP_KEY,
+    MODERATION_DEFAULTS_STALE_DAYS_KEY,
+    MODERATION_REVIEWER_MODE_KEY,
+    MODERATION_REVIEWER_CATEGORY_MAP_KEY,
+    MODERATION_REVIEWER_ROTATION_CURSOR_KEY,
+    MODERATION_REVIEWER_CATEGORY_CURSORS_KEY,
+    MODERATION_REVIEWER_MODE_VERSION_KEY,
+    MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY,
+    MODERATION_LEXICON_ENUM_HASH_KEY,
+    MODERATION_LEXICON_BANNER_KEY,
+    // Federation Pattern-1 Phase A (#351) — the four federation.policy.* keys
+    // (§2.1/§3.1/§4.1/§3.4). Registered now so phases B–E land boot-seed + CRUD
+    // without re-touching the registry; validators stay accept-any this phase
+    // (the `_ => true` arm), tightened per-key as each phase's CRUD lands.
+    FEDERATION_POLICY_PEER_ALLOWLIST_KEY,
+    FEDERATION_POLICY_DISCOVERY_MODE_KEY,
+    FEDERATION_POLICY_RELAY_URLS_KEY,
+    FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
+    // v0.9 Federation runtime-mutability arc Phase A (#386/#387/#388) —
+    // env-frozen federation fields migrated to runtime settings.
+    FEDERATION_APPVIEW_URL_KEY,
+    FEDERATION_FIREHOSE_ENABLED_KEY,
+    FEDERATION_CRAWL_ENABLED_KEY,
+    // v0.9 Federation runtime-mutability arc §2.1/§2.2 — restart-required fields.
+    FEDERATION_ENABLED_KEY,
+    SERVICE_PUBLIC_URL_KEY,
+    // Key-rotation arc B2 (#373 / §4.6) — operator-supplied-keys feature gate.
+    KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY,
 ];
-const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
+
+// Federation Pattern-1 Phase A (#351 / design §2.1, §3.1, §4.1, §3.4).
+pub const FEDERATION_POLICY_PEER_ALLOWLIST_KEY: &str = "federation.policy.peer-allowlist";
+pub const FEDERATION_POLICY_DISCOVERY_MODE_KEY: &str = "federation.policy.discovery-mode";
+pub const FEDERATION_POLICY_RELAY_URLS_KEY: &str = "federation.policy.relay-urls";
+pub const FEDERATION_POLICY_PENDING_DISCOVERIES_KEY: &str =
+    "federation.policy.pending-discoveries";
+
+// v0.9 Federation runtime-mutability arc Phase A (#386/#387/#388 / locked design
+// §2.4) — three env-frozen federation fields migrated to runtime settings via the
+// Pattern-1 recipe. Consumers read the runtime row with env-config fallback (see
+// `read_runtime_row_value` + the per-field resolvers); `default_for_key` carries
+// the compiled default since it has no `AppContext` to reach the env value.
+pub const FEDERATION_APPVIEW_URL_KEY: &str = "federation.appview_url";
+// `firehose_enabled` (#387) — describe-only advertised flag (recon: gates no
+// route/subscription; surfaces in `describeServer` + admin describe only).
+pub const FEDERATION_FIREHOSE_ENABLED_KEY: &str = "federation.firehose_enabled";
+// `crawl_enabled` (#388) — describe-only advertised relay-may-crawl hint (recon:
+// no crawler subsystem reads it; `describeServer` + admin describe only).
+pub const FEDERATION_CRAWL_ENABLED_KEY: &str = "federation.crawl_enabled";
+// v0.9 Federation runtime-mutability arc §2.1/§2.2 (#393/#395) — the two
+// restart-required fields' resolver registration (design §2.1/§2.2 "registered in
+// KNOWN_RUNTIME_KEYS like the Pattern-1 fields"). C4 needs them allowlisted to
+// support delete/revert; C6 reads `federation.enabled` for the request-layer
+// short-circuit. The save HANDLERS (modal, restart trigger, boot-seed, consumer
+// switch) land in the D-phase; here we register the keys only.
+pub const FEDERATION_ENABLED_KEY: &str = "federation.enabled";
+pub const SERVICE_PUBLIC_URL_KEY: &str = "service.public_url";
+
+/// Key-rotation arc B2 (#373 / design §4.6) — gates the operator-supplied
+/// signing-key path in account-key rotation. `false` (default) means the
+/// rotation flow only accepts PDS-generated keys; `true` permits an operator
+/// to supply their own (publicDidKey, privateKeyHex) pair (HSM-backed /
+/// pre-generated / compliance-required paths). Read fail-closed (absent or
+/// non-bool → disabled) by the dry-run XRPC gate-check and, in B3, by the
+/// rotation handler + CLI. SuperAdmin-mutable; flip is audit-chained for free
+/// via `set_runtime_setting`.
+pub const KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY: &str =
+    "key_rotation.operator_supplied_keys_enabled";
+
+pub const RECOVERY_MODE_ENV: &str = "AURORA_RECOVERY_MODE";
 
 /// Env-var override of the file-tier YAML path. Default is
 /// `<data_directory>/runtime.yaml`. Resolved in `AppContext::new`.
@@ -3629,6 +4304,62 @@ fn default_for_key(key: &str) -> serde_json::Value {
     match key {
         MODERATION_MODE_KEY => serde_json::Value::String("full".to_string()),
         MODERATION_MODE_REDIRECT_KEY => serde_json::Value::String(String::new()),
+        THEME_DEPLOYMENT_DEFAULT_KEY => serde_json::Value::String("aurora-classic".to_string()),
+        LAQUNA_ROTATION_CADENCE_KEY => serde_json::Value::String("daily".to_string()),
+        BRANDING_LOGIN_LOGO_KEY
+        | BRANDING_LOGIN_BANNER_KEY
+        | BRANDING_LOGIN_TITLE_TEXT_KEY
+        | BRANDING_LOGIN_SUBTITLE_TEXT_KEY
+        | BRANDING_LOGIN_TITLE_COLOR_KEY
+        | BRANDING_LOGIN_SUBTITLE_COLOR_KEY => serde_json::Value::String(String::new()),
+        KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY => serde_json::Value::String("immediate".to_string()),
+        KRYPHOCRON_ACCESS_DELAY_DAYS_KEY => serde_json::Value::from(7),
+        KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY => serde_json::Value::String("nobody".to_string()),
+        KRYPHOCRON_PROCESS_SHAPE_KEY => serde_json::Value::String("single-process".to_string()),
+        KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY => {
+            serde_json::Value::String("weekly-to-daily".to_string())
+        }
+        // §5.5.4 Phase A moderation defaults.
+        MODERATION_DEFAULTS_REPORT_ACTION_KEY => {
+            serde_json::Value::String("acknowledge".to_string())
+        }
+        MODERATION_DEFAULTS_CATEGORY_MAP_KEY => serde_json::json!({}),
+        MODERATION_DEFAULTS_STALE_DAYS_KEY => serde_json::Value::from(90),
+        // §5.5.4 Phase B reviewer assignment.
+        MODERATION_REVIEWER_MODE_KEY => serde_json::Value::String("manual".to_string()),
+        MODERATION_REVIEWER_CATEGORY_MAP_KEY => serde_json::json!({}),
+        MODERATION_REVIEWER_CATEGORY_CURSORS_KEY => serde_json::json!({}),
+        MODERATION_REVIEWER_ROTATION_CURSOR_KEY
+        | MODERATION_REVIEWER_MODE_VERSION_KEY
+        | MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY => serde_json::Value::from(0),
+        MODERATION_LEXICON_ENUM_HASH_KEY | MODERATION_LEXICON_BANNER_KEY => {
+            serde_json::Value::String(String::new())
+        }
+        // Federation Pattern-1 Phase A: empty defaults. The boot-seed (phase
+        // B+) populates peer-allowlist/relay-urls from FederationConfig; the
+        // runtime store is unset until then, so consumers fall back to config.
+        FEDERATION_POLICY_PEER_ALLOWLIST_KEY
+        | FEDERATION_POLICY_RELAY_URLS_KEY
+        | FEDERATION_POLICY_PENDING_DISCOVERIES_KEY => serde_json::json!([]),
+        FEDERATION_POLICY_DISCOVERY_MODE_KEY => {
+            serde_json::Value::String("allowlist-only".to_string())
+        }
+        // Key-rotation arc B2 (#373 / §4.6) — operator-supplied keys off by default.
+        KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY => serde_json::Value::Bool(false),
+        // v0.9 Federation runtime-mutability arc Phase A (#386) — appview_url has
+        // no compiled value (env-seeded `Option<String>`; the read site falls back
+        // to `FederationConfig.appview_url`). Null here mirrors that "unset".
+        FEDERATION_APPVIEW_URL_KEY => serde_json::Value::Null,
+        // Phase A (#387) — firehose_enabled compiled default is `false`
+        // (`FederationConfig.firehose_enabled` defaults false; env can override).
+        FEDERATION_FIREHOSE_ENABLED_KEY => serde_json::Value::Bool(false),
+        // Phase A (#388) — crawl_enabled compiled default is `false`.
+        FEDERATION_CRAWL_ENABLED_KEY => serde_json::Value::Bool(false),
+        // §2.1 (#393/#395) — federation.enabled compiled default is `false`
+        // (fail-safe per design §2.1; the consumer reads config as the real
+        // fallback). service.public_url has no compiled value (env-seeded).
+        FEDERATION_ENABLED_KEY => serde_json::Value::Bool(false),
+        SERVICE_PUBLIC_URL_KEY => serde_json::Value::Null,
         _ => serde_json::Value::Null,
     }
 }
@@ -3644,7 +4375,526 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
             .as_str()
             .is_some_and(|s| matches!(s, "full" | "reduced" | "disabled")),
         MODERATION_MODE_REDIRECT_KEY => value.as_str().is_some(),
+        THEME_DEPLOYMENT_DEFAULT_KEY => value.as_str().is_some_and(|s| !s.trim().is_empty()),
+        LAQUNA_ROTATION_CADENCE_KEY => value
+            .as_str()
+            .is_some_and(|s| matches!(s, "hourly" | "daily" | "weekly" | "manual-only")),
+        // Branding URLs: any string (including empty = "use the default").
+        // No URL/size validation in v0.9 — operators host their own assets.
+        BRANDING_LOGIN_LOGO_KEY | BRANDING_LOGIN_BANNER_KEY => value.as_str().is_some(),
+        // Branding text: any string up to the per-field cap (empty = default).
+        BRANDING_LOGIN_TITLE_TEXT_KEY => {
+            value.as_str().is_some_and(|s| s.chars().count() <= BRANDING_LOGIN_TITLE_MAX)
+        }
+        BRANDING_LOGIN_SUBTITLE_TEXT_KEY => {
+            value.as_str().is_some_and(|s| s.chars().count() <= BRANDING_LOGIN_SUBTITLE_MAX)
+        }
+        // Branding colors: #RRGGBB or empty (= use the theme token).
+        BRANDING_LOGIN_TITLE_COLOR_KEY | BRANDING_LOGIN_SUBTITLE_COLOR_KEY => {
+            value.as_str().is_some_and(is_branding_color_value)
+        }
+        // Kryphocron policy settings (#334). `earned` access is a backend-prereq
+        // (§6.6.2:1777) and rejected — only immediate/delayed are shippable.
+        KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY => {
+            value.as_str().is_some_and(|s| matches!(s, "immediate" | "delayed"))
+        }
+        // Delay window: a positive integer number of days, generously bounded.
+        KRYPHOCRON_ACCESS_DELAY_DAYS_KEY => {
+            value.as_u64().is_some_and(|n| (1..=36500).contains(&n))
+        }
+        KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY => value.as_str().is_some_and(|s| {
+            matches!(s, "list" | "everyone" | "followers" | "following" | "nobody")
+        }),
+        KRYPHOCRON_PROCESS_SHAPE_KEY => {
+            value.as_str().is_some_and(|s| matches!(s, "single-process" | "multi-process"))
+        }
+        KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY => value
+            .as_str()
+            .is_some_and(|s| matches!(s, "weekly-to-daily" | "weekly-to-hourly" | "no-override")),
+        // §5.5.4 §2.2: top-level default action. The "≥1 entry when
+        // auto-resolve-by-category" cross-key invariant cannot be checked
+        // here (no map access); the consumer degrades an empty map to
+        // `acknowledge` at apply time.
+        MODERATION_DEFAULTS_REPORT_ACTION_KEY => value.as_str().is_some_and(|s| {
+            matches!(s, "acknowledge" | "hide-pending-review" | "auto-resolve-by-category")
+        }),
+        // §5.5.4 §2.3: object keyed on the ReportReason vocabulary with
+        // per-category action values. Empty object is valid (the default).
+        MODERATION_DEFAULTS_CATEGORY_MAP_KEY => value.as_object().is_some_and(|m| {
+            m.iter().all(|(k, v)| {
+                matches!(
+                    k.as_str(),
+                    "spam" | "violation" | "misleading" | "sexual" | "rude" | "other"
+                ) && v
+                    .as_str()
+                    .is_some_and(|s| matches!(s, "acknowledge" | "hide-pending-review"))
+            })
+        }),
+        // §5.5.4 §2.5: stale-hold timeout, 1..=365 days.
+        MODERATION_DEFAULTS_STALE_DAYS_KEY => {
+            value.as_u64().is_some_and(|n| (1..=365).contains(&n))
+        }
+        // §5.5.4 §4.2: reviewer-assignment mode. The "≥1 entry when
+        // category-routed" cross-key invariant is enforced at apply time
+        // (empty pool → no assignment) + guarded client-side, same as the
+        // §2.2 default-action pattern.
+        MODERATION_REVIEWER_MODE_KEY => value.as_str().is_some_and(|s| {
+            matches!(s, "manual" | "round-robin" | "load-balanced" | "category-routed")
+        }),
+        // §5.5.4 §4.3: object keyed on the ReportReason vocabulary; values
+        // are arrays of operator-DID strings. Empty object valid (default).
+        MODERATION_REVIEWER_CATEGORY_MAP_KEY => value.as_object().is_some_and(|m| {
+            m.iter().all(|(k, v)| {
+                is_report_category(k)
+                    && v.as_array().is_some_and(|arr| arr.iter().all(|d| d.is_string()))
+            })
+        }),
+        // §5.5.4 §4.7: per-category rotation cursors — object keyed on the
+        // ReportReason vocabulary; values are non-negative integers.
+        MODERATION_REVIEWER_CATEGORY_CURSORS_KEY => value.as_object().is_some_and(|m| {
+            m.iter()
+                .all(|(k, v)| is_report_category(k) && v.as_u64().is_some())
+        }),
+        // §5.5.4 §4.7/§4.5: scalar non-negative integer counters.
+        MODERATION_REVIEWER_ROTATION_CURSOR_KEY
+        | MODERATION_REVIEWER_MODE_VERSION_KEY
+        | MODERATION_ESCALATION_SUPERADMIN_CURSOR_KEY => value.as_u64().is_some(),
+        // v0.9 Federation Pattern-1 Phase B (#352 / design §2.3, Step 4): the
+        // peer-allowlist tightens from Phase A's accept-any to the real shape.
+        // Runs on every CAS write (incl. boot-seed) so the runtime store stays
+        // well-formed even if env-var parsing has a bug. discovery-mode /
+        // relay-urls / pending-discoveries stay accept-any (Phase C/D tighten).
+        FEDERATION_POLICY_PEER_ALLOWLIST_KEY => is_valid_peer_allowlist(value),
+        // v0.9 Federation Pattern-1 Phase C (#353) — discovery-mode enum +
+        // pending-discoveries shape tighten from Phase A's accept-any.
+        FEDERATION_POLICY_DISCOVERY_MODE_KEY => value
+            .as_str()
+            .is_some_and(|s| matches!(s, "allowlist-only" | "auto-accept" | "discovery-disabled")),
+        FEDERATION_POLICY_PENDING_DISCOVERIES_KEY => is_valid_pending_discoveries(value),
+        // v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — relay-urls
+        // tightens from accept-any: JSON array, HTTPS, no-dup, 1..=10 entries.
+        FEDERATION_POLICY_RELAY_URLS_KEY => is_valid_relay_urls(value),
+        // Key-rotation arc B2 (#373 / §4.6) — a strict bool. Rejects strings
+        // ("true"), numbers (1), and any non-boolean shape so the gate-check's
+        // `as_bool()` read is unambiguous.
+        KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY => value.is_boolean(),
+        // v0.9 Federation runtime-mutability arc Phase A (#386) — appview_url must
+        // be a non-empty, well-formed http(s) URL. "Revert to default" is a row
+        // delete (Phase F2), not an empty string, so empty is rejected here.
+        FEDERATION_APPVIEW_URL_KEY => value.as_str().is_some_and(is_valid_http_url),
+        // Phase A (#387) — describe-only advertised flag; strict bool so the
+        // describe-payload `as_bool()` read is unambiguous.
+        FEDERATION_FIREHOSE_ENABLED_KEY => value.is_boolean(),
+        // Phase A (#388) — describe-only advertised flag; strict bool.
+        FEDERATION_CRAWL_ENABLED_KEY => value.is_boolean(),
+        // §2.1/§2.2 (#393/#395) — federation.enabled is a strict bool;
+        // service.public_url must be a non-empty http(s) URL (like appview_url).
+        FEDERATION_ENABLED_KEY => value.is_boolean(),
+        SERVICE_PUBLIC_URL_KEY => value.as_str().is_some_and(is_valid_http_url),
         _ => true,
+    }
+}
+
+/// v0.9 Federation runtime-mutability arc Phase A (#386) — accept a non-empty,
+/// parseable `http`/`https` URL. Used to validate `federation.appview_url`
+/// runtime-setting writes at the API boundary and file-tier load.
+fn is_valid_http_url(s: &str) -> bool {
+    if s.trim().is_empty() {
+        return false;
+    }
+    url::Url::parse(s).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+/// v0.9 Federation Pattern-1 Phase D (#354) — relay-urls structural validator:
+/// a JSON array of 1..=10 unique HTTPS URL strings.
+fn is_valid_relay_urls(value: &serde_json::Value) -> bool {
+    let Some(arr) = value.as_array() else {
+        return false;
+    };
+    if arr.is_empty() || arr.len() > 10 {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for el in arr {
+        let Some(url) = el.as_str() else {
+            return false;
+        };
+        if !url.starts_with("https://") {
+            return false;
+        }
+        if !seen.insert(url) {
+            return false;
+        }
+    }
+    true
+}
+
+/// v0.9 Federation Pattern-1 Phase C (#353) — pending-discoveries structural
+/// validator: a JSON array (≤100) of objects with exactly `{did, url,
+/// first_seen_at, last_seen_at, first_scan_id, last_seen_scan_id}`, all strings,
+/// DIDs `did:`-prefixed.
+fn is_valid_pending_discoveries(value: &serde_json::Value) -> bool {
+    let Some(arr) = value.as_array() else {
+        return false;
+    };
+    if arr.len() > 100 {
+        return false;
+    }
+    const FIELDS: [&str; 6] = [
+        "did",
+        "url",
+        "first_seen_at",
+        "last_seen_at",
+        "first_scan_id",
+        "last_seen_scan_id",
+    ];
+    arr.iter().all(|el| {
+        let Some(obj) = el.as_object() else {
+            return false;
+        };
+        if obj.len() != FIELDS.len() {
+            return false;
+        }
+        if !FIELDS.iter().all(|f| obj.get(*f).and_then(|v| v.as_str()).is_some()) {
+            return false;
+        }
+        obj.get("did")
+            .and_then(|v| v.as_str())
+            .is_some_and(|d| d.starts_with("did:"))
+    })
+}
+
+/// v0.9 Federation Pattern-1 Phase B (#352) — peer-allowlist structural
+/// validator: a JSON array of objects with exactly `{did, url}`, DIDs
+/// `did:`-prefixed and unique across the array, URLs HTTPS-only.
+fn is_valid_peer_allowlist(value: &serde_json::Value) -> bool {
+    let Some(arr) = value.as_array() else {
+        return false;
+    };
+    let mut seen = std::collections::HashSet::new();
+    for el in arr {
+        let Some(obj) = el.as_object() else {
+            return false;
+        };
+        if obj.len() != 2 {
+            return false;
+        }
+        let (Some(did), Some(url)) = (
+            obj.get("did").and_then(|v| v.as_str()),
+            obj.get("url").and_then(|v| v.as_str()),
+        ) else {
+            return false;
+        };
+        if did.is_empty() || !did.starts_with("did:") || !url.starts_with("https://") {
+            return false;
+        }
+        if !seen.insert(did) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The ReportReason vocabulary (per Phase A recon — the lexicon's six).
+/// Shared validator for the §2.3/§4.3 category-keyed setting maps.
+fn is_report_category(k: &str) -> bool {
+    matches!(
+        k,
+        "spam" | "violation" | "misleading" | "sexual" | "rude" | "other"
+    )
+}
+
+/// `tools.aurora.ops.themes.listInstalled` output (§11.10.2).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListInstalledThemesOutput {
+    pub themes: Vec<crate::themes::ThemeMetadata>,
+}
+
+/// §11.10.2 — list installed themes (valid + invalid, both roots) for the
+/// Configuration → Themes page. Admin+ read; the page itself is
+/// SuperAdmin-route-gated, and setting the deployment default stays
+/// SuperAdmin via `setRuntimeSetting`.
+pub async fn list_installed_themes(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<ListInstalledThemesOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::Admin) {
+        return Err(forbidden(&format!(
+            "themes.listInstalled requires Admin+ role; caller has {:?}",
+            auth.role
+        )));
+    }
+    Ok(Json(ListInstalledThemesOutput {
+        themes: ctx.theme_registry.list(),
+    }))
+}
+
+/// Query for the resolved-theme CSS route.
+#[derive(serde::Deserialize)]
+pub struct ActiveThemeParams {
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+/// Serve the active theme's inheritance-resolved token CSS (§11). Walks the
+/// requested theme's `extends` chain and emits one stylesheet. Unauthenticated
+/// by design — it's loaded via a `<link>` (which can't carry auth headers)
+/// and theme colors aren't secret. `?id=` selects a theme; absent, the
+/// deployment-default theme (the `theme.deployment-default` runtime setting,
+/// §11.10.2) is resolved and served — so a fresh boot's static `<link>` paints
+/// the deployment's chosen theme without a client round-trip. Returns an empty
+/// 200 when no theme is installed yet, so the admin UI keeps using its static
+/// tokens.css.
+pub async fn serve_active_theme_css(
+    State(ctx): State<AppContext>,
+    axum::extract::Query(params): axum::extract::Query<ActiveThemeParams>,
+) -> impl axum::response::IntoResponse {
+    let id = resolve_active_theme_id(&ctx, &params).await;
+    let css = ctx.theme_registry.resolve_token_css(&id).unwrap_or_default();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/css; charset=utf-8",
+        )],
+        css,
+    )
+}
+
+/// Read the deployment-default theme id from the runtime-settings tiers
+/// (runtime row → file tier → compiled default `aurora-classic`). Used by the
+/// unauthenticated active-theme serve routes when no `?id` is given; never
+/// errors — falls back to the inheritance root on any DB error.
+async fn deployment_default_theme(ctx: &AppContext) -> String {
+    use sqlx::Row as _;
+    let from_runtime = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(THEME_DEPLOYMENT_DEFAULT_KEY)
+        .fetch_optional(&ctx.account_db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("value").ok())
+        .map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s)));
+    let tiered = from_runtime.or_else(|| ctx.file_tier_settings.get(THEME_DEPLOYMENT_DEFAULT_KEY).cloned());
+    tiered
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::themes::ROOT_THEME_ID.to_string())
+}
+
+/// Resolve the theme id a serve route should render: an explicit non-empty
+/// `?id=`, else the deployment-default.
+async fn resolve_active_theme_id(ctx: &AppContext, params: &ActiveThemeParams) -> String {
+    match params.id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(id) => id.to_string(),
+        None => deployment_default_theme(ctx).await,
+    }
+}
+
+/// Read a runtime-setting string from the tiers (runtime row → file tier),
+/// returning the trimmed value when non-empty. Used by the unauthenticated
+/// login-branding read; never errors (a DB error yields `None`, i.e. the
+/// default behavior).
+async fn read_runtime_string(ctx: &AppContext, key: &str) -> Option<String> {
+    use sqlx::Row as _;
+    let from_runtime = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(&ctx.account_db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("value").ok())
+        .map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s)));
+    let tiered = from_runtime.or_else(|| ctx.file_tier_settings.get(key).cloned());
+    tiered
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `GET /theme/login-branding` — unauthenticated JSON the (pre-auth) login page
+/// reads to theme itself and apply operator branding: the resolved
+/// deployment-default theme id (so the page sets `data-theme` for theme-scoped
+/// rules + cache-busts the theme CSS) plus the two `branding.login-*` URLs
+/// (empty string when unset → the page keeps its built-in logo / no banner / the
+/// default wordmark / the theme's text colors). Same unauthenticated, secret-free
+/// contract as the theme-serve routes.
+pub async fn serve_login_branding(State(ctx): State<AppContext>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "theme": deployment_default_theme(&ctx).await,
+        "logoUrl": read_runtime_string(&ctx, BRANDING_LOGIN_LOGO_KEY)
+            .await
+            .unwrap_or_default(),
+        "bannerUrl": read_runtime_string(&ctx, BRANDING_LOGIN_BANNER_KEY)
+            .await
+            .unwrap_or_default(),
+        "titleText": read_runtime_string(&ctx, BRANDING_LOGIN_TITLE_TEXT_KEY)
+            .await
+            .unwrap_or_default(),
+        "subtitleText": read_runtime_string(&ctx, BRANDING_LOGIN_SUBTITLE_TEXT_KEY)
+            .await
+            .unwrap_or_default(),
+        "titleColor": read_runtime_string(&ctx, BRANDING_LOGIN_TITLE_COLOR_KEY)
+            .await
+            .unwrap_or_default(),
+        "subtitleColor": read_runtime_string(&ctx, BRANDING_LOGIN_SUBTITLE_COLOR_KEY)
+            .await
+            .unwrap_or_default(),
+    }))
+}
+
+/// Serve the active theme's inheritance-resolved effect-class CSS (§11.6).
+/// Parallel to [`serve_active_theme_css`]: walks the requested theme's
+/// `extends` chain and concatenates each theme's `effects.css` so the leaf's
+/// redefinitions of a class win. Unauthenticated for the same reason (loaded
+/// via `<link>`). Returns an empty 200 when no theme is installed yet, so the
+/// admin UI keeps using its static `effects.css` baseline.
+pub async fn serve_active_theme_effects_css(
+    State(ctx): State<AppContext>,
+    axum::extract::Query(params): axum::extract::Query<ActiveThemeParams>,
+) -> impl axum::response::IntoResponse {
+    let id = resolve_active_theme_id(&ctx, &params).await;
+    let css = ctx.theme_registry.resolve_effect_css(&id).unwrap_or_default();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/css; charset=utf-8",
+        )],
+        css,
+    )
+}
+
+/// Serve the active theme's inheritance-resolved extension-point CSS (§11.7,
+/// #285). Parallel to [`serve_active_theme_effects_css`] over each theme's
+/// optional `extensions.css`; extension points are additive across the chain.
+/// Unauthenticated (loaded via `<link>`). Empty 200 when no theme is installed.
+pub async fn serve_active_theme_extensions_css(
+    State(ctx): State<AppContext>,
+    axum::extract::Query(params): axum::extract::Query<ActiveThemeParams>,
+) -> impl axum::response::IntoResponse {
+    let id = resolve_active_theme_id(&ctx, &params).await;
+    let css = ctx
+        .theme_registry
+        .resolve_extension_css(&id)
+        .unwrap_or_default();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/css; charset=utf-8",
+        )],
+        css,
+    )
+}
+
+/// `GET /theme/active-extension-points` — the active theme's effective
+/// extension points (own + inherited, deduped) as JSON (§11.7, #285). The
+/// frontend runtime (`AuroraThemeRuntime.themeProvidesExtension`) fetches this
+/// once at theme-load and caches it for synchronous membership checks.
+/// Unauthenticated, same id-or-deployment-default contract as the serve-CSS
+/// routes; always 200 (empty array when no theme / none declared).
+pub async fn serve_active_theme_extension_points(
+    State(ctx): State<AppContext>,
+    axum::extract::Query(params): axum::extract::Query<ActiveThemeParams>,
+) -> Json<serde_json::Value> {
+    let id = resolve_active_theme_id(&ctx, &params).await;
+    let points = ctx.theme_registry.resolve_extension_points(&id);
+    Json(serde_json::json!({ "extensionPoints": points }))
+}
+
+/// `tools.aurora.ops.kryphocron.triggerRotation` — force a Laquna rotation
+/// ahead of cadence (§6.4.2). Admin+ (via [`AdminAuthContext`]). Single-flight:
+/// the rewrite job's [`try_start`](crate::kryphocron_rewrite::RewriteJob::try_start)
+/// rotates the slug (`force_rotation()`) **and** spawns the rewrite-on-rotate
+/// background job that re-encodes existing private-tier records under the new
+/// generation — both under the running-guard, so a concurrent trigger while a
+/// rewrite is in progress is rejected with HTTP 409 "rotation already in
+/// progress" (§6.4.2 verification gate) and does NOT rotate the generation.
+/// In-progress visibility (`getRotationProgress`) and cancellation
+/// (`cancelRotation`) are the #225 XRPCs reading/calling this job.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TriggerRotationBody {
+    /// Operator rationale from the typed-confirm modal (#303). Threaded into the
+    /// audit chain so the manual-rotation decision is recorded with its reason.
+    pub rationale: Option<String>,
+}
+
+pub async fn trigger_rotation(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    // Tolerant of a missing/empty body (legacy callers): `Option<Json<…>>` is
+    // `None` if the body is absent or unparseable, and rationale falls back.
+    body: Option<Json<TriggerRotationBody>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let rationale = body
+        .and_then(|b| b.0.rationale)
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| "operator-triggered Laquna rotation".to_string());
+    match &ctx.kryphocron_rewrite_job {
+        Some(job) => {
+            if job.try_start(ctx.clone()) {
+                tracing::info!(
+                    "kryphocron Laquna rotation triggered (triggerRotation XRPC); \
+                     rewrite-on-rotate job started",
+                );
+                // #303 — record the operator decision in the tamper-evident
+                // audit chain (read by getAuditTrail / #mod/audit). Manual
+                // rotation is operator-initiated with a typed-confirm rationale;
+                // the cadence-organic rotation path is a SYSTEM action and stays
+                // in the moderation_event feed only (per the F5 scope). Best-
+                // effort: a chain-emit failure never reverses the started job.
+                if let Err(e) = audit_chain::insert_chain_entry_pool(
+                    &ctx.account_db,
+                    ctx.config.database.backend,
+                    AppendEntryParams {
+                        source: "manual",
+                        payload: None,
+                        actor_did: &auth.did,
+                        action: "kryphocron.laquna.rotate",
+                        subject: None,
+                        rationale: &rationale,
+                        snapshot_id: None,
+                        event_id: None,
+                        cascade_subjects: &[],
+                        cascade_snapshot_ids: &[],
+                    },
+                )
+                .await
+                {
+                    tracing::error!(
+                        target: "aurora_locus::kryphocron",
+                        error = %e,
+                        "laquna rotation audit-chain emit failed (rotation still started)",
+                    );
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "status": "rotation-triggered" })),
+                )
+            } else {
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "RotationInProgress",
+                        "message": "a rewrite-on-rotate job is already in progress; \
+                                    cancel it before triggering a new rotation",
+                    })),
+                )
+            }
+        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "KryphocronDisabled",
+                "message": "kryphocron is not enabled on this deployment",
+            })),
+        ),
     }
 }
 
@@ -3745,6 +4995,188 @@ pub fn load_file_tier_settings(
     Ok(out)
 }
 
+/// Resolve a runtime setting's effective value for substrate consumers
+/// that read settings outside the XRPC handler (e.g. the §5.5.4
+/// report-intake default-action consumer). Mirrors
+/// [`get_runtime_setting`]'s three-tier resolution — runtime row →
+/// file-tier YAML → compiled default — minus the role gate and the
+/// recovery-mode override (callers needing the latter apply it
+/// themselves). A DB read error falls through to file-tier/default
+/// rather than erroring: read-only resolution must never fail a caller.
+pub async fn resolve_runtime_setting(ctx: &AppContext, key: &str) -> serde_json::Value {
+    use sqlx::Row as _;
+    if let Ok(Some(r)) = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(&ctx.account_db)
+        .await
+    {
+        if let Ok(value_str) = r.try_get::<String, _>("value") {
+            return serde_json::from_str(&value_str)
+                .unwrap_or(serde_json::Value::String(value_str));
+        }
+    }
+    if let Some(value) = ctx.file_tier_settings.get(key) {
+        return value.clone();
+    }
+    default_for_key(key)
+}
+
+/// Read the RAW stored value string for a runtime-row (the exact bytes the
+/// value-CAS witnesses), or `None` when no runtime row exists. Distinct
+/// from [`resolve_runtime_setting`], which parses + falls through to
+/// file/default tiers — the CAS needs the literal stored string, not the
+/// effective value.
+pub async fn read_runtime_row_value(ctx: &AppContext, key: &str) -> Option<String> {
+    use sqlx::Row as _;
+    sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(&ctx.account_db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("value").ok())
+}
+
+/// v0.9 Federation runtime-mutability arc Phase A (#386 / locked design §2.4) —
+/// resolve the effective AppView base URL: the `federation.appview_url` runtime
+/// override row if set to a non-blank string, else the env-seeded
+/// `FederationConfig.appview_url`.
+///
+/// Direct runtime-row read (mirrors `TrustedPeerSet::resolve`), NOT
+/// [`resolve_runtime_setting`] — the latter collapses "unset" into the compiled
+/// `default_for_key` (`Null`) and so cannot express the config fallback. A row
+/// holding a blank string is treated as unset.
+pub async fn resolve_appview_url(ctx: &AppContext) -> Option<String> {
+    if let Some(raw) = read_runtime_row_value(ctx, FEDERATION_APPVIEW_URL_KEY).await {
+        if let Ok(s) = serde_json::from_str::<String>(&raw) {
+            if !s.trim().is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    ctx.config.federation.appview_url.clone()
+}
+
+/// v0.9 Federation runtime-mutability arc Phase A (#387/#388 / locked design
+/// §2.5–2.6) — resolve a federation boolean describe-flag
+/// (`firehose_enabled` / `crawl_enabled`): the runtime override row if set to a
+/// bool, else the env-seeded `fallback`.
+///
+/// Direct runtime-row read (mirrors `TrustedPeerSet::resolve`), NOT
+/// [`resolve_runtime_setting`]: the compiled `default_for_key` for these keys is
+/// `false`, so a resolver read can't tell "unset" from an explicit `false` and
+/// would mask an env-set `true`. The presence check here preserves the env
+/// fallback. A row holding a non-bool value falls back to `fallback`.
+pub async fn resolve_federation_flag(ctx: &AppContext, key: &str, fallback: bool) -> bool {
+    match read_runtime_row_value(ctx, key).await {
+        Some(raw) => serde_json::from_str::<bool>(&raw).unwrap_or(fallback),
+        None => fallback,
+    }
+}
+
+/// v0.9 Federation runtime-mutability arc §2.1 (#397) — boot-time read of
+/// `federation.enabled` directly from the pool. `AppContext::new` resolves the
+/// master federation gate BEFORE any `AppContext` exists, so the ctx-based
+/// resolvers can't be used; this takes the `account_db` pool directly. Mirrors
+/// [`resolve_federation_flag`]'s runtime-row → env-config fallback (row-only, no
+/// file tier — consistent with the other federation consumers). Migrations have
+/// already run by the call site, so `runtime_settings` is present.
+pub async fn read_federation_enabled_at_boot(pool: &sqlx::AnyPool, fallback: bool) -> bool {
+    use sqlx::Row as _;
+    let row: Option<String> = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(FEDERATION_ENABLED_KEY)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("value").ok());
+    match row {
+        Some(v) => serde_json::from_str::<bool>(&v).unwrap_or(fallback),
+        None => fallback,
+    }
+}
+
+/// v0.9 Federation runtime-mutability arc §2.2 (#398) — boot-time read of the
+/// `service.public_url` runtime override directly from the pool. Returns the row
+/// value (a non-blank string) if set, else `None` (no override). `AppContext::new`
+/// uses this to bake the override into `config.service.public_url` BEFORE the
+/// config is shared, so the sync `effective_public_url()` accessor — and every
+/// caller of it — sees the new URL on this boot without an async ripple. Row-only
+/// read (no file tier), consistent with the other federation consumers.
+pub async fn read_service_public_url_at_boot(pool: &sqlx::AnyPool) -> Option<String> {
+    use sqlx::Row as _;
+    let raw: String = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+        .bind(SERVICE_PUBLIC_URL_KEY)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("value").ok())?;
+    let parsed = serde_json::from_str::<String>(&raw).ok()?;
+    if parsed.trim().is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+/// v0.9 Federation runtime-mutability arc §3.7 (#395) — request-layer
+/// short-circuit decision for inbound federation endpoints. Resolves
+/// `federation.enabled` (runtime override → `FederationConfig.enabled` fallback)
+/// on EVERY call (uncached per-request DB read; the cost is budgeted in §7.1 —
+/// an AtomicBool mirror is a v0.10 optimization). Returns `Some(503)` to refuse
+/// the request when federation is disabled, `None` to let it proceed.
+///
+/// Scope is inbound only — outbound federation operations continue until the
+/// subsystem is torn down at restart. The `federation_enabled_gate` middleware
+/// applies this to the federation operational endpoints.
+pub async fn federation_inbound_gate_503(
+    ctx: &AppContext,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let enabled =
+        resolve_federation_flag(ctx, FEDERATION_ENABLED_KEY, ctx.config.federation.enabled).await;
+    if enabled {
+        None
+    } else {
+        Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "FederationDisabled",
+                "message": "Federation is currently disabled on this deployment"
+            })),
+        ))
+    }
+}
+
+/// Compare-and-swap a runtime setting's stored value (§5.5.4 §4.7 cursor
+/// advance — the substrate-general optimistic-concurrency primitive). Sets
+/// `key`'s value to `new` iff its current stored value equals `expected`
+/// (the value column itself is the CAS witness — no version column needed);
+/// returns `true` when it won (`rows_affected >= 1`), `false` on contention.
+/// Caller re-reads + recomputes + retries. Targets only existing rows; the
+/// counter rows this is used against are migration-seeded, so a `false` here
+/// always means a concurrent writer won, never a missing row.
+pub async fn cas_runtime_setting(
+    ctx: &AppContext,
+    key: &str,
+    expected: &str,
+    new: &str,
+    actor: &str,
+) -> crate::error::PdsResult<bool> {
+    let res = sqlx::query(
+        "UPDATE runtime_settings SET value = $1, last_modified = $2, last_modified_by = $3 \
+         WHERE key = $4 AND value = $5",
+    )
+    .bind(new)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(actor)
+    .bind(key)
+    .bind(expected)
+    .execute(&ctx.account_db)
+    .await?;
+    Ok(res.rows_affected() >= 1)
+}
+
 pub async fn get_runtime_setting(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
@@ -3753,8 +5185,12 @@ pub async fn get_runtime_setting(
     use crate::admin::roles::Role;
     // Per §8.16: most settings require Admin+, but moderation-mode
     // is readable at any role since every operator needs to know
-    // what mode they're in.
-    if params.key != MODERATION_MODE_KEY && !auth.role.can_act_as(Role::Admin) {
+    // what mode they're in. theme.deployment-default (§11.10.2) is
+    // likewise any-role-readable — every operator's UI applies it at boot.
+    if params.key != MODERATION_MODE_KEY
+        && params.key != THEME_DEPLOYMENT_DEFAULT_KEY
+        && !auth.role.can_act_as(Role::Admin)
+    {
         return Err(forbidden(&format!(
             "key '{}' requires Admin+ role; caller has {:?}",
             params.key, auth.role
@@ -3866,6 +5302,38 @@ pub async fn set_runtime_setting(
             return Err(validation("moderation-mode must be one of: full, reduced, disabled"));
         }
     }
+    // v0.9 Arc D (#223) — validate the Laquna rotation cadence value.
+    if input.key == LAQUNA_ROTATION_CADENCE_KEY {
+        let s = input.value.as_str().unwrap_or("");
+        if !["hourly", "daily", "weekly", "manual-only"].contains(&s) {
+            return Err(validation(
+                "kryphocron.laquna.rotation-cadence must be one of: hourly, daily, weekly, manual-only",
+            ));
+        }
+    }
+    // §5.5.4 moderation-defaults keys (Phase A §2 + Phase B §4) validate at
+    // the API boundary via the same `validate_runtime_value` vocabulary the
+    // file-tier loader uses — enum/shape/range checks for the default-action,
+    // reviewer-assignment, category maps, and cursor counters.
+    if input.key.starts_with("moderation.defaults.")
+        && !validate_runtime_value(&input.key, &input.value)
+    {
+        return Err(validation(format!(
+            "invalid value for runtime setting '{}'",
+            input.key
+        )));
+    }
+    // Key-rotation arc B2 (#373 / §4.6) — the operator-supplied-keys gate is a
+    // strict bool; reject non-boolean input at the boundary so a stray "true"
+    // string never persists and the gate-check's `as_bool()` read can't silently
+    // fall to the disabled default on a malformed value.
+    if input.key == KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY
+        && !validate_runtime_value(&input.key, &input.value)
+    {
+        return Err(validation(
+            "key_rotation.operator_supplied_keys_enabled must be a boolean (true or false)",
+        ));
+    }
     // Read previous value for the diff returned in output.
     let prev_row = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
         .bind(&input.key)
@@ -3879,40 +5347,180 @@ pub async fn set_runtime_setting(
     } else {
         default_for_key(&input.key)
     };
-    let now = chrono::Utc::now().to_rfc3339();
-    let value_json =
-        serde_json::to_string(&input.value).map_err(internal)?;
+    // v0.9 Federation runtime-mutability arc §2.1 (#397) — for the
+    // restart-required `federation.enabled` key the value-write + audit entry +
+    // restart marker land atomically (R3-verified §3.5 outer-tx + guard
+    // lifetime). The operator's "Restart now / Queue for later" choice is a
+    // separate `triggerRestart` call; the marker drives the post-restart action
+    // either way. All other keys use the self-managed write unchanged.
+    let audit_entry_id = if input.key == FEDERATION_ENABLED_KEY {
+        save_runtime_setting_with_restart_marker(
+            &ctx,
+            &input.key,
+            &input.value,
+            &auth.did,
+            &input.rationale,
+            crate::api::pending_restart::ACTION_RESTART_FEDERATION_ENABLED,
+            r#"{"version":1}"#,
+        )
+        .await?
+    } else if input.key == SERVICE_PUBLIC_URL_KEY {
+        // §2.2 — public-URL change additionally queues the bulk did:plc update
+        // (two markers + initial pending result rows, one run_id).
+        save_service_public_url_with_bulk_update(&ctx, &input.value, &auth.did, &input.rationale)
+            .await?
+    } else {
+        write_runtime_setting_audited(&ctx, &input.key, &input.value, &auth.did, &input.rationale)
+            .await?
+    };
 
-    // LB-1 Session 12 / chainlink #129: runtime_settings upsert +
-    // chain entry in one transaction. Upsert uses DELETE then INSERT
-    // for cross-backend portability — sqlx ON CONFLICT syntax differs
-    // between SQLite and Postgres.
-    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    // v0.9 Arc D (#223) — propagate a cadence change to the live
+    // aurora-locus-standard rotation oracle, so it takes effect on the next
+    // encode without a restart (§6.4.2). In-memory atomic store; the next
+    // current_generation() consults the new cadence.
+    if input.key == LAQUNA_ROTATION_CADENCE_KEY {
+        if let (Some(oracle), Some(s)) =
+            (&ctx.kryphocron_rotation_oracle, input.value.as_str())
+        {
+            oracle.set_cadence(crate::kryphocron_rotation::Cadence::from_setting(s));
+        }
+    }
+
+    // §5.5.4 Phase B §4.5: a reviewer-assignment-mode change bumps the
+    // monotonic mode-version that drives per-operator mode-change-banner
+    // re-display. Only on an actual value change; best-effort.
+    if input.key == MODERATION_REVIEWER_MODE_KEY && previous_value != input.value {
+        if let Err(e) = crate::api::reviewer_assignment::bump_mode_version(&ctx).await {
+            tracing::warn!(error = %e, "failed to bump reviewer mode-change version");
+        }
+    }
+
+    Ok(Json(SetRuntimeSettingOutput {
+        key: input.key,
+        previous_value,
+        new_value: input.value,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// Upsert a runtime setting and its audit-chain entry in one transaction,
+/// returning the chain entry id. Shared by [`set_runtime_setting`] and the
+/// branding-upload handler so both land an identical audit trail (rationale
+/// recorded as `key → value: rationale`). Upsert is DELETE-then-INSERT for
+/// cross-backend portability (#129).
+async fn write_runtime_setting_audited(
+    ctx: &AppContext,
+    key: &str,
+    value: &serde_json::Value,
+    actor_did: &str,
+    rationale: &str,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    // Self-managed mode: own guard, own transaction (existing behaviour). All
+    // current callers route through here unchanged.
+    write_runtime_setting_audited_with_tx(ctx, key, value, actor_did, rationale, None, false).await
+}
+
+/// v0.9 Federation runtime-mutability arc §3.5 (#392) — the outer-tx-aware form
+/// of [`write_runtime_setting_audited`]. Writes the `runtime_settings` row + its
+/// audit-chain entry either in its own transaction (self-managed) or into a
+/// caller-provided outer transaction so the value-change can compose atomically
+/// with sibling writes (the restart marker, bulk-update result rows).
+///
+/// `outer_tx` and `guard_already_held` MUST be set together:
+/// - `(None, false)` — self-managed: acquires its own [`audit_chain::AppendChainGuard`],
+///   opens and commits its own transaction.
+/// - `(Some(tx), true)` — outer-tx mode: the caller acquired the guard BEFORE
+///   `begin()` and holds it until AFTER its own `commit()` (the R3-verified §3.5
+///   chain-linearity contract). This function does NOT acquire a second guard and
+///   does NOT commit — the caller composes further writes and commits the outer
+///   tx, dropping the guard after.
+///
+/// Any mismatched combination is a programming error and returns 500 rather than
+/// silently violating the guard contract.
+async fn write_runtime_setting_audited_with_tx(
+    ctx: &AppContext,
+    key: &str,
+    value: &serde_json::Value,
+    actor_did: &str,
+    rationale: &str,
+    outer_tx: Option<&mut sqlx::Transaction<'_, sqlx::Any>>,
+    guard_already_held: bool,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    if outer_tx.is_some() != guard_already_held {
+        return Err(internal(
+            "write_runtime_setting_audited_with_tx: outer_tx and guard_already_held \
+             must be set together (caller owns both, or neither)",
+        ));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let value_json = serde_json::to_string(value).map_err(internal)?;
+
+    // Acquire the chain guard only in self-managed mode. In outer-tx mode the
+    // caller holds it across its own begin()..commit() per the §3.5 contract.
+    let _owned_guard = if guard_already_held {
+        None
+    } else {
+        Some(audit_chain::AppendChainGuard::acquire().await)
+    };
+
+    match outer_tx {
+        Some(tx) => {
+            // Write into the caller's transaction; the caller commits (and drops
+            // its guard) after composing the marker / result-row writes.
+            runtime_setting_row_writes(tx, ctx, key, &value_json, &now, actor_did, rationale).await
+        }
+        None => {
+            let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+            let audit_entry_id = runtime_setting_row_writes(
+                &mut tx, ctx, key, &value_json, &now, actor_did, rationale,
+            )
+            .await?;
+            tx.commit().await.map_err(internal)?;
+            Ok(audit_entry_id)
+        }
+    }
+}
+
+/// The DELETE-then-INSERT of the runtime row plus the audit-chain append, all
+/// within a single (caller-owned) transaction. Returns the chain entry id.
+/// Cross-process serialization on Postgres is handled inside
+/// [`audit_chain::insert_chain_entry`] (a `pg_advisory_xact_lock` bound to this
+/// tx); in-process serialization is the caller-held [`audit_chain::AppendChainGuard`].
+async fn runtime_setting_row_writes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ctx: &AppContext,
+    key: &str,
+    value_json: &str,
+    now: &str,
+    actor_did: &str,
+    rationale: &str,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
     sqlx::query("DELETE FROM runtime_settings WHERE key = $1")
-        .bind(&input.key)
-        .execute(&mut *tx)
+        .bind(key)
+        .execute(&mut **tx)
         .await
         .map_err(internal)?;
     sqlx::query(
         "INSERT INTO runtime_settings (key, value, last_modified, last_modified_by) \
          VALUES ($1, $2, $3, $4)",
     )
-    .bind(&input.key)
-    .bind(&value_json)
-    .bind(&now)
-    .bind(&auth.did)
-    .execute(&mut *tx)
+    .bind(key)
+    .bind(value_json)
+    .bind(now)
+    .bind(actor_did)
+    .execute(&mut **tx)
     .await
     .map_err(internal)?;
     let audit_entry_id = audit_chain::insert_chain_entry(
-        &mut tx,
+        &mut *tx,
         ctx.config.database.backend,
         AppendEntryParams {
-            actor_did: &auth.did,
+            actor_did,
+            source: "manual",
+            payload: None,
             action: "SetRuntimeSetting",
             subject: None,
-            rationale: &format!("{} → {}: {}", input.key, value_json, input.rationale),
+            rationale: &format!("{} → {}: {}", key, value_json, rationale),
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
@@ -3921,13 +5529,777 @@ pub async fn set_runtime_setting(
     )
     .await
     .map_err(internal_pds)?;
-    tx.commit().await.map_err(internal)?;
-    Ok(Json(SetRuntimeSettingOutput {
-        key: input.key,
-        previous_value,
-        new_value: input.value,
+    Ok(audit_entry_id)
+}
+
+// ===========================================================================
+// v0.9 Federation runtime-mutability arc §3.4 (#393) — deleteRuntimeSetting
+// (revert-to-default), and §3.8 (#396) — listPendingRestartActions.
+// ===========================================================================
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRuntimeSettingInput {
+    pub key: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRuntimeSettingOutput {
+    pub audit_entry_id: String,
+}
+
+/// `tools.aurora.superadmin.deleteRuntimeSetting` (§3.4) — delete a runtime row
+/// so the field reverts to its env-config default (consumer-side fallback).
+/// SuperAdmin-gated, rationale required, allowlist-checked. For restart-required
+/// keys the deletion ALSO sets the appropriate `pending_restart_action`
+/// marker(s) in the SAME outer transaction (M-6): reverting `federation.enabled`
+/// queues the federation-enabled restart; reverting `service.public_url` queues
+/// BOTH the public-url restart and the bulk DID-doc update (the revert un-aligns
+/// DID docs exactly as a forward change would).
+pub async fn delete_runtime_setting(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<DeleteRuntimeSettingInput>,
+) -> Result<Json<DeleteRuntimeSettingOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "deleteRuntimeSetting requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    if !KNOWN_RUNTIME_KEYS.contains(&input.key.as_str()) {
+        return Err(validation(format!(
+            "unknown runtime setting key '{}'; known keys: {:?}",
+            input.key, KNOWN_RUNTIME_KEYS,
+        )));
+    }
+
+    let markers = restart_markers_for_revert(&input.key);
+    let audit_entry_id = if markers.is_empty() {
+        // Runtime-mutable key: self-managed delete + audit, no markers.
+        delete_runtime_setting_with_tx(&ctx, &input.key, &auth.did, &input.rationale, None, false)
+            .await?
+    } else {
+        // Restart-required key: delete + audit + marker(s) atomically. The guard
+        // is held by THIS caller from before begin() until after commit (§3.5).
+        let _guard = audit_chain::AppendChainGuard::acquire().await;
+        let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+        let id = delete_runtime_setting_with_tx(
+            &ctx,
+            &input.key,
+            &auth.did,
+            &input.rationale,
+            Some(&mut tx),
+            true,
+        )
+        .await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for (action, payload) in &markers {
+            crate::api::pending_restart::upsert_marker(&mut tx, action, payload, &now)
+                .await
+                .map_err(internal_pds)?;
+        }
+        tx.commit().await.map_err(internal)?;
+        id
+    };
+
+    Ok(Json(DeleteRuntimeSettingOutput {
         audit_entry_id: audit_entry_id.to_string(),
     }))
+}
+
+/// Restart-coordination markers a revert (delete) of `key` must set, per §3.4 +
+/// M-6. Runtime-mutable keys need none. `federation.enabled` queues its restart
+/// marker; `service.public_url` ALSO queues `bulk-diddoc-update` (sharing a fresh
+/// run_id + started_at) because the revert un-aligns DID docs the same way a
+/// forward URL change does (§2.2).
+fn restart_markers_for_revert(key: &str) -> Vec<(&'static str, String)> {
+    match key {
+        FEDERATION_ENABLED_KEY => vec![(
+            crate::api::pending_restart::ACTION_RESTART_FEDERATION_ENABLED,
+            r#"{"version":1}"#.to_string(),
+        )],
+        SERVICE_PUBLIC_URL_KEY => {
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let started_at = chrono::Utc::now().to_rfc3339();
+            let payload = serde_json::json!({
+                "version": 1,
+                "run_id": run_id,
+                "started_at": started_at,
+            })
+            .to_string();
+            vec![
+                (
+                    crate::api::pending_restart::ACTION_RESTART_SERVICE_PUBLIC_URL,
+                    payload.clone(),
+                ),
+                (crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE, payload),
+            ]
+        }
+        _ => vec![],
+    }
+}
+
+/// Outer-tx-aware row deletion + audit append, mirroring
+/// [`write_runtime_setting_audited_with_tx`]'s mode contract. `(None, false)` is
+/// self-managed (own guard + tx + commit); `(Some(tx), true)` writes into the
+/// caller's tx and does not commit (the caller holds the guard across its own
+/// commit per §3.5). Returns the audit entry id.
+async fn delete_runtime_setting_with_tx(
+    ctx: &AppContext,
+    key: &str,
+    actor_did: &str,
+    rationale: &str,
+    outer_tx: Option<&mut sqlx::Transaction<'_, sqlx::Any>>,
+    guard_already_held: bool,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    if outer_tx.is_some() != guard_already_held {
+        return Err(internal(
+            "delete_runtime_setting_with_tx: outer_tx and guard_already_held must be set together",
+        ));
+    }
+    let _owned_guard = if guard_already_held {
+        None
+    } else {
+        Some(audit_chain::AppendChainGuard::acquire().await)
+    };
+    match outer_tx {
+        Some(tx) => delete_runtime_setting_row_writes(tx, ctx, key, actor_did, rationale).await,
+        None => {
+            let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+            let id = delete_runtime_setting_row_writes(&mut tx, ctx, key, actor_did, rationale).await?;
+            tx.commit().await.map_err(internal)?;
+            Ok(id)
+        }
+    }
+}
+
+/// DELETE the runtime row + append the audit-chain entry within a caller-owned
+/// transaction. Returns the chain entry id. A delete of an absent row is a no-op
+/// on the row but still records the operator's revert intent in the chain.
+async fn delete_runtime_setting_row_writes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ctx: &AppContext,
+    key: &str,
+    actor_did: &str,
+    rationale: &str,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    sqlx::query("DELETE FROM runtime_settings WHERE key = $1")
+        .bind(key)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut *tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            actor_did,
+            source: "manual",
+            payload: None,
+            action: "DeleteRuntimeSetting",
+            subject: None,
+            rationale: &format!("{} (revert to default): {}", key, rationale),
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_pds)?;
+    Ok(audit_entry_id)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRestartActionView {
+    pub action: String,
+    pub created_at: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPendingRestartActionsOutput {
+    pub pending_actions: Vec<PendingRestartActionView>,
+}
+
+/// `tools.aurora.superadmin.listPendingRestartActions` (§3.8) — read endpoint for
+/// the queued-change banner (F3). `pending_restart_action` is intentionally off
+/// the runtime-settings XRPC surface (H-3), so the banner reads here. SuperAdmin-
+/// gated, read-only (no audit). Ordered by `created_at` ascending (queue order).
+/// Unknown-version payloads are returned unchanged for forward compatibility.
+pub async fn list_pending_restart_actions(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<ListPendingRestartActionsOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    use sqlx::Row as _;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "listPendingRestartActions requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    let rows = sqlx::query(
+        "SELECT action, payload, created_at FROM pending_restart_action ORDER BY created_at ASC",
+    )
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(internal)?;
+    let pending_actions = rows
+        .into_iter()
+        .map(|row| {
+            let action: String = row.try_get("action").map_err(internal)?;
+            let payload_str: String = row.try_get("payload").map_err(internal)?;
+            let created_at: String = row.try_get("created_at").map_err(internal)?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+            Ok(PendingRestartActionView { action, created_at, payload })
+        })
+        .collect::<Result<Vec<_>, (StatusCode, Json<serde_json::Value>)>>()?;
+    Ok(Json(ListPendingRestartActionsOutput { pending_actions }))
+}
+
+/// v0.9 Federation runtime-mutability arc §2.1 (#397) — save a restart-required
+/// runtime setting so its value-write, audit-chain entry, and restart marker land
+/// in ONE transaction. Follows the R3-verified §3.5 caller pattern: the guard is
+/// acquired before `begin()` and held until after `commit()`, and the audited
+/// write runs in outer-tx mode (no nested guard/commit).
+async fn save_runtime_setting_with_restart_marker(
+    ctx: &AppContext,
+    key: &str,
+    value: &serde_json::Value,
+    actor_did: &str,
+    rationale: &str,
+    marker_action: &str,
+    marker_payload: &str,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    let _audit_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut outer_tx = ctx.account_db.begin().await.map_err(internal)?;
+    let audit_entry_id = write_runtime_setting_audited_with_tx(
+        ctx,
+        key,
+        value,
+        actor_did,
+        rationale,
+        Some(&mut outer_tx),
+        true,
+    )
+    .await?;
+    crate::api::pending_restart::upsert_marker(
+        &mut outer_tx,
+        marker_action,
+        marker_payload,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .await
+    .map_err(internal_pds)?;
+    outer_tx.commit().await.map_err(internal)?;
+    // _audit_guard drops here, AFTER commit per the §3.5 contract.
+    Ok(audit_entry_id)
+}
+
+/// v0.9 Federation runtime-mutability arc §2.2 (#398) — save the
+/// restart-required `service.public_url`. Beyond the value + audit + restart
+/// marker, a public-URL change requires re-pointing every account's did:plc DID
+/// document after restart, so this also queues the `bulk-diddoc-update` marker
+/// and writes one `pending` result row per account — all in ONE outer
+/// transaction (R3-verified §3.5 guard lifetime). A fresh `run_id` + `started_at`
+/// are generated once and carried through both markers and the result rows so
+/// E2/E4 can correlate the run. Phase E2 reads the marker on boot and executes
+/// the per-account PLC operations.
+async fn save_service_public_url_with_bulk_update(
+    ctx: &AppContext,
+    value: &serde_json::Value,
+    actor_did: &str,
+    rationale: &str,
+) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let started_at = chrono::Utc::now().to_rfc3339();
+
+    let _audit_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut outer_tx = ctx.account_db.begin().await.map_err(internal)?;
+
+    let audit_entry_id = write_runtime_setting_audited_with_tx(
+        ctx,
+        SERVICE_PUBLIC_URL_KEY,
+        value,
+        actor_did,
+        rationale,
+        Some(&mut outer_tx),
+        true,
+    )
+    .await?;
+
+    // Both markers share one run_id + started_at (§2.2). The bulk-update marker
+    // drives E2 on the next boot; the restart marker is a no-op clear.
+    let payload = serde_json::json!({
+        "version": 1,
+        "run_id": run_id,
+        "started_at": started_at,
+    })
+    .to_string();
+    crate::api::pending_restart::upsert_marker(
+        &mut outer_tx,
+        crate::api::pending_restart::ACTION_RESTART_SERVICE_PUBLIC_URL,
+        &payload,
+        &started_at,
+    )
+    .await
+    .map_err(internal_pds)?;
+    crate::api::pending_restart::upsert_marker(
+        &mut outer_tx,
+        crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE,
+        &payload,
+        &started_at,
+    )
+    .await
+    .map_err(internal_pds)?;
+
+    // Initial pending result rows, one per account. v0.9: all accounts are
+    // did:plc (#381 Outcome A), so no did_method filter; v0.10 filters here.
+    let dids: Vec<String> = sqlx::query("SELECT did FROM actor")
+        .fetch_all(&mut *outer_tx)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .filter_map(|r| r.try_get::<String, _>("did").ok())
+        .collect();
+    crate::api::bulk_diddoc_result::write_initial_pending_rows(
+        &mut outer_tx,
+        &dids,
+        &run_id,
+        &started_at,
+    )
+    .await
+    .map_err(internal_pds)?;
+
+    outer_tx.commit().await.map_err(internal)?;
+    // _audit_guard drops here, AFTER commit per the §3.5 contract.
+    Ok(audit_entry_id)
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerRestartInput {
+    pub rationale: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerRestartOutput {
+    pub audit_entry_id: String,
+}
+
+/// `tools.aurora.superadmin.triggerRestart` (§2.1) — operator-driven restart for
+/// the "Restart now" choice in the save modal. Records the audited intent, then
+/// fires the graceful-shutdown trigger (C1): `serve`'s `with_graceful_shutdown`
+/// drains in-flight connections and the watchdog force-exits past the deadline;
+/// the supervisor relaunches with config + runtime overrides re-read at boot.
+/// Returns BEFORE the process actually exits (the UI shows a restarting state).
+/// SuperAdmin-gated; rationale required.
+pub async fn trigger_restart(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<TriggerRestartInput>,
+) -> Result<Json<TriggerRestartOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "triggerRestart requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    if input.rationale.trim().is_empty() {
+        return Err(validation("rationale is required and must be non-empty"));
+    }
+    // Record the operator's restart intent in the audit chain.
+    let audit_entry_id = {
+        let _guard = audit_chain::AppendChainGuard::acquire().await;
+        let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+        let id = audit_chain::insert_chain_entry(
+            &mut tx,
+            ctx.config.database.backend,
+            AppendEntryParams {
+                actor_did: &auth.did,
+                source: "manual",
+                payload: None,
+                action: "TriggerRestart",
+                subject: None,
+                rationale: &input.rationale,
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .map_err(internal_pds)?;
+        tx.commit().await.map_err(internal)?;
+        id
+    };
+    // Fire the graceful-shutdown signal (C1). `send` errors only if no receivers
+    // exist (e.g. a test without a running `serve`); the restart intent is
+    // already audited, so ignore that case.
+    let _ = ctx.shutdown_trigger.send(());
+    Ok(Json(TriggerRestartOutput {
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+// ===========================================================================
+// v0.9 Federation runtime-mutability arc §2.3 (#400 / E4) — bulk did:plc update
+// result surface: read the most-recent run + retry a single account.
+// ===========================================================================
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkResultRowView {
+    pub did: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkResultCounts {
+    pub pending: i64,
+    pub aligned: i64,
+    pub failed: i64,
+    pub unresolvable: i64,
+    pub skipped_did_web: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBulkDidDocUpdateLatestOutput {
+    pub run_id: Option<String>,
+    pub started_at: Option<String>,
+    pub counts: Option<BulkResultCounts>,
+    pub rows: Vec<BulkResultRowView>,
+}
+
+/// `tools.aurora.superadmin.getBulkDidDocUpdateLatest` (§2.3 result surface) —
+/// the most-recent bulk did:plc update run (by `started_at`, NOT `run_id`, per
+/// R3 H-2), its per-account rows (triage-needed first), and aggregate counts.
+/// SuperAdmin-gated, read-only. Empty (all-null) when no run has ever happened.
+pub async fn get_bulk_diddoc_update_latest(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<GetBulkDidDocUpdateLatestOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    use sqlx::Row as _;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "getBulkDidDocUpdateLatest requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+
+    // Most-recent run by recency (started_at), not the lexicographic UUID.
+    let latest = sqlx::query(
+        "SELECT run_id, started_at FROM bulk_diddoc_update_result ORDER BY started_at DESC LIMIT 1",
+    )
+    .fetch_optional(&ctx.account_db)
+    .await
+    .map_err(internal)?;
+    let Some(latest) = latest else {
+        return Ok(Json(GetBulkDidDocUpdateLatestOutput {
+            run_id: None,
+            started_at: None,
+            counts: None,
+            rows: vec![],
+        }));
+    };
+    let run_id: String = latest.try_get("run_id").map_err(internal)?;
+    let started_at: String = latest.try_get("started_at").map_err(internal)?;
+
+    // Rows for that run — failed / unresolvable first so triage is on top.
+    let rows = sqlx::query(
+        "SELECT did, status, reason, updated_at FROM bulk_diddoc_update_result \
+         WHERE run_id = $1 \
+         ORDER BY CASE status \
+           WHEN 'failed' THEN 0 WHEN 'unresolvable' THEN 1 WHEN 'pending' THEN 2 \
+           WHEN 'aligned' THEN 3 ELSE 4 END, did",
+    )
+    .bind(&run_id)
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(internal)?
+    .into_iter()
+    .map(|r| {
+        Ok(BulkResultRowView {
+            did: r.try_get("did").map_err(internal)?,
+            status: r.try_get("status").map_err(internal)?,
+            reason: r.try_get("reason").map_err(internal)?,
+            updated_at: r.try_get("updated_at").map_err(internal)?,
+        })
+    })
+    .collect::<Result<Vec<_>, (StatusCode, Json<serde_json::Value>)>>()?;
+
+    // Aggregate counts for the run.
+    let mut counts = BulkResultCounts::default();
+    let count_rows = sqlx::query(
+        "SELECT status, COUNT(*) AS n FROM bulk_diddoc_update_result WHERE run_id = $1 GROUP BY status",
+    )
+    .bind(&run_id)
+    .fetch_all(&ctx.account_db)
+    .await
+    .map_err(internal)?;
+    for cr in count_rows {
+        let status: String = cr.try_get("status").map_err(internal)?;
+        let n: i64 = cr.try_get("n").map_err(internal)?;
+        match status.as_str() {
+            "pending" => counts.pending = n,
+            "aligned" => counts.aligned = n,
+            "failed" => counts.failed = n,
+            "unresolvable" => counts.unresolvable = n,
+            "skipped_did_web" => counts.skipped_did_web = n,
+            _ => {}
+        }
+    }
+
+    Ok(Json(GetBulkDidDocUpdateLatestOutput {
+        run_id: Some(run_id),
+        started_at: Some(started_at),
+        counts: Some(counts),
+        rows,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryBulkDidDocUpdateInput {
+    pub did: String,
+    pub run_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryBulkDidDocUpdateOutput {
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+/// `tools.aurora.superadmin.retryBulkDidDocUpdateForDid` (§2.3) — re-run the
+/// did:plc update for a single account (the "Retry" control on a failed row).
+/// SuperAdmin-gated; audited as `RetryBulkServiceUrlUpdate` (inside the shared
+/// per-account helper). A PLC failure returns `{status:"failed"}`, not an XRPC
+/// error — the failure is the operator-triaged result.
+pub async fn retry_bulk_diddoc_update_for_did(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(input): Json<RetryBulkDidDocUpdateInput>,
+) -> Result<Json<RetryBulkDidDocUpdateOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "retryBulkDidDocUpdateForDid requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    // v0.9: only did:plc accounts exist (#381); did:web is a v0.10 path.
+    if !input.did.starts_with("did:plc:") {
+        return Err(validation(format!(
+            "only did:plc accounts can be re-pointed; got '{}'",
+            input.did
+        )));
+    }
+    let exists = sqlx::query("SELECT 1 FROM actor WHERE did = $1")
+        .bind(&input.did)
+        .fetch_optional(&ctx.account_db)
+        .await
+        .map_err(internal)?;
+    if exists.is_none() {
+        return Err(validation(format!("account not found: {}", input.did)));
+    }
+
+    let outcome = crate::api::bulk_diddoc_result::retry_one_account(&ctx, &input.did, &input.run_id)
+        .await
+        .map_err(internal_pds)?;
+    Ok(Json(RetryBulkDidDocUpdateOutput {
+        status: outcome.status,
+        reason: outcome.reason,
+    }))
+}
+
+/// Query params for `uploadBrandingAsset`: which asset, + an optional rationale.
+/// camelCase on the wire (`assetType`) per the atproto convention the admin
+/// client sends.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadBrandingParams {
+    pub asset_type: String,
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
+/// Accepted image Content-Type → canonical file extension; `None` outside the
+/// whitelist (PNG / JPEG / SVG / WebP).
+fn branding_ext_for_content_type(ct: &str) -> Option<&'static str> {
+    match ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/svg+xml" => Some("svg"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// Content-Type for a stored branding file, from its extension.
+fn branding_content_type_for_filename(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// `tools.aurora.superadmin.uploadBrandingAsset` — upload a login-splash logo
+/// or banner directly (v0.9), so operators needn't host the asset themselves.
+/// SuperAdmin only. The raw file is the request body (matching `uploadBlob`'s
+/// idiom — no multipart); `assetType` (`logo`|`banner`) and an optional
+/// `rationale` are query params; the extension comes from Content-Type. The
+/// file is written atomically to `<data>/branding/<asset>.<ext>` (overwriting
+/// any prior asset of that type, including a different extension), the matching
+/// `branding.login-*` runtime setting is repointed to `/branding/<file>`, and
+/// an audit-chain entry is emitted. Returns the served URL, the runtime-setting
+/// key, and the audit entry id.
+pub async fn upload_branding_asset(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UploadBrandingParams>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(forbidden(&format!(
+            "uploadBrandingAsset requires SuperAdmin role; caller has {:?}",
+            auth.role
+        )));
+    }
+    let (key, base, max_bytes) = match params.asset_type.as_str() {
+        "logo" => (BRANDING_LOGIN_LOGO_KEY, "logo", 1_048_576usize),
+        "banner" => (BRANDING_LOGIN_BANNER_KEY, "banner", 5_242_880usize),
+        _ => return Err(validation("assetType must be 'logo' or 'banner'")),
+    };
+    if body.is_empty() {
+        return Err(validation("uploaded file is empty"));
+    }
+    if body.len() > max_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "PayloadTooLarge",
+                "message": format!("{base} must be at most {max_bytes} bytes"),
+            })),
+        ));
+    }
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let ext = branding_ext_for_content_type(content_type)
+        .ok_or_else(|| validation("unsupported image type; accepted: PNG, JPEG, SVG, WebP"))?;
+
+    let dir = ctx.config.storage.data_directory.join("branding");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| internal(format!("could not create branding dir: {e}")))?;
+    let filename = format!("{base}.{ext}");
+    // Atomic write: temp then rename, so a concurrent serve never sees a
+    // partial file.
+    let tmp_path = dir.join(format!("{base}.{ext}.tmp"));
+    let final_path = dir.join(&filename);
+    tokio::fs::write(&tmp_path, &body)
+        .await
+        .map_err(|e| internal(format!("could not stage branding asset: {e}")))?;
+    tokio::fs::rename(&tmp_path, &final_path)
+        .await
+        .map_err(|e| internal(format!("could not finalize branding asset: {e}")))?;
+    // Remove any prior asset of this type with a different extension, so only
+    // one logo / banner file exists and the runtime pointer is unambiguous.
+    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+        let prefix = format!("{base}.");
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && name != filename {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+
+    let url = format!("/branding/{filename}");
+    let rationale = params
+        .rationale
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("branding upload");
+    let value = serde_json::Value::String(url.clone());
+    let audit_entry_id =
+        write_runtime_setting_audited(&ctx, key, &value, &auth.did, rationale).await?;
+
+    Ok(Json(serde_json::json!({
+        "url": url,
+        "runtimeSetting": key,
+        "auditEntryId": audit_entry_id.to_string(),
+    })))
+}
+
+/// `GET /branding/<filename>` — serve an uploaded branding asset from
+/// `<data>/branding/`. Public (the pre-auth login page fetches it). The
+/// filename is constrained to a bare name (no separators / `..`) so it can't
+/// escape the directory; Content-Type is derived from the extension. 404 when
+/// the file is absent (nothing uploaded / cleared).
+pub async fn serve_branding_asset(
+    State(ctx): State<AppContext>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+    {
+        return (StatusCode::BAD_REQUEST, "invalid filename").into_response();
+    }
+    let path = ctx
+        .config
+        .storage
+        .data_directory
+        .join("branding")
+        .join(&filename);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                branding_content_type_for_filename(&filename),
+            )],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
 }
 
 // ===========================================================================
@@ -3939,6 +6311,37 @@ mod tests {
     use super::*;
     use crate::admin::roles::Role;
     use crate::account::ValidatedSession;
+
+    // #302 — getReport's wire shape must be camelCase: the admin UI's
+    // ReportDetail page reads `subjectDid` / `reportedBy` / `reasonType`. The
+    // underlying Report struct serializes snake_case, so GetReportOutput is the
+    // camelCase re-projection — this pins that contract.
+    #[test]
+    fn get_report_output_serializes_camelcase() {
+        let out = GetReportOutput {
+            id: 7,
+            subject_did: Some("did:plc:subj".into()),
+            subject_uri: None,
+            subject_cid: None,
+            reason_type: crate::admin::reports::ReportReason::Spam,
+            reason: Some("spammy".into()),
+            reported_by: "did:plc:reporter".into(),
+            reported_at: chrono::Utc::now(),
+            status: crate::admin::reports::ReportStatus::Open,
+            reviewed_by: None,
+            reviewed_at: None,
+            resolution: None,
+        };
+        let v = serde_json::to_value(&out).expect("serialize");
+        assert_eq!(v["subjectDid"], serde_json::json!("did:plc:subj"));
+        assert_eq!(v["reportedBy"], serde_json::json!("did:plc:reporter"));
+        assert_eq!(v["reasonType"], serde_json::json!("spam"));
+        assert_eq!(v["status"], serde_json::json!("open"));
+        assert!(
+            v.get("subject_did").is_none(),
+            "must be camelCase (subjectDid), not snake_case (subject_did)",
+        );
+    }
 
     fn moderator_auth() -> AdminAuthContext {
         AdminAuthContext {
@@ -4042,7 +6445,6 @@ mod tests {
                 firehose_enabled: false,
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
-                auto_stream_events: false,
                 peer_pds: vec![],
             },
             validation_mode: PathBuf::from("required").into_os_string().to_string_lossy().parse().unwrap_or(crate::validation::ValidationMode::Required),
@@ -4078,6 +6480,717 @@ mod tests {
         Subject::Repo {
             did: did.to_string(),
         }
+    }
+
+    // v0.9 Federation runtime-mutability arc §3.5 (#392) — outer-tx refactor of
+    // write_runtime_setting_audited. The new code path is `_with_tx` in outer-tx
+    // mode; these pin its atomicity + guard contract.
+
+    async fn count_runtime_rows(ctx: &AppContext, key: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM runtime_settings WHERE key = $1")
+            .bind(key)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+    }
+
+    async fn count_audit_for(ctx: &AppContext, key_fragment: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = 'SetRuntimeSetting' \
+             AND rationale LIKE $1",
+        )
+        .bind(format!("%{key_fragment}%"))
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn audited_write_outer_tx_commit_lands_row_and_audit() {
+        let ctx = create_test_context().await;
+        let key = "test.c3.commit";
+        // Caller owns the guard (acquired BEFORE begin) and the transaction.
+        let _guard = audit_chain::AppendChainGuard::acquire().await;
+        let mut tx = ctx.account_db.begin().await.unwrap();
+        write_runtime_setting_audited_with_tx(
+            &ctx,
+            key,
+            &serde_json::json!("v1"),
+            "did:plc:op",
+            "commit-test",
+            Some(&mut tx),
+            true,
+        )
+        .await
+        .expect("outer-tx write succeeds");
+        // A sibling write composes in the SAME tx (mirrors the D-phase marker).
+        sqlx::query(
+            "INSERT INTO pending_restart_action (action, payload, created_at) VALUES ($1, $2, $3)",
+        )
+        .bind("restart-required-for-federation-enabled")
+        .bind(r#"{"version":1}"#)
+        .bind("2026-06-27T00:00:00Z")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        drop(_guard);
+        assert_eq!(count_runtime_rows(&ctx, key).await, 1, "runtime row committed");
+        assert_eq!(count_audit_for(&ctx, key).await, 1, "audit entry committed");
+        let markers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_restart_action")
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap();
+        assert_eq!(markers, 1, "sibling marker committed atomically");
+    }
+
+    #[tokio::test]
+    async fn audited_write_outer_tx_rollback_discards_both() {
+        let ctx = create_test_context().await;
+        let key = "test.c3.rollback";
+        let _guard = audit_chain::AppendChainGuard::acquire().await;
+        let mut tx = ctx.account_db.begin().await.unwrap();
+        write_runtime_setting_audited_with_tx(
+            &ctx,
+            key,
+            &serde_json::json!("v1"),
+            "did:plc:op",
+            "rollback-test",
+            Some(&mut tx),
+            true,
+        )
+        .await
+        .expect("outer-tx write succeeds");
+        tx.rollback().await.unwrap();
+        drop(_guard);
+        // Atomicity: neither the runtime row nor the audit entry survive.
+        assert_eq!(count_runtime_rows(&ctx, key).await, 0, "runtime row rolled back");
+        assert_eq!(count_audit_for(&ctx, key).await, 0, "audit entry rolled back");
+    }
+
+    #[tokio::test]
+    async fn audited_write_guard_tx_mismatch_errors() {
+        let ctx = create_test_context().await;
+        // Claims guard held but provides no outer tx → error, no write.
+        let r1 = write_runtime_setting_audited_with_tx(
+            &ctx,
+            "test.c3.bad1",
+            &serde_json::json!("v"),
+            "did:plc:op",
+            "bad",
+            None,
+            true,
+        )
+        .await;
+        assert!(r1.is_err(), "None + guard_already_held=true must error");
+        // Provides an outer tx but claims no guard → error.
+        let mut tx = ctx.account_db.begin().await.unwrap();
+        let r2 = write_runtime_setting_audited_with_tx(
+            &ctx,
+            "test.c3.bad2",
+            &serde_json::json!("v"),
+            "did:plc:op",
+            "bad",
+            Some(&mut tx),
+            false,
+        )
+        .await;
+        assert!(r2.is_err(), "Some(tx) + guard_already_held=false must error");
+        drop(tx);
+        assert_eq!(count_runtime_rows(&ctx, "test.c3.bad1").await, 0);
+        assert_eq!(count_runtime_rows(&ctx, "test.c3.bad2").await, 0);
+    }
+
+    #[tokio::test]
+    async fn audited_write_self_managed_still_works() {
+        // Backward-compat: the original wrapper signature is unchanged and lands
+        // the row + audit entry in its own guard + transaction.
+        let ctx = create_test_context().await;
+        let key = "test.c3.selfmanaged";
+        let id = write_runtime_setting_audited(
+            &ctx,
+            key,
+            &serde_json::json!("v1"),
+            "did:plc:op",
+            "self-managed",
+        )
+        .await
+        .expect("self-managed write succeeds");
+        assert!(id > 0, "returns the audit entry id");
+        assert_eq!(count_runtime_rows(&ctx, key).await, 1);
+        assert_eq!(count_audit_for(&ctx, key).await, 1);
+    }
+
+    // v0.9 Federation runtime-mutability arc §3.4/§3.7/§3.8 (#393/#395/#396) —
+    // deleteRuntimeSetting (revert), the federation.enabled request-gate, and
+    // listPendingRestartActions.
+
+    fn c4_super() -> AdminAuthContext {
+        AdminAuthContext {
+            did: "did:plc:superadmin".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:superadmin".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role: Role::SuperAdmin,
+        }
+    }
+
+    fn c4_admin() -> AdminAuthContext {
+        AdminAuthContext {
+            did: "did:plc:admin".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:admin".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        }
+    }
+
+    async fn count_markers(ctx: &AppContext, action: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM pending_restart_action WHERE action = $1")
+            .bind(action)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+    }
+
+    async fn count_audit_action(ctx: &AppContext, action: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1")
+            .bind(action)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+    }
+
+    fn del_input(key: &str, rationale: &str) -> DeleteRuntimeSettingInput {
+        DeleteRuntimeSettingInput { key: key.to_string(), rationale: rationale.to_string() }
+    }
+
+    #[tokio::test]
+    async fn delete_runtime_mutable_key_removes_row_and_audits() {
+        let ctx = create_test_context().await;
+        let key = FEDERATION_APPVIEW_URL_KEY;
+        write_runtime_setting_audited(&ctx, key, &serde_json::json!("https://x.example"), "op", "set")
+            .await
+            .unwrap();
+        assert_eq!(count_runtime_rows(&ctx, key).await, 1);
+        let _ = delete_runtime_setting(State(ctx.clone()), c4_super(), Json(del_input(key, "revert")))
+            .await
+            .expect("delete ok");
+        assert_eq!(count_runtime_rows(&ctx, key).await, 0, "row deleted");
+        assert!(count_audit_action(&ctx, "DeleteRuntimeSetting").await >= 1, "audit recorded");
+        // No markers for a runtime-mutable key.
+        let markers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_restart_action")
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap();
+        assert_eq!(markers, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_federation_enabled_queues_restart_marker() {
+        let ctx = create_test_context().await;
+        let _ = delete_runtime_setting(State(ctx.clone()), c4_super(), Json(del_input(FEDERATION_ENABLED_KEY, "revert")))
+            .await
+            .expect("delete ok");
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_RESTART_FEDERATION_ENABLED).await,
+            1,
+            "federation-enabled restart marker queued"
+        );
+        assert!(count_audit_action(&ctx, "DeleteRuntimeSetting").await >= 1);
+    }
+
+    #[tokio::test]
+    async fn delete_service_public_url_queues_both_markers() {
+        let ctx = create_test_context().await;
+        let _ = delete_runtime_setting(State(ctx.clone()), c4_super(), Json(del_input(SERVICE_PUBLIC_URL_KEY, "revert")))
+            .await
+            .expect("delete ok");
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_RESTART_SERVICE_PUBLIC_URL).await,
+            1,
+            "public-url restart marker queued"
+        );
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE).await,
+            1,
+            "bulk-diddoc-update marker queued (revert un-aligns DID docs)"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_key_rejected() {
+        let ctx = create_test_context().await;
+        let r = delete_runtime_setting(State(ctx.clone()), c4_super(), Json(del_input("nope.unknown", "x")))
+            .await;
+        assert_eq!(r.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_requires_rationale_and_superadmin() {
+        let ctx = create_test_context().await;
+        // Empty rationale → 400.
+        let r1 = delete_runtime_setting(State(ctx.clone()), c4_super(), Json(del_input(FEDERATION_APPVIEW_URL_KEY, "  ")))
+            .await;
+        assert_eq!(r1.unwrap_err().0, StatusCode::BAD_REQUEST);
+        // Non-SuperAdmin → 403.
+        let r2 = delete_runtime_setting(State(ctx.clone()), c4_admin(), Json(del_input(FEDERATION_APPVIEW_URL_KEY, "revert")))
+            .await;
+        assert_eq!(r2.unwrap_err().0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn federation_gate_proceeds_when_enabled() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+        })
+        .await;
+        assert!(
+            federation_inbound_gate_503(&ctx).await.is_none(),
+            "enabled → request proceeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_gate_503_on_runtime_disable_no_cache() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+        })
+        .await;
+        // Operator flips the runtime override off (incident response).
+        write_runtime_setting_audited(&ctx, FEDERATION_ENABLED_KEY, &serde_json::json!(false), "op", "incident")
+            .await
+            .unwrap();
+        let gate = federation_inbound_gate_503(&ctx).await;
+        assert!(gate.is_some(), "runtime-disabled → 503 immediately (no cache window)");
+        assert_eq!(gate.unwrap().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn federation_gate_503_when_config_disabled_and_no_row() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = false;
+        })
+        .await;
+        // No runtime row → config fallback (false) → 503.
+        assert!(federation_inbound_gate_503(&ctx).await.is_some());
+    }
+
+    async fn insert_marker_raw(ctx: &AppContext, action: &str, payload: &str, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO pending_restart_action (action, payload, created_at) VALUES ($1, $2, $3)",
+        )
+        .bind(action)
+        .bind(payload)
+        .bind(created_at)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_pending_empty_when_none() {
+        let ctx = create_test_context().await;
+        let out = list_pending_restart_actions(State(ctx.clone()), c4_super())
+            .await
+            .expect("ok");
+        assert!(out.0.pending_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_pending_returns_markers_in_queue_order() {
+        let ctx = create_test_context().await;
+        // Insert out of chronological order; expect created_at-ascending output.
+        insert_marker_raw(&ctx, "b-action", r#"{"version":1}"#, "2026-06-27T02:00:00Z").await;
+        insert_marker_raw(&ctx, "a-action", r#"{"version":1}"#, "2026-06-27T01:00:00Z").await;
+        let out = list_pending_restart_actions(State(ctx.clone()), c4_super())
+            .await
+            .expect("ok");
+        assert_eq!(out.0.pending_actions.len(), 2);
+        assert_eq!(out.0.pending_actions[0].created_at, "2026-06-27T01:00:00Z", "queue order");
+        assert_eq!(out.0.pending_actions[1].created_at, "2026-06-27T02:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn list_pending_returns_unknown_version_unchanged() {
+        let ctx = create_test_context().await;
+        insert_marker_raw(&ctx, "future-action", r#"{"version":99,"x":1}"#, "2026-06-27T01:00:00Z")
+            .await;
+        let out = list_pending_restart_actions(State(ctx.clone()), c4_super())
+            .await
+            .expect("ok");
+        assert_eq!(out.0.pending_actions.len(), 1);
+        assert_eq!(out.0.pending_actions[0].payload["version"], 99);
+    }
+
+    #[tokio::test]
+    async fn list_pending_forbidden_for_non_superadmin() {
+        let ctx = create_test_context().await;
+        let r = list_pending_restart_actions(State(ctx.clone()), c4_admin()).await;
+        assert_eq!(r.unwrap_err().0, StatusCode::FORBIDDEN);
+    }
+
+    // v0.9 Federation runtime-mutability arc §2.1 (#397) — federation.enabled
+    // save-and-restart flow, consumer switch, triggerRestart.
+
+    #[tokio::test]
+    async fn boot_read_federation_enabled_row_or_config_fallback() {
+        let ctx = create_test_context().await;
+        // No row → env-config fallback.
+        assert!(read_federation_enabled_at_boot(&ctx.account_db, true).await);
+        assert!(!read_federation_enabled_at_boot(&ctx.account_db, false).await);
+        // Runtime row overrides the fallback in both directions.
+        write_runtime_setting_audited(&ctx, FEDERATION_ENABLED_KEY, &serde_json::json!(false), "op", "x")
+            .await
+            .unwrap();
+        assert!(!read_federation_enabled_at_boot(&ctx.account_db, true).await);
+        write_runtime_setting_audited(&ctx, FEDERATION_ENABLED_KEY, &serde_json::json!(true), "op", "x")
+            .await
+            .unwrap();
+        assert!(read_federation_enabled_at_boot(&ctx.account_db, false).await);
+    }
+
+    #[tokio::test]
+    async fn consumer_switch_gates_subsystems_on_boot() {
+        // No runtime row → the master gate falls back to env config, and the
+        // federation subsystems are built (or not) accordingly.
+        let on = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+        })
+        .await;
+        assert!(on.federation_enabled);
+        assert!(on.federation_auth.is_some(), "subsystems up when enabled");
+        let off = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = false;
+        })
+        .await;
+        assert!(!off.federation_enabled);
+        assert!(off.federation_auth.is_none(), "subsystems down when disabled");
+    }
+
+    #[tokio::test]
+    async fn save_federation_enabled_writes_row_marker_audit_atomically() {
+        let ctx = create_test_context().await;
+        let _ = set_runtime_setting(
+            State(ctx.clone()),
+            c4_super(),
+            Json(SetRuntimeSettingInput {
+                key: FEDERATION_ENABLED_KEY.to_string(),
+                value: serde_json::json!(false),
+                rationale: "incident".to_string(),
+            }),
+        )
+        .await
+        .expect("save ok");
+        assert_eq!(count_runtime_rows(&ctx, FEDERATION_ENABLED_KEY).await, 1, "runtime row written");
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_RESTART_FEDERATION_ENABLED).await,
+            1,
+            "restart marker written in the same tx"
+        );
+        assert!(count_audit_action(&ctx, "SetRuntimeSetting").await >= 1, "audit recorded");
+    }
+
+    #[tokio::test]
+    async fn trigger_restart_fires_shutdown_signal_and_audits() {
+        let ctx = create_test_context().await;
+        let rx = ctx.shutdown_trigger.subscribe();
+        assert!(!rx.has_changed().unwrap(), "no signal before triggerRestart");
+        let _ = trigger_restart(
+            State(ctx.clone()),
+            c4_super(),
+            Json(TriggerRestartInput { rationale: "restart now".to_string() }),
+        )
+        .await
+        .expect("trigger ok");
+        assert!(rx.has_changed().unwrap(), "shutdown signal fired");
+        assert!(count_audit_action(&ctx, "TriggerRestart").await >= 1, "restart audited");
+    }
+
+    #[tokio::test]
+    async fn save_federation_disabled_composes_with_request_gate() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+        })
+        .await;
+        // Before the save the gate lets federation requests through.
+        assert!(federation_inbound_gate_503(&ctx).await.is_none());
+        // Operator disables federation at runtime (incident response).
+        let _ = set_runtime_setting(
+            State(ctx.clone()),
+            c4_super(),
+            Json(SetRuntimeSettingInput {
+                key: FEDERATION_ENABLED_KEY.to_string(),
+                value: serde_json::json!(false),
+                rationale: "incident".to_string(),
+            }),
+        )
+        .await
+        .expect("save ok");
+        // C6 short-circuit catches the saved value immediately — before any
+        // restart tears the subsystem down.
+        assert!(
+            federation_inbound_gate_503(&ctx).await.is_some(),
+            "request gate 503s on the saved value before restart"
+        );
+    }
+
+    // v0.9 Federation runtime-mutability arc §2.2 (#398) — service.public_url
+    // save-and-restart flow (two markers + initial pending result rows).
+
+    async fn count_bulk_rows(ctx: &AppContext, status: Option<&str>) -> i64 {
+        match status {
+            Some(s) => sqlx::query_scalar(
+                "SELECT COUNT(*) FROM bulk_diddoc_update_result WHERE status = $1",
+            )
+            .bind(s)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap(),
+            None => sqlx::query_scalar("SELECT COUNT(*) FROM bulk_diddoc_update_result")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap(),
+        }
+    }
+
+    async fn save_public_url(ctx: &AppContext, url: &str) {
+        let _ = set_runtime_setting(
+            State(ctx.clone()),
+            c4_super(),
+            Json(SetRuntimeSettingInput {
+                key: SERVICE_PUBLIC_URL_KEY.to_string(),
+                value: serde_json::json!(url),
+                rationale: "migrate".to_string(),
+            }),
+        )
+        .await
+        .expect("save ok");
+    }
+
+    #[tokio::test]
+    async fn boot_read_service_public_url_override() {
+        let ctx = create_test_context().await;
+        assert!(
+            read_service_public_url_at_boot(&ctx.account_db).await.is_none(),
+            "no row → no override"
+        );
+        write_runtime_setting_audited(&ctx, SERVICE_PUBLIC_URL_KEY, &serde_json::json!("https://new.example.com"), "op", "x")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_service_public_url_at_boot(&ctx.account_db).await.as_deref(),
+            Some("https://new.example.com")
+        );
+        // Blank stored value → treated as no override.
+        write_runtime_setting_audited(&ctx, SERVICE_PUBLIC_URL_KEY, &serde_json::json!("   "), "op", "x")
+            .await
+            .unwrap();
+        assert!(read_service_public_url_at_boot(&ctx.account_db).await.is_none(), "blank → none");
+    }
+
+    #[tokio::test]
+    async fn save_service_public_url_writes_value_markers_and_pending_rows() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:a", "a.test").await;
+        seed_actor(&ctx, "did:plc:b", "b.test").await;
+        seed_actor(&ctx, "did:plc:c", "c.test").await;
+        save_public_url(&ctx, "https://new.example.com").await;
+        assert_eq!(count_runtime_rows(&ctx, SERVICE_PUBLIC_URL_KEY).await, 1, "value row");
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_RESTART_SERVICE_PUBLIC_URL).await,
+            1,
+            "restart marker"
+        );
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE).await,
+            1,
+            "bulk-update marker"
+        );
+        assert!(count_audit_action(&ctx, "SetRuntimeSetting").await >= 1, "audit recorded");
+        assert_eq!(count_bulk_rows(&ctx, Some("pending")).await, 3, "one pending row per account");
+        assert_eq!(count_bulk_rows(&ctx, None).await, 3, "no rows in a terminal state at save");
+    }
+
+    #[tokio::test]
+    async fn save_service_public_url_run_id_and_started_at_consistent() {
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:a", "a.test").await;
+        save_public_url(&ctx, "https://new.example.com").await;
+        let restart_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM pending_restart_action WHERE action = $1",
+        )
+        .bind(crate::api::pending_restart::ACTION_RESTART_SERVICE_PUBLIC_URL)
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        let bulk_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM pending_restart_action WHERE action = $1",
+        )
+        .bind(crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE)
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(restart_payload, bulk_payload, "both markers share one run_id + started_at");
+        let pv: serde_json::Value = serde_json::from_str(&bulk_payload).unwrap();
+        let run_id = pv["run_id"].as_str().unwrap();
+        let started_at = pv["started_at"].as_str().unwrap();
+        let row_run: String = sqlx::query_scalar("SELECT run_id FROM bulk_diddoc_update_result LIMIT 1")
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap();
+        let row_started: String =
+            sqlx::query_scalar("SELECT started_at FROM bulk_diddoc_update_result LIMIT 1")
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(row_run, run_id, "result row run_id matches the marker");
+        assert_eq!(row_started, started_at, "result row started_at matches the marker");
+    }
+
+    #[tokio::test]
+    async fn save_service_public_url_with_zero_accounts_ok() {
+        // No accounts → markers written, zero result rows, no error.
+        let ctx = create_test_context().await;
+        save_public_url(&ctx, "https://new.example.com").await;
+        assert_eq!(
+            count_markers(&ctx, crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE).await,
+            1
+        );
+        assert_eq!(count_bulk_rows(&ctx, None).await, 0);
+    }
+
+    // v0.9 Federation runtime-mutability arc §2.3 (#400 / E4) — bulk-update
+    // result surface XRPCs.
+
+    async fn insert_bulk_row(ctx: &AppContext, did: &str, run_id: &str, started_at: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO bulk_diddoc_update_result \
+             (did, run_id, started_at, status, reason, updated_at) VALUES ($1,$2,$3,$4,NULL,$5)",
+        )
+        .bind(did)
+        .bind(run_id)
+        .bind(started_at)
+        .bind(status)
+        .bind(started_at)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bulk_latest_empty_when_no_runs() {
+        let ctx = create_test_context().await;
+        let out = get_bulk_diddoc_update_latest(State(ctx.clone()), c4_super()).await.unwrap().0;
+        assert!(out.run_id.is_none());
+        assert!(out.counts.is_none());
+        assert!(out.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_latest_returns_run_rows_and_counts_triage_first() {
+        let ctx = create_test_context().await;
+        insert_bulk_row(&ctx, "did:plc:a", "run-1", "2026-06-27T01:00:00Z", "aligned").await;
+        insert_bulk_row(&ctx, "did:plc:b", "run-1", "2026-06-27T01:00:00Z", "failed").await;
+        let out = get_bulk_diddoc_update_latest(State(ctx.clone()), c4_super()).await.unwrap().0;
+        assert_eq!(out.run_id.as_deref(), Some("run-1"));
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(out.rows[0].status, "failed", "triage-needed rows sort first");
+        let counts = out.counts.unwrap();
+        assert_eq!(counts.aligned, 1);
+        assert_eq!(counts.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_latest_picks_most_recent_run_by_started_at_not_run_id() {
+        let ctx = create_test_context().await;
+        // "zzz-old" sorts later lexically but is the OLDER run by started_at.
+        insert_bulk_row(&ctx, "did:plc:a", "zzz-old", "2026-06-27T01:00:00Z", "aligned").await;
+        // "aaa-new" sorts earlier lexically but is the NEWER run.
+        insert_bulk_row(&ctx, "did:plc:b", "aaa-new", "2026-06-27T02:00:00Z", "aligned").await;
+        let out = get_bulk_diddoc_update_latest(State(ctx.clone()), c4_super()).await.unwrap().0;
+        assert_eq!(
+            out.run_id.as_deref(),
+            Some("aaa-new"),
+            "recency is by started_at, not MAX(run_id) (R3 H-2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_publishes_and_records_aligned_with_retry_audit() {
+        let mut ctx = create_test_context().await;
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1,$2,$3)")
+            .bind("did:plc:a")
+            .bind("a.test")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        insert_bulk_row(&ctx, "did:plc:a", "run-1", "2026-06-27T01:00:00Z", "failed").await;
+        let mock = std::sync::Arc::new(
+            crate::crypto::plc_client::MockPlcClient::new().with_current_signing_key("did:plc:a", "zKEY"),
+        );
+        ctx.plc_client = mock.clone();
+
+        let out = retry_bulk_diddoc_update_for_did(
+            State(ctx.clone()),
+            c4_super(),
+            Json(RetryBulkDidDocUpdateInput {
+                did: "did:plc:a".to_string(),
+                run_id: "run-1".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out.status, "aligned");
+        assert_eq!(
+            mock.published_service_endpoint("did:plc:a").as_deref(),
+            Some(ctx.config.service.effective_public_url().as_str())
+        );
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = 'RetryBulkServiceUrlUpdate'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(audits, 1, "retry audited as RetryBulkServiceUrlUpdate");
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM bulk_diddoc_update_result WHERE did = 'did:plc:a' AND run_id = 'run-1'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(status, "aligned", "failed row advanced to aligned");
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_unknown_and_did_web() {
+        let ctx = create_test_context().await;
+        let unknown = retry_bulk_diddoc_update_for_did(
+            State(ctx.clone()),
+            c4_super(),
+            Json(RetryBulkDidDocUpdateInput {
+                did: "did:plc:nope".to_string(),
+                run_id: "run-1".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(unknown.unwrap_err().0, StatusCode::BAD_REQUEST, "unknown did:plc → 400");
+        let web = retry_bulk_diddoc_update_for_did(
+            State(ctx.clone()),
+            c4_super(),
+            Json(RetryBulkDidDocUpdateInput {
+                did: "did:web:example.com".to_string(),
+                run_id: "run-1".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(web.unwrap_err().0, StatusCode::BAD_REQUEST, "did:web → 400 (v0.10 path)");
     }
 
     #[tokio::test]
@@ -5460,6 +8573,70 @@ mod tests {
         );
     }
 
+    /// #361: account-growth buckets per UTC calendar day, carries the
+    /// before-window baseline, and accumulates cumulative from it. Seeds
+    /// actors at controlled `created_at`s and pins a fixed `now` so the
+    /// 30-day window is deterministic.
+    #[tokio::test]
+    async fn account_growth_buckets_per_day_with_baseline_and_cumulative() {
+        async fn seed_at(ctx: &AppContext, did: &str, created_at: &str) {
+            sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+                .bind(did)
+                .bind(did)
+                .bind(created_at)
+                .execute(&ctx.account_db)
+                .await
+                .expect("seed actor");
+        }
+
+        let ctx = create_test_context().await;
+        // Fixed anchor: window_end = 2026-06-15, window_start = 2026-05-17
+        // (30 trailing days inclusive).
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Two accounts strictly before the window (one on the eve, one far
+        // earlier) — the cumulative baseline.
+        seed_at(&ctx, "did:plc:old1", "2025-12-01T00:00:00Z").await;
+        seed_at(&ctx, "did:plc:eve", "2026-05-16T23:59:59Z").await;
+        // Two on the first window day (2026-05-17), different hours.
+        seed_at(&ctx, "did:plc:d0a", "2026-05-17T03:00:00Z").await;
+        seed_at(&ctx, "did:plc:d0b", "2026-05-17T20:00:00Z").await;
+        // One on the last window day (today, 2026-06-15).
+        seed_at(&ctx, "did:plc:d29", "2026-06-15T08:00:00Z").await;
+        // One future-dated (clock skew) past the window — must be discarded,
+        // not counted in any bucket nor the baseline.
+        seed_at(&ctx, "did:plc:future", "2026-06-20T00:00:00Z").await;
+
+        let (points, baseline, start_date, end_date) =
+            compute_account_growth(&ctx, now).await.expect("compute");
+
+        assert_eq!(baseline, 2, "two accounts created before the window");
+        assert_eq!(points.len(), ACCOUNT_GROWTH_WINDOW_DAYS as usize);
+        assert_eq!(start_date.format("%Y-%m-%d").to_string(), "2026-05-17");
+        assert_eq!(end_date.format("%Y-%m-%d").to_string(), "2026-06-15");
+
+        // Day 0: two new, cumulative = baseline (2) + 2 = 4.
+        assert_eq!(points[0].day, "2026-05-17");
+        assert_eq!(points[0].new_accounts, 2);
+        assert_eq!(points[0].cumulative_accounts, 4);
+
+        // Interior days are empty and hold the cumulative flat at 4.
+        for p in &points[1..29] {
+            assert_eq!(p.new_accounts, 0);
+            assert_eq!(p.cumulative_accounts, 4);
+        }
+
+        // Day 29 (today): one new, cumulative = 5. Future-dated row excluded.
+        assert_eq!(points[29].day, "2026-06-15");
+        assert_eq!(points[29].new_accounts, 1);
+        assert_eq!(points[29].cumulative_accounts, 5);
+
+        let total_new: i64 = points.iter().map(|p| p.new_accounts).sum();
+        assert_eq!(total_new, 3, "future-skew row is excluded from the window");
+    }
+
     /// Sub-3c: GetQueueStatsOutput's retyped fields serialize as
     /// non-negative JSON integers. Pin the wire shape so a future
     /// refactor that drops the `serde::Serialize` derive (or
@@ -5518,9 +8695,22 @@ mod tests {
     #[tokio::test]
     async fn get_moderation_metrics_returns_series_with_buckets() {
         let ctx = create_test_context().await;
-        // Seed 3 reports today.
+        // Fixed anchor for both seeds and the query window so they can't drift
+        // (#265). compute_metric buckets a row at idx = (ts - start)/bucket_secs
+        // and drops it when idx >= bucket_count; with Day granularity a ~1-day
+        // window yields bucket_count == 1, so a report landing exactly on the
+        // 86400s boundary (idx == 1) is silently excluded. The old now()-based
+        // fixture put report i=0 at exactly `now` with `start = now - 1day`,
+        // i.e. precisely on that boundary, and passed only because `start` was
+        // sampled microseconds *after* the seed — a backward wall-clock step
+        // under load (WSL2) flipped secs_since to >= 86400 and dropped it
+        // (aggregate 2.0, not 3.0). Anchoring `start` 3h before the newest
+        // report keeps all three strictly interior to bucket 0, deterministically.
+        let anchor = chrono::DateTime::parse_from_rfc3339("2020-06-15T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         for i in 0..3 {
-            let when = (chrono::Utc::now() - chrono::Duration::hours(i)).to_rfc3339();
+            let when = (anchor - chrono::Duration::hours(i)).to_rfc3339();
             sqlx::query(
                 "INSERT INTO report (subject_did, reason_type, reported_by, reported_at, status) \
                  VALUES ('did:plc:s', 'spam', 'did:plc:r', $1, 'open')",
@@ -5530,8 +8720,8 @@ mod tests {
             .await
             .unwrap();
         }
-        let start = chrono::Utc::now() - chrono::Duration::days(1);
-        let end = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let start = anchor - chrono::Duration::hours(3);
+        let end = anchor + chrono::Duration::seconds(60);
         use axum_extra::extract::Query as ExtraQuery;
         let resp = get_moderation_metrics(
             State(ctx),
@@ -5553,7 +8743,14 @@ mod tests {
     #[tokio::test]
     async fn get_moderation_metrics_delta_compares_previous_range() {
         let ctx = create_test_context().await;
-        let now = chrono::Utc::now();
+        // Fixed anchor (see the buckets test, #265) to drop the now()-drift
+        // anti-pattern. These reports sit at now-1h / now-30h — interior to
+        // their buckets, not on the 86400s boundary — so this test wasn't the
+        // observed flake; pinning `now` still forecloses the same class and
+        // keeps current-vs-previous-window bucketing fully deterministic.
+        let now = chrono::DateTime::parse_from_rfc3339("2020-06-15T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         // 2 reports in current 1-day window
         for _ in 0..2 {
             sqlx::query(
@@ -5666,6 +8863,10 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -5680,6 +8881,240 @@ mod tests {
         assert!(entry.snapshot_id.is_some());
     }
 
+    /// #359: getAuditEntry resolves a single entry by id and by current_hash
+    /// (the chain-walk path), 404s on an unknown id, and 400s when neither or
+    /// both selectors are given. Replaces the page-scoped _auditCache.
+    #[tokio::test]
+    async fn get_audit_entry_by_id_and_hash_with_404_and_400() {
+        let ctx = create_test_context().await;
+        crate::admin::audit_chain::insert_chain_entry_pool(
+            &ctx.account_db,
+            ctx.config.database.backend,
+            crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
+                actor_did: "did:plc:auditor",
+                action: "account.update_email",
+                subject: Some(&repo_subject("did:plc:subj")),
+                rationale: "support ticket #99",
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await
+        .expect("seed audit entry");
+
+        let (id, hash): (i64, String) = sqlx::query_as(
+            "SELECT id, current_hash FROM audit_chain_entry \
+             WHERE action = 'account.update_email'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+
+        // By id.
+        let by_id = get_audit_entry(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditEntryParams {
+                id: Some(id),
+                hash: None,
+            }),
+        )
+        .await
+        .expect("fetch by id")
+        .0;
+        assert_eq!(by_id.action, "account.update_email");
+        assert_eq!(by_id.rationale, "support ticket #99");
+        assert_eq!(by_id.current_hash, hash);
+        assert!(by_id.verified, "row-local hash recompute should verify");
+
+        // By hash → resolves the same entry (the walk-to-previous path).
+        let by_hash = get_audit_entry(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditEntryParams {
+                id: None,
+                hash: Some(hash.clone()),
+            }),
+        )
+        .await
+        .expect("fetch by hash")
+        .0;
+        assert_eq!(by_hash.id, by_id.id);
+
+        // Unknown id → 404.
+        let missing = get_audit_entry(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditEntryParams {
+                id: Some(9_999_999),
+                hash: None,
+            }),
+        )
+        .await;
+        assert_eq!(missing.unwrap_err().0, StatusCode::NOT_FOUND);
+
+        // Neither selector → 400.
+        let neither = get_audit_entry(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditEntryParams {
+                id: None,
+                hash: None,
+            }),
+        )
+        .await;
+        assert_eq!(neither.unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        // Both selectors → 400 (mutually exclusive).
+        let both = get_audit_entry(
+            State(ctx),
+            moderator_auth(),
+            axum::extract::Query(GetAuditEntryParams {
+                id: Some(id),
+                hash: Some(hash),
+            }),
+        )
+        .await;
+        assert_eq!(both.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    // §5.5.4 Phase E (§6.4 / MD-40) — source filter + rule-management filter.
+    #[tokio::test]
+    async fn get_audit_trail_phase_e_source_and_rule_management_filters() {
+        let ctx = create_test_context().await;
+        let ins = |source: &'static str, action: &'static str| {
+            let db = ctx.account_db.clone();
+            let backend = ctx.config.database.backend;
+            async move {
+                crate::admin::audit_chain::insert_chain_entry_pool(
+                    &db,
+                    backend,
+                    crate::admin::audit_chain::AppendEntryParams {
+                        source,
+                        payload: None,
+                        actor_did: "did:plc:m1",
+                        action,
+                        subject: Some(&repo_subject("did:plc:s1")),
+                        rationale: "r",
+                        snapshot_id: None,
+                        event_id: None,
+                        cascade_subjects: &[],
+                        cascade_snapshot_ids: &[],
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+        ins("escalation", "moderation_escalation_triggered").await;
+        ins("manual", "role.grant").await;
+        ins("manual", "moderation_auto_label_rule_created").await; // rule-lifecycle
+
+        let query = |source: Option<&str>, rule_management: Option<bool>| {
+            let ctx = ctx.clone();
+            let source = source.map(String::from);
+            async move {
+                get_audit_trail(
+                    State(ctx),
+                    moderator_auth(),
+                    axum::extract::Query(GetAuditTrailParams {
+                        actor_did: None,
+                        action: None,
+                        subject_did: None,
+                        subject_uri: None,
+                        subject_cid: None,
+                        after_created: None,
+                        before_created: None,
+                        source,
+                        rule_management,
+                        hook_management: None,
+                        federation_management: None,
+                        pagination: PaginationParams::default(),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0
+                .items
+            }
+        };
+        // source='escalation' → only the escalation entry.
+        let esc = query(Some("escalation"), None).await;
+        assert_eq!(esc.len(), 1);
+        assert_eq!(esc[0].action, "moderation_escalation_triggered");
+        // rule-management → only the rule-lifecycle entry (NOT the other manuals).
+        let rm = query(None, Some(true)).await;
+        assert_eq!(rm.len(), 1);
+        assert_eq!(rm[0].action, "moderation_auto_label_rule_created");
+        // source='manual' → both manual entries (incl. the rule-lifecycle one).
+        assert_eq!(query(Some("manual"), None).await.len(), 2);
+    }
+
+    // Federation Pattern-1 Phase E (#355 / §5.3) — federation-management filter:
+    // the whole federation.* namespace via the prefix LIKE.
+    #[tokio::test]
+    async fn get_audit_trail_federation_management_filter() {
+        let ctx = create_test_context().await;
+        let ins = |source: &'static str, action: &'static str| {
+            let db = ctx.account_db.clone();
+            let backend = ctx.config.database.backend;
+            async move {
+                crate::admin::audit_chain::insert_chain_entry_pool(
+                    &db,
+                    backend,
+                    crate::admin::audit_chain::AppendEntryParams {
+                        source,
+                        payload: None,
+                        actor_did: "did:plc:m1",
+                        action,
+                        subject: Some(&repo_subject("did:plc:s1")),
+                        rationale: "r",
+                        snapshot_id: None,
+                        event_id: None,
+                        cascade_subjects: &[],
+                        cascade_snapshot_ids: &[],
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+        // Three federation.* entries (peer / relay / discovery) + one non-federation.
+        ins("manual", "federation.peer_added").await;
+        ins("manual", "federation.relay_switched").await;
+        ins("manual", "federation.discovery_mode_changed").await;
+        ins("manual", "role.grant").await;
+
+        let resp = get_audit_trail(
+            State(ctx.clone()),
+            moderator_auth(),
+            axum::extract::Query(GetAuditTrailParams {
+                actor_did: None,
+                action: None,
+                subject_did: None,
+                subject_uri: None,
+                subject_cid: None,
+                after_created: None,
+                before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: Some(true),
+                pagination: PaginationParams::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        // Exactly the three federation.* entries; the role.grant is excluded.
+        assert_eq!(resp.items.len(), 3);
+        assert!(resp.items.iter().all(|e| e.action.starts_with("federation.")));
+    }
+
     #[tokio::test]
     async fn get_audit_trail_filters_by_actor_did() {
         let ctx = create_test_context().await;
@@ -5689,6 +9124,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&repo_subject("did:plc:s1")),
@@ -5703,6 +9140,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m2",
                 action: "RestoreAccount",
                 subject: Some(&repo_subject("did:plc:s1")),
@@ -5721,6 +9160,10 @@ mod tests {
                 action: None, subject_did: None, subject_uri: None,
                 subject_cid: None,
                 after_created: None, before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -5748,6 +9191,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&Subject::Blob {
@@ -5768,6 +9213,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&Subject::Blob {
@@ -5797,6 +9244,10 @@ mod tests {
                 subject_cid: Some(target_cid.to_string()),
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -5818,6 +9269,10 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -5846,6 +9301,8 @@ mod tests {
                 &ctx.account_db,
                 ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: actor,
                     action: "TakedownAccount",
                     subject: Some(&Subject::Blob {
@@ -5876,6 +9333,10 @@ mod tests {
                 subject_cid: Some(cid_a.to_string()),
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -5929,6 +9390,10 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6012,6 +9477,8 @@ mod tests {
                 &ctx.account_db,
                 ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
                     subject: Some(&repo_subject("did:plc:victim")),
@@ -6036,6 +9503,10 @@ mod tests {
             subject_cid: None,
             after_created: None,
             before_created: None,
+            source: None,
+            rule_management: None,
+            hook_management: None,
+            federation_management: None,
             pagination: PaginationParams { limit, cursor },
         }
     }
@@ -6109,6 +9580,8 @@ mod tests {
                         &ctx.account_db,
                         ctx.config.database.backend,
                         crate::admin::audit_chain::AppendEntryParams {
+                            source: "manual",
+                            payload: None,
                             actor_did: actor,
                             action,
                             subject: Some(&repo_subject(subj)),
@@ -6137,6 +9610,10 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6159,16 +9636,22 @@ mod tests {
     async fn get_audit_trail_time_range_window_filters_strictly() {
         let ctx = create_test_context().await;
         seed_actor(&ctx, "did:plc:victim", "victim.test").await;
-        // Append 5 entries; record their actual stored timestamps.
-        // insert_chain_entry_pool uses Utc::now() so entries land at the
-        // wall-clock instant of insertion. Stagger by sleeps to make
-        // the timestamps distinguishable at sub-millisecond resolution.
-        let mut timestamps: Vec<String> = Vec::new();
+        // Append 5 entries, then stamp each with a deterministic, well-
+        // separated created_at. insert_chain_entry_pool uses Utc::now()
+        // internally, and under a coarse OS clock (e.g. WSL2 ~15ms) plus
+        // parallel-test load the rapid inserts can collide same-millisecond —
+        // making the strict [t1, t3] window boundary ambiguous (#258). Stamping
+        // fixed RFC3339 values one hour apart (the same form Utc::now()
+        // .to_rfc3339() produces; created_at is a TEXT column the handler
+        // compares with `created_at >= ?` / `<= ?`) makes the window
+        // timing-independent.
         for i in 0..5 {
             crate::admin::audit_chain::insert_chain_entry_pool(
                 &ctx.account_db,
                 ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
                     subject: Some(&repo_subject("did:plc:victim")),
@@ -6181,15 +9664,17 @@ mod tests {
             )
             .await
             .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            // Read the just-inserted row's timestamp.
-            use sqlx::Row as _;
-            let r = sqlx::query("SELECT created_at FROM audit_chain_entry WHERE sequence = $1")
+        }
+        let timestamps: Vec<String> = (0..5)
+            .map(|i| format!("2020-01-01T0{}:00:00+00:00", i))
+            .collect();
+        for (i, ts) in timestamps.iter().enumerate() {
+            sqlx::query("UPDATE audit_chain_entry SET created_at = $1 WHERE sequence = $2")
+                .bind(ts)
                 .bind((i + 1) as i64)
-                .fetch_one(&ctx.account_db)
+                .execute(&ctx.account_db)
                 .await
                 .unwrap();
-            timestamps.push(r.try_get("created_at").unwrap());
         }
         // Window = [timestamp[1], timestamp[3]] (inclusive both ends
         // per the handler's `>=` / `<=` semantics). Should return
@@ -6205,6 +9690,10 @@ mod tests {
                 subject_cid: None,
                 after_created: Some(timestamps[1].clone()),
                 before_created: Some(timestamps[3].clone()),
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6398,6 +9887,8 @@ mod tests {
                 &ctx.account_db,
                 ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
                     subject: Some(&repo_subject("did:plc:s1")),
@@ -6422,6 +9913,10 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6444,6 +9939,8 @@ mod tests {
                 &ctx.account_db,
                 ctx.config.database.backend,
                 crate::admin::audit_chain::AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:moderator",
                     action: "TakedownAccount",
                     subject: Some(&repo_subject("did:plc:s1")),
@@ -6481,6 +9978,10 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6809,6 +10310,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             crate::admin::audit_chain::AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:moderator",
                 action: "TakedownAccount",
                 subject: Some(&repo_subject("did:plc:parity")),
@@ -6834,6 +10337,10 @@ mod tests {
                 subject_cid: None,
                 after_created: None,
                 before_created: None,
+                source: None,
+                rule_management: None,
+                hook_management: None,
+                federation_management: None,
                 pagination: PaginationParams::default(),
             }),
         )
@@ -6954,6 +10461,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn export_forensic_bundles_blobs_and_records_repo_status() {
+        // #339 — include_repo + include_blobs now ship content. An Admin (not
+        // SuperAdmin — repo/blobs are the §8.7 "basic" export) gets the
+        // account's blobs as blobs/<cid>.bin, and the manifest records the
+        // repo/blob status (replacing the old deferredContents note).
+        let ctx = create_test_context().await;
+        seed_actor(&ctx, "did:plc:exported", "exported.test").await;
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES ($1, $2, $3, NULL, FALSE)",
+        )
+        .bind("did:plc:exported")
+        .bind("exp@example.com")
+        .bind("$argon2id$dummy")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        // One blob owned by the account.
+        ctx.blob_store
+            .upload(
+                b"\x89PNG\r\n\x1a\nforensic-fake-image".to_vec(),
+                Some("image/png"),
+                "did:plc:exported",
+            )
+            .await
+            .unwrap();
+
+        let resp = export_account_forensic(
+            State(ctx.clone()),
+            admin_auth(),
+            Json(ExportAccountForensicInput {
+                did: "did:plc:exported".to_string(),
+                rationale: "investigation".to_string(),
+                include_repo: true,
+                include_blobs: true,
+                include_moderation_history: false,
+                include_account_metadata: false,
+                include_audit_chain: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        let mut archive = tar::Archive::new(&body[..]);
+        let mut blob_entries = 0;
+        let mut has_repo_car = false;
+        let mut manifest_json: Option<serde_json::Value> = None;
+        for entry in archive.entries().expect("archive iterates") {
+            let mut entry = entry.expect("entry readable");
+            let name = entry.path().expect("path").to_string_lossy().to_string();
+            if name.starts_with("blobs/") && name.ends_with(".bin") {
+                blob_entries += 1;
+            }
+            if name == "repo.car" {
+                has_repo_car = true;
+            }
+            if name == "manifest.json" {
+                let mut buf = Vec::new();
+                use std::io::Read as _;
+                entry.read_to_end(&mut buf).expect("manifest readable");
+                manifest_json = Some(serde_json::from_slice(&buf).expect("manifest parses"));
+            }
+        }
+        assert_eq!(blob_entries, 1, "the account's one blob is bundled as blobs/<cid>.bin");
+        assert!(!has_repo_car, "the seeded actor has no repo, so no repo.car is added");
+
+        let m = manifest_json.expect("tar contains manifest.json");
+        assert!(m.get("deferredContents").is_none(), "the v0.2 deferred note is gone");
+        assert_eq!(m["blobs"]["included"], 1, "manifest records one blob included");
+        assert_eq!(m["repo"]["included"], false, "no repo → recorded as not included");
+        assert!(m["repo"]["reason"].is_string(), "repo status carries a reason when absent");
+    }
+
     // ---------- Phase 3.10 — runtime settings (§8.16) ----------
 
     fn super_admin_auth() -> AdminAuthContext {
@@ -7069,7 +10654,6 @@ mod tests {
                 firehose_enabled: false,
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
-                auto_stream_events: false,
                 peer_pds: vec![],
             },
             validation_mode: PathBuf::from("required")
@@ -7398,6 +10982,508 @@ mod tests {
         assert_eq!(audit_count, 1);
     }
 
+    // ---- key-rotation arc B2 (#373 / §4.6) operator-supplied-keys gate ----
+
+    #[test]
+    fn key_rotation_gate_registered_and_defaults_false() {
+        assert!(
+            KNOWN_RUNTIME_KEYS.contains(&KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY),
+            "the gate key must be in the known-keys registry so setRuntimeSetting accepts it"
+        );
+        assert_eq!(
+            default_for_key(KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY),
+            serde_json::Value::Bool(false),
+            "operator-supplied keys must default OFF (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn key_rotation_gate_validates_as_strict_bool() {
+        let k = KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY;
+        assert!(validate_runtime_value(k, &serde_json::json!(true)));
+        assert!(validate_runtime_value(k, &serde_json::json!(false)));
+        // Non-boolean shapes are rejected so the gate read is unambiguous.
+        assert!(!validate_runtime_value(k, &serde_json::json!("true")));
+        assert!(!validate_runtime_value(k, &serde_json::json!(1)));
+        assert!(!validate_runtime_value(k, &serde_json::json!(null)));
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_key_rotation_gate_accepts_bool() {
+        let ctx = create_test_context().await;
+        let resp = set_runtime_setting(
+            State(ctx.clone()),
+            super_admin_auth(),
+            Json(SetRuntimeSettingInput {
+                key: KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY.to_string(),
+                value: serde_json::Value::Bool(true),
+                rationale: "enable operator-supplied keys for the HSM rotation path".to_string(),
+            }),
+        )
+        .await
+        .expect("a bool value is accepted")
+        .0;
+        assert_eq!(resp.previous_value, serde_json::Value::Bool(false));
+        assert_eq!(resp.new_value, serde_json::Value::Bool(true));
+        // The flip is audit-chained for free via write_runtime_setting_audited.
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1 AND rationale LIKE $2",
+        )
+        .bind("SetRuntimeSetting")
+        .bind("key_rotation.operator_supplied_keys_enabled%")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 1, "flipping the gate must land a SetRuntimeSetting audit entry");
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_key_rotation_gate_rejects_non_bool() {
+        let ctx = create_test_context().await;
+        // A string "true" must be rejected at the boundary, not coerced.
+        let err = set_runtime_setting(
+            State(ctx),
+            super_admin_auth(),
+            Json(SetRuntimeSettingInput {
+                key: KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY.to_string(),
+                value: serde_json::Value::String("true".to_string()),
+                rationale: "trying to set a string".to_string(),
+            }),
+        )
+        .await
+        .expect_err("non-boolean value must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    // ---- uploadBrandingAsset / serve_branding_asset (#329) ----
+
+    fn png_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::CONTENT_TYPE, "image/png".parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn upload_branding_params_deserialize_camelcase() {
+        // Wire form is camelCase (`assetType`) per atproto convention + what the
+        // admin client sends; pins the serde rename (the bug was its absence —
+        // the query failed to deserialize `assetType`).
+        let p: UploadBrandingParams =
+            serde_json::from_value(serde_json::json!({ "assetType": "banner" })).unwrap();
+        assert_eq!(p.asset_type, "banner");
+        assert!(p.rationale.is_none());
+        // snake_case is no longer the wire name.
+        assert!(serde_json::from_value::<UploadBrandingParams>(
+            serde_json::json!({ "asset_type": "banner" })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn branding_text_and_color_validation() {
+        use serde_json::json;
+        // Title text: <= 64 chars (empty ok), longer rejected.
+        assert!(validate_runtime_value(BRANDING_LOGIN_TITLE_TEXT_KEY, &json!("")));
+        assert!(validate_runtime_value(BRANDING_LOGIN_TITLE_TEXT_KEY, &json!("Acme PDS")));
+        assert!(!validate_runtime_value(BRANDING_LOGIN_TITLE_TEXT_KEY, &json!("x".repeat(65))));
+        // Subtitle text: <= 128 chars.
+        assert!(validate_runtime_value(BRANDING_LOGIN_SUBTITLE_TEXT_KEY, &json!("x".repeat(128))));
+        assert!(!validate_runtime_value(BRANDING_LOGIN_SUBTITLE_TEXT_KEY, &json!("x".repeat(129))));
+        // Colors: #RRGGBB (case-insensitive) or empty; reject 3-digit / no-# / non-hex.
+        assert!(validate_runtime_value(BRANDING_LOGIN_TITLE_COLOR_KEY, &json!("#aabbcc")));
+        assert!(validate_runtime_value(BRANDING_LOGIN_TITLE_COLOR_KEY, &json!("#AABBCC")));
+        assert!(validate_runtime_value(BRANDING_LOGIN_SUBTITLE_COLOR_KEY, &json!("")));
+        assert!(!validate_runtime_value(BRANDING_LOGIN_TITLE_COLOR_KEY, &json!("#abc")));
+        assert!(!validate_runtime_value(BRANDING_LOGIN_TITLE_COLOR_KEY, &json!("aabbcc")));
+        assert!(!validate_runtime_value(BRANDING_LOGIN_SUBTITLE_COLOR_KEY, &json!("#gggggg")));
+    }
+
+    #[test]
+    fn kryphocron_policy_settings_registered_with_defaults() {
+        // #334 — the five Kryphocron Policy keys must be in the allowlist (so
+        // setRuntimeSetting stops 400ing) and carry the UI's assumed defaults.
+        for key in [
+            KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY,
+            KRYPHOCRON_ACCESS_DELAY_DAYS_KEY,
+            KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY,
+            KRYPHOCRON_PROCESS_SHAPE_KEY,
+            KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY,
+        ] {
+            assert!(KNOWN_RUNTIME_KEYS.contains(&key), "{key} must be allowlisted");
+        }
+        use serde_json::json;
+        assert_eq!(default_for_key(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY), json!("immediate"));
+        assert_eq!(default_for_key(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY), json!(7));
+        assert_eq!(default_for_key(KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY), json!("nobody"));
+        assert_eq!(default_for_key(KRYPHOCRON_PROCESS_SHAPE_KEY), json!("single-process"));
+        assert_eq!(
+            default_for_key(KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY),
+            json!("weekly-to-daily")
+        );
+    }
+
+    #[test]
+    fn federation_appview_url_registered_and_validated() {
+        // v0.9 Federation runtime-mutability arc Phase A (#386): appview_url must
+        // be allowlisted (so setRuntimeSetting stops 400ing), default to Null
+        // (unset → consumer falls back to env-config), and validate as an http(s) URL.
+        use serde_json::json;
+        assert!(
+            KNOWN_RUNTIME_KEYS.contains(&FEDERATION_APPVIEW_URL_KEY),
+            "appview_url must be allowlisted"
+        );
+        assert_eq!(default_for_key(FEDERATION_APPVIEW_URL_KEY), json!(null));
+        // Accept well-formed http(s) URLs.
+        assert!(validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("https://api.bsky.app")));
+        assert!(validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("http://localhost:2584")));
+        // Reject empty, non-URL, wrong-scheme, and non-string shapes.
+        assert!(!validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("")));
+        assert!(!validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("   ")));
+        assert!(!validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("not a url")));
+        assert!(!validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!("ftp://example.com")));
+        assert!(!validate_runtime_value(FEDERATION_APPVIEW_URL_KEY, &json!(42)));
+    }
+
+    #[test]
+    fn federation_firehose_enabled_registered_and_validated() {
+        // v0.9 Federation runtime-mutability arc Phase A (#387): firehose_enabled
+        // must be allowlisted, default to false (compiled default), and validate
+        // as a strict bool.
+        use serde_json::json;
+        assert!(KNOWN_RUNTIME_KEYS.contains(&FEDERATION_FIREHOSE_ENABLED_KEY));
+        assert_eq!(default_for_key(FEDERATION_FIREHOSE_ENABLED_KEY), json!(false));
+        assert!(validate_runtime_value(FEDERATION_FIREHOSE_ENABLED_KEY, &json!(true)));
+        assert!(validate_runtime_value(FEDERATION_FIREHOSE_ENABLED_KEY, &json!(false)));
+        // Reject non-bool shapes (string "true", number, null).
+        assert!(!validate_runtime_value(FEDERATION_FIREHOSE_ENABLED_KEY, &json!("true")));
+        assert!(!validate_runtime_value(FEDERATION_FIREHOSE_ENABLED_KEY, &json!(1)));
+        assert!(!validate_runtime_value(FEDERATION_FIREHOSE_ENABLED_KEY, &json!(null)));
+    }
+
+    #[test]
+    fn federation_crawl_enabled_registered_and_validated() {
+        // v0.9 Federation runtime-mutability arc Phase A (#388): crawl_enabled
+        // must be allowlisted, default to false, and validate as a strict bool.
+        use serde_json::json;
+        assert!(KNOWN_RUNTIME_KEYS.contains(&FEDERATION_CRAWL_ENABLED_KEY));
+        assert_eq!(default_for_key(FEDERATION_CRAWL_ENABLED_KEY), json!(false));
+        assert!(validate_runtime_value(FEDERATION_CRAWL_ENABLED_KEY, &json!(true)));
+        assert!(validate_runtime_value(FEDERATION_CRAWL_ENABLED_KEY, &json!(false)));
+        assert!(!validate_runtime_value(FEDERATION_CRAWL_ENABLED_KEY, &json!("true")));
+        assert!(!validate_runtime_value(FEDERATION_CRAWL_ENABLED_KEY, &json!(0)));
+    }
+
+    #[test]
+    fn kryphocron_policy_value_validation() {
+        use serde_json::json;
+        // new-account-access: immediate/delayed only; earned (backend-prereq) rejected.
+        assert!(validate_runtime_value(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY, &json!("immediate")));
+        assert!(validate_runtime_value(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY, &json!("delayed")));
+        assert!(!validate_runtime_value(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY, &json!("earned")));
+        assert!(!validate_runtime_value(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY, &json!("open")));
+        // access-delay-days: positive integer, bounded; reject 0, negatives, non-ints.
+        assert!(validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(7)));
+        assert!(validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(1)));
+        assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(0)));
+        assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(-3)));
+        assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!("7")));
+        assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(40000)));
+        // default-audience-mode: the five kryphocron modes; reject anything else.
+        for m in ["list", "everyone", "followers", "following", "nobody"] {
+            assert!(validate_runtime_value(KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY, &json!(m)));
+        }
+        assert!(!validate_runtime_value(KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY, &json!("public")));
+        // process-shape: the two declarations.
+        assert!(validate_runtime_value(KRYPHOCRON_PROCESS_SHAPE_KEY, &json!("single-process")));
+        assert!(validate_runtime_value(KRYPHOCRON_PROCESS_SHAPE_KEY, &json!("multi-process")));
+        assert!(!validate_runtime_value(KRYPHOCRON_PROCESS_SHAPE_KEY, &json!("clustered")));
+        // account-cadence-range: the three range options.
+        for r in ["weekly-to-daily", "weekly-to-hourly", "no-override"] {
+            assert!(validate_runtime_value(KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY, &json!(r)));
+        }
+        assert!(!validate_runtime_value(KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY, &json!("hourly-to-daily")));
+    }
+
+    #[tokio::test]
+    async fn serve_login_branding_includes_text_color_fields() {
+        let ctx = create_test_context().await;
+        let body = serve_login_branding(State(ctx.clone())).await.0;
+        for f in ["titleText", "subtitleText", "titleColor", "subtitleColor"] {
+            assert_eq!(body[f], "", "{f} defaults empty");
+        }
+        // Set the title color → it surfaces in the payload.
+        write_runtime_setting_audited(
+            &ctx,
+            BRANDING_LOGIN_TITLE_COLOR_KEY,
+            &serde_json::Value::String("#ffcc00".to_string()),
+            "did:plc:test",
+            "set",
+        )
+        .await
+        .unwrap();
+        let body = serve_login_branding(State(ctx)).await.0;
+        assert_eq!(body["titleColor"], "#ffcc00");
+    }
+
+    // ---- per-account kryphocron overrides (#316) ----
+
+    // Seed an override row via the tx-aware store fn (the path the audited
+    // handler uses), so the store tests don't depend on the handler/auth.
+    async fn seed_ov(
+        pool: &sqlx::AnyPool,
+        did: &str,
+        rle: Option<bool>,
+        ci: Option<bool>,
+    ) {
+        let mut tx = pool.begin().await.unwrap();
+        crate::kryphocron_override::upsert_override_in_tx(
+            &mut tx, did, rle, ci, "did:plc:op", Some("r"), "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_override_store_roundtrip_and_capability_blocked() {
+        use crate::kryphocron_override as ov;
+        let ctx = create_test_context().await;
+        let pool = &ctx.account_db;
+        // Set rate-limit-exempt + capability blocked.
+        seed_ov(pool, "did:plc:x", Some(true), Some(false)).await;
+        let got = ov::get_override(pool, "did:plc:x").await.unwrap().unwrap();
+        assert_eq!(got.rate_limit_exempt, Some(true));
+        assert_eq!(got.capability_issuance, Some(false));
+        assert!(ov::capability_blocked(pool, "did:plc:x").await);
+        // Full-state replace clears both back to unset → not blocked.
+        seed_ov(pool, "did:plc:x", None, None).await;
+        let got = ov::get_override(pool, "did:plc:x").await.unwrap().unwrap();
+        assert_eq!(got.rate_limit_exempt, None);
+        assert_eq!(got.capability_issuance, None);
+        assert!(!ov::capability_blocked(pool, "did:plc:x").await);
+        // No row → not blocked, no override.
+        assert!(!ov::capability_blocked(pool, "did:plc:none").await);
+        assert!(ov::get_override(pool, "did:plc:none").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_account_overrides_gating_and_shapes() {
+        use crate::api::aurora_kryphocron_ops::{get_account_overrides, AccountDidQuery};
+        let q = || axum::extract::Query(AccountDidQuery { did: "did:plc:x".to_string() });
+        let ctx = create_test_context().await;
+        // Admin (not SuperAdmin) → 403.
+        let err = get_account_overrides(State(ctx.clone()), admin_auth(), q()).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        // SuperAdmin, no row → empty overrides object.
+        let body = get_account_overrides(State(ctx.clone()), super_admin_auth(), q()).await.unwrap().0;
+        assert!(body["overrides"].as_object().unwrap().is_empty());
+        // After a set → values surface.
+        seed_ov(&ctx.account_db, "did:plc:x", Some(true), Some(false)).await;
+        let body = get_account_overrides(State(ctx), super_admin_auth(), q()).await.unwrap().0;
+        assert_eq!(body["overrides"]["rateLimitExempt"], true);
+        assert_eq!(body["overrides"]["capabilityIssuance"], false);
+    }
+
+    #[tokio::test]
+    async fn set_account_override_gating_rationale_and_audit() {
+        use crate::api::aurora_kryphocron_ops::{set_account_override, SetAccountOverrideInput};
+        let ctx = create_test_context().await;
+        let mk = |rationale: &str| SetAccountOverrideInput {
+            did: "did:plc:x".to_string(),
+            rate_limit_exempt: Some(true),
+            capability_issuance: Some(false),
+            rationale: rationale.to_string(),
+        };
+        // Admin → 403.
+        let err = set_account_override(State(ctx.clone()), admin_auth(), Json(mk("ok"))).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        // SuperAdmin, empty rationale → 400.
+        let err = set_account_override(State(ctx.clone()), super_admin_auth(), Json(mk(""))).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // SuperAdmin, valid → row written + audit entry.
+        let out = set_account_override(State(ctx.clone()), super_admin_auth(), Json(mk("blocking a spammer")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(out["did"], "did:plc:x");
+        assert!(out["auditEntryId"].as_str().is_some_and(|s| !s.is_empty()));
+        let got = crate::kryphocron_override::get_override(&ctx.account_db, "did:plc:x").await.unwrap().unwrap();
+        assert_eq!(got.capability_issuance, Some(false));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1")
+            .bind("kryphocron_account_override_changed")
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn upload_branding_writes_file_setting_and_audit() {
+        let ctx = create_test_context().await;
+        let bytes = axum::body::Bytes::from(vec![7u8; 256]);
+        let resp = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            png_headers(),
+            axum::extract::Query(UploadBrandingParams {
+                asset_type: "logo".to_string(),
+                rationale: Some("new wordmark".to_string()),
+            }),
+            bytes,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp["url"], "/branding/logo.png");
+        assert_eq!(resp["runtimeSetting"], BRANDING_LOGIN_LOGO_KEY);
+        assert!(resp["auditEntryId"].as_str().is_some_and(|s| !s.is_empty()));
+
+        // File on disk.
+        let path = ctx.config.storage.data_directory.join("branding").join("logo.png");
+        let on_disk = tokio::fs::read(&path).await.expect("logo written");
+        assert_eq!(on_disk, vec![7u8; 256]);
+
+        // Runtime setting repointed.
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM runtime_settings WHERE key = $1")
+                .bind(BRANDING_LOGIN_LOGO_KEY)
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(stored, "\"/branding/logo.png\"");
+
+        // Audit-chain entry landed.
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1",
+        )
+        .bind("SetRuntimeSetting")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 1);
+    }
+
+    #[tokio::test]
+    async fn upload_branding_overwrites_other_extension() {
+        let ctx = create_test_context().await;
+        // First a PNG logo, then an SVG logo — only logo.svg should remain.
+        let _ = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            png_headers(),
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            axum::body::Bytes::from(vec![1u8; 16]),
+        )
+        .await
+        .unwrap();
+        let mut svg_headers = axum::http::HeaderMap::new();
+        svg_headers.insert(axum::http::header::CONTENT_TYPE, "image/svg+xml".parse().unwrap());
+        let resp = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            svg_headers,
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            axum::body::Bytes::from(vec![2u8; 16]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp["url"], "/branding/logo.svg");
+        let dir = ctx.config.storage.data_directory.join("branding");
+        assert!(tokio::fs::metadata(dir.join("logo.svg")).await.is_ok());
+        assert!(tokio::fs::metadata(dir.join("logo.png")).await.is_err(), "old png removed");
+    }
+
+    #[tokio::test]
+    async fn upload_branding_rejects_oversized() {
+        let ctx = create_test_context().await;
+        // 1MB + 1 byte exceeds the logo cap.
+        let bytes = axum::body::Bytes::from(vec![0u8; 1_048_577]);
+        let err = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            png_headers(),
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            bytes,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn upload_branding_rejects_unknown_format() {
+        let ctx = create_test_context().await;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+        let err = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            headers,
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            axum::body::Bytes::from(vec![0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn upload_branding_requires_superadmin() {
+        let ctx = create_test_context().await;
+        let err = upload_branding_asset(
+            State(ctx.clone()),
+            admin_auth(),
+            png_headers(),
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            axum::body::Bytes::from(vec![0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn serve_branding_asset_serves_uploaded_and_404s_missing() {
+        let ctx = create_test_context().await;
+        // Missing → 404.
+        let resp = serve_branding_asset(
+            State(ctx.clone()),
+            axum::extract::Path("logo.png".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Path traversal → 400.
+        let resp = serve_branding_asset(
+            State(ctx.clone()),
+            axum::extract::Path("../secret".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // After upload → 200 + the exact bytes + image content-type.
+        let _ = upload_branding_asset(
+            State(ctx.clone()),
+            super_admin_auth(),
+            png_headers(),
+            axum::extract::Query(UploadBrandingParams { asset_type: "logo".into(), rationale: None }),
+            axum::body::Bytes::from(vec![9u8; 64]),
+        )
+        .await
+        .unwrap();
+        let resp = serve_branding_asset(
+            State(ctx.clone()),
+            axum::extract::Path("logo.png".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "image/png",
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], &vec![9u8; 64][..]);
+    }
+
     #[tokio::test]
     async fn set_runtime_setting_rejects_invalid_mode_value() {
         let ctx = create_test_context().await;
@@ -7413,6 +11499,67 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_runtime_setting_validates_phase_b_reviewer_keys() {
+        let ctx = create_test_context().await;
+        let try_set = |key: &str, value: serde_json::Value| {
+            let ctx = ctx.clone();
+            let key = key.to_string();
+            async move {
+                set_runtime_setting(
+                    State(ctx),
+                    super_admin_auth(),
+                    Json(SetRuntimeSettingInput {
+                        key,
+                        value,
+                        rationale: "t".to_string(),
+                    }),
+                )
+                .await
+            }
+        };
+        // Invalid mode enum → 400.
+        assert_eq!(
+            try_set(MODERATION_REVIEWER_MODE_KEY, serde_json::json!("bogus"))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Category map key outside ReportReason → 400.
+        assert_eq!(
+            try_set(
+                MODERATION_REVIEWER_CATEGORY_MAP_KEY,
+                serde_json::json!({"harassment": ["did:plc:a"]})
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Category map value not an array of strings → 400.
+        assert_eq!(
+            try_set(
+                MODERATION_REVIEWER_CATEGORY_MAP_KEY,
+                serde_json::json!({"spam": "did:plc:a"})
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Valid mode + valid map → accepted.
+        assert!(try_set(MODERATION_REVIEWER_MODE_KEY, serde_json::json!("round-robin"))
+            .await
+            .is_ok());
+        assert!(try_set(
+            MODERATION_REVIEWER_CATEGORY_MAP_KEY,
+            serde_json::json!({"spam": ["did:plc:a", "did:plc:b"]})
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]

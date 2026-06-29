@@ -17,8 +17,9 @@
     else document.addEventListener('DOMContentLoaded', fn);
   }
 
-  // localStorage key migration per §12.8: future v0.3 will move
-  // 'adminToken' → 'aurora-admin-token'. v0.2 preserves the old key.
+  // The admin token lives in localStorage under 'aurora-admin-token'
+  // (renamed from the legacy 'adminToken' per §8.1.1; session.js runs the
+  // one-time migration at module load).
 
   async function bootstrap() {
     // Auth check first — bare fetch since AuroraSession is a thin
@@ -47,14 +48,47 @@
       return;
     }
 
-    mountSidebar();
-    mountSidebarFooter();
+    // Load the deployment moderation-mode before the first sidebar paint —
+    // sidebar domain visibility (§5.7.4) depends on it. If the fetch fails
+    // the cached default ('full') stands.
+    await loadModerationMode();
+
+    // Load the theme registry (installed themes + deployment-default) into the
+    // AuroraSettings cache so the theme picker is populated and a 'follow
+    // default' preference resolves correctly. Non-blocking for layout.
+    loadThemeRegistry();
+
+    renderSidebar();
+
+    // §5.8.4 — rebuild the sidebar when moderation-mode changes (e.g. an
+    // operator switches it on Configuration → UI & modes, which calls
+    // setModerationModeCache → AuroraSettings.notify). Only modMode
+    // transitions matter here; theme/language changes are ignored.
+    if (global.AuroraSettings) {
+      let lastMode = global.AuroraSettings.getModerationMode();
+      global.AuroraSettings.subscribe((s) => {
+        if (s && s.modMode !== lastMode) {
+          lastMode = s.modMode;
+          renderSidebar();
+        }
+      });
+    }
 
     // Wire router to the main mount point.
     const main = document.getElementById('content');
     if (global.AuroraRouter && main) {
       global.AuroraRouter.setMain(main);
       global.AuroraRouter.start();
+    }
+
+    // v0.9 Federation runtime-mutability arc §4.4 (#403) — mount the
+    // pending-restart banner in the shell so it shows on every admin page (a
+    // queued change activates on the next restart for any reason). SuperAdmin-
+    // gated server-side (403 → empty); refreshed after restart-required
+    // saves/reverts and re-checked on full page reload after a restart.
+    if (global.AuroraQueuedChangeBanner) {
+      const bannerRoot = document.getElementById('restart-banner-root');
+      if (bannerRoot) global.AuroraQueuedChangeBanner.load(bannerRoot);
     }
 
     // Command palette global keybinding.
@@ -79,32 +113,66 @@
   function mountSidebar() {
     const aside = document.getElementById('sidebar');
     if (!aside) return;
-    const sidebar = global.AuroraRoutes ? global.AuroraRoutes.sidebar : [];
+    const routes = global.AuroraRoutes;
+    const sidebar = routes ? routes.sidebar : [];
     const session = global.AuroraSession;
+    const role = session ? session.role() : 'moderator';
+    const mode = global.AuroraSettings ? global.AuroraSettings.getModerationMode() : 'full';
+
+    function domainVisible(domain) {
+      return (routes && routes.domainVisible) ? routes.domainVisible(domain, role, mode) : true;
+    }
+    function itemAllowed(item) {
+      return !(item.requires && session && !session.hasRole(item.requires));
+    }
+
     let html = '';
+    // §11.11.3 / §4.6 — the wordmark carries .heading-aurora so a theme can
+    // paint it as a gradient logo (aurora-classic does); the sober themes
+    // leave it plain. Dormant until a theme styling it is served (B-themes-page).
     html += '<div class="logo">' +
-            '  <h1>Aurora Locus</h1>' +
-            '  <p class="subtitle">Admin Panel</p>' +
+            '  <h1 class="heading-aurora">Aurora Locus</h1>' +
+            '  <p class="subtitle">Aurora-Locus admin</p>' +
             '</div>';
     html += '<nav class="nav-menu" aria-label="Primary navigation">';
     for (const node of sidebar) {
       if (node.heading) {
-        // Skip whole sections the operator can't see at all.
-        if (node.requires && session && !session.hasRole(node.requires)) continue;
+        // §5.7.4 — skip a domain the operator can't see in this role/mode.
+        const domain = node.heading.toLowerCase();
+        if (!domainVisible(domain)) continue;
+        // Per-item role gate realises the "limited" cells of the matrix.
+        const visibleItems = (node.items || []).filter(itemAllowed);
+        // §5.8.3 — render the group label only when it has ≥1 visible item.
+        if (visibleItems.length === 0) continue;
         html += '<div class="nav-section">';
-        html += '<span class="nav-section-label">' + escHtml(node.heading) + '</span>';
-        for (const item of node.items || []) {
-          if (item.requires && session && !session.hasRole(item.requires)) continue;
-          html += navItem(item);
-        }
+        html += navSectionLabel(node);
+        for (const item of visibleItems) html += navItem(item);
         html += '</div>';
       } else if (node.route) {
+        const domain = (routes && routes.domainForPattern) ? routes.domainForPattern(node.route) : 'dashboard';
+        if (!domainVisible(domain) || !itemAllowed(node)) continue;
         html += navItem(node);
       }
     }
     html += '</nav>';
     html += '<div class="sidebar-footer" id="sidebar-footer"></div>';
     aside.innerHTML = html;
+  }
+
+  // A group label. When the node carries a `route` the label is a link
+  // (§5.8.2: clicking the Moderation label or its bell badge goes to the
+  // Queue); the optional badge renders inside it, hidden until a non-zero
+  // count arrives via refreshBadge().
+  function navSectionLabel(node) {
+    const badge = node.badgeId
+      ? '<span class="badge" id="' + node.badgeId + '" style="display:none">0</span>'
+      : '';
+    const label = escHtml(node.heading);
+    if (node.route) {
+      return '<a class="nav-section-label nav-section-link" href="#' + node.route + '" data-route="' + node.route + '">' +
+             label + badge + '</a>';
+    }
+    return '<span class="nav-section-label">' + label + badge + '</span>';
   }
 
   function navItem(item) {
@@ -124,11 +192,15 @@
     const session = global.AuroraSession;
     const handle = (session && session.user() && session.user().handle) || 'Admin';
     const role = (session && session.role()) || 'Operator';
+    const sessionsLabel = global.t ? global.t('sessions.menu') : 'Sessions';
     footer.innerHTML =
       '<div class="admin-info">' +
       '  <p class="admin-name" id="admin-name">' + escHtml(handle) + '</p>' +
       '  <p class="admin-role" id="admin-role">' + escHtml(role) + '</p>' +
       '</div>' +
+      // Operator self-service session management (§8.1.7 / #274) — the
+      // "user menu" entry, beside the operator identity + logout.
+      '<a class="btn-logout" id="sessions-link" href="#configuration/sessions">' + escHtml(sessionsLabel) + '</a>' +
       '<button class="btn-logout" id="sidebar-theme-toggle" type="button"></button>' +
       '<button class="btn-logout" id="logout-btn" type="button">Log out</button>';
     if (global.AuroraThemeToggle) {
@@ -141,21 +213,87 @@
     return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s);
   }
 
+  // Fetch the deployment moderation-mode (and its redirect URL) into the
+  // AuroraSettings cache. Mirrors ConfigUiModes.loadModerationMode; runs
+  // once at boot and is harmless to call again.
+  async function loadModerationMode() {
+    if (!global.AuroraEndpoints || !global.AuroraSettings) return;
+    try {
+      const data = await global.AuroraEndpoints.admin.getRuntimeSetting('moderation-mode');
+      const mode = (data && typeof data.value === 'string') ? data.value : 'full';
+      let redirect;
+      try {
+        const r = await global.AuroraEndpoints.admin.getRuntimeSetting('moderation-mode-redirect-url');
+        redirect = (r && typeof r.value === 'string') ? r.value : '';
+      } catch (e) { /* redirect is optional */ }
+      global.AuroraSettings.setModerationModeCache(mode, redirect);
+    } catch (e) { /* cached default ('full') stands */ }
+  }
+
+  // Fetch the installed-theme list and deployment-default theme into the
+  // AuroraSettings cache. Populates the theme picker and lets a 'follow
+  // default' preference resolve to the deployment-default. Best-effort: on
+  // failure the picker shows only 'Follow deployment default' and the cached
+  // default ('aurora-classic') stands.
+  async function loadThemeRegistry() {
+    if (!global.AuroraEndpoints || !global.AuroraSettings) return;
+    try {
+      const data = await global.AuroraEndpoints.ops.listInstalledThemes();
+      if (data && Array.isArray(data.themes)) {
+        global.AuroraSettings.setInstalledThemesCache(data.themes);
+      }
+    } catch (e) { /* picker falls back to follow-default only */ }
+    try {
+      const d = await global.AuroraEndpoints.admin.getRuntimeSetting('theme.deployment-default');
+      if (d && typeof d.value === 'string' && d.value.trim()) {
+        global.AuroraSettings.setDeploymentDefaultCache(d.value.trim());
+      }
+    } catch (e) { /* cached default ('aurora-classic') stands */ }
+  }
+
+  // Rebuild the whole sidebar (nav + footer) and re-apply the active
+  // highlight and bell badge. Called at boot and on every mode change.
+  function renderSidebar() {
+    mountSidebar();
+    mountSidebarFooter();
+    refreshBadge();
+    markActive((window.location.hash || '').replace(/^#\/?/, ''));
+  }
+
+  // Mark the nav entry (item or group label) matching the current hash. Shares
+  // the router's exact "longest matching route wins" resolution so a child page
+  // lights only its own entry, not a shorter sibling that shares its prefix
+  // (#411), and so a mode-driven re-render without navigation keeps the same
+  // highlight the router would set. Router loads before app.js (index.html), so
+  // the helper is present; absent it, nothing is marked rather than mis-marked.
+  function markActive(hashPath) {
+    const items = document.querySelectorAll('.sidebar [data-route]');
+    const routes = [];
+    items.forEach((el) => routes.push(el.dataset.route));
+    const resolve = global.AuroraRouter && global.AuroraRouter.resolveActiveRoute;
+    const best = resolve ? resolve(hashPath, routes) : null;
+    items.forEach((el) => {
+      el.classList.toggle('active', el.dataset.route === best);
+    });
+  }
+
   // ----- Bell badge polling -----
   let pollHandle = null;
 
   async function refreshBadge() {
     if (!global.AuroraEndpoints) return;
+    // The badge exists only when the Moderation domain is visible
+    // (Moderator+ in full mode), so its absence is the mode/role gate.
+    const badge = document.getElementById('mod-attention-count');
+    if (!badge) return;
     try {
       const stats = await global.AuroraEndpoints.admin.getQueueStats();
       if (!stats) return;
-      const badge = document.getElementById('mod-queue-count');
-      if (badge) {
-        badge.textContent = String(stats.queueAttentionTotal || 0);
-        badge.classList.toggle('badge-attention', (stats.queueAttentionTotal || 0) > 0);
-      }
-      const reports = document.getElementById('reports-count');
-      if (reports) reports.textContent = String(stats.openReports || 0);
+      // §5.8.2 — combined count of open reports + pending appeals.
+      const count = (stats.openReports || 0) + (stats.pendingAppeals || stats.openAppeals || 0);
+      badge.textContent = String(count);
+      badge.classList.toggle('badge-attention', count > 0);
+      badge.style.display = count > 0 ? '' : 'none';
     } catch (e) {
       // network/auth — leave badge unchanged
     }

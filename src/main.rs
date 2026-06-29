@@ -13,6 +13,7 @@ mod auth;
 mod backup;
 mod blob_store;
 mod cache;
+mod cascade;
 mod cli;
 mod config;
 mod context;
@@ -25,15 +26,25 @@ mod identity;
 mod jobs;
 mod kryphocron;
 mod kryphocron_audit;
+mod kryphocron_content;
+mod kryphocron_oracle_activity;
+mod kryphocron_override;
+mod kryphocron_policy;
+mod kryphocron_rewrite;
+mod kryphocron_rotation;
 mod mailer;
 mod metrics;
 mod oauth;
 mod rate_limit;
 mod read_after_write;
+mod rebuild;
+mod repo_scan;
 mod repository;
 mod sequencer;
+mod sequencer_recovery;
 mod server;
 mod service_auth;
+mod themes;
 mod validation;
 
 use clap::Parser;
@@ -91,6 +102,38 @@ async fn main() -> PdsResult<()> {
     // Handle CLI commands
     match cli.command {
         Some(Commands::Serve) | None => {
+            // §5.5.4 Phase E (#349) — startup-trigger lexicon migration (§6.7):
+            // runs after AppContext::new (audit-chain ready) and before serving
+            // so any migrated category-config is visible to the first request.
+            // Best-effort; never blocks boot.
+            api::lexicon_migration::run_lexicon_migration(&ctx).await;
+
+            // v0.9 Federation Pattern-1 Phase B (#352 / design §2.4, Step 1) —
+            // boot-seed federation.policy.peer-allowlist from FederationConfig
+            // when unset, emitting one federation.peer_seeded per peer. Placed
+            // after AppContext::new (audit-chain ready) and before serving (per
+            // §2.4: after audit-chain init, before request-handler acceptance).
+            // Seed-if-absent + idempotent: a prior boot's runtime contents stay
+            // authoritative. discovery-mode / relay-urls / pending-discoveries
+            // stay unset (Phases C/D seed them). Best-effort; never blocks boot.
+            // v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — boot-seed
+            // all four federation.policy.* keys (peer-allowlist, discovery-mode,
+            // pending-discoveries, relay-urls) via independent seed-if-absent
+            // wrappers. relay-urls is gated on federation.enabled. If any seed
+            // fails, emits federation.boot_seed_failed + sets the boot-seed
+            // refusal flag (the 8 mutation XRPCs + the discovery scheduler then
+            // 503/skip). Placed before JobScheduler::start() so the scheduler
+            // reads the post-seed mode + flag.
+            api::federation_peers::run_federation_boot_seed(&ctx).await;
+
+            // v0.9 Federation runtime-mutability arc §3.3 (#391) — process any
+            // pending restart-coordination markers left by a save-and-restart
+            // flow before this boot. Best-effort: a failure logs and boot
+            // continues (markers are coordination, not a boot prerequisite).
+            if let Err(e) = api::pending_restart::process_pending_restart_actions(&ctx).await {
+                tracing::error!(error = %e, "pending-restart-action boot hook failed");
+            }
+
             // Start background jobs
             let scheduler = std::sync::Arc::new(jobs::JobScheduler::new(Arc::clone(&ctx)));
             scheduler.start();
@@ -205,8 +248,27 @@ async fn main() -> PdsResult<()> {
             cli::publish_identity::publish_identity_from_file(&ctx, &file, delay).await?;
         }
 
-        Some(Commands::RotateKeys { dids, concurrency }) => {
-            cli::rotate_keys::rotate_keys(&ctx, dids.clone(), concurrency).await?;
+        Some(Commands::RotateKeys {
+            dids,
+            concurrency,
+            rationale,
+            public_key,
+            private_key_hex,
+        }) => {
+            // clap `requires` guarantees both-or-neither; assemble the
+            // operator-supplied keypair (gated + single-DID enforced in
+            // rotate_keys) only when both halves are present.
+            let operator_keypair = match (public_key, private_key_hex) {
+                (Some(public_did_key), Some(private_key_hex)) => {
+                    Some(crate::account::OperatorSuppliedKeypair {
+                        public_did_key,
+                        private_key_hex,
+                    })
+                }
+                _ => None,
+            };
+            cli::rotate_keys::rotate_keys(&ctx, dids, concurrency, rationale, operator_keypair)
+                .await?;
         }
 
         Some(Commands::RotateKeysFile { file, concurrency }) => {

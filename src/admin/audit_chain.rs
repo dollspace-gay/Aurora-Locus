@@ -209,6 +209,22 @@ pub struct AuditEntry {
     /// documented in `docs/operator/audit-chain-verification.md`
     /// (Arc 3 Step 2).
     pub cascade_snapshot_ids: Vec<Option<String>>,
+
+    /// Provenance discriminator (§5.5.4 / #345): `default_action |
+    /// auto_label_rule | manual | stale_expiration | operator_removal |
+    /// escalation | system_diagnostic`. NOT NULL on the row; surfaced
+    /// here so external verifiers can fold it into the canonical hash
+    /// (it joined the canonical set in the v0.9 format bump). Direct
+    /// copy into the canonical input.
+    pub source: String,
+
+    /// Action-specific scalars as a JSON object (§5.5.4 / #345), or
+    /// `None` when the action carries no payload. Wire form is the parsed
+    /// JSON value; the canonical hash sees its compact serialization —
+    /// the same wire-vs-canonical asymmetry as `cascade_subjects` (the
+    /// serialized string is embedded, escaped, in the canonical object).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Build an [`AuditEntry`] from a fetched `audit_chain_entry` row.
@@ -280,7 +296,38 @@ pub fn audit_entry_from_row(row: &sqlx::any::AnyRow) -> Result<AuditEntry, PdsEr
         .map(|opt| opt.map(|v| v.to_string()))
         .collect();
 
+    // `source` is NOT NULL post-v0.9 migration; legacy reads tolerate a
+    // missing column (pre-migration row in a mixed read path) by treating
+    // it as the 'manual' backfill default. `payload` is the stored JSON
+    // string, fed verbatim to the verifier.
+    let source: String = row
+        .try_get::<String, _>("source")
+        .unwrap_or_else(|_| "manual".to_string());
+    let payload_str: Option<String> = row.try_get("payload").ok().flatten();
+
+    // A row is `verified` if it matches the current v0.9 canonical form OR
+    // the pre-v0.9 legacy form (sealed before the #345 source/payload bump).
+    // Both are honestly-sealed, untampered rows; only matching neither marks
+    // the entry unverified. This keeps the per-row badge from flagging
+    // pre-bump entries as tampered.
     let verified = verify_entry(
+        sequence,
+        &created_at_str,
+        &actor_did,
+        &action,
+        subject_did.as_deref(),
+        subject_uri.as_deref(),
+        subject_cid.as_deref(),
+        &rationale,
+        snapshot_id,
+        event_id,
+        previous_hash.as_deref(),
+        cascade_str.as_deref(),
+        cascade_snapshot_ids_str.as_deref(),
+        &source,
+        payload_str.as_deref(),
+        &current_hash,
+    ) || verify_entry_legacy(
         sequence,
         &created_at_str,
         &actor_did,
@@ -317,6 +364,13 @@ pub fn audit_entry_from_row(row: &sqlx::any::AnyRow) -> Result<AuditEntry, PdsEr
         verified,
         cascade_subjects,
         cascade_snapshot_ids,
+        source,
+        // Wire form is the parsed JSON value; malformed on-disk JSON
+        // (should never happen — the writer serializes a Value) falls
+        // back to None rather than failing the whole row read.
+        payload: payload_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok()),
     })
 }
 
@@ -441,11 +495,25 @@ async fn fetch_account_snapshot(db: &AnyPool, did: &str) -> Result<SnapshotConte
 /// Append a new entry to the chain. Computes the SHA-256 over a
 /// canonical JSON of (sequence, timestamp, actor, action, subject,
 /// rationale, snapshot_id, event_id, previous_hash, cascade_subjects,
-/// cascade_snapshot_ids) — re-hashing later in the same way
-/// reproduces `current_hash`, which is the verification primitive.
+/// cascade_snapshot_ids, source, payload) — re-hashing later in the
+/// same way reproduces `current_hash`, which is the verification
+/// primitive. `source`/`payload` joined the canonical set in the v0.9
+/// format bump (chainlink #345); pre-v0.9 rows hash under the prior
+/// form (the accepted legacy tradeoff documented for cascade_snapshot_ids).
 pub struct AppendEntryParams<'a> {
     pub actor_did: &'a str,
     pub action: &'a str,
+    /// Provenance discriminator (§6.1): `default_action | auto_label_rule
+    /// | manual | stale_expiration | operator_removal | escalation |
+    /// system_diagnostic`. NOT NULL — non-substrate operator calls pass
+    /// `"manual"`. Enters the canonical hash (v0.9 chain-format bump) so
+    /// the §6.4 source filter reads a tamper-evident, attested column.
+    pub source: &'a str,
+    /// Action-specific scalars carried as a JSON object (§6.1). Phase A:
+    /// `{"applied": bool}` on `moderation_auto_label_applied`. NULL for
+    /// the common case. Serialized to a stable string and folded into the
+    /// canonical hash alongside `source`.
+    pub payload: Option<serde_json::Value>,
     pub subject: Option<&'a Subject>,
     pub rationale: &'a str,
     pub snapshot_id: Option<i64>,
@@ -647,16 +715,33 @@ async fn write_chain_entry_inner(
     // alphabetical source order makes the serialized output alphabetical
     // regardless of which `Map` backing serde_json is using — durable
     // against future feature-graph drift either direction.
+    // Serialize the action-scalar payload to a stable string once, and
+    // hash that exact string (the verifier re-hashes the stored string
+    // byte-for-byte). `None` → SQL NULL → canonical `null`, identical to
+    // an entry that never carried a payload. Same wire-vs-canonical
+    // nesting asymmetry as cascade_subjects (the string is embedded,
+    // escaped, inside the canonical object).
+    let payload_json: Option<String> = match &params.payload {
+        Some(v) => Some(serde_json::to_string(v).map_err(|e| PdsError::Internal(e.to_string()))?),
+        None => None,
+    };
+    // Alphabetical source order — `payload` falls between `event_id` and
+    // `previous_hash`; `source` between `snapshot_id` and `subject_cid`.
+    // See the cargo-feature-unification note above: writing keys
+    // alphabetically makes the serialized output alphabetical under either
+    // serde_json Map backing.
     let canon = serde_json::json!({
         "action": params.action,
         "actor_did": params.actor_did,
         "cascade_snapshot_ids": cascade_snapshot_ids_json,
         "cascade_subjects": cascade_json,
         "event_id": params.event_id,
+        "payload": payload_json,
         "previous_hash": prev_hash,
         "rationale": params.rationale,
         "sequence": seq,
         "snapshot_id": params.snapshot_id,
+        "source": params.source,
         "subject_cid": subject_cid,
         "subject_did": subject_did,
         "subject_uri": subject_uri,
@@ -671,8 +756,9 @@ async fn write_chain_entry_inner(
         "INSERT INTO audit_chain_entry \
          (sequence, created_at, actor_did, action, subject_did, subject_uri, subject_cid, \
           rationale, snapshot_id, event_id, current_hash, previous_hash, cascade_subjects, \
-          cascade_snapshot_ids) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
+          cascade_snapshot_ids, source, payload) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+         RETURNING id",
     )
     .bind(seq)
     .bind(&now_str)
@@ -688,6 +774,8 @@ async fn write_chain_entry_inner(
     .bind(&prev_hash)
     .bind(&cascade_json)
     .bind(&cascade_snapshot_ids_json)
+    .bind(params.source)
+    .bind(&payload_json)
     .fetch_one(&mut **tx)
     .await?;
     Ok(id)
@@ -759,6 +847,26 @@ impl std::fmt::Display for ChainVerificationError {
 
 impl std::error::Error for ChainVerificationError {}
 
+/// Outcome of a successful chain walk. Distinguishes entries that match
+/// the current (v0.9) canonical hash form from entries that match only
+/// the pre-v0.9 form (written before the #345 `source`+`payload` bump and
+/// re-verified via [`verify_entry_legacy`]). A legacy entry is NOT a
+/// failure — it is a correctly-sealed row predating the format change —
+/// so the walk records it and continues. `Ok(ChainVerificationSummary)`
+/// therefore means the whole window is tamper-clean; `legacy_count > 0`
+/// only tells operators which rows predate the bump.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChainVerificationSummary {
+    /// Entries whose stored hash matches the current v0.9 canonical form.
+    pub verified_count: usize,
+    /// Entries whose stored hash matches only the pre-v0.9 legacy form.
+    pub legacy_count: usize,
+    /// Lowest sequence verified under the legacy form, if any.
+    pub first_legacy_seq: Option<i64>,
+    /// Highest sequence verified under the legacy form, if any.
+    pub last_legacy_seq: Option<i64>,
+}
+
 /// Verify the chain is internally consistent across `[start_seq, end_seq]`.
 /// Walks the rows in ascending sequence order and checks two things per
 /// row:
@@ -767,8 +875,17 @@ impl std::error::Error for ChainVerificationError {}
 /// 2. The row's `previous_hash` equals the prior row's `current_hash`
 ///    (linkage).
 ///
-/// Returns `Ok(())` if every checked entry passes both. Returns the
-/// first failure on mismatch — caller can re-scan after the failing
+/// A per-row hash is checked against the current (v0.9) canonical form
+/// first; if that fails, against the pre-v0.9 legacy form
+/// ([`verify_entry_legacy`]). A row matching EITHER form is consistent —
+/// legacy matches are recorded in the returned [`ChainVerificationSummary`]
+/// and the walk continues. Only a row matching NEITHER form halts the walk
+/// as a `PerRowMismatch` (real tamper). This is the v0.8→v0.9 boundary
+/// accommodation; it is not a general multi-schema fallback.
+///
+/// Returns `Ok(ChainVerificationSummary)` if every checked entry passes
+/// (under one form or the other) and linkage holds throughout. Returns
+/// the first failure on mismatch — caller can re-scan after the failing
 /// sequence if it wants a complete picture.
 ///
 /// Pre-Phase-3.8 sentinel rows (`current_hash="pre-chain"`) are skipped
@@ -777,14 +894,15 @@ impl std::error::Error for ChainVerificationError {}
 /// negatives.
 ///
 /// `start_seq` and `end_seq` are inclusive. If `start_seq > end_seq` the
-/// function returns `Ok(())` (empty window is trivially consistent).
+/// function returns an empty summary (empty window is trivially consistent).
 pub async fn verify_chain_range(
     db: &AnyPool,
     start_seq: i64,
     end_seq: i64,
-) -> Result<(), ChainVerificationError> {
+) -> Result<ChainVerificationSummary, ChainVerificationError> {
+    let mut summary = ChainVerificationSummary::default();
     if start_seq > end_seq {
-        return Ok(());
+        return Ok(summary);
     }
     // Fetch the latest row strictly before start_seq so the linkage of
     // the first row in the window can be checked against its
@@ -811,7 +929,7 @@ pub async fn verify_chain_range(
     let rows = sqlx::query(
         "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                 subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                cascade_subjects, cascade_snapshot_ids \
+                cascade_subjects, cascade_snapshot_ids, source, payload \
          FROM audit_chain_entry \
          WHERE sequence >= $1 AND sequence <= $2 \
          ORDER BY sequence ASC",
@@ -896,6 +1014,10 @@ pub async fn verify_chain_range(
         let cascade_str: Option<String> = row.try_get("cascade_subjects").ok().flatten();
         let cascade_snapshot_ids_str: Option<String> =
             row.try_get("cascade_snapshot_ids").ok().flatten();
+        let source: String = row
+            .try_get::<String, _>("source")
+            .unwrap_or_else(|_| "manual".to_string());
+        let payload_str: Option<String> = row.try_get("payload").ok().flatten();
 
         // Linkage check: the row's stored previous_hash must equal the
         // prior non-sentinel row's current_hash. The very first non-
@@ -910,7 +1032,10 @@ pub async fn verify_chain_range(
         }
 
         // Per-row check: rehash content + stored previous_hash, compare
-        // to stored current_hash.
+        // to stored current_hash. Try the current v0.9 form first; on a
+        // miss, try the pre-v0.9 legacy form (no source/payload in the
+        // hash). A row matching neither is a real tamper and halts the
+        // walk; a legacy match is recorded and the walk continues.
         let row_ok = verify_entry(
             seq,
             &created_at_str,
@@ -925,13 +1050,40 @@ pub async fn verify_chain_range(
             stored_prev.as_deref(),
             cascade_str.as_deref(),
             cascade_snapshot_ids_str.as_deref(),
+            &source,
+            payload_str.as_deref(),
             &current_hash,
         );
-        if !row_ok {
-            return Err(ChainVerificationError {
-                failing_sequence: seq,
-                kind: ChainFailureKind::PerRowMismatch,
-            });
+        if row_ok {
+            summary.verified_count += 1;
+        } else {
+            let legacy_ok = verify_entry_legacy(
+                seq,
+                &created_at_str,
+                &actor_did,
+                &action,
+                subject_did.as_deref(),
+                subject_uri.as_deref(),
+                subject_cid.as_deref(),
+                &rationale,
+                snapshot_id,
+                event_id,
+                stored_prev.as_deref(),
+                cascade_str.as_deref(),
+                cascade_snapshot_ids_str.as_deref(),
+                &current_hash,
+            );
+            if !legacy_ok {
+                return Err(ChainVerificationError {
+                    failing_sequence: seq,
+                    kind: ChainFailureKind::PerRowMismatch,
+                });
+            }
+            summary.legacy_count += 1;
+            if summary.first_legacy_seq.is_none() {
+                summary.first_legacy_seq = Some(seq);
+            }
+            summary.last_legacy_seq = Some(seq);
         }
 
         prev_hash = Some(current_hash);
@@ -963,7 +1115,7 @@ pub async fn verify_chain_range(
         }
     }
 
-    Ok(())
+    Ok(summary)
 }
 
 /// Recompute an entry's hash from its stored fields and compare to
@@ -984,10 +1136,75 @@ pub fn verify_entry(
     previous_hash: Option<&str>,
     cascade_subjects: Option<&str>,
     cascade_snapshot_ids: Option<&str>,
+    source: &str,
+    payload: Option<&str>,
     expected_hash: &str,
 ) -> bool {
     // Alphabetical source order — see write_chain_entry_inner's
     // canonical-form note for the cargo-feature-unification rationale.
+    // `payload` (the stored JSON string, re-hashed byte-for-byte) and
+    // `source` joined the canonical set in the v0.9 format bump (#345).
+    let canon = serde_json::json!({
+        "action": action,
+        "actor_did": actor_did,
+        "cascade_snapshot_ids": cascade_snapshot_ids,
+        "cascade_subjects": cascade_subjects,
+        "event_id": event_id,
+        "payload": payload,
+        "previous_hash": previous_hash,
+        "rationale": rationale,
+        "sequence": sequence,
+        "snapshot_id": snapshot_id,
+        "source": source,
+        "subject_cid": subject_cid,
+        "subject_did": subject_did,
+        "subject_uri": subject_uri,
+        "timestamp": timestamp,
+    });
+    let canon_str = match serde_json::to_string(&canon) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(canon_str.as_bytes());
+    let computed = hex::encode(hasher.finalize());
+    computed == expected_hash
+}
+
+/// Recompute an entry's hash under the PRE-v0.9 canonical form and compare to
+/// `current_hash`. The pre-bump canonical object is identical to
+/// [`verify_entry`]'s but WITHOUT the `payload` and `source` keys, which joined
+/// the hash in the #345 format bump (`ac4a2d3`). A row written before the bump
+/// (e.g. on a v0.8 deployment upgraded to v0.9) matches THIS form, not
+/// `verify_entry`'s — its stored hash was computed without source/payload.
+///
+/// This is purely diagnostic — it lets the verifier distinguish an expected
+/// legacy-format entry (matches this form) from a real tamper (matches NEITHER
+/// form). It does NOT relax tamper-evidence: a tampered legacy row still fails
+/// both forms, and stored hashes are never modified. Scoped specifically to the
+/// one-time v0.8→v0.9 boundary — it is NOT a general "try every historical
+/// schema" framework.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_entry_legacy(
+    sequence: i64,
+    timestamp: &str,
+    actor_did: &str,
+    action: &str,
+    subject_did: Option<&str>,
+    subject_uri: Option<&str>,
+    subject_cid: Option<&str>,
+    rationale: &str,
+    snapshot_id: Option<i64>,
+    event_id: Option<i64>,
+    previous_hash: Option<&str>,
+    cascade_subjects: Option<&str>,
+    cascade_snapshot_ids: Option<&str>,
+    expected_hash: &str,
+) -> bool {
+    // Pre-bump canonical form: `verify_entry`'s object with the `payload` and
+    // `source` keys removed (the #345 additions). The remaining 13 keys and
+    // their alphabetical serialization are byte-identical to what pre-v0.9 code
+    // produced.
     let canon = serde_json::json!({
         "action": action,
         "actor_did": actor_did,
@@ -1071,6 +1288,66 @@ pub(crate) async fn corrupt_entry_rationale(
         .map(|_| ())
 }
 
+/// Test-only helper: insert a row sealed under the PRE-v0.9 (legacy) hash
+/// form — the 13-key canonical object WITHOUT `payload`/`source` (see
+/// [`verify_entry_legacy`]). The row carries the post-migration
+/// `source='manual'`/`payload=NULL` column defaults but a `current_hash`
+/// computed without them, exactly reproducing a row upgraded from a v0.8
+/// deployment. Returns the stored `current_hash` so callers can chain
+/// `previous_hash`. Lives here (not in a consumer's test module) because
+/// the build-time guard forbids raw `INSERT INTO audit_chain_entry`
+/// outside this file; the CLI verifier tests call it across the boundary.
+#[cfg(test)]
+pub(crate) async fn insert_legacy_chain_entry(
+    db: &AnyPool,
+    sequence: i64,
+    rationale: &str,
+    previous_hash: Option<&str>,
+) -> String {
+    let created_at = format!("2024-01-{:02}T00:00:00Z", sequence);
+    let actor_did = "did:plc:m1";
+    let action = "TakedownAccount";
+    let subject_did = "did:plc:victim";
+    // Pre-v0.9 canonical form: 13 keys, no `payload`/`source`.
+    let canon = serde_json::json!({
+        "action": action,
+        "actor_did": actor_did,
+        "cascade_snapshot_ids": Option::<String>::None,
+        "cascade_subjects": Option::<String>::None,
+        "event_id": Option::<i64>::None,
+        "previous_hash": previous_hash,
+        "rationale": rationale,
+        "sequence": sequence,
+        "snapshot_id": Option::<i64>::None,
+        "subject_cid": Option::<String>::None,
+        "subject_did": subject_did,
+        "subject_uri": Option::<String>::None,
+        "timestamp": &created_at,
+    });
+    let canon_str = serde_json::to_string(&canon).expect("legacy canon serializes");
+    let mut hasher = Sha256::new();
+    hasher.update(canon_str.as_bytes());
+    let current_hash = hex::encode(hasher.finalize());
+    sqlx::query(
+        "INSERT INTO audit_chain_entry \
+         (sequence, created_at, actor_did, action, subject_did, rationale, \
+          current_hash, previous_hash, source, payload) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'manual', NULL)",
+    )
+    .bind(sequence)
+    .bind(&created_at)
+    .bind(actor_did)
+    .bind(action)
+    .bind(subject_did)
+    .bind(rationale)
+    .bind(&current_hash)
+    .bind(previous_hash)
+    .execute(db)
+    .await
+    .expect("legacy entry inserts");
+    current_hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,6 +1380,8 @@ mod tests {
                 previous_hash TEXT,
                 cascade_subjects TEXT,
                 cascade_snapshot_ids TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                payload TEXT,
                 UNIQUE(sequence)
             )",
         )
@@ -1183,6 +1462,8 @@ mod tests {
                 &mut tx,
                 crate::config::DatabaseBackend::Sqlite,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:m1",
                     action: "TakedownAccount",
                     subject: Some(&subject),
@@ -1249,6 +1530,8 @@ mod tests {
             &mut tx,
             crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&subject),
@@ -1288,6 +1571,8 @@ mod tests {
             &db,
             crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&subject),
@@ -1316,11 +1601,15 @@ mod tests {
             did: "did:plc:s".to_string(),
         };
         insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:m1", action: "TakedownAccount",
             subject: Some(&subject), rationale: "first",
             snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
         }).await.unwrap();
         insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:m1", action: "RestoreAccount",
             subject: Some(&subject), rationale: "second",
             snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1355,6 +1644,8 @@ mod tests {
             &db,
             crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownRecord",
                 subject: Some(&subject),
@@ -1402,6 +1693,8 @@ mod tests {
             &db,
             crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownRecord",
                 subject: Some(&subject),
@@ -1453,6 +1746,8 @@ mod tests {
             &db,
             crate::config::DatabaseBackend::Sqlite,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&Subject::Repo {
@@ -1513,6 +1808,8 @@ mod tests {
             did: "did:plc:victim".to_string(),
         };
         let id = insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:m1", action: "SuspendAccount",
             subject: Some(&subject), rationale: "rationale text",
             snapshot_id: Some(42), event_id: Some(7), cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1520,7 +1817,7 @@ mod tests {
         let row = sqlx::query(
             "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                     subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                    cascade_subjects, cascade_snapshot_ids \
+                    cascade_subjects, cascade_snapshot_ids , source, payload \
              FROM audit_chain_entry WHERE id = $1",
         )
         .bind(id)
@@ -1541,6 +1838,8 @@ mod tests {
             row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("source").unwrap(),
+            row.try_get::<Option<String>, _>("payload").unwrap().as_deref(),
             &row.try_get::<String, _>("current_hash").unwrap(),
         );
         assert!(verified, "fresh entry should verify against its stored hash");
@@ -1553,6 +1852,8 @@ mod tests {
             did: "did:plc:victim".to_string(),
         };
         let id = insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: "did:plc:m1", action: "TakedownAccount",
             subject: Some(&subject), rationale: "original rationale",
             snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1566,7 +1867,7 @@ mod tests {
         let row = sqlx::query(
             "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                     subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                    cascade_subjects, cascade_snapshot_ids \
+                    cascade_subjects, cascade_snapshot_ids , source, payload \
              FROM audit_chain_entry WHERE id = $1",
         )
         .bind(id)
@@ -1587,6 +1888,8 @@ mod tests {
             row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("source").unwrap(),
+            row.try_get::<Option<String>, _>("payload").unwrap().as_deref(),
             &row.try_get::<String, _>("current_hash").unwrap(),
         );
         assert!(!verified, "tampered entry must fail verification");
@@ -1600,6 +1903,8 @@ mod tests {
         };
         for i in 0..3 {
             insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action: "TakedownAccount",
                 subject: Some(&subject),
@@ -1620,6 +1925,8 @@ mod tests {
         };
         for i in 0..3 {
             insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("orig-{}", i),
                 snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1647,6 +1954,8 @@ mod tests {
         };
         for i in 0..3 {
             insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("orig-{}", i),
                 snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1659,22 +1968,28 @@ mod tests {
         let row = sqlx::query(
             "SELECT created_at, actor_did, action, subject_did, subject_uri, subject_cid, \
                     rationale, snapshot_id, event_id, previous_hash, cascade_subjects, \
-                    cascade_snapshot_ids \
+                    cascade_snapshot_ids, source, payload \
              FROM audit_chain_entry WHERE sequence = 2",
         )
         .fetch_one(&db).await.unwrap();
         let new_rationale = "attacker-rewrite";
-        // Alphabetical source order — see write_chain_entry_inner.
+        // Alphabetical source order — see write_chain_entry_inner. The
+        // attacker recomputes a per-row-CONSISTENT hash, so it must fold
+        // in source/payload exactly as production does — otherwise the
+        // per-row check would catch it at seq 2 and we'd never exercise
+        // the linkage path this test is about.
         let canon = serde_json::json!({
             "action": row.try_get::<String, _>("action").unwrap(),
             "actor_did": row.try_get::<String, _>("actor_did").unwrap(),
             "cascade_snapshot_ids": row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap(),
             "cascade_subjects": row.try_get::<Option<String>, _>("cascade_subjects").unwrap(),
             "event_id": row.try_get::<Option<i64>, _>("event_id").unwrap(),
+            "payload": row.try_get::<Option<String>, _>("payload").unwrap(),
             "previous_hash": row.try_get::<Option<String>, _>("previous_hash").unwrap(),
             "rationale": new_rationale,
             "sequence": 2,
             "snapshot_id": row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            "source": row.try_get::<String, _>("source").unwrap(),
             "subject_cid": row.try_get::<Option<String>, _>("subject_cid").unwrap(),
             "subject_did": row.try_get::<Option<String>, _>("subject_did").unwrap(),
             "subject_uri": row.try_get::<Option<String>, _>("subject_uri").unwrap(),
@@ -1718,6 +2033,8 @@ mod tests {
         // independently of the sentinel row above.
         for i in 0..2 {
             insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1", action: "TakedownAccount",
                 subject: Some(&subject), rationale: &format!("post-{}", i),
                 snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
@@ -1738,6 +2055,187 @@ mod tests {
     async fn verify_chain_range_inverted_window_is_ok() {
         let db = open_test_pool().await;
         verify_chain_range(&db, 5, 1).await.expect("inverted window is trivially consistent");
+    }
+
+    #[tokio::test]
+    async fn verify_entry_legacy_matches_pre_bump_row_v09_does_not() {
+        // A pre-bump row verifies under the legacy form but NOT the v0.9
+        // form — the two forms are genuinely distinct, so legacy acceptance
+        // is not a blanket pass.
+        let db = open_test_pool().await;
+        let h1 = insert_legacy_chain_entry(&db, 1, "r1", None).await;
+        let row = sqlx::query(
+            "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
+                    subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
+                    cascade_subjects, cascade_snapshot_ids, source, payload \
+             FROM audit_chain_entry WHERE sequence = 1",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let legacy_ok = verify_entry_legacy(
+            row.try_get::<i64, _>("sequence").unwrap(),
+            &row.try_get::<String, _>("created_at").unwrap(),
+            &row.try_get::<String, _>("actor_did").unwrap(),
+            &row.try_get::<String, _>("action").unwrap(),
+            row.try_get::<Option<String>, _>("subject_did").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("subject_uri").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("subject_cid").unwrap().as_deref(),
+            &row.try_get::<String, _>("rationale").unwrap(),
+            row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            row.try_get::<Option<i64>, _>("event_id").unwrap(),
+            row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("current_hash").unwrap(),
+        );
+        assert!(legacy_ok, "pre-bump row must verify under the legacy form");
+        let v09_ok = verify_entry(
+            row.try_get::<i64, _>("sequence").unwrap(),
+            &row.try_get::<String, _>("created_at").unwrap(),
+            &row.try_get::<String, _>("actor_did").unwrap(),
+            &row.try_get::<String, _>("action").unwrap(),
+            row.try_get::<Option<String>, _>("subject_did").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("subject_uri").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("subject_cid").unwrap().as_deref(),
+            &row.try_get::<String, _>("rationale").unwrap(),
+            row.try_get::<Option<i64>, _>("snapshot_id").unwrap(),
+            row.try_get::<Option<i64>, _>("event_id").unwrap(),
+            row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("source").unwrap(),
+            row.try_get::<Option<String>, _>("payload").unwrap().as_deref(),
+            &row.try_get::<String, _>("current_hash").unwrap(),
+        );
+        assert!(!v09_ok, "pre-bump row must NOT verify under the v0.9 form");
+        // Sanity: h1 is the stored hash we verified against.
+        assert_eq!(h1, row.try_get::<String, _>("current_hash").unwrap());
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_accepts_legacy_chain() {
+        // A wholly pre-bump chain verifies clean: every row counts as legacy,
+        // none as v0.9, and linkage holds across all three.
+        let db = open_test_pool().await;
+        let h1 = insert_legacy_chain_entry(&db, 1, "r1", None).await;
+        let h2 = insert_legacy_chain_entry(&db, 2, "r2", Some(&h1)).await;
+        let _h3 = insert_legacy_chain_entry(&db, 3, "r3", Some(&h2)).await;
+        let summary = verify_chain_range(&db, 1, 3).await.expect("legacy chain verifies");
+        assert_eq!(summary.legacy_count, 3);
+        assert_eq!(summary.verified_count, 0);
+        assert_eq!(summary.first_legacy_seq, Some(1));
+        assert_eq!(summary.last_legacy_seq, Some(3));
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_v09_chain_reports_no_legacy() {
+        // A current-format chain verifies entirely under the v0.9 form; the
+        // legacy fallback never fires, so legacy_count stays zero.
+        let db = open_test_pool().await;
+        let subject = Subject::Repo { did: "did:plc:s".to_string() };
+        for i in 0..3 {
+            insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+                source: "manual",
+                payload: None,
+                actor_did: "did:plc:m1", action: "TakedownAccount",
+                subject: Some(&subject), rationale: &format!("r-{}", i),
+                snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
+            }).await.unwrap();
+        }
+        let summary = verify_chain_range(&db, 1, 3).await.expect("v0.9 chain verifies");
+        assert_eq!(summary.verified_count, 3);
+        assert_eq!(summary.legacy_count, 0);
+        assert_eq!(summary.first_legacy_seq, None);
+        assert_eq!(summary.last_legacy_seq, None);
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_mixed_legacy_then_v09_verifies() {
+        // The real upgrade shape: pre-bump rows followed by post-bump rows.
+        // insert_chain_entry_pool links row 3 to row 2's stored (legacy)
+        // hash, so linkage holds across the format boundary and the walk
+        // reports both regions.
+        let db = open_test_pool().await;
+        let h1 = insert_legacy_chain_entry(&db, 1, "r1", None).await;
+        let _h2 = insert_legacy_chain_entry(&db, 2, "r2", Some(&h1)).await;
+        let subject = Subject::Repo { did: "did:plc:s".to_string() };
+        insert_chain_entry_pool(&db, crate::config::DatabaseBackend::Sqlite, AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: "did:plc:m1", action: "TakedownAccount",
+            subject: Some(&subject), rationale: "r3-v09",
+            snapshot_id: None, event_id: None, cascade_subjects: &[], cascade_snapshot_ids: &[],
+        }).await.unwrap();
+        let summary = verify_chain_range(&db, 1, 3).await.expect("mixed chain verifies clean");
+        assert_eq!(summary.legacy_count, 2);
+        assert_eq!(summary.verified_count, 1);
+        assert_eq!(summary.first_legacy_seq, Some(1));
+        assert_eq!(summary.last_legacy_seq, Some(2));
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_tampered_legacy_fails_both_forms() {
+        // A tampered legacy row matches NEITHER form, so it is a real
+        // failure, not silently absorbed by the legacy fallback.
+        let db = open_test_pool().await;
+        let _h1 = insert_legacy_chain_entry(&db, 1, "r1", None).await;
+        corrupt_entry_rationale(&db, EntryRef::Sequence(1), "tampered")
+            .await
+            .unwrap();
+        let err = verify_chain_range(&db, 1, 1)
+            .await
+            .expect_err("tampered legacy row must fail both forms");
+        assert_eq!(err.failing_sequence, 1);
+        assert_eq!(err.kind, ChainFailureKind::PerRowMismatch);
+    }
+
+    #[tokio::test]
+    async fn verify_chain_range_legacy_linkage_tamper_detected() {
+        // Even when an attacker reseals a legacy row's per-row hash
+        // consistently (so the per-row legacy check passes), the broken
+        // linkage to the next row is still caught — legacy acceptance does
+        // not weaken linkage enforcement.
+        let db = open_test_pool().await;
+        let h1 = insert_legacy_chain_entry(&db, 1, "r1", None).await;
+        let h2_old = insert_legacy_chain_entry(&db, 2, "r2", Some(&h1)).await;
+        let _h3 = insert_legacy_chain_entry(&db, 3, "r3", Some(&h2_old)).await;
+        // Rewrite row 2 with a per-row-CONSISTENT legacy hash over new
+        // content; row 3's previous_hash still points at the OLD row-2 hash.
+        let new_rationale = "attacker-rewrite";
+        let new_created = "2024-01-02T00:00:00Z";
+        let canon = serde_json::json!({
+            "action": "TakedownAccount",
+            "actor_did": "did:plc:m1",
+            "cascade_snapshot_ids": Option::<String>::None,
+            "cascade_subjects": Option::<String>::None,
+            "event_id": Option::<i64>::None,
+            "previous_hash": Some(&h1),
+            "rationale": new_rationale,
+            "sequence": 2,
+            "snapshot_id": Option::<i64>::None,
+            "subject_cid": Option::<String>::None,
+            "subject_did": "did:plc:victim",
+            "subject_uri": Option::<String>::None,
+            "timestamp": new_created,
+        });
+        let canon_str = serde_json::to_string(&canon).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(canon_str.as_bytes());
+        let new_h2 = hex::encode(hasher.finalize());
+        sqlx::query(
+            "UPDATE audit_chain_entry SET rationale = $1, current_hash = $2 WHERE sequence = 2",
+        )
+        .bind(new_rationale)
+        .bind(&new_h2)
+        .execute(&db)
+        .await
+        .unwrap();
+        let err = verify_chain_range(&db, 1, 3)
+            .await
+            .expect_err("legacy linkage tamper must be detected");
+        assert_eq!(err.failing_sequence, 3);
+        assert_eq!(err.kind, ChainFailureKind::LinkageMismatch);
     }
 
     #[tokio::test]
@@ -1872,6 +2370,8 @@ mod tests {
                 previous_hash TEXT,
                 cascade_subjects TEXT,
                 cascade_snapshot_ids TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                payload TEXT,
                 UNIQUE(sequence)
             )",
         )
@@ -1900,6 +2400,8 @@ mod tests {
                     &pool,
                     crate::config::DatabaseBackend::Sqlite,
                     AppendEntryParams {
+                        source: "manual",
+                        payload: None,
                         actor_did: "did:plc:m1",
                         action: "TakedownAccount",
                         subject: Some(&subject),
@@ -1956,6 +2458,66 @@ mod tests {
             .expect("clean chain after concurrent appends");
     }
 
+    // #303 — the three operator-initiated destructive ops (repo rebuild, bulk
+    // repair, manual Laquna rotation) emit operator-decision chain entries. This
+    // pins that each entry shape is a valid, hash-linked, verifiable chain entry:
+    // single-subject (rebuild), multi-subject via cascade_subjects (the batch
+    // repair — the novel column path), and no-subject (deployment-wide rotation),
+    // with the typed-confirm rationale persisted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f303_operator_decision_entries_chain_verify() {
+        let db = open_concurrent_test_pool(2).await;
+        let be = crate::config::DatabaseBackend::Sqlite;
+
+        let rebuild_subj = Subject::Repo { did: "did:plc:rebuilt".into() };
+        insert_chain_entry_pool(&db, be, AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: "did:plc:op", action: "repo.rebuild", subject: Some(&rebuild_subj),
+            rationale: "corruption recovery", snapshot_id: None, event_id: None,
+            cascade_subjects: &[], cascade_snapshot_ids: &[],
+        }).await.expect("rebuild entry");
+
+        let targets = vec![
+            Subject::Repo { did: "did:plc:t1".into() },
+            Subject::Repo { did: "did:plc:t2".into() },
+        ];
+        insert_chain_entry_pool(&db, be, AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: "did:plc:op", action: "repo.bulk_repair", subject: None,
+            rationale: "batch scrub", snapshot_id: None, event_id: None,
+            cascade_subjects: &targets, cascade_snapshot_ids: &[],
+        }).await.expect("bulk-repair entry");
+
+        insert_chain_entry_pool(&db, be, AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: "did:plc:op", action: "kryphocron.laquna.rotate", subject: None,
+            rationale: "ahead-of-cadence rotation", snapshot_id: None, event_id: None,
+            cascade_subjects: &[], cascade_snapshot_ids: &[],
+        }).await.expect("rotation entry");
+
+        // All three form one clean, hash-linked, verifiable chain.
+        verify_chain_range(&db, 1, 3).await.expect("F5 entries chain-verify");
+
+        // The bulk-repair entry round-trips both targets in cascade_subjects.
+        let cascade_json: Option<String> = sqlx::query_scalar(
+            "SELECT cascade_subjects FROM audit_chain_entry WHERE action = 'repo.bulk_repair'",
+        ).fetch_one(&db).await.unwrap();
+        let cascade_json = cascade_json.expect("cascade_subjects present for bulk repair");
+        assert!(
+            cascade_json.contains("did:plc:t1") && cascade_json.contains("did:plc:t2"),
+            "both repair targets recorded in cascade_subjects: {cascade_json}",
+        );
+
+        // The typed-confirm rationale persists (the safety-critical reason).
+        let rebuild_rationale: String = sqlx::query_scalar(
+            "SELECT rationale FROM audit_chain_entry WHERE action = 'repo.rebuild'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(rebuild_rationale, "corruption recovery");
+    }
+
     // ====================================================================
     // Arc 3 Step 0.6 (§7.4.0.6) — invariants on `corrupt_entry_rationale`.
     //
@@ -1979,6 +2541,8 @@ mod tests {
                 db,
                 crate::config::DatabaseBackend::Sqlite,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:m1",
                     action: "TakedownAccount",
                     subject: Some(&subject),
@@ -2002,7 +2566,7 @@ mod tests {
         let row = sqlx::query(
             "SELECT sequence, created_at, actor_did, action, subject_did, subject_uri, \
                     subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                    cascade_subjects, cascade_snapshot_ids \
+                    cascade_subjects, cascade_snapshot_ids , source, payload \
              FROM audit_chain_entry WHERE id = $1",
         )
         .bind(id)
@@ -2023,6 +2587,8 @@ mod tests {
             row.try_get::<Option<String>, _>("previous_hash").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_subjects").unwrap().as_deref(),
             row.try_get::<Option<String>, _>("cascade_snapshot_ids").unwrap().as_deref(),
+            &row.try_get::<String, _>("source").unwrap(),
+            row.try_get::<Option<String>, _>("payload").unwrap().as_deref(),
             &row.try_get::<String, _>("current_hash").unwrap(),
         )
     }

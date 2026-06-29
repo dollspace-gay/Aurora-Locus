@@ -1,0 +1,61 @@
+/*
+ * dark — token values (design §11.9.1).
+ *
+ * The sober, accessibility-flawless inheritance root. A slightly-warm-tinted
+ * neutral dark palette; contrast ratios are noted per token and verified by the
+ * substrate's WCAG 2.2 contrast gate (§11.10) at startup. Every other bundled
+ * theme either is this theme or extends it.
+ */
+
+:root {
+  /* Surfaces */
+  --color-surface-primary: #1a1a1c;
+  --color-surface-secondary: #232325;
+  --color-surface-tertiary: #2c2c2e;
+  --color-surface-overlay: rgba(0, 0, 0, 0.6);
+
+  /* Text */
+  --color-text-primary: #e8e8ea;   /* 13.5:1 on surface-primary — AAA */
+  --color-text-secondary: #b0b0b3; /* 6.8:1 — AAA-normal */
+  --color-text-tertiary: #828285;  /* 4.0:1 — AA-large */
+  --color-text-inverted: #1a1a1c;  /* 5.3:1 on accent-primary — AA-normal */
+
+  /* Accent */
+  --color-accent-primary: #5b8bf0;        /* a calm blue */
+  --color-accent-primary-hover: #6e98f3;
+  --color-accent-primary-active: #4f7adb;
+  --color-accent-secondary: #828b9c;
+
+  /* Inline-link color (#410). Defined on the root so every theme inherits it;
+   * defaults to the interactive accent. A theme whose accent is too light as
+   * body-sized text on its surface overrides these (see pride). The WCAG gate
+   * checks both against surface-primary at 4.5:1. */
+  --color-link: var(--color-accent-primary);
+  --color-link-hover: var(--color-accent-primary-hover);
+
+  /* Status */
+  --color-status-success: #4ade80;
+  --color-status-warning: #fbbf24;
+  --color-status-danger: #f87171;
+  --color-status-info: #60a5fa;
+
+  /* Borders */
+  --color-border-primary: rgba(255, 255, 255, 0.08);
+  --color-border-secondary: rgba(255, 255, 255, 0.04);
+  --color-border-focus: var(--color-accent-primary);
+
+  /* Typography */
+  --font-family-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
+  --font-family-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --font-family-display: var(--font-family-sans);
+
+  /* Sizing */
+  --font-size-base: 14px;
+  --space-unit: 4px;
+
+  /* Motion */
+  --motion-duration-fast: 120ms;
+  --motion-duration-medium: 220ms;
+  --motion-duration-slow: 380ms;
+  --motion-easing-standard: cubic-bezier(0.16, 1, 0.3, 1);
+}

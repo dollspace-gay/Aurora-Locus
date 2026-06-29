@@ -489,7 +489,7 @@ async fn fetch_new_chain_entries(
     let rows = sqlx::query(
         "SELECT id, sequence, created_at, actor_did, action, subject_did, subject_uri, \
                 subject_cid, rationale, snapshot_id, event_id, current_hash, previous_hash, \
-                cascade_subjects, cascade_snapshot_ids \
+                cascade_subjects, cascade_snapshot_ids, source, payload \
          FROM audit_chain_entry WHERE sequence > $1 ORDER BY sequence ASC LIMIT $2",
     )
     .bind(after_seq)
@@ -534,8 +534,32 @@ async fn fetch_new_chain_entries(
             .iter()
             .map(|opt| opt.map(|v| v.to_string()))
             .collect();
+        let source: String = row
+            .try_get::<String, _>("source")
+            .unwrap_or_else(|_| "manual".to_string());
+        let payload_str: Option<String> = row.try_get("payload").ok().flatten();
 
+        // Verified if the row matches the current v0.9 canonical form OR the
+        // pre-v0.9 legacy form (pre-#345 source/payload bump). Both are
+        // honestly-sealed rows; only matching neither marks it unverified.
         let verified = crate::admin::audit_chain::verify_entry(
+            sequence,
+            &created_at_str,
+            &actor_did,
+            &action,
+            subject_did.as_deref(),
+            subject_uri.as_deref(),
+            subject_cid.as_deref(),
+            &rationale,
+            snapshot_id,
+            event_id,
+            previous_hash.as_deref(),
+            cascade_str.as_deref(),
+            cascade_snapshot_ids_str.as_deref(),
+            &source,
+            payload_str.as_deref(),
+            &current_hash,
+        ) || crate::admin::audit_chain::verify_entry_legacy(
             sequence,
             &created_at_str,
             &actor_did,
@@ -577,6 +601,10 @@ async fn fetch_new_chain_entries(
             verified,
             cascade_subjects,
             cascade_snapshot_ids,
+            source,
+            payload: payload_str
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
         });
     }
     Ok(out)
@@ -739,6 +767,8 @@ mod tests {
             verified: true,
             cascade_subjects: Vec::new(),
             cascade_snapshot_ids: Vec::new(),
+            source: "manual".to_string(),
+            payload: None,
         }
     }
 
@@ -842,6 +872,8 @@ mod tests {
                 verified: true,
                 cascade_subjects: Vec::new(),
                 cascade_snapshot_ids: Vec::new(),
+                source: "manual".to_string(),
+                payload: None,
             }),
             sequence: 42,
         };
@@ -892,6 +924,8 @@ mod tests {
             verified: true,
             cascade_subjects: Vec::new(),
             cascade_snapshot_ids: Vec::new(),
+            source: "manual".to_string(),
+            payload: None,
         };
         let standalone = serde_json::to_value(&entry).unwrap();
         let wrapped = serde_json::to_value(&SubscribeMessage::AuditEntry {
@@ -1020,7 +1054,6 @@ mod tests {
                 firehose_enabled: false,
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
-                auto_stream_events: false,
                 peer_pds: vec![],
             },
             validation_mode: PathBuf::from("required")
@@ -1053,6 +1086,8 @@ mod tests {
             &ctx.account_db,
             ctx.config.database.backend,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: "did:plc:m1",
                 action,
                 subject: Some(&subject),

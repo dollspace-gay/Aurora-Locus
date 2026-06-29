@@ -1,0 +1,36 @@
+/*
+ * emerald — token overrides. Extends dark.
+ *
+ * Deep forest base with jewel-tone green accents: near-black greens with a
+ * saturated emerald that reads as gemstone depth rather than surgical-green.
+ * Typography, sizing, motion, and the effect library are inherited from the
+ * dark root. Contrast is verified by the substrate WCAG gate.
+ */
+
+:root {
+  /* Surfaces — deep forest near-black */
+  --color-surface-primary: #0e1512;
+  --color-surface-secondary: #15201b;
+  --color-surface-tertiary: #1c2a23;
+  --color-surface-overlay: rgba(0, 0, 0, 0.6);
+
+  /* Text — cool off-whites on deep green */
+  --color-text-primary: #e9f1ec;
+  --color-text-secondary: #aebeb4;
+  --color-text-tertiary: #7e8f85;
+  --color-text-inverted: #0a130e;
+
+  /* Accent — jewel-tone emerald */
+  --color-accent-primary: #19c98a;
+  --color-accent-primary-hover: #2ad79a;
+  --color-accent-primary-active: #14a874;
+  --color-accent-secondary: #7d9a8c;
+
+  /* Status — info shifted off the accent's green */
+  --color-status-info: #5fb0f5;
+
+  /* Borders — faint green-tinted hairlines */
+  --color-border-primary: rgba(200, 255, 230, 0.08);
+  --color-border-secondary: rgba(200, 255, 230, 0.04);
+  --color-border-focus: var(--color-accent-primary);
+}

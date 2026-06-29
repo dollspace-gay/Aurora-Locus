@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "extension-point-author",
+  "themeName": "Extension Point Author",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "aurora-default",
+  "themeAuthor": "Aurora-Locus examples",
+  "themeDescription": "Inherits aurora-default unchanged and declares three extension points (cosmic hero, accent emphasis glow, nav active indicator) so surfaces can opt into them. The companion to Chapter 6.",
+  "providedExtensionPoints": [
+    "hero-treatment-cosmic",
+    "accent-emphasis-glow",
+    "nav-active-indicator"
+  ],
+  "files": {
+    "tokens": "tokens.css",
+    "extensions": "extensions.css"
+  }
+}

@@ -38,10 +38,18 @@
 
   function actionItems() {
     return [
-      { id: 'theme.cycle', type: 'action', label: 'Toggle theme (light → dark → system)', run: () => {
-          const cur = global.AuroraSettings ? global.AuroraSettings.theme() : 'system';
-          const next = cur === 'light' ? 'dark' : cur === 'dark' ? 'system' : 'light';
-          if (global.AuroraSettings) global.AuroraSettings.setTheme(next);
+      { id: 'theme.cycle', type: 'action', label: 'Cycle theme', run: () => {
+          // Cycle through 'follow deployment default' + the installed themes,
+          // matching the registry-populated picker (§11.10.2 / B-themes-page).
+          const s = global.AuroraSettings;
+          if (!s) return;
+          const opts = ['default'].concat(
+            (s.getInstalledThemes ? s.getInstalledThemes() : [])
+              .filter((t) => t && t.valid === true && t.themeId)
+              .map((t) => t.themeId)
+          );
+          const idx = Math.max(0, opts.indexOf(s.theme()));
+          s.setTheme(opts[(idx + 1) % opts.length]);
         } },
       { id: 'logout', type: 'action', label: 'Log out', run: () => global.AuroraSession && global.AuroraSession.logout() },
     ];

@@ -17,7 +17,7 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::Redirect,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use proto_blue::oauth::{
@@ -81,11 +81,242 @@ pub fn routes(state_store: OAuthStateStore) -> Router<AppContext> {
     let oauth_router = Router::new()
         .route("/admin-oauth/login", get(initiate_oauth))
         .route("/admin-oauth/callback", get(handle_oauth_callback))
+        .route("/admin-oauth/refresh", post(handle_refresh))
         .layer(axum::Extension(state_store));
 
     Router::new()
         .merge(oauth_router)
         .route("/oauth/client-metadata.json", get(client_metadata))
+}
+
+/// Mint a 24h HS256 `scope=admin` access JWT for `did`, carrying the
+/// operator-session id `sid` (§8.1.7 / #271). Shared by the OAuth callback
+/// (AS-only admin login) and `/admin-oauth/refresh` so both paths emit a
+/// byte-identical access-token shape — and so a refreshed token preserves
+/// the session's `sid`, keeping the per-request session lookup continuous
+/// across refreshes. The auth path treats the `sid` as optional: tokens
+/// minted before #271 simply have none and take the legacy stateless path.
+fn mint_admin_access_jwt(
+    jwt_secret: &str,
+    did: &str,
+    sid: Option<&str>,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::json;
+
+    let now = chrono::Utc::now().timestamp();
+    let mut claims = json!({
+        "sub": did,
+        "iat": now,
+        "exp": now + 86400, // 24 hours
+        "scope": "admin",
+    });
+    // Only stamp `sid` when there's a session to bind to. A legacy refresh
+    // token minted before #271 has none; its refreshed access token stays
+    // sid-less and takes the auth path's legacy stateless branch.
+    if let Some(sid) = sid {
+        claims["sid"] = serde_json::Value::String(sid.to_string());
+    }
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(jwt_secret.as_bytes()),
+    )
+}
+
+/// Mint an HS256 `scope=refresh` JWT carrying the operator-session id `sid`
+/// and rotation-chain id `rid` (#271/#272). `exp` is the absolute expiry
+/// (unix seconds): a rotated refresh token keeps the *original* session's
+/// expiry rather than sliding it forward, so a refresh token can never
+/// outlive its operator_session row. Shared by login and the rotation path.
+fn mint_admin_refresh_jwt(
+    jwt_secret: &str,
+    did: &str,
+    sid: &str,
+    rid: &str,
+    exp: i64,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::json;
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = json!({
+        "sub": did,
+        "iat": now,
+        "exp": exp,
+        "scope": "refresh",
+        "sid": sid,
+        "rid": rid,
+    });
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(jwt_secret.as_bytes()),
+    )
+}
+
+/// Request body for `POST /admin-oauth/refresh`.
+#[derive(Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+/// Response from `POST /admin-oauth/refresh`. `refresh_token` is present
+/// only when the underlying refresh rotated it (account-backed admins);
+/// the AS-only HS256 path does not rotate, so it is omitted there.
+#[derive(Serialize, Debug)]
+struct RefreshResponse {
+    access_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+}
+
+fn refresh_error(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({ "error": code, "message": message })),
+    )
+}
+
+/// `POST /admin-oauth/refresh` — exchange a refresh token for a fresh
+/// admin access token (Arc E first wave, §8.1.2 / #268).
+///
+/// Public by design: the refresh token IS the credential, and the (likely
+/// expired) access token is not required. Two refresh-token shapes are
+/// accepted, disambiguated only after signature verification so an
+/// unverified `scope` claim can never drive a mint:
+///
+/// 1. **AS-only admins** — an HS256 `scope=refresh` JWT minted at login.
+///    A fresh 24h `scope=admin` access token is issued; the refresh
+///    token is NOT rotated. Rotation, a server-side refresh-token store,
+///    and the SuperAdmin revocation surface land together in 0.9.3
+///    (§8.1.7). Revocation in the meantime is enforced at use-time:
+///    `finalize_admin_role` resolves the role live per request (#267),
+///    so a revoked operator's freshly-minted access token still 403s on
+///    its next request.
+/// 2. **Account-backed admins** — an atproto account refresh token,
+///    handled by `AccountManager::refresh_session`, which rotates it;
+///    the new refresh token is returned for the client to store.
+///
+/// Returns 401 for an expired, malformed, or wrong-scope refresh token —
+/// the only case in which the client falls back to interactive re-login.
+async fn handle_refresh(
+    State(ctx): State<AppContext>,
+    Json(req): Json<RefreshRequest>,
+) -> Result<Json<RefreshResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // Path 1: AS-only admin HS256 `scope=refresh` JWT. Verify the
+    // signature against the PDS secret FIRST — only a server-minted token
+    // passes — then trust its `scope`. A sig-valid token whose scope is
+    // not "refresh" (e.g. an access token, or an account refresh token
+    // that happens to verify) is NOT minted from here; it falls through.
+    if let Ok(token_data) = crate::auth::verify_jwt_token(
+        &req.refresh_token,
+        &ctx.config.authentication.jwt_secret,
+    ) {
+        let claims = &token_data.claims;
+        if claims.get("scope").and_then(|v| v.as_str()) == Some("refresh") {
+            let did = claims
+                .get("sub")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    refresh_error(
+                        StatusCode::UNAUTHORIZED,
+                        "InvalidToken",
+                        "refresh token missing 'sub' claim",
+                    )
+                })?;
+            let sid = claims.get("sid").and_then(|v| v.as_str());
+            let rid = claims.get("rid").and_then(|v| v.as_str());
+
+            // Post-#271 tokens carry both `sid` and `rid`: rotate-on-use
+            // (#272). The presented refresh token is validated against, and
+            // its `rid` rotated within, the live operator session; the old
+            // refresh token becomes unusable (past the grace window). A
+            // rejected rotation (revoked/expired session, stale/replayed
+            // token past grace) bounces the client to interactive re-login.
+            if let (Some(sid), Some(rid)) = (sid, rid) {
+                let new_rid = match ctx.operator_session_store.rotate(sid, rid).await {
+                    Ok(Some(new_rid)) => new_rid,
+                    Ok(None) => {
+                        return Err(refresh_error(
+                            StatusCode::UNAUTHORIZED,
+                            "InvalidToken",
+                            "refresh token is no longer valid",
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::error!("operator-session rotation failed: {}", e);
+                        return Err(refresh_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "RotateFailed",
+                            "failed to rotate session",
+                        ));
+                    }
+                };
+                let secret = &ctx.config.authentication.jwt_secret;
+                let mint_err = |e: jsonwebtoken::errors::Error, what: &str| {
+                    tracing::error!("failed to mint {} on refresh: {}", what, e);
+                    refresh_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "MintFailed",
+                        "failed to mint tokens",
+                    )
+                };
+                let access_token = mint_admin_access_jwt(secret, did, Some(sid))
+                    .map_err(|e| mint_err(e, "access token"))?;
+                // Keep the session's original expiry — never slide it.
+                let exp = claims
+                    .get("exp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp() + 2592000);
+                let refresh_token = mint_admin_refresh_jwt(secret, did, sid, &new_rid, exp)
+                    .map_err(|e| mint_err(e, "refresh token"))?;
+                tracing::debug!(did = %did, "admin tokens rotated (AS-only path)");
+                return Ok(Json(RefreshResponse {
+                    access_token,
+                    refresh_token: Some(refresh_token),
+                }));
+            }
+
+            // Legacy (pre-#271) refresh token: no rotation chain to advance.
+            // Reissue a stateless access token, preserving any `sid`.
+            let access_token =
+                mint_admin_access_jwt(&ctx.config.authentication.jwt_secret, did, sid).map_err(
+                    |e| {
+                        tracing::error!("failed to mint admin access token on refresh: {}", e);
+                        refresh_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "MintFailed",
+                            "failed to mint access token",
+                        )
+                    },
+                )?;
+            tracing::debug!(did = %did, "admin access token refreshed (legacy AS-only path)");
+            return Ok(Json(RefreshResponse {
+                access_token,
+                refresh_token: None,
+            }));
+        }
+    }
+
+    // Path 2: account-backed admin refresh token (rotates).
+    match ctx.account_manager.refresh_session(&req.refresh_token).await {
+        Ok(session) => {
+            tracing::debug!(did = %session.did, "admin access token refreshed (account path)");
+            Ok(Json(RefreshResponse {
+                access_token: session.access_token,
+                refresh_token: Some(session.refresh_token),
+            }))
+        }
+        Err(e) => {
+            tracing::debug!("admin refresh rejected: {}", e);
+            Err(refresh_error(
+                StatusCode::UNAUTHORIZED,
+                "InvalidToken",
+                "invalid or expired refresh token",
+            ))
+        }
+    }
 }
 
 /// Build a fresh `OAuthClient` configured for this PDS's admin flow.
@@ -198,6 +429,7 @@ struct OAuthLoginResponse {
 async fn handle_oauth_callback(
     State(ctx): State<AppContext>,
     axum::Extension(state_store): axum::Extension<OAuthStateStore>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<OAuthCallbackParams>,
 ) -> Result<axum::response::Html<String>, (StatusCode, String)> {
     tracing::info!("Handling OAuth callback");
@@ -304,41 +536,57 @@ async fn handle_oauth_callback(
 
         (session.access_token, session.refresh_token)
     } else {
-        use jsonwebtoken::{encode, EncodingKey, Header};
-        use serde_json::json;
+
+        // Record a server-side operator session (§8.1.7 / #271). It outlives
+        // the 24h access token, so tie its lifetime to the 30d refresh
+        // window. `refresh_id` is the rotation-chain head (#272). Both the
+        // access and refresh tokens carry the resulting `sid` so the auth
+        // path can validate/touch/revoke this session per request.
+        let refresh_id = uuid::Uuid::new_v4().to_string();
+        let source_ip =
+            crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
+                .map(|ip| ip.to_string());
+        let user_agent = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let sid = ctx
+            .operator_session_store
+            .create(
+                &did,
+                source_ip.as_deref(),
+                user_agent.as_deref(),
+                &refresh_id,
+                chrono::Duration::days(30),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create operator session: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to create session".to_string(),
+                )
+            })?;
 
         let now = chrono::Utc::now().timestamp();
-        let claims = json!({
-            "sub": did,
-            "iat": now,
-            "exp": now + 86400, // 24 hours
-            "scope": "admin",
-        });
 
-        let access_token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(ctx.config.authentication.jwt_secret.as_bytes()),
-        )
-        .map_err(|e| {
-            tracing::error!("Failed to create JWT: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create token".to_string(),
-            )
-        })?;
+        let access_token =
+            mint_admin_access_jwt(&ctx.config.authentication.jwt_secret, &did, Some(&sid))
+                .map_err(|e| {
+                    tracing::error!("Failed to create JWT: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to create token".to_string(),
+                    )
+                },
+            )?;
 
-        let refresh_claims = json!({
-            "sub": did,
-            "iat": now,
-            "exp": now + 2592000, // 30 days
-            "scope": "refresh",
-        });
-
-        let refresh_token = encode(
-            &Header::default(),
-            &refresh_claims,
-            &EncodingKey::from_secret(ctx.config.authentication.jwt_secret.as_bytes()),
+        let refresh_token = mint_admin_refresh_jwt(
+            &ctx.config.authentication.jwt_secret,
+            &did,
+            &sid,
+            &refresh_id,
+            now + 2592000, // 30 days
         )
         .map_err(|e| {
             tracing::error!("Failed to create refresh token: {}", e);
@@ -392,9 +640,11 @@ async fn handle_oauth_callback(
         <p>Redirecting to admin panel...</p>
     </div>
     <script>
-        // Store tokens in localStorage
-        localStorage.setItem('adminToken', {});
-        localStorage.setItem('adminRefreshToken', {});
+        // Store tokens in localStorage under the canonical key names
+        // (§8.1.1 rename + §8.1.2 refresh consumer / #268). adminDid /
+        // adminRole keep their names (out of scope for the §8.1.1 rename).
+        localStorage.setItem('aurora-admin-token', {});
+        localStorage.setItem('aurora-admin-refresh-token', {});
         localStorage.setItem('adminDid', {});
         localStorage.setItem('adminRole', {} || 'admin');
 
@@ -444,4 +694,290 @@ async fn client_metadata(State(ctx): State<AppContext>) -> Json<ClientMetadataRe
         application_type: "web".to_string(),
         dpop_bound_access_tokens: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_refresh, mint_admin_access_jwt, RefreshRequest};
+    use crate::admin::roles::Role;
+    use crate::config::*;
+    use crate::AppContext;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::Json;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    // Must match `jwt_secret` below so minted/signed tokens verify.
+    const TEST_SECRET: &str = "test-secret-key-aurora-admin-test-32xx";
+
+    async fn create_test_context() -> AppContext {
+        let dir = tempdir().unwrap().keep();
+        let db_path = dir.join("test.db");
+        let config = ServerConfig {
+            service: ServiceConfig {
+                hostname: "localhost".to_string(),
+                port: 2583,
+                service_did: "did:web:localhost".to_string(),
+                version: "0.1.0-test".to_string(),
+                blob_upload_limit: 5_242_880,
+                public_url: None,
+                max_blob_fetch_size: 50_000_000,
+                blob_fetch_timeout_seconds: 30,
+                blob_fetch_max_retries: 3,
+                accepting_imports: true,
+                max_import_size: None,
+            },
+            storage: StorageConfig {
+                data_directory: dir.clone(),
+                account_db: db_path.clone(),
+                sequencer_db: dir.join("sequencer.db"),
+                did_cache_db: dir.join("did_cache.db"),
+                actor_store_directory: dir.join("actors"),
+                blobstore: BlobstoreConfig::Disk {
+                    location: dir.join("blobs"),
+                    tmp_location: dir.join("temp"),
+                },
+            },
+            database: Default::default(),
+            authentication: AuthConfig {
+                jwt_secret: TEST_SECRET.to_string(),
+                repo_signing_key: "a".repeat(64),
+                plc_rotation_key: "b".repeat(64),
+                oauth: OAuthConfig {
+                    client_id: "http://localhost:3000/client-metadata.json".to_string(),
+                    redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
+                    pds_url: "https://bsky.social".to_string(),
+                },
+                jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
+                oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration"
+                    .to_string(),
+                oauth_features: Default::default(),
+            },
+            identity: IdentityConfig {
+                did_plc_url: "https://plc.directory".to_string(),
+                service_handle_domains: vec![".localhost".to_string()],
+                did_cache_stale_ttl: 3600,
+                did_cache_max_ttl: 86400,
+                recovery_did_key: None,
+            },
+            email: None,
+            invites: InviteConfig {
+                required: false,
+                interval: 604800,
+                epoch: "2024-01-01T00:00:00Z".to_string(),
+            },
+            rate_limit: RateLimitConfig {
+                enabled: false,
+                global_requests_per_minute: 3000,
+                exempt_admin_assets: true,
+                buckets_retention_days: 7,
+            },
+            logging: LoggingConfig {
+                level: "info".to_string(),
+            },
+            federation: FederationConfig {
+                enabled: false,
+                relay_urls: vec![],
+                appview_url: None,
+                firehose_enabled: false,
+                crawl_enabled: false,
+                public_url: Some("http://localhost:2583".to_string()),
+                peer_pds: vec![],
+            },
+            validation_mode: crate::validation::ValidationMode::Required,
+            distributed_state_mode: Default::default(),
+            maintenance_pool: Default::default(),
+            gc_sweep: Default::default(),
+            bind_audit_orphan_marker: Default::default(),
+            blob_metadata: Default::default(),
+            entryway: None,
+            lexicon: crate::config::LexiconConfig::default(),
+            kryphocron: crate::config::KryphocronConfig::default(),
+        };
+        AppContext::new(
+            config,
+            Arc::new(crate::api::registry::RouteRegistry::default()),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn encode_jwt(claims: serde_json::Value) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    /// The shared mint helper produces a valid 24h `scope=admin` JWT.
+    #[test]
+    fn mint_admin_access_jwt_produces_valid_admin_token() {
+        let token = mint_admin_access_jwt(TEST_SECRET, "did:plc:minttest", None).unwrap();
+        let td = crate::auth::verify_jwt_token(&token, TEST_SECRET).expect("verifies");
+        assert_eq!(
+            td.claims.get("scope").and_then(|v| v.as_str()),
+            Some("admin")
+        );
+        assert_eq!(
+            td.claims.get("sub").and_then(|v| v.as_str()),
+            Some("did:plc:minttest")
+        );
+        let exp = td.claims.get("exp").and_then(|v| v.as_i64()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(exp > now + 86_000 && exp <= now + 86_400 + 5, "~24h expiry");
+    }
+
+    /// §8.1.2 happy path: a valid HS256 `scope=refresh` JWT yields a fresh
+    /// access token that is itself a usable admin credential, and the
+    /// refresh token is NOT rotated on the AS-only path.
+    #[tokio::test]
+    async fn refresh_hs256_scope_refresh_mints_usable_admin_token() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:refreshtest";
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let refresh = encode_jwt(serde_json::json!({
+            "sub": did, "iat": now, "exp": now + 2_592_000, "scope": "refresh",
+        }));
+
+        let resp = handle_refresh(
+            State(ctx.clone()),
+            Json(RefreshRequest {
+                refresh_token: refresh,
+            }),
+        )
+        .await
+        .expect("refresh succeeds")
+        .0;
+
+        assert!(
+            resp.refresh_token.is_none(),
+            "AS-only path must not rotate the refresh token"
+        );
+        // The minted access token works as an admin credential and carries
+        // the live role (proving end-to-end usability + §8.1.6 coupling).
+        let auth = crate::auth::admin_auth_from_token(&ctx, &resp.access_token)
+            .await
+            .expect("minted token is a usable admin credential");
+        assert_eq!(auth.did, did);
+        assert_eq!(auth.role, Role::Admin);
+    }
+
+    /// An expired refresh token is rejected with 401 (falls through the
+    /// HS256 path on the failed signature/expiry check, then the account
+    /// path misses) — the client's only re-login trigger.
+    #[tokio::test]
+    async fn refresh_rejects_expired_refresh_token() {
+        let ctx = create_test_context().await;
+        let now = chrono::Utc::now().timestamp();
+        let expired = encode_jwt(serde_json::json!({
+            "sub": "did:plc:x", "iat": now - 100_000, "exp": now - 86_400, "scope": "refresh",
+        }));
+        let err = handle_refresh(
+            State(ctx),
+            Json(RefreshRequest {
+                refresh_token: expired,
+            }),
+        )
+        .await
+        .expect_err("expired refresh must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A `scope=admin` access token presented to the refresh endpoint must
+    /// NOT mint another access token (no access->access loop): it isn't
+    /// `scope=refresh`, so it falls to the account path and 401s.
+    #[tokio::test]
+    async fn refresh_rejects_access_token_presented_as_refresh() {
+        let ctx = create_test_context().await;
+        let access = mint_admin_access_jwt(TEST_SECRET, "did:plc:x", None).unwrap();
+        let err = handle_refresh(
+            State(ctx),
+            Json(RefreshRequest {
+                refresh_token: access,
+            }),
+        )
+        .await
+        .expect_err("access token is not a refresh token");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A non-JWT string is rejected with 401.
+    #[tokio::test]
+    async fn refresh_rejects_garbage_token() {
+        let ctx = create_test_context().await;
+        let err = handle_refresh(
+            State(ctx),
+            Json(RefreshRequest {
+                refresh_token: "not.a.jwt".to_string(),
+            }),
+        )
+        .await
+        .expect_err("garbage must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// #272 rotation-on-use end to end via the endpoint: a sid+rid refresh
+    /// token rotates (returns a NEW refresh token), the new one rotates
+    /// again (the chain advances), and a token whose `rid` was never the
+    /// session's current head is rejected.
+    #[tokio::test]
+    async fn refresh_rotates_chain_and_rejects_stale_rid() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:rotateop";
+        let exp = chrono::Utc::now().timestamp() + 2_592_000;
+        let sid = ctx
+            .operator_session_store
+            .create(did, None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+
+        let refresh_r1 = encode_jwt(serde_json::json!({
+            "sub": did, "exp": exp, "scope": "refresh", "sid": sid, "rid": "r1",
+        }));
+        let resp1 = handle_refresh(
+            State(ctx.clone()),
+            Json(RefreshRequest {
+                refresh_token: refresh_r1.clone(),
+            }),
+        )
+        .await
+        .expect("rotation succeeds")
+        .0;
+        let new_refresh = resp1.refresh_token.expect("rotation returns a new refresh token");
+        assert_ne!(new_refresh, refresh_r1, "a new refresh token is issued");
+
+        // The newly issued refresh token rotates again — the chain advances.
+        let resp2 = handle_refresh(
+            State(ctx.clone()),
+            Json(RefreshRequest {
+                refresh_token: new_refresh.clone(),
+            }),
+        )
+        .await
+        .expect("second rotation succeeds")
+        .0;
+        let new_refresh2 = resp2.refresh_token.expect("second rotation returns a token");
+        assert_ne!(new_refresh2, new_refresh, "chain advanced again");
+
+        // A token whose rid was never this session's head is rejected.
+        let bogus = encode_jwt(serde_json::json!({
+            "sub": did, "exp": exp, "scope": "refresh", "sid": sid, "rid": "never-current",
+        }));
+        let err = handle_refresh(
+            State(ctx),
+            Json(RefreshRequest {
+                refresh_token: bogus,
+            }),
+        )
+        .await
+        .expect_err("stale rid must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
 }

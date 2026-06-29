@@ -10,7 +10,7 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#dashboard">Operations</a> <span class="breadcrumb-sep">›</span> Sequencer</nav>' +
       '<header class="page-header"><div><h2>Sequencer</h2><p class="page-subtitle">Position, lag, recent events</p></div></header>' +
-      '<div class="ops-section" id="seq-status"><h3>Status</h3><p class="empty-state">Loading…</p></div>' +
+      '<div class="ops-section" id="seq-status"><h3>Status</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '<div class="ops-section" id="seq-controls"><h3>Controls</h3>' +
       '  <div class="action-panel-buttons" style="justify-content:flex-start; gap: 0.5rem; flex-wrap: wrap;">' +
       '    <button class="btn-secondary" id="seq-pause">Pause</button>' +
@@ -19,12 +19,12 @@
       '    <button class="btn-danger" id="seq-rebuild">Rebuild</button>' +
       '  </div>' +
       '</div>' +
-      '<div class="ops-section" id="seq-recent"><h3>Recent events</h3><p class="empty-state">Loading…</p></div>';
+      '<div class="ops-section" id="seq-recent"><h3>Recent events</h3>' + global.AuroraSkeleton.lines(3) + '</div>';
 
-    document.getElementById('seq-pause').addEventListener('click', () => doAction('pauseSequencer', 'Pause sequencer?'));
-    document.getElementById('seq-resume').addEventListener('click', () => doAction('resumeSequencer', 'Resume sequencer?'));
-    document.getElementById('seq-reset').addEventListener('click', () => doAction('resetSequencerCursor', 'Reset sequencer cursor? This is high-impact.'));
-    document.getElementById('seq-rebuild').addEventListener('click', () => doAction('rebuildSequencer', 'Rebuild the entire sequencer? This is very high-impact.'));
+    document.getElementById('seq-pause').addEventListener('click', (e) => doAction('pauseSequencer', 'Pause sequencer?', e.currentTarget));
+    document.getElementById('seq-resume').addEventListener('click', (e) => doAction('resumeSequencer', 'Resume sequencer?', e.currentTarget));
+    document.getElementById('seq-reset').addEventListener('click', (e) => doAction('resetSequencerCursor', 'Reset sequencer cursor? This is high-impact.', e.currentTarget));
+    document.getElementById('seq-rebuild').addEventListener('click', (e) => doAction('rebuildSequencer', 'Rebuild the entire sequencer? This is very high-impact.', e.currentTarget));
 
     await refresh();
     pollHandle = setInterval(refresh, 30_000);
@@ -60,7 +60,7 @@
         '<tbody>' + items.map((e) =>
           '<tr><td>' + esc(e.sequence || e.seq) + '</td>' +
           '<td>' + esc(e.eventType || e.kind) + '</td>' +
-          '<td>' + esc(fmt ? fmt.date(e.createdAt || e.timestamp, 'short') : '') + '</td>' +
+          '<td>' + global.AuroraTimestamp.render({ value: e.createdAt || e.timestamp, context: 'detail' }) + '</td>' +
           '<td>' + (e.did ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(e.did) : '<code>' + esc(e.did) + '</code>') : '—') + '</td></tr>'
         ).join('') + '</tbody></table>';
     } catch (e) {
@@ -68,7 +68,7 @@
     }
   }
 
-  async function doAction(nsidLeaf, prompt) {
+  async function doAction(nsidLeaf, prompt, btn) {
     // Per V04_DESIGN §5.3.3's Sequencer decision: sequencer ops are
     // almost universally destructive (cursor adjustments, event
     // replay, restart), so the dispatcher uses destructiveConfirm
@@ -82,7 +82,7 @@
     });
     if (!result.confirmed) return;
     try {
-      await global.AuroraClient.post('tools.aurora.ops.' + nsidLeaf, {});
+      await global.AuroraSpinner.busy(btn, () => global.AuroraEndpoints.ops[nsidLeaf]());
       global.AuroraToast.success('Action complete: ' + nsidLeaf);
       await refresh();
     } catch (e) {

@@ -9,7 +9,7 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#ops/invites">Operations</a> <span class="breadcrumb-sep">›</span> <a href="#ops/invites">Invites</a> <span class="breadcrumb-sep">›</span> <code>' + esc(code) + '</code></nav>' +
       '<header class="page-header"><div><h2>Invite <code>' + esc(code) + '</code></h2></div></header>' +
-      '<div id="id-body"><p class="empty-state">Loading…</p></div>';
+      '<div id="id-body">' + global.AuroraSkeleton.lines(4) + '</div>';
     try {
       const data = await global.AuroraEndpoints.atproto.getInviteCodes({ codes: [code] });
       const codes = (data && (data.codes || data.inviteCodes)) || [];
@@ -37,7 +37,7 @@
       '    <p><strong>Code:</strong> <code>' + esc(c.code) + '</code></p>' +
       '    <p><strong>Status:</strong> ' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(c.disabled ? 'suspended' : 'active', c.disabled ? 'Disabled' : 'Active') : '') + '</p>' +
       '    <p><strong>Uses:</strong> ' + (c.uses || 0) + ' / ' + (c.available || 1) + '</p>' +
-      '    <p><strong>Created at:</strong> ' + esc(fmt ? fmt.date(c.created_at, 'medium') : c.created_at) + '</p>' +
+      '    <p><strong>Created at:</strong> ' + global.AuroraTimestamp.render({ value: c.created_at, context: 'detail' }) + '</p>' +
       '    <p><strong>Created by:</strong> ' + (c.created_by ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(c.created_by) : '@' + esc(c.created_by)) : 'system') + '</p>' +
       '  </div>' +
       '  <div class="settings-card">' +
@@ -45,7 +45,7 @@
       (usedBy.length === 0 ? '<p class="empty-state">No redemptions yet.</p>' :
        '<ul style="list-style:none; padding:0;">' + usedBy.map((u) =>
          '<li style="padding: 0.25rem 0;">' + (global.AuroraEntityRef ? global.AuroraEntityRef.account(u.usedBy || u.did, u.handle) : esc(u.usedBy || u.did || u)) +
-         (u.usedAt ? ' <span style="color: var(--text-tertiary);">— ' + esc(fmt ? fmt.relativeTime(u.usedAt) : u.usedAt) + '</span>' : '') +
+         (u.usedAt ? ' <span style="color: var(--color-text-tertiary);">— ' + global.AuroraTimestamp.render({ value: u.usedAt, context: 'activity' }) + '</span>' : '') +
          '</li>').join('') + '</ul>') +
       '  </div>' +
       '</div>' +

@@ -187,6 +187,20 @@ pub enum Commands {
         /// Number of concurrent rotations (default: 10)
         #[arg(short, long, default_value = "10")]
         concurrency: usize,
+
+        /// Optional rationale recorded in the rotation audit entry.
+        #[arg(long)]
+        rationale: Option<String>,
+
+        /// Operator-supplied public did:key (key-rotation arc §4.4). Requires
+        /// --private-key-hex, only one DID, and the runtime gate
+        /// key_rotation.operator_supplied_keys_enabled = true.
+        #[arg(long, requires = "private_key_hex")]
+        public_key: Option<String>,
+
+        /// Operator-supplied private key, hex-encoded. Requires --public-key.
+        #[arg(long, requires = "public_key")]
+        private_key_hex: Option<String>,
     },
 
     /// Rotate keys from file (one DID per line)

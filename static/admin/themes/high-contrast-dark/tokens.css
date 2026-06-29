@@ -1,0 +1,40 @@
+/*
+ * high-contrast-dark — token overrides. Extends dark.
+ *
+ * Functional accessibility theme: pure-black background, pure/near-white text,
+ * and a single maximum-luminance yellow accent. Every contrast-requiring pair
+ * is designed to clear WCAG 2.2 AAA (7:1 normal text). Design subordinates to
+ * the contrast requirement. Typography, sizing, motion, and the effect library
+ * are inherited from dark.
+ */
+
+:root {
+  /* Surfaces — pure black, minimal elevation steps */
+  --color-surface-primary: #000000;
+  --color-surface-secondary: #0b0b0b;
+  --color-surface-tertiary: #161616;
+  --color-surface-overlay: rgba(0, 0, 0, 0.75);
+
+  /* Text — white / near-white, all pairs ≥ 7:1 */
+  --color-text-primary: #ffffff;
+  --color-text-secondary: #f2f2f2;
+  --color-text-tertiary: #d6d6d6;
+  --color-text-inverted: #000000;
+
+  /* Accent — maximum-luminance yellow against black */
+  --color-accent-primary: #ffd400;
+  --color-accent-primary-hover: #ffdf45;
+  --color-accent-primary-active: #e6bf00;
+  --color-accent-secondary: #d6d6d6;
+
+  /* Status — bright, high-luminance against black */
+  --color-status-success: #00e676;
+  --color-status-warning: #ffd400;
+  --color-status-danger: #ff5a5a;
+  --color-status-info: #4dc3ff;
+
+  /* Borders — strongly visible (no faint hairlines in HC) */
+  --color-border-primary: rgba(255, 255, 255, 0.5);
+  --color-border-secondary: rgba(255, 255, 255, 0.3);
+  --color-border-focus: var(--color-accent-primary);
+}

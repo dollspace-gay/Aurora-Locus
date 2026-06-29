@@ -11,6 +11,11 @@
 
   // -------- com.atproto.* --------
   const atproto = {
+    // Public server descriptor — real static config (inviteCodeRequired,
+    // availableUserDomains, DID). Used by the Registration policy overview (#342).
+    describeServer: () => C().get('com.atproto.server.describeServer'),
+    // Public federation-scoped describe (#344) — Aurora-aware peer posture.
+    describeFederationPosture: () => C().get('com.aurora.federation.describePosture'),
     listAccounts: (params) => C().get('com.atproto.admin.listAccounts', params || { limit: 100 }),
     getAccount: (did) => C().get('com.atproto.admin.getAccount', { did: did }),
     getAccountInfo: (did) => C().get('com.atproto.admin.getAccountInfo', { did: did }),
@@ -23,8 +28,21 @@
     createInviteCode: (body) => C().post('com.atproto.admin.createInviteCode', body),
     disableInviteCode: (body) => C().post('com.atproto.admin.disableInviteCode', body),
     disableInviteCodes: (body) => C().post('com.atproto.admin.disableInviteCodes', body),
+    // Account-mutation surface for the Account Detail page (#362.1). These were
+    // direct AuroraClient.post() calls bypassing the registry; routing them here
+    // keeps every account mutation discoverable in one place. Each body shape is
+    // the handler's request struct (did + the field(s) being changed; rationale
+    // when the handler records one — see #362.5).
+    updateAccountPassword: (body) => C().post('com.atproto.admin.updateAccountPassword', body),
+    updateAccountEmail: (body) => C().post('com.atproto.admin.updateAccountEmail', body),
+    updateAccountHandle: (body) => C().post('com.atproto.admin.updateAccountHandle', body),
+    updateAccountSigningKey: (body) => C().post('com.atproto.admin.updateAccountSigningKey', body),
+    enableAccountInvites: (body) => C().post('com.atproto.admin.enableAccountInvites', body),
+    disableAccountInvites: (body) => C().post('com.atproto.admin.disableAccountInvites', body),
+    deleteAccount: (body) => C().post('com.atproto.admin.deleteAccount', body),
     listRecentEvents: (params) => C().get('com.atproto.admin.listRecentEvents', params || { limit: 20 }),
     getRecord: (params) => C().get('com.atproto.repo.getRecord', params),
+    getReport: (params) => C().get('tools.aurora.admin.getReport', params || {}),
     getSession: () => C().get('com.atproto.server.getSession'),
   };
 
@@ -32,13 +50,30 @@
   const adminTools = {
     describeCapabilities: () => C().get('tools.aurora.describeCapabilities'),
     getQueueStats: () => C().get('tools.aurora.admin.getQueueStats'),
-    getModerationMetrics: (body) => C().post('tools.aurora.admin.getModerationMetrics', body),
+    // GET per the XRPC `query` convention (chainlink #118; route registered
+    // `get(...)` in src/api/admin.rs). Params (timeRange/granularity/metrics)
+    // ride the query string — `metrics` is a repeated key (client.get expands
+    // arrays), which the handler's axum_extra Query requires.
+    getModerationMetrics: (params) => C().get('tools.aurora.admin.getModerationMetrics', params),
+    // #361 — account-growth series backing the Dashboard sparkline. No params;
+    // the handler fixes a 30-day UTC window. Admin+.
+    getAccountGrowth: () => C().get('tools.aurora.admin.getAccountGrowth'),
     getAuditTrail: (params) => C().get('tools.aurora.admin.getAuditTrail', params || { limit: 25 }),
+    // #359 — single audit-chain entry by id or current_hash (the walk-to-
+    // previous path). Replaces the page-scoped window._auditCache.
+    getAuditEntry: (params) => C().get('tools.aurora.admin.getAuditEntry', params || {}),
     triggerPasswordReset: (body) => C().post('tools.aurora.admin.triggerPasswordReset', body),
     exportAccountForensicRaw: (body) => C().postRaw('tools.aurora.admin.exportAccountForensic', body),
     getRuntimeSetting: (key) => C().get('tools.aurora.admin.getRuntimeSetting', { key: key }),
     setRuntimeSetting: (body) => C().post('tools.aurora.admin.setRuntimeSetting', body),
     emitEvent: (body) => C().post('tools.aurora.admin.emitEvent', body),
+    // Per-operator session management (§8.1.7 / #273). listSessions: own
+    // sessions (self-service) or, for SuperAdmin, a `did` for one operator
+    // / omitted for all. revokeSession: force-logout a single sid.
+    listSessions: (params) => C().get('tools.aurora.admin.listSessions', params || { limit: 25 }),
+    revokeSession: (body) => C().post('tools.aurora.admin.revokeSession', body),
+    // Bulk force-logout of every active session for one operator (SuperAdmin; #338).
+    revokeOperatorSessions: (body) => C().post('tools.aurora.admin.revokeOperatorSessions', body || {}),
   };
 
   // -------- tools.aurora.moderator.* --------
@@ -49,6 +84,7 @@
     getAppeal: (id) => C().get('tools.aurora.moderator.getAppeal', { id: id }),
     getSubjectContext: (params) => C().get('tools.aurora.moderator.getSubjectContext', params || {}),
     getSubjectHistory: (params) => C().get('tools.aurora.moderator.getSubjectHistory', params || {}),
+    resolveAppeal: (body) => C().post('tools.aurora.moderator.resolveAppeal', body),
   };
 
   // -------- tools.aurora.ops.* --------
@@ -57,6 +93,19 @@
     getInstanceMetrics: () => C().get('tools.aurora.ops.getInstanceMetrics'),
     getSystemHealth: () => C().get('tools.aurora.ops.getSystemHealth'),
     getFederationStatus: () => C().get('tools.aurora.ops.getFederationStatus'),
+    // SuperAdmin full deployment-federation env view for the policy page (#344).
+    getFederationPolicy: () => C().get('tools.aurora.ops.getFederationPolicy'),
+    // v0.9 Federation Pattern-1 Phase B (#352) — peer-allowlist CRUD (SuperAdmin).
+    addFederationPeer: (body) => C().post('tools.aurora.ops.addFederationPeer', body),
+    removeFederationPeer: (body) => C().post('tools.aurora.ops.removeFederationPeer', body),
+    modifyFederationPeer: (body) => C().post('tools.aurora.ops.modifyFederationPeer', body),
+    // v0.9 Federation Pattern-1 Phase C (#353) — discovery mode + pending dismissal.
+    setDiscoveryMode: (body) => C().post('tools.aurora.ops.setDiscoveryMode', body),
+    dismissPendingDiscovery: (body) => C().post('tools.aurora.ops.dismissPendingDiscovery', body),
+    // v0.9 Federation Pattern-1 Phase D (#354) — relay runtime-switch (SuperAdmin).
+    addRelayUrl: (body) => C().post('tools.aurora.ops.addRelayUrl', body),
+    removeRelayUrl: (body) => C().post('tools.aurora.ops.removeRelayUrl', body),
+    setFederationRelays: (body) => C().post('tools.aurora.ops.setFederationRelays', body),
     getVersionInfo: () => C().get('tools.aurora.ops.getVersionInfo'),
     listBlobs: (params) => C().get('tools.aurora.ops.listBlobs', params || {}),
     getBlobStatistics: () => C().get('tools.aurora.ops.getBlobStatistics'),
@@ -70,12 +119,111 @@
     listBackgroundJobs: () => C().get('tools.aurora.ops.listBackgroundJobs'),
     getNonceStoreStatus: () => C().get('tools.aurora.ops.getNonceStoreStatus'),
     getValidationFailures: (params) => C().get('tools.aurora.ops.getValidationFailures', params || {}),
+    // §11.10.2 — installed themes + their validation status (B-themes-page).
+    listInstalledThemes: () => C().get('tools.aurora.ops.themes.listInstalled'),
+    // Control POSTs (§8.1.5 fold-in — were stringly-typed AuroraClient.post
+    // calls in the ops pages; registered here so every NSID has a named
+    // wrapper). All take an empty body today.
+    runBlobGC: () => C().post('tools.aurora.ops.runBlobGC', {}),
+    pauseSequencer: () => C().post('tools.aurora.ops.pauseSequencer', {}),
+    resumeSequencer: () => C().post('tools.aurora.ops.resumeSequencer', {}),
+    resetSequencerCursor: () => C().post('tools.aurora.ops.resetSequencerCursor', {}),
+    rebuildSequencer: () => C().post('tools.aurora.ops.rebuildSequencer', {}),
+    triggerPdsDiscovery: () => C().post('tools.aurora.ops.triggerPdsDiscovery', {}),
+    cleanupRateLimitState: () => C().post('tools.aurora.ops.cleanupRateLimitState', {}),
+    runHealthChecks: () => C().post('tools.aurora.ops.runHealthChecks', {}),
+    cleanupNonceStores: () => C().post('tools.aurora.ops.cleanupNonceStores', {}),
+  };
+
+  // -------- tools.aurora.ops.kryphocron.* (v0.9 Arc D, #225 backend) --------
+  // The ten operator read XRPC backing the Kryphocron domain pages (§6.4,
+  // §6.5). `triggerRotation` (#223) + the read cohort (#225). listAudiences /
+  // getBlockCascadeImpact are per-account-filtered (the §6.5 drawer).
+  opsTools.kryphocron = {
+    getSubstrateInfo: () => C().get('tools.aurora.ops.kryphocron.getSubstrateInfo'),
+    getTierStats: () => C().get('tools.aurora.ops.kryphocron.getTierStats'),
+    getOracleActivity: () => C().get('tools.aurora.ops.kryphocron.getOracleActivity'),
+    getRotationStatus: () => C().get('tools.aurora.ops.kryphocron.getRotationStatus'),
+    getRotationProgress: () => C().get('tools.aurora.ops.kryphocron.getRotationProgress'),
+    triggerRotation: (body) => C().post('tools.aurora.ops.kryphocron.triggerRotation', body || {}),
+    cancelRotation: () => C().post('tools.aurora.ops.kryphocron.cancelRotation', {}),
+    listRotations: () => C().get('tools.aurora.ops.kryphocron.listRotations'),
+    getAudienceAggregate: () => C().get('tools.aurora.ops.kryphocron.getAudienceAggregate'),
+    listAudiences: (account) =>
+      C().get('tools.aurora.ops.kryphocron.listAudiences', { account: account }),
+    getBlockCascadeImpact: (account) =>
+      C().get('tools.aurora.ops.kryphocron.getBlockCascadeImpact', { account: account }),
+    // Per-account overrides (#316, SuperAdmin) — Account Detail drawer.
+    getAccountOverrides: (did) =>
+      C().get('tools.aurora.ops.kryphocron.getAccountOverrides', { did: did }),
+    setAccountOverride: (body) =>
+      C().post('tools.aurora.ops.kryphocron.setAccountOverride', body || {}),
   };
 
   // -------- tools.aurora.superadmin.* --------
   const superadminTools = {
     grantRole: (body) => C().post('tools.aurora.superadmin.grantRole', body),
     revokeRole: (body) => C().post('tools.aurora.superadmin.revokeRole', body),
+    // v0.9 Federation runtime-mutability arc §2.3 (#400) — bulk did:plc update
+    // result surface: latest run + per-account retry.
+    getBulkDidDocUpdateLatest: () => C().get('tools.aurora.superadmin.getBulkDidDocUpdateLatest'),
+    retryBulkDidDocUpdateForDid: (body) => C().post('tools.aurora.superadmin.retryBulkDidDocUpdateForDid', body),
+    // v0.9 Federation runtime-mutability arc F-phase (#401/#402/#403) — runtime
+    // setting revert (C4), queued restart markers (C7), operator restart (D1).
+    deleteRuntimeSetting: (body) => C().post('tools.aurora.superadmin.deleteRuntimeSetting', body),
+    listPendingRestartActions: () => C().get('tools.aurora.superadmin.listPendingRestartActions'),
+    triggerRestart: (body) => C().post('tools.aurora.superadmin.triggerRestart', body),
+    // §5.5.4 Phase B (#346) — manual reviewer reassignment.
+    assignReviewer: (body) => C().post('tools.aurora.superadmin.assignReviewer', body),
+    // §5.5.4 Phase C (#347) — auto-label rule CRUD.
+    createAutoLabelRule: (body) => C().post('tools.aurora.superadmin.createAutoLabelRule', body),
+    editAutoLabelRule: (body) => C().post('tools.aurora.superadmin.editAutoLabelRule', body),
+    deleteAutoLabelRule: (body) => C().post('tools.aurora.superadmin.deleteAutoLabelRule', body),
+    listAutoLabelRules: (params) => C().get('tools.aurora.superadmin.listAutoLabelRules', params || {}),
+    // §5.5.4 Phase D (#348) — escalation rule CRUD + de-escalation.
+    createEscalationRule: (body) => C().post('tools.aurora.superadmin.createEscalationRule', body),
+    editEscalationRule: (body) => C().post('tools.aurora.superadmin.editEscalationRule', body),
+    deleteEscalationRule: (body) => C().post('tools.aurora.superadmin.deleteEscalationRule', body),
+    listEscalationRules: (params) => C().get('tools.aurora.superadmin.listEscalationRules', params || {}),
+    clearEscalation: (body) => C().post('tools.aurora.superadmin.clearEscalation', body),
+    // §5.5.4 Phase E (#349) — composite-load of all four sub-surfaces.
+    getDefaultsState: () => C().get('tools.aurora.superadmin.getDefaultsState'),
+    // v0.9 Integration hooks Phase A (#350) — declaration CRUD + composite-load.
+    createHook: (body) => C().post('tools.aurora.superadmin.createHook', body),
+    editHook: (body) => C().post('tools.aurora.superadmin.editHook', body),
+    deleteHook: (body) => C().post('tools.aurora.superadmin.deleteHook', body),
+    listHooks: (params) => C().get('tools.aurora.superadmin.listHooks', params || {}),
+    getIntegrationHooksState: () => C().get('tools.aurora.superadmin.getIntegrationHooksState'),
+    // Repository rebuild (§7.4.1 / #286 + #290). preRebuildCheck: shallow
+    // metadata preflight ({did}), or full reconstruction+verification
+    // ({did, deep:true}). rebuildRepo: start a rebuild ({did, rationale}) →
+    // {jobId}. getRebuildProgress/cancelRebuild: poll/abort by job-id.
+    preRebuildCheck: (params) => C().get('tools.aurora.superadmin.preRebuildCheck', params),
+    rebuildRepo: (body) => C().post('tools.aurora.superadmin.rebuildRepo', body),
+    getRebuildProgress: (jobId) =>
+      C().get('tools.aurora.superadmin.getRebuildProgress', { jobId: jobId }),
+    cancelRebuild: (jobId) =>
+      C().post('tools.aurora.superadmin.cancelRebuild', { jobId: jobId }),
+    // Bulk repository repair (§7.4.3 / #291 scan + #292 repair). scan*: start /
+    // poll / cancel the across-accounts inconsistency scan + read findings.
+    // repair*: start / poll / cancel the bulk repair over the findings.
+    scanReposForInconsistencies: () =>
+      C().post('tools.aurora.superadmin.scanReposForInconsistencies', {}),
+    getScanProgress: () => C().get('tools.aurora.superadmin.getScanProgress'),
+    cancelScan: () => C().post('tools.aurora.superadmin.cancelScan', {}),
+    getRepoScanResults: (params) =>
+      C().get('tools.aurora.superadmin.getRepoScanResults', params || {}),
+    repairRepos: (body) => C().post('tools.aurora.superadmin.repairRepos', body),
+    getBulkRepairProgress: () => C().get('tools.aurora.superadmin.getBulkRepairProgress'),
+    cancelBulkRepair: () => C().post('tools.aurora.superadmin.cancelBulkRepair', {}),
+    // Sequencer recovery (§7.4.2 / #294). options: current state + available
+    // operations. run: dispatch one (v0.9: "validate", read-only deep
+    // integrity validation). progress/cancel: poll/abort the in-flight op.
+    sequencerRecoveryOptions: () => C().get('tools.aurora.superadmin.sequencerRecoveryOptions'),
+    runSequencerRecovery: (body) => C().post('tools.aurora.superadmin.runSequencerRecovery', body),
+    getSequencerRecoveryProgress: () =>
+      C().get('tools.aurora.superadmin.getSequencerRecoveryProgress'),
+    cancelSequencerRecovery: () => C().post('tools.aurora.superadmin.cancelSequencerRecovery', {}),
   };
 
   global.AuroraEndpoints = {

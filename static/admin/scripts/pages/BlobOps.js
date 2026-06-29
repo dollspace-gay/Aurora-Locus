@@ -10,13 +10,13 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#dashboard">Operations</a> <span class="breadcrumb-sep">›</span> Blob ops</nav>' +
       '<header class="page-header"><div><h2>Blob ops</h2><p class="page-subtitle">Storage and blob lifecycle</p></div></header>' +
-      '<div class="ops-section" id="bo-stats"><h3>Storage statistics</h3><p class="empty-state">Loading…</p></div>' +
-      '<div class="ops-section" id="bo-recent"><h3>Recent blobs</h3><p class="empty-state">Loading…</p></div>' +
+      '<div class="ops-section" id="bo-stats"><h3>Storage statistics</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '<div class="ops-section" id="bo-recent"><h3>Recent blobs</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '<div class="ops-section">' +
       '  <h3>Controls</h3>' +
       '  <button class="btn-secondary" id="bo-gc">Run GC</button>' +
       '</div>';
-    document.getElementById('bo-gc').addEventListener('click', runGC);
+    document.getElementById('bo-gc').addEventListener('click', (e) => runGC(e.currentTarget));
     await refresh();
     pollHandle = setInterval(refresh, 60_000);
     return { unmount: () => { if (pollHandle) clearInterval(pollHandle); pollHandle = null; } };
@@ -60,7 +60,7 @@
     }
   }
 
-  async function runGC() {
+  async function runGC(btn) {
     const result = await global.AuroraModal.form({
       heading: 'Run blob garbage collection?',
       body: 'This may take a few minutes. The operation is safe to interrupt.',
@@ -69,7 +69,7 @@
     });
     if (!result.submitted) return;
     try {
-      await global.AuroraClient.post('tools.aurora.ops.runBlobGC', {});
+      await global.AuroraSpinner.busy(btn, () => global.AuroraEndpoints.ops.runBlobGC());
       global.AuroraToast.success('Blob GC started.');
       await refresh();
     } catch (e) {

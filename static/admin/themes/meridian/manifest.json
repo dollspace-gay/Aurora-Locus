@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "meridian",
+  "themeName": "Meridian",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "dark",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "Structured editorial light theme; disciplined typography and grid.",
+  "files": {
+    "tokens": "tokens.css"
+  }
+}

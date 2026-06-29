@@ -4,7 +4,7 @@
 
 mod manager;
 
-pub use manager::{AccountManager, ConsumeResult};
+pub use manager::{AccountManager, ConsumeResult, OperatorSuppliedKeypair};
 
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +62,15 @@ pub struct SessionInfo {
     pub handle: String,
     pub email: Option<String>,
     pub email_confirmed: Option<bool>,
+    /// The caller's operator role (`"moderator"` / `"admin"` / `"superadmin"`)
+    /// when the DID holds a non-revoked `admin_roles` grant; absent for regular
+    /// accounts. The admin UI reads this off `getSession` to resolve the live
+    /// operator tier for its sidebar/route gating (#297) — the role is looked
+    /// up per request (not token-baked), so a role change is reflected on the
+    /// next `getSession` without re-login (§8.1.6). `#[serde(skip)]` when None
+    /// keeps the standard atproto session shape unchanged for non-operators.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// Validated session from bearer token
@@ -119,4 +128,42 @@ pub struct ListAppPasswordsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeAppPasswordRequest {
     pub name: String,
+}
+
+#[cfg(test)]
+mod session_info_tests {
+    use super::*;
+
+    // #297 — the admin UI reads `role` off the getSession response to resolve
+    // the live operator tier. Pin the wire contract: present when the caller
+    // is an operator, omitted (standard atproto session shape) otherwise.
+    #[test]
+    fn role_is_serialized_under_camelcase_role_key_when_present() {
+        let s = SessionInfo {
+            did: "did:plc:op".to_string(),
+            handle: "op.localhost".to_string(),
+            email: None,
+            email_confirmed: Some(false),
+            role: Some("superadmin".to_string()),
+        };
+        let v = serde_json::to_value(&s).expect("serialize");
+        assert_eq!(v["role"], serde_json::json!("superadmin"));
+    }
+
+    #[test]
+    fn role_is_omitted_for_non_operators() {
+        let s = SessionInfo {
+            did: "did:plc:user".to_string(),
+            handle: "user.localhost".to_string(),
+            email: None,
+            email_confirmed: Some(false),
+            role: None,
+        };
+        let v = serde_json::to_value(&s).expect("serialize");
+        assert!(
+            v.get("role").is_none(),
+            "role must be omitted (not null) for regular accounts so the standard \
+             session shape is unchanged",
+        );
+    }
 }

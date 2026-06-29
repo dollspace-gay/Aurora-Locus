@@ -3,8 +3,9 @@
 use crate::{
     admin::{
         audit_chain::{self, AppendEntryParams},
-        defs::Subject,
-        InviteCode,
+        defs::{PaginationParams, Subject},
+        operator_session::SessionCursor,
+        InviteCode, OperatorSessionStore,
     },
     api::registry::{aurora_route_builder, CapsBuilder, Family, RouteRegistry},
     auth::AdminAuthContext,
@@ -402,6 +403,63 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(trigger_pds_discovery),
             CapsBuilder::new(Family::Ops),
         )
+        // #344 — SuperAdmin read of the full deployment federation config (the
+        // env-view the Configuration → Federation policy page renders). Distinct
+        // from getFederationStatus (counts/connectivity); the handler gates
+        // SuperAdmin and returns security-adjacent fields (peer allowlist) the
+        // public describe endpoints intentionally omit.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.getFederationPolicy",
+            get(get_federation_policy),
+            CapsBuilder::new(Family::Ops),
+        )
+        // v0.9 Federation Pattern-1 Phase B (#352) — peer-allowlist CRUD.
+        // SuperAdmin-gated in-handler (the federation family lives under
+        // Family::Ops alongside getFederationPolicy); mutates the runtime
+        // federation.policy.peer-allowlist via CAS + audit emission.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.addFederationPeer",
+            post(add_federation_peer),
+            CapsBuilder::new(Family::Ops),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.removeFederationPeer",
+            post(remove_federation_peer),
+            CapsBuilder::new(Family::Ops),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.modifyFederationPeer",
+            post(modify_federation_peer),
+            CapsBuilder::new(Family::Ops),
+        )
+        // v0.9 Federation Pattern-1 Phase C (#353) — discovery-mode +
+        // pending-discovery dismissal.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.setDiscoveryMode",
+            post(set_discovery_mode),
+            CapsBuilder::new(Family::Ops),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.dismissPendingDiscovery",
+            post(dismiss_pending_discovery),
+            CapsBuilder::new(Family::Ops),
+        )
+        // v0.9 Federation Pattern-1 Phase D (#354) — relay runtime-switch.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.addRelayUrl",
+            post(add_relay_url),
+            CapsBuilder::new(Family::Ops),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.removeRelayUrl",
+            post(remove_relay_url),
+            CapsBuilder::new(Family::Ops),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.setFederationRelays",
+            post(set_federation_relays),
+            CapsBuilder::new(Family::Ops),
+        )
         // ---- tools.aurora.moderator.* (chainlink #100 / Phase 3.3) ----
         //
         // Moderator-tier read endpoints. Five queries with shared
@@ -572,6 +630,14 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             get(crate::api::aurora_admin::get_moderation_metrics),
             CapsBuilder::new(Family::Admin).extensions(["moderation-metrics-v1"]),
         )
+        // #361 — account-growth metric backing the Dashboard sparkline.
+        // Admin+ at the handler; read-only; no capability extension (a basic
+        // dashboard read, gated by role like getReport).
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.getAccountGrowth",
+            get(crate::api::aurora_admin::get_account_growth),
+            CapsBuilder::new(Family::Admin),
+        )
         // Phase 3.8 (chainlink #105) — hash-chained audit trail.
         // Auth: AdminModeration scope, Moderator+ role at handler.
         // Per design doc §8.4: cursor-paginated newest-first; verified
@@ -580,6 +646,23 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             "/xrpc/tools.aurora.admin.getAuditTrail",
             get(crate::api::aurora_admin::get_audit_trail),
             CapsBuilder::new(Family::Admin).extensions(["audit-trail-v1"]),
+        )
+        // #359 — single audit-entry fetch by id or current_hash. Moderator+ at
+        // the handler; no capability extension (a basic read, like getReport).
+        // Retires the page-scoped window._auditCache the detail page relied on.
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.getAuditEntry",
+            get(crate::api::aurora_admin::get_audit_entry),
+            CapsBuilder::new(Family::Admin),
+        )
+        // #302 — single-report fetch for the report-detail page. The store
+        // method existed; this HTTP surface was never registered (the UI 404'd
+        // on the legacy com.atproto.admin.getReport NSID). Moderator+; no
+        // capability extension (a basic read, gated by role).
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.getReport",
+            get(crate::api::aurora_admin::get_report),
+            CapsBuilder::new(Family::Admin),
         )
         // Phase 3.8 (chainlink #105) — chain-of-custody forensic
         // export. AdminServer scope; Admin+ baseline at handler with
@@ -615,6 +698,84 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(crate::api::aurora_admin::set_runtime_setting),
             CapsBuilder::new(Family::Admin),
         )
+        // ---- v0.9 Arc B theming substrate (§11.10.2) ----
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.themes.listInstalled",
+            get(crate::api::aurora_admin::list_installed_themes),
+            CapsBuilder::new(Family::Admin).extensions(["themes-v1"]),
+        )
+        // ---- v0.9 Arc D Kryphocron (§6.4.2) — Laquna rotation ----
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.triggerRotation",
+            post(crate::api::aurora_admin::trigger_rotation),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-rotation-v1"]),
+        )
+        // ---- v0.9 Arc D Kryphocron (#225) — operator read cohort (§6.4, §6.5) ----
+        // Ten read XRPC backing the Kryphocron domain pages. All attribute the
+        // single `kryphocron-read-v1` cohort capability; role floor (Moderator+
+        // vs Admin+) is enforced in-handler per design §6.4.x.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getSubstrateInfo",
+            get(crate::api::aurora_kryphocron_ops::get_substrate_info),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getTierStats",
+            get(crate::api::aurora_kryphocron_ops::get_tier_stats),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getOracleActivity",
+            get(crate::api::aurora_kryphocron_ops::get_oracle_activity),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getRotationStatus",
+            get(crate::api::aurora_kryphocron_ops::get_rotation_status),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getRotationProgress",
+            get(crate::api::aurora_kryphocron_ops::get_rotation_progress),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.cancelRotation",
+            post(crate::api::aurora_kryphocron_ops::cancel_rotation),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.listRotations",
+            get(crate::api::aurora_kryphocron_ops::list_rotations),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getAudienceAggregate",
+            get(crate::api::aurora_kryphocron_ops::get_audience_aggregate),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.listAudiences",
+            get(crate::api::aurora_kryphocron_ops::list_audiences),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getBlockCascadeImpact",
+            get(crate::api::aurora_kryphocron_ops::get_block_cascade_impact),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-read-v1"]),
+        )
+        // Per-account overrides (#316 / §6.6.2 item 4) — SuperAdmin (in-handler);
+        // read + audited write of the per-account kryphocron override row.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.getAccountOverrides",
+            get(crate::api::aurora_kryphocron_ops::get_account_overrides),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-overrides-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.kryphocron.setAccountOverride",
+            post(crate::api::aurora_kryphocron_ops::set_account_override),
+            CapsBuilder::new(Family::Ops).extensions(["kryphocron-overrides-v1"]),
+        )
         // ---- tools.aurora.superadmin.* (chainlink #103 / Phase 3.6) ----
         //
         // Role management relocated from com.atproto.admin.* per design
@@ -631,6 +792,269 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             "/xrpc/tools.aurora.superadmin.revokeRole",
             post(revoke_role),
             CapsBuilder::new(Family::SuperAdmin),
+        )
+        // v0.9 Federation runtime-mutability arc §3.4 (#393) — revert-to-default:
+        // delete a runtime row (and, for restart-required keys, queue the restart
+        // marker(s) atomically). §3.8 (#396) — read the queued restart markers for
+        // the queued-change banner (F3). Both SuperAdmin-gated.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.deleteRuntimeSetting",
+            post(crate::api::aurora_admin::delete_runtime_setting),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.listPendingRestartActions",
+            get(crate::api::aurora_admin::list_pending_restart_actions),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // v0.9 Federation runtime-mutability arc §2.1 (#397) — operator-driven
+        // restart for the "Restart now" save-modal choice. Audited; fires the
+        // graceful-shutdown trigger.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.triggerRestart",
+            post(crate::api::aurora_admin::trigger_restart),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // v0.9 Federation runtime-mutability arc §2.3 (#400) — bulk did:plc update
+        // result surface: read the latest run + retry a single failed account.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getBulkDidDocUpdateLatest",
+            get(crate::api::aurora_admin::get_bulk_diddoc_update_latest),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.retryBulkDidDocUpdateForDid",
+            post(crate::api::aurora_admin::retry_bulk_diddoc_update_for_did),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // §5.5.4 Phase B (#346) — SuperAdmin manual reviewer reassignment
+        // (§4.7): set a queue item's assignee with assignment_source =
+        // 'manual_override'. Covers orphan-and-escalated recovery.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.assignReviewer",
+            post(assign_reviewer),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // §5.5.4 Phase C (#347) — auto-label rule CRUD (§3.5).
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.createAutoLabelRule",
+            post(create_auto_label_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.editAutoLabelRule",
+            post(edit_auto_label_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.deleteAutoLabelRule",
+            post(delete_auto_label_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.listAutoLabelRules",
+            get(list_auto_label_rules),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // §5.5.4 Phase D (#348) — escalation rule CRUD + de-escalation (§5).
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.createEscalationRule",
+            post(create_escalation_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.editEscalationRule",
+            post(edit_escalation_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.deleteEscalationRule",
+            post(delete_escalation_rule),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.listEscalationRules",
+            get(list_escalation_rules),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.clearEscalation",
+            post(clear_escalation),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // §5.5.4 Phase E (#349) — composite-load of all four sub-surfaces (§6.5).
+        // Design names it ops.moderation.getDefaultsState; kept under the
+        // superadmin family for consistency with the §5.5.4 CRUD + the
+        // SuperAdmin gate (namespace is cosmetic; the handler gates).
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getDefaultsState",
+            get(get_defaults_state),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // v0.9 Integration hooks Phase A (#350) — declaration CRUD +
+        // composite-load (declaration without execution).
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.createHook",
+            post(create_hook),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.editHook",
+            post(edit_hook),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.deleteHook",
+            post(delete_hook),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.listHooks",
+            get(list_hooks),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getIntegrationHooksState",
+            get(get_integration_hooks_state),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // v0.9 (#329) — upload a login-splash branding asset (logo/banner)
+        // directly; writes it under <data>/branding/ and repoints the
+        // branding.login-* runtime setting. Raw-body upload (uploadBlob idiom).
+        // Raise the body limit to cover the 5MB banner (axum defaults to 2MB);
+        // the handler enforces the precise per-asset cap (1MB logo / 5MB banner).
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.uploadBrandingAsset",
+            post(crate::api::aurora_admin::upload_branding_asset)
+                .layer(axum::extract::DefaultBodyLimit::max(6 * 1024 * 1024)),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // Repository rebuild preflight (§7.4.1 / #286) — non-destructive read.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.preRebuildCheck",
+            get(pre_rebuild_check),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // Repository rebuild — destructive surface (§7.4.1 / #290): start a
+        // background rebuild, poll its progress, cancel it. Reconstructs from
+        // sequencer history → verify → atomic per-DID swap.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.rebuildRepo",
+            post(rebuild_repo),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getRebuildProgress",
+            get(get_rebuild_progress),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.cancelRebuild",
+            post(cancel_rebuild),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // Rotation dry-run validation (key-rotation arc #372 / B1): read-only —
+        // validate an operator-supplied keypair or report what the PDS would
+        // generate, without mutating state or publishing to PLC.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.dryRunRotationValidation",
+            post(dry_run_rotation_validation),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // Signing-key migration check (key-rotation arc Phase C / #376 / §5.3):
+        // read-only diagnostic — confirm every account's locally-stored signing
+        // key matches what PLC publishes; report divergences for operator review.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.runSigningKeyMigrationCheck",
+            post(run_signing_key_migration_check),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // Bulk repository repair — scan substrate (§7.4.3 / #291): start an
+        // across-accounts inconsistency scan, poll its progress, cancel it,
+        // and read the persisted findings.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.scanReposForInconsistencies",
+            post(scan_repos_for_inconsistencies),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getScanProgress",
+            get(get_scan_progress),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.cancelScan",
+            post(cancel_scan),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getRepoScanResults",
+            get(get_repo_scan_results),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // Bulk repository repair — repair substrate (§7.4.3 / #292): start a
+        // bulk repair over the scan findings (or a subset), poll its bulk
+        // progress, cancel it. Each account is rebuilt via the per-account
+        // machinery.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.repairRepos",
+            post(repair_repos),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getBulkRepairProgress",
+            get(get_bulk_repair_progress),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.cancelBulkRepair",
+            post(cancel_bulk_repair),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // Sequencer recovery — escalation surface (§7.4.2 / #294): enumerate
+        // available recovery operations + the sequencer state, run one (v0.9:
+        // read-only deep integrity validation), poll its progress, cancel it.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.sequencerRecoveryOptions",
+            get(sequencer_recovery_options),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.runSequencerRecovery",
+            post(run_sequencer_recovery),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.getSequencerRecoveryProgress",
+            get(get_sequencer_recovery_progress),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.cancelSequencerRecovery",
+            post(cancel_sequencer_recovery),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
+        // Per-operator session management (§8.1.7 / #273). Admin-tier
+        // namespace; the handlers gate finer: any operator lists/revokes
+        // their OWN sessions (self-service), SuperAdmin lists all and
+        // force-logs-out any. The "session-management-v1" capability is
+        // introduced on listSessions (the canonical introducer).
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.listSessions",
+            get(list_sessions),
+            CapsBuilder::new(Family::Admin).extensions(["session-management-v1"]),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.revokeSession",
+            post(revoke_session),
+            CapsBuilder::new(Family::Admin),
+        )
+        // #338 — SuperAdmin bulk force-logout of an operator's sessions. Same
+        // session-management capability; the handler enforces the SuperAdmin floor.
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.revokeOperatorSessions",
+            post(revoke_operator_sessions),
+            CapsBuilder::new(Family::Admin),
         )
         .build()
 }
@@ -682,6 +1106,8 @@ async fn create_invite_code(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "invite.create",
             subject: None,
@@ -1089,6 +1515,8 @@ async fn grant_role(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "role.grant",
             subject: Some(&subject),
@@ -1103,6 +1531,14 @@ async fn grant_role(
     .map_err(|e| {
         json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
     })?;
+    // §5.5.4 Phase B §4.5/§2.7: an operator-set change (here, addition)
+    // invalidates the round-robin/category/escalation cursors — reset them
+    // single-step within this same mutation transaction (no CAS contention).
+    crate::api::reviewer_assignment::reset_assignment_cursors_in_tx(&mut tx, &auth.did)
+        .await
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?;
     tx.commit()
         .await
         .map_err(|e| {
@@ -1181,7 +1617,10 @@ async fn revoke_role(
         did: req.did.clone(),
     };
 
-    // LB-1 / chainlink #122: revoke + chain in one transaction.
+    // LB-1 / chainlink #122: revoke + chain in one transaction. §5.5.4
+    // Phase B (primary path): the §4.7 reviewer-routing cleanup (category-
+    // map prune + per-item assignment reset + cursor reset + audit) rides
+    // this same transaction — atomic with the revocation.
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
     let mut tx = ctx
         .account_db
@@ -1190,6 +1629,9 @@ async fn revoke_role(
         .map_err(|e| {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
         })?;
+    // Stage 1 — the revocation itself. A precondition failure here (e.g.
+    // no active role) is not a rollback of an in-progress revocation, so
+    // it does NOT emit the rollback diagnostic.
     crate::admin::AdminRoleManager::revoke_role_in_tx(
         &mut tx,
         &req.did,
@@ -1200,14 +1642,780 @@ async fn revoke_role(
     .map_err(|e| {
         json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
     })?;
+    // Stage 2 — audit + cleanup + commit. A failure from here rolls back a
+    // revocation that DID begin, so it emits `operator_revocation_rollback`
+    // (§4.7 / §6.1 system_diagnostic) from outside the rolled-back tx.
+    let staged: crate::error::PdsResult<i64> = async {
+        let audit_entry_id = audit_chain::insert_chain_entry(
+            &mut tx,
+            ctx.config.database.backend,
+            AppendEntryParams {
+                source: "manual",
+                payload: None,
+                actor_did: &auth.did,
+                action: "role.revoke",
+                subject: Some(&subject),
+                rationale,
+                snapshot_id: None,
+                event_id: None,
+                cascade_subjects: &[],
+                cascade_snapshot_ids: &[],
+            },
+        )
+        .await?;
+        crate::api::reviewer_assignment::handle_operator_removal_in_tx(
+            &mut tx,
+            ctx.config.database.backend,
+            &req.did,
+            &auth.did,
+        )
+        .await?;
+        tx.commit().await.map_err(crate::error::PdsError::from)?;
+        Ok(audit_entry_id)
+    }
+    .await;
+    // Release the chain guard before any rollback-diagnostic emit (which
+    // re-acquires it on its own transaction).
+    drop(_chain_guard);
+
+    match staged {
+        Ok(audit_entry_id) => Ok(Json(RevokeRoleOutput {
+            success: true,
+            did: req.did,
+            audit_entry_id: audit_entry_id.to_string(),
+        })),
+        Err(e) => {
+            let _ = crate::api::reviewer_assignment::emit_revocation_rollback(
+                &ctx,
+                &req.did,
+                &e.to_string(),
+            )
+            .await;
+            Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                e.to_string(),
+            ))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AssignReviewerRequest {
+    report_id: i64,
+    operator_did: String,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+/// `tools.aurora.superadmin.assignReviewer` (§5.5.4 Phase B §4.7) — manual
+/// reviewer reassignment. Sets the queue item's `assigned_operator_did` and
+/// `assignment_source = 'manual_override'`, atomic with an audit entry.
+///
+/// Local-idiom translation (recorded): the design registers
+/// `moderation_reviewer_assigned` + the report-ID subject convention but does
+/// not pin an audit emit for the manual-reassignment affordance. Aurora-Locus
+/// audits every operator mutation, so this emits `moderation_reviewer_assigned`
+/// with `source = "manual"` (a non-substrate operator action) and the report's
+/// content subject + `report_id` in the payload — consistent with §6.1's
+/// subject convention.
+async fn assign_reviewer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<AssignReviewerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "assignReviewer requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("manual reviewer reassignment");
+
+    // Resolve the report so the audit subject reflects the content it points
+    // at (account/record), not the report row itself.
+    let report = ctx
+        .report_manager
+        .get_report(req.report_id)
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?
+        .ok_or_else(|| {
+            json_error(StatusCode::NOT_FOUND, "NotFound", format!("report {} not found", req.report_id))
+        })?;
+    let subject = report.subject_uri.as_deref().map_or_else(
+        || report.subject_did.as_deref().map(|d| Subject::Repo { did: d.to_string() }),
+        |uri| {
+            Some(Subject::Record {
+                uri: uri.to_string(),
+                cid: report.subject_cid.clone().unwrap_or_default(),
+            })
+        },
+    );
+
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx
+        .account_db
+        .begin()
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
+    sqlx::query(
+        "UPDATE report SET assigned_operator_did = $1, assignment_source = 'manual_override' WHERE id = $2",
+    )
+    .bind(&req.operator_did)
+    .bind(req.report_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
+    let payload = serde_json::json!({
+        "report_id": req.report_id,
+        "assigned_operator_did": req.operator_did,
+    });
     let audit_entry_id = audit_chain::insert_chain_entry(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: Some(payload),
             actor_did: &auth.did,
-            action: "role.revoke",
-            subject: Some(&subject),
+            action: "moderation_reviewer_assigned",
+            subject: subject.as_ref(),
             rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "reportId": req.report_id,
+        "assignedOperatorDid": req.operator_did,
+        "auditEntryId": audit_entry_id.to_string(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// §5.5.4 Phase C — auto-label rule CRUD (#347, §3.5). SuperAdmin-gated.
+// ---------------------------------------------------------------------------
+
+/// Map the store layer's `(u16, String)` into a json_error response.
+fn rule_err((code, msg): (u16, String)) -> (StatusCode, Json<serde_json::Value>) {
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let label = if code == 400 {
+        "InvalidRequest"
+    } else if code == 404 {
+        "NotFound"
+    } else {
+        "InternalServerError"
+    };
+    json_error(status, label, msg)
+}
+
+fn require_superadmin(auth: &AdminAuthContext) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if auth.role.can_act_as(Role::SuperAdmin) {
+        Ok(())
+    } else {
+        Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("requires SuperAdmin role; have {}", auth.role.as_str()),
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateAutoLabelRuleRequest {
+    trigger_type: String,
+    trigger_params: serde_json::Value,
+    label_value: String,
+    subject_scope: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+async fn create_auto_label_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<CreateAutoLabelRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let rule = crate::api::auto_label_rules::create_rule(
+        &ctx,
+        &auth.did,
+        &req.trigger_type,
+        &req.trigger_params,
+        &req.label_value,
+        &req.subject_scope,
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "rule": rule })))
+}
+
+#[derive(Deserialize)]
+struct EditAutoLabelRuleRequest {
+    id: String,
+    trigger_type: String,
+    trigger_params: serde_json::Value,
+    label_value: String,
+    subject_scope: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn edit_auto_label_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<EditAutoLabelRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::auto_label_rules::edit_rule(
+        &ctx,
+        &auth.did,
+        &req.id,
+        &req.trigger_type,
+        &req.trigger_params,
+        &req.label_value,
+        &req.subject_scope,
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+#[derive(Deserialize)]
+struct DeleteAutoLabelRuleRequest {
+    id: String,
+}
+
+async fn delete_auto_label_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<DeleteAutoLabelRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::auto_label_rules::delete_rule(&ctx, &auth.did, &req.id)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+#[derive(Deserialize)]
+struct ListAutoLabelRulesQuery {
+    #[serde(default)]
+    include_deleted: bool,
+}
+
+async fn list_auto_label_rules(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(q): Query<ListAutoLabelRulesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let rules = crate::api::auto_label_rules::list_rules(&ctx, q.include_deleted)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "rules": rules })))
+}
+
+// ---------------------------------------------------------------------------
+// §5.5.4 Phase D — escalation rule CRUD + clearEscalation (#348, §5). SuperAdmin.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateEscalationRuleRequest {
+    trigger_type: String,
+    trigger_params: serde_json::Value,
+    action_type: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn create_escalation_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<CreateEscalationRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let rule = crate::api::escalation_rules::create_rule(
+        &ctx,
+        &auth.did,
+        &req.trigger_type,
+        &req.trigger_params,
+        &req.action_type,
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "rule": rule })))
+}
+
+#[derive(Deserialize)]
+struct EditEscalationRuleRequest {
+    id: String,
+    trigger_type: String,
+    trigger_params: serde_json::Value,
+    action_type: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn edit_escalation_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<EditEscalationRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::escalation_rules::edit_rule(
+        &ctx,
+        &auth.did,
+        &req.id,
+        &req.trigger_type,
+        &req.trigger_params,
+        &req.action_type,
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+async fn delete_escalation_rule(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<DeleteAutoLabelRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::escalation_rules::delete_rule(&ctx, &auth.did, &req.id)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+async fn list_escalation_rules(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(q): Query<ListAutoLabelRulesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let rules = crate::api::escalation_rules::list_rules(&ctx, q.include_deleted)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "rules": rules })))
+}
+
+#[derive(Deserialize)]
+struct ClearEscalationRequest {
+    item_id: String,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn clear_escalation(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<ClearEscalationRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("de-escalated by SuperAdmin");
+    crate::api::escalation_rules::clear_escalation(&ctx, &req.item_id, rationale, &auth.did)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "itemId": req.item_id })))
+}
+
+// ---------------------------------------------------------------------------
+// §5.5.4 Phase E — composite-load (#349, §6.5). SuperAdmin.
+// ---------------------------------------------------------------------------
+
+fn section_ok(data: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "status": "ok", "data": data })
+}
+
+fn section_err(code: &str, message: String) -> serde_json::Value {
+    serde_json::json!({ "status": "error", "error": { "code": code, "message": message } })
+}
+
+/// `tools.aurora.ops.moderation.getDefaultsState` (§6.5) — one SuperAdmin GET
+/// returning all four §5.5.4 sub-surfaces with partial-success semantics: a
+/// section's failure surfaces as `{status:"error"}` in its slot, the endpoint
+/// still returns HTTP 200. Saves the ConfigModerationPolicy page four calls.
+async fn get_defaults_state(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::api::aurora_admin::{
+        resolve_runtime_setting, MODERATION_DEFAULTS_CATEGORY_MAP_KEY,
+        MODERATION_DEFAULTS_REPORT_ACTION_KEY, MODERATION_DEFAULTS_STALE_DAYS_KEY,
+        MODERATION_REVIEWER_CATEGORY_MAP_KEY, MODERATION_REVIEWER_MODE_KEY,
+        MODERATION_REVIEWER_MODE_VERSION_KEY,
+    };
+    require_superadmin(&auth)?;
+
+    let report_action = section_ok(serde_json::json!({
+        "mode": resolve_runtime_setting(&ctx, MODERATION_DEFAULTS_REPORT_ACTION_KEY).await,
+        "categoryMap": resolve_runtime_setting(&ctx, MODERATION_DEFAULTS_CATEGORY_MAP_KEY).await,
+        "staleDays": resolve_runtime_setting(&ctx, MODERATION_DEFAULTS_STALE_DAYS_KEY).await,
+    }));
+    let reviewer_assignment = section_ok(serde_json::json!({
+        "mode": resolve_runtime_setting(&ctx, MODERATION_REVIEWER_MODE_KEY).await,
+        "categoryMap": resolve_runtime_setting(&ctx, MODERATION_REVIEWER_CATEGORY_MAP_KEY).await,
+        "modeVersion": resolve_runtime_setting(&ctx, MODERATION_REVIEWER_MODE_VERSION_KEY).await,
+    }));
+    let auto_label_rules = match crate::api::auto_label_rules::list_rules(&ctx, false).await {
+        Ok(rules) => section_ok(serde_json::json!(rules)),
+        Err((_, msg)) => section_err("auto_label_load_failed", msg),
+    };
+    let escalation_rules = match crate::api::escalation_rules::list_rules(&ctx, false).await {
+        Ok(rules) => section_ok(serde_json::json!(rules)),
+        Err((_, msg)) => section_err("escalation_load_failed", msg),
+    };
+
+    Ok(Json(serde_json::json!({
+        "reportAction": report_action,
+        "reviewerAssignment": reviewer_assignment,
+        "autoLabelRules": auto_label_rules,
+        "escalationRules": escalation_rules,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// v0.9 Integration hooks Phase A (#350) — declaration CRUD. SuperAdmin.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateHookRequest {
+    name: String,
+    url: String,
+    event_classes: Vec<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn create_hook(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<CreateHookRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let hook = crate::api::integration_hooks::create_hook(
+        &ctx,
+        &auth.did,
+        &req.name,
+        &req.url,
+        &req.event_classes,
+        req.description.as_deref(),
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "hook": hook })))
+}
+
+#[derive(Deserialize)]
+struct EditHookRequest {
+    id: String,
+    expected_last_modified_at: String,
+    name: String,
+    url: String,
+    event_classes: Vec<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+async fn edit_hook(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<EditHookRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::integration_hooks::edit_hook(
+        &ctx,
+        &auth.did,
+        &req.id,
+        &req.expected_last_modified_at,
+        &req.name,
+        &req.url,
+        &req.event_classes,
+        req.description.as_deref(),
+        req.enabled,
+        req.rationale.as_deref(),
+    )
+    .await
+    .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+async fn delete_hook(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<DeleteAutoLabelRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    crate::api::integration_hooks::delete_hook(&ctx, &auth.did, &req.id)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "id": req.id })))
+}
+
+async fn list_hooks(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(q): Query<ListAutoLabelRulesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let hooks = crate::api::integration_hooks::list_hooks(&ctx, q.include_deleted)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(serde_json::json!({ "hooks": hooks })))
+}
+
+async fn get_integration_hooks_state(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_superadmin(&auth)?;
+    let state = crate::api::integration_hooks::integration_hooks_state(&ctx)
+        .await
+        .map_err(rule_err)?;
+    Ok(Json(state))
+}
+
+// ---------------------------------------------------------------------------
+// Per-operator session management (§8.1.7 / #273)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ListSessionsQuery {
+    /// SuperAdmin only: scope the listing to one operator. Omitted by a
+    /// SuperAdmin lists ALL operators' sessions; supplied (or any value) by
+    /// a non-SuperAdmin is forced to their own did.
+    did: Option<String>,
+    #[serde(flatten)]
+    pagination: PaginationParams,
+}
+
+/// `GET /xrpc/tools.aurora.admin.listSessions` — active operator sessions
+/// (#273). Self-service for any operator (their own logins); SuperAdmin
+/// overview across all operators. Returns newest-first, keyset-paginated;
+/// each row flags `isCurrent` by matching the caller's own session id.
+async fn list_sessions(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(q): Query<ListSessionsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+
+    let is_superadmin = auth.role.can_act_as(Role::SuperAdmin);
+    let limit = q.pagination.effective_limit();
+    let cursor = match &q.pagination.cursor {
+        Some(s) => Some(SessionCursor::decode(s).map_err(|_| {
+            json_error(StatusCode::BAD_REQUEST, "OutdatedCursor", "invalid cursor")
+        })?),
+        None => None,
+    };
+
+    // Authorization + listing scope:
+    //   SuperAdmin + no did → all operators; SuperAdmin + did → that operator;
+    //   non-SuperAdmin → own sessions only (a foreign did is forbidden).
+    let result = if is_superadmin {
+        match &q.did {
+            Some(d) => ctx.operator_session_store.list_by_did(d, limit, cursor).await,
+            None => ctx.operator_session_store.list_all(limit, cursor).await,
+        }
+    } else {
+        if let Some(d) = &q.did {
+            if d != &auth.did {
+                return Err(json_error(
+                    StatusCode::FORBIDDEN,
+                    "Forbidden",
+                    "listing another operator's sessions requires SuperAdmin",
+                ));
+            }
+        }
+        ctx.operator_session_store
+            .list_by_did(&auth.did, limit, cursor)
+            .await
+    };
+    let (sessions, next) = result.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+
+    let current_sid = &auth.session.session_id;
+    let items: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "sid": s.id,
+                "did": s.did,
+                "createdAt": s.created_at.to_rfc3339(),
+                "lastActiveAt": s.last_active_at.to_rfc3339(),
+                "expiresAt": s.expires_at.to_rfc3339(),
+                "sourceIp": s.source_ip,
+                "userAgent": s.user_agent,
+                "isCurrent": &s.id == current_sid,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "sessions": items, "cursor": next })))
+}
+
+#[derive(Deserialize)]
+struct RevokeSessionRequest {
+    /// The session id (`sid`) to force-logout.
+    sid: String,
+    /// Required when revoking ANOTHER operator's session (a security event);
+    /// optional for self-service logout.
+    rationale: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct RevokeSessionOutput {
+    success: bool,
+    sid: String,
+    #[serde(rename = "auditEntryId")]
+    audit_entry_id: String,
+}
+
+/// `POST /xrpc/tools.aurora.admin.revokeSession` — force-logout a session
+/// (#273). Any operator may revoke their OWN session; SuperAdmin may revoke
+/// any. The #271 per-request gate rejects the revoked session on its next
+/// request, so the operator reauthenticates. Emits an audit-chain entry
+/// (`session.revoke` for a cross-operator force-logout, `session.revoke_self`
+/// for self-service) in the same transaction as the flag flip.
+async fn revoke_session(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RevokeSessionRequest>,
+) -> Result<Json<RevokeSessionOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+
+    // Resolve the target's owner to authorize + audit before mutating.
+    let target = ctx
+        .operator_session_store
+        .get(&req.sid)
+        .await
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "NotFound", "session not found"))?;
+
+    let is_self = target.did == auth.did;
+    if !is_self && !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "revoking another operator's session requires SuperAdmin",
+        ));
+    }
+
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    // A cross-operator force-logout is a security event — require a reason.
+    if !is_self && rationale.is_none() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "rationale-required",
+        ));
+    }
+    let action = if is_self {
+        "session.revoke_self"
+    } else {
+        "session.revoke"
+    };
+    let audit_rationale = format!(
+        "{} (session {})",
+        rationale.unwrap_or("operator self-service session revocation"),
+        req.sid
+    );
+    let subject = Subject::Repo {
+        did: target.did.clone(),
+    };
+    let now = chrono::Utc::now();
+
+    // Flip + audit atomically (LB-1 pattern; mirrors revoke_role).
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    OperatorSessionStore::revoke_in_tx(&mut tx, &req.sid, &auth.did, rationale, now)
+        .await
+        .map_err(|e| match e {
+            PdsError::NotFound(_) => json_error(
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                "session not found or already revoked",
+            ),
+            other => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                other.to_string(),
+            ),
+        })?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action,
+            subject: Some(&subject),
+            rationale: &audit_rationale,
             snapshot_id: None,
             event_id: None,
             cascade_subjects: &[],
@@ -1218,17 +2426,1220 @@ async fn revoke_role(
     .map_err(|e| {
         json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
     })?;
-    tx.commit()
+    tx.commit().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+
+    Ok(Json(RevokeSessionOutput {
+        success: true,
+        sid: req.sid,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct RevokeOperatorSessionsRequest {
+    /// The operator DID whose active sessions to force-logout.
+    did: String,
+    /// Required — a bulk force-logout of an operator is always a security event.
+    rationale: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct RevokeOperatorSessionsOutput {
+    success: bool,
+    did: String,
+    /// Count of active sessions revoked (0 when the operator had none active).
+    revoked: u64,
+    #[serde(rename = "auditEntryId")]
+    audit_entry_id: String,
+}
+
+/// `POST /xrpc/tools.aurora.admin.revokeOperatorSessions` — bulk force-logout of
+/// EVERY active session for one operator (#338), for compromise / departure
+/// response. SuperAdmin-only: revoking another operator's sessions
+/// deployment-wide is escalation-of-trust territory. Rationale required (a
+/// security event). Revokes all of `did`'s active sessions — the #271
+/// per-request gate then rejects each on its next request — and audits the bulk
+/// action with the count, in one transaction (the revoke_role / revoke_session
+/// pattern). A zero count (operator had no active sessions) is still a success
+/// and still audited, for forensic completeness. Targeting one's own DID is
+/// permitted (it logs the caller out everywhere, current session included —
+/// recoverable by re-login); session revocation never touches roles, so there
+/// is no last-SuperAdmin lockout to guard (that guard is for role revocation).
+async fn revoke_operator_sessions(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RevokeOperatorSessionsRequest>,
+) -> Result<Json<RevokeOperatorSessionsOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "bulk session revocation requires SuperAdmin",
+        ));
+    }
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required"))?;
+    let did = req.did.trim();
+    if did.is_empty() {
+        return Err(json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "did-required"));
+    }
+    let subject = Subject::Repo { did: did.to_string() };
+    let now = chrono::Utc::now();
+
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    let count = OperatorSessionStore::revoke_all_for_did_in_tx(
+        &mut tx,
+        did,
+        &auth.did,
+        Some(rationale),
+        now,
+    )
+    .await
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    let audit_rationale = format!("{} (bulk revoke: {} session(s))", rationale, count);
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "session.revoke_all",
+            subject: Some(&subject),
+            rationale: &audit_rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    tx.commit().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+
+    Ok(Json(RevokeOperatorSessionsOutput {
+        success: true,
+        did: did.to_string(),
+        revoked: count,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Repository rebuild — preflight (§7.4.1 / #286)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PreRebuildCheckParams {
+    did: String,
+    /// When `true`, additionally reconstruct the repo in memory from the full
+    /// sequencer history and run it through proto-blue's `verify_repo`, reporting
+    /// whether replay yields a coherent repo (`deepVerified`). Structural-only
+    /// (no signature check) — that, plus the destructive swap, is #290. Off by
+    /// default because reconstruction reads and decodes every commit's CAR slice.
+    #[serde(default)]
+    deep: bool,
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.preRebuildCheck?did=<did>[&deep=true]` —
+/// non-destructive repo-rebuild preflight (§7.4.1 / #286, #289). Walks the
+/// account's full commit history and reports what a rebuild would reconstruct
+/// (commit count, net live record count, the rev range, the head commit CID) so
+/// a SuperAdmin can confirm scope before triggering the destructive rebuild
+/// (#290). With `deep=true` it goes further: it reconstructs the repo in memory
+/// and verifies it resolves via `verify_repo` — the same correctness gate the
+/// destructive rebuild will use — so a failed reconstruction is surfaced as a
+/// diagnostic *before* any swap. Read-only either way; touches no repo state.
+async fn pre_rebuild_check(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(params): Query<PreRebuildCheckParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "preRebuildCheck requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let pf = match ctx.sequencer.rebuild_preflight(&params.did).await {
+        Ok(Some(pf)) => pf,
+        Ok(None) => {
+            return Err(json_error(
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                format!("no sequencer history for {} — nothing to rebuild", params.did),
+            ))
+        }
+        Err(e) => {
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                e.to_string(),
+            ))
+        }
+    };
+
+    let mut body = serde_json::json!({
+        "did": params.did,
+        "commitCount": pf.commit_count,
+        "recordCount": pf.record_count,
+        "creates": pf.creates,
+        "deletes": pf.deletes,
+        "headCommitCid": pf.head_commit_cid,
+        "headRev": pf.head_rev,
+        "firstRev": pf.first_rev,
+    });
+
+    if params.deep {
+        let obj = body.as_object_mut().expect("json! built a map above");
+        // Structural-only (signing_did_key = None); full signature verification
+        // is part of the destructive rebuild (#290). Capture the reconstructed
+        // block set + root so the A2 history-aware verify below can re-run over
+        // it (key-rotation arc #366 / #368).
+        let mut reconstructed: Option<(proto_blue::repo::BlockMap, proto_blue::lex_data::Cid)> =
+            None;
+        match crate::rebuild::reconstruct_and_verify(&ctx.sequencer, &params.did, None).await {
+            Ok(Some(vr)) => {
+                let head = vr.commit_cid.to_string();
+                let rev = vr.rev().to_string();
+                obj.insert("deepVerified".into(), serde_json::Value::Bool(true));
+                obj.insert("reconstructedHeadCid".into(), serde_json::Value::String(head));
+                obj.insert("reconstructedRev".into(), serde_json::Value::String(rev));
+                reconstructed = Some((vr.blocks, vr.commit_cid));
+            }
+            // No history despite a preflight: treat as not-verifiable rather than 500.
+            Ok(None) => {
+                obj.insert("deepVerified".into(), serde_json::Value::Bool(false));
+            }
+            // Reconstruction failed verification — a real diagnostic, not a server
+            // fault: replay would NOT produce a coherent repo. Report, don't 500.
+            Err(e) => {
+                obj.insert("deepVerified".into(), serde_json::Value::Bool(false));
+                obj.insert("deepError".into(), serde_json::Value::String(e.to_string()));
+            }
+        }
+
+        // Signing-key history (Phase A1 / #367). Surface how many times the
+        // account has rotated — an account with rotation history is exactly the
+        // case a history-aware verify must handle. Non-fatal: a PLC fetch failure
+        // surfaces as `keyHistoryError` (mirrors the `deepError` posture).
+        let history = match ctx.plc_client.get_op_history(&params.did).await {
+            Ok(history) => {
+                obj.insert("keyHistoryEntries".into(), serde_json::json!(history.len()));
+                obj.insert(
+                    "rotatedKeysCount".into(),
+                    serde_json::json!(history.len().saturating_sub(1)),
+                );
+                Some(history)
+            }
+            Err(e) => {
+                obj.insert("keyHistoryError".into(), serde_json::Value::String(e.to_string()));
+                None
+            }
+        };
+
+        // History-aware verify (Phase A2 / #368) — the in-bin consumer of
+        // `verify_repo_with_history`. Runs only when BOTH reconstruction and the
+        // PLC history are available; checks every commit against the key valid at
+        // its rev. `historyAwareVerifyResult` carries the verdict + stats; a
+        // can't-even-run condition surfaces as `historyAwareVerifyError`
+        // (distinct from a ran-and-failed verdict), mirroring the keyHistoryError
+        // posture. A3 makes this the production rebuild gate; here it is
+        // preflight-only.
+        if let (Some((blocks, root)), Some(hist)) = (reconstructed, history) {
+            use crate::crypto::verify_history::{verify_repo_with_history, VerifyError};
+            match verify_repo_with_history(blocks, &root, Some(&params.did), &hist) {
+                Ok(out) => {
+                    obj.insert(
+                        "historyAwareVerifyResult".into(),
+                        serde_json::json!({
+                            "verified": true,
+                            "commitsVerified": out.commits_verified,
+                            "keysUsed": out.keys_used,
+                            // The head the history-aware verify resolved — should
+                            // equal reconstructedHeadCid (both from the same
+                            // reconstruction); surfaced so an operator can confirm
+                            // the two verify paths agree.
+                            "verifiedHeadCid": out.repo.commit_cid.to_string(),
+                        }),
+                    );
+                }
+                // The verify ran and found a bad/unmappable commit — a verdict
+                // (verified:false), not a can't-run.
+                Err(VerifyError::CommitVerifyFailed { commit_cid, rev, reason, .. }) => {
+                    obj.insert(
+                        "historyAwareVerifyResult".into(),
+                        serde_json::json!({
+                            "verified": false,
+                            "failure": { "commitCid": commit_cid, "rev": rev, "reason": reason },
+                        }),
+                    );
+                }
+                Err(VerifyError::CommitBeforeGenesis { commit_cid, rev, .. }) => {
+                    obj.insert(
+                        "historyAwareVerifyResult".into(),
+                        serde_json::json!({
+                            "verified": false,
+                            "failure": {
+                                "commitCid": commit_cid,
+                                "rev": rev,
+                                "reason": "commit predates the genesis PLC op",
+                            },
+                        }),
+                    );
+                }
+                // EmptyHistory / PlcFetch / ProtoBlueRepo — couldn't run the verify.
+                Err(other) => {
+                    obj.insert(
+                        "historyAwareVerifyError".into(),
+                        serde_json::Value::String(other.to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(Json(body))
+}
+
+// ---------------------------------------------------------------------------
+// Rotation dry-run validation (key-rotation arc #372 / B1 §4.2.1)
+// ---------------------------------------------------------------------------
+
+/// The `key_rotation.operator_supplied_keys_enabled` gate (B2 / #373 / §4.6).
+/// Reads the runtime setting through the standard three-tier resolution
+/// (runtime row → file-tier → compiled default). Fail-closed: an absent or
+/// non-boolean value resolves to `false` (disabled), so a malformed setting can
+/// never silently open the operator-supplied path. `resolve_runtime_setting`
+/// never errors (a DB read failure falls through to file/default), so this
+/// returns a bare bool rather than a `Result`.
+async fn operator_supplied_keys_gate_enabled(ctx: &AppContext) -> bool {
+    crate::api::aurora_admin::resolve_runtime_setting(
+        ctx,
+        crate::api::aurora_admin::KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY,
+    )
+    .await
+    .as_bool()
+    .unwrap_or(false)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DryRunRotationValidationRequest {
+    did: String,
+    /// Present → validate the operator-supplied keypair (gated); absent →
+    /// simulate PDS generation (no storage).
+    #[serde(default)]
+    operator_keypair: Option<crate::account::OperatorSuppliedKeypair>,
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.dryRunRotationValidation` — read-only
+/// dry-run of a signing-key rotation (#372 / B1). With no `operatorKeypair`,
+/// reports the public did:key the PDS WOULD generate; with one, validates it
+/// (derive-public-from-private + compare) and reports whether it would be
+/// accepted. Never persists, never publishes to PLC, never returns or logs a
+/// private key. SuperAdmin; 404 on unknown DID. The in-bin consumer of
+/// `generate_rotation_keypair` + `validate_operator_keypair`.
+async fn dry_run_rotation_validation(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<DryRunRotationValidationRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "dryRunRotationValidation requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    // The dry-run is "for this account" — confirm it exists.
+    ctx.account_manager.get_account(&req.did).await.map_err(|e| {
+        if matches!(e, PdsError::NotFound(_)) {
+            json_error(StatusCode::NOT_FOUND, "NotFound", format!("account not found: {}", req.did))
+        } else {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        }
+    })?;
+
+    match req.operator_keypair {
+        // Path A — PDS generation (default): report what would be generated.
+        None => {
+            let kp = ctx.account_manager.generate_rotation_keypair().map_err(|e| {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+            })?;
+            // Sanity guard: a generated keypair must carry private material (the
+            // rotation signing key B3 will use). Never exposed or logged.
+            if kp.private_key_bytes.is_empty() {
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    "key generation produced empty private key material",
+                ));
+            }
+            Ok(Json(serde_json::json!({
+                "did": req.did,
+                "path": "pdsGeneration",
+                "resultingPublicDidKey": kp.public_did_key,
+                "wouldProceedSummary":
+                    format!("would rotate {} to a PDS-generated key ({})", req.did, kp.public_did_key),
+            })))
+        }
+        // Path B — operator-supplied (gated): validate FIRST so a mismatched or
+        // malformed pair surfaces even when the gate is off, THEN enforce the gate.
+        Some(supplied) => {
+            let validated =
+                ctx.account_manager.validate_operator_keypair(&supplied).map_err(|e| {
+                    json_error(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string())
+                })?;
+            // Sanity guard: a validated keypair carries the decoded private
+            // material. Never exposed or logged.
+            if validated.private_key_bytes.is_empty() {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "operator keypair decoded to empty private key material",
+                ));
+            }
+            if !operator_supplied_keys_gate_enabled(&ctx).await {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "OperatorSuppliedKeysDisabled",
+                    "operator-supplied rotation keys are disabled on this deployment \
+                     (set key_rotation.operator_supplied_keys_enabled to enable)",
+                ));
+            }
+            Ok(Json(serde_json::json!({
+                "did": req.did,
+                "path": "operatorSuppliedValidation",
+                "resultingPublicDidKey": validated.public_did_key,
+                "wouldProceedSummary":
+                    format!("would rotate {} to operator-supplied key ({})", req.did, validated.public_did_key),
+            })))
+        }
+    }
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.runSigningKeyMigrationCheck` — read-only
+/// (key-rotation arc Phase C / #376 / §5.3). Runs the signing-key migration
+/// check across all accounts and returns the report (aligned count + any
+/// divergent / unresolvable accounts). SuperAdmin; no request body; no state
+/// mutation. The divergence set is expected empty.
+async fn run_signing_key_migration_check(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<crate::admin::migration_check::MigrationCheckReport>, (StatusCode, Json<serde_json::Value>)>
+{
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "runSigningKeyMigrationCheck requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let report = crate::admin::migration_check::run_signing_key_migration_check(&ctx)
         .await
         .map_err(|e| {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
         })?;
+    Ok(Json(report))
+}
 
-    Ok(Json(RevokeRoleOutput {
-        success: true,
-        did: req.did,
-        audit_entry_id: audit_entry_id.to_string(),
-    }))
+// ---------------------------------------------------------------------------
+// Repository rebuild — destructive surface (§7.4.1 / #290)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RebuildRepoRequest {
+    did: String,
+    /// Operator rationale — required (high-impact destructive action). Carried
+    /// into the `RepoRebuilt` audit event on a successful swap.
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.rebuildRepo` — start a background
+/// repository rebuild for `did` (§7.4.1 / #290). Reconstructs the account's
+/// repo from its full sequencer history in memory, verifies it (full signature
+/// check) via `verify_repo`, and atomically swaps it into live storage in one
+/// per-DID transaction. Returns the job-id to poll via `getRebuildProgress`.
+///
+/// Per-DID single-flight: a 409 if a rebuild is already in flight for the same
+/// DID. SuperAdmin only; `rationale` required. The original repo is untouched
+/// unless and until the atomic swap commits, so a failed/cancelled rebuild is
+/// safe (shadow-then-swap). A no-history account surfaces as a `failed` job via
+/// `getRebuildProgress` (run `preRebuildCheck` first to confirm scope).
+async fn rebuild_repo(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RebuildRepoRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "rebuildRepo requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required")
+        })?;
+
+    let registry = ctx.rebuild_registry.clone();
+    let job_id = registry
+        .start(
+            ctx.clone(),
+            req.did.clone(),
+            auth.did.clone(),
+            rationale.to_string(),
+        )
+        .map_err(|e| match e {
+            PdsError::Conflict(msg) => json_error(StatusCode::CONFLICT, "Conflict", msg),
+            other => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                other.to_string(),
+            ),
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "jobId": job_id,
+        "did": req.did,
+        "status": "started",
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetRebuildProgressParams {
+    job_id: String,
+}
+
+/// Render a [`RebuildProgress`](crate::rebuild::RebuildProgress) as the
+/// `getRebuildProgress` wire shape (camelCase; `SystemTime`s as unix millis).
+fn rebuild_progress_json(p: &crate::rebuild::RebuildProgress) -> serde_json::Value {
+    fn ms(t: Option<std::time::SystemTime>) -> Option<u64> {
+        t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    }
+    serde_json::json!({
+        "jobId": p.job_id,
+        "did": p.did,
+        "phase": p.phase.as_str(),
+        "commitsTotal": p.commits_total,
+        "commitsProcessed": p.commits_processed,
+        "recordsWritten": p.records_written,
+        "headCommitCidBefore": p.head_before,
+        "headCommitCidAfter": p.head_after,
+        "error": p.error,
+        "cancelRequested": p.cancel_requested,
+        "startedAt": ms(p.started_at),
+        "finishedAt": ms(p.finished_at),
+    })
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.getRebuildProgress?jobId=<id>` — progress
+/// for a rebuild job (§7.4.1 / #290): phase (walking / verifying / swapping /
+/// completed / failed / cancelled), commits walked vs total, records written,
+/// head CID before/after, and any failure diagnostic. SuperAdmin only; 404 on
+/// an unknown job-id.
+async fn get_rebuild_progress(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(params): Query<GetRebuildProgressParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "getRebuildProgress requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    match ctx.rebuild_registry.progress(&params.job_id) {
+        Some(p) => Ok(Json(rebuild_progress_json(&p))),
+        None => Err(json_error(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            format!("no rebuild job {}", params.job_id),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelRebuildRequest {
+    job_id: String,
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.cancelRebuild` — request cancellation of
+/// an in-flight rebuild (§7.4.1 / #290). Cancellation is observed at commit
+/// boundaries and between phases; the atomic swap is the point of no return, so
+/// a cancel that arrives during the swap is a no-op (the transaction is whole).
+/// SuperAdmin only. 404 on an unknown job-id; 409 if the job already reached a
+/// terminal phase ("nothing to cancel").
+async fn cancel_rebuild(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<CancelRebuildRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "cancelRebuild requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    match ctx.rebuild_registry.request_cancel(&req.job_id) {
+        None => Err(json_error(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            format!("no rebuild job {}", req.job_id),
+        )),
+        Some(true) => Ok(Json(serde_json::json!({
+            "jobId": req.job_id,
+            "status": "cancelling",
+        }))),
+        Some(false) => Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "rebuild job already complete; nothing to cancel".to_string(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk repository repair — scan substrate (§7.4.3 / #291)
+// ---------------------------------------------------------------------------
+
+/// `POST /xrpc/tools.aurora.superadmin.scanReposForInconsistencies` — start a
+/// background across-accounts scan (§7.4.3 / #291). Walks every account,
+/// structurally reconstructs its repo from the sequencer, and persists any
+/// repo-vs-sequencer inconsistency as a finding (reviewable via
+/// getRepoScanResults). Read-only — it detects, it does not repair (#292).
+/// Deployment single-flight (409 if a scan is already running). SuperAdmin.
+async fn scan_repos_for_inconsistencies(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "scanReposForInconsistencies requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let job = ctx.repo_scan_job.clone();
+    match job.try_start(ctx.clone(), auth.did.clone()) {
+        Some(scan_id) => Ok(Json(serde_json::json!({
+            "scanId": scan_id,
+            "status": "started",
+        }))),
+        None => Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "a repository scan is already in progress".to_string(),
+        )),
+    }
+}
+
+/// Render a [`ScanProgress`](crate::repo_scan::ScanProgress) as the
+/// `getScanProgress` wire shape.
+fn scan_progress_json(p: &crate::repo_scan::ScanProgress) -> serde_json::Value {
+    fn ms(t: Option<std::time::SystemTime>) -> Option<u64> {
+        t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    }
+    serde_json::json!({
+        "running": p.running,
+        "scanId": p.scan_id,
+        "accountsScanned": p.accounts_scanned,
+        "findingsHigh": p.counts.high,
+        "findingsMedium": p.counts.medium,
+        "findingsLow": p.counts.low,
+        "findingsTotal": p.counts.total(),
+        "startedAt": ms(p.started_at),
+        "finishedAt": ms(p.finished_at),
+        "cancelRequested": p.cancel_requested,
+        "lastOutcome": p.last_outcome,
+    })
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.getScanProgress` — live progress of the
+/// repository scan (§7.4.3 / #291): running flag, accounts scanned, the
+/// severity breakdown so far, and the last run's outcome. SuperAdmin.
+async fn get_scan_progress(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("getScanProgress requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    Ok(Json(scan_progress_json(&ctx.repo_scan_job.progress())))
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.cancelScan` — request cancellation of
+/// the in-flight scan (§7.4.3 / #291); the walk stops at the next account
+/// boundary. SuperAdmin. 409 if no scan is in progress.
+async fn cancel_scan(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("cancelScan requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    if ctx.repo_scan_job.request_cancel() {
+        Ok(Json(serde_json::json!({ "status": "cancelling" })))
+    } else {
+        Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "no repository scan is in progress".to_string(),
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+struct GetRepoScanResultsParams {
+    /// Filter by severity (`high` | `medium` | `low`); omitted = all.
+    severity: Option<String>,
+    limit: Option<i64>,
+    /// Keyset cursor: the last did from the previous page.
+    cursor: Option<String>,
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.getRepoScanResults` — the latest scan's
+/// findings (§7.4.3 / #291), optionally filtered by severity, keyset-paginated
+/// by did, with the full severity breakdown. SuperAdmin.
+async fn get_repo_scan_results(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Query(params): Query<GetRepoScanResultsParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("getRepoScanResults requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    let severity = match params.severity.as_deref() {
+        None => None,
+        Some(s) => match s.parse::<crate::repo_scan::Severity>() {
+            Ok(sev) => Some(sev),
+            Err(e) => return Err(json_error(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string())),
+        },
+    };
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let findings = ctx
+        .scan_findings_store
+        .list(severity, limit, params.cursor.as_deref())
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
+    let counts = ctx
+        .scan_findings_store
+        .counts()
+        .await
+        .map_err(|e| json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string()))?;
+    let next_cursor = if findings.len() as i64 == limit {
+        findings.last().map(|f| f.did.clone())
+    } else {
+        None
+    };
+    let items: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "did": f.did,
+                "severity": f.severity.as_str(),
+                "liveHead": f.live_head,
+                "reconstructedHead": f.recon_head,
+                "detail": f.detail,
+                "scanId": f.scan_id,
+                "createdAt": f.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "findings": items,
+        "counts": {
+            "high": counts.high,
+            "medium": counts.medium,
+            "low": counts.low,
+            "total": counts.total(),
+        },
+        "cursor": next_cursor,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Bulk repository repair — repair substrate (§7.4.3 / #292)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RepairReposRequest {
+    /// Explicit target DID subset. Ignored when `all` is true.
+    #[serde(default)]
+    dids: Vec<String>,
+    /// Repair every account in the current scan findings.
+    #[serde(default)]
+    all: bool,
+    /// Operator rationale — required (high-impact destructive action); carried
+    /// into the BulkRepairInitiated envelope and each per-account RepoRebuilt.
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.repairRepos` — start a bulk repair over
+/// a set of accounts (§7.4.3 / #292): `all` = every account in the current scan
+/// findings, or an explicit `dids` subset. Each target is rebuilt via the same
+/// per-account machinery as `rebuildRepo` (single-flight, RepoRebuilt audit); a
+/// per-account failure or conflict is skipped, not fatal. Deployment
+/// single-flight (409 if a bulk repair is already running). SuperAdmin;
+/// rationale required.
+async fn repair_repos(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RepairReposRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("repairRepos requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required"))?;
+
+    // Resolve the target DID set: `all` = every current finding, else the
+    // explicit subset.
+    let targets = if req.all {
+        ctx.scan_findings_store.all_dids().await.map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?
+    } else {
+        req.dids.clone()
+    };
+    if targets.is_empty() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "no repair targets — pass `dids` or `all:true` with a non-empty findings set".to_string(),
+        ));
+    }
+
+    let job = ctx.bulk_repair_job.clone();
+    let target_count = targets.len();
+    match job.try_start(ctx.clone(), targets, auth.did.clone(), rationale.to_string()) {
+        Some(batch_id) => Ok(Json(serde_json::json!({
+            "batchId": batch_id,
+            "targetCount": target_count,
+            "status": "started",
+        }))),
+        None => Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "a bulk repository repair is already in progress".to_string(),
+        )),
+    }
+}
+
+/// Render a [`BulkRepairProgress`](crate::repo_scan::BulkRepairProgress) as the
+/// `getBulkRepairProgress` wire shape.
+fn bulk_repair_progress_json(p: &crate::repo_scan::BulkRepairProgress) -> serde_json::Value {
+    fn ms(t: Option<std::time::SystemTime>) -> Option<u64> {
+        t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    }
+    serde_json::json!({
+        "running": p.running,
+        "batchId": p.batch_id,
+        "targetsTotal": p.targets_total,
+        "processed": p.processed,
+        "repaired": p.repaired,
+        "skipped": p.skipped,
+        "failed": p.failed,
+        "currentDid": p.current_did,
+        "startedAt": ms(p.started_at),
+        "finishedAt": ms(p.finished_at),
+        "cancelRequested": p.cancel_requested,
+        "lastOutcome": p.last_outcome,
+    })
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.getBulkRepairProgress` — live progress of
+/// the bulk repair (§7.4.3 / #292): targets total, processed, the
+/// repaired/skipped/failed tally, the current account, and the last outcome.
+/// SuperAdmin.
+async fn get_bulk_repair_progress(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("getBulkRepairProgress requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    Ok(Json(bulk_repair_progress_json(&ctx.bulk_repair_job.progress())))
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.cancelBulkRepair` — request cancellation
+/// of the in-flight bulk repair (§7.4.3 / #292); the loop stops before the next
+/// account. A per-account rebuild already in flight finishes atomically.
+/// SuperAdmin. 409 if no bulk repair is in progress.
+async fn cancel_bulk_repair(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("cancelBulkRepair requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    if ctx.bulk_repair_job.request_cancel() {
+        Ok(Json(serde_json::json!({ "status": "cancelling" })))
+    } else {
+        Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "no bulk repository repair is in progress".to_string(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sequencer recovery — §7.4.2 / #294 (escalation surface; one operation:
+// read-only deep integrity validation)
+// ---------------------------------------------------------------------------
+
+/// `GET /xrpc/tools.aurora.superadmin.sequencerRecoveryOptions` — the current
+/// sequencer state (row counts, head/min seq) plus the recovery operations
+/// available given that state (§7.4.2 / #294). v0.9 offers one operation,
+/// `validate` (read-only deep integrity validation). SuperAdmin.
+async fn sequencer_recovery_options(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("sequencerRecoveryOptions requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    let counts = ctx.sequencer.integrity_counts().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    let last = ctx.sequencer_recovery_job.progress();
+    let last_validation = last.report.as_ref().map(|r| {
+        serde_json::json!({
+            "outcome": last.last_outcome,
+            "malformedCount": r.malformed_count,
+            "nonMonotonicCount": r.non_monotonic_count,
+            "rowsScanned": r.rows_scanned,
+            "affectedDids": r.affected_dids,
+        })
+    });
+    // The routing op is offered only once a validate has flagged malformed
+    // events (it routes from that report's affected-DID set).
+    let affected_count = last.report.as_ref().map(|r| r.affected_dids.len()).unwrap_or(0);
+    let mut operations = vec![serde_json::json!({
+        "id": crate::sequencer_recovery::OP_VALIDATE,
+        "label": "Deep integrity validation",
+        "destructive": false,
+        "available": true,
+        "description": "Walk the live sequencer log, decoding every event \
+            and checking per-DID rev monotonicity. Read-only.",
+    })];
+    operations.push(serde_json::json!({
+        "id": crate::sequencer_recovery::OP_ROUTE_MALFORMED,
+        "label": "Rebuild malformed-event accounts",
+        "destructive": true,
+        "available": affected_count > 0,
+        "affectedCount": affected_count,
+        "description": "Rebuild every account the most recent validation flagged \
+            with a malformed event, by re-deriving its repo from history (§7.4.1). \
+            Requires a completed validation that found malformed events.",
+    }));
+    Ok(Json(serde_json::json!({
+        "state": {
+            "totalRows": counts.total_rows,
+            "invalidatedRows": counts.invalidated_rows,
+            "headSeq": counts.head_seq,
+            "minSeq": counts.min_seq,
+        },
+        "operations": operations,
+        "running": last.running,
+        "lastValidation": last_validation,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RunSequencerRecoveryRequest {
+    operation: String,
+    /// Ignored by the read-only `validate` operation; REQUIRED by the
+    /// destructive `route_malformed` operation (it is carried into each fanned
+    /// per-account `RepoRebuilt` audit).
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.runSequencerRecovery` — dispatch a
+/// sequencer recovery operation (§7.4.2 / #294). v0.9 accepts `operation:
+/// "validate"` (read-only). Deployment single-flight (409 if one is already
+/// running). SuperAdmin.
+async fn run_sequencer_recovery(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RunSequencerRecoveryRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("runSequencerRecovery requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    match req.operation.as_str() {
+        crate::sequencer_recovery::OP_VALIDATE => {
+            let job = ctx.sequencer_recovery_job.clone();
+            match job.try_start_validate(ctx.clone(), auth.did.clone()) {
+                Some(job_id) => Ok(Json(serde_json::json!({
+                    "jobId": job_id,
+                    "operation": crate::sequencer_recovery::OP_VALIDATE,
+                    "status": "started",
+                }))),
+                None => Err(json_error(
+                    StatusCode::CONFLICT,
+                    "Conflict",
+                    "a sequencer recovery operation is already in progress".to_string(),
+                )),
+            }
+        }
+        crate::sequencer_recovery::OP_ROUTE_MALFORMED => {
+            // Each fanned rebuild is a high-impact destructive op, so rationale
+            // is required (it is carried into every per-account RepoRebuilt
+            // audit). Reject blank before queuing anything.
+            let rationale = req
+                .rationale
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required")
+                })?;
+
+            // Route from the most-recent validate report (in-memory on the job).
+            let prog = ctx.sequencer_recovery_job.progress();
+            let dids = crate::sequencer_recovery::dids_to_route(&prog).map_err(|e| {
+                json_error(StatusCode::BAD_REQUEST, "InvalidRequest", e.message().to_string())
+            })?;
+            let validate_job = prog.job_id.clone().unwrap_or_default();
+
+            // Fan a per-account rebuild over the COMPLETE affected set. The
+            // RebuildRegistry's per-DID single-flight is the guard: a DID with a
+            // rebuild already in flight is skipped (not double-queued), not
+            // failed. No new audit variant — each rebuild emits RepoRebuilt with
+            // the routing rationale, which is the trail.
+            let mut queued: Vec<serde_json::Value> = Vec::new();
+            let mut skipped: Vec<serde_json::Value> = Vec::new();
+            for did in &dids {
+                let per_rationale = format!(
+                    "routed from sequencer validation (job {validate_job}) — malformed event(s): {rationale}"
+                );
+                match ctx.rebuild_registry.start(
+                    ctx.clone(),
+                    did.clone(),
+                    auth.did.clone(),
+                    per_rationale,
+                ) {
+                    Ok(job_id) => queued.push(serde_json::json!({ "did": did, "jobId": job_id })),
+                    Err(PdsError::Conflict(_)) => skipped.push(serde_json::json!({
+                        "did": did, "reason": "rebuild_already_in_flight",
+                    })),
+                    Err(e) => {
+                        skipped.push(serde_json::json!({ "did": did, "reason": e.to_string() }))
+                    }
+                }
+            }
+
+            Ok(Json(serde_json::json!({
+                "operation": crate::sequencer_recovery::OP_ROUTE_MALFORMED,
+                "status": "routed",
+                "totalAffected": dids.len(),
+                "queued": queued,
+                "skipped": skipped,
+            })))
+        }
+        other => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            format!("unknown or unavailable recovery operation: {other}"),
+        )),
+    }
+}
+
+/// Render a [`RecoveryProgress`](crate::sequencer_recovery::RecoveryProgress) as
+/// the `getSequencerRecoveryProgress` wire shape.
+fn sequencer_recovery_progress_json(
+    p: &crate::sequencer_recovery::RecoveryProgress,
+) -> serde_json::Value {
+    fn ms(t: Option<std::time::SystemTime>) -> Option<u64> {
+        t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    }
+    let report = p.report.as_ref().map(|r| {
+        serde_json::json!({
+            "totalRows": r.total_rows,
+            "invalidatedRows": r.invalidated_rows,
+            "headSeq": r.head_seq,
+            "minSeq": r.min_seq,
+            "rowsScanned": r.rows_scanned,
+            "malformedCount": r.malformed_count,
+            "malformed": r.malformed.iter().map(|m| serde_json::json!({
+                "seq": m.seq, "did": m.did, "eventType": m.event_type,
+            })).collect::<Vec<_>>(),
+            "nonMonotonicCount": r.non_monotonic_count,
+            "nonMonotonic": r.non_monotonic.iter().map(|n| serde_json::json!({
+                "did": n.did, "seq": n.seq, "rev": n.rev, "prevRev": n.prev_rev,
+            })).collect::<Vec<_>>(),
+            // The COMPLETE affected-DID set (not sample-bounded) — drives the
+            // slice-2 malformed→rebuild routing affordance (#357).
+            "affectedDids": r.affected_dids,
+        })
+    });
+    serde_json::json!({
+        "running": p.running,
+        "operation": p.operation,
+        "jobId": p.job_id,
+        "rowsScanned": p.rows_scanned,
+        "startedAt": ms(p.started_at),
+        "finishedAt": ms(p.finished_at),
+        "cancelRequested": p.cancel_requested,
+        "lastOutcome": p.last_outcome,
+        "error": p.error,
+        "report": report,
+    })
+}
+
+/// `GET /xrpc/tools.aurora.superadmin.getSequencerRecoveryProgress` — live
+/// progress + the validation report once complete (§7.4.2 / #294). SuperAdmin.
+async fn get_sequencer_recovery_progress(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("getSequencerRecoveryProgress requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    Ok(Json(sequencer_recovery_progress_json(
+        &ctx.sequencer_recovery_job.progress(),
+    )))
+}
+
+/// `POST /xrpc/tools.aurora.superadmin.cancelSequencerRecovery` — request
+/// cancellation of the in-flight recovery operation (§7.4.2 / #294); the walk
+/// stops at the next page boundary and returns its partial report. SuperAdmin.
+/// 409 if none is in progress.
+async fn cancel_sequencer_recovery(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("cancelSequencerRecovery requires SuperAdmin role; have {}", auth.role.as_str()),
+        ));
+    }
+    if ctx.sequencer_recovery_job.request_cancel() {
+        Ok(Json(serde_json::json!({ "status": "cancelling" })))
+    } else {
+        Err(json_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "no sequencer recovery operation is in progress".to_string(),
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -1339,6 +3750,12 @@ struct UpdateAccountEmailRequest {
     did: Option<String>,
     /// New email address
     email: String,
+    /// Operator rationale recorded in the audit chain (#362.5). Optional on
+    /// the wire (the canonical lexicon doesn't define it — these structs carry
+    /// no `deny_unknown_fields`, so it's an additive local field); when absent
+    /// the handler falls back to the descriptive default.
+    #[serde(default)]
+    rationale: Option<String>,
 }
 
 /// Update account email address
@@ -1374,7 +3791,12 @@ async fn update_account_email(
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rationale = format!("change email to {}", req.email);
+    // #362.5: record the operator's rationale when supplied; otherwise fall
+    // back to the descriptive default (mirrors the B3 signing-key pattern).
+    let rationale = req
+        .rationale
+        .clone()
+        .unwrap_or_else(|| format!("change email to {}", req.email));
 
     // LB-1 / chainlink #128: the email UPDATE and chain entry land
     // in one transaction. Multi-store side effects (token store
@@ -1407,6 +3829,8 @@ async fn update_account_email(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.update_email",
             subject: Some(&subject),
@@ -1432,6 +3856,10 @@ struct UpdateAccountHandleRequest {
     did: String,
     /// New handle
     handle: String,
+    /// Operator rationale recorded in the audit chain (#362.5). Optional;
+    /// falls back to the descriptive default when absent.
+    #[serde(default)]
+    rationale: Option<String>,
 }
 
 /// Update account handle
@@ -1456,7 +3884,11 @@ async fn update_account_handle(
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rationale = format!("change handle to {}", req.handle);
+    // #362.5: operator rationale when supplied, else the descriptive default.
+    let rationale = req
+        .rationale
+        .clone()
+        .unwrap_or_else(|| format!("change handle to {}", req.handle));
 
     // LB-1 Session 12 / chainlink #129: handle UPDATE + chain entry
     // in one transaction so a crash between the two leaves neither row.
@@ -1484,6 +3916,8 @@ async fn update_account_handle(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.update_handle",
             subject: Some(&subject),
@@ -1509,6 +3943,11 @@ struct UpdateAccountPasswordRequest {
     did: String,
     /// New password
     password: String,
+    /// Operator rationale recorded in the audit chain (#362.5). This is
+    /// operator-typed justification text — distinct from `password`, which
+    /// never reaches the chain. Optional; falls back to the fixed default.
+    #[serde(default)]
+    rationale: Option<String>,
 }
 
 /// Update account password (admin override)
@@ -1530,14 +3969,20 @@ async fn update_account_password(
         ));
     }
 
-    // Rationale is fixed text — under no circumstances does the password
-    // value (raw or otherwise) get committed to the chain.
+    // #362.5: the chain records the operator's rationale when supplied, else
+    // fixed default text. Under no circumstances does the password value (raw
+    // or otherwise) get committed to the chain — `rationale` is a separate
+    // operator-typed field, never derived from `password`.
     let subject = Subject::Repo {
         did: req.did.clone(),
     };
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rationale = req
+        .rationale
+        .clone()
+        .unwrap_or_else(|| "reset account password".to_string());
 
     // LB-1 Session 12 / chainlink #129: password UPDATE +
     // session/refresh_token DELETE + chain entry in one transaction.
@@ -1563,10 +4008,12 @@ async fn update_account_password(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.reset_password",
             subject: Some(&subject),
-            rationale: "reset account password",
+            rationale: &rationale,
             snapshot_id,
             event_id: None,
             cascade_subjects: &[],
@@ -1634,6 +4081,8 @@ async fn admin_delete_account(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.delete",
             subject: Some(&subject),
@@ -1654,40 +4103,72 @@ async fn admin_delete_account(
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateAccountSigningKeyRequest {
-    /// DID of the account whose signing key is being updated
-    did: String,
-    /// New signing key in did:key: format (per the lexicon)
-    signing_key: String,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct UpdateAccountSigningKeyRequest {
+    /// DID of the account whose signing key is being rotated.
+    pub(crate) did: String,
+    /// Operator rationale, recorded in the rotation audit entry.
+    #[serde(default)]
+    pub(crate) rationale: Option<String>,
+    /// Operator-supplied keypair (the gated path, §4.2.1 Path B). Absent → the
+    /// PDS generates a fresh per-account keypair (Path A). Present → validated
+    /// (derive-public-from-private + compare) and gated on
+    /// `key_rotation.operator_supplied_keys_enabled`.
+    #[serde(default)]
+    pub(crate) operator_keypair: Option<crate::account::OperatorSuppliedKeypair>,
 }
 
-/// Update an account's signing key in the PLC directory
+/// How the new per-account signing key was produced — the load-bearing forensic
+/// record in the rotation audit (§4.2.6). Serializes to the design's snake-case
+/// wire values (`"pds"` / `"operator_supplied"`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) enum KeyGenerationSource {
+    #[serde(rename = "pds")]
+    PdsGenerated,
+    #[serde(rename = "operator_supplied")]
+    OperatorSupplied,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateAccountSigningKeyResponse {
+    did: String,
+    /// The account's new (or, on a no-op, current) atproto signing key, did:key form.
+    new_signing_key: String,
+    generation_source: KeyGenerationSource,
+    /// CID of the empty-commit advance signed with the new per-account key.
+    /// Absent on the idempotent no-op short-circuit (no commit produced).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    empty_commit_cid: Option<String>,
+    /// The PLC operation CID. Currently always absent: the substrate's
+    /// `PlcClient::update_signing_key` does not surface the op CID (see the
+    /// TODO at plc_client.rs — PLC op CIDs aren't computed yet). Modelled as
+    /// optional so it populates once the substrate returns it, without another
+    /// contract change. Flagged on #374 for design.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plc_op_cid: Option<String>,
+}
+
+/// Rotate an account's atproto signing key (`com.atproto.admin.updateAccountSigningKey`).
 ///
-/// Implements `com.atproto.admin.updateAccountSigningKey`. Submits a PLC
-/// operation rotating the `verificationMethods.atproto` entry to the supplied
-/// did:key value, then advances the repository commit chain with an empty
-/// commit and sequences an identity event so federation peers learn of the
-/// change.
+/// Key-rotation arc B3 (#374, design §4.2.0-§4.2.6 / §4.3). The PDS generates a
+/// fresh per-account keypair by default; an operator may supply their own
+/// keypair when the `key_rotation.operator_supplied_keys_enabled` runtime gate
+/// is on (§4.6). The flow: pick/validate the keypair → publish the new public
+/// key to PLC → write the new private key to `plc_keys` → advance the repo with
+/// an empty commit signed by the **new per-account key** (not the PDS-wide repo
+/// key — the R2.1 contradiction fix) → sequence an identity event → emit the
+/// rotation audit recording the generation source and old/new public keys.
 ///
-/// Aurora-Locus runs in a single-operator-key model: the operator's
-/// `authentication.repo_signing_key` is the only private key the PDS can sign
-/// commits with. Rotating to any other public key would leave the account
-/// unable to produce new commits, so this handler enforces strict-mode
-/// validation: the supplied `signingKey` must match the operator's configured
-/// key. The lexicon contract permits arbitrary `signingKey` values; the
-/// strict-mode check is an Aurora-architecture safety constraint.
-async fn update_account_signing_key(
+/// No request-supplied `signingKey` and no single-operator-key strict check:
+/// per-account keys are the model now (the strict check + its TODO are removed).
+pub(crate) async fn update_account_signing_key(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
     Json(req): Json<UpdateAccountSigningKeyRequest>,
-) -> Result<StatusCode, axum::response::Response> {
+) -> Result<Json<UpdateAccountSigningKeyResponse>, axum::response::Response> {
     use crate::actor_store::repository::RepositoryManager;
-    use crate::crypto::{
-        plc::PlcSigner,
-        plc_client::{PlcClient, PlcClientConfig},
-        proto_blue_signer::RepoSigner,
-    };
+    use crate::crypto::{plc::PlcSigner, proto_blue_signer::RepoSigner};
     use crate::sequencer::events::IdentityEvent;
     use axum::response::IntoResponse;
 
@@ -1715,51 +4196,44 @@ async fn update_account_signing_key(
             "did must be a did:plc identifier",
         ));
     }
-    if !req.signing_key.starts_with("did:key:") {
-        return Err(plain_err(
-            StatusCode::BAD_REQUEST,
-            "signingKey must be in did:key: format",
-        ));
-    }
 
-    // Strict-mode validation: the supplied signingKey must match the operator's
-    // configured repo_signing_key. Aurora-Locus has a single operator-level
-    // private key; any other rotation target would leave the account unable to
-    // sign new commits.
-    //
-    // TODO: Relax this check when Aurora-Locus supports per-account signing
-    // keys. The lexicon contract permits arbitrary signingKey values; this
-    // strict-mode validation is a safety check appropriate to Aurora's
-    // current single-key architecture.
-    let repo_signer = PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key)
-        .map_err(|e| {
-            plain_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Operator repo signing key not configured: {}", e),
+    // §4.2.1 — pick the new per-account keypair. Path A (no operator_keypair):
+    // PDS generation. Path B (operator-supplied): validate FIRST so a mismatched
+    // or malformed pair surfaces regardless of gate state (B1/B2 ordering), THEN
+    // enforce the operator-supplied-keys gate. Same gate-read as the dry-run.
+    let (rotation_keypair, generation_source) = match &req.operator_keypair {
+        None => (
+            ctx.account_manager.generate_rotation_keypair().map_err(|e| {
+                plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?,
+            KeyGenerationSource::PdsGenerated,
+        ),
+        Some(supplied) => {
+            let validated = ctx
+                .account_manager
+                .validate_operator_keypair(supplied)
+                .map_err(|e| xrpc_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()))?;
+            let gate_on = crate::api::aurora_admin::resolve_runtime_setting(
+                &ctx,
+                crate::api::aurora_admin::KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY,
             )
-        })?;
-    let operator_did_key = repo_signer.public_key_did_key();
-    if req.signing_key != operator_did_key {
-        return Err(xrpc_err(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "signingKey does not match operator's configured signing key. \
-             Aurora-Locus uses a single operator-level signing key model; \
-             the provided signingKey must match the operator's \
-             repo_signing_key config.",
-        ));
-    }
+            .await
+            .as_bool()
+            .unwrap_or(false);
+            if !gate_on {
+                return Err(xrpc_err(
+                    StatusCode::BAD_REQUEST,
+                    "OperatorSuppliedKeysDisabled",
+                    "operator-supplied rotation keys are disabled on this deployment \
+                     (set key_rotation.operator_supplied_keys_enabled to enable)",
+                ));
+            }
+            (validated, KeyGenerationSource::OperatorSupplied)
+        }
+    };
 
-    let plc_client = PlcClient::new(PlcClientConfig {
-        plc_url: ctx.config.identity.did_plc_url.clone(),
-        timeout_secs: 30,
-    })
-    .map_err(|e| {
-        plain_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("PLC client init failed: {}", e),
-        )
-    })?;
+    // Threaded shared PLC client (#371 / A3b) — no ad-hoc construction.
+    let plc_client = &ctx.plc_client;
 
     let rotation_signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)
         .map_err(|e| {
@@ -1769,10 +4243,11 @@ async fn update_account_signing_key(
             )
         })?;
 
-    // Compare against the current PLC document. Aurora's PlcClient::get_signing_key
-    // returns multibase form (the bare `z...` prefix); the request's signingKey is
-    // in did:key form. Strip the prefix for comparison so we don't submit a no-op
-    // PLC operation when the keys already match.
+    // §4.2.2 / §4.3 no-op short-circuit (preserved as-is; scope narrowed by
+    // R2.1). Compare the would-be-published key against the current PLC key;
+    // skip if they already match. Vestigial on Path A (a freshly-generated key
+    // never matches), meaningful on Path B when the operator supplies the
+    // already-current key (the genuine idempotent no-op).
     let current_doc = plc_client.get_document(&req.did).await.map_err(|e| {
         if matches!(e, PdsError::IdentityResolution(_)) {
             plain_err(
@@ -1786,28 +4261,55 @@ async fn update_account_signing_key(
     let current_key_multibase = plc_client
         .get_signing_key(&current_doc)
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let new_key_multibase = req
-        .signing_key
+    let new_key_multibase = rotation_keypair
+        .public_did_key
         .strip_prefix("did:key:")
-        .unwrap_or(&req.signing_key);
+        .unwrap_or(&rotation_keypair.public_did_key);
 
     if plc_client.keys_match(&current_key_multibase, new_key_multibase) {
-        tracing::debug!(did = %req.did, "Signing key already up to date; skipping PLC submission");
-        return Ok(StatusCode::OK);
+        tracing::debug!(did = %req.did, "Signing key already up to date; skipping rotation (no-op)");
+        return Ok(Json(UpdateAccountSigningKeyResponse {
+            did: req.did,
+            new_signing_key: rotation_keypair.public_did_key,
+            generation_source,
+            empty_commit_cid: None,
+            plc_op_cid: None,
+        }));
     }
 
-    // Submit PLC update with the did:key form so the entry stores the canonical
-    // verificationMethods.atproto value.
+    // §4.2.3 — publish the new public key to PLC with the PDS-wide rotation key.
     plc_client
-        .update_signing_key(&req.did, &req.signing_key, &rotation_signer)
+        .update_signing_key(&req.did, &rotation_keypair.public_did_key, &rotation_signer)
         .await
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Advance the repository commit chain with an empty commit so the rotation
-    // is reflected in repository state, not just the DID document. Mirrors the
-    // CLI rotation flow in src/cli/rotate_keys.rs. Strict-mode validation
-    // guarantees the operator's repo_signing_key matches the new PLC entry, so
-    // the commit signature will verify against the newly-installed key.
+    // §4.2.4 — write the new private key to plc_keys; capture the old keys for
+    // the audit. NotFound (no plc_keys row) → 404.
+    let old_keys = ctx
+        .account_manager
+        .update_atproto_signing_key(&req.did, &rotation_keypair.private_key_bytes)
+        .await
+        .map_err(|e| {
+            if matches!(e, PdsError::NotFound(_)) {
+                plain_err(StatusCode::NOT_FOUND, format!("Account not found: {}", req.did))
+            } else {
+                plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
+    // Defensive invariant: a rotation must have had a real prior key (the writer
+    // already errors on a malformed/empty prior key; this guards the contract
+    // and reads old_private_key_bytes so the field is never dead).
+    if old_keys.old_private_key_bytes.is_empty() {
+        return Err(plain_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rotation produced no prior signing key to record",
+        ));
+    }
+
+    // §4.2.5 — advance the repo with an empty commit signed by the NEW
+    // per-account private key (the R2.1 contradiction fix: was the PDS-wide
+    // repo_signing_key). The commit now verifies against the key PLC just
+    // published — internally consistent.
     let repo_mgr = RepositoryManager::with_sequencer(
         req.did.clone(),
         (*ctx.actor_store).clone(),
@@ -1815,16 +4317,10 @@ async fn update_account_signing_key(
     )
     .with_blob_store(ctx.blob_store.clone());
     let repo_signer_pb: std::sync::Arc<dyn proto_blue::crypto::Signer> = {
-        let key_bytes = hex::decode(&ctx.config.authentication.repo_signing_key).map_err(|e| {
+        let s = RepoSigner::from_bytes(&rotation_keypair.private_key_bytes).map_err(|e| {
             plain_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Invalid hex repo signing key: {}", e),
-            )
-        })?;
-        let s = RepoSigner::from_bytes(&key_bytes).map_err(|e| {
-            plain_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to build repo signer: {}", e),
+                format!("Failed to build repo signer from new per-account key: {}", e),
             )
         })?;
         std::sync::Arc::new(s)
@@ -1861,21 +4357,31 @@ async fn update_account_signing_key(
         .await
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // §4.2.6 — emit the rotation audit. The forensic record (old/new public
+    // did:keys, generation source, empty-commit CID) rides the structured
+    // payload; the operator rationale is the rationale column. Private key
+    // material NEVER appears — only public did:keys.
     let subject = Subject::Repo {
         did: req.did.clone(),
     };
     let snapshot_id = audit_chain::capture_snapshot(&ctx.account_db, &subject)
         .await
         .map_err(|e| plain_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rationale = format!("rotate signing key to {}", req.signing_key);
+    let rationale = req
+        .rationale
+        .clone()
+        .unwrap_or_else(|| "rotate account signing key".to_string());
+    let payload = serde_json::json!({
+        "old_atproto_signing_key": old_keys.old_public_did_key,
+        "new_atproto_signing_key": rotation_keypair.public_did_key,
+        "generation_source": generation_source,
+        "empty_commit_cid": commit_cid.to_string(),
+    });
 
     // LB-1 Session 12 / chainlink #129: signing-key rotation's actor
-    // mutations live in actor_store (separate DB) and the PLC
-    // directory (HTTP), with the operator's repo_signing_key as the
-    // only signing material in account_db (read-only here). The chain
-    // entry is the only account_db write and the tx wrapper is
-    // structurally consistent with the rest of Session 12 (no other
-    // writes share the tx).
+    // mutations live in actor_store (separate DB) and the PLC directory
+    // (HTTP). The chain entry is the only account_db write and the tx wrapper
+    // is structurally consistent with the rest of Session 12.
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
     let mut tx = ctx
         .account_db
@@ -1886,6 +4392,8 @@ async fn update_account_signing_key(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: Some(payload),
             actor_did: &auth.did,
             action: "account.update_signing_key",
             subject: Some(&subject),
@@ -1905,10 +4413,16 @@ async fn update_account_signing_key(
     tracing::info!(
         admin = %auth.did,
         did = %req.did,
-        "Updated account signing key via XRPC"
+        "Rotated account signing key via XRPC"
     );
 
-    Ok(StatusCode::OK)
+    Ok(Json(UpdateAccountSigningKeyResponse {
+        did: req.did,
+        new_signing_key: rotation_keypair.public_did_key,
+        generation_source,
+        empty_commit_cid: Some(commit_cid.to_string()),
+        plc_op_cid: None,
+    }))
 }
 
 // ============================================================================
@@ -1972,6 +4486,8 @@ async fn takedown_account(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.takedown",
             subject: Some(&subject),
@@ -2071,6 +4587,8 @@ async fn suspend_account(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.suspend",
             subject: Some(&subject),
@@ -2141,6 +4659,8 @@ async fn restore_account(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.restore",
             subject: Some(&subject),
@@ -2257,13 +4777,18 @@ async fn apply_label(
         &req.val,
         &auth.did,
         expires_in,
+        "manual",
+        None,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .label;
     audit_chain::insert_chain_entry(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "label.apply",
             subject: Some(&subject),
@@ -2332,6 +4857,8 @@ async fn remove_label(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "label.remove",
             subject: Some(&subject),
@@ -2398,6 +4925,44 @@ async fn submit_report(
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // §5.5.4 Phase A: apply the configured default action (full tier
+    // only). Best-effort — the report is already persisted.
+    if let Err(e) =
+        crate::api::moderation_defaults::apply_report_default(&ctx, &report).await
+    {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "moderation default-action consumer failed on submitReport intake"
+        );
+    }
+    // §5.5.4 Phase B: reviewer routing (Pipeline A §4), best-effort.
+    if let Err(e) =
+        crate::api::reviewer_assignment::assign_reviewer_on_intake(&ctx, &report).await
+    {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "reviewer-assignment consumer failed on submitReport intake"
+        );
+    }
+    // §5.5.4 Phase C: Pipeline A report-count auto-label rules. Best-effort.
+    if let Err(e) = crate::api::auto_label_rules::evaluate_pipeline_a(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "auto-label Pipeline A failed on submitReport intake"
+        );
+    }
+    // §5.5.4 Phase D: Pipeline A escalation rules. Best-effort.
+    if let Err(e) = crate::api::escalation_rules::evaluate_pipeline_a(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "escalation Pipeline A failed on submitReport intake"
+        );
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -2481,6 +5046,8 @@ async fn update_report_status(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "report.update",
             subject: subject.as_ref(),
@@ -2515,10 +5082,11 @@ struct ListReportsQuery {
 /// List reports
 async fn list_reports(
     State(ctx): State<AppContext>,
-    _auth: AdminAuthContext,
+    auth: AdminAuthContext,
     Query(query): Query<ListReportsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::admin::reports::ReportStatus;
+    use crate::admin::reports::{AssignmentScope, ReportStatus};
+    use crate::admin::roles::Role;
 
     // Parse status filter if provided
     let status_filter = if let Some(status_str) = query.status {
@@ -2531,10 +5099,17 @@ async fn list_reports(
         None
     };
 
+    // §5.5.4 §4.5 queue scope (same as getModerationQueue).
+    let scope = if auth.role.can_act_as(Role::SuperAdmin) {
+        AssignmentScope::All
+    } else {
+        AssignmentScope::AssignedTo(&auth.did)
+    };
+
     // List reports
     let reports = ctx
         .report_manager
-        .list_reports(status_filter, query.limit)
+        .list_reports_scoped(status_filter, query.limit, scope)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -2650,6 +5225,8 @@ async fn send_email(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: sender,
             action: "email.send",
             subject: Some(&subject_ref),
@@ -3067,6 +5644,12 @@ struct GetAccountInfoQuery {
 
 #[derive(Deserialize)]
 struct SearchAccountsQuery {
+    /// Free-text search term (#315) — case-insensitive substring over handle,
+    /// DID, and email. This is what the admin UI's Accounts search box sends;
+    /// it was previously absent from this struct, so `Query<>` silently dropped
+    /// it and every account came back regardless of the term.
+    #[serde(default)]
+    q: Option<String>,
     /// Optional email to filter by (exact, case-insensitive)
     #[serde(default)]
     email: Option<String>,
@@ -3115,6 +5698,7 @@ async fn search_accounts(
         .account_manager
         .search_accounts(
             query.email.as_deref(),
+            query.q.as_deref(),
             query.cursor.as_deref(),
             limit + 1,
         )
@@ -3573,7 +6157,7 @@ async fn ops_get_instance_metrics(
     };
 
     let federation_health = OpsFederationHealth {
-        federation_enabled: ctx.config.federation.enabled,
+        federation_enabled: ctx.federation_enabled, // §2.1 (#397) effective gate
         relay_connected: ctx.relay_client.is_some(),
         known_instances,
     };
@@ -3917,6 +6501,8 @@ async fn update_subject_status(
             &mut tx,
             ctx.config.database.backend,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: &auth.did,
                 action: "subject.update_status",
                 subject: Some(&chain_subject),
@@ -4527,6 +7113,10 @@ async fn get_subject_status(
 
 #[derive(Deserialize)]
 struct GetModerationQueueQuery {
+    /// Queue header status filter (#209). Absent → open-only (prior default);
+    /// `all` → every status; otherwise a report status, else `400`.
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     limit: Option<i64>,
 }
@@ -4534,15 +7124,29 @@ struct GetModerationQueueQuery {
 /// Get moderation queue (reports needing review)
 async fn get_moderation_queue(
     State(ctx): State<AppContext>,
-    _auth: AdminAuthContext,
+    auth: AdminAuthContext,
     Query(query): Query<GetModerationQueueQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::admin::reports::ReportStatus;
+    use crate::admin::reports::{AssignmentScope, ReportStatus};
+    use crate::admin::roles::Role;
 
-    // Get open reports as the moderation queue
+    // Resolve the header status filter (#209). No param preserves the prior
+    // hardcoded open-only queue; `all` widens to every status; an unknown
+    // value is a 400 rather than a silently-ignored decorative filter.
+    let status_filter = ReportStatus::queue_filter_from_param(query.status.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // §5.5.4 §4.5 queue scope: SuperAdmin sees every item; everyone else
+    // sees items assigned to them plus the unassigned pool.
+    let scope = if auth.role.can_act_as(Role::SuperAdmin) {
+        AssignmentScope::All
+    } else {
+        AssignmentScope::AssignedTo(&auth.did)
+    };
+
     let reports = ctx
         .report_manager
-        .list_reports(Some(ReportStatus::Open), query.limit)
+        .list_reports_scoped(status_filter, query.limit, scope)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -4586,6 +7190,8 @@ async fn disable_invite_code(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "invite.disable",
             subject: None,
@@ -4666,6 +7272,8 @@ async fn disable_invite_codes(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "invite.disable_batch",
             subject: None,
@@ -4749,6 +7357,8 @@ async fn enable_account_invites(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.invites.enable",
             subject: Some(&subject),
@@ -4809,6 +7419,8 @@ async fn disable_account_invites(
         &mut tx,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "account.invites.disable",
             subject: Some(&subject),
@@ -4880,7 +7492,7 @@ async fn get_system_health(
 
     // Check optional services
     let relay_connected = ctx.relay_client.is_some();
-    let federation_enabled = ctx.config.federation.enabled;
+    let federation_enabled = ctx.federation_enabled; // §2.1 (#397) effective gate
 
     // Determine overall health
     let status = if db_healthy && sequencer_healthy {
@@ -5152,7 +7764,7 @@ async fn get_version_info(
         "rust_version": env!("CARGO_PKG_RUST_VERSION"),
         "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
         "features": {
-            "federation": ctx.config.federation.enabled,
+            "federation": ctx.federation_enabled, // §2.1 (#397) effective gate
             "invites_required": ctx.config.invites.required,
             "rate_limiting": ctx.config.rate_limit.enabled,
             "email": ctx.config.email.is_some(),
@@ -5805,6 +8417,8 @@ async fn pause_sequencer(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "sequencer.pause",
             subject: None,
@@ -5840,6 +8454,8 @@ async fn resume_sequencer(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "sequencer.resume",
             subject: None,
@@ -5906,6 +8522,8 @@ async fn reset_sequencer_cursor(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "sequencer.reset_cursor",
             subject: None,
@@ -5982,6 +8600,8 @@ async fn rebuild_sequencer(
             &ctx.account_db,
             ctx.config.database.backend,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: &auth.did,
                 action: "sequencer.verify",
                 subject: None,
@@ -6019,6 +8639,8 @@ async fn rebuild_sequencer(
             &ctx.account_db,
             ctx.config.database.backend,
             AppendEntryParams {
+                source: "manual",
+                payload: None,
                 actor_did: &auth.did,
                 action: "sequencer.rebuild",
                 subject: None,
@@ -6192,6 +8814,8 @@ async fn cleanup_rate_limit_state(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "rate_limit.cleanup",
             subject: None,
@@ -6285,6 +8909,357 @@ async fn get_federation_status(
         known_instances,
         status,
     }))
+}
+
+/// The full deployment federation config (#344) — the env-view the
+/// Configuration → Federation policy page renders. Unlike the public describe
+/// endpoints, this is the SuperAdmin's *complete* view: it includes the
+/// trusted-issuer peer allowlist, which the peer-facing describes omit.
+/// Read-only; all fields come straight from
+/// `FederationConfig` (env/startup config), so the page is honest that mutation
+/// is a restart-time deployment change, not a runtime setting.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FederationPolicyView {
+    enabled: bool,
+    relay_urls: Vec<String>,
+    appview_url: Option<String>,
+    firehose_enabled: bool,
+    crawl_enabled: bool,
+    public_url: Option<String>,
+    peer_pds: Vec<PeerPdsConfigView>,
+    /// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A2 M2-4) — the
+    /// boot-seed-failure state, so the operator can diagnose the refusal without
+    /// grepping the audit log.
+    boot_seed_status: BootSeedStatus,
+    /// v0.9 Federation Pattern-1 Phase E (#355 / design §6.4) — composite-load:
+    /// the live discovery mode + pending-discovery surface, so external operator
+    /// tooling reads all runtime federation policy in one call (the page already
+    /// renders these via getRuntimeSetting).
+    discovery_mode: String,
+    pending_discoveries: Vec<PendingDiscoveryView>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingDiscoveryView {
+    did: String,
+    url: String,
+    first_seen_at: String,
+    last_seen_at: String,
+    first_scan_id: String,
+    last_seen_scan_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerPdsConfigView {
+    did: String,
+    url: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BootSeedStatus {
+    boot_seed_failed: bool,
+    failed_keys: Vec<String>,
+    seeded_keys: Vec<String>,
+    failure_reasons: std::collections::HashMap<String, String>,
+}
+
+/// `tools.aurora.ops.getFederationPolicy` (#344) — SuperAdmin read of the full
+/// deployment federation config for the Federation policy page. SuperAdmin-only
+/// because it surfaces the trusted-issuer peer allowlist (who this PDS trusts) —
+/// a security-adjacent field the public `describeServer` / `describePosture`
+/// endpoints intentionally exclude.
+/// Read-only; no mutation.
+async fn get_federation_policy(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<FederationPolicyView>, (StatusCode, String)> {
+    use crate::admin::roles::Role;
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "getFederationPolicy requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+    let fc = &ctx.config.federation;
+    // v0.9 Federation Pattern-1 (#351 / design §2.2): the describe surface reads
+    // the trusted-peer list through the runtime-backed snapshot rather than the
+    // static `fc.peer_pds`. Phase A: the runtime key is unset, so the snapshot
+    // is the `peer_pds` fallback (identical output to before).
+    let peer_snapshot = ctx.trusted_peers.snapshot().await;
+    // Phase D (#354 / addendum §A2 H-2): relay_urls reads the runtime store
+    // (federation.policy.relay-urls) with a fallback to the static config, so the
+    // describe reflects runtime relay switches — paralleling peer_pds.
+    let relay_urls = {
+        let v = crate::api::aurora_admin::resolve_runtime_setting(
+            &ctx,
+            crate::api::aurora_admin::FEDERATION_POLICY_RELAY_URLS_KEY,
+        )
+        .await;
+        match serde_json::from_value::<Vec<String>>(v) {
+            Ok(urls) if !urls.is_empty() => urls,
+            _ => fc.relay_urls.clone(),
+        }
+    };
+    // Phase D (#354 / addendum M2-4): surface the boot-seed-failure state.
+    let boot_seed_status = {
+        use std::sync::atomic::Ordering;
+        let failed = ctx.boot_seed_failed.load(Ordering::Acquire);
+        let details = ctx.boot_seed_failure_details.read().await.clone();
+        match details {
+            Some(d) => BootSeedStatus {
+                boot_seed_failed: failed,
+                failed_keys: d.failed_keys,
+                seeded_keys: d.seeded_keys,
+                failure_reasons: d.failure_reasons,
+            },
+            None => BootSeedStatus {
+                boot_seed_failed: failed,
+                failed_keys: vec![],
+                seeded_keys: vec![],
+                failure_reasons: std::collections::HashMap::new(),
+            },
+        }
+    };
+    // Phase E (#355 / §6.4): composite-load discovery-mode + pending-discoveries.
+    let discovery_mode = crate::api::federation_discovery::current_mode(&ctx)
+        .await
+        .as_str()
+        .to_string();
+    let pending_discoveries = {
+        let v = crate::api::aurora_admin::resolve_runtime_setting(
+            &ctx,
+            crate::api::aurora_admin::FEDERATION_POLICY_PENDING_DISCOVERIES_KEY,
+        )
+        .await;
+        serde_json::from_value::<Vec<crate::api::federation_discovery::PendingEntry>>(v)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| PendingDiscoveryView {
+                did: e.did,
+                url: e.url,
+                first_seen_at: e.first_seen_at,
+                last_seen_at: e.last_seen_at,
+                first_scan_id: e.first_scan_id,
+                last_seen_scan_id: e.last_seen_scan_id,
+            })
+            .collect()
+    };
+    // v0.9 Federation runtime-mutability arc Phase A (#386): appview_url reflects
+    // the runtime override (→ env-config fallback), paralleling relay_urls above
+    // so the policy view shows the effective value, not the static env seed.
+    let appview_url = crate::api::aurora_admin::resolve_appview_url(&ctx).await;
+    // Phase A (#387): firehose_enabled reflects the runtime override (→ config).
+    let firehose_enabled = crate::api::aurora_admin::resolve_federation_flag(
+        &ctx,
+        crate::api::aurora_admin::FEDERATION_FIREHOSE_ENABLED_KEY,
+        fc.firehose_enabled,
+    )
+    .await;
+    // Phase A (#388): crawl_enabled reflects the runtime override (→ config).
+    let crawl_enabled = crate::api::aurora_admin::resolve_federation_flag(
+        &ctx,
+        crate::api::aurora_admin::FEDERATION_CRAWL_ENABLED_KEY,
+        fc.crawl_enabled,
+    )
+    .await;
+    Ok(Json(FederationPolicyView {
+        // §2.1 (#397): effective gate (runtime override resolved at boot).
+        enabled: ctx.federation_enabled,
+        relay_urls,
+        appview_url,
+        firehose_enabled,
+        crawl_enabled,
+        public_url: fc.public_url.clone(),
+        peer_pds: peer_snapshot
+            .peers
+            .iter()
+            .map(|p| PeerPdsConfigView {
+                did: p.did.clone(),
+                url: p.url.clone(),
+            })
+            .collect(),
+        boot_seed_status,
+        discovery_mode,
+        pending_discoveries,
+    }))
+}
+
+// v0.9 Federation Pattern-1 Phase B (#352) — peer-allowlist CRUD handlers.
+// SuperAdmin-gated; core logic + audit/CAS/recovery handling lives in
+// `crate::api::federation_peers`. Mutations round-trip through the
+// `getFederationPolicy` describe above (which reads `trusted_peers.snapshot()`).
+
+#[derive(Deserialize)]
+struct AddFederationPeerRequest {
+    did: String,
+    url: String,
+}
+
+async fn add_federation_peer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<AddFederationPeerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_peers::add_federation_peer(&ctx, &auth.did, &req.did, &req.url)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "did": req.did })))
+}
+
+#[derive(Deserialize)]
+struct RemoveFederationPeerRequest {
+    did: String,
+}
+
+async fn remove_federation_peer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RemoveFederationPeerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_peers::remove_federation_peer(&ctx, &auth.did, &req.did)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "did": req.did })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModifyFederationPeerRequest {
+    did: String,
+    new_url: String,
+}
+
+async fn modify_federation_peer(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<ModifyFederationPeerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_peers::modify_federation_peer(&ctx, &auth.did, &req.did, &req.new_url)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "did": req.did })))
+}
+
+// v0.9 Federation Pattern-1 Phase C (#353) — discovery-mode + pending-discovery
+// dismissal. SuperAdmin-gated; core logic in `crate::api::federation_discovery`.
+
+#[derive(Deserialize)]
+struct SetDiscoveryModeRequest {
+    mode: String,
+}
+
+async fn set_discovery_mode(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SetDiscoveryModeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_discovery::set_discovery_mode(&ctx, &auth.did, &req.mode)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "mode": req.mode })))
+}
+
+#[derive(Deserialize)]
+struct DismissPendingDiscoveryRequest {
+    did: String,
+}
+
+async fn dismiss_pending_discovery(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<DismissPendingDiscoveryRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_discovery::dismiss_pending_discovery(&ctx, &auth.did, &req.did)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "did": req.did })))
+}
+
+// v0.9 Federation Pattern-1 Phase D (#354) — relay runtime-switch. SuperAdmin-
+// gated; boot-seed-failure-flag-gated; core logic + CAS/reconfigure/audit in
+// `crate::api::federation_relays`.
+
+#[derive(Deserialize)]
+struct AddRelayUrlRequest {
+    url: String,
+}
+
+async fn add_relay_url(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<AddRelayUrlRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_relays::add_relay_url(&ctx, &auth.did, &req.url)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "url": req.url })))
+}
+
+#[derive(Deserialize)]
+struct RemoveRelayUrlRequest {
+    url: String,
+}
+
+async fn remove_relay_url(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RemoveRelayUrlRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_relays::remove_relay_url(&ctx, &auth.did, &req.url)
+        .await
+        .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "url": req.url })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetFederationRelaysRequest {
+    relay_urls: Vec<String>,
+    #[serde(default = "default_transition_mode")]
+    transition_mode: String,
+}
+
+fn default_transition_mode() -> String {
+    "graceful".to_string()
+}
+
+async fn set_federation_relays(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SetFederationRelaysRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::api::federation_peers::guard_boot_seed(&ctx).map_err(|e| e.into_http())?;
+    require_superadmin(&auth)?;
+    crate::api::federation_relays::set_federation_relays(
+        &ctx,
+        &auth.did,
+        req.relay_urls.clone(),
+        &req.transition_mode,
+    )
+    .await
+    .map_err(|e| e.into_http())?;
+    Ok(Json(serde_json::json!({ "success": true, "relayUrls": req.relay_urls })))
 }
 
 /// Relay server info
@@ -6417,6 +9392,8 @@ async fn trigger_pds_discovery(
                     &ctx.account_db,
                     ctx.config.database.backend,
                     AppendEntryParams {
+                        source: "manual",
+                        payload: None,
                         actor_did: &auth.did,
                         action: "federation.discover",
                         subject: None,
@@ -6429,6 +9406,14 @@ async fn trigger_pds_discovery(
                 )
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                // v0.9 Federation Pattern-1 Phase C (#353 / Step 7): manual
+                // scans bypass the scheduler-level discovery-disabled
+                // short-circuit (operator-initiated), but per-peer processing
+                // still honors the active mode. No scheduled_discovery_ran audit
+                // (manual keeps its own federation.discover above).
+                let mode = crate::api::federation_discovery::current_mode(&ctx).await;
+                crate::api::federation_discovery::process_scan(&ctx, &instances, mode, false).await;
 
                 tracing::info!(
                     "Admin {} triggered PDS discovery: {} instances found",
@@ -6528,6 +9513,8 @@ async fn cleanup_nonce_stores(
         &ctx.account_db,
         ctx.config.database.backend,
         AppendEntryParams {
+            source: "manual",
+            payload: None,
             actor_did: &auth.did,
             action: "federation.nonce_cleanup",
             subject: None,
@@ -6597,6 +9584,15 @@ mod tests {
     }
 
     async fn create_test_context() -> AppContext {
+        create_test_context_with(|_| {}).await
+    }
+
+    // Variant that lets a test tweak the config before the context is built —
+    // e.g. flip kryphocron off, since it is ON by default as of v0.9 and the
+    // disabled-path tests need to opt the fixture back out.
+    async fn create_test_context_with(
+        mutate: impl FnOnce(&mut ServerConfig),
+    ) -> AppContext {
         let _guard = fixture_setup_lock().lock().await;
         // `into_path()` leaks the TempDir so its Drop doesn't unlink the
         // directory while sqlx connections still hold it open. Under the
@@ -6607,7 +9603,7 @@ mod tests {
         let dir = tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
 
-        let config = ServerConfig {
+        let mut config = ServerConfig {
             service: ServiceConfig {
                 hostname: "localhost".to_string(),
                 port: 2583,
@@ -6651,7 +9647,13 @@ mod tests {
                 oauth_features: Default::default(),
             },
             identity: IdentityConfig {
-                did_plc_url: "https://plc.directory".to_string(),
+                // Non-routable fail-fast URL: unit tests must not dial the real
+                // PLC directory. Port 0 is doubly useful — it triggers
+                // generate_plc_did's #[cfg(test)] short-circuit (so create_account
+                // works in admin tests) AND, being an invalid connect target, it
+                // fails fast for real PLC fetches (rotation, preRebuildCheck deep
+                // key-history) instead of a network round-trip / timeout.
+                did_plc_url: "http://127.0.0.1:0".to_string(),
                 service_handle_domains: vec![".localhost".to_string()],
                 did_cache_stale_ttl: 3600,
                 did_cache_max_ttl: 86400,
@@ -6679,7 +9681,6 @@ mod tests {
                 firehose_enabled: false,
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
-                auto_stream_events: false,
                 peer_pds: vec![],
             },
             validation_mode: crate::validation::ValidationMode::Required,
@@ -6702,7 +9703,128 @@ mod tests {
         // fixtures (auth.rs, aurora_*.rs, tests/) keep the empty
         // default — they don't exercise the capability probe.
         let (_router, registry) = super::routes();
+        mutate(&mut config);
         AppContext::new(config, registry).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_federation_policy_superadmin_only_full_view() {
+        // #344 — SuperAdmin-only; returns the FULL env config including the
+        // peer allowlist (a security-adjacent field the public describes omit).
+        use crate::admin::roles::Role;
+        let ctx = create_test_context_with(|c| {
+            c.federation.enabled = true;
+            c.federation.appview_url = Some("https://api.example".to_string());
+            c.federation.peer_pds = vec![crate::config::PeerPdsConfig {
+                did: "did:plc:peer".to_string(),
+                url: "https://peer.example".to_string(),
+            }];
+        })
+        .await;
+        let mk = |role: Role| AdminAuthContext {
+            did: "did:plc:op".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:op".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role,
+        };
+        // Non-SuperAdmin → 403.
+        let forbidden = get_federation_policy(State(ctx.clone()), mk(Role::Admin)).await;
+        assert_eq!(forbidden.unwrap_err().0, StatusCode::FORBIDDEN);
+        // SuperAdmin → full view incl peer_pds.
+        let view = get_federation_policy(State(ctx.clone()), mk(Role::SuperAdmin))
+            .await
+            .expect("superadmin gets the policy view")
+            .0;
+        assert!(view.enabled);
+        assert_eq!(view.appview_url.as_deref(), Some("https://api.example"));
+        assert_eq!(view.peer_pds.len(), 1);
+        assert_eq!(view.peer_pds[0].did, "did:plc:peer");
+        assert_eq!(view.peer_pds[0].url, "https://peer.example");
+        // Phase E (#355) composite-load: discovery-mode + pending-discoveries +
+        // boot-seed status all surface in the one read. Unseeded runtime →
+        // discovery_mode resolves to the default; pending list empty; not failed.
+        assert_eq!(view.discovery_mode, "allowlist-only");
+        assert!(view.pending_discoveries.is_empty());
+        assert!(!view.boot_seed_status.boot_seed_failed);
+    }
+
+    // §5.5.4 Phase E — composite-load gating + section composition.
+    #[tokio::test]
+    async fn phase_e_get_defaults_state_gated_and_composes() {
+        let ctx = create_test_context().await;
+        let mk = |role: Role| AdminAuthContext {
+            did: "did:plc:op".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:op".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role,
+        };
+        assert_eq!(
+            get_defaults_state(State(ctx.clone()), mk(Role::Admin)).await.unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        let v = get_defaults_state(State(ctx.clone()), mk(Role::SuperAdmin)).await.unwrap().0;
+        for sec in ["reportAction", "reviewerAssignment", "autoLabelRules", "escalationRules"] {
+            assert_eq!(v[sec]["status"], "ok", "section {} ok", sec);
+        }
+    }
+
+    // §5.5.4 Phase E — SuperAdmin gating sweep across the §5.5.4 XRPCs.
+    #[tokio::test]
+    async fn phase_e_superadmin_gating_sweep() {
+        let ctx = create_test_context().await;
+        let admin = || AdminAuthContext {
+            did: "did:plc:op".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:op".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+        let f = StatusCode::FORBIDDEN;
+        assert_eq!(get_defaults_state(State(ctx.clone()), admin()).await.unwrap_err().0, f);
+        assert_eq!(
+            create_auto_label_rule(State(ctx.clone()), admin(), Json(CreateAutoLabelRuleRequest {
+                trigger_type: "report-count".into(),
+                trigger_params: serde_json::json!({}),
+                label_value: "l".into(),
+                subject_scope: "account".into(),
+                enabled: true,
+                rationale: None,
+            })).await.unwrap_err().0,
+            f
+        );
+        assert_eq!(
+            create_escalation_rule(State(ctx.clone()), admin(), Json(CreateEscalationRuleRequest {
+                trigger_type: "category-match".into(),
+                trigger_params: serde_json::json!({}),
+                action_type: "mark".into(),
+                enabled: true,
+                rationale: None,
+            })).await.unwrap_err().0,
+            f
+        );
+        assert_eq!(
+            clear_escalation(State(ctx.clone()), admin(), Json(ClearEscalationRequest {
+                item_id: "1".into(),
+                rationale: None,
+            })).await.unwrap_err().0,
+            f
+        );
+        assert_eq!(
+            assign_reviewer(State(ctx.clone()), admin(), Json(AssignReviewerRequest {
+                report_id: 1,
+                operator_did: "did:plc:x".into(),
+                rationale: None,
+            })).await.unwrap_err().0,
+            f
+        );
     }
 
     #[tokio::test]
@@ -6752,6 +9874,84 @@ mod tests {
         assert!(json["pool"]["active_connections"].is_number());
         assert!(json["latency_ms"].is_number());
         assert!(json["statistics"]["total_accounts"].is_number());
+    }
+
+    #[tokio::test]
+    async fn revoke_operator_sessions_gates_super_requires_rationale_and_audits() {
+        let ctx = create_test_context().await;
+        let mk_auth = |did: &str, role: Role| AdminAuthContext {
+            did: did.to_string(),
+            session: ValidatedSession {
+                did: did.to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role,
+        };
+        let target = "did:plc:target";
+        let req = |rationale: Option<&str>| {
+            Json(RevokeOperatorSessionsRequest {
+                did: target.to_string(),
+                rationale: rationale.map(str::to_string),
+            })
+        };
+        // Two active sessions for the target operator.
+        for rid in ["r1", "r2"] {
+            ctx.operator_session_store
+                .create(target, None, None, rid, chrono::Duration::days(30))
+                .await
+                .unwrap();
+        }
+
+        // Non-SuperAdmin → 403.
+        let forbidden = revoke_operator_sessions(
+            State(ctx.clone()),
+            mk_auth("did:plc:adm", Role::Admin),
+            req(Some("x")),
+        )
+        .await;
+        assert_eq!(forbidden.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // SuperAdmin without rationale → 400.
+        let no_rationale = revoke_operator_sessions(
+            State(ctx.clone()),
+            mk_auth("did:plc:super", Role::SuperAdmin),
+            req(None),
+        )
+        .await;
+        assert_eq!(no_rationale.unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        // SuperAdmin happy path → both sessions revoked + an audit entry.
+        let ok = revoke_operator_sessions(
+            State(ctx.clone()),
+            mk_auth("did:plc:super", Role::SuperAdmin),
+            req(Some("operator departed")),
+        )
+        .await
+        .expect("bulk revoke succeeds")
+        .0;
+        assert!(ok.success);
+        assert_eq!(ok.revoked, 2);
+        assert!(!ok.audit_entry_id.is_empty());
+
+        // The target now has no active sessions.
+        let (left, _) = ctx
+            .operator_session_store
+            .list_by_did(target, 50, None)
+            .await
+            .unwrap();
+        assert!(left.is_empty(), "all target sessions revoked");
+
+        // Idempotent: a second bulk revoke succeeds with a zero count.
+        let again = revoke_operator_sessions(
+            State(ctx.clone()),
+            mk_auth("did:plc:super", Role::SuperAdmin),
+            req(Some("re-run")),
+        )
+        .await
+        .expect("idempotent success")
+        .0;
+        assert_eq!(again.revoked, 0);
     }
 
     #[tokio::test]
@@ -6998,6 +10198,20 @@ mod tests {
         }
     }
 
+    /// Moderator auth fixture — for asserting Admin+ gates reject a Moderator
+    /// (v0.9 Arc D #225 kryphocron-ops role-gate tests).
+    fn moderator_test_auth() -> AdminAuthContext {
+        AdminAuthContext {
+            did: "did:plc:moderator".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:moderator".to_string(),
+                session_id: "test_session_moderator".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Moderator,
+        }
+    }
+
     /// SuperAdmin auth fixture for tests of tools.aurora.superadmin.*
     /// endpoints (Phase 3.6 / chainlink #103). Same shape as
     /// admin_test_auth, role bumped to SuperAdmin so the handler-level
@@ -7020,14 +10234,52 @@ mod tests {
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
+    // ---------- key-rotation arc B3 (#374): rotation handler reshape ----------
+
+    use crate::crypto::plc_client::MockPlcClient;
+    use std::sync::Arc as TestArc;
+
+    // A mock PLC whose published key for `did` is `current` (so the no-op
+    // short-circuit compares against a known value) and whose update/publish is
+    // a no-op Ok.
+    fn mock_plc_with_current(did: &str, current: &str) -> TestArc<dyn crate::crypto::plc_client::PlcClientApi> {
+        TestArc::new(MockPlcClient::new().with_current_signing_key(did, current))
+    }
+
+    // Create an account AND initialize its actor-store repo (genesis commit) so
+    // the rotation's empty-commit advance (apply_writes) has a repo to append to
+    // — account_manager.create_account writes the DB rows only; the genesis repo
+    // comes from create_account_emit_sequence (the real createAccount flow).
+    async fn seed_rotatable_account(ctx: &AppContext, handle: &str, email: &str) -> String {
+        let acc = ctx
+            .account_manager
+            .create_account(handle.into(), Some(email.into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        // Mirror the real createAccount flow: initialize the actor-store repo
+        // namespace, then emit the genesis commit. Without initialize() the
+        // genesis put_block 404s ("Actor repository not found").
+        let repo_mgr = crate::actor_store::RepositoryManager::with_validation_mode(
+            acc.did.clone(),
+            (*ctx.actor_store).clone(),
+            ctx.config.validation_mode,
+        );
+        repo_mgr.initialize().await.expect("initialize actor repo");
+        let h = acc.handle.clone().unwrap_or_else(|| handle.to_string());
+        crate::api::account_emit::create_account_emit_sequence(ctx, &acc.did, &h)
+            .await
+            .expect("seed genesis repo for rotation");
+        acc.did
+    }
+
     #[tokio::test]
-    async fn test_update_account_signing_key_rejects_non_plc_did() {
+    async fn update_signing_key_rejects_non_plc_did() {
         let ctx = create_test_context().await;
         let req = UpdateAccountSigningKeyRequest {
             did: "did:web:example.com".to_string(),
-            signing_key: "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH".to_string(),
+            rationale: None,
+            operator_keypair: None,
         };
-
         let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
             .await
             .expect_err("non-did:plc DID should be rejected");
@@ -7036,86 +10288,268 @@ mod tests {
         assert!(body.contains("did:plc"));
     }
 
-    #[tokio::test]
-    async fn test_update_account_signing_key_rejects_non_did_key_signing_key() {
-        let ctx = create_test_context().await;
-        let req = UpdateAccountSigningKeyRequest {
-            did: "did:plc:abcdefghijklmnop".to_string(),
-            signing_key: "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH".to_string(),
-        };
-
-        let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
-            .await
-            .expect_err("bare multibase signingKey should be rejected");
-        let (status, body) = read_response_body(resp).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("did:key"));
+    #[test]
+    fn update_signing_key_request_rejects_legacy_signing_key_field() {
+        // §4.5: the contract dropped `signingKey`; deny_unknown_fields makes a
+        // stale caller's `signingKey` a hard deserialize error, not a silent
+        // ignore that would PDS-generate a key they didn't ask for.
+        let json = serde_json::json!({"did": "did:plc:x", "signingKey": "did:key:zABC"});
+        let r: Result<UpdateAccountSigningKeyRequest, _> = serde_json::from_value(json);
+        assert!(r.is_err(), "legacy signingKey field must be rejected");
     }
 
     #[tokio::test]
-    async fn test_update_account_signing_key_rejects_mismatched_signing_key() {
-        use crate::crypto::plc::PlcSigner;
+    async fn update_signing_key_pds_generated_rotates_and_audits() {
+        let mut ctx = create_test_context().await;
+        let did = seed_rotatable_account(&ctx, "rotpds", "rp@example.com").await;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        // Current PLC key differs from any freshly generated key → no no-op.
+        ctx.plc_client = mock_plc_with_current(&did, "zCurrentPlaceholderNotMatchingNew");
 
-        let ctx = create_test_context().await;
-        // Sanity-check: derive the operator's did:key so we know what would be
-        // accepted, then submit something different.
-        let operator_signer =
-            PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key).unwrap();
-        let operator_did_key = operator_signer.public_key_did_key();
-        let mismatching_did_key = "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme";
-        assert_ne!(operator_did_key, mismatching_did_key);
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: Some("scheduled rotation".into()),
+                operator_keypair: None,
+            }),
+        )
+        .await
+        .expect("pds-generated rotation succeeds")
+        .0;
 
-        let req = UpdateAccountSigningKeyRequest {
-            did: "did:plc:abcdefghijklmnop".to_string(),
-            signing_key: mismatching_did_key.to_string(),
-        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["generationSource"], "pds");
+        assert!(v["newSigningKey"].as_str().unwrap().starts_with("did:key:"));
+        assert!(v["emptyCommitCid"].is_string(), "real rotation carries an empty-commit CID");
+        assert!(v.get("plcOpCid").is_none(), "plc op CID is not surfaced by the substrate yet");
 
-        let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
-            .await
-            .expect_err("mismatched signingKey should be rejected by strict-mode");
-        let (status, body) = read_response_body(resp).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
-        assert_eq!(parsed["error"], "InvalidRequest");
-        assert!(parsed["message"]
-            .as_str()
-            .unwrap()
-            .contains("operator's configured signing key"));
+        // The stored private key actually changed.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_ne!(before, after, "signing key rotated");
+
+        // Audit landed, records generation_source=pds, and never leaks private bytes.
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM audit_chain_entry WHERE action = $1",
+        )
+        .bind("account.update_signing_key")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert!(payload.contains("\"generation_source\":\"pds\""), "got {payload}");
+        assert!(
+            !payload.contains(&hex::encode(&after)),
+            "private key material must never appear in the audit payload"
+        );
     }
 
     #[tokio::test]
-    async fn test_update_account_signing_key_accepts_matching_signing_key() {
-        use crate::crypto::plc::PlcSigner;
+    async fn update_signing_key_pds_generated_is_non_idempotent() {
+        let mut ctx = create_test_context().await;
+        let did = seed_rotatable_account(&ctx, "rotnoidem", "ni@example.com").await;
+        ctx.plc_client = mock_plc_with_current(&did, "zCurrentPlaceholderNotMatchingNew");
 
-        let ctx = create_test_context().await;
-        let operator_signer =
-            PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key).unwrap();
-        let operator_did_key = operator_signer.public_key_did_key();
-
-        let req = UpdateAccountSigningKeyRequest {
-            did: "did:plc:abcdefghijklmnop".to_string(),
-            signing_key: operator_did_key.clone(),
-        };
-
-        // A matching signingKey passes strict-mode validation; the handler
-        // then proceeds to fetch the PLC document, which fails in the test
-        // environment because the configured PLC URL is plc.directory and
-        // the DID is fictitious. We assert that the failure is *not* the
-        // strict-mode 400 InvalidRequest — i.e., strict-mode let us through.
-        let resp = update_account_signing_key(State(ctx), admin_test_auth(), Json(req))
+        let mk = |did: String| UpdateAccountSigningKeyRequest { did, rationale: None, operator_keypair: None };
+        let _ = update_account_signing_key(State(ctx.clone()), admin_test_auth(), Json(mk(did.clone())))
             .await
-            .expect_err("PLC document fetch will fail in test env");
+            .expect("first rotation");
+        let after_first = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let _ = update_account_signing_key(State(ctx.clone()), admin_test_auth(), Json(mk(did.clone())))
+            .await
+            .expect("second rotation");
+        let after_second = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_ne!(after_first, after_second, "each PDS rotation produces a fresh distinct key");
+    }
+
+    #[tokio::test]
+    async fn update_signing_key_operator_supplied_gate_off_rejects() {
+        let ctx = create_test_context().await; // gate defaults OFF
+        let did = seed_rotatable_account(&ctx, "rotgateoff", "go@example.com").await;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let kp = ctx.account_manager.generate_rotation_keypair().unwrap();
+
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: None,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: kp.public_did_key.clone(),
+                    private_key_hex: hex::encode(&kp.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("operator-supplied rejected while gate is off");
         let (status, body) = read_response_body(resp).await;
-        if status == StatusCode::BAD_REQUEST {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&body).expect("BAD_REQUEST body must be JSON in this path");
-            assert_ne!(
-                parsed["error"], "InvalidRequest",
-                "strict-mode incorrectly rejected matching signingKey"
-            );
-        }
-        // Otherwise we hit a downstream failure (network, NOT_FOUND from
-        // PLC, etc.) — which is expected and confirms strict-mode passed.
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "OperatorSuppliedKeysDisabled");
+        // Critical: no state mutation.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(before, after, "gate-off rejection must not rotate");
+    }
+
+    #[tokio::test]
+    async fn update_signing_key_operator_supplied_mismatch_rejects_before_gate() {
+        let ctx = create_test_context().await; // gate OFF — mismatch still surfaces first
+        let did = seed_rotatable_account(&ctx, "rotmis", "mis@example.com").await;
+        let gen = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let other = ctx.account_manager.generate_rotation_keypair().unwrap();
+
+        let resp = update_account_signing_key(
+            State(ctx),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did,
+                rationale: None,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: other.public_did_key.clone(),
+                    private_key_hex: hex::encode(&gen.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("mismatched pair rejected before the gate check");
+        let (status, body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "InvalidRequest", "validate-first: mismatch, not gate");
+    }
+
+    #[tokio::test]
+    async fn update_signing_key_operator_supplied_gate_on_rotates() {
+        let mut ctx = create_test_context().await;
+        set_operator_supplied_gate(&ctx, true).await;
+        let did = seed_rotatable_account(&ctx, "rotgateon", "gon@example.com").await;
+        let kp = ctx.account_manager.generate_rotation_keypair().unwrap();
+        ctx.plc_client = mock_plc_with_current(&did, "zCurrentPlaceholderNotMatchingNew");
+
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: Some("HSM key".into()),
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: kp.public_did_key.clone(),
+                    private_key_hex: hex::encode(&kp.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect("operator-supplied rotation succeeds with gate on")
+        .0;
+
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["generationSource"], "operator_supplied");
+        assert_eq!(v["newSigningKey"], kp.public_did_key);
+        // The stored private key is exactly what the operator supplied.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(after, kp.private_key_bytes, "stored key is the operator-supplied one");
+    }
+
+    #[tokio::test]
+    async fn update_signing_key_no_op_when_operator_key_already_current() {
+        let mut ctx = create_test_context().await;
+        set_operator_supplied_gate(&ctx, true).await;
+        let did = seed_rotatable_account(&ctx, "rotnoop", "noop@example.com").await;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let kp = ctx.account_manager.generate_rotation_keypair().unwrap();
+        // Current published key == the operator-supplied key → idempotent no-op.
+        ctx.plc_client = mock_plc_with_current(&did, &kp.public_did_key);
+
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: None,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: kp.public_did_key.clone(),
+                    private_key_hex: hex::encode(&kp.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect("no-op short-circuit returns OK")
+        .0;
+
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["generationSource"], "operator_supplied");
+        assert!(v.get("emptyCommitCid").is_none(), "no commit on the no-op path");
+        // plc_keys row unchanged — no rotation happened.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(before, after, "no-op must not mutate the stored key");
+    }
+
+    #[tokio::test]
+    async fn update_signing_key_unknown_account_404() {
+        let mut ctx = create_test_context().await;
+        let unknown = "did:plc:unknownrotationtarget0000";
+        // Configure a current key so the flow passes the no-op check and reaches
+        // the plc_keys writer, which 404s on the missing row.
+        ctx.plc_client = mock_plc_with_current(unknown, "zSomeCurrentKey");
+
+        let resp = update_account_signing_key(
+            State(ctx),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: unknown.to_string(),
+                rationale: None,
+                operator_keypair: None,
+            }),
+        )
+        .await
+        .expect_err("unknown account → 404 at the plc_keys write");
+        let (status, _body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // Phase C / C2 (#376) — XRPC-side gate-off immutability: an operator-supplied
+    // rotation rejected by the gate leaves plc_keys unchanged AND emits no audit
+    // entry (the rejection precedes any PLC publish, DB write, or audit). Pairs
+    // with the CLI-side phase_c_cli_gate_off_no_publish_no_audit in rotate_keys.
+    #[tokio::test]
+    async fn phase_c_xrpc_gate_off_no_audit_state_unchanged() {
+        let ctx = create_test_context().await; // gate OFF (default)
+        let did = seed_rotatable_account(&ctx, "cxrpcimmut", "cx@example.com").await;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let kp = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let resp = update_account_signing_key(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountSigningKeyRequest {
+                did: did.clone(),
+                rationale: None,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: kp.public_did_key.clone(),
+                    private_key_hex: hex::encode(&kp.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("gate off rejects operator-supplied");
+        let (status, body) = read_response_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"],
+            "OperatorSuppliedKeysDisabled"
+        );
+        // plc_keys unchanged.
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(before, after, "gate-off rejection must not rotate");
+        // No audit entry emitted.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1",
+        )
+        .bind("account.update_signing_key")
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "no audit emitted on gate-off rejection");
     }
 
     #[tokio::test]
@@ -7305,6 +10739,7 @@ mod tests {
             State(ctx),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: None,
                 cursor: None,
                 limit: Some(101),
@@ -7323,6 +10758,7 @@ mod tests {
             State(ctx2),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: None,
                 cursor: None,
                 limit: Some(0),
@@ -7343,6 +10779,7 @@ mod tests {
             State(ctx),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: None,
                 cursor: None,
                 limit: None,
@@ -7367,6 +10804,7 @@ mod tests {
             State(ctx.clone()),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: Some("alice@example.com".to_string()),
                 cursor: None,
                 limit: None,
@@ -7384,6 +10822,7 @@ mod tests {
             State(ctx),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: Some("nobody@example.com".to_string()),
                 cursor: None,
                 limit: None,
@@ -7393,6 +10832,55 @@ mod tests {
         .unwrap()
         .0;
         assert!(resp.accounts.is_empty());
+    }
+
+    // #315 — the free-text `q` param must actually filter (it was silently
+    // dropped, returning every account). Covers handle / DID / email substring,
+    // the non-matching → 0 case (the bug), and no-q → all (preserved).
+    #[tokio::test]
+    async fn test_search_accounts_filters_by_q_across_handle_did_email() {
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:aaaa", "alice.test", Some("alice@example.com")).await;
+        seed_test_account(&ctx, "did:plc:bbbb", "bob.test", Some("bob@example.com")).await;
+        seed_test_account(&ctx, "did:plc:zzzz", "carol.test", None).await;
+
+        let q_search = |term: Option<&str>| {
+            let c = ctx.clone();
+            let t = term.map(str::to_string);
+            async move {
+                search_accounts(
+                    State(c),
+                    admin_test_auth(),
+                    Query(SearchAccountsQuery { q: t, email: None, cursor: None, limit: None }),
+                )
+                .await
+                .unwrap()
+                .0
+            }
+        };
+
+        // Handle substring (case-insensitive).
+        let r = q_search(Some("ALICE")).await;
+        assert_eq!(r.accounts.len(), 1, "q matches a handle substring");
+        assert_eq!(r.accounts[0].did, "did:plc:aaaa");
+
+        // DID substring.
+        let r = q_search(Some("zzzz")).await;
+        assert_eq!(r.accounts.len(), 1, "q matches a DID substring");
+        assert_eq!(r.accounts[0].did, "did:plc:zzzz");
+
+        // Email substring.
+        let r = q_search(Some("bob@")).await;
+        assert_eq!(r.accounts.len(), 1, "q matches an email substring");
+        assert_eq!(r.accounts[0].did, "did:plc:bbbb");
+
+        // Non-matching q → 0 accounts (the bug: previously returned all).
+        let r = q_search(Some("did:plc:nonexistent-prefix")).await;
+        assert!(r.accounts.is_empty(), "non-matching q must return 0 accounts, not the full list");
+
+        // No q → all accounts (existing behavior preserved).
+        let r = q_search(None).await;
+        assert_eq!(r.accounts.len(), 3, "absent q returns all accounts");
     }
 
     // ---- tools.aurora.ops.listAccounts (chainlink #84 / Phase 2.3.7) ----
@@ -7714,11 +11202,12 @@ mod tests {
     /// - Top-level field set (`extensions`, `families`,
     ///   `implementation`, `version`) and ordering (alphabetical via
     ///   canonical-JSON).
-    /// - All 14 capability extension strings (the advertised set
-    ///   per Arc 2 Step 0 recon Q2; two further §8.15 vocabulary
-    ///   entries — `invite-lineage-v1` and `reporter-context-v1` —
-    ///   remain intentionally omitted because their endpoints aren't
-    ///   shipped).
+    /// - All 17 advertised capability extension strings (the Arc 2
+    ///   Step 0 recon Q2 set plus the v0.9 Arc B/D additions —
+    ///   `themes-v1`, `kryphocron-rotation-v1`, `kryphocron-read-v1`;
+    ///   two further §8.15 vocabulary entries — `invite-lineage-v1`
+    ///   and `reporter-context-v1` — remain intentionally omitted
+    ///   because their endpoints aren't shipped).
     /// - The four namespace keys (`tools.aurora.admin`, `.moderator`,
     ///   `.ops`, `.superadmin`) and every endpoint within each.
     /// - `implementation` literal "aurora-locus" and the pinned
@@ -7755,7 +11244,7 @@ mod tests {
         let actual = canonical_json(&resp);
         let expected = concat!(
             r#"{"#,
-            // ---- extensions: 14 strings in Vec declaration order ----
+            // ---- extensions: 18 strings in Vec declaration order ----
             r#""extensions":["#,
             r#"{"name":"subject-context-v1"},"#,
             r#"{"name":"moderator-activity-v1"},"#,
@@ -7770,11 +11259,16 @@ mod tests {
             r#"{"name":"audit-trail-v1"},"#,
             r#"{"name":"forensic-export-v1"},"#,
             r#"{"name":"mod-events-stream-v1"},"#,
-            r#"{"name":"runtime-settings-v1"}"#,
+            r#"{"name":"runtime-settings-v1"},"#,
+            r#"{"name":"themes-v1"},"#,
+            r#"{"name":"kryphocron-rotation-v1"},"#,
+            r#"{"name":"kryphocron-read-v1"},"#,
+            r#"{"name":"session-management-v1"},"#,
+            r#"{"name":"kryphocron-overrides-v1"}"#,
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
-            // tools.aurora.admin (15 endpoints)
+            // tools.aurora.admin (21 endpoints)
             r#""tools.aurora.admin":["#,
             r#""emitEvent","#,
             r#""batchTakedownAccounts","#,
@@ -7786,11 +11280,18 @@ mod tests {
             r#""triggerPasswordReset","#,
             r#""getQueueStats","#,
             r#""getModerationMetrics","#,
+            r#""getAccountGrowth","#,
             r#""getAuditTrail","#,
+            r#""getAuditEntry","#,
+            r#""getReport","#,
             r#""exportAccountForensic","#,
             r#""subscribeModEvents","#,
             r#""getRuntimeSetting","#,
-            r#""setRuntimeSetting""#,
+            r#""setRuntimeSetting","#,
+            r#""listInstalled","#,
+            r#""listSessions","#,
+            r#""revokeSession","#,
+            r#""revokeOperatorSessions""#,
             r#"],"#,
             // tools.aurora.moderator (7 endpoints)
             r#""tools.aurora.moderator":["#,
@@ -7802,7 +11303,7 @@ mod tests {
             r#""listAppeals","#,
             r#""getAppeal""#,
             r#"],"#,
-            // tools.aurora.ops (32 endpoints)
+            // tools.aurora.ops (51 endpoints)
             r#""tools.aurora.ops":["#,
             r#""getStats","#,
             r#""listAccounts","#,
@@ -7835,17 +11336,79 @@ mod tests {
             r#""getFederationStatus","#,
             r#""getRelayConfig","#,
             r#""listKnownInstances","#,
-            r#""triggerPdsDiscovery""#,
+            r#""triggerPdsDiscovery","#,
+            r#""getFederationPolicy","#,
+            r#""addFederationPeer","#,
+            r#""removeFederationPeer","#,
+            r#""modifyFederationPeer","#,
+            r#""setDiscoveryMode","#,
+            r#""dismissPendingDiscovery","#,
+            r#""addRelayUrl","#,
+            r#""removeRelayUrl","#,
+            r#""setFederationRelays","#,
+            r#""triggerRotation","#,
+            // v0.9 Arc D (#225) — kryphocron operator read cohort.
+            r#""getSubstrateInfo","#,
+            r#""getTierStats","#,
+            r#""getOracleActivity","#,
+            r#""getRotationStatus","#,
+            r#""getRotationProgress","#,
+            r#""cancelRotation","#,
+            r#""listRotations","#,
+            r#""getAudienceAggregate","#,
+            r#""listAudiences","#,
+            r#""getBlockCascadeImpact","#,
+            r#""getAccountOverrides","#,
+            r#""setAccountOverride""#,
             r#"],"#,
-            // tools.aurora.superadmin (2 endpoints)
+            // tools.aurora.superadmin (33 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
-            r#""revokeRole""#,
+            r#""revokeRole","#,
+            r#""deleteRuntimeSetting","#,
+            r#""listPendingRestartActions","#,
+            r#""triggerRestart","#,
+            r#""getBulkDidDocUpdateLatest","#,
+            r#""retryBulkDidDocUpdateForDid","#,
+            r#""assignReviewer","#,
+            r#""createAutoLabelRule","#,
+            r#""editAutoLabelRule","#,
+            r#""deleteAutoLabelRule","#,
+            r#""listAutoLabelRules","#,
+            r#""createEscalationRule","#,
+            r#""editEscalationRule","#,
+            r#""deleteEscalationRule","#,
+            r#""listEscalationRules","#,
+            r#""clearEscalation","#,
+            r#""getDefaultsState","#,
+            r#""createHook","#,
+            r#""editHook","#,
+            r#""deleteHook","#,
+            r#""listHooks","#,
+            r#""getIntegrationHooksState","#,
+            r#""uploadBrandingAsset","#,
+            r#""preRebuildCheck","#,
+            r#""rebuildRepo","#,
+            r#""getRebuildProgress","#,
+            r#""cancelRebuild","#,
+            r#""dryRunRotationValidation","#,
+            r#""runSigningKeyMigrationCheck","#,
+            r#""scanReposForInconsistencies","#,
+            r#""getScanProgress","#,
+            r#""cancelScan","#,
+            r#""getRepoScanResults","#,
+            r#""repairRepos","#,
+            r#""getBulkRepairProgress","#,
+            r#""cancelBulkRepair","#,
+            r#""sequencerRecoveryOptions","#,
+            r#""runSequencerRecovery","#,
+            r#""getSequencerRecoveryProgress","#,
+            r#""cancelSequencerRecovery""#,
             r#"]"#,
             r#"},"#,
             // ---- implementation, version (literals) ----
             r#""implementation":"aurora-locus","#,
-            r#""version":"0.8.0""#,
+            r#""version":"0.9.0""#,
             r#"}"#,
         );
         assert_eq!(
@@ -7898,6 +11461,145 @@ mod tests {
         );
     }
 
+    // ---- v0.9 Arc D (#225) — kryphocron operator read cohort ----
+    //
+    // `create_test_context()` builds a kryphocron-disabled deployment (no
+    // at-rest hooks / oracle / rewrite job), so these exercise the handlers'
+    // entry paths: the `KryphocronDisabled` 400 every endpoint returns when the
+    // substrate is absent, and the Admin+ role gate the Laquna-control reads
+    // enforce before that. The endpoints' computational core (tier walks,
+    // audience tally, cascade parsing, rewrite-job state machine, oracle
+    // accessors) is unit-tested in `aurora_kryphocron_ops`, `kryphocron_rewrite`
+    // and `kryphocron_rotation`; the dispatchability of all ten is pinned by the
+    // describeCapabilities snapshot above.
+
+    /// Status of an `ApiErr`-returning kryphocron-ops handler result.
+    fn err_status<T>(r: Result<T, (StatusCode, Json<serde_json::Value>)>) -> StatusCode {
+        match r {
+            Ok(_) => panic!("expected an error result on a kryphocron-disabled context"),
+            Err((status, _)) => status,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_oracle_activity_reports_instrumented_audience_counts() {
+        // #335 — with kryphocron enabled (the v0.9 default), the endpoint
+        // surfaces the audience-oracle consultation tally as instrumented
+        // aggregate counts (not the old instrumented:false stub).
+        use crate::api::aurora_kryphocron_ops as k;
+        use crate::kryphocron_oracle_activity::OracleConsultation;
+        let ctx = create_test_context().await;
+        ctx.audience_oracle_activity.record(OracleConsultation::WriteAllowed);
+        ctx.audience_oracle_activity.record(OracleConsultation::WriteDenied);
+        ctx.audience_oracle_activity.record(OracleConsultation::WriteDeferred);
+        ctx.audience_oracle_activity.record(OracleConsultation::ReadAuthorized);
+        ctx.audience_oracle_activity.record(OracleConsultation::ReadAuthorized);
+
+        let body = k::get_oracle_activity(State(ctx.clone()), admin_test_auth())
+            .await
+            .expect("enabled substrate returns activity")
+            .0;
+        assert_eq!(body["instrumented"], true);
+        assert_eq!(body["oracle"], "audience");
+        assert!(body["since"].is_string());
+        assert_eq!(body["consultations"]["total"], 5);
+        assert_eq!(body["consultations"]["write"]["allowed"], 1);
+        assert_eq!(body["consultations"]["write"]["denied"], 1);
+        assert_eq!(body["consultations"]["write"]["deferred"], 1);
+        assert_eq!(body["consultations"]["read"]["authorized"], 2);
+        assert_eq!(body["consultations"]["read"]["denied"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_kryphocron_ops_disabled_returns_400() {
+        use crate::api::aurora_kryphocron_ops as k;
+        // Kryphocron is on by default (v0.9); this test exercises the
+        // explicitly-disabled deployment, so opt the fixture back out.
+        let ctx = create_test_context_with(|c| c.kryphocron.enabled = false).await;
+        let acct = || {
+            axum::extract::Query(k::AccountFilter {
+                account: "did:plc:test".to_string(),
+            })
+        };
+
+        // Moderator+ reads: disabled substrate ⇒ 400 (no role gate).
+        assert_eq!(
+            err_status(k::get_substrate_info(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::get_tier_stats(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::get_oracle_activity(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::get_rotation_status(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::get_audience_aggregate(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::list_audiences(State(ctx.clone()), admin_test_auth(), acct()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(
+                k::get_block_cascade_impact(State(ctx.clone()), admin_test_auth(), acct()).await
+            ),
+            StatusCode::BAD_REQUEST,
+        );
+
+        // Admin+ reads with an Admin caller: role gate passes, disabled ⇒ 400.
+        assert_eq!(
+            err_status(k::get_rotation_progress(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::cancel_rotation(State(ctx.clone()), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            err_status(k::list_rotations(State(ctx), admin_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kryphocron_ops_admin_gate_denies_moderator() {
+        use crate::api::aurora_kryphocron_ops as k;
+        // The Admin-gate (403) checks fire before the disabled (400) check, but
+        // the final assertion reaches the disabled check — so opt the fixture
+        // out of the now-default-on kryphocron to keep exercising that 400.
+        let ctx = create_test_context_with(|c| c.kryphocron.enabled = false).await;
+
+        // The three Laquna-control reads gate at Admin+ (§6.4.2 / §6.4.2.1):
+        // a Moderator is rejected with 403 BEFORE the disabled check.
+        assert_eq!(
+            err_status(k::get_rotation_progress(State(ctx.clone()), moderator_test_auth()).await),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            err_status(k::cancel_rotation(State(ctx.clone()), moderator_test_auth()).await),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            err_status(k::list_rotations(State(ctx.clone()), moderator_test_auth()).await),
+            StatusCode::FORBIDDEN,
+        );
+
+        // A Moderator+ observability read is NOT Admin-gated: it reaches the
+        // disabled check and returns 400, not 403.
+        assert_eq!(
+            err_status(k::get_substrate_info(State(ctx), moderator_test_auth()).await),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
     #[tokio::test]
     async fn test_describe_capabilities_returns_expected_shape() {
         let ctx = create_test_context().await;
@@ -7910,7 +11612,7 @@ mod tests {
         // version comes from CARGO_PKG_VERSION; pinned to the
         // current cycle release per CR-4 / chainlink #117. Bump in
         // lockstep with Cargo.toml when the cycle increments.
-        assert_eq!(resp.version, "0.8.0");
+        assert_eq!(resp.version, "0.9.0");
 
         // Families object must include the four Aurora namespaces, each
         // a JSON array (possibly empty for namespaces that haven't
@@ -8117,6 +11819,21 @@ mod tests {
             superadmin.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(names.contains(&"grantRole"), "grantRole missing");
         assert!(names.contains(&"revokeRole"), "revokeRole missing");
+        assert!(names.contains(&"preRebuildCheck"), "preRebuildCheck missing");
+        assert!(names.contains(&"rebuildRepo"), "rebuildRepo missing");
+        assert!(names.contains(&"getRebuildProgress"), "getRebuildProgress missing");
+        assert!(names.contains(&"cancelRebuild"), "cancelRebuild missing");
+        assert!(names.contains(&"scanReposForInconsistencies"), "scanReposForInconsistencies missing");
+        assert!(names.contains(&"getScanProgress"), "getScanProgress missing");
+        assert!(names.contains(&"cancelScan"), "cancelScan missing");
+        assert!(names.contains(&"getRepoScanResults"), "getRepoScanResults missing");
+        assert!(names.contains(&"repairRepos"), "repairRepos missing");
+        assert!(names.contains(&"getBulkRepairProgress"), "getBulkRepairProgress missing");
+        assert!(names.contains(&"cancelBulkRepair"), "cancelBulkRepair missing");
+        assert!(names.contains(&"sequencerRecoveryOptions"), "sequencerRecoveryOptions missing");
+        assert!(names.contains(&"runSequencerRecovery"), "runSequencerRecovery missing");
+        assert!(names.contains(&"getSequencerRecoveryProgress"), "getSequencerRecoveryProgress missing");
+        assert!(names.contains(&"cancelSequencerRecovery"), "cancelSequencerRecovery missing");
     }
 
     #[tokio::test]
@@ -8474,6 +12191,8 @@ mod tests {
                 &mut tx,
                 ctx.config.database.backend,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:admin",
                     action: "account.takedown",
                     subject: Some(&Subject::Repo {
@@ -8534,6 +12253,8 @@ mod tests {
                 &mut tx,
                 ctx.config.database.backend,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:admin",
                     action: "account.update_handle",
                     subject: Some(&Subject::Repo {
@@ -8628,6 +12349,7 @@ mod tests {
             account: None,
             did: Some("did:plc:emailchain".to_string()),
             email: "new@example.org".to_string(),
+            rationale: None,
         };
         let status = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -8637,6 +12359,67 @@ mod tests {
             count_chain_rows(&ctx, "account.update_email", Some("did:plc:emailchain"))
                 .await,
             1
+        );
+    }
+
+    /// #362.5: the operator-supplied rationale is what lands in the chain
+    /// `rationale` column; when omitted, the handler's descriptive default is
+    /// recorded instead. Guards that the new Option field is actually threaded
+    /// to the audit (a wiring tripwire, not just "logic works when set").
+    #[tokio::test]
+    async fn update_account_email_records_operator_rationale_else_default() {
+        async fn chain_rationale(ctx: &AppContext, did: &str) -> String {
+            sqlx::query_scalar(
+                "SELECT rationale FROM audit_chain_entry \
+                 WHERE action = ? AND subject_did = ?",
+            )
+            .bind("account.update_email")
+            .bind(did)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+        }
+
+        // Supplied rationale → recorded verbatim.
+        let ctx = create_test_context().await;
+        seed_test_account(&ctx, "did:plc:emailrat", "er.test", Some("a@b.com")).await;
+        update_account_email(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountEmailRequest {
+                account: None,
+                did: Some("did:plc:emailrat".to_string()),
+                email: "new@example.org".to_string(),
+                rationale: Some("support ticket #4821".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            chain_rationale(&ctx, "did:plc:emailrat").await,
+            "support ticket #4821",
+            "operator rationale must be recorded verbatim",
+        );
+
+        // Omitted rationale → descriptive default.
+        let ctx2 = create_test_context().await;
+        seed_test_account(&ctx2, "did:plc:emaildef", "ed.test", Some("a@b.com")).await;
+        update_account_email(
+            State(ctx2.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountEmailRequest {
+                account: None,
+                did: Some("did:plc:emaildef".to_string()),
+                email: "fresh@example.org".to_string(),
+                rationale: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            chain_rationale(&ctx2, "did:plc:emaildef").await,
+            "change email to fresh@example.org",
+            "absent rationale falls back to the descriptive default",
         );
     }
 
@@ -8653,6 +12436,7 @@ mod tests {
             account: None,
             did: Some("did:plc:colontest".to_string()),
             email: "did:foo@example.com".to_string(),
+            rationale: None,
         };
         let err = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -8690,6 +12474,8 @@ mod tests {
                 &mut tx,
                 ctx.config.database.backend,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:admin",
                     action: "account.update_email",
                     subject: Some(&Subject::Repo {
@@ -8783,6 +12569,7 @@ mod tests {
             account: Some("email.test".to_string()),
             did: None,
             email: "new@example.com".to_string(),
+            rationale: None,
         };
         let status = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -8803,6 +12590,7 @@ mod tests {
             account: None,
             did: Some("did:plc:legacyemail".to_string()),
             email: "back@compat.com".to_string(),
+            rationale: None,
         };
         let status = update_account_email(State(ctx.clone()), admin_test_auth(), Json(req))
             .await
@@ -9579,11 +13367,21 @@ mod tests {
                 .create_invite("did:plc:creator", 5, None, Some(format!("seed {i}")), None)
                 .await
                 .unwrap();
+            // #258: create_invite stamps created_at with Utc::now(); under a
+            // coarse OS clock (e.g. WSL2 ~15ms) plus parallel-test load, the
+            // rapid inserts can collide same-millisecond, making the `recent`
+            // (created_at DESC) ordering + cursor boundary ambiguous. Stamp a
+            // deterministic, strictly-increasing created_at (one minute apart,
+            // same RFC3339 form Utc::now().to_rfc3339() produces) so the order
+            // is timing-independent: codes[i] is always older than codes[i+1].
+            let created_at = format!("2020-01-01T00:{:02}:00+00:00", i);
+            sqlx::query("UPDATE invite_code SET created_at = $1 WHERE code = $2")
+                .bind(&created_at)
+                .bind(&c.code)
+                .execute(&ctx.account_db)
+                .await
+                .unwrap();
             codes.push(c);
-            // SQLite chrono RFC3339 strings are millisecond-resolution; a
-            // tiny sleep keeps timestamps strictly distinct so the cursor
-            // tuple boundary doesn't get ambiguous in tests.
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         codes
     }
@@ -9958,6 +13756,7 @@ mod tests {
             State(ctx),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: Some("s@x".to_string()),
                 cursor: None,
                 limit: None,
@@ -10000,6 +13799,7 @@ mod tests {
             account: Some("did:plc:x".to_string()),
             did: Some("did:plc:x".to_string()),
             email: "x@y.com".to_string(),
+            rationale: None,
         };
         let err = update_account_email(State(ctx), admin_test_auth(), Json(req))
             .await
@@ -10020,6 +13820,7 @@ mod tests {
             State(ctx.clone()),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: None,
                 cursor: None,
                 limit: Some(2),
@@ -10038,6 +13839,7 @@ mod tests {
             State(ctx),
             admin_test_auth(),
             Query(SearchAccountsQuery {
+                q: None,
                 email: None,
                 cursor: page1.cursor,
                 limit: Some(2),
@@ -10156,5 +13958,996 @@ mod tests {
         }"#;
         let req: UpdateSubjectStatusRequest = serde_json::from_str(strong_ref_json).unwrap();
         assert!(!req.legacy_record_uri_used);
+    }
+
+    // ---------- §8.1.7 / #273 — listSessions + revokeSession ----------
+
+    fn op_auth(did: &str, role: Role, sid: &str) -> AdminAuthContext {
+        AdminAuthContext {
+            did: did.to_string(),
+            session: ValidatedSession {
+                did: did.to_string(),
+                session_id: sid.to_string(),
+                is_app_password: false,
+            },
+            role,
+        }
+    }
+
+    fn list_query(did: Option<&str>) -> axum::extract::Query<ListSessionsQuery> {
+        axum::extract::Query(ListSessionsQuery {
+            did: did.map(|s| s.to_string()),
+            pagination: PaginationParams::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn list_sessions_self_service_returns_own_with_current_flag() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:selfop";
+        let sid1 = ctx
+            .operator_session_store
+            .create(did, Some("203.0.113.1"), None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+        let _sid2 = ctx
+            .operator_session_store
+            .create(did, None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+
+        let resp = list_sessions(
+            State(ctx.clone()),
+            op_auth(did, Role::Moderator, &sid1),
+            list_query(None),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        let sessions = resp["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2, "both of the operator's sessions");
+        let current: Vec<_> = sessions.iter().filter(|s| s["isCurrent"] == true).collect();
+        assert_eq!(current.len(), 1, "exactly the caller's own session is current");
+        assert_eq!(current[0]["sid"], sid1);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_superadmin_lists_all_operators() {
+        let ctx = create_test_context().await;
+        ctx.operator_session_store
+            .create("did:plc:opA", None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+        ctx.operator_session_store
+            .create("did:plc:opB", None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+
+        let resp = list_sessions(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "super-sid"),
+            list_query(None),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        let dids: Vec<&str> = resp["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["did"].as_str().unwrap())
+            .collect();
+        assert!(dids.contains(&"did:plc:opA") && dids.contains(&"did:plc:opB"));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_non_superadmin_foreign_did_forbidden() {
+        let ctx = create_test_context().await;
+        let err = list_sessions(
+            State(ctx),
+            op_auth("did:plc:me", Role::Admin, "my-sid"),
+            list_query(Some("did:plc:someone-else")),
+        )
+        .await
+        .expect_err("foreign did without SuperAdmin must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn revoke_session_self_service_fires_the_gate() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:selfrevoke";
+        let sid = ctx
+            .operator_session_store
+            .create(did, None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+        // Self-service revoke needs no rationale.
+        let out = revoke_session(
+            State(ctx.clone()),
+            op_auth(did, Role::Moderator, &sid),
+            axum::Json(RevokeSessionRequest {
+                sid: sid.clone(),
+                rationale: None,
+            }),
+        )
+        .await
+        .expect("self-service revoke succeeds")
+        .0;
+        assert!(out.success);
+        assert!(
+            !ctx.operator_session_store
+                .validate_and_touch(&sid)
+                .await
+                .unwrap(),
+            "self-revoked session fails the per-request gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_session_superadmin_force_logout_gate_and_rationale() {
+        let ctx = create_test_context().await;
+        let victim = "did:plc:victim";
+        let sid = ctx
+            .operator_session_store
+            .create(victim, None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+        let super_auth = || op_auth("did:plc:super", Role::SuperAdmin, "super-sid");
+
+        // Cross-operator force-logout requires a rationale.
+        let err = revoke_session(
+            State(ctx.clone()),
+            super_auth(),
+            axum::Json(RevokeSessionRequest {
+                sid: sid.clone(),
+                rationale: None,
+            }),
+        )
+        .await
+        .expect_err("cross-operator revoke without rationale is rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // With a rationale it succeeds and the gate fires.
+        let out = revoke_session(
+            State(ctx.clone()),
+            super_auth(),
+            axum::Json(RevokeSessionRequest {
+                sid: sid.clone(),
+                rationale: Some("suspected credential compromise".to_string()),
+            }),
+        )
+        .await
+        .expect("superadmin force-logout succeeds")
+        .0;
+        assert!(out.success);
+        assert!(
+            !ctx.operator_session_store
+                .validate_and_touch(&sid)
+                .await
+                .unwrap(),
+            "force-logged-out session fails the per-request gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_session_moderator_cannot_revoke_other() {
+        let ctx = create_test_context().await;
+        let sid = ctx
+            .operator_session_store
+            .create("did:plc:other", None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+        let err = revoke_session(
+            State(ctx),
+            op_auth("did:plc:mod", Role::Moderator, "mod-sid"),
+            axum::Json(RevokeSessionRequest {
+                sid,
+                rationale: Some("nope".to_string()),
+            }),
+        )
+        .await
+        .expect_err("non-SuperAdmin revoking another's session is forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    /// The full §8.1.7 verification gate, end to end through both surfaces:
+    /// SuperAdmin force-logs-out a specific operator session via the XRPC,
+    /// and that operator's next request (a real admin token bearing the
+    /// session's `sid`) reauthenticates — admin_auth_from_token now rejects.
+    #[tokio::test]
+    async fn force_logout_makes_operators_next_request_reauthenticate() {
+        let ctx = create_test_context().await;
+        let victim = "did:plc:gatevictim";
+        ctx.admin_role_manager
+            .grant_role(victim, Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .unwrap();
+        let sid = ctx
+            .operator_session_store
+            .create(victim, None, None, "r1", chrono::Duration::days(30))
+            .await
+            .unwrap();
+
+        // A real admin token bearing the session sid.
+        let secret = &ctx.config.authentication.jwt_secret;
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &serde_json::json!({
+                "sub": victim,
+                "scope": "admin",
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "sid": sid,
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+
+        // Live before revoke.
+        crate::auth::admin_auth_from_token(&ctx, &token)
+            .await
+            .expect("token authenticates before force-logout");
+
+        // SuperAdmin force-logs-out the session.
+        let _ = revoke_session(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "super-sid"),
+            axum::Json(RevokeSessionRequest {
+                sid: sid.clone(),
+                rationale: Some("compromised laptop".to_string()),
+            }),
+        )
+        .await
+        .expect("force-logout succeeds");
+
+        // Next request reauthenticates: the same token is now rejected.
+        match crate::auth::admin_auth_from_token(&ctx, &token).await {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401) after force-logout, got {:?}", other),
+        }
+    }
+
+    // ---------- §7.4.1 / #286 preRebuildCheck ----------
+
+    #[tokio::test]
+    async fn pre_rebuild_check_requires_superadmin() {
+        let ctx = create_test_context().await;
+        let err = pre_rebuild_check(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            axum::extract::Query(PreRebuildCheckParams {
+                did: "did:plc:target".to_string(),
+                deep: false,
+            }),
+        )
+        .await
+        .expect_err("Admin (not SuperAdmin) must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn pre_rebuild_check_404_when_no_history() {
+        let ctx = create_test_context().await;
+        // A fresh context's sequencer has no commit events for this DID, so the
+        // preflight returns None → 404 (nothing to rebuild). Exercises the
+        // handler's None path + SuperAdmin gate; the aggregation itself is
+        // covered by the sequencer-level rebuild_preflight tests.
+        let err = pre_rebuild_check(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            axum::extract::Query(PreRebuildCheckParams {
+                did: "did:plc:no-history".to_string(),
+                deep: false,
+            }),
+        )
+        .await
+        .expect_err("no history → NotFound");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pre_rebuild_check_deep_surfaces_unverifiable_history() {
+        use crate::sequencer::events::CommitEvent;
+        use proto_blue::lex_cbor::cid_for_lex;
+        use proto_blue::lex_data::LexValue;
+        use proto_blue::repo::{blocks_to_car, BlockMap};
+
+        let ctx = create_test_context().await;
+        let did = "did:plc:deep-broken";
+        // Seed one commit whose head block is absent from its (empty) CAR. The
+        // metadata preflight still succeeds (commit exists), but deep
+        // reconstruction can't resolve the repo → verify_repo errors.
+        let absent = cid_for_lex(&LexValue::String("absent".to_string())).unwrap();
+        ctx.sequencer
+            .sequence_commit(CommitEvent::new(
+                did.to_string(),
+                absent.to_string(),
+                "3jzfcijpj2z2a".to_string(),
+                None,
+                None,
+                blocks_to_car(None, &BlockMap::new()).unwrap(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let resp = pre_rebuild_check(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            axum::extract::Query(PreRebuildCheckParams {
+                did: did.to_string(),
+                deep: true,
+            }),
+        )
+        .await
+        .expect("unverifiable history is a 200 diagnostic, not a 500");
+        // Wiring assertion: deep=true actually ran reconstruction and reported it.
+        assert_eq!(resp.0["deepVerified"], serde_json::Value::Bool(false));
+        assert!(
+            resp.0["deepError"].is_string(),
+            "the verification failure must be surfaced as a diagnostic"
+        );
+        // Wiring assertion (#367): deep mode also runs the signing-key-history
+        // consumer. The test PLC URL is non-routable, so it degrades to
+        // `keyHistoryError` (non-fatal) rather than 500ing or blocking — proving
+        // the `get_op_history` consumer is wired into the deep path. (The happy
+        // path — keyHistoryEntries / rotatedKeysCount on a real multi-entry PLC
+        // history — is covered by the `parse_op_history` unit tests; a live count
+        // needs real-binary, as there is no mock-PLC unit harness.)
+        assert!(
+            resp.0["keyHistoryError"].is_string(),
+            "deep mode must run the key-history consumer and degrade gracefully when PLC is unreachable"
+        );
+        assert!(
+            resp.0.get("keyHistoryEntries").is_none(),
+            "no counts when the PLC fetch failed"
+        );
+        // Wiring assertion (#368): history-aware verify (Phase A2) runs ONLY when
+        // BOTH reconstruction and PLC history are available. Here reconstruction
+        // failed (broken repo) so the A2 consumer is correctly skipped — neither
+        // the verdict nor the can't-run error appears. (The live verdict path
+        // needs a real PLC + a reconstructable repo → real-binary; the verifier
+        // itself is covered by the crypto::verify_history unit tests.)
+        assert!(
+            resp.0.get("historyAwareVerifyResult").is_none(),
+            "A2 verify must not run when reconstruction failed"
+        );
+        assert!(
+            resp.0.get("historyAwareVerifyError").is_none(),
+            "A2 verify must not even attempt when reconstruction failed"
+        );
+    }
+
+    // ---------- key-rotation arc #372 / B1 dry-run validation XRPC ----------
+
+    #[tokio::test]
+    async fn dry_run_rotation_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            Json(DryRunRotationValidationRequest { did: "did:plc:x".into(), operator_keypair: None }),
+        )
+        .await
+        .expect_err("Admin (not SuperAdmin) must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_unknown_did_404() {
+        let ctx = create_test_context().await;
+        let err = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest {
+                did: "did:plc:nonexistent".into(),
+                operator_keypair: None,
+            }),
+        )
+        .await
+        .expect_err("unknown DID → 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_pds_generation_is_read_only() {
+        let ctx = create_test_context().await;
+        let acc = ctx
+            .account_manager
+            .create_account("dryrun".into(), Some("d@example.com".into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        let did = acc.did;
+        let before = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+
+        let resp = dry_run_rotation_validation(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest { did: did.clone(), operator_keypair: None }),
+        )
+        .await
+        .expect("dry-run succeeds")
+        .0;
+        assert_eq!(resp["path"], "pdsGeneration");
+        assert!(resp["resultingPublicDidKey"].as_str().unwrap().starts_with("did:key:"));
+
+        let after = ctx.account_manager.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(before, after, "dry-run must NOT mutate plc_keys");
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_operator_valid_but_gate_off_rejects() {
+        let ctx = create_test_context().await;
+        let acc = ctx
+            .account_manager
+            .create_account("dryrun2".into(), Some("d2@example.com".into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        let did = acc.did;
+        let gen = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let err = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest {
+                did,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: gen.public_did_key.clone(),
+                    private_key_hex: hex::encode(&gen.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("a valid pair still rejects while the gate is off (B1 stub)");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"], "OperatorSuppliedKeysDisabled");
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_operator_mismatch_surfaces_before_gate() {
+        let ctx = create_test_context().await;
+        let acc = ctx
+            .account_manager
+            .create_account("dryrun3".into(), Some("d3@example.com".into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        let did = acc.did;
+        let gen = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let other = ctx.account_manager.generate_rotation_keypair().unwrap();
+        // Wrong public key for the private bytes → mismatch, surfaced before the
+        // gate check (validate-first).
+        let err = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest {
+                did,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: other.public_did_key.clone(),
+                    private_key_hex: hex::encode(&gen.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("mismatched keypair → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"], "InvalidRequest");
+    }
+
+    // B2 (#373 / §4.6) — flip the operator-supplied-keys gate ON by writing the
+    // runtime-settings row directly (value is the JSON-encoded bool the
+    // three-tier resolver parses + `as_bool()`s). Direct insert keeps the test
+    // independent of the set_runtime_setting handler's auth/audit machinery.
+    async fn set_operator_supplied_gate(ctx: &AppContext, enabled: bool) {
+        sqlx::query(
+            "INSERT INTO runtime_settings (key, value, last_modified, last_modified_by) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(crate::api::aurora_admin::KEY_ROTATION_OPERATOR_SUPPLIED_KEYS_ENABLED_KEY)
+        .bind(if enabled { "true" } else { "false" })
+        .bind("2026-06-25T00:00:00Z")
+        .bind("did:plc:super")
+        .execute(&ctx.account_db)
+        .await
+        .expect("seed gate runtime_settings row");
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_operator_gate_on_valid_accepts() {
+        let ctx = create_test_context().await;
+        set_operator_supplied_gate(&ctx, true).await;
+        let acc = ctx
+            .account_manager
+            .create_account("dryrun4".into(), Some("d4@example.com".into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        let did = acc.did;
+        let gen = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let resp = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest {
+                did: did.clone(),
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: gen.public_did_key.clone(),
+                    private_key_hex: hex::encode(&gen.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect("gate on + valid pair → accepted")
+        .0;
+        assert_eq!(resp["path"], "operatorSuppliedValidation");
+        assert_eq!(resp["resultingPublicDidKey"], gen.public_did_key);
+    }
+
+    #[tokio::test]
+    async fn dry_run_rotation_operator_gate_on_mismatch_still_rejects() {
+        // Validate-first holds regardless of gate state: with the gate ON, a
+        // mismatched pair surfaces the validation error (not a gate error).
+        let ctx = create_test_context().await;
+        set_operator_supplied_gate(&ctx, true).await;
+        let acc = ctx
+            .account_manager
+            .create_account("dryrun5".into(), Some("d5@example.com".into()), "password123".into(), None, None)
+            .await
+            .unwrap();
+        let did = acc.did;
+        let gen = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let other = ctx.account_manager.generate_rotation_keypair().unwrap();
+        let err = dry_run_rotation_validation(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(DryRunRotationValidationRequest {
+                did,
+                operator_keypair: Some(crate::account::OperatorSuppliedKeypair {
+                    public_did_key: other.public_did_key.clone(),
+                    private_key_hex: hex::encode(&gen.private_key_bytes),
+                }),
+            }),
+        )
+        .await
+        .expect_err("gate on + mismatch → still a validation error");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"], "InvalidRequest");
+    }
+
+    // ---------- §7.4.1 / #290 destructive rebuild XRPCs ----------
+
+    #[tokio::test]
+    async fn rebuild_repo_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = rebuild_repo(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            Json(RebuildRepoRequest {
+                did: "did:plc:target".to_string(),
+                rationale: Some("fixing it".to_string()),
+            }),
+        )
+        .await
+        .expect_err("Admin (not SuperAdmin) must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn rebuild_repo_requires_rationale() {
+        let ctx = create_test_context().await;
+        // Empty/whitespace rationale is rejected (high-impact destructive action).
+        let err = rebuild_repo(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RebuildRepoRequest {
+                did: "did:plc:target".to_string(),
+                rationale: Some("   ".to_string()),
+            }),
+        )
+        .await
+        .expect_err("missing rationale → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_rebuild_progress_unknown_job_404() {
+        let ctx = create_test_context().await;
+        let err = get_rebuild_progress(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            axum::extract::Query(GetRebuildProgressParams {
+                job_id: "no-such-job".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unknown job → NotFound");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancel_rebuild_unknown_job_404() {
+        let ctx = create_test_context().await;
+        let err = cancel_rebuild(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(CancelRebuildRequest {
+                job_id: "no-such-job".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unknown job → NotFound");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    /// End-to-end job lifecycle through the handlers: starting a rebuild for an
+    /// account with no resolvable signing key spawns a job that fails fast, and
+    /// `getRebuildProgress` reports the terminal `failed` phase with a
+    /// diagnostic — exercising start → spawn → run → finish → progress, and
+    /// proving the original repo is never touched (shadow-then-swap).
+    #[tokio::test]
+    async fn rebuild_repo_lifecycle_reports_terminal_failure() {
+        let ctx = create_test_context().await;
+        let started = rebuild_repo(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RebuildRepoRequest {
+                did: "did:plc:no-account".to_string(),
+                rationale: Some("investigating".to_string()),
+            }),
+        )
+        .await
+        .expect("a rebuild is started")
+        .0;
+        let job_id = started["jobId"].as_str().expect("jobId returned").to_string();
+        assert_eq!(started["status"], "started");
+
+        // Poll until the background job reaches a terminal phase.
+        let mut phase = String::new();
+        let mut error_present = false;
+        for _ in 0..200 {
+            let p = get_rebuild_progress(
+                State(ctx.clone()),
+                op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+                axum::extract::Query(GetRebuildProgressParams {
+                    job_id: job_id.clone(),
+                }),
+            )
+            .await
+            .expect("progress for a known job")
+            .0;
+            phase = p["phase"].as_str().unwrap().to_string();
+            error_present = p["error"].is_string();
+            if phase == "failed" || phase == "completed" || phase == "cancelled" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(phase, "failed", "no-account rebuild must terminate as failed");
+        assert!(error_present, "a failed job surfaces a diagnostic");
+    }
+
+    // ---------- §7.4.3 / #291 bulk-repair scan XRPCs ----------
+
+    #[tokio::test]
+    async fn scan_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = scan_repos_for_inconsistencies(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+        )
+        .await
+        .expect_err("Admin (not SuperAdmin) must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn get_repo_scan_results_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = get_repo_scan_results(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            axum::extract::Query(GetRepoScanResultsParams { severity: None, limit: None, cursor: None }),
+        )
+        .await
+        .expect_err("Admin must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cancel_scan_with_none_running_is_409() {
+        let ctx = create_test_context().await;
+        let err = cancel_scan(State(ctx), op_auth("did:plc:super", Role::SuperAdmin, "sid"))
+            .await
+            .expect_err("no scan in progress → Conflict");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    /// End-to-end scan lifecycle through the handlers: a fresh test context has
+    /// no accounts, so the scan completes with zero findings — exercising
+    /// start → run → finish (+ ScanCompleted audit) → getScanProgress →
+    /// getRepoScanResults.
+    #[tokio::test]
+    async fn scan_lifecycle_empty_completes_with_no_findings() {
+        let ctx = create_test_context().await;
+        let started = scan_repos_for_inconsistencies(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+        )
+        .await
+        .expect("scan starts")
+        .0;
+        assert_eq!(started["status"], "started");
+        assert!(started["scanId"].is_string());
+
+        // Poll until the scan reports not-running.
+        let mut last_outcome = serde_json::Value::Null;
+        for _ in 0..200 {
+            let p = get_scan_progress(
+                State(ctx.clone()),
+                op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            )
+            .await
+            .expect("progress")
+            .0;
+            if p["running"] == serde_json::Value::Bool(false) && p["lastOutcome"].is_string() {
+                last_outcome = p["lastOutcome"].clone();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(last_outcome, "completed", "empty scan completes");
+
+        // Results: no findings, zero counts.
+        let results = get_repo_scan_results(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            axum::extract::Query(GetRepoScanResultsParams { severity: None, limit: None, cursor: None }),
+        )
+        .await
+        .expect("results")
+        .0;
+        assert_eq!(results["findings"].as_array().unwrap().len(), 0);
+        assert_eq!(results["counts"]["total"], 0);
+    }
+
+    // ---------- §7.4.3 / #292 bulk-repair XRPCs ----------
+
+    #[tokio::test]
+    async fn repair_repos_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = repair_repos(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            Json(RepairReposRequest { dids: vec!["did:plc:x".into()], all: false, rationale: Some("fix".into()) }),
+        )
+        .await
+        .expect_err("Admin must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn repair_repos_requires_rationale() {
+        let ctx = create_test_context().await;
+        let err = repair_repos(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RepairReposRequest { dids: vec!["did:plc:x".into()], all: false, rationale: None }),
+        )
+        .await
+        .expect_err("missing rationale → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn repair_repos_empty_targets_400() {
+        let ctx = create_test_context().await;
+        // all=true but no findings → empty target set → 400.
+        let err = repair_repos(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RepairReposRequest { dids: vec![], all: true, rationale: Some("fix".into()) }),
+        )
+        .await
+        .expect_err("no targets → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cancel_bulk_repair_with_none_running_is_409() {
+        let ctx = create_test_context().await;
+        let err = cancel_bulk_repair(State(ctx), op_auth("did:plc:super", Role::SuperAdmin, "sid"))
+            .await
+            .expect_err("no bulk repair → Conflict");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    /// End-to-end bulk-repair lifecycle through the handlers: a bogus target
+    /// DID (no account → its per-account rebuild fails) drives the loop to a
+    /// completed batch with failed=1 — exercising start → run_one per target →
+    /// tally → finish (+ BulkRepairInitiated envelope) → progress.
+    #[tokio::test]
+    async fn bulk_repair_lifecycle_tallies_per_account_failure() {
+        let ctx = create_test_context().await;
+        let started = repair_repos(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RepairReposRequest {
+                dids: vec!["did:plc:no-account".into()],
+                all: false,
+                rationale: Some("investigating".into()),
+            }),
+        )
+        .await
+        .expect("bulk repair starts")
+        .0;
+        assert_eq!(started["status"], "started");
+        assert_eq!(started["targetCount"], 1);
+
+        let mut done = false;
+        let mut progress = serde_json::Value::Null;
+        for _ in 0..200 {
+            progress = get_bulk_repair_progress(
+                State(ctx.clone()),
+                op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            )
+            .await
+            .expect("progress")
+            .0;
+            if progress["running"] == serde_json::Value::Bool(false)
+                && progress["lastOutcome"].is_string()
+            {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done, "bulk repair reached a terminal state");
+        assert_eq!(progress["lastOutcome"], "completed");
+        assert_eq!(progress["processed"], 1);
+        assert_eq!(progress["failed"], 1, "the no-account target fails its rebuild");
+        assert_eq!(progress["repaired"], 0);
+    }
+
+    // ---------- §7.4.2 / #294 sequencer-recovery XRPCs ----------
+
+    #[tokio::test]
+    async fn sequencer_recovery_options_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = sequencer_recovery_options(State(ctx), op_auth("did:plc:admin", Role::Admin, "sid"))
+            .await
+            .expect_err("Admin must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sequencer_recovery_options_lists_validate() {
+        let ctx = create_test_context().await;
+        let out = sequencer_recovery_options(State(ctx), op_auth("did:plc:super", Role::SuperAdmin, "sid"))
+            .await
+            .expect("options")
+            .0;
+        let ops = out["operations"].as_array().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0]["id"], "validate");
+        assert_eq!(ops[0]["destructive"], false);
+        // The routing op is advertised but unavailable until a validate flags
+        // malformed events (fresh ctx → no report).
+        assert_eq!(ops[1]["id"], "route_malformed");
+        assert_eq!(ops[1]["destructive"], true);
+        assert_eq!(ops[1]["available"], false);
+        assert_eq!(ops[1]["affectedCount"], 0);
+        // Empty test sequencer → zero rows, no head.
+        assert_eq!(out["state"]["totalRows"], 0);
+        assert_eq!(out["state"]["invalidatedRows"], 0);
+    }
+
+    #[tokio::test]
+    async fn route_malformed_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        let err = run_sequencer_recovery(
+            State(ctx),
+            op_auth("did:plc:admin", Role::Admin, "sid"),
+            Json(RunSequencerRecoveryRequest {
+                operation: "route_malformed".into(),
+                rationale: Some("fix them".into()),
+            }),
+        )
+        .await
+        .expect_err("Admin (not SuperAdmin) must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn route_malformed_requires_rationale() {
+        let ctx = create_test_context().await;
+        let err = run_sequencer_recovery(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RunSequencerRecoveryRequest {
+                operation: "route_malformed".into(),
+                rationale: Some("   ".into()),
+            }),
+        )
+        .await
+        .expect_err("blank rationale → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_malformed_without_a_report_is_400() {
+        // A SuperAdmin with a valid rationale, but no validate has run → there
+        // is no report to route from (400, not a 500 or a silent no-op).
+        let ctx = create_test_context().await;
+        let err = run_sequencer_recovery(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RunSequencerRecoveryRequest {
+                operation: "route_malformed".into(),
+                rationale: Some("route the malformed accounts".into()),
+            }),
+        )
+        .await
+        .expect_err("no report → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn run_sequencer_recovery_unknown_op_400() {
+        let ctx = create_test_context().await;
+        let err = run_sequencer_recovery(
+            State(ctx),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RunSequencerRecoveryRequest { operation: "reSequence".into(), rationale: None }),
+        )
+        .await
+        .expect_err("unknown operation → 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cancel_sequencer_recovery_with_none_running_is_409() {
+        let ctx = create_test_context().await;
+        let err = cancel_sequencer_recovery(State(ctx), op_auth("did:plc:super", Role::SuperAdmin, "sid"))
+            .await
+            .expect_err("nothing running → Conflict");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    /// End-to-end validate lifecycle through the handlers: a fresh (empty)
+    /// sequencer validates clean — exercising runSequencerRecovery → run →
+    /// finish (+ SequencerValidated audit) → getSequencerRecoveryProgress with
+    /// the report attached.
+    #[tokio::test]
+    async fn sequencer_recovery_validate_lifecycle_clean() {
+        let ctx = create_test_context().await;
+        let started = run_sequencer_recovery(
+            State(ctx.clone()),
+            op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            Json(RunSequencerRecoveryRequest { operation: "validate".into(), rationale: None }),
+        )
+        .await
+        .expect("validate starts")
+        .0;
+        assert_eq!(started["status"], "started");
+        assert_eq!(started["operation"], "validate");
+
+        let mut progress = serde_json::Value::Null;
+        let mut done = false;
+        for _ in 0..200 {
+            progress = get_sequencer_recovery_progress(
+                State(ctx.clone()),
+                op_auth("did:plc:super", Role::SuperAdmin, "sid"),
+            )
+            .await
+            .expect("progress")
+            .0;
+            if progress["running"] == serde_json::Value::Bool(false)
+                && progress["lastOutcome"].is_string()
+            {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(done, "validate reached a terminal state");
+        assert_eq!(progress["lastOutcome"], "completed");
+        assert_eq!(progress["report"]["malformedCount"], 0);
+        assert_eq!(progress["report"]["nonMonotonicCount"], 0);
     }
 }

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "dark",
+  "themeName": "Dark",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "Sober dark — the substrate's baseline; readable for sustained moderation work.",
+  "files": {
+    "tokens": "tokens.css",
+    "effects": "effects.css"
+  }
+}

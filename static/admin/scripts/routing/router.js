@@ -29,7 +29,12 @@
 
   function parseHash() {
     const hash = (window.location.hash || '').replace(/^#\/?/, '');
-    return hash;
+    // Strip any filter-state query string (§5.7.5) — a route pattern
+    // never contains '?', so route matching, legacy redirects, and the
+    // active-nav highlight all operate on the path alone. Pages read the
+    // query via AuroraUrlState.read().
+    const q = hash.indexOf('?');
+    return q >= 0 ? hash.slice(0, q) : hash;
   }
 
   // Match a hash path against the route table. Returns
@@ -97,6 +102,20 @@
         return;
       }
     }
+    // §5.7.4 mode gate — a route whose top-level domain is hidden by the
+    // current moderation-mode is unreachable even by deep link (e.g. any
+    // non-Configuration route in `disabled` mode, or Moderation in
+    // `reduced`). This is the MODE dimension only; the route's own
+    // `requires` above is the authoritative role gate, so Moderator-level
+    // routes that sit under an Admin+ sidebar group stay reachable.
+    if (global.AuroraRoutes && global.AuroraRoutes.domainModeAllowed) {
+      const mode = global.AuroraSettings ? global.AuroraSettings.getModerationMode() : 'full';
+      const domain = global.AuroraRoutes.domainForPattern(match.route.pattern);
+      if (!global.AuroraRoutes.domainModeAllowed(domain, mode)) {
+        mountModeUnavailable(match.route, mode);
+        return;
+      }
+    }
     const page = pages.get(match.route.page);
     if (!page || typeof page.mount !== 'function') {
       mountNotFound(hashPath, 'Page not implemented: ' + match.route.page);
@@ -142,7 +161,7 @@
   // innerHTML template literal — a textbook XSS sink because the hash
   // and any error message might originate in attacker-controlled URLs.
   // A successful XSS in the admin UI hands the attacker the operator's
-  // localStorage.adminToken and from there every admin XRPC the
+  // localStorage 'aurora-admin-token' and from there every admin XRPC the
   // operator has scope for. Treat all inputs here as hostile.
   function renderMessage(headingText, bodyParts) {
     if (!mainEl) return;
@@ -201,12 +220,57 @@
     renderMessage('Page error', [message]);
   }
 
+  // §5.7.4 / §5.5 — a route whose domain is hidden in the current
+  // moderation mode. In disabled mode the deployment may configure a
+  // landing redirect; we honour it but only as an INTERNAL hash target
+  // (stripping any leading '#') so a runtime-setting string can't become
+  // an open redirect to an arbitrary origin. Otherwise we explain and
+  // point at Configuration, which is always reachable.
+  function mountModeUnavailable(route, mode) {
+    if (mode === 'disabled' && global.AuroraSettings && global.AuroraSettings.getModerationModeRedirect) {
+      const redirect = String(global.AuroraSettings.getModerationModeRedirect() || '');
+      const target = redirect.replace(/^#\/?/, '');
+      if (target && target !== (route.pattern || '')) {
+        window.location.replace('#' + target);
+        return;
+      }
+    }
+    renderMessage('Unavailable in this mode', [
+      'This area is not available while moderation mode is ',
+      { tag: 'strong', text: mode || 'reduced' },
+      '. Open ',
+      { tag: 'code', text: '#configuration/general' },
+      ' to change the mode, or continue in an available area.',
+    ]);
+  }
+
+  // Pure: among `routes`, return the longest one that is `hashPath` itself or a
+  // true ancestor of it (a prefix at a '/' boundary), or null if none match.
+  // "Longest wins" is what makes a child page light only its own nav entry: on
+  // `ops/sequencer/recovery` both `ops/sequencer` (ancestor) and
+  // `ops/sequencer/recovery` (exact) match, and the exact, longer one wins — so
+  // the shorter sibling no longer lights alongside it (#411). A detail page with
+  // no nav entry of its own (e.g. `ops/accounts/<did>`) still lights its parent,
+  // since the parent is then the only — hence longest — match.
+  function resolveActiveRoute(hashPath, routes) {
+    let best = null;
+    for (const r of routes) {
+      if (r === hashPath || hashPath.startsWith(r + '/')) {
+        if (best === null || r.length > best.length) {
+          best = r;
+        }
+      }
+    }
+    return best;
+  }
+
   function updateSidebarActive(hashPath) {
     const items = document.querySelectorAll('.sidebar [data-route]');
+    const routes = [];
+    items.forEach((el) => routes.push(el.dataset.route));
+    const best = resolveActiveRoute(hashPath, routes);
     items.forEach((el) => {
-      const r = el.dataset.route;
-      const active = (r === hashPath) || hashPath.startsWith(r + '/');
-      el.classList.toggle('active', active);
+      el.classList.toggle('active', el.dataset.route === best);
     });
   }
 
@@ -229,6 +293,7 @@
     navigate: navigate,
     dispatch: dispatch,
     resolve: resolve,
+    resolveActiveRoute: resolveActiveRoute,
     start: start,
   };
 })(window);

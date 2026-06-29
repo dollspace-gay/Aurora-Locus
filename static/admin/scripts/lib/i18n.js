@@ -90,16 +90,32 @@
       return '';
     }
     const n = Number(count);
-    // Try =N first, then one (when n === 1), then other.
+    // Try the exact-match =N arm first.
     const exact = matchArm(body, '=' + n);
     if (exact != null) return exact.replace(/#/g, String(n));
-    if (n === 1) {
-      const one = matchArm(body, 'one');
-      if (one != null) return one.replace(/#/g, String(n));
+    // Then the locale's plural category. English maps 1→'one', else→'other';
+    // other locales get their correct category (few/many/…) once their
+    // locale file supplies those arms.
+    const category = pluralCategory(n);
+    if (category && category !== 'other') {
+      const arm = matchArm(body, category);
+      if (arm != null) return arm.replace(/#/g, String(n));
     }
     const other = matchArm(body, 'other');
     if (other != null) return other.replace(/#/g, String(n));
     return String(n);
+  }
+
+  // Resolve a count to its CLDR plural category. Delegates to the public
+  // AuroraFormat.resolvePlural (single Intl.PluralRules source, resolved at
+  // call time — format.js loads after i18n.js but t() runs post-load), with
+  // an English fallback if AuroraFormat isn't present.
+  function pluralCategory(n) {
+    if (global.AuroraFormat && typeof global.AuroraFormat.resolvePlural === 'function') {
+      return global.AuroraFormat.resolvePlural(n);
+    }
+    try { return new Intl.PluralRules(activeLocale).select(Number(n)); }
+    catch (e) { return Number(n) === 1 ? 'one' : 'other'; }
   }
 
   // Extract the body of `selector { … }` from the plural body string.
@@ -126,6 +142,16 @@
   function t(key, params) {
     const template = get(strings, key);
     if (template == null) return key;
+    // Sub-key plural (§16 D3): a plural-keyed entry is an object of CLDR
+    // category sub-keys, e.g. { one: "1 member", other: "{count} members" }.
+    // With a `count` arg, pick the category for count and interpolate that
+    // arm. Non-object entries (plain strings, incl. inline {count, plural,…})
+    // resolve normally — no behavior change for existing keys.
+    if (template && typeof template === 'object' && params && params.count != null) {
+      const cat = pluralCategory(params.count);
+      const arm = (template[cat] != null) ? template[cat] : template.other;
+      return format(arm != null ? arm : key, params);
+    }
     return format(template, params);
   }
 

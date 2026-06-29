@@ -39,19 +39,18 @@
       "account or record has been deleted.",
     SubjectsArrayInvalidForAction:
       "This action only supports a single subject.",
-    // Phase B addition: the per-arm subject-shape check at
-    // aurora_admin.rs:552 (dispatch_err_to_response wrapping
-    // PdsError::Validation from the require_*_pds helpers)
-    // emits this when an action like TakedownRecord requires
-    // a specific subject shape (e.g., a Record), but the
-    // request supplied a different shape (e.g., a Repo). Also
-    // emitted by validation() at aurora_admin.rs:339 for early-
-    // validation failures (e.g., empty rationale).
-    InvalidEvent:
-      "The action and the subject you selected are incompatible. " +
-      "Check that the subject type matches what this action " +
-      "operates on (TakedownRecord needs a record subject, " +
-      "TakedownAccount needs an account subject, etc.).",
+    // `InvalidEvent` is deliberately NOT translated here (#300). The code is
+    // OVERLOADED across unrelated subsystems: the moderation per-arm
+    // subject-shape check (aurora_admin.rs:552) AND setRuntimeSetting's
+    // unknown-key rejection ("unknown runtime setting key 'X'; known keys:
+    // [...]", aurora_admin.rs:4079). A single canned translation keyed on the
+    // code alone can only be right for one arm — the prior moderation-context
+    // copy showed "TakedownRecord needs a record subject…" for a
+    // runtime-setting save failure, which is actively misleading. The substrate
+    // sends a specific, informative `message` in BOTH arms, so falling through
+    // to it (translate's fallback) is more honest than any canned guess. If a
+    // future arm needs friendlier prose, scope the translation per-endpoint or
+    // give that arm a distinct error code rather than re-canning InvalidEvent.
     // Phase B addition: emitted by the AuroraJson extractor
     // (src/api/extractors.rs) when the request body fails JSON
     // deserialization. The original axum diagnostic is preserved

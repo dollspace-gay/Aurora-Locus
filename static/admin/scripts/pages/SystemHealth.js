@@ -11,12 +11,12 @@
       '<nav class="breadcrumb"><a href="#dashboard">Operations</a> <span class="breadcrumb-sep">›</span> System health</nav>' +
       '<header class="page-header"><div><h2>System health</h2><p class="page-subtitle">Subsystem status, jobs, validation</p></div></header>' +
       '<div class="settings-grid">' +
-      '  <div class="settings-card" id="sh-overall"><h3>Overall</h3><p class="empty-state">Loading…</p></div>' +
-      '  <div class="settings-card" id="sh-resources"><h3>Resource usage</h3><p class="empty-state">Loading…</p></div>' +
-      '  <div class="settings-card" id="sh-database"><h3>Database</h3><p class="empty-state">Loading…</p></div>' +
-      '  <div class="settings-card" id="sh-jobs"><h3>Background jobs</h3><p class="empty-state">Loading…</p></div>' +
-      '  <div class="settings-card" id="sh-nonce"><h3>Nonce store</h3><p class="empty-state">Loading…</p></div>' +
-      '  <div class="settings-card" id="sh-validation"><h3>Validation failures</h3><p class="empty-state">Loading…</p></div>' +
+      '  <div class="settings-card" id="sh-overall"><h3>Overall</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="sh-resources"><h3>Resource usage</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="sh-database"><h3>Database</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="sh-jobs"><h3>Background jobs</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="sh-nonce"><h3>Nonce store</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '  <div class="settings-card" id="sh-validation"><h3>Validation failures</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '</div>' +
       '<div class="ops-section">' +
       '  <h3>Controls</h3>' +
@@ -26,7 +26,7 @@
       '  </div>' +
       '</div>';
     document.getElementById('sh-checks').addEventListener('click', async () => {
-      try { await global.AuroraClient.post('tools.aurora.ops.runHealthChecks', {});
+      try { await global.AuroraEndpoints.ops.runHealthChecks();
             global.AuroraToast.success('Health checks scheduled.'); await refresh(); }
       catch (e) { global.AuroraToast.danger('Run failed: ' + (e && e.message)); }
     });
@@ -38,7 +38,7 @@
         submitLabel: 'Clean up',
       });
       if (!result.submitted) return;
-      try { await global.AuroraClient.post('tools.aurora.ops.cleanupNonceStores', {});
+      try { await global.AuroraEndpoints.ops.cleanupNonceStores();
             global.AuroraToast.success('Cleanup complete.'); await refresh(); }
       catch (e) { global.AuroraToast.danger('Cleanup failed: ' + (e && e.message)); }
     });
@@ -52,11 +52,31 @@
     if (!ep) return;
     safeRender('sh-overall', '<h3>Overall</h3>', async () => {
       const h = await ep.ops.getSystemHealth();
-      return Object.entries(h.subsystems || {}).map(([k, v]) =>
-        '<p><strong>' + esc(k) + ':</strong> ' +
-        (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(v.status, v.status) : esc(v.status)) +
-        ' ' + esc(v.message || '') + '</p>'
-      ).join('') || 'No subsystem data.';
+      const subs = h.subsystems || {};
+      // §9.6: System Health is the rollup, the Sequencer page is the
+      // detail. The sequencer indicator here shows state + tail-lag + a
+      // click-through to #ops/sequencer (cursor/controls/raw metrics live
+      // there). Pull the lag from getSequencerStatus.
+      let seq = null;
+      try { seq = await ep.ops.getSequencerStatus(); } catch (e) { /* lag optional */ }
+      function seqRollup(statusFallback) {
+        const state = (seq && seq.state) || statusFallback || 'unknown';
+        const lag = (seq && seq.lagSeconds != null && global.AuroraFormat)
+          ? ' · lag ' + esc(global.AuroraFormat.durationCompact(seq.lagSeconds)) : '';
+        const badge = global.AuroraStatusBadge ? global.AuroraStatusBadge.render(state, state) : esc(state);
+        return '<p><strong>sequencer:</strong> ' + badge + lag +
+               ' <a href="#ops/sequencer">' + (global.t ? global.t('ops.systemHealth.open_sequencer') : 'Open Sequencer →') + '</a></p>';
+      }
+      const rows = [];
+      let sawSeq = false;
+      for (const [k, v] of Object.entries(subs)) {
+        if (k === 'sequencer') { sawSeq = true; rows.push(seqRollup(v && v.status)); continue; }
+        rows.push('<p><strong>' + esc(k) + ':</strong> ' +
+          (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(v.status, v.status) : esc(v.status)) +
+          ' ' + esc(v.message || '') + '</p>');
+      }
+      if (!sawSeq && seq) rows.push(seqRollup());
+      return rows.join('') || 'No subsystem data.';
     });
     safeRender('sh-resources', '<h3>Resource usage</h3>', async () => {
       const r = await ep.ops.getResourceUsage();

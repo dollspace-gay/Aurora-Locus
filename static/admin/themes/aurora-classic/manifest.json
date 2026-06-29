@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "aurora-classic",
+  "themeName": "Aurora Classic",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "dark",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "Cyberpunk dark with periwinkle accents; preserves the original Aurora-Locus visual lineage.",
+  "files": {
+    "tokens": "tokens.css",
+    "effects": "effects.css"
+  }
+}

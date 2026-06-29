@@ -27,14 +27,26 @@ const { test } = require('node:test');
 // globalThis to a fresh stub set.
 function makeWindow() {
   const storage = new Map();
+  const localStorage = {
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => storage.set(k, String(v)),
+    removeItem: (k) => storage.delete(k),
+    clear: () => storage.clear(),
+  };
   return {
-    localStorage: {
-      getItem: (k) => (storage.has(k) ? storage.get(k) : null),
-      setItem: (k, v) => storage.set(k, String(v)),
-      removeItem: (k) => storage.delete(k),
-      clear: () => storage.clear(),
-    },
+    localStorage: localStorage,
     fetch: () => Promise.reject(new Error('fetch not stubbed for this test')),
+    // #360 — capabilities.js routes auth headers through AuroraClient (which
+    // client.js loads first in the browser). Faithful stub of the canonical
+    // builder: merge extras + Bearer from the localStorage fallback path.
+    AuroraClient: {
+      authHeaders: (extra) => {
+        const headers = Object.assign({}, extra || {});
+        const token = localStorage.getItem('aurora-admin-token');
+        if (token) headers.Authorization = 'Bearer ' + token;
+        return headers;
+      },
+    },
   };
 }
 
@@ -168,7 +180,7 @@ test('refreshCapabilities infers caps from families list', async () => {
 
 test('callEndpoint sends POST with auth headers and JSON body', async () => {
   const w = makeWindow();
-  w.localStorage.setItem('adminToken', 'test-token-xyz');
+  w.localStorage.setItem('aurora-admin-token', 'test-token-xyz');
   w.localStorage.setItem(
     'aurora.capabilities',
     JSON.stringify({

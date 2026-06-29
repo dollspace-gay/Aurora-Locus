@@ -2,8 +2,8 @@
 //
 // The server's GrantRoleRequest / RevokeRoleRequest in
 // src/api/admin.rs deserialize from `did`, not `subject`. The admin
-// UI previously sent `subject` at three call sites (SettingsRoles.js,
-// SettingsRolesMembers.js x2), which caused every grant/revoke to
+// UI previously sent `subject` at three call sites (ConfigRoles.js,
+// ConfigRolesMembers.js x2), which caused every grant/revoke to
 // fail with a serde deserialization error before reaching the
 // handler. This test pins the corrected field name so a future
 // rename / regression doesn't silently reintroduce the same bug.
@@ -47,8 +47,8 @@ function findCalls(src) {
   return calls;
 }
 
-test('SettingsRoles.js grantRole sends did, not subject', () => {
-  const src = readPage('SettingsRoles.js');
+test('ConfigRoles.js grantRole sends did, not subject', () => {
+  const src = readPage('ConfigRoles.js');
   const calls = findCalls(src);
   const grants = calls.filter((c) => c.method === 'grantRole');
   assert.equal(grants.length, 1, 'expected exactly one grantRole call site');
@@ -62,8 +62,8 @@ test('SettingsRoles.js grantRole sends did, not subject', () => {
   }
 });
 
-test('SettingsRolesMembers.js grantRole sends did, not subject', () => {
-  const src = readPage('SettingsRolesMembers.js');
+test('ConfigRolesMembers.js grantRole sends did, not subject', () => {
+  const src = readPage('ConfigRolesMembers.js');
   const grants = findCalls(src).filter((c) => c.method === 'grantRole');
   assert.equal(grants.length, 1, 'expected exactly one grantRole call site');
   for (const c of grants) {
@@ -72,8 +72,8 @@ test('SettingsRolesMembers.js grantRole sends did, not subject', () => {
   }
 });
 
-test('SettingsRolesMembers.js revokeRole sends did, not subject', () => {
-  const src = readPage('SettingsRolesMembers.js');
+test('ConfigRolesMembers.js revokeRole sends did, not subject', () => {
+  const src = readPage('ConfigRolesMembers.js');
   const revokes = findCalls(src).filter((c) => c.method === 'revokeRole');
   assert.equal(revokes.length, 1, 'expected exactly one revokeRole call site');
   for (const c of revokes) {

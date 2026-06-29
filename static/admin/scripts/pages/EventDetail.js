@@ -9,15 +9,24 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#mod/events">Moderation</a> <span class="breadcrumb-sep">›</span> <a href="#mod/events">Events</a> <span class="breadcrumb-sep">›</span> #' + esc(id) + '</nav>' +
       '<header class="page-header"><div><h2>Event #' + esc(id) + '</h2></div></header>' +
-      '<div id="ed-body"><p class="empty-state">Loading…</p></div>';
+      '<div id="ed-body">' + global.AuroraSkeleton.lines(4) + '</div>';
+    await loadEvent(id);
+    return {};
+  }
+
+  async function loadEvent(id) {
+    const body = document.getElementById('ed-body');
+    if (!body) return;
+    body.innerHTML = global.AuroraSkeleton.lines(4);
     try {
       const data = await global.AuroraEndpoints.moderator.getEvent(id);
       renderBody(data);
     } catch (e) {
-      document.getElementById('ed-body').innerHTML =
-        '<p class="empty-state">Could not load event: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(body, {
+        message: 'Could not load event: ' + ((e && e.message) || ''),
+        onRetry: function () { loadEvent(id); },
+      });
     }
-    return {};
   }
 
   function renderBody(e) {
@@ -29,7 +38,7 @@
       '  <div class="settings-card">' +
       '    <h3>Event metadata</h3>' +
       '    <p><strong>Type:</strong> ' + esc(e.eventType) + '</p>' +
-      '    <p><strong>When:</strong> ' + esc(fmt ? fmt.date(e.createdAt, 'medium') : e.createdAt) + '</p>' +
+      '    <p><strong>When:</strong> ' + global.AuroraTimestamp.render({ value: e.createdAt, context: 'detail' }) + '</p>' +
       '    <p><strong>Actor:</strong> ' + (e.actorDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(e.actorDid, e.actorHandle) : esc(e.actorDid)) : '—') + '</p>' +
       '    <p><strong>Subject:</strong> ' + subj + '</p>' +
       '  </div>' +
@@ -40,7 +49,7 @@
       '</div>' +
       '<div class="settings-card" style="margin-top: 1rem;">' +
       '  <h3>Raw event payload</h3>' +
-      '  <pre style="white-space: pre-wrap; padding: 1rem; background: var(--background); border-radius: 6px; max-height: 400px; overflow-y: auto;">' +
+      '  <pre style="white-space: pre-wrap; padding: 1rem; background: var(--color-surface-primary); border-radius: 6px; max-height: 400px; overflow-y: auto;">' +
       esc(JSON.stringify(e, null, 2)) + '</pre>' +
       '</div>';
   }

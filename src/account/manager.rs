@@ -70,6 +70,65 @@ pub struct AccountManager {
     config: Arc<ServerConfig>,
 }
 
+/// A per-account atproto signing keypair for rotation (key-rotation arc #372).
+/// Holds private key material — deliberately NOT `Debug`/`Serialize` so it can't
+/// be accidentally logged or returned on the wire.
+pub struct RotationKeypair {
+    pub private_key_bytes: Vec<u8>,
+    pub public_did_key: String,
+}
+
+/// An operator-supplied rotation keypair (the gated path), deserialized from the
+/// rotation / dry-run request. Carries private key material in
+/// `private_key_hex` — never logged, never echoed.
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorSuppliedKeypair {
+    pub public_did_key: String,
+    pub private_key_hex: String,
+}
+
+// Manual, REDACTING Debug impls — needed for `Result::unwrap_err` in tests, but
+// must never print private key bytes (which a derived Debug would).
+impl std::fmt::Debug for RotationKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotationKeypair")
+            .field("public_did_key", &self.public_did_key)
+            .field("private_key_bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for OperatorSuppliedKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorSuppliedKeypair")
+            .field("public_did_key", &self.public_did_key)
+            .field("private_key_hex", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// The keys an account held *before* a rotation, returned by
+/// [`AccountManager::update_atproto_signing_key`] (key-rotation arc B3 / #374,
+/// design §4.2.4). `old_public_did_key` is the load-bearing forensic value the
+/// rotation audit records; `old_private_key_bytes` is the prior signing material
+/// (a rotation handler guards on its presence, and it is the substrate a future
+/// key-archival policy — §6 forward commitment — would consume). Private bytes
+/// never logged, never echoed.
+pub struct RotationOldKeys {
+    pub old_private_key_bytes: Vec<u8>,
+    pub old_public_did_key: String,
+}
+
+impl std::fmt::Debug for RotationOldKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotationOldKeys")
+            .field("old_public_did_key", &self.old_public_did_key)
+            .field("old_private_key_bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl AccountManager {
     /// Create a new account manager
     pub fn new(db: AnyPool, config: Arc<ServerConfig>) -> Self {
@@ -599,6 +658,115 @@ impl AccountManager {
         let hex_key: String = row.try_get("atproto_signing_key").map_err(PdsError::Database)?;
         hex::decode(&hex_key).map_err(|e| {
             PdsError::Internal(format!("atproto_signing_key for {} is malformed hex: {}", did, e))
+        })
+    }
+
+    /// Generate a fresh per-account atproto signing keypair for rotation
+    /// (key-rotation arc #372 / B1 §4.2.1 Path A). Pure: no DB, no PLC — side
+    /// effects (PLC publish, `plc_keys` write, empty-commit) come in B3. Mirrors
+    /// the keygen slice of `generate_plc_did` (a fresh ES256K key via `PlcSigner`),
+    /// so a rotation key is constructed exactly like an account-creation key.
+    pub fn generate_rotation_keypair(&self) -> PdsResult<RotationKeypair> {
+        use crate::crypto::plc::PlcSigner;
+        use rand::RngCore;
+        let mut private_key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut private_key);
+        let signer = PlcSigner::new(&private_key)?;
+        let public_did_key = signer.public_key_did_key();
+        Ok(RotationKeypair {
+            private_key_bytes: private_key.to_vec(),
+            public_did_key,
+        })
+    }
+
+    /// Validate an operator-supplied rotation keypair (#372 / B1 §4.2.1 Path B):
+    /// derive the public did:key from the private bytes (via the same `PlcSigner`
+    /// path account creation uses) and compare to the supplied public did:key.
+    /// Pure — errors before any state mutation in a calling context. (Design
+    /// §4.2.1 named distinct error types; the codebase has no `AccountError`, so
+    /// these map to `PdsError::Validation` with distinct messages.)
+    pub fn validate_operator_keypair(
+        &self,
+        keypair: &OperatorSuppliedKeypair,
+    ) -> PdsResult<RotationKeypair> {
+        use crate::crypto::plc::PlcSigner;
+        let bytes = hex::decode(&keypair.private_key_hex).map_err(|e| {
+            PdsError::Validation(format!("operator keypair private_key_hex is not valid hex: {e}"))
+        })?;
+        let signer = PlcSigner::new(&bytes).map_err(|e| {
+            PdsError::Validation(format!("operator keypair private key is invalid: {e}"))
+        })?;
+        let derived = signer.public_key_did_key();
+        if derived != keypair.public_did_key {
+            return Err(PdsError::Validation(format!(
+                "operator keypair mismatch: the private key derives to {derived}, \
+                 but the supplied public key is {}",
+                keypair.public_did_key
+            )));
+        }
+        Ok(RotationKeypair {
+            private_key_bytes: bytes,
+            public_did_key: keypair.public_did_key.clone(),
+        })
+    }
+
+    /// Rotate the account's stored atproto signing private key to
+    /// `new_private_key_bytes` (key-rotation arc B3 / #374, design §4.2.4).
+    /// Returns the keys the account held before the write — the old public
+    /// did:key (for the rotation audit) and the old private bytes — derived from
+    /// the pre-rotation `plc_keys` row. Wrapped in a per-DID transaction:
+    /// SELECT-then-UPDATE (not `RETURNING`, for cross-backend portability,
+    /// matching the codebase's other dual-step writes). Errors:
+    /// `PdsError::NotFound` if no `plc_keys` row exists for `did`;
+    /// `PdsError::Internal` if the stored prior key is malformed/empty (a
+    /// rotation requires a usable prior key — legacy empty rows surface here
+    /// rather than silently rotating from nothing).
+    pub async fn update_atproto_signing_key(
+        &self,
+        did: &str,
+        new_private_key_bytes: &[u8],
+    ) -> PdsResult<RotationOldKeys> {
+        use crate::crypto::plc::PlcSigner;
+        let new_hex = hex::encode(new_private_key_bytes);
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        // Read the prior value inside the txn so the old-key derivation and the
+        // write witness the same row.
+        let row = sqlx::query("SELECT atproto_signing_key FROM plc_keys WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PdsError::Database)?
+            .ok_or_else(|| PdsError::NotFound(format!("plc_keys row missing for did={}", did)))?;
+        let old_hex: String = row.try_get("atproto_signing_key").map_err(PdsError::Database)?;
+        sqlx::query("UPDATE plc_keys SET atproto_signing_key = $1 WHERE did = $2")
+            .bind(&new_hex)
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .map_err(PdsError::Database)?;
+        tx.commit().await.map_err(PdsError::Database)?;
+
+        // Derive the old public did:key from the prior private bytes (same
+        // PlcSigner path account creation + validate_operator_keypair use). A
+        // malformed or empty prior key (legacy `''` rows) fails here — a
+        // rotation must have a real prior key to record.
+        let old_private_key_bytes = hex::decode(&old_hex).map_err(|e| {
+            PdsError::Internal(format!(
+                "prior atproto_signing_key for {} is malformed hex: {}",
+                did, e
+            ))
+        })?;
+        let old_public_did_key = PlcSigner::from_hex(&old_hex)
+            .map_err(|e| {
+                PdsError::Internal(format!(
+                    "prior atproto_signing_key for {} is not a valid signing key: {}",
+                    did, e
+                ))
+            })?
+            .public_key_did_key();
+        Ok(RotationOldKeys {
+            old_private_key_bytes,
+            old_public_did_key,
         })
     }
 
@@ -2797,11 +2965,12 @@ impl AccountManager {
     pub async fn search_accounts(
         &self,
         email: Option<&str>,
+        q: Option<&str>,
         cursor: Option<&str>,
         limit: i64,
     ) -> PdsResult<Vec<ActorAccount>> {
-        // Build SQL with optional email and cursor predicates so we don't run
-        // a join+filter when the caller only wants pagination.
+        // Build SQL with optional email, free-text (`q`), and cursor predicates
+        // so we don't run a join+filter when the caller only wants pagination.
         let mut sql = String::from(
             "SELECT
                 a.did, a.handle, a.created_at, a.takedown_ref, a.deactivated_at, a.delete_after,
@@ -2814,21 +2983,36 @@ impl AccountManager {
         if email.is_some() {
             sql.push_str(" AND LOWER(ac.email) = LOWER(?)");
         }
+        // #315 — free-text search the admin UI's Accounts box sends as `q`:
+        // case-insensitive substring across handle, DID, and email (matching
+        // the "Search by handle, DID, or email" affordance). Previously the
+        // handler accepted no `q` field, so the param was silently dropped and
+        // every account was returned regardless of the search term.
+        if q.is_some() {
+            sql.push_str(
+                " AND (LOWER(a.handle) LIKE ? OR LOWER(a.did) LIKE ? OR LOWER(ac.email) LIKE ?)",
+            );
+        }
         if cursor.is_some() {
             sql.push_str(" AND a.did > ?");
         }
         sql.push_str(" ORDER BY a.did LIMIT ?");
 
-        let mut q = sqlx::query(&sql);
+        // `%term%` substring, lower-cased to pair with the LOWER() columns.
+        let q_like = q.map(|s| format!("%{}%", s.to_lowercase()));
+        let mut stmt = sqlx::query(&sql);
         if let Some(e) = email {
-            q = q.bind(e);
+            stmt = stmt.bind(e);
+        }
+        if let Some(ref like) = q_like {
+            stmt = stmt.bind(like).bind(like).bind(like);
         }
         if let Some(c) = cursor {
-            q = q.bind(c);
+            stmt = stmt.bind(c);
         }
-        q = q.bind(limit);
+        stmt = stmt.bind(limit);
 
-        let rows = q.fetch_all(&self.db).await.map_err(PdsError::Database)?;
+        let rows = stmt.fetch_all(&self.db).await.map_err(PdsError::Database)?;
 
         let mut accounts = Vec::new();
         for row in rows {
@@ -3176,7 +3360,6 @@ mod tests {
                 firehose_enabled: false,
                 crawl_enabled: false,
                 public_url: None,
-                auto_stream_events: false,
                 peer_pds: vec![],
             },
             validation_mode: crate::validation::ValidationMode::Optimistic,
@@ -3191,6 +3374,119 @@ mod tests {
         });
 
         AccountManager::new(db, config)
+    }
+
+    // ---- key-rotation arc #372 / B1: rotation substrate primitives ----
+
+    #[tokio::test]
+    async fn generate_rotation_keypair_valid_distinct_round_trip() {
+        let m = create_test_manager().await;
+        let kp1 = m.generate_rotation_keypair().unwrap();
+        assert!(!kp1.private_key_bytes.is_empty());
+        assert!(kp1.public_did_key.starts_with("did:key:"));
+        let kp2 = m.generate_rotation_keypair().unwrap();
+        assert_ne!(kp1.private_key_bytes, kp2.private_key_bytes, "CSRNG → distinct keys");
+        // Round-trip: the public did:key derived from the private bytes matches.
+        let derived = crate::crypto::plc::PlcSigner::new(&kp1.private_key_bytes)
+            .unwrap()
+            .public_key_did_key();
+        assert_eq!(derived, kp1.public_did_key);
+    }
+
+    #[tokio::test]
+    async fn validate_operator_keypair_matching_mismatch_malformed() {
+        let m = create_test_manager().await;
+        let gen = m.generate_rotation_keypair().unwrap();
+
+        // Matching pair → validated.
+        let ok = m
+            .validate_operator_keypair(&OperatorSuppliedKeypair {
+                public_did_key: gen.public_did_key.clone(),
+                private_key_hex: hex::encode(&gen.private_key_bytes),
+            })
+            .unwrap();
+        assert_eq!(ok.public_did_key, gen.public_did_key);
+        assert_eq!(ok.private_key_bytes, gen.private_key_bytes);
+
+        // Mismatched public did:key → error.
+        let other = m.generate_rotation_keypair().unwrap();
+        let err = m
+            .validate_operator_keypair(&OperatorSuppliedKeypair {
+                public_did_key: other.public_did_key.clone(),
+                private_key_hex: hex::encode(&gen.private_key_bytes),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "got {err}");
+
+        // Malformed hex → error.
+        let err = m
+            .validate_operator_keypair(&OperatorSuppliedKeypair {
+                public_did_key: gen.public_did_key.clone(),
+                private_key_hex: "not-hex!!".to_string(),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("hex"), "got {err}");
+
+        // Valid hex, wrong byte length → invalid private key (or mismatch).
+        let err = m
+            .validate_operator_keypair(&OperatorSuppliedKeypair {
+                public_did_key: gen.public_did_key.clone(),
+                private_key_hex: "abcd".to_string(),
+            })
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid") || msg.contains("mismatch"), "got {msg}");
+    }
+
+    // ---- key-rotation arc B3 (#374 / §4.2.4): update_atproto_signing_key ----
+
+    #[tokio::test]
+    async fn update_atproto_signing_key_round_trip_returns_old_keys() {
+        let m = create_test_manager().await;
+        let account = m
+            .create_account(
+                "rotuser".to_string(),
+                Some("rot@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let did = account.did;
+
+        // The key the account was created with (K1).
+        let k1_bytes = m.get_atproto_signing_key_bytes(&did).await.unwrap();
+        let k1_public = crate::crypto::plc::PlcSigner::from_hex(&hex::encode(&k1_bytes))
+            .unwrap()
+            .public_key_did_key();
+
+        // Rotate to a fresh key (K2).
+        let k2 = m.generate_rotation_keypair().unwrap();
+        let old = m
+            .update_atproto_signing_key(&did, &k2.private_key_bytes)
+            .await
+            .unwrap();
+
+        // Returned old keys describe K1.
+        assert_eq!(old.old_private_key_bytes, k1_bytes, "old private bytes are K1");
+        assert_eq!(old.old_public_did_key, k1_public, "old public did:key is K1's");
+
+        // The stored key is now K2.
+        let stored = m.get_atproto_signing_key_bytes(&did).await.unwrap();
+        assert_eq!(stored, k2.private_key_bytes, "row now holds K2's private bytes");
+        assert_ne!(stored, k1_bytes, "the key actually changed");
+    }
+
+    #[tokio::test]
+    async fn update_atproto_signing_key_unknown_did_not_found() {
+        let m = create_test_manager().await;
+        let k = m.generate_rotation_keypair().unwrap();
+        let err = m
+            .update_atproto_signing_key("did:plc:nonexistent", &k.private_key_bytes)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::NotFound(_)), "got {err:?}");
     }
 
     /// v0.8 arc 3 (#184) — Gate 1 of the email `:`-reject. A `did:`-leading

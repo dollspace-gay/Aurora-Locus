@@ -1,0 +1,149 @@
+/*
+ * effects.css — the baseline effect-class library (design §11.6).
+ *
+ * Effect classes are reusable visual *compositions* (gradients, glows,
+ * elevation, glass) layered on top of the design *tokens* in tokens.css.
+ * Surfaces apply a class name (e.g. class="effect-surface-elevation-1");
+ * the active theme decides what that class renders.
+ *
+ * This file is the un-themed live-UI baseline — the sober `aurora-default`
+ * implementations from §11.9.2, consuming the 28 canonical tokens. It loads
+ * directly (index.html), in parallel with tokens.css. When the theme registry
+ * serves a named theme's resolved effects.css, that theme's redefinitions of
+ * the same class names override these (CSS cascade / later source).
+ *
+ * Required classes (§11.6.5 — must exist in every theme, here or inherited):
+ *   .effect-focus-ring, .effect-surface-elevation-1 / -2 / -3
+ *
+ * Per Arc B §215 (substrate-stylesheet-wired-not-applied): this library loads
+ * but existing component markup is not yet rewired to consume it — surfaces
+ * adopt effect classes incrementally as the bundled themes and Themes page land
+ * (#216 / #217). Decorative effects are intentionally trivial here (the class
+ * exists so surfaces applying it don't break); `aurora-classic` lights
+ * them up.
+ */
+
+/* ------------------------------------------------------------------ *
+ * Background effects
+ * ------------------------------------------------------------------ */
+
+/* Progressively-elevated surfaces (§11.9.2). Shadow-based so elevation
+ * composes cleanly with background-based effects like frosted-glass.
+ *
+ * §10.4.4 allowlist: the box-shadow black-alpha is theme-invariant decorative
+ * depth (shadows read dark under every theme), not a themeable surface/text/
+ * accent color — so it's a legitimate exception to the no-hardcoded-color rule
+ * (which targets hex theme colors). These are a distinct §11.9.2 effect scale
+ * with their own geometry, deliberately separate from the --shadow-* tokens. */
+.effect-surface-elevation-1 {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+.effect-surface-elevation-2 {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+}
+.effect-surface-elevation-3 {
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+/* Frosted glass (§11.9.2) — minimal: translucent surface + backdrop blur. */
+.effect-frosted-glass {
+  background: var(--color-surface-secondary);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* Subtle page-level gradient: surface-primary easing into surface-secondary. */
+.effect-gradient-subtle {
+  background: linear-gradient(
+    180deg,
+    var(--color-surface-primary),
+    var(--color-surface-secondary)
+  );
+}
+
+/* Accent-tinted gradient for emphasized cards/callouts — sober: the accent
+ * is a faint wash over the card surface, not a saturated fill. */
+.effect-gradient-accent {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--color-surface-secondary) 92%, var(--color-accent-primary) 8%),
+    var(--color-surface-secondary)
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Border effects
+ * ------------------------------------------------------------------ */
+
+/* Subtle border: a single hairline in the secondary border token. */
+.effect-border-subtle {
+  border: 1px solid var(--color-border-secondary);
+}
+
+/* Outer glow border — sober: a faint accent ring, no spread. */
+.effect-border-glow {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent-primary) 40%, transparent);
+}
+
+/* Double-line decorative border (for classic-aesthetic themes). */
+.effect-border-double {
+  border: 3px double var(--color-border-primary);
+}
+
+/* ------------------------------------------------------------------ *
+ * Interactive-state effects
+ * ------------------------------------------------------------------ */
+
+/* Hover lift (§11.9.2) — subtle 1px rise. */
+.effect-hover-lift {
+  transition: transform var(--motion-duration-fast) var(--motion-easing-standard);
+}
+.effect-hover-lift:hover {
+  transform: translateY(-1px);
+}
+
+/* Hover glow — soft accent halo appears on hover (emphasized actions). */
+.effect-hover-glow {
+  transition: box-shadow var(--motion-duration-fast) var(--motion-easing-standard);
+}
+.effect-hover-glow:hover {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent-primary) 25%, transparent);
+}
+
+/* Focus ring (§11.9.2) — accessibility-required: every focusable element gets
+ * a visible focus indicator. Themes may change color/offset but must keep it
+ * visible. */
+.effect-focus-ring:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Pressed-state — slight scale-down + transition. */
+.effect-active-press {
+  transition: transform var(--motion-duration-fast) var(--motion-easing-standard);
+}
+.effect-active-press:active {
+  transform: scale(0.98);
+}
+
+/* ------------------------------------------------------------------ *
+ * Decorative effects — intentionally trivial in aurora-default (§11.9.2).
+ * The class exists for surfaces that apply it; richer themes override.
+ * ------------------------------------------------------------------ */
+
+/* Sober default: no texture overlay. */
+.effect-decorative-noise {
+  background-image: none;
+}
+
+/* Sober default: no geometric pattern. */
+.effect-decorative-pattern-subtle {
+  background-image: none;
+}
+
+/* The signature aurora glow — off-by-default here (§11.9.2);
+ * `aurora-classic` overrides this with the full treatment. */
+.effect-aurora-glow {
+  box-shadow: none;
+}

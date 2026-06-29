@@ -9,15 +9,24 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#mod/appeals">Moderation</a> <span class="breadcrumb-sep">›</span> <a href="#mod/appeals">Appeals</a> <span class="breadcrumb-sep">›</span> #' + esc(id) + '</nav>' +
       '<header class="page-header"><div><h2>Appeal #' + esc(id) + '</h2></div></header>' +
-      '<div id="apd-body"><p class="empty-state">Loading…</p></div>';
+      '<div id="apd-body">' + global.AuroraSkeleton.lines(4) + '</div>';
+    await loadAppeal(id);
+    return {};
+  }
+
+  async function loadAppeal(id) {
+    const body = document.getElementById('apd-body');
+    if (!body) return;
+    body.innerHTML = global.AuroraSkeleton.lines(4);
     try {
       const data = await global.AuroraEndpoints.moderator.getAppeal(id);
       renderBody(data);
     } catch (e) {
-      document.getElementById('apd-body').innerHTML =
-        '<p class="empty-state">Could not load appeal: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(body, {
+        message: 'Could not load appeal: ' + ((e && e.message) || ''),
+        onRetry: function () { loadAppeal(id); },
+      });
     }
-    return {};
   }
 
   function renderBody(a) {
@@ -31,7 +40,7 @@
       '<div class="settings-grid">' +
       '  <div class="settings-card">' +
       '    <h3>Appeal metadata</h3>' +
-      '    <p><strong>Submitted:</strong> ' + esc(fmt ? fmt.date(a.submittedAt, 'medium') : a.submittedAt) + '</p>' +
+      '    <p><strong>Submitted:</strong> ' + global.AuroraTimestamp.render({ value: a.submittedAt, context: 'detail' }) + '</p>' +
       '    <p><strong>Status:</strong> ' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(a.status, a.status) : esc(a.status)) + '</p>' +
       '    <p><strong>Appellant:</strong> ' + (a.submitterDid ? (global.AuroraEntityRef ? global.AuroraEntityRef.account(a.submitterDid, a.submitterHandle) : esc(a.submitterDid)) : '—') + '</p>' +
       '    <p><strong>Subject:</strong> ' + subj + '</p>' +
@@ -77,7 +86,7 @@
       const rationale = document.getElementById('apd-rationale').value.trim();
       if (!rationale) { global.AuroraToast.warning('Rationale is required.'); return; }
       try {
-        await global.AuroraClient.post('tools.aurora.moderator.resolveAppeal', {
+        await global.AuroraEndpoints.moderator.resolveAppeal({
           id: id, status: status, rationale: rationale,
         });
         global.AuroraToast.success('Appeal resolved.');

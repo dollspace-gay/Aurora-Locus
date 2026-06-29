@@ -2,7 +2,10 @@
 use crate::{
     account::AccountManager,
     actor_store::{ActorStore, ActorStoreConfig},
-    admin::{AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager, ReportManager},
+    admin::{
+        AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager,
+        OperatorSessionStore, ReportManager,
+    },
     blob_store::{BlobBackendType, BlobStorageConfig, BlobStore, BlobStoreConfig},
     config::{BlobstoreConfig, DatabaseConfig, DistributedStateMode, ServerConfig},
     db,
@@ -22,12 +25,41 @@ use crate::{
     read_after_write::LocalRecordsCache,
     sequencer::{Sequencer, SequencerConfig},
 };
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+/// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — details of a
+/// boot-seed failure, surfaced in the `getFederationPolicy` describe so the
+/// operator can diagnose the refusal state without grepping the audit log.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BootSeedFailureDetails {
+    pub failed_keys: Vec<String>,
+    pub seeded_keys: Vec<String>,
+    pub failure_reasons: std::collections::HashMap<String, String>,
+}
 
 /// Application context holding all shared services
 #[derive(Clone)]
 pub struct AppContext {
     pub config: Arc<ServerConfig>,
+    /// v0.9 Federation runtime-mutability arc §3.1 (#390) — the internal
+    /// graceful-shutdown trigger. `serve` subscribes receivers from this sender
+    /// to drive `with_graceful_shutdown` + the post-signal drain watchdog; the
+    /// save-and-restart handlers landing in the D-phase (`federation.enabled` /
+    /// `service.public_url`) call `shutdown_trigger.send(())` to request a
+    /// restart. `Arc<watch::Sender<()>>` so it shares across `AppContext` clones
+    /// and stays `Clone`-compatible; the channel is created once in `new`.
+    pub shutdown_trigger: Arc<tokio::sync::watch::Sender<()>>,
+    /// v0.9 Federation runtime-mutability arc §2.1 (#397) — the master federation
+    /// gate, resolved ONCE at boot from the `federation.enabled` runtime row
+    /// (env-config fallback) BEFORE the federation subsystems are constructed.
+    /// This is the value the `Option<Arc<…>>` federation subsystems were built
+    /// against, so it equals "are the subsystems up". Describe surfaces and the
+    /// job scheduler read THIS (not `config.federation.enabled`) so they report
+    /// and gate on the effective post-restart state. The request-layer
+    /// short-circuit (§3.7) instead reads the runtime row LIVE for incident-
+    /// response immediacy before a restart.
+    pub federation_enabled: bool,
     /// Shared-database pool for account, sequencer, OAuth tables, etc.
     /// Backend is selected by `config.database.backend` (SQLite or
     /// Postgres). `AnyPool` makes the dispatch transparent to consumers.
@@ -36,12 +68,23 @@ pub struct AppContext {
     pub actor_store: Arc<ActorStore>,
     pub blob_store: Arc<BlobStore>,
     pub identity_resolver: Arc<dyn IdentityResolverApi>,
+    /// Shared PLC directory client (key-rotation arc #371 / A3b). Threaded so
+    /// PLC-touching paths (rotation, repo-rebuild history-aware verify,
+    /// preRebuildCheck) consume one client instead of constructing ad-hoc.
+    pub plc_client: Arc<dyn crate::crypto::plc_client::PlcClientApi>,
     // Admin & Moderation
     pub admin_role_manager: Arc<AdminRoleManager>,
+    /// Per-operator session store (§8.1.7 / #271): backs admin session
+    /// listing, force-logout, and refresh rotation. Keyed by the `sid`
+    /// claim carried in admin access/refresh tokens.
+    pub operator_session_store: Arc<OperatorSessionStore>,
     pub moderation_manager: Arc<ModerationManager>,
     pub label_manager: Arc<LabelManager>,
     pub invite_manager: Arc<InviteCodeManager>,
     pub report_manager: Arc<ReportManager>,
+    /// v0.9 Arc B (§11) — installed-theme registry, enumerated + validated
+    /// at startup; serves the active theme's resolved token CSS to the UI.
+    pub theme_registry: Arc<crate::themes::ThemeRegistry>,
     // OAuth server components (for third-party app authorization)
     #[allow(dead_code)] // Future OAuth client management
     pub oauth_client_manager: Arc<ClientManager>,
@@ -52,6 +95,20 @@ pub struct AppContext {
     // Relay client for federation
     pub relay_client: Option<Arc<tokio::sync::Mutex<RelayClient>>>,
     // Federation components
+    /// v0.9 Federation Pattern-1 (#351 / design §2.2): the runtime-backed
+    /// trusted-peer read-site. Consumers route trust reads through this rather
+    /// than `config.federation.peer_pds` directly, so phases B+ can make the
+    /// allowlist runtime-mutable without re-touching them. Phase A: the runtime
+    /// key is always unset, so it falls back to `peer_pds` (no behavior change).
+    pub trusted_peers: crate::federation::trusted_peer_set::TrustedPeerSet,
+    /// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — set true by the
+    /// `main.rs` boot-completion check when any federation seed failed. Gates the
+    /// 8 federation-policy mutation XRPCs + the discovery scheduler (503/skip).
+    /// `Arc<AtomicBool>` so it shares across `AppContext` clones and stays
+    /// `Clone`-compatible.
+    pub boot_seed_failed: Arc<AtomicBool>,
+    /// Details of the boot-seed failure (if any), for the describe surface.
+    pub boot_seed_failure_details: Arc<tokio::sync::RwLock<Option<BootSeedFailureDetails>>>,
     pub federation_auth: Option<Arc<FederationAuthenticator>>,
     pub pds_discovery: Option<Arc<PdsDiscovery>>,
     pub federated_search: Option<Arc<FederatedSearch>>,
@@ -178,6 +235,76 @@ pub struct AppContext {
             >,
         >,
     >,
+
+    /// v0.9 Arc D (#223) — Aurora-Locus's standard kryphocron rotation oracle
+    /// (`aurora-locus-standard`). `Some` when `config.kryphocron.enabled`;
+    /// `None` otherwise. Held so the `triggerRotation` XRPC can invoke
+    /// `force_rotation()` and so the encode seam (#236) can build the at-rest
+    /// hooks around it. Its cadence is seeded at boot from
+    /// `kryphocron.laquna.rotation-cadence` and updated live thereafter.
+    pub kryphocron_rotation_oracle:
+        Option<Arc<crate::kryphocron_rotation::AuroraLocusStandardRotationOracle>>,
+
+    /// v0.9 Arc D (#335) — process-local tally of audience-oracle consultations
+    /// (§6.4.1). The write path (`participatePrivate`) and read path
+    /// (`authorize_private_read`) increment it; `getOracleActivity` reads the
+    /// snapshot. Aggregate counts only (no per-subject data), so it honours the
+    /// substrate privacy property. Always present (cheap, no kryphocron
+    /// dependency); the endpoint still gates on kryphocron being enabled.
+    pub audience_oracle_activity: Arc<crate::kryphocron_oracle_activity::AudienceOracleActivity>,
+
+    /// v0.9 Arc D (#236) — the persisted kryphocron at-rest hooks
+    /// (Laquna `ContentCodec` baseline + the #223
+    /// `aurora-locus-standard` rotation oracle). `Some` when
+    /// `config.kryphocron.enabled`; `None` otherwise. #222 built
+    /// these at boot, validated the install fail-closed, then dropped
+    /// them; #236 holds them so the encode-on-write seam
+    /// ([`crate::kryphocron_content::encode_private_content`]) can run
+    /// every private-tier record's content through
+    /// `kryphocron::encode_record_content` — the constitutional
+    /// encoding-at-default floor (kryphocron 0.3 §1.1). Built around
+    /// the same oracle held in `kryphocron_rotation_oracle`.
+    pub kryphocron_at_rest_hooks:
+        Option<Arc<dyn kryphocron::encryption::AtRestHooks>>,
+
+    /// v0.9 Arc D (#224) — the deployment's single rewrite-on-rotate job
+    /// (host-side; kryphocron 0.3 ships no rewrite driver). `Some` when
+    /// `config.kryphocron.enabled`; `None` otherwise. Holds the single-flight
+    /// guard + cancel hook + observable progress: `triggerRotation`
+    /// (`force_rotation` + spawn the corpus walk) starts it, the #225
+    /// `getRotationProgress` / `cancelRotation` XRPCs read/cancel it. Re-encodes
+    /// every account's private-tier records under the post-rotation generation
+    /// via the #237a decode + #236 encode primitives.
+    pub kryphocron_rewrite_job:
+        Option<Arc<crate::kryphocron_rewrite::RewriteJob>>,
+
+    /// Arc H §7.4.1 (#290) — registry of repository-rebuild jobs.
+    /// `rebuildRepo` starts one (per-DID single-flight); `getRebuildProgress` /
+    /// `cancelRebuild` read/cancel it by job-id. Reconstructs an account's repo
+    /// from its sequencer history in memory and atomically swaps it in.
+    pub rebuild_registry: Arc<crate::rebuild::RebuildRegistry>,
+
+    /// Arc H §7.4.3 (#291) — persistent store of bulk-scan findings (the
+    /// `repo_scan_finding` table). Read by `getRepoScanResults`; written by the
+    /// scan job.
+    pub scan_findings_store: Arc<crate::repo_scan::ScanFindingsStore>,
+
+    /// Arc H §7.4.3 (#291) — the deployment's single repository-scan job
+    /// (`scanReposForInconsistencies` / `getScanProgress` / `cancelScan`).
+    /// Walks all accounts, structurally reconstructs each, and persists
+    /// inconsistencies as findings.
+    pub repo_scan_job: Arc<crate::repo_scan::ScanJob>,
+
+    /// Arc H §7.4.3 (#292) — the deployment's single bulk repository-repair job
+    /// (`repairRepos` / `getBulkRepairProgress` / `cancelBulkRepair`). Iterates
+    /// target DIDs and fires per-account rebuilds through `rebuild_registry`.
+    pub bulk_repair_job: Arc<crate::repo_scan::BulkRepairJob>,
+
+    /// Arc H §7.4.2 (#294) — the deployment's single sequencer-recovery job
+    /// (`sequencerRecoveryOptions` / `runSequencerRecovery` /
+    /// `getSequencerRecoveryProgress` / `cancelSequencerRecovery`). v0.9 ships
+    /// one operation: a read-only deep integrity validation.
+    pub sequencer_recovery_job: Arc<crate::sequencer_recovery::SequencerRecoveryJob>,
 }
 
 /// Manual `Debug` impl per Arc 9 Step 2 (chainlink #55, V04_DESIGN.md
@@ -210,6 +337,7 @@ impl std::fmt::Debug for AppContext {
             .field("blob_store", &"<BlobStore>")
             .field("identity_resolver", &"<dyn IdentityResolverApi>")
             .field("admin_role_manager", &"<AdminRoleManager>")
+            .field("operator_session_store", &"<OperatorSessionStore>")
             .field("moderation_manager", &"<ModerationManager>")
             .field("label_manager", &"<LabelManager>")
             .field("invite_manager", &"<InviteCodeManager>")
@@ -272,7 +400,7 @@ impl AppContext {
     /// — the empty registry is fine for non-`describe_capabilities`
     /// code paths.
     pub async fn new(
-        config: ServerConfig,
+        mut config: ServerConfig,
         route_registry: Arc<crate::api::registry::RouteRegistry>,
     ) -> PdsResult<Self> {
         // Validate configuration
@@ -467,6 +595,14 @@ impl AppContext {
 
         // Initialize admin & moderation managers
         let admin_role_manager = Arc::new(AdminRoleManager::new(account_db.clone()));
+        let operator_session_store = Arc::new(OperatorSessionStore::new(account_db.clone()));
+        // v0.9 Arc H §7.4.3 (#291) — bulk repository-repair scan substrate.
+        let scan_findings_store =
+            Arc::new(crate::repo_scan::ScanFindingsStore::new(account_db.clone()));
+        let repo_scan_job = Arc::new(crate::repo_scan::ScanJob::new());
+        let bulk_repair_job = Arc::new(crate::repo_scan::BulkRepairJob::new());
+        let sequencer_recovery_job =
+            Arc::new(crate::sequencer_recovery::SequencerRecoveryJob::new());
         let moderation_manager = Arc::new(ModerationManager::new(
             account_db.clone(),
             account_manager.clone(),
@@ -485,9 +621,35 @@ impl AppContext {
         let oauth_client_manager = Arc::new(ClientManager::new(account_db.clone(), vec![]));
         let oauth_device_manager = Arc::new(DeviceManager::new(account_db.clone()));
 
-        // Initialize relay client first (optional - only if relay servers configured and federation enabled)
-        let relay_client = if config.federation.enabled && !config.federation.relay_urls.is_empty()
+        // v0.9 Federation runtime-mutability arc §2.1 (#397) — resolve the master
+        // federation gate from the runtime override (federation.enabled row →
+        // env-config fallback) so a save-and-restart toggle takes effect on this
+        // boot. Read directly from the pool: there is no AppContext yet, and
+        // migrations have already run above so runtime_settings is present. Every
+        // federation subsystem below, the describe surfaces, and the job
+        // scheduler gate on THIS value (stored on the context) rather than the
+        // immutable env config.
+        let federation_enabled = crate::api::aurora_admin::read_federation_enabled_at_boot(
+            &account_db,
+            config.federation.enabled,
+        )
+        .await;
+
+        // v0.9 Federation runtime-mutability arc §2.2 (#398) — bake the
+        // `service.public_url` runtime override into the config BEFORE it is
+        // shared, so the sync `effective_public_url()` accessor (and every URL it
+        // builds — DID docs, OAuth issuer, service URL) returns the operator's
+        // value on this boot. The change is restart-required precisely so this
+        // single boot-time swap is the clean event boundary; the post-restart
+        // bulk did:plc update (Phase E2) re-points existing DID documents.
+        if let Some(url) =
+            crate::api::aurora_admin::read_service_public_url_at_boot(&account_db).await
         {
+            config.service.public_url = Some(url);
+        }
+
+        // Initialize relay client first (optional - only if relay servers configured and federation enabled)
+        let relay_client = if federation_enabled && !config.federation.relay_urls.is_empty() {
             tracing::info!(
                 "Federation enabled with {} relay server(s)",
                 config.federation.relay_urls.len()
@@ -506,7 +668,7 @@ impl AppContext {
         };
 
         // Initialize federation components (Phase 1)
-        let (federation_auth, pds_discovery) = if config.federation.enabled {
+        let (federation_auth, pds_discovery) = if federation_enabled {
             tracing::info!("Initializing federation authenticator and PDS discovery");
 
             // Federation authenticator for cross-PDS authentication
@@ -546,7 +708,7 @@ impl AppContext {
         };
 
         // Initialize federated search (Phase 2)
-        let federated_search = if config.federation.enabled {
+        let federated_search = if federation_enabled {
             if let Some(ref discovery) = pds_discovery {
                 tracing::info!("Initializing federated search (max_concurrent: 10, timeout: 30s)");
                 Some(Arc::new(FederatedSearch::new(
@@ -562,7 +724,7 @@ impl AppContext {
         };
 
         // Initialize nonce store for service auth (Phase 4)
-        let nonce_store = if config.federation.enabled {
+        let nonce_store = if federation_enabled {
             tracing::info!("Initializing nonce store for replay prevention (retention: 120s)");
             Some(Arc::new(NonceStore::new()))
         } else {
@@ -592,7 +754,7 @@ impl AppContext {
                 store
             }
         };
-        let dpop_nonce_store: Option<Arc<DPopNonceStore>> = if config.federation.enabled {
+        let dpop_nonce_store: Option<Arc<DPopNonceStore>> = if federation_enabled {
             tracing::info!(
                 "Initializing DPoP §8 nonce challenge store (federation enabled)"
             );
@@ -894,30 +1056,193 @@ impl AppContext {
         // `kryphocron::KRYPHOCRON_LEXICON_REGISTRY`. When the switch is
         // off, both are skipped: the registry stays uninitialised and
         // `kryphocron_deny_map` stays `None`.
-        let kryphocron_deny_map = if config.kryphocron.enabled {
+        let (
+            kryphocron_deny_map,
+            kryphocron_rotation_oracle,
+            kryphocron_at_rest_hooks,
+            kryphocron_rewrite_job,
+        ) = if config.kryphocron.enabled {
             crate::kryphocron::warm_lexicons();
             let map = crate::kryphocron::build_deny_map();
             tracing::info!(
                 deny_map_entries = map.len(),
                 "kryphocron enabled; lexicons warmed and deny-error map built",
             );
-            Some(Arc::new(map))
+
+            // v0.9 Arc D (#223) — install Aurora-Locus's standard rotation
+            // oracle and validate the at-rest baseline, fail-closed. The oracle
+            // is `aurora-locus-standard` (peer to the substrate's
+            // `DefaultRotationOracle`, own state file at
+            // `<data-dir>/aurora-locus/rotation.state`), with its cadence seeded
+            // from the `kryphocron.laquna.rotation-cadence` runtime setting
+            // (unset → daily). We build the at-rest hooks around it (Laquna
+            // codec by default) and run `validate_at_rest_install` (the §11.10
+            // fail-closed install check). v0.9 Arc D (#236) — the hooks are now
+            // HELD in `AppContext` (no longer dropped post-validation): the
+            // encode-on-write seam runs every private-tier record's content
+            // through them. The oracle is also held separately so the
+            // `triggerRotation` XRPC can invoke `force_rotation()`.
+            use kryphocron::encryption::{AtRestHooks as _, RotationOracle};
+
+            // Seed cadence from the runtime setting (in-memory read thereafter).
+            let cadence = {
+                use sqlx::Row as _;
+                let raw = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
+                    .bind("kryphocron.laquna.rotation-cadence")
+                    .fetch_optional(&account_db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.try_get::<String, _>("value").ok());
+                // Stored values are JSON-encoded strings (e.g. "\"daily\"").
+                let s = raw
+                    .map(|v| serde_json::from_str::<String>(&v).unwrap_or(v))
+                    .unwrap_or_default();
+                crate::kryphocron_rotation::Cadence::from_setting(&s)
+            };
+
+            let oracle = Arc::new(
+                crate::kryphocron_rotation::AuroraLocusStandardRotationOracle::for_data_dir(
+                    &config.storage.data_directory,
+                    cadence,
+                )
+                .map_err(|e| {
+                    PdsError::Internal(format!(
+                        "aurora-locus-standard rotation oracle construction failed: {e}"
+                    ))
+                })?,
+            );
+
+            let hooks = kryphocron::encryption::DefaultAtRestHooks::builder(
+                config.storage.data_directory.clone(),
+            )
+            .with_rotation_oracle(oracle.clone() as Arc<dyn RotationOracle>)
+            .build()
+            .map_err(|e| {
+                PdsError::Internal(format!("kryphocron at-rest hooks build failed: {e}"))
+            })?;
+            kryphocron::at_rest::validate_at_rest_install(&hooks).map_err(|e| {
+                PdsError::Internal(format!(
+                    "kryphocron at-rest install validation failed (fail-closed): {e}"
+                ))
+            })?;
+            tracing::info!(
+                codec = %hooks.content_codec().codec_id(),
+                rotation_oracle =
+                    crate::kryphocron_rotation::AuroraLocusStandardRotationOracle::IDENTIFIER,
+                cadence = ?cadence,
+                "kryphocron at-rest baseline validated; aurora-locus-standard rotation oracle \
+                 installed; encode-on-write seam holds these hooks (#236)",
+            );
+
+            // #236 — hold the hooks (was `drop(hooks)` in #222). The
+            // encode-on-write seam consumes them at every private-tier
+            // record write.
+            let hooks: Arc<dyn kryphocron::encryption::AtRestHooks> = Arc::new(hooks);
+
+            // #224 — the rewrite-on-rotate job (host-side; reads its own
+            // bookkeeping under <data-dir>/aurora-locus/). Independent of the
+            // oracle/hooks Arcs — it resolves them from AppContext at run time.
+            let rewrite_job = Arc::new(crate::kryphocron_rewrite::RewriteJob::new(
+                config.storage.data_directory.clone(),
+            ));
+
+            (Some(Arc::new(map)), Some(oracle), Some(hooks), Some(rewrite_job))
         } else {
-            None
+            (None, None, None, None)
         };
+
+        // v0.9 Arc B — enumerate + validate installed themes at startup.
+        // Bundled themes ship read-only under static/admin/themes/; operator
+        // themes under <data-dir>/themes/. The registry serves the active
+        // theme's inheritance-resolved token CSS to the admin UI (§11).
+        let theme_registry = {
+            let bundled_root = std::path::Path::new("static/admin/themes");
+            let operator_root = config.storage.data_directory.join("themes");
+            let reg = crate::themes::ThemeRegistry::build(bundled_root, &operator_root);
+            let (total, valid) = reg.summary();
+            tracing::info!(total_themes = total, valid_themes = valid, "theme registry built");
+            // WCAG 2.2 certification record (#321): one structured line per
+            // valid theme. The operational audit trail of the accessibility
+            // claim — programmatic contrast only (not a focus-indicator /
+            // keyboard / screen-reader audit).
+            for c in reg.wcag_report() {
+                tracing::info!(
+                    theme = %c.theme_id,
+                    aa = c.aa,
+                    aaa = c.aaa,
+                    min_ratio = format_args!("{:.2}", c.min_ratio),
+                    weakest_pair = %c.min_pair,
+                    "theme wcag certification",
+                );
+            }
+            // §11.8 lifecycle hooks — declaration-aware no-op (§11.8.4). v0.9
+            // detects and surfaces hooks a theme declares but does not fetch or
+            // run them: execution opens a code-execution surface the design
+            // defers until the sandboxing model is security-reviewed. One line
+            // per declared hook so an operator sees the hook is dormant, not
+            // silently ignored.
+            for t in reg.lifecycle_hook_report() {
+                for h in &t.hooks {
+                    tracing::info!(
+                        theme = %t.theme_id,
+                        hook = %h.phase,
+                        script = %h.script,
+                        "theme lifecycle hook declared but execution-mode off in v0.9 (§11.8.4)",
+                    );
+                }
+            }
+            Arc::new(reg)
+        };
+
+        // v0.9 Federation Pattern-1 (#351): build the trusted-peer read-site
+        // before `config`/`account_db` are moved into the struct. Phase A seeds
+        // the fallback from the static `peer_pds`; the runtime key is unset.
+        let trusted_peers = crate::federation::trusted_peer_set::TrustedPeerSet::new(
+            account_db.clone(),
+            &config.federation.peer_pds,
+        );
+
+        // Shared PLC client (#371 / A3b). Constructed once from the configured
+        // directory URL; PLC-touching paths consume this instead of ad-hoc.
+        let plc_client: Arc<dyn crate::crypto::plc_client::PlcClientApi> =
+            Arc::new(crate::crypto::plc_client::PlcClient::new(
+                crate::crypto::plc_client::PlcClientConfig {
+                    plc_url: config.identity.did_plc_url.clone(),
+                    timeout_secs: 30,
+                },
+            )?);
+
+        // v0.9 Federation runtime-mutability arc §3.1 (#390) — graceful-shutdown
+        // trigger. Created here so the field is always populated (no before-move
+        // ordering hazard in `serve`); receivers are derived via `.subscribe()`.
+        // The throwaway receiver is dropped: `serve` subscribes fresh ones, and
+        // the watch channel stays open as long as this sender lives.
+        let (shutdown_trigger, _) = tokio::sync::watch::channel(());
 
         Ok(Self {
             config: Arc::new(config),
+            shutdown_trigger: Arc::new(shutdown_trigger),
+            federation_enabled,
             account_db,
+            plc_client,
+            trusted_peers,
+            boot_seed_failed: Arc::new(AtomicBool::new(false)),
+            boot_seed_failure_details: Arc::new(tokio::sync::RwLock::new(None)),
             account_manager,
+            audience_oracle_activity: Arc::new(
+                crate::kryphocron_oracle_activity::AudienceOracleActivity::new(chrono::Utc::now()),
+            ),
             actor_store,
             blob_store,
             identity_resolver,
             admin_role_manager,
+            operator_session_store,
             moderation_manager,
             label_manager,
             invite_manager,
             report_manager,
+            theme_registry,
             oauth_client_manager,
             oauth_device_manager,
             sequencer,
@@ -948,6 +1273,22 @@ impl AppContext {
             // v0.7 arc 1 — kryphocron deny-error map constructed below
             // (Some when config.kryphocron.enabled, None otherwise).
             kryphocron_deny_map,
+            // v0.9 Arc D (#223) — aurora-locus-standard rotation oracle.
+            kryphocron_rotation_oracle,
+            // v0.9 Arc D (#236) — persisted at-rest hooks for the
+            // encode-on-write seam.
+            kryphocron_at_rest_hooks,
+            // v0.9 Arc D (#224) — rewrite-on-rotate job.
+            kryphocron_rewrite_job,
+            // v0.9 Arc H (#290) — repository-rebuild job registry.
+            rebuild_registry: Arc::new(crate::rebuild::RebuildRegistry::new()),
+            // v0.9 Arc H (#291) — bulk repository-repair scan substrate.
+            scan_findings_store,
+            repo_scan_job,
+            // v0.9 Arc H (#292) — bulk repository-repair job.
+            bulk_repair_job,
+            // v0.9 Arc H (#294) — sequencer-recovery job.
+            sequencer_recovery_job,
         })
     }
 
@@ -976,6 +1317,15 @@ impl AppContext {
                     PdsError::Internal(format!("Failed to create directory {:?}: {}", dir, e))
                 })?;
             }
+        }
+
+        // v0.9 Arc B — operator theme directory (<data-dir>/themes/), where
+        // operators drop custom themes. Bundled themes live in the repo tree.
+        let themes_dir = config.storage.data_directory.join("themes");
+        if !themes_dir.exists() {
+            tokio::fs::create_dir_all(&themes_dir).await.map_err(|e| {
+                PdsError::Internal(format!("Failed to create themes directory {:?}: {}", themes_dir, e))
+            })?;
         }
 
         // Create blob storage directories if using disk storage

@@ -1,0 +1,17 @@
+/*
+ * minimal-accent-override — the smallest useful theme.
+ *
+ * Extends aurora-default and overrides only the accent. Every other token (all
+ * 28 required, plus the optional structural set) and the entire effect library
+ * are inherited. --color-border-focus is var(--color-accent-primary) in
+ * aurora-default, so the focus ring follows this accent automatically.
+ *
+ * The teal is light enough that aurora-default's inherited dark
+ * --color-text-inverted (#1a1a1c) clears AA (4.5:1) on the accent fill.
+ */
+
+:root {
+  --color-accent-primary: #2f9e7e;
+  --color-accent-primary-hover: #36b08c;
+  --color-accent-primary-active: #28876c;
+}

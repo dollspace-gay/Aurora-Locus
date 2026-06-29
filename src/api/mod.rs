@@ -2,11 +2,13 @@
 pub mod admin;
 pub mod appview;
 pub mod aurora_admin;
+pub mod aurora_kryphocron_ops;
 pub mod aurora_lexicon;
 pub mod extractors;
 pub mod aurora_moderator;
 pub mod aurora_subscribe;
 pub mod blob;
+pub mod bulk_diddoc_result;
 #[cfg(debug_assertions)]
 pub mod dev_routes;
 pub mod federation;
@@ -17,9 +19,19 @@ pub mod health;
 pub mod identity;
 pub mod labels;
 pub mod middleware;
+pub mod auto_label_rules;
+pub mod escalation_rules;
+pub mod federation_discovery;
+pub mod federation_peers;
+pub mod federation_relays;
+pub mod integration_hooks;
+pub mod lexicon_migration;
 pub mod moderation;
+pub mod moderation_defaults;
+pub mod reviewer_assignment;
 pub mod oauth_admin;
 pub mod oauth_server;
+pub mod pending_restart;
 pub mod kryphocron_endpoints;
 pub mod registry;
 pub mod repo;
@@ -58,6 +70,44 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
         .merge(blob::routes())
         .merge(identity::routes())
         .merge(admin_router)
+        // v0.9 Arc B — resolved active-theme token CSS (§11). Unauthenticated
+        // (loaded by the admin UI via a <link> tag); State<AppContext> for the
+        // theme registry.
+        .route(
+            "/theme/active.css",
+            axum::routing::get(crate::api::aurora_admin::serve_active_theme_css),
+        )
+        // v0.9 Arc B §215 — resolved active-theme effect-class CSS (§11.6).
+        // Sibling of active.css; same unauthenticated <link>-loaded contract.
+        .route(
+            "/theme/active-effects.css",
+            axum::routing::get(crate::api::aurora_admin::serve_active_theme_effects_css),
+        )
+        // v0.9 Arc C §11.7 / #285 — resolved active-theme extension-point CSS
+        // + the effective extension-point list (JSON) the runtime caches.
+        // Same unauthenticated <link>/fetch contract as the siblings above.
+        .route(
+            "/theme/active-extensions.css",
+            axum::routing::get(crate::api::aurora_admin::serve_active_theme_extensions_css),
+        )
+        .route(
+            "/theme/active-extension-points",
+            axum::routing::get(crate::api::aurora_admin::serve_active_theme_extension_points),
+        )
+        // v0.9 — login-splash branding + the resolved default theme for the
+        // pre-auth login page. Unauthenticated (the page reads it before any
+        // token exists); returns only the deployment-default theme id and the
+        // operator-set branding URLs — all non-secret.
+        .route(
+            "/theme/login-branding",
+            axum::routing::get(crate::api::aurora_admin::serve_login_branding),
+        )
+        // v0.9 (#329) — serve uploaded branding assets from <data>/branding/.
+        // Public (the pre-auth login page fetches the logo/banner by URL).
+        .route(
+            "/branding/:filename",
+            axum::routing::get(crate::api::aurora_admin::serve_branding_asset),
+        )
         .merge(sync::routes())
         .merge(firehose::routes())
         .merge(labels::routes())

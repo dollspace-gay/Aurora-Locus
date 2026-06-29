@@ -714,7 +714,7 @@ impl RepositoryManager {
         &self,
         write: &WriteOp,
         shared_tx: Option<&mut sqlx::Transaction<'_, sqlx::Any>>,
-        cascade_context: Option<&mut crate::kryphocron::CascadeContext>,
+        cascade_context: Option<&mut crate::cascade::CascadeContext>,
         // v0.8 arc 1 (#180) — bind_pipeline pushes the emitted
         // moderation_event.id here so `commit_with_orphan_recovery`
         // can key a persistent orphan marker off it. Only the
@@ -909,11 +909,42 @@ impl RepositoryManager {
     /// The Arc 16f importRepo handler passes [`TolerantPromoter`],
     /// which signals `NeedsFetch` on row-absent CIDs for the
     /// caller-driven fetch-and-retry loop per §9.6.3.5.
+    /// Apply a batch of writes for the writer's repo. Public entry point for
+    /// the standard (non-cascade) write path — no active `CascadeContext`, so
+    /// any `Cascade`-authorized write would be rejected at the bind pipeline.
     pub async fn apply_writes(
         &self,
         writes: Vec<WriteOp>,
         signer: Arc<dyn Signer>,
         promoter: Arc<dyn crate::blob_store::BlobPromoter>,
+    ) -> PdsResult<(String, String)> {
+        self.apply_writes_inner(writes, signer, promoter, None).await
+    }
+
+    /// Apply a batch of writes with an active `CascadeContext` threaded into
+    /// the bind pipeline (#282). The block-cascade handler calls this for each
+    /// audience `Update` so `bind_pipeline`'s Cascade arm can verify the
+    /// freshly-minted token against `ctx` and emit the Cascade-arm audience
+    /// audit. The cascade `Update`s carry a `swap_cid` pin (§2.4.2 CAS), so a
+    /// concurrent edit surfaces as [`PdsError::SwapCidMismatch`] for the
+    /// handler's best-effort skip.
+    pub async fn apply_writes_cascade(
+        &self,
+        writes: Vec<WriteOp>,
+        signer: Arc<dyn Signer>,
+        promoter: Arc<dyn crate::blob_store::BlobPromoter>,
+        cascade_context: &mut crate::cascade::CascadeContext,
+    ) -> PdsResult<(String, String)> {
+        self.apply_writes_inner(writes, signer, promoter, Some(cascade_context))
+            .await
+    }
+
+    async fn apply_writes_inner(
+        &self,
+        writes: Vec<WriteOp>,
+        signer: Arc<dyn Signer>,
+        promoter: Arc<dyn crate::blob_store::BlobPromoter>,
+        mut cascade_context: Option<&mut crate::cascade::CascadeContext>,
     ) -> PdsResult<(String, String)> {
         // ATProto spec: max 200 writes per commit.
         if writes.len() > 200 {
@@ -989,11 +1020,12 @@ impl RepositoryManager {
             // commits first in `commit_with_orphan_recovery` per
             // the step-3.5 addendum's audit-first ordering.
             //
-            // No active CascadeContext is plumbed yet — production
-            // cascade-initiating handlers (post-arc-2 work) will
-            // construct one and pass it as `Some(&mut ctx)`. Step
-            // 5's dedicated endpoints don't construct cascades, so
-            // `None` here is correct for arc 2 ship state.
+            // #282 — `cascade_context` is threaded from the caller:
+            // `apply_writes` passes `None` (standard writes); the
+            // block-cascade handler calls `apply_writes_cascade` with
+            // `Some(&mut ctx)` so `bind_pipeline`'s Cascade arm can verify
+            // the per-audience token against the active context. Reborrowed
+            // per-iteration via `as_deref_mut()`.
             //
             // v0.8 arc 1 (#180) — capture the moderation_event.id of
             // every audit row emitted onto `shared_tx` during the
@@ -1008,7 +1040,7 @@ impl RepositoryManager {
                 self.validate_write(
                     write,
                     Some(&mut shared_tx),
-                    None,
+                    cascade_context.as_deref_mut(),
                     &mut emitted_event_ids,
                 )
                 .await?;
@@ -1947,8 +1979,15 @@ impl RepositoryManager {
                         match self.store.get_record(&self.did, &uri).await? {
                             Some(current_record) => {
                                 if current_record.cid != *swap_cid {
-                                    return Err(PdsError::Validation(format!(
-                                        "Swap CID mismatch for {}/{}: expected '{}', found '{}'",
+                                    // M-10 (#282): a dedicated typed variant (was
+                                    // untyped `Validation`) so the block-cascade
+                                    // handler can route a swap mismatch — an
+                                    // expected concurrent-edit race — to its
+                                    // best-effort skip-and-continue path,
+                                    // type-distinct from shape-rejects and generic
+                                    // transients (§3.2 / ST-3). HTTP 409.
+                                    return Err(PdsError::SwapCidMismatch(format!(
+                                        "{}/{}: expected '{}', found '{}'",
                                         write.collection, write.rkey, swap_cid, current_record.cid
                                     )));
                                 }

@@ -600,11 +600,43 @@ pub(crate) async fn run_verify_audit_chain<W: std::io::Write>(
     };
 
     match verify_chain_range(db, 1, head).await {
-        Ok(()) => {
+        Ok(summary) => {
             let label = if head == 1 { "entry" } else { "entries" };
             writeln!(out, "{} {} verified, chain healthy.", head, label).map_err(|e| {
                 crate::error::PdsError::Internal(format!("write failed: {}", e))
             })?;
+            // Annotate the format boundary: legacy entries are pre-v0.9
+            // rows (sealed before the #345 source/payload hash bump) that
+            // re-verify under the prior canonical form. They are NOT
+            // tampered — surfacing the count keeps an operator from reading
+            // a clean-but-legacy chain as suspect. Linkage is checked
+            // across the boundary like any other row, so a clean walk means
+            // it holds end-to-end.
+            if summary.legacy_count > 0 {
+                let leg_label = if summary.legacy_count == 1 { "entry" } else { "entries" };
+                match (summary.first_legacy_seq, summary.last_legacy_seq) {
+                    (Some(first), Some(last)) if first != last => {
+                        writeln!(
+                            out,
+                            "  ({} {} verified under the legacy / pre-v0.9 format, sequences {}-{}).",
+                            summary.legacy_count, leg_label, first, last
+                        )
+                    }
+                    (Some(first), _) => writeln!(
+                        out,
+                        "  ({} {} verified under the legacy / pre-v0.9 format, sequence {}).",
+                        summary.legacy_count, leg_label, first
+                    ),
+                    _ => writeln!(
+                        out,
+                        "  ({} {} verified under the legacy / pre-v0.9 format).",
+                        summary.legacy_count, leg_label
+                    ),
+                }
+                .map_err(|e| {
+                    crate::error::PdsError::Internal(format!("write failed: {}", e))
+                })?;
+            }
             Ok(true)
         }
         Err(ChainVerificationError {
@@ -673,6 +705,8 @@ mod verify_audit_chain_tests {
                 previous_hash TEXT,
                 cascade_subjects TEXT,
                 cascade_snapshot_ids TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                payload TEXT,
                 UNIQUE(sequence)
             )",
         )
@@ -712,6 +746,8 @@ mod verify_audit_chain_tests {
                 db,
                 crate::config::DatabaseBackend::Sqlite,
                 AppendEntryParams {
+                    source: "manual",
+                    payload: None,
                     actor_did: "did:plc:m1",
                     action: "TakedownAccount",
                     subject: Some(&subject),
@@ -783,6 +819,45 @@ mod verify_audit_chain_tests {
             out,
             "Chain discontinuity at sequence 2: per-row hash mismatch.\n\
              1 entry verified before discontinuity.\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_entries_annotate_format_boundary_in_report() {
+        // A clean chain containing pre-v0.9 rows reports healthy AND
+        // annotates the legacy region — operators must be able to tell a
+        // legacy boundary from corruption. The legacy fixture lives in
+        // audit_chain.rs (raw audit-chain INSERTs are guarded out of other
+        // modules); we reuse it across the verifier boundary here.
+        use crate::admin::audit_chain::insert_legacy_chain_entry;
+        let db = open_test_pool().await;
+        let h1 = insert_legacy_chain_entry(&db, 1, "r1", None).await;
+        let h2 = insert_legacy_chain_entry(&db, 2, "r2", Some(&h1)).await;
+        let _h3 = insert_legacy_chain_entry(&db, 3, "r3", Some(&h2)).await;
+        let mut buf: Vec<u8> = Vec::new();
+        let healthy = run_verify_audit_chain(&db, &mut buf).await.unwrap();
+        assert!(healthy);
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            out,
+            "3 entries verified, chain healthy.\n  \
+             (3 entries verified under the legacy / pre-v0.9 format, sequences 1-3).\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_legacy_entry_uses_singular_labels() {
+        use crate::admin::audit_chain::insert_legacy_chain_entry;
+        let db = open_test_pool().await;
+        insert_legacy_chain_entry(&db, 1, "r1", None).await;
+        let mut buf: Vec<u8> = Vec::new();
+        let healthy = run_verify_audit_chain(&db, &mut buf).await.unwrap();
+        assert!(healthy);
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            out,
+            "1 entry verified, chain healthy.\n  \
+             (1 entry verified under the legacy / pre-v0.9 format, sequence 1).\n"
         );
     }
 }

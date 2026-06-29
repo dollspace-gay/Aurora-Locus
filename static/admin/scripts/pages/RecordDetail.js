@@ -22,13 +22,13 @@
       '  <p class="meta"><code>' + esc(uri) + '</code></p>' +
       '</header>' +
       '<div class="detail-layout">' +
-      '  <div class="detail-primary" id="rd-primary"><p class="empty-state">Loading…</p></div>' +
+      '  <div class="detail-primary" id="rd-primary">' + global.AuroraSkeleton.lines(4) + '</div>' +
       '  <aside class="detail-rail" aria-label="Context">' +
       '    <div class="rail-card"><h4>Owning account</h4><div id="rd-owner">' +
       (global.AuroraEntityRef ? global.AuroraEntityRef.account(ownerDid) : '<code>' + esc(ownerDid) + '</code>') +
       '</div></div>' +
-      '    <div class="rail-card" id="rd-context"><h4>Subject context</h4><p class="empty-state">Loading…</p></div>' +
-      '    <div class="rail-card" id="rd-history"><h4>Subject history</h4><p class="empty-state">Loading…</p></div>' +
+      '    <div class="rail-card" id="rd-context"><h4>Subject context</h4>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '    <div class="rail-card" id="rd-history"><h4>Subject history</h4>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '  </aside>' +
       '</div>';
 
@@ -48,7 +48,7 @@
     primary.innerHTML =
       '<div class="settings-card">' +
       '  <h3>Record content</h3>' +
-      '  <pre style="white-space: pre-wrap; padding: 1rem; background: var(--background); border-radius: 6px; max-height: 320px; overflow-y: auto;">' +
+      '  <pre style="white-space: pre-wrap; padding: 1rem; background: var(--color-surface-primary); border-radius: 6px; max-height: 320px; overflow-y: auto;">' +
       esc(JSON.stringify(data && data.value, null, 2)) + '</pre>' +
       '</div>' +
       '<div class="settings-card" style="margin-top: 1rem;">' +
@@ -76,14 +76,14 @@
       const reports = (ctx && ctx.recentReports) || [];
       const actions = (ctx && ctx.recentActions) || [];
       card.innerHTML = '<h4>Subject context</h4>' +
-        '<h5 style="margin: 0.5rem 0 0.25rem 0; font-size: 0.75rem; color: var(--text-tertiary);">Recent reports</h5>' +
+        '<h5 style="margin: 0.5rem 0 0.25rem 0; font-size: 0.75rem; color: var(--color-text-tertiary);">Recent reports</h5>' +
         (reports.length ? '<ul style="list-style:none; padding:0;">' + reports.slice(0, 5).map((r) =>
           '<li>#' + esc(r.id) + ' — ' + esc(r.reasonType || '') + '</li>').join('') + '</ul>'
-        : '<p style="color: var(--text-tertiary); font-size: 0.8125rem;">None</p>') +
-        '<h5 style="margin: 0.5rem 0 0.25rem 0; font-size: 0.75rem; color: var(--text-tertiary);">Recent actions</h5>' +
+        : '<p style="color: var(--color-text-tertiary); font-size: 0.8125rem;">None</p>') +
+        '<h5 style="margin: 0.5rem 0 0.25rem 0; font-size: 0.75rem; color: var(--color-text-tertiary);">Recent actions</h5>' +
         (actions.length ? '<ul style="list-style:none; padding:0;">' + actions.slice(0, 5).map((a) =>
           '<li>' + (global.AuroraEntityRef ? global.AuroraEntityRef.event(a.id) : '#' + esc(a.id)) + ' — ' + esc(a.eventType || a.action || '') + '</li>').join('') + '</ul>'
-        : '<p style="color: var(--text-tertiary); font-size: 0.8125rem;">None</p>');
+        : '<p style="color: var(--color-text-tertiary); font-size: 0.8125rem;">None</p>');
     } catch (e) {
       document.getElementById('rd-context').innerHTML = '<h4>Subject context</h4><p class="empty-state">Could not load.</p>';
     }
@@ -97,7 +97,7 @@
         const fmt = global.AuroraFormat;
         card.innerHTML = '<h4>Subject history</h4><ul style="list-style:none; padding:0;">' + items.map((it) =>
           '<li style="padding: 0.25rem 0;">' + esc(it.eventType || it.action || '') + ' — ' +
-          (fmt ? esc(fmt.relativeTime(it.createdAt || it.timestamp)) : esc(it.createdAt || '')) +
+          global.AuroraTimestamp.render({ value: it.createdAt || it.timestamp, context: 'activity' }) +
           '</li>').join('') + '</ul>';
       }
     } catch (e) { /* ignore */ }

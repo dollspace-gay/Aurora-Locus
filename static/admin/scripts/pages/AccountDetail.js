@@ -9,9 +9,10 @@
 (function (global) {
   'use strict';
 
+  function T(key, params) { return global.t ? global.t(key, params) : key; }
+
   let currentDid = null;
   let currentAccount = null;
-  let currentRoleCheck = null;
 
   async function mount({ params, container }) {
     const did = params && params.did;
@@ -28,11 +29,23 @@
       loadRecords(),
       loadBlobs(),
       loadInvites(),
+      loadRoles(),
     ]);
     return { unmount: () => { currentDid = null; currentAccount = null; } };
   }
 
   function renderShell(did) {
+    // Subject-context pivot to the Audit page pre-filtered to this DID
+    // (§6.5 + §9.8 audit cross-pivot convention, #264). The Audit route is
+    // Moderator+ (routes.js), so the affordance only renders for operators
+    // who can actually follow it — a gated dead link is worse than none.
+    // The filter rides the canonical `#mod/audit?subject=<did>` URL-state
+    // form (router splits path?query; Audit.mount reads `subject`).
+    const session = global.AuroraSession;
+    const auditPivot = (session && session.hasRole('moderator'))
+      ? '  <p class="detail-header-pivots"><a href="#mod/audit?subject=' +
+        encodeURIComponent(did) + '">' + esc(T('accountDetail.viewAuditChain')) + '</a></p>'
+      : '';
     return '<nav class="breadcrumb" aria-label="Breadcrumb">' +
            '  <a href="#ops/accounts">Operations</a>' +
            '  <span class="breadcrumb-sep">›</span>' +
@@ -43,6 +56,7 @@
            '<header class="detail-header">' +
            '  <h2 id="ad-handle">Loading…</h2>' +
            '  <p class="meta" id="ad-meta"><code>' + esc(did) + '</code></p>' +
+           auditPivot +
            '</header>' +
            '<div class="detail-layout">' +
            '  <div class="detail-primary" id="ad-primary"></div>' +
@@ -62,8 +76,10 @@
       }
     } catch (e) {
       const primary = document.getElementById('ad-primary');
-      if (primary) primary.innerHTML = '<p class="empty-state">Could not load account: ' +
-                                       (e && e.message ? esc(e.message) : 'unknown') + '</p>';
+      if (primary) global.AuroraErrorBoundary.mount(primary, {
+        message: 'Could not load account: ' + ((e && e.message) || 'unknown'),
+        onRetry: loadAccount,
+      });
       return;
     }
     currentAccount = info || {};
@@ -79,9 +95,9 @@
     }
     if (bcEl) bcEl.textContent = '@' + handle;
     if (metaEl) {
-      const created = global.AuroraFormat ? global.AuroraFormat.date(info.createdAt, 'medium') : '';
+      const created = global.AuroraTimestamp.render({ value: info.createdAt, context: 'detail' });
       metaEl.innerHTML = '<code>' + esc(currentDid) + '</code>' +
-                        (created ? ' · Member since ' + esc(created) : '');
+                        (created ? ' · Member since ' + created : '');
     }
     renderDrawers(info);
   }
@@ -90,6 +106,7 @@
     const session = global.AuroraSession;
     const isAdmin = session && session.hasRole('admin');
     const isMod = session && session.hasRole('moderator');
+    const isSuper = session && session.hasRole('superadmin');
     const drawer = global.AuroraDrawer;
     const primary = document.getElementById('ad-primary');
     if (!primary || !drawer) return;
@@ -126,11 +143,36 @@
         id: 'history-' + currentDid,
         summary: '<strong>Subject history</strong>',
         roleTag: 'Moderator+',
-        bodyHtml: '<div id="ad-history-body"><p class="empty-state">Loading…</p></div>',
+        bodyHtml: '<div id="ad-history-body">' + global.AuroraSkeleton.lines(3) + '</div>',
+      });
+    }
+    // Kryphocron audience visibility (Mod+, §6.5) — read-only.
+    if (isMod) {
+      html += drawer.render({
+        id: 'kryphocron-' + currentDid,
+        summary: '<strong>' + esc(T('kryphocron.drawer.title')) + '</strong>',
+        roleTag: 'Moderator+',
+        bodyHtml: '<div id="ad-kryphocron-body">' + global.AuroraSkeleton.lines(3) + '</div>',
+      });
+    }
+    // Kryphocron overrides (SuperAdmin, §6.6.2 item 4 / #316) — per-account
+    // policy exceptions, distinct from the Mod+ read-only audience drawer above.
+    if (isSuper) {
+      html += drawer.render({
+        id: 'kryphocron-overrides-' + currentDid,
+        summary: '<strong>' + esc(T('kryphocron.overrides.title')) + '</strong>',
+        roleTag: 'SuperAdmin',
+        bodyHtml: '<div id="ad-overrides-body">' + global.AuroraSkeleton.lines(3) + '</div>',
       });
     }
     primary.innerHTML = html;
     drawer.attach(primary);
+
+    // Kryphocron drawer content (audiences owned + block-cascade impact),
+    // loaded async from the #225 per-account read endpoints.
+    if (isMod) loadKryphocronDrawer(currentDid);
+    // Per-account override controls (SuperAdmin, #316).
+    if (isSuper) loadOverridesDrawer(currentDid);
 
     // Mount Pattern B (moderation) ActionPanel.
     const modPanelHost = document.getElementById('ad-mod-action-panel');
@@ -147,7 +189,110 @@
       panel.mount(modPanelHost);
     }
     wireManagementHandlers();
-    // Pivot links wiring (Roles panel — render to rail when data available)
+  }
+
+  // Kryphocron audience-visibility drawer (§6.5): audiences owned (read-only,
+  // never the members contents) + block-cascade impact. Default-audience and
+  // per-account cadence are omitted (not host-exposed yet — §6.5 "surface if
+  // exposed; otherwise omit"). Reads the #225 per-account endpoints.
+  async function loadKryphocronDrawer(did) {
+    const K = global.AuroraEndpoints && global.AuroraEndpoints.ops && global.AuroraEndpoints.ops.kryphocron;
+    const host = document.getElementById('ad-kryphocron-body');
+    if (!host || !K) return;
+    const [audRes, casRes] = await Promise.all([
+      K.listAudiences(did).catch((e) => ({ __err: e })),
+      K.getBlockCascadeImpact(did).catch((e) => ({ __err: e })),
+    ]);
+    // Bail if the operator navigated to another account meanwhile.
+    if (currentDid !== did) return;
+
+    let html = '<h4 class="drawer-subhead">' + esc(T('kryphocron.drawer.audiences_title')) + '</h4>';
+    if (audRes && audRes.__err) {
+      html += '<p class="empty-state">' + esc(T('kryphocron.drawer.audiences_error')) + '</p>';
+    } else {
+      const audiences = (audRes && audRes.audiences) || [];
+      if (!audiences.length) {
+        html += '<p class="empty-state">' + esc(T('kryphocron.drawer.audiences_empty')) + '</p>';
+      } else {
+        html += '<ul class="ad-audience-list">' + audiences.map(function (a) {
+          const mode = a.mode ? T('kryphocron.audiences.mode_' + a.mode) : T('kryphocron.audiences.mode_unset');
+          const members = (a.mode === 'list' && a.memberCount != null)
+            ? ' · ' + esc(T('kryphocron.drawer.members', { count: a.memberCount }))
+            : '';
+          return '<li><strong>' + esc(a.name || a.rkey || '—') + '</strong> ' +
+            '<span class="badge">' + esc(mode) + '</span>' + members + '</li>';
+        }).join('') + '</ul>';
+      }
+    }
+
+    html += '<h4 class="drawer-subhead">' + esc(T('kryphocron.drawer.cascade_title')) + '</h4>';
+    if (casRes && casRes.__err) {
+      html += '<p class="empty-state">' + esc(T('kryphocron.drawer.cascade_error')) + '</p>';
+    } else if (casRes && casRes.available) {
+      html += '<p>' + esc(T('kryphocron.drawer.cascade_count', { count: casRes.cascadeRemovals || 0 })) + '</p>';
+    } else {
+      html += '<p class="empty-state">' + esc(T('kryphocron.drawer.cascade_pending')) + '</p>';
+    }
+
+    host.innerHTML = html;
+  }
+
+  // Per-account override controls (SuperAdmin, §6.6.2 item 4 / #316): two
+  // checkboxes (block capability-issuance; exempt from rate limits — stored,
+  // enforced when per-tier limits ship) + a required rationale + an audit pivot.
+  async function loadOverridesDrawer(did) {
+    const K = global.AuroraEndpoints && global.AuroraEndpoints.ops && global.AuroraEndpoints.ops.kryphocron;
+    const host = document.getElementById('ad-overrides-body');
+    if (!host || !K) return;
+    let ov = {};
+    try {
+      const res = await K.getAccountOverrides(did);
+      ov = (res && res.overrides) || {};
+    } catch (e) {
+      host.innerHTML = '<p class="empty-state">' + esc(T('kryphocron.overrides.error')) + '</p>';
+      return;
+    }
+    if (currentDid !== did) return;
+    const blocked = ov.capabilityIssuance === false;
+    const rlExempt = ov.rateLimitExempt === true;
+    host.innerHTML =
+      '<label class="ad-ov-row"><input type="checkbox" id="ad-ov-block"' + (blocked ? ' checked' : '') + '> ' +
+        esc(T('kryphocron.overrides.block_label')) + '</label>' +
+      '<label class="ad-ov-row"><input type="checkbox" id="ad-ov-ratelimit"' + (rlExempt ? ' checked' : '') + '> ' +
+        esc(T('kryphocron.overrides.ratelimit_label')) + '</label>' +
+      '<p class="settings-help">' + esc(T('kryphocron.overrides.ratelimit_note')) + '</p>' +
+      '<label class="ad-ov-rationale">' + esc(T('kryphocron.overrides.rationale_label')) +
+        '<textarea id="ad-ov-rationale" rows="2"></textarea></label>' +
+      '<div class="ad-ov-actions">' +
+        '<button type="button" class="btn-primary btn-sm" id="ad-ov-save">' + esc(T('common.save')) + '</button>' +
+        '<a class="btn-secondary btn-sm" href="#mod/audit?subject=' + encodeURIComponent(did) + '">' +
+          esc(T('kryphocron.overrides.audit_pivot')) + '</a>' +
+      '</div>';
+    const saveBtn = document.getElementById('ad-ov-save');
+    if (saveBtn) saveBtn.addEventListener('click', function () { saveOverride(did); });
+  }
+
+  async function saveOverride(did) {
+    const K = global.AuroraEndpoints.ops.kryphocron;
+    const rationale = (document.getElementById('ad-ov-rationale').value || '').trim();
+    if (!rationale) { global.AuroraToast.warning(T('kryphocron.overrides.rationale_required')); return; }
+    // Checkbox → full-state value: blocked sets capabilityIssuance=false,
+    // unchecked clears to null (default allowed); exempt sets rateLimitExempt=true.
+    const body = {
+      did: did,
+      capabilityIssuance: document.getElementById('ad-ov-block').checked ? false : null,
+      rateLimitExempt: document.getElementById('ad-ov-ratelimit').checked ? true : null,
+      rationale: rationale,
+    };
+    try {
+      const res = await K.setAccountOverride(body);
+      global.AuroraToast.success(T('kryphocron.overrides.saved'), res && res.auditEntryId ? {
+        action: { label: T('settings.roles.view_audit'), href: '#mod/audit/' + encodeURIComponent(res.auditEntryId) },
+      } : undefined);
+      loadOverridesDrawer(did);
+    } catch (e) {
+      global.AuroraToast.danger(T('kryphocron.overrides.save_failed') + (e && e.message ? ': ' + e.message : ''));
+    }
   }
 
   function overviewHtml(info) {
@@ -156,7 +301,7 @@
            defItem('Handle', '@' + esc(info.handle || '—')) +
            defItem('DID', '<code>' + esc(currentDid) + '</code>') +
            defItem('Email', esc(info.email || 'N/A')) +
-           defItem('Created', fmt ? esc(fmt.date(info.createdAt, 'medium')) : esc(info.createdAt || '')) +
+           defItem('Created', global.AuroraTimestamp.render({ value: info.createdAt, context: 'detail' })) +
            defItem('Posts', String(info.postsCount || 0)) +
            defItem('Followers', String(info.followersCount || 0)) +
            defItem('Following', String(info.followingCount || 0)) +
@@ -164,8 +309,8 @@
   }
 
   function defItem(label, value) {
-    return '<div style="display:flex; justify-content:space-between; padding: 0.25rem 0; border-bottom: 1px solid var(--border-color);">' +
-           '<dt style="color: var(--text-secondary);">' + esc(label) + '</dt>' +
+    return '<div style="display:flex; justify-content:space-between; padding: 0.25rem 0; border-bottom: 1px solid var(--color-border-primary);">' +
+           '<dt style="color: var(--color-text-secondary);">' + esc(label) + '</dt>' +
            '<dd>' + value + '</dd></div>';
   }
 
@@ -226,7 +371,7 @@
 
   async function doPasswordReset() {
     const rationale = await promptRationale('Send password reset email?',
-      'Subject: ' + (currentAccount.handle || currentDid));
+      'Subject: ' + (currentAccount.handle || currentDid), 'Send reset email');
     if (rationale == null) return;
     try {
       const res = await global.AuroraCapabilities.callEndpoint('trigger-password-reset', {
@@ -259,8 +404,9 @@
     });
     if (!result.submitted) return;
     try {
-      await global.AuroraClient.post('com.atproto.admin.updateAccountPassword', {
-        did: currentDid, password: result.values.newPwd,
+      await global.AuroraEndpoints.atproto.updateAccountPassword({
+        // #362.5: transmit the audit rationale the form already collects.
+        did: currentDid, password: result.values.newPwd, rationale: result.values.rationale,
       });
       global.AuroraToast.success('Password override applied.');
     } catch (e) {
@@ -269,34 +415,66 @@
   }
 
   async function updateSigningKey() {
+    // Key-rotation arc B3 (#374): the PDS generates a fresh per-account key by
+    // default. An operator may supply their own keypair only when the runtime
+    // gate key_rotation.operator_supplied_keys_enabled is on (§4.6) — the
+    // keypair fields are shown only then. The form no longer takes a bare
+    // signingKey (the old single-operator-key contract is gone).
+    let gateOn = false;
+    try {
+      const g = await global.AuroraEndpoints.admin.getRuntimeSetting('key_rotation.operator_supplied_keys_enabled');
+      const raw = g && (g.value !== undefined ? g.value : g);
+      gateOn = raw === true || raw === 'true';
+    } catch (e) { /* gate read failed → treat as off (PDS-generated only) */ }
+
+    const fields = [
+      { name: 'rationale', label: 'Rationale (recorded in audit log)', type: 'textarea', required: true },
+    ];
+    if (gateOn) {
+      fields.push({ name: 'publicDidKey', label: 'Operator public key (did:key, optional)', type: 'text', required: false });
+      fields.push({ name: 'privateKeyHex', label: 'Operator private key (hex, optional)', type: 'text', required: false });
+    }
+
     const result = await global.AuroraModal.form({
-      heading: 'Update signing key',
-      body: 'Updates the account\'s signing key. Affects identity verification across federation.',
-      fields: [
-        { name: 'didKey', label: 'New signing key (DID-key form)', type: 'text', required: true },
-        { name: 'rationale', label: 'Rationale (recorded in audit log)', type: 'textarea', required: true },
-      ],
-      submitLabel: 'Update signing key',
+      heading: 'Rotate signing key',
+      body: gateOn
+        ? 'Rotates the account\'s signing key. Leave the operator key fields blank to have the PDS generate a fresh key, or supply your own keypair (HSM-backed / pre-generated). Affects identity verification across federation.'
+        : 'Rotates the account\'s signing key to a freshly generated per-account key. Affects identity verification across federation.',
+      fields: fields,
+      submitLabel: 'Rotate signing key',
     });
     if (!result.submitted) return;
+
+    const payload = { did: currentDid };
+    if (result.values.rationale) payload.rationale = result.values.rationale;
+    if (gateOn) {
+      const pub = (result.values.publicDidKey || '').trim();
+      const priv = (result.values.privateKeyHex || '').trim();
+      if (pub && priv) {
+        payload.operatorKeypair = { publicDidKey: pub, privateKeyHex: priv };
+      } else if (pub || priv) {
+        global.AuroraToast.warning('Supply both the public and private key, or leave both blank for PDS generation.');
+        return;
+      }
+    }
+
     try {
-      await global.AuroraClient.post('com.atproto.admin.updateAccountSigningKey', {
-        did: currentDid, signingKey: result.values.didKey,
-      });
-      global.AuroraToast.success('Signing key updated.');
+      await global.AuroraEndpoints.atproto.updateAccountSigningKey(payload);
+      global.AuroraToast.success('Signing key rotated.');
     } catch (e) {
-      global.AuroraToast.danger('Update failed: ' + (e && e.message ? e.message : ''));
+      global.AuroraToast.danger('Rotation failed: ' + (e && e.message ? e.message : ''));
     }
   }
 
   async function updateEmail() {
     const newEmail = document.getElementById('ad-mgmt-email').value.trim();
     if (!newEmail) return global.AuroraToast.warning('Email cannot be empty.');
-    const rationale = await promptRationale('Update email to ' + newEmail + '?');
+    const rationale = await promptRationale('Update email to ' + newEmail + '?', null, 'Update email');
     if (rationale == null) return;
     try {
-      await global.AuroraClient.post('com.atproto.admin.updateAccountEmail', {
-        did: currentDid, email: newEmail,
+      await global.AuroraEndpoints.atproto.updateAccountEmail({
+        // #362.5: transmit the rationale promptRationale already collected.
+        did: currentDid, email: newEmail, rationale: rationale,
       });
       global.AuroraToast.success('Email updated.');
       currentAccount.email = newEmail;
@@ -308,11 +486,12 @@
   async function updateHandle() {
     const newHandle = document.getElementById('ad-mgmt-handle').value.trim();
     if (!newHandle) return global.AuroraToast.warning('Handle cannot be empty.');
-    const rationale = await promptRationale('Update handle to @' + newHandle + '?');
+    const rationale = await promptRationale('Update handle to @' + newHandle + '?', null, 'Update handle');
     if (rationale == null) return;
     try {
-      await global.AuroraClient.post('com.atproto.admin.updateAccountHandle', {
-        did: currentDid, handle: newHandle,
+      await global.AuroraEndpoints.atproto.updateAccountHandle({
+        // #362.5: transmit the rationale promptRationale already collected.
+        did: currentDid, handle: newHandle, rationale: rationale,
       });
       global.AuroraToast.success('Handle updated.');
       currentAccount.handle = newHandle;
@@ -353,10 +532,10 @@
     if (!result.submitted) return;
     const enable = result.values.state === 'enabled';
     try {
-      const ep = enable
-        ? 'com.atproto.admin.enableAccountInvites'
-        : 'com.atproto.admin.disableAccountInvites';
-      await global.AuroraClient.post(ep, { account: currentDid, note: result.values.rationale });
+      const toggle = enable
+        ? global.AuroraEndpoints.atproto.enableAccountInvites
+        : global.AuroraEndpoints.atproto.disableAccountInvites;
+      await toggle({ account: currentDid, note: result.values.rationale });
       global.AuroraToast.success((enable ? 'Enabled' : 'Disabled') + ' invites.');
     } catch (e) {
       global.AuroraToast.danger('Toggle failed: ' + (e && e.message ? e.message : ''));
@@ -375,7 +554,7 @@
     });
     if (!result.confirmed) return;
     try {
-      await global.AuroraClient.post('com.atproto.admin.deleteAccount', {
+      await global.AuroraEndpoints.atproto.deleteAccount({
         did: currentDid,
       });
       global.AuroraToast.success('Account deleted.');
@@ -403,8 +582,8 @@
            esc((currentAccount.handle ? '@' + currentAccount.handle + ' — ' : '') + currentDid) + '</p>' +
            '<fieldset>' +
            '  <legend>Include</legend>' +
-           '  <label style="display:block;"><input type="checkbox" id="fx-repo" checked> Repository content (CAR file) — deferred to v0.3</label>' +
-           '  <label style="display:block;"><input type="checkbox" id="fx-blobs" checked> Blobs — deferred to v0.3</label>' +
+           '  <label style="display:block;"><input type="checkbox" id="fx-repo" checked> Repository content (CAR file)</label>' +
+           '  <label style="display:block;"><input type="checkbox" id="fx-blobs" checked> Blobs (the account\'s uploaded files)</label>' +
            '  <label style="display:block;"><input type="checkbox" id="fx-mod" checked> Moderation history</label>' +
            '  <label style="display:block;"><input type="checkbox" id="fx-meta"' + (isSuper ? '' : ' disabled') +
            '> Account metadata <span class="role-tag">SuperAdmin only</span></label>' +
@@ -470,8 +649,10 @@
     }
   }
 
-  // Inline rationale prompt — uses a modal to ensure proper a11y.
-  function promptRationale(title, subtext) {
+  // Inline rationale prompt — uses a modal to ensure proper a11y. The
+  // confirm button takes a descriptive, action-naming label (§8.2.3 — not a
+  // generic "Confirm"); the caller passes the verb that matches `title`.
+  function promptRationale(title, subtext, confirmLabel) {
     return new Promise((resolve) => {
       const div = document.createElement('div');
       div.innerHTML = (subtext ? '<p>' + esc(subtext) + '</p>' : '') +
@@ -479,7 +660,8 @@
                       '<textarea id="pr-r" rows="3" style="width:100%;"></textarea>' +
                       '<div class="action-panel-buttons" style="margin-top: 0.75rem;">' +
                       '  <button class="btn-secondary" id="pr-cancel">Cancel</button>' +
-                      '  <button class="btn-primary" id="pr-confirm">Confirm</button>' +
+                      '  <button class="btn-primary" id="pr-confirm">' +
+                        esc(confirmLabel || 'Submit') + '</button>' +
                       '</div>';
       const handle = global.AuroraModal.open({ title: title, body: div, onClose: () => resolve(null) });
       div.querySelector('#pr-cancel').addEventListener('click', () => { handle.close(); });
@@ -494,31 +676,6 @@
     });
   }
 
-  function promptRationaleAndConfirmation(title, warning, ackLabel) {
-    return new Promise((resolve) => {
-      const div = document.createElement('div');
-      div.innerHTML = '<div class="action-panel-high-impact">' + esc(warning) + '</div>' +
-                      '<label style="margin-top: 0.75rem;">Rationale (required)</label>' +
-                      '<textarea id="prc-r" rows="3" style="width:100%;"></textarea>' +
-                      '<label style="display:block; margin-top: 0.5rem;">' +
-                      '  <input type="checkbox" id="prc-ack"> ' + esc(ackLabel) +
-                      '</label>' +
-                      '<div class="action-panel-buttons" style="margin-top: 0.75rem;">' +
-                      '  <button class="btn-secondary" id="prc-cancel">Cancel</button>' +
-                      '  <button class="btn-danger" id="prc-confirm">Confirm</button>' +
-                      '</div>';
-      const handle = global.AuroraModal.open({ title: title, body: div, onClose: () => resolve(null) });
-      div.querySelector('#prc-cancel').addEventListener('click', () => { handle.close(); });
-      div.querySelector('#prc-confirm').addEventListener('click', () => {
-        const v = div.querySelector('#prc-r').value.trim();
-        const ack = div.querySelector('#prc-ack').checked;
-        if (!v) { global.AuroraToast.warning('Rationale is required.'); return; }
-        if (!ack) { global.AuroraToast.warning('You must acknowledge the warning.'); return; }
-        handle.close();
-        resolve(v);
-      });
-    });
-  }
 
   // ---------- Rail panels ----------
 
@@ -526,19 +683,25 @@
     const rail = document.getElementById('ad-rail');
     if (!rail) return;
     rail.insertAdjacentHTML('beforeend', railCard('subject-context', 'Subject context',
-      '<p class="empty-state">Loading…</p>'));
+      global.AuroraSkeleton.lines(3)));
     rail.insertAdjacentHTML('beforeend', railCard('records-authored', 'Records authored',
-      '<p class="empty-state">Loading…</p>'));
+      global.AuroraSkeleton.lines(3)));
     rail.insertAdjacentHTML('beforeend', railCard('blob-inventory', 'Blob inventory',
-      '<p class="empty-state">Loading…</p>'));
+      global.AuroraSkeleton.lines(3)));
     rail.insertAdjacentHTML('beforeend', railCard('invite-lineage', 'Invite lineage',
-      '<p class="empty-state">Loading…</p>'));
+      global.AuroraSkeleton.lines(3)));
+    rail.insertAdjacentHTML('beforeend', railCard('account-roles', T('accountDetail.roles.title'),
+      global.AuroraSkeleton.lines(3)));
 
     try {
-      const ctx = await global.AuroraEndpoints.moderator.getSubjectContext({ subjectDid: currentDid });
+      const ctx = await global.AuroraEndpoints.moderator.getSubjectContext({ did: currentDid });
       renderSubjectContext(ctx);
     } catch (e) {
-      setRailBody('subject-context', '<p class="empty-state">Could not load context.</p>');
+      const body = railBodyEl('subject-context');
+      if (body) global.AuroraInlineError.mount(body, {
+        message: 'Could not load context: ' + ((e && e.message) || ''),
+        onRetry: loadSubjectContext,
+      });
     }
   }
 
@@ -566,7 +729,7 @@
     const host = document.getElementById('ad-history-body');
     if (!host) return;
     try {
-      const data = await global.AuroraEndpoints.moderator.getSubjectHistory({ subjectDid: currentDid, limit: 25 });
+      const data = await global.AuroraEndpoints.moderator.getSubjectHistory({ did: currentDid, limit: 25 });
       const items = (data && data.items) || [];
       if (items.length === 0) {
         host.innerHTML = '<p class="empty-state">No prior actions on this account.</p>';
@@ -574,20 +737,28 @@
       }
       const fmt = global.AuroraFormat;
       host.innerHTML = '<ul style="list-style:none; padding:0;">' + items.map((it) =>
-        '<li style="padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">' +
+        '<li style="padding: 0.5rem 0; border-bottom: 1px solid var(--color-border-primary);">' +
         '<strong>' + esc(it.eventType || it.action || '') + '</strong>' +
         ' by ' + (global.AuroraEntityRef ? global.AuroraEntityRef.account(it.actorDid) : esc(it.actorDid)) +
-        ' — ' + (fmt ? esc(fmt.relativeTime(it.createdAt || it.timestamp)) : esc(it.createdAt || '')) +
+        ' — ' + global.AuroraTimestamp.render({ value: it.createdAt || it.timestamp, context: 'activity' }) +
         (it.id != null ? ' · ' + (global.AuroraEntityRef ? global.AuroraEntityRef.event(it.id) : '#' + esc(it.id)) : '') +
         '</li>').join('') + '</ul>';
     } catch (e) {
-      host.innerHTML = '<p class="empty-state">Could not load history.</p>';
+      global.AuroraInlineError.mount(host, {
+        message: 'Could not load history: ' + ((e && e.message) || ''),
+        onRetry: loadSubjectHistory,
+      });
     }
   }
 
   async function loadRecords() {
     try {
       const repo = currentDid;
+      // #362.1: left as a direct AuroraClient call by the judgment rule — a
+      // single-page, read-only diagnostic (the "records authored" rail preview),
+      // not an account mutation and not reused elsewhere, so it earns no
+      // registry wrapper. The mutations on this page were routed through
+      // AuroraEndpoints.atproto.*.
       const data = await global.AuroraClient.get('com.atproto.repo.listRecords', {
         repo: repo, collection: 'app.bsky.feed.post', limit: 5,
       });
@@ -602,7 +773,11 @@
           (global.AuroraEntityRef ? global.AuroraEntityRef.record(r.uri) : '<code>' + esc(r.uri) + '</code>') +
           '</li>').join('') + '</ul>');
     } catch (e) {
-      setRailBody('records-authored', '<p class="empty-state">Could not load records.</p>');
+      const body = railBodyEl('records-authored');
+      if (body) global.AuroraInlineError.mount(body, {
+        message: 'Could not load records: ' + ((e && e.message) || ''),
+        onRetry: loadRecords,
+      });
     }
   }
 
@@ -618,17 +793,21 @@
         '<ul style="list-style:none; padding:0;">' + blobs.map((b) =>
           '<li style="padding: 0.25rem 0;">' +
           (global.AuroraEntityRef ? global.AuroraEntityRef.blob(b.cid) : '<code>' + esc(b.cid) + '</code>') +
-          (b.size ? ' <span style="color: var(--text-tertiary);">' +
+          (b.size ? ' <span style="color: var(--color-text-tertiary);">' +
                     (global.AuroraFormat ? global.AuroraFormat.bytes(b.size) : '') + '</span>' : '') +
           '</li>').join('') + '</ul>');
     } catch (e) {
-      setRailBody('blob-inventory', '<p class="empty-state">Could not load blobs.</p>');
+      const body = railBodyEl('blob-inventory');
+      if (body) global.AuroraInlineError.mount(body, {
+        message: 'Could not load blobs: ' + ((e && e.message) || ''),
+        onRetry: loadBlobs,
+      });
     }
   }
 
   async function loadInvites() {
     try {
-      const data = await global.AuroraClient.get('com.atproto.admin.getInviteCodes', { did: currentDid, limit: 10 });
+      const data = await global.AuroraEndpoints.atproto.getInviteCodes({ did: currentDid, limit: 10 });
       const codes = (data && (data.codes || data.inviteCodes)) || [];
       if (codes.length === 0) {
         setRailBody('invite-lineage', '<p class="empty-state">No invite codes for this account.</p>');
@@ -638,14 +817,46 @@
         '<ul style="list-style:none; padding:0;">' + codes.slice(0, 10).map((c) =>
           '<li style="padding: 0.25rem 0;">' +
           (global.AuroraEntityRef ? global.AuroraEntityRef.invite(c.code) : '<code>' + esc(c.code) + '</code>') +
-          ' <span style="color: var(--text-tertiary);">(' + (c.uses || 0) + '/' + (c.available || 1) + ')</span>' +
+          ' <span style="color: var(--color-text-tertiary);">(' + (c.uses || 0) + '/' + (c.available || 1) + ')</span>' +
           '</li>').join('') + '</ul>');
     } catch (e) {
-      setRailBody('invite-lineage', '<p class="empty-state">Could not load invites.</p>');
+      const body = railBodyEl('invite-lineage');
+      if (body) global.AuroraInlineError.mount(body, {
+        message: 'Could not load invites: ' + ((e && e.message) || ''),
+        onRetry: loadInvites,
+      });
     }
   }
 
   // ---------- Rail helpers ----------
+
+  // §10.2.4 Roles panel: surface this account's admin role (if any) in the
+  // rail with a navigation-only pivot to Configuration → Roles. list_roles
+  // with ?did returns { did, role } where role is the role string (or the
+  // AdminRole object, or null for a non-operator account). Rationale-wiring
+  // of management actions stays Arc F; this is read + navigate only.
+  async function loadRoles() {
+    try {
+      const data = await global.AuroraEndpoints.atproto.listRoles({ did: currentDid });
+      const roleRec = data && data.role;
+      const roleName = (typeof roleRec === 'string') ? roleRec : (roleRec && roleRec.role);
+      if (!roleName) {
+        setRailBody('account-roles',
+          '<p class="empty-state">' + esc(T('accountDetail.roles.none')) + '</p>' +
+          '<p><a href="#configuration/roles">' + esc(T('accountDetail.roles.manage')) + '</a></p>');
+        return;
+      }
+      setRailBody('account-roles',
+        '<p>' + esc(T('accountDetail.roles.role_label', { role: roleName })) + '</p>' +
+        '<p><a href="#configuration/roles">' + esc(T('accountDetail.roles.open_mgmt')) + '</a></p>');
+    } catch (e) {
+      const body = railBodyEl('account-roles');
+      if (body) global.AuroraInlineError.mount(body, {
+        message: T('accountDetail.roles.error'),
+        onRetry: loadRoles,
+      });
+    }
+  }
 
   function railCard(id, title, body) {
     return '<div class="rail-card" data-rail-id="' + id + '">' +
@@ -655,20 +866,26 @@
   }
 
   function setRailBody(id, html) {
-    const card = document.querySelector('[data-rail-id="' + id + '"]');
-    if (!card) return;
-    const body = card.querySelector('[data-rail-body]');
+    const body = railBodyEl(id);
     if (body) body.innerHTML = html;
+  }
+
+  // Resolve the inner body element of a rail card so error primitives can
+  // mount() onto it (mount() takes a DOM element, not an HTML string).
+  function railBodyEl(id) {
+    const card = document.querySelector('[data-rail-id="' + id + '"]');
+    if (!card) return null;
+    return card.querySelector('[data-rail-body]');
   }
 
   function sectionTitle(t) {
     return '<h5 style="margin: 0.75rem 0 0.25rem 0; font-size: 0.75rem; ' +
-           'text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-tertiary);">' +
+           'text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-tertiary);">' +
            esc(t) + '</h5>';
   }
 
   function listOrEmpty(items) {
-    if (!items || items.length === 0) return '<p style="color: var(--text-tertiary); font-size: 0.8125rem;">None</p>';
+    if (!items || items.length === 0) return '<p style="color: var(--color-text-tertiary); font-size: 0.8125rem;">None</p>';
     return '<ul style="list-style:none; padding:0; font-size: 0.875rem;">' + items.join('') + '</ul>';
   }
 

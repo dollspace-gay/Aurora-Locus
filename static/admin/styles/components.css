@@ -15,7 +15,7 @@
 }
 
 .stat-card {
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   padding: var(--space-6);
   display: flex;
@@ -27,12 +27,12 @@
   font-size: var(--font-size-2xl);
   width: 60px;
   height: 60px;
-  background: var(--background);
+  background: var(--color-surface-primary);
   border-radius: var(--radius-sm);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--primary-color);
+  color: var(--color-accent-primary);
 }
 
 .stat-icon svg {
@@ -46,33 +46,33 @@
 
 .stat-label {
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   margin-bottom: var(--space-2);
 }
 
 .stat-value {
   font-size: 1.875rem;
   font-weight: var(--font-weight-bold);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
   margin-bottom: var(--space-1);
 }
 
 .stat-change {
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 .stat-change.positive {
-  color: var(--success-color);
+  color: var(--color-status-success);
 }
 
 .stat-change.attention {
-  color: var(--danger-color);
+  color: var(--color-status-danger);
   font-weight: var(--font-weight-semibold);
 }
 
 .stat-change.neutral {
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 /* ==================== Charts ==================== */
@@ -85,7 +85,7 @@
 }
 
 .chart-card {
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   padding: var(--space-6);
   box-shadow: var(--shadow-sm);
@@ -106,7 +106,7 @@
 /* ==================== Activity card ==================== */
 
 .activity-card {
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   padding: var(--space-6);
   box-shadow: var(--shadow-sm);
@@ -128,7 +128,7 @@
   display: flex;
   align-items: center;
   padding: var(--space-4);
-  background: var(--background);
+  background: var(--color-surface-primary);
   border-radius: var(--radius-sm);
 }
 
@@ -136,8 +136,8 @@
   width: 40px;
   height: 40px;
   border-radius: var(--radius-full);
-  background: var(--primary-color);
-  color: white;
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -151,12 +151,76 @@
 
 .activity-content { flex: 1; }
 .activity-text { margin-bottom: var(--space-1); }
-.activity-time { font-size: var(--font-size-sm); color: var(--text-secondary); }
+.activity-time { font-size: var(--font-size-sm); color: var(--color-text-secondary); }
+
+/* ============ Dashboard (v0.9 role-tiered composition §5.2) ============ */
+
+.dash-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.dash-block {
+  background: var(--color-surface-secondary);
+  border-radius: var(--radius-md);
+  padding: var(--space-6);
+  box-shadow: var(--shadow-sm);
+}
+
+.dash-block > h3 {
+  margin-bottom: var(--space-4);
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+}
+
+.dash-identity {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.dash-identity-main h3 { margin-bottom: var(--space-1); }
+.dash-version { color: var(--color-text-secondary); margin-inline-start: var(--space-2); }
+
+.dash-identity-session {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-1);
+}
+.dash-session-handle { font-weight: var(--font-weight-semibold); }
+.dash-session-role {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.dash-health-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-block-start: var(--space-3);
+}
+
+.dash-source-tag { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+
+/* Anchor wrappers stay visually identical to their non-link content. */
+.stat-card-link,
+a.activity-item {
+  text-decoration: none;
+  color: inherit;
+}
+.stat-card-link { display: block; }
 
 /* ==================== Tables ==================== */
 
 .table-card {
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
   overflow: hidden;
@@ -168,7 +232,7 @@
 }
 
 .data-table thead {
-  background: var(--background);
+  background: var(--color-surface-primary);
 }
 
 .data-table th {
@@ -176,19 +240,19 @@
   text-align: left;
   font-weight: var(--font-weight-semibold);
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
 
 .data-table td {
   padding: var(--space-4) var(--space-6);
-  border-top: 1px solid var(--border-color);
-  color: var(--text-primary);
+  border-top: 1px solid var(--color-border-primary);
+  color: var(--color-text-primary);
 }
 
 .data-table tr:hover {
-  background: var(--background);
+  background: var(--color-surface-primary);
 }
 
 /* ==================== Buttons ==================== */
@@ -207,8 +271,8 @@
 }
 
 .btn-primary {
-  background: var(--primary-color);
-  color: var(--text-on-primary);
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
 }
 
 .btn-primary:hover {
@@ -217,27 +281,39 @@
 
 .btn-secondary {
   background: transparent;
-  color: var(--text-primary);
-  border: 1px solid var(--border-color);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-primary);
 }
 
 .btn-secondary:hover {
-  background: var(--background);
+  background: var(--color-surface-primary);
 }
 
 .btn-danger {
-  background: var(--danger-color);
-  color: white;
+  background: var(--color-status-danger);
+  color: var(--color-text-inverted);
 }
 
 .btn-success {
-  background: var(--success-color);
-  color: white;
+  background: var(--color-status-success);
+  color: var(--color-text-inverted);
 }
 
 .btn-sm {
   padding: 0.375rem 0.75rem;
   font-size: 0.8125rem;
+}
+
+/* Disabled state for the shared button classes — the visual affordance
+   must match the functional `disabled` attribute (e.g. the self-row Revoke
+   guard on the roles pages, §9.1). Mirrors .action-panel-card's treatment. */
+.btn-primary[disabled],
+.btn-secondary[disabled],
+.btn-danger[disabled],
+.btn-success[disabled],
+.btn-sm[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* ==================== Status badges ==================== */
@@ -264,18 +340,18 @@
 .search-input,
 .filter-select {
   padding: 0.625rem var(--space-4);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
   min-width: 200px;
-  background: var(--surface);
-  color: var(--text-primary);
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
 }
 
 .search-input:focus,
 .filter-select:focus {
   outline: none;
-  border-color: var(--primary-color);
+  border-color: var(--color-accent-primary);
 }
 
 .form-group {
@@ -286,7 +362,7 @@
   display: block;
   margin-bottom: var(--space-2);
   font-weight: var(--font-weight-medium);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 .form-group input[type="text"],
@@ -295,11 +371,11 @@
 .form-group input[type="url"] {
   width: 100%;
   padding: 0.625rem var(--space-4);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
-  background: var(--surface);
-  color: var(--text-primary);
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
 }
 
 .checkbox-label {
@@ -321,7 +397,7 @@
 }
 
 .settings-card {
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   padding: var(--space-6);
   box-shadow: var(--shadow-sm);
@@ -334,7 +410,7 @@
 }
 
 .settings-card fieldset {
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   padding: var(--space-3);
   margin-top: var(--space-3);
@@ -347,7 +423,7 @@
 
 .settings-help {
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   margin-top: var(--space-2);
 }
 
@@ -357,10 +433,10 @@
   max-height: 400px;
   overflow-y: auto;
   padding: var(--space-3);
-  background: #1a1a1a;
-  color: #e6e6e6;
+  background: var(--color-surface-tertiary);
+  color: var(--color-text-primary);
   border-radius: var(--radius-sm);
-  font-family: var(--font-mono);
+  font-family: var(--font-family-mono);
   font-size: var(--font-size-xs);
 }
 
@@ -375,7 +451,7 @@
 
 .mod-item,
 .report-item {
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   padding: var(--space-6);
   box-shadow: var(--shadow-sm);
@@ -394,7 +470,7 @@
 .report-content {
   margin-bottom: var(--space-4);
   padding: var(--space-4);
-  background: var(--background);
+  background: var(--color-surface-primary);
   border-radius: var(--radius-sm);
 }
 
@@ -410,7 +486,7 @@
 .modal-overlay {
   position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: var(--color-surface-overlay);
   display: none;
   z-index: 999;
 }
@@ -424,7 +500,7 @@
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
   max-width: 600px;
@@ -444,7 +520,7 @@
   justify-content: space-between;
   align-items: center;
   padding: var(--space-6);
-  border-bottom: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--color-border-primary);
 }
 
 .modal-header h3 {
@@ -457,7 +533,7 @@
   border: none;
   font-size: var(--font-size-2xl);
   cursor: pointer;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 .modal-body {
@@ -466,7 +542,7 @@
 
 .modal-footer {
   padding: var(--space-6);
-  border-top: 1px solid var(--border-color);
+  border-top: 1px solid var(--color-border-primary);
   display: flex;
   justify-content: flex-end;
   gap: var(--space-3);
@@ -479,18 +555,18 @@
  * required field labels, and .modal-buttons for the footer row. */
 .modal-body-text {
   margin-bottom: var(--space-4);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 .form-error {
-  color: var(--danger-color);
+  color: var(--color-status-danger);
   font-size: var(--font-size-sm);
   margin-top: var(--space-1);
   min-height: 1em;
 }
 
 .required-marker {
-  color: var(--danger-color);
+  color: var(--color-status-danger);
   margin-left: 0.125rem;
 }
 
@@ -508,7 +584,7 @@
   gap: var(--space-8);
   margin-bottom: var(--space-8);
   padding: var(--space-6);
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
 }
@@ -520,11 +596,11 @@
 
 .stat-item .label {
   font-weight: var(--font-weight-semibold);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 .stat-item .value {
-  color: var(--primary-color);
+  color: var(--color-accent-primary);
   font-weight: var(--font-weight-bold);
 }
 
@@ -532,8 +608,8 @@
 /* Per §6.3 / §6.4 */
 
 .action-panel-card {
-  background: var(--surface);
-  border: 1px solid var(--border-color);
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-md);
   padding: var(--space-6);
   max-width: 540px;
@@ -544,7 +620,7 @@
 .action-panel-title {
   margin: 0 0 var(--space-4) 0;
   font-size: var(--font-size-xl);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 .action-panel-row {
@@ -554,14 +630,14 @@
 .action-panel-label {
   display: block;
   font-weight: var(--font-weight-semibold);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
   margin-bottom: 0.375rem;
   font-size: var(--font-size-sm);
 }
 
 .action-panel-label-inline {
   margin-left: var(--space-2);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
   font-size: var(--font-size-sm);
 }
 
@@ -572,13 +648,13 @@
 .action-panel-card textarea {
   width: 100%;
   padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
   font-family: inherit;
   box-sizing: border-box;
-  background: var(--surface);
-  color: var(--text-primary);
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
 }
 
 .action-panel-rationale {
@@ -588,28 +664,28 @@
 }
 
 .action-panel-subject {
-  background: var(--background);
+  background: var(--color-surface-primary);
   border-radius: var(--radius-sm);
   padding: var(--space-3);
   margin-bottom: var(--space-4);
 }
 
 .action-panel-subject-value {
-  font-family: var(--font-mono);
+  font-family: var(--font-family-mono);
   font-size: 0.8125rem;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   word-break: break-all;
 }
 
 .action-panel-hint {
   margin-top: var(--space-1);
   font-size: var(--font-size-xs);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 .action-panel-high-impact {
-  background: rgba(245, 158, 11, 0.08);
-  border-left: 3px solid var(--warning-color);
+  background: color-mix(in srgb, var(--color-status-warning) 8%, transparent);
+  border-left: 3px solid var(--color-status-warning);
   padding: var(--space-3);
   border-radius: var(--radius-sm);
 }
@@ -623,12 +699,12 @@
   margin-bottom: var(--space-4);
   padding: 0 var(--space-1);
   font-size: var(--font-size-sm);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
   min-height: 1.25em;
 }
 
 .action-panel-status-error {
-  color: var(--danger-color);
+  color: var(--color-status-danger);
 }
 
 .action-panel-buttons {
@@ -652,9 +728,9 @@
   overflow-y: auto;
   margin: var(--space-1) 0 0 var(--space-5);
   padding: 0;
-  font-family: var(--font-mono);
+  font-family: var(--font-family-mono);
   font-size: 0.8125rem;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 .bulk-subjects-list li {
@@ -665,18 +741,18 @@
 .bulk-subjects-overflow {
   list-style: none;
   margin-left: -1.25rem !important;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   font-style: italic;
 }
 
 .bulk-cap-warning {
   margin: var(--space-3) 0;
   padding: 0.625rem 0.875rem;
-  background: rgba(245, 158, 11, 0.12);
-  border-left: 3px solid var(--warning-color);
+  background: color-mix(in srgb, var(--color-status-warning) 12%, transparent);
+  border-left: 3px solid var(--color-status-warning);
   border-radius: 4px;
   font-size: 0.8125rem;
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 /* Bulk selection bar */
@@ -687,15 +763,15 @@
   gap: var(--space-2);
   padding: 0.625rem var(--space-4);
   margin-bottom: var(--space-3);
-  background: rgba(59, 130, 246, 0.08);
-  border-left: 3px solid var(--primary-color);
+  background: color-mix(in srgb, var(--color-accent-primary) 8%, transparent);
+  border-left: 3px solid var(--color-accent-primary);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
 }
 
 .bulk-action-bar > span {
   margin-right: auto;
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 input[type="checkbox"].bulk-select-user,
@@ -714,10 +790,10 @@ input[type="checkbox"][disabled] {
 
 /* User-details modal action drawers */
 .user-details-actions details {
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   padding: 0.625rem 0.875rem;
-  background: var(--background);
+  background: var(--color-surface-primary);
 }
 
 .user-details-actions summary {
@@ -730,8 +806,8 @@ input[type="checkbox"][disabled] {
   display: inline-block;
   padding: 0.0625rem 0.4375rem;
   margin-left: 0.375rem;
-  background: var(--primary-color);
-  color: var(--text-on-primary);
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
   border-radius: var(--radius-full);
   font-size: 0.6875rem;
   font-weight: var(--font-weight-semibold);
@@ -751,28 +827,83 @@ input[type="checkbox"][disabled] {
 #dashboard-flavor-tabs button {
   padding: var(--space-2) var(--space-4);
   background: transparent;
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 #dashboard-flavor-tabs button.active {
-  background: var(--primary-color);
-  color: var(--text-on-primary);
-  border-color: var(--primary-color);
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
+  border-color: var(--color-accent-primary);
 }
 
 #dashboard-flavor-tabs button:focus {
-  outline: 2px solid var(--primary-color);
+  outline: 2px solid var(--color-accent-primary);
   outline-offset: 2px;
 }
 
 .badge.badge-attention {
-  background: var(--danger-color);
-  color: white;
+  background: var(--color-status-danger);
+  color: var(--color-text-inverted);
 }
+
+/* ==================== Source-tier indicator (§8.2.1) ==================== */
+/* The AuroraSourceTier.badge() chip on settings cards — a muted annotation of
+ * where a setting's value comes from (Default / File / Recovery override;
+ * Runtime renders no badge). Token-only colors per §10.4.4. */
+.source-tier {
+  display: inline-block;
+  margin-left: var(--space-2);
+  padding: 0.0625rem 0.4rem;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-tertiary);
+  color: var(--color-text-tertiary);
+  border: 1px solid var(--color-border-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-normal);
+  vertical-align: middle;
+}
+.source-tier-recoverymode {
+  background: color-mix(in srgb, var(--color-status-warning) 14%, transparent);
+  color: var(--color-status-warning);
+  border-color: color-mix(in srgb, var(--color-status-warning) 40%, transparent);
+}
+
+/* ==================== Error primitives (§8.2.4) ==================== */
+/* AuroraInlineError — contextual error + retry, in place. Token-only colors. */
+.inline-error {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-status-danger) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-status-danger) 35%, transparent);
+  color: var(--color-text-primary);
+}
+.inline-error-icon { color: var(--color-status-danger); display: inline-flex; }
+.inline-error-msg { flex: 1; }
+.inline-error-retry { flex: none; }
+
+/* AuroraErrorBoundary — render-blocking fallback; takes over the region. */
+.error-boundary {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--space-2);
+  padding: var(--space-8) var(--space-6);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-border-secondary);
+}
+.error-boundary-icon { color: var(--color-status-danger); }
+.error-boundary-title { margin: 0; }
+.error-boundary-msg { color: var(--color-text-secondary); margin: 0; }
+.error-boundary-detail { margin-top: var(--space-2); max-width: 100%; overflow-x: auto; }
 
 /* ==================== Real-time indicator (§6.19) ==================== */
 
@@ -781,7 +912,7 @@ input[type="checkbox"][disabled] {
   align-items: center;
   gap: 0.375rem;
   font-size: 0.8125rem;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 .rt-indicator-slot {
@@ -794,25 +925,25 @@ input[type="checkbox"][disabled] {
   width: 12px;
   height: 12px;
   border-radius: var(--radius-full);
-  background: var(--text-tertiary);
+  background: var(--color-text-tertiary);
 }
 
 .rt-dot-connected {
-  background: var(--success-color);
+  background: var(--color-status-success);
   animation: rt-pulse 2s ease-in-out infinite;
 }
 
 .rt-dot-reconnecting {
-  background: var(--warning-color);
+  background: var(--color-status-warning);
   animation: rt-spin 1s linear infinite;
 }
 
 .rt-dot-offline {
-  background: var(--danger-color);
+  background: var(--color-status-danger);
 }
 
 .rt-dot-polling {
-  background: var(--text-tertiary);
+  background: var(--color-text-tertiary);
 }
 
 @keyframes rt-pulse {
@@ -837,7 +968,7 @@ input[type="checkbox"][disabled] {
 }
 
 @keyframes rt-fadein {
-  0%   { background: rgba(16, 185, 129, 0.18); }
+  0%   { background: color-mix(in srgb, var(--color-status-success) 18%, transparent); }
   100% { background: transparent; }
 }
 
@@ -875,7 +1006,7 @@ input[type="checkbox"][disabled] {
 
 .theme-toggle-pill {
   display: inline-flex;
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   overflow: hidden;
 }
@@ -888,13 +1019,13 @@ input[type="checkbox"][disabled] {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
   font-size: var(--font-size-sm);
 }
 
 .theme-toggle-pill button[aria-checked="true"] {
-  background: var(--primary-color);
-  color: var(--text-on-primary);
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
 }
 
 /* ==================== Command palette (§6.15) ==================== */
@@ -913,21 +1044,21 @@ input[type="checkbox"][disabled] {
   background: transparent;
   font-size: var(--font-size-base);
   outline: none;
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 .cp-item {
   padding: 0.625rem var(--space-4);
   cursor: pointer;
-  color: var(--text-primary);
+  color: var(--color-text-primary);
   border-radius: 4px;
   margin: 0.125rem 0;
 }
 
 .cp-item:hover,
 .cp-item.active {
-  background: var(--primary-color);
-  color: var(--text-on-primary);
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
 }
 
 .cp-section-label {
@@ -936,14 +1067,14 @@ input[type="checkbox"][disabled] {
   font-weight: var(--font-weight-semibold);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--text-tertiary);
+  color: var(--color-text-tertiary);
 }
 
 /* ==================== Drawer (§6.8) ==================== */
 
 .drawer {
-  background: var(--surface);
-  border: 1px solid var(--border-color);
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-md);
   margin-bottom: var(--space-4);
   overflow: hidden;
@@ -960,7 +1091,7 @@ input[type="checkbox"][disabled] {
 }
 
 .drawer-summary:hover {
-  background: var(--background);
+  background: var(--color-surface-primary);
 }
 
 .drawer-summary svg.chev {
@@ -975,7 +1106,7 @@ input[type="checkbox"][disabled] {
 
 .drawer-body {
   padding: var(--space-4) var(--space-6) var(--space-6) var(--space-6);
-  border-top: 1px solid var(--border-color);
+  border-top: 1px solid var(--color-border-primary);
 }
 
 /* ==================== Filter bar / pagination strip ==================== */
@@ -987,16 +1118,31 @@ input[type="checkbox"][disabled] {
   flex-wrap: wrap;
 }
 
+/* "Filters appear in your URL" hint (§5.7.5) — sets the expectation that
+   the filtered view is shareable via the address bar. */
+.filter-url-hint {
+  margin-block: calc(-1 * var(--space-2)) var(--space-4);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+
+/* Clear-filters link under a filtered-empty list (§5.3.1 queue, #209). */
+.empty-state-action {
+  text-align: center;
+  margin-block-start: var(--space-2);
+  font-size: var(--font-size-sm);
+}
+
 .filter-bar input[type="text"],
 .filter-bar select {
   flex: 1;
   min-width: 200px;
   padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
-  background: var(--surface);
-  color: var(--text-primary);
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
 }
 
 .pagination-strip {
@@ -1009,7 +1155,7 @@ input[type="checkbox"][disabled] {
 .pagination-strip .pagination-info {
   margin-left: auto;
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 /* ==================== EntityRef (§6.1) ==================== */
@@ -1019,7 +1165,7 @@ input[type="checkbox"][disabled] {
   align-items: center;
   gap: 0.25rem;
   text-decoration: none;
-  color: var(--primary-color);
+  color: var(--color-accent-primary);
 }
 
 .entity-ref:hover {
@@ -1027,9 +1173,9 @@ input[type="checkbox"][disabled] {
 }
 
 .entity-ref code {
-  font-family: var(--font-mono);
+  font-family: var(--font-family-mono);
   font-size: 0.8125rem;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
 }
 
 /* CLI-actor sentinel: actor strings prefixed with `cli:` render as a
@@ -1038,13 +1184,13 @@ input[type="checkbox"][disabled] {
  * so operators see at a glance that the actor was a CLI invocation
  * rather than a runtime PDS user. */
 .entity-ref--cli {
-  color: var(--text-secondary);
-  background: var(--background);
-  border: 1px solid var(--border-color);
+  color: var(--color-text-secondary);
+  background: var(--color-surface-primary);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   padding: 0.05em 0.4em;
   font-size: 0.85em;
-  font-family: var(--font-mono);
+  font-family: var(--font-family-mono);
   cursor: default;
 }
 
@@ -1073,7 +1219,7 @@ input[type="checkbox"][disabled] {
 }
 
 .rail-card {
-  background: var(--surface);
+  background: var(--color-surface-secondary);
   border-radius: var(--radius-md);
   padding: var(--space-4) var(--space-6);
   box-shadow: var(--shadow-sm);
@@ -1084,15 +1230,15 @@ input[type="checkbox"][disabled] {
   font-weight: var(--font-weight-semibold);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   margin-bottom: var(--space-3);
 }
 
 /* ==================== Calendar (§6.20) ==================== */
 
 .calendar-widget {
-  background: var(--surface);
-  border: 1px solid var(--border-color);
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-md);
   padding: var(--space-4);
   width: 320px;
@@ -1109,17 +1255,17 @@ input[type="checkbox"][disabled] {
 .calendar-preset {
   padding: 0.25rem var(--space-2);
   background: transparent;
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-xs);
   cursor: pointer;
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 .calendar-preset[aria-pressed="true"] {
-  background: var(--primary-color);
-  color: var(--text-on-primary);
-  border-color: var(--primary-color);
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
+  border-color: var(--color-accent-primary);
 }
 
 .calendar-nav {
@@ -1135,11 +1281,11 @@ input[type="checkbox"][disabled] {
   cursor: pointer;
   padding: var(--space-1);
   border-radius: var(--radius-sm);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 .calendar-nav button:hover {
-  background: var(--background);
+  background: var(--color-surface-primary);
 }
 
 .calendar-grid {
@@ -1151,7 +1297,7 @@ input[type="checkbox"][disabled] {
 .calendar-day-name {
   padding: var(--space-1);
   font-size: var(--font-size-xs);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   text-align: center;
   font-weight: var(--font-weight-semibold);
 }
@@ -1163,12 +1309,12 @@ input[type="checkbox"][disabled] {
   border-radius: var(--radius-sm);
   background: transparent;
   border: none;
-  color: var(--text-primary);
+  color: var(--color-text-primary);
   font-size: var(--font-size-sm);
 }
 
 .calendar-cell:hover {
-  background: var(--background);
+  background: var(--color-surface-primary);
 }
 
 .calendar-cell.empty {
@@ -1177,8 +1323,8 @@ input[type="checkbox"][disabled] {
 }
 
 .calendar-cell[aria-selected="true"] {
-  background: var(--primary-color);
-  color: var(--text-on-primary);
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
 }
 
 .calendar-cell.in-range {
@@ -1195,7 +1341,7 @@ input[type="checkbox"][disabled] {
 .calendar-text-inputs label {
   flex: 1;
   font-size: var(--font-size-xs);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   display: flex;
   flex-direction: column;
   gap: 0.125rem;
@@ -1203,11 +1349,11 @@ input[type="checkbox"][disabled] {
 
 .calendar-text-inputs input {
   padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-primary);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
-  background: var(--surface);
-  color: var(--text-primary);
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
 }
 
 /* ==================== Toast (§6.7) ==================== */
@@ -1224,8 +1370,8 @@ input[type="checkbox"][disabled] {
 }
 
 .toast {
-  background: var(--surface);
-  border: 1px solid var(--border-color);
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-border-primary);
   border-left-width: 4px;
   border-radius: var(--radius-sm);
   padding: var(--space-3) var(--space-4);
@@ -1236,13 +1382,13 @@ input[type="checkbox"][disabled] {
   align-items: flex-start;
   gap: var(--space-2);
   font-size: var(--font-size-sm);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
-.toast.toast-info    { border-left-color: var(--primary-color); }
-.toast.toast-success { border-left-color: var(--success-color); }
-.toast.toast-warning { border-left-color: var(--warning-color); }
-.toast.toast-danger  { border-left-color: var(--danger-color); }
+.toast.toast-info    { border-left-color: var(--color-accent-primary); }
+.toast.toast-success { border-left-color: var(--color-status-success); }
+.toast.toast-warning { border-left-color: var(--color-status-warning); }
+.toast.toast-danger  { border-left-color: var(--color-status-danger); }
 
 .toast-message { flex: 1; }
 
@@ -1251,7 +1397,7 @@ input[type="checkbox"][disabled] {
  * the existing hash router. Subdued styling so it reads as a
  * secondary affordance, not competing with the message. */
 .toast-action {
-  color: var(--primary-color);
+  color: var(--color-accent-primary);
   text-decoration: underline;
   font-size: var(--font-size-sm);
   white-space: nowrap;
@@ -1266,7 +1412,7 @@ input[type="checkbox"][disabled] {
   background: transparent;
   border: none;
   cursor: pointer;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   font-size: var(--font-size-base);
   padding: 0;
   line-height: 1;
@@ -1277,9 +1423,9 @@ input[type="checkbox"][disabled] {
 .skeleton {
   background: linear-gradient(
     90deg,
-    var(--background) 0%,
-    var(--border-color) 50%,
-    var(--background) 100%
+    var(--color-surface-primary) 0%,
+    var(--color-border-primary) 50%,
+    var(--color-surface-primary) 100%
   );
   background-size: 200% 100%;
   animation: skeleton-shimmer 1.4s ease-in-out infinite;
@@ -1291,8 +1437,35 @@ input[type="checkbox"][disabled] {
   100% { background-position: -100% 0; }
 }
 
+/* AuroraSkeleton element shapes (§8.2.5) — composed by the primitive. */
+.skeleton-line {
+  height: 0.85em;
+  margin: var(--space-2) 0;
+}
+.skeleton-title {
+  height: 1.1em;
+  width: 40%;
+  margin-bottom: var(--space-3);
+}
+.skeleton-card .skeleton-line:last-child { margin-bottom: 0; }
+
+/* ==================== Spinner (§8.2.5 action-in-flight) ==================== */
+.spinner {
+  display: inline-block;
+  vertical-align: middle;
+  border: 2px solid color-mix(in srgb, var(--color-text-tertiary) 40%, transparent);
+  border-top-color: var(--color-accent-primary);
+  border-radius: var(--radius-full);
+  animation: spinner-rotate 0.7s linear infinite;
+}
+
+@keyframes spinner-rotate {
+  to { transform: rotate(360deg); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .skeleton { animation: none; }
+  .spinner { animation-duration: 1.6s; }
 }
 
 /* ==================== Utility helpers (#108D legacy) ==================== */
@@ -1323,18 +1496,18 @@ input[type="checkbox"][disabled] {
 [data-theme="dark"] .rail-card,
 [data-theme="dark"] .drawer,
 [data-theme="dark"] .calendar-widget {
-  background: var(--surface);
-  color: var(--text-primary);
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
 }
 
 [data-theme="dark"] .data-table th {
-  background: var(--background);
-  color: var(--text-primary);
+  background: var(--color-surface-primary);
+  color: var(--color-text-primary);
 }
 
 [data-theme="dark"] code {
-  background: var(--background);
-  color: var(--text-primary);
+  background: var(--color-surface-primary);
+  color: var(--color-text-primary);
   padding: 0.125rem 0.25rem;
   border-radius: 4px;
 }

@@ -3,14 +3,26 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Aurora Locus admin</title>
+  <title>Aurora-Locus admin</title>
   <link rel="stylesheet" href="/admin/styles/tokens.css">
+  <link rel="stylesheet" href="/admin/styles/effects.css">
+  <!-- Active named theme (§11): server-resolved token + effect CSS. No ?id ⇒
+       the server serves the deployment-default theme; settings.js re-points
+       these to ?id=<theme> for a per-operator preference. Loaded after the
+       static substrate so a theme's :root tokens override the baseline. -->
+  <link id="theme-tokens" rel="stylesheet" href="/theme/active.css">
+  <link id="theme-effects" rel="stylesheet" href="/theme/active-effects.css">
+  <link id="theme-extensions" rel="stylesheet" href="/theme/active-extensions.css">
   <link rel="stylesheet" href="/admin/styles/base.css">
   <link rel="stylesheet" href="/admin/styles/components.css">
   <link rel="stylesheet" href="/admin/styles/pages.css">
 </head>
 <body>
   <a href="#content" class="skip-to-content">Skip to content</a>
+
+  <!-- v0.9 Federation runtime-mutability arc §4.4 (#403) — pending-restart banner;
+       mounted by app.js, persists across router navigation (sibling of #content). -->
+  <div id="restart-banner-root"></div>
 
   <div class="admin-container">
     <aside class="sidebar" id="sidebar" aria-label="Primary navigation">
@@ -27,16 +39,17 @@
   <div id="toast-root" aria-live="polite" aria-atomic="true"></div>
   <div id="palette-root"></div>
 
-  <!-- Chart.js retained from previous build for Dashboard sparklines -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
   <!-- Foundation: state + dom + i18n + format + a11y + icons -->
   <script src="/admin/scripts/lib/dom.js"></script>
   <script src="/admin/scripts/lib/icons.js"></script>
   <script src="/admin/scripts/lib/i18n.js"></script>
   <script src="/admin/scripts/lib/format.js"></script>
   <script src="/admin/scripts/lib/a11y.js"></script>
+  <script src="/admin/scripts/lib/roles.js"></script>
   <script src="/admin/scripts/state/session.js"></script>
+  <!-- theme-runtime before settings: settings.applyTheme() drives the runtime's
+       cache at boot, so the runtime global must already be defined (#285). -->
+  <script src="/admin/scripts/state/theme-runtime.js"></script>
   <script src="/admin/scripts/state/settings.js"></script>
 
   <!-- API substrate -->
@@ -47,6 +60,16 @@
   <script src="/admin/scripts/api/subscription.js"></script>
 
   <!-- Substrate components (substrate primitives 1, 3, 4, 5, 7, 8, 10–12, 14–15, 20) -->
+  <script src="/admin/scripts/components/AuroraSourceTier.js"></script>
+  <script src="/admin/scripts/components/AuroraTimestamp.js"></script>
+  <script src="/admin/scripts/components/AuroraInlineError.js"></script>
+  <script src="/admin/scripts/components/AuroraErrorBoundary.js"></script>
+  <script src="/admin/scripts/components/AuroraSkeleton.js"></script>
+  <script src="/admin/scripts/components/AuroraSpinner.js"></script>
+  <script src="/admin/scripts/components/AuroraAuditedSave.js"></script>
+  <script src="/admin/scripts/components/AuroraRevertToDefault.js"></script>
+  <script src="/admin/scripts/components/QueuedChangeBanner.js"></script>
+  <script src="/admin/scripts/components/AuroraLazySection.js"></script>
   <script src="/admin/scripts/components/EntityRef.js"></script>
   <script src="/admin/scripts/components/Modal.js"></script>
   <script src="/admin/scripts/components/Toast.js"></script>
@@ -57,12 +80,15 @@
   <script src="/admin/scripts/components/CalendarWidget.js"></script>
   <script src="/admin/scripts/components/FilterStrip.js"></script>
   <script src="/admin/scripts/components/ThemeToggle.js"></script>
+  <script src="/admin/scripts/components/PrideHover.js"></script>
   <script src="/admin/scripts/components/CommandPalette.js"></script>
   <script src="/admin/scripts/components/ActionPanel.js"></script>
   <script src="/admin/scripts/components/BulkActionPanel.js"></script>
+  <script src="/admin/scripts/components/ListPage.js"></script>
 
   <!-- Routing -->
   <script src="/admin/scripts/routing/routes.js"></script>
+  <script src="/admin/scripts/routing/url-state.js"></script>
   <script src="/admin/scripts/routing/router.js"></script>
 
   <!-- Pages (each registers itself with the router on load) -->
@@ -88,10 +114,39 @@
   <script src="/admin/scripts/pages/RateLimits.js"></script>
   <script src="/admin/scripts/pages/SystemHealth.js"></script>
   <script src="/admin/scripts/pages/Capabilities.js"></script>
-  <script src="/admin/scripts/pages/SettingsGeneral.js"></script>
-  <script src="/admin/scripts/pages/SettingsUiModes.js"></script>
-  <script src="/admin/scripts/pages/SettingsRoles.js"></script>
-  <script src="/admin/scripts/pages/SettingsRolesMembers.js"></script>
+  <!-- Configuration domain (was Settings; renamed v0.9 §5.5) -->
+  <script src="/admin/scripts/pages/ConfigGeneral.js"></script>
+  <script src="/admin/scripts/pages/ConfigUiModes.js"></script>
+  <script src="/admin/scripts/pages/ConfigModerationPolicy.js"></script>
+  <script src="/admin/scripts/pages/ConfigRegistrationPolicy.js"></script>
+  <script src="/admin/scripts/pages/ConfigObservability.js"></script>
+  <script src="/admin/scripts/pages/ConfigFederationPolicy.js"></script>
+  <script src="/admin/scripts/pages/ConfigIntegrationHooks.js"></script>
+  <script src="/admin/scripts/pages/ConfigThemes.js"></script>
+  <script src="/admin/scripts/pages/ConfigRoles.js"></script>
+  <script src="/admin/scripts/pages/ConfigRolesMembers.js"></script>
+  <script src="/admin/scripts/pages/Sessions.js"></script>
+  <script src="/admin/scripts/pages/RecoveryMode.js"></script>
+  <!-- v0.9 Arc H §7.4.1 — repository rebuild recovery surface (#288). -->
+  <script src="/admin/scripts/pages/RepoRebuild.js"></script>
+  <!-- v0.9 Arc H §7.4.3 — bulk repository repair surface (#293). -->
+  <script src="/admin/scripts/pages/RepoRepair.js"></script>
+  <!-- v0.9 Arc H §7.4.2 — sequencer recovery surface (#295). -->
+  <script src="/admin/scripts/pages/SequencerRecovery.js"></script>
+  <!-- v0.9 Arc D Kryphocron domain pages (§6.4–§6.6). -->
+  <script src="/admin/scripts/pages/ConfigKryphocronPolicy.js"></script>
+  <!-- Key-rotation arc B2 (#373 / §4.6) — operator-supplied-keys gate. -->
+  <script src="/admin/scripts/pages/ConfigKeyRotationPolicy.js"></script>
+  <script src="/admin/scripts/pages/KryphocronOverview.js"></script>
+  <script src="/admin/scripts/pages/Laquna.js"></script>
+  <script src="/admin/scripts/pages/LaqunaHistory.js"></script>
+  <script src="/admin/scripts/pages/AudienceAggregate.js"></script>
+  <script src="/admin/scripts/pages/TierActivity.js"></script>
+  <!-- Stub pages for routes whose bodies ship in Arc B/D/G. register()
+       is last-wins, so when an owning arc lands its real page it must
+       delete that key's row from ConfigStubs.js (contract documented in
+       that file's header) — load order alone is not the guard. -->
+  <script src="/admin/scripts/pages/ConfigStubs.js"></script>
 
   <!-- App entry point — runs after all pages have registered -->
   <script src="/admin/scripts/app.js"></script>

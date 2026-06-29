@@ -14,6 +14,7 @@ pub mod api;
 pub mod auth;
 pub mod blob_store;
 pub mod cache;
+pub mod cascade;
 pub mod cli;
 pub mod config;
 pub mod context;
@@ -26,14 +27,24 @@ pub mod identity;
 pub mod jobs;
 pub mod kryphocron;
 pub mod kryphocron_audit;
+pub mod kryphocron_content;
+pub mod kryphocron_oracle_activity;
+pub mod kryphocron_override;
+pub mod kryphocron_policy;
+pub mod kryphocron_rewrite;
+pub mod kryphocron_rotation;
 pub mod mailer;
 pub mod metrics;
 pub mod oauth;
 pub mod rate_limit;
 pub mod read_after_write; // Must come before actor_store (actor_store uses its types)
+pub mod rebuild;
+pub mod repo_scan;
 pub mod repository;
 pub mod sequencer;
+pub mod sequencer_recovery;
 pub mod service_auth;
+pub mod themes;
 pub mod validation;
 
 // Re-export commonly used types for easier testing

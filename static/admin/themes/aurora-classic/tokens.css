@@ -1,0 +1,65 @@
+/*
+ * aurora-classic — token overrides (design §11.11.3).
+ *
+ * The classic "Aurora Stack" identity, now drawn from the canonical Aurora
+ * Prism source (recon docs/internal/v09/v09_aurora_prism_visual_language_recon.md,
+ * #409) rather than the prior authored translation. Prism's deep-space-blue
+ * GitHub-dark surfaces (#0D1117 / #161B22), a teal-forward tri-accent
+ * (teal #00F5D4 primary / green #9AEF82 secondary / purple #B900F5 decoration),
+ * slate-alpha borders, and Inter + JetBrains Mono. Status colors, sizing, and
+ * motion are inherited from dark. Contrast verified by the substrate gate.
+ *
+ * Composition rules (Prism §5, codified so future tweaks stay in-system):
+ *  - Two-tier surface: the body gradient runs between surface-primary and
+ *    surface-secondary (see effects.css).
+ *  - Tri-accent roles: teal = interactive / focus, green = secondary / success,
+ *    purple = decoration (the heading-aurora gradient; no system token — aurora-
+ *    locus has no themeable tertiary-accent surface, badges are status-coloured).
+ *  - Accent-as-fill: a solid accent background always carries dark text
+ *    (--color-text-inverted = #0D1117), never accent-on-white.
+ *  - Glow: interactive / elevated elements glow in their own accent (effects.css).
+ *  - Border: slate-alpha at rest, teal-alpha on hover.
+ *  - Focus: teal ring (border-focus) on all focusable elements.
+ *
+ * The @import is valid at the head of this standalone file; when the registry
+ * concatenates the resolved chain (B-themes-page / serving), @import hoisting
+ * is handled there.
+ */
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
+:root {
+  /* Surfaces — Aurora Prism deep space blue (GitHub-dark) */
+  --color-surface-primary: #0d1117;
+  --color-surface-secondary: #161b22;
+  --color-surface-tertiary: #1d222c;
+  --color-surface-overlay: rgba(5, 6, 12, 0.7);
+
+  /* Text — Prism neutral off-whites */
+  --color-text-primary: #f0f0f0;   /* ~16:1 on surface-primary */
+  --color-text-secondary: #8b95a8; /* ~6.3:1 on surface-primary — AA */
+  --color-text-tertiary: #8b95a8;  /* Prism does not separate tertiary text */
+  --color-text-inverted: #0d1117;  /* dark text on a bright accent fill */
+
+  /* Accent — Aurora Prism teal-forward tri-accent (purple lives in the
+   * heading-aurora gradient as decoration, not as a system token) */
+  --color-accent-primary: #00f5d4;        /* teal — interactive / focus */
+  --color-accent-primary-hover: #33f7db;  /* ~lighter teal */
+  --color-accent-primary-active: #00c9ae; /* ~darker teal */
+  --color-accent-secondary: #9aef82;      /* green — secondary / success */
+
+  /* .btn-primary:hover background reads --primary-dark (optional token); point
+   * it at the teal active value so the primary CTA stays teal on hover rather
+   * than falling back to dark's blue. */
+  --primary-dark: #00c9ae;
+
+  /* Typography — Inter + JetBrains Mono (Prism) */
+  --font-family-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-family-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-family-display: "Inter", sans-serif;
+
+  /* Borders — Prism slate-alpha (#8B949E), teal focus ring */
+  --color-border-primary: rgba(139, 148, 158, 0.30);
+  --color-border-secondary: rgba(139, 148, 158, 0.50);
+  --color-border-focus: var(--color-accent-primary);
+}

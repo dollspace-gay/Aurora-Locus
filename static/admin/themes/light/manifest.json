@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "light",
+  "themeName": "Light",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "dark",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "Inverted-palette companion to Dark, for light ambient environments.",
+  "files": {
+    "tokens": "tokens.css"
+  }
+}

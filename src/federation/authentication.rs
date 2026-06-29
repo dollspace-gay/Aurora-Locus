@@ -163,22 +163,6 @@ impl FederationAuthenticator {
 
         Ok(profile)
     }
-
-    /// Check if a DID is from a known/trusted PDS
-    pub async fn is_trusted_pds(&self, did: &str, trusted_instances: &[String]) -> PdsResult<bool> {
-        let did_doc = self.identity_resolver.resolve_did(did).await?;
-        let pds_endpoint = self.extract_pds_endpoint(&did_doc);
-
-        match pds_endpoint {
-            Some(endpoint) => {
-                // Check if endpoint is in trusted list
-                Ok(trusted_instances
-                    .iter()
-                    .any(|trusted| endpoint.contains(trusted)))
-            }
-            None => Ok(false),
-        }
-    }
 }
 
 /// Remote user information

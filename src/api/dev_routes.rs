@@ -444,12 +444,10 @@ async fn fed_inspect_account(
     };
 
     let is_service_did = q.did == ctx.service_did();
-    let is_peer_pds = ctx
-        .config
-        .federation
-        .peer_pds
-        .iter()
-        .any(|p| p.did == q.did);
+    // v0.9 Federation Pattern-1 (#351 / design §2.2): the live trust read goes
+    // through the runtime-backed set (per-call freshness), not the static
+    // `peer_pds`. Phase A: runtime key unset → falls back to `peer_pds`.
+    let is_peer_pds = ctx.trusted_peers.is_trusted(&q.did).await;
     let is_entryway_did = ctx.entryway_did() == Some(q.did.as_str());
 
     Ok(Json(FedInspectAccountResponse {
@@ -488,10 +486,15 @@ struct FedPeerEntry {
 async fn fed_list_known_peers(
     State(ctx): State<AppContext>,
 ) -> Result<Json<FedListKnownPeersResponse>, (StatusCode, String)> {
+    // v0.9 Federation Pattern-1 (#351 / design §2.2): the operator-owned peer
+    // list is read through the runtime-backed snapshot. Phase A: runtime key
+    // unset → the snapshot is the `peer_pds` fallback, so these remain the
+    // `config`-sourced bootstrap entries.
     let mut peers: Vec<FedPeerEntry> = ctx
-        .config
-        .federation
-        .peer_pds
+        .trusted_peers
+        .snapshot()
+        .await
+        .peers
         .iter()
         .map(|p| FedPeerEntry {
             did: p.did.clone(),

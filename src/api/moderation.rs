@@ -164,6 +164,42 @@ async fn create_report(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // §5.5.4 Phase A: apply the configured default action (full tier
+    // only). Best-effort — the report is already persisted, so a
+    // default-application failure is logged, not surfaced as a 500.
+    if let Err(e) = crate::api::moderation_defaults::apply_report_default(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "moderation default-action consumer failed on createReport intake"
+        );
+    }
+    // §5.5.4 Phase B: route the new item to a reviewer (Pipeline A §4),
+    // after the §2 default action. Best-effort, full tier only.
+    if let Err(e) = crate::api::reviewer_assignment::assign_reviewer_on_intake(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "reviewer-assignment consumer failed on createReport intake"
+        );
+    }
+    // §5.5.4 Phase C: Pipeline A report-count auto-label rules. Best-effort.
+    if let Err(e) = crate::api::auto_label_rules::evaluate_pipeline_a(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "auto-label Pipeline A failed on createReport intake"
+        );
+    }
+    // §5.5.4 Phase D: Pipeline A escalation rules. Best-effort.
+    if let Err(e) = crate::api::escalation_rules::evaluate_pipeline_a(&ctx, &report).await {
+        tracing::warn!(
+            error = %e,
+            report_id = report.id,
+            "escalation Pipeline A failed on createReport intake"
+        );
+    }
+
     // Build response subject
     let subject_json = match &req.subject {
         ReportSubject::Repo(repo_ref) => serde_json::json!({

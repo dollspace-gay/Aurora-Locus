@@ -13,10 +13,57 @@
 }
 
 body {
-  font-family: var(--font-sans);
-  background: var(--background);
-  color: var(--text-primary);
+  font-family: var(--font-family-sans);
+  background: var(--color-surface-primary);
+  color: var(--color-text-primary);
   line-height: var(--line-height-normal);
+}
+
+/* Inline links (#410) — route through each theme's link token so every theme
+ * renders contextual <a> in its own palette instead of the browser default.
+ * --color-link defaults to the interactive accent (dark root); pride overrides
+ * it to clear AA as text. Underlined per WCAG 1.4.1 (distinguishable by more
+ * than colour). Anchors styled as buttons / nav / row-wrappers opt out below. */
+a {
+  color: var(--color-link);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  transition: color var(--transition-fast, 150ms ease);
+}
+
+a:hover {
+  color: var(--color-link-hover);
+}
+
+a:active {
+  color: var(--color-accent-primary-active);
+}
+
+a:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Carve-outs: anchors that are buttons, sidebar nav, or whole-row/card wrappers
+ * carry their own colour and must not be underlined. (.toast-action and
+ * .entity-ref already style themselves as accent links and are intentionally
+ * left alone.) */
+.btn-primary,
+.btn-secondary,
+.btn-logout,
+.nav-item,
+.nav-section-link,
+.stat-card-link,
+.activity-item {
+  text-decoration: none;
+}
+
+.nav-section-link,
+.stat-card-link,
+.activity-item {
+  color: inherit;
 }
 
 /* Layout */
@@ -39,11 +86,11 @@ body {
 
 .logo {
   padding: var(--space-8) var(--space-6);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  border-bottom: 1px solid color-mix(in srgb, var(--sidebar-text) 10%, transparent);
 }
 
 .logo h1 {
-  color: white;
+  color: var(--sidebar-text);
   font-size: var(--font-size-2xl);
   font-weight: var(--font-weight-bold);
   margin-bottom: var(--space-1);
@@ -70,7 +117,7 @@ body {
   font-weight: var(--font-weight-semibold);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--text-tertiary);
+  color: var(--color-text-tertiary);
 }
 
 .nav-item {
@@ -85,12 +132,12 @@ body {
 
 .nav-item:hover {
   background: var(--sidebar-hover);
-  color: white;
+  color: var(--sidebar-text);
 }
 
 .nav-item.active {
-  background: var(--primary-color);
-  color: white;
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
 }
 
 .nav-item .icon {
@@ -106,8 +153,31 @@ body {
 
 .nav-item .badge {
   margin-left: auto;
-  background: var(--danger-color);
-  color: white;
+  background: var(--color-status-danger);
+  color: var(--color-text-inverted);
+  padding: 0.125rem var(--space-2);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+}
+
+/* Clickable group label (§5.8.2) — e.g. the Moderation label links to the
+   Queue and hosts the combined open-reports + pending-appeals bell badge. */
+.nav-section-link {
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.nav-section-link:hover {
+  color: var(--sidebar-text);
+}
+
+.nav-section-link .badge {
+  margin-inline-start: auto;
+  background: var(--color-status-danger);
+  color: var(--color-text-inverted);
   padding: 0.125rem var(--space-2);
   border-radius: var(--radius-full);
   font-size: var(--font-size-xs);
@@ -116,7 +186,7 @@ body {
 
 .sidebar-footer {
   padding: var(--space-6);
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  border-top: 1px solid color-mix(in srgb, var(--sidebar-text) 10%, transparent);
 }
 
 .admin-info {
@@ -124,7 +194,7 @@ body {
 }
 
 .admin-name {
-  color: white;
+  color: var(--sidebar-text);
   font-weight: var(--font-weight-semibold);
   margin-bottom: var(--space-1);
 }
@@ -137,16 +207,16 @@ body {
 .btn-logout {
   width: 100%;
   padding: var(--space-2);
-  background: rgba(255, 255, 255, 0.1);
-  color: white;
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: color-mix(in srgb, var(--sidebar-text) 10%, transparent);
+  color: var(--sidebar-text);
+  border: 1px solid color-mix(in srgb, var(--sidebar-text) 20%, transparent);
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all var(--transition-normal);
 }
 
 .btn-logout:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: color-mix(in srgb, var(--sidebar-text) 15%, transparent);
 }
 
 /* Main Content */
@@ -177,11 +247,11 @@ body {
 .page-header h2 {
   font-size: var(--font-size-2xl);
   font-weight: var(--font-weight-bold);
-  color: var(--text-primary);
+  color: var(--color-text-primary);
 }
 
 .page-subtitle {
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   margin-top: var(--space-2);
 }
 
@@ -193,23 +263,23 @@ body {
 /* Breadcrumb (per §4.5) */
 .breadcrumb {
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   margin-bottom: var(--space-3);
 }
 
 .breadcrumb a {
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   text-decoration: none;
 }
 
 .breadcrumb a:hover {
-  color: var(--primary-color);
+  color: var(--color-accent-primary);
   text-decoration: underline;
 }
 
 .breadcrumb-sep {
   margin: 0 var(--space-2);
-  color: var(--text-tertiary);
+  color: var(--color-text-tertiary);
 }
 
 /* Accessibility utilities */
@@ -230,8 +300,8 @@ body {
   position: absolute;
   top: -40px;
   left: 0;
-  background: var(--primary-color);
-  color: white;
+  background: var(--color-accent-primary);
+  color: var(--color-text-inverted);
   padding: var(--space-2) var(--space-4);
   z-index: var(--z-toast);
   text-decoration: none;
@@ -243,7 +313,7 @@ body {
 
 /* Universal focus visibility per §7.9 */
 *:focus-visible {
-  outline: 2px solid var(--primary-color);
+  outline: 2px solid var(--color-accent-primary);
   outline-offset: 2px;
 }
 
@@ -258,7 +328,7 @@ textarea:focus-visible {
 .empty-state {
   padding: var(--space-6);
   text-align: center;
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
 }
 

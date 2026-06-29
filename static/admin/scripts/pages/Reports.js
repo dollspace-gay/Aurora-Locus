@@ -9,18 +9,38 @@
   let nextCursor = null;
   let lastFilters = {};
 
+  // url-state wiring (§5.7.5) — the shared shape lives in AuroraListPage
+  // (components/ListPage.js, #257). Scalar filters round-trip through the hash
+  // query; the dateRange `when` round-trips as since/until ISO scalars
+  // (FilterStrip can't restore the date *chip* from initial, but the filter
+  // still applies and is preserved across applies). applyFilters writes the
+  // query, which remounts the page → readFilters re-seeds.
+  const SCALAR_KEYS = ['status', 'reporter', 'subject'];
+  const BOOL_KEYS = [];
+
+  function applyFilters(vals) {
+    global.AuroraListPage.applyFilters(SCALAR_KEYS, BOOL_KEYS, vals, lastFilters && lastFilters.when, function (v) {
+      lastFilters = v;
+      cursorStack = [];
+      nextCursor = null;
+      refresh(null);
+    });
+  }
+
   async function mount({ container }) {
     container.innerHTML =
       '<header class="page-header">' +
       '  <div><h2>Reports</h2><p class="page-subtitle">Content reports</p></div>' +
       '</header>' +
       '<div id="reports-filter"></div>' +
+      '<p class="filter-url-hint">' + (global.t ? global.t('common.filters_in_url') : '') + '</p>' +
       '<div id="reports-bulk-bar"></div>' +
       '<div class="reports-list" id="reports-items"></div>' +
       '<div id="reports-pagination"></div>';
     bulkSelected = new Set();
     cursorStack = [];
     nextCursor = null;
+    lastFilters = global.AuroraListPage.readFilters(SCALAR_KEYS, BOOL_KEYS, { status: 'open' });
     if (global.AuroraFilterStrip) {
       global.AuroraFilterStrip.build({
         container: document.getElementById('reports-filter'),
@@ -34,11 +54,10 @@
           { type: 'text', id: 'subject', placeholder: 'Subject DID' },
           { type: 'dateRange', id: 'when', label: 'Date range' },
         ],
-        initial: { status: 'open' },
-        onApply: (vals) => { lastFilters = vals; cursorStack = []; nextCursor = null; refresh(null); },
+        initial: lastFilters,
+        onApply: applyFilters,
       });
     }
-    lastFilters = { status: 'open' };
     await refresh(null);
     return { unmount: () => { bulkSelected = new Set(); } };
   }
@@ -105,7 +124,10 @@
       renderBulkBar();
       renderPagination();
     } catch (e) {
-      c.innerHTML = '<p class="empty-state">Could not load reports: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(c, {
+        message: 'Could not load reports: ' + ((e && e.message) || ''),
+        onRetry: function () { refresh(cursor); },
+      });
     }
   }
 
@@ -148,25 +170,11 @@
   }
 
   function renderPagination() {
-    const c = document.getElementById('reports-pagination');
-    if (!c || !global.AuroraPagination) return;
-    global.AuroraPagination.render({
-      container: c,
-      prevDisabled: cursorStack.length === 0,
-      nextDisabled: !nextCursor,
-      onPrev: () => {
-        if (cursorStack.length > 1) {
-          cursorStack.pop();
-          const p = cursorStack[cursorStack.length - 1] || null;
-          refresh(p);
-        } else if (cursorStack.length === 1) {
-          cursorStack = [];
-          refresh(null);
-        }
-      },
-      onNext: () => {
-        if (nextCursor) { cursorStack.push(nextCursor); refresh(nextCursor); }
-      },
+    global.AuroraListPage.renderPagination({
+      container: document.getElementById('reports-pagination'),
+      cursorStack: cursorStack,
+      nextCursor: nextCursor,
+      refresh: refresh,
     });
   }
 

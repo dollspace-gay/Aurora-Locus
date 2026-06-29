@@ -1,0 +1,50 @@
+/*
+ * extension-point-author — extension points.
+ *
+ * Three theme-specific treatments, each declared in manifest.json's
+ * `providedExtensionPoints` and defined here as a `.extension-<name>` class.
+ * A surface applies one only when AuroraThemeRuntime.themeProvidesExtension()
+ * reports this theme provides it (see README.md). Every value derives from the
+ * inherited token contract, so the treatments stay portable if the palette
+ * changes.
+ *
+ * The substrate validates that every declared name has a definition here (or in
+ * an inherited extensions.css): a declared-but-undefined point fails theme
+ * validation (theme.extensions.declared.undefined: <name>).
+ */
+
+/* hero-treatment-cosmic — a deep-space gradient backdrop for a hero/landing
+   section. Expects a positioned, full-bleed container (it sets position:
+   relative and paints a layered background). */
+.extension-hero-treatment-cosmic {
+  position: relative;
+  background:
+    radial-gradient(circle at 50% 0%,
+      color-mix(in srgb, var(--color-accent-primary) 30%, transparent) 0%,
+      transparent 55%),
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--color-surface-primary) 70%, #000018 30%),
+      var(--color-surface-primary));
+  overflow: hidden;
+}
+
+/* accent-emphasis-glow — an outer glow for an element a surface wants to
+   emphasize (a primary CTA, a highlighted card). Apply to the element itself. */
+.extension-accent-emphasis-glow {
+  box-shadow: 0 0 32px color-mix(in srgb, var(--color-accent-primary) 35%, transparent);
+}
+
+/* nav-active-indicator — an accent rail on the active navigation item. Expects
+   the element to host a ::before (a nav link/button is fine). */
+.extension-nav-active-indicator {
+  position: relative;
+}
+.extension-nav-active-indicator::before {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  inline-size: 3px;
+  background: var(--color-accent-primary);
+  border-radius: 0 2px 2px 0;
+}

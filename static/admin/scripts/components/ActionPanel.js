@@ -325,8 +325,9 @@
       });
     }
 
-    // Buttons
-    const confirmText = def && def.destructive ? 'Confirm' : 'Confirm';
+    // Buttons. The label is the same either way; destructiveness is
+    // conveyed by the button class (btn-danger vs btn-primary) below.
+    const confirmText = 'Confirm';
     const confirmBtn = el(
       'button',
       {

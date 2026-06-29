@@ -19,6 +19,45 @@ fn parse_ts(s: &str) -> Result<chrono::DateTime<chrono::Utc>, crate::error::PdsE
         .map_err(|e| crate::error::PdsError::Internal(format!("Invalid timestamp: {}", e)))
 }
 
+/// A DID the caller has authenticated as authorized to write to — produced by
+/// the request-auth chokepoints (e.g. `authenticated_did_for_repo`, which
+/// validates that the request's authenticated identity owns the target repo).
+///
+/// Arc H §7.2.5 / #280 rev4 (LB-5/H-7), scoped per #281: this newtype makes the
+/// kryphocron dedicated-endpoint write boundary — including the `graph.block`
+/// cascade entry point (`createBlock`, #282) — take a *deliberately-constructed*
+/// DID rather than a bare `&str`, so a write DID sourced from request input
+/// can't be passed implicitly to the write helpers.
+///
+/// **Scope note (per the #281 §16 clarification).** rev4's literal "type-proof
+/// Boundary-1 everywhere via `for_writer`" was reduced to *this* boundary,
+/// because `RepositoryManager::for_writer` lives in `actor_store` and cannot
+/// depend on the `api` auth types (layering), and because a legitimate
+/// non-request writer exists (the rewrite-on-rotate system job). So this is a
+/// low-level, `api`-free newtype constructed from an already-validated DID
+/// string; `for_writer` still takes `String`. The global, auth-object-bound
+/// version is future work (precondition: resolve the layering bar / introduce a
+/// low-level principal type). Boundary-1 for #280 holds because `createBlock` —
+/// the only #280 cascade entry point — consumes this type at its boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedDid(String);
+
+impl AuthenticatedDid {
+    /// Construct from a DID the caller has already authenticated **and**
+    /// authorized — i.e. a request-auth chokepoint has validated
+    /// `requested_repo == auth.did()`. The kryphocron `authenticated_did_for_repo`
+    /// chokepoint is the producer; do not call this with a DID taken straight
+    /// from request input without that validation.
+    pub fn from_authenticated(did: impl Into<String>) -> Self {
+        Self(did.into())
+    }
+
+    /// The underlying DID string.
+    pub fn value(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Authentication method used for the request
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
@@ -299,9 +338,31 @@ pub(crate) async fn admin_auth_from_token(
                     "HS256 token does not have admin scope".to_string(),
                 ));
             }
+            // §8.1.7 / #271: tokens minted once the operator-session store
+            // landed carry a `sid`. When present, the session must be live —
+            // not revoked, not expired — on EVERY request; this is what makes
+            // a SuperAdmin force-logout (#273) take effect on the operator's
+            // very next request, and bumps the session's last-active stamp.
+            // Tokens without a `sid` (minted before #271) take the legacy
+            // stateless path unchanged, so a deploy doesn't bounce live
+            // sessions.
+            let sid = claims
+                .get("sid")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            if let Some(sid) = sid {
+                if !state.operator_session_store.validate_and_touch(sid).await? {
+                    tracing::debug!(reason = "session-invalid", "HS256 admin token rejected");
+                    return Err(PdsError::Authentication(
+                        "operator session is no longer valid".to_string(),
+                    ));
+                }
+            }
             let session = ValidatedSession {
                 did: did.clone(),
-                session_id: format!("jwt-{}", Uuid::new_v4()),
+                session_id: sid
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("jwt-{}", Uuid::new_v4())),
                 is_app_password: false,
             };
             return finalize_admin_role(state, did, session).await;
@@ -1561,7 +1622,6 @@ mod admin_auth_third_path_tests {
                 firehose_enabled: false,
                 crawl_enabled: false,
                 public_url: Some("http://localhost:2583".to_string()),
-                auto_stream_events: false,
                 peer_pds: vec![],
             },
             validation_mode: PathBuf::from("required")
@@ -1903,5 +1963,193 @@ mod admin_auth_third_path_tests {
             0,
             "layer 2 success must not reach the identity resolver"
         );
+    }
+
+    // ---------- §8.1.6 role-change invalidation (satisfied-by-architecture) ----------
+
+    /// Verification gate for design §8.1.6 (Arc E first wave, #267): a
+    /// mid-session role change takes effect on the operator's *next
+    /// request* with no operator action and no token re-issuance.
+    ///
+    /// The design assumed roles were embedded in the session token, so it
+    /// specified a `401 token-stale` -> `refresh-required` -> transparent-
+    /// refresh dance to pick up new claims. Aurora-Locus never embeds the
+    /// role: `finalize_admin_role` resolves it live from `admin_role_manager
+    /// .get_role(did)` on every request (the token only carries `scope`).
+    /// So the gate is met structurally — there is no stale claim to
+    /// invalidate. This test mints ONE token and reuses it across an
+    /// upgrade-equivalent change and a full revoke, asserting each takes
+    /// effect immediately on the very next `admin_auth_from_token` call.
+    #[traced_test]
+    #[tokio::test]
+    async fn role_change_takes_effect_on_next_request_without_reauth() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let did = "did:plc:rolechange";
+
+        ctx.admin_role_manager
+            .grant_role(did, Role::Moderator, "did:plc:bootstrap", None)
+            .await
+            .expect("initial grant");
+
+        // One token for the whole "session" — never re-minted below.
+        let secret = &ctx.config.authentication.jwt_secret;
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let claims = serde_json::json!({ "sub": did, "scope": "admin", "exp": exp });
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+
+        // Baseline: the session resolves to the granted role.
+        let auth = admin_auth_from_token(&ctx, &token).await.expect("baseline");
+        assert_eq!(auth.role, Role::Moderator);
+
+        // SuperAdmin changes the role mid-session (revoke + re-grant is the
+        // role-change path — a second grant on an active role conflicts).
+        ctx.admin_role_manager
+            .revoke_role(did, "did:plc:superadmin", None)
+            .await
+            .expect("revoke for change");
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "did:plc:superadmin", None)
+            .await
+            .expect("re-grant elevated");
+
+        // Same token, next request: the new role is in effect immediately.
+        let auth = admin_auth_from_token(&ctx, &token)
+            .await
+            .expect("post-change");
+        assert_eq!(
+            auth.role,
+            Role::Admin,
+            "role change must take effect on next request without re-auth"
+        );
+
+        // Full revocation also takes effect immediately: next request 403s.
+        ctx.admin_role_manager
+            .revoke_role(did, "did:plc:superadmin", None)
+            .await
+            .expect("full revoke");
+        match admin_auth_from_token(&ctx, &token).await {
+            Err(PdsError::Authorization(_)) => {}
+            other => panic!("expected Authorization (403) after revoke, got {:?}", other),
+        }
+    }
+
+    // ---------- §8.1.7 operator-session enforcement in the auth path (#271) ----------
+
+    /// Mint an HS256 admin token carrying a `sid` claim, for the
+    /// operator-session enforcement tests below.
+    fn admin_token_with_sid(secret: &str, did: &str, sid: &str) -> String {
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let claims = serde_json::json!({
+            "sub": did,
+            "scope": "admin",
+            "exp": chrono::Utc::now().timestamp() + 3600,
+            "sid": sid,
+        });
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    /// A token bound to a live operator session authenticates, and the
+    /// per-request lookup bumps the session's last-active stamp.
+    #[traced_test]
+    #[tokio::test]
+    async fn admin_token_with_live_session_is_accepted() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let did = "did:plc:liveop";
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .expect("grant_role");
+        let sid = ctx
+            .operator_session_store
+            .create(did, Some("203.0.113.9"), None, "rid-1", chrono::Duration::days(30))
+            .await
+            .expect("create session");
+
+        let token = admin_token_with_sid(&ctx.config.authentication.jwt_secret, did, &sid);
+        let auth = admin_auth_from_token(&ctx, &token).await.expect("live session");
+        assert_eq!(auth.role, Role::Admin);
+        assert_eq!(auth.session.session_id, sid, "session_id reflects the sid");
+    }
+
+    /// The gate that backs SuperAdmin force-logout (#273): once a session is
+    /// revoked, a token bound to it is rejected on the very next request even
+    /// though its signature, scope, and role are all still valid.
+    #[traced_test]
+    #[tokio::test]
+    async fn admin_token_with_revoked_session_is_rejected() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let did = "did:plc:revokedop";
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .expect("grant_role");
+        let sid = ctx
+            .operator_session_store
+            .create(did, None, None, "rid-1", chrono::Duration::days(30))
+            .await
+            .expect("create session");
+        let token = admin_token_with_sid(&ctx.config.authentication.jwt_secret, did, &sid);
+
+        // Live first.
+        admin_auth_from_token(&ctx, &token).await.expect("live before revoke");
+
+        // Simulate the #273 force-logout writer.
+        sqlx::query("UPDATE operator_session SET revoked = TRUE WHERE id = $1")
+            .bind(&sid)
+            .execute(&ctx.account_db)
+            .await
+            .expect("revoke");
+
+        match admin_auth_from_token(&ctx, &token).await {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401) after revoke, got {:?}", other),
+        }
+    }
+
+    /// A token whose `sid` names no session row (stale/forged) is rejected —
+    /// the store returns false for an unknown id.
+    #[traced_test]
+    #[tokio::test]
+    async fn admin_token_with_unknown_session_is_rejected() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let did = "did:plc:ghostop";
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "did:plc:bootstrap", None)
+            .await
+            .expect("grant_role");
+        let token = admin_token_with_sid(
+            &ctx.config.authentication.jwt_secret,
+            did,
+            "00000000-0000-0000-0000-000000000000",
+        );
+        match admin_auth_from_token(&ctx, &token).await {
+            Err(PdsError::Authentication(_)) => {}
+            other => panic!("expected Authentication (401) for unknown sid, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod authenticated_did_tests {
+    use super::AuthenticatedDid;
+
+    #[test]
+    fn from_authenticated_round_trips() {
+        let d = AuthenticatedDid::from_authenticated("did:plc:abc123".to_string());
+        assert_eq!(d.value(), "did:plc:abc123");
+        // Accepts &str via Into.
+        let d2 = AuthenticatedDid::from_authenticated("did:plc:abc123");
+        assert_eq!(d, d2);
     }
 }

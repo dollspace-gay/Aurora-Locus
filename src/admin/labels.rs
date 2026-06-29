@@ -19,6 +19,33 @@ pub struct Label {
     pub sig: Option<Vec<u8>>,
 }
 
+/// Outcome of an apply-label attempt (§5.5.4 §2.4 / chainlink #345).
+///
+/// `issued` distinguishes a freshly inserted label from one that was
+/// already present (a non-negated label with the same `(uri, val)`) —
+/// the dedup signal the moderation-defaults consumer records as
+/// `applied: bool` in the `moderation_auto_label_applied` audit
+/// payload. Phase-A-minimal: existence is keyed on `(uri, val, neg=false)`
+/// only; richer dedup (carrying the prior `source`) is deferred to a
+/// later phase per the design's §3.8.
+#[derive(Debug, Clone)]
+pub struct LabelApplication {
+    pub label: Label,
+    /// `true` when this call inserted a new label row; `false` when a
+    /// matching non-negated label already existed (no row inserted —
+    /// the returned `label` is the pre-existing row).
+    pub issued: bool,
+    /// §5.5.4 §3.8 (Phase C, #347): when `issued == false`, the
+    /// `rule_id` of the pre-existing active label, or `None` if it was
+    /// not applied by an auto-label rule (manual / default-action /
+    /// pre-Phase-C row). Always `None` on a fresh issue.
+    pub existing_rule_id: Option<String>,
+    /// §3.8 provenance of the pre-existing active label
+    /// (`default_action | auto_label_rule | manual | stale_expiration`),
+    /// or `None` for pre-Phase-C rows. Always `None` on a fresh issue.
+    pub existing_source: Option<String>,
+}
+
 /// Label manager
 #[derive(Clone)]
 pub struct LabelManager {
@@ -41,6 +68,7 @@ impl LabelManager {
         expires_in: Option<chrono::Duration>,
     ) -> PdsResult<Label> {
         let mut tx = self.db.begin().await?;
+        // Pool-API manual apply — provenance is operator-driven.
         let label = Self::apply_label_in_tx(
             &mut tx,
             &self.server_did,
@@ -49,8 +77,11 @@ impl LabelManager {
             val,
             created_by,
             expires_in,
+            "manual",
+            None,
         )
-        .await?;
+        .await?
+        .label;
         tx.commit().await?;
         Ok(label)
     }
@@ -72,14 +103,61 @@ impl LabelManager {
         val: &str,
         created_by: &str,
         expires_in: Option<chrono::Duration>,
-    ) -> PdsResult<Label> {
+        // §5.5.4 §3.8 (Phase C): decision provenance for the label —
+        // `default_action | auto_label_rule | manual | stale_expiration`.
+        // Distinct from the `src` (labeling-authority DID) column.
+        source: &str,
+        // The auto-label rule that applied this label, when source is
+        // `auto_label_rule`; `None` otherwise.
+        rule_id: Option<&str>,
+    ) -> PdsResult<LabelApplication> {
+        // §2.4 dedup: an ACTIVE non-negated label with the same (uri,
+        // val) makes this apply a no-op — return the existing row with
+        // issued=false rather than inserting a duplicate. "Active" means
+        // not superseded by a later negation (label rows are append-only;
+        // a higher-id neg=TRUE row negates a prior neg=FALSE row), so a
+        // label that was applied, then removed/expired, then re-reported
+        // re-issues fresh (issued=true) rather than being suppressed. The
+        // moderation-defaults consumer reads `issued` for its audit
+        // `applied` field; manual callers ignore it via `.label`.
+        let existing = sqlx::query(
+            r#"
+            SELECT id, cid, src, created_at, created_by, expires_at, rule_id, source
+            FROM label l
+            WHERE l.uri = $1 AND l.val = $2 AND l.neg = FALSE
+              AND NOT EXISTS (
+                SELECT 1 FROM label n
+                WHERE n.uri = l.uri AND n.val = l.val AND n.neg = TRUE AND n.id > l.id
+              )
+            ORDER BY l.id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(uri)
+        .bind(val)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(row) = existing {
+            // §3.8: surface the pre-existing label's provenance so the
+            // auto-label dedup contract can attribute it. NULL on
+            // pre-Phase-C rows → None.
+            let existing_rule_id: Option<String> = row.try_get("rule_id").ok().flatten();
+            let existing_source: Option<String> = row.try_get("source").ok().flatten();
+            return Ok(LabelApplication {
+                label: Self::label_from_row(&row, uri, val, false)?,
+                issued: false,
+                existing_rule_id,
+                existing_source,
+            });
+        }
+
         let now = Utc::now();
         let expires_at = expires_in.map(|d| now + d);
 
         let id: i64 = sqlx::query_scalar(
             r#"
-            INSERT INTO label (uri, cid, val, neg, src, created_at, created_by, expires_at)
-            VALUES ($1, $2, $3, FALSE, $4, $5, $6, $7)
+            INSERT INTO label (uri, cid, val, neg, src, created_at, created_by, expires_at, source, rule_id)
+            VALUES ($1, $2, $3, FALSE, $4, $5, $6, $7, $8, $9)
             RETURNING id
             "#,
         )
@@ -90,18 +168,59 @@ impl LabelManager {
         .bind(now.to_rfc3339())
         .bind(created_by)
         .bind(expires_at.map(|dt| dt.to_rfc3339()))
+        .bind(source)
+        .bind(rule_id)
         .fetch_one(&mut **tx)
         .await?;
 
+        Ok(LabelApplication {
+            label: Label {
+                id,
+                uri: uri.to_string(),
+                cid: cid.map(String::from),
+                val: val.to_string(),
+                neg: false,
+                src: server_did.to_string(),
+                created_at: now,
+                created_by: created_by.to_string(),
+                expires_at,
+                sig: None,
+            },
+            issued: true,
+            existing_rule_id: None,
+            existing_source: None,
+        })
+    }
+
+    /// Reconstruct a [`Label`] from a fetched `label` row for the
+    /// dedup-hit path of [`apply_label_in_tx`]. `uri`/`val`/`neg` are
+    /// known from the query predicate and passed through verbatim.
+    fn label_from_row(
+        row: &sqlx::any::AnyRow,
+        uri: &str,
+        val: &str,
+        neg: bool,
+    ) -> PdsResult<Label> {
+        let parse_ts = |s: &str| {
+            DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| PdsError::Internal(e.to_string()))
+        };
+        let created_at_s: String = row.try_get("created_at")?;
+        let expires_at_s: Option<String> = row.try_get("expires_at").ok().flatten();
+        let expires_at = match expires_at_s {
+            Some(s) => Some(parse_ts(&s)?),
+            None => None,
+        };
         Ok(Label {
-            id,
+            id: row.try_get("id")?,
             uri: uri.to_string(),
-            cid: cid.map(String::from),
+            cid: row.try_get("cid").ok().flatten(),
             val: val.to_string(),
-            neg: false,
-            src: server_did.to_string(),
-            created_at: now,
-            created_by: created_by.to_string(),
+            neg,
+            src: row.try_get("src")?,
+            created_at: parse_ts(&created_at_s)?,
+            created_by: row.try_get("created_by")?,
             expires_at,
             sig: None,
         })
@@ -234,7 +353,9 @@ mod tests {
                 created_at TEXT NOT NULL,
                 created_by TEXT NOT NULL,
                 expires_at TEXT,
-                sig BLOB
+                sig BLOB,
+                rule_id TEXT,
+                source TEXT
             )",
         )
         .execute(&pool)
@@ -259,6 +380,8 @@ mod tests {
                 None,
                 "spam",
                 "did:plc:moderator",
+                None,
+                "manual",
                 None,
             )
             .await
@@ -288,9 +411,12 @@ mod tests {
             "spam",
             "did:plc:moderator",
             None,
+            "manual",
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .label;
         tx.commit().await.unwrap();
 
         assert_eq!(label.val, "spam");

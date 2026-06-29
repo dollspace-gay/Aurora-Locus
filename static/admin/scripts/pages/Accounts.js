@@ -14,6 +14,10 @@
     container.innerHTML = renderShell();
     bulkSelected = new Set();
     const search = container.querySelector('#account-search');
+    // url-state (§5.7.5): seed the search box from the hash query so a
+    // pasted/bookmarked #ops/accounts?q=… restores the filtered view.
+    const urlF = global.AuroraUrlState ? global.AuroraUrlState.read() : {};
+    if (search && urlF.q) search.value = urlF.q;
     if (search) search.addEventListener('input', debounce(refresh, 400));
     await refresh();
 
@@ -30,6 +34,7 @@
            '    <input type="text" class="search-input" id="account-search" placeholder="Search by handle, DID, or email">' +
            '  </div>' +
            '</header>' +
+           '<p class="filter-url-hint">' + (global.t ? global.t('common.search_in_url') : '') + '</p>' +
            '<div id="accounts-bulk-bar"></div>' +
            '<div class="table-card">' +
            '  <table class="data-table">' +
@@ -49,6 +54,10 @@
     if (!tbody) return;
     const search = document.getElementById('account-search');
     const q = search && search.value.trim();
+    // Sync the query into the URL without a remount (replaceState) — a
+    // remount would drop focus mid-typing in this live-search box. This is
+    // why Accounts uses replace() rather than the FilterStrip pages' write().
+    if (global.AuroraUrlState) global.AuroraUrlState.replace(q ? { q: q } : {});
     let accounts = [];
     try {
       const data = q
@@ -56,8 +65,12 @@
         : await ep.atproto.listAccounts({ limit: 100 });
       accounts = (data && (data.accounts || data.users)) || [];
     } catch (e) {
-      tbody.innerHTML = '<tr><td colspan="7"><p class="empty-state">Failed to load accounts: ' +
-                       (e && e.message ? e.message : 'unknown') + '</p></td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7"><div data-accounts-error></div></td></tr>';
+      const cell = tbody.querySelector('[data-accounts-error]');
+      global.AuroraErrorBoundary.mount(cell, {
+        message: 'Failed to load accounts: ' + ((e && e.message) || 'unknown'),
+        onRetry: refresh,
+      });
       return;
     }
 
@@ -73,7 +86,7 @@
 
     tbody.innerHTML = accounts.map((u) => {
       const status = u.status || 'active';
-      const created = global.AuroraFormat ? global.AuroraFormat.date(u.createdAt, 'short') : '';
+      const created = global.AuroraTimestamp.render({ value: u.createdAt, context: 'detail' });
       return '<tr>' +
              '<td><input type="checkbox" class="bulk-select-account" data-did="' + esc(u.did) +
              '"' + (bulkSelected.has(u.did) ? ' checked' : '') +
@@ -81,7 +94,7 @@
              '<td><a href="#ops/accounts/' + encodeURIComponent(u.did) + '">@' + esc(u.handle || 'unknown') + '</a></td>' +
              '<td><code>' + esc(global.AuroraEntityRef ? global.AuroraEntityRef.shortDid(u.did) : u.did) + '</code></td>' +
              '<td>' + esc(u.email || 'N/A') + '</td>' +
-             '<td>' + esc(created) + '</td>' +
+             '<td>' + created + '</td>' +
              '<td>' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(status, status) : status) + '</td>' +
              '<td><a class="btn-sm btn-primary" href="#ops/accounts/' + encodeURIComponent(u.did) + '">View</a></td>' +
              '</tr>';

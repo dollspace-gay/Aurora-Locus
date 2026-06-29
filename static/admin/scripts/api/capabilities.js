@@ -135,11 +135,12 @@
     }
   }
 
+  // §8.1.4 / #360 — route through the canonical builder in client.js (the
+  // single token-read path: AuroraSession → localStorage fallback) rather
+  // than carrying a divergent copy. Preserves the JSON Content-Type this
+  // module's capability calls expect.
   function authHeaders() {
-    const token = localStorage.getItem('adminToken');
-    const headers = { 'Content-Type': 'application/json' };
-    if (token) headers.Authorization = 'Bearer ' + token;
-    return headers;
+    return global.AuroraClient.authHeaders({ 'Content-Type': 'application/json' });
   }
 
   // Fetch fresh capabilities from the server. Returns a promise that

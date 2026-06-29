@@ -240,7 +240,6 @@ when the federation-crawl URL differs from the server's general public URL
 | `PDS_FEDERATION_RELAY_URLS` | `https://bsky.network` | comma-separated URLs | Relay server URLs. An empty list disables the relay loop entirely (federation may still be active for peer-PDS / entryway flows). |
 | `PDS_FEDERATION_FIREHOSE_ENABLED` | `false` | boolean | Enable the WebSocket firehose endpoint (`com.atproto.sync.subscribeRepos`). |
 | `PDS_FEDERATION_CRAWL_ENABLED` | `false` | boolean | Allow relays to crawl this PDS's repositories. |
-| `PDS_FEDERATION_AUTO_STREAM` | `false` | boolean | Auto-publish events to configured relays without explicit operator action. |
 | `PDS_PUBLIC_URL` | None | URL | Federation-specific public URL (must be internet-accessible if `PDS_FEDERATION_CRAWL_ENABLED=true`). |
 | `PDS_FEDERATION_PEER_PDS` | None | CSV of `did@url` pairs | Trusted peer-PDS allowlist. Malformed entries fail at startup (all-or-nothing). Joins the trusted-issuer allowlist for cross-PDS auth. |
 | `PDS_APPVIEW_URL` | None | URL | AppView URL for feed/profile proxying (e.g. `https://api.bsky.app`). |
@@ -321,7 +320,7 @@ For the per-key value formats accepted by runtime settings, see
 
 | Variable | Default | Accepted values | Purpose |
 |---|---|---|---|
-| `PDS_ENABLE_DEBUG_PAGES` | `false` | `true` / `1` to enable | Opt-in debug pages in the admin UI. **The debug pages render the bearer token visibly in the DOM — local-development only.** When disabled (default), the pages 404 on any non-localhost binding. |
+| `PDS_ENABLE_DEBUG_PAGES` | `false` | `true` / `1` to enable | Opt-in debug pages in the Aurora-Locus admin. **The debug pages render the bearer token visibly in the DOM — local-development only.** When disabled (default), the pages 404 on any non-localhost binding. |
 
 ## 23. Wire Deprecation & Moderation Retention
 

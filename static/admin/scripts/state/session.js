@@ -2,14 +2,48 @@
 // authentication and current-operator state moved from script.js
 // globals into an explicit state module with a small subscribe API.
 //
-// localStorage key: 'adminToken' (preserved from current build for
-// backward compat per §12.8); future migration to 'aurora-admin-token'
-// happens at app load time.
+// localStorage key: 'aurora-admin-token' (renamed from the legacy
+// 'adminToken' per §8.1.1 / recon §4.6). A one-time boot migration below
+// moves an existing legacy token to the new key so a session created
+// before the rename survives the upgrade. adminDid / adminRole are
+// separate keys and out of scope for this rename.
 
 (function (global) {
   'use strict';
 
-  const TOKEN_KEY = 'adminToken';
+  const TOKEN_KEY = 'aurora-admin-token';
+  const LEGACY_TOKEN_KEY = 'adminToken';
+  // Refresh-token store (§8.1.2 / #268). localStorage was the chosen
+  // strategy (see §8.1.2 doc note): same XSS-exfil surface the access
+  // token already has, documented as the accepted threat model, no
+  // httpOnly-cookie/backend-coordination cost. Consumed by
+  // api/client.js's silent refresh-on-401.
+  const REFRESH_KEY = 'aurora-admin-refresh-token';
+
+  // One-time token-key migration (§8.1.1). Runs at module load, before any
+  // consumer reads token() — session.js loads ahead of client.js,
+  // capabilities.js, and app.js in index.html. Read the legacy key, write
+  // it under the new key if the new key isn't already set, then drop the
+  // legacy key so the rename completes in a single visit.
+  (function migrateLegacyToken() {
+    try {
+      const legacy = localStorage.getItem(LEGACY_TOKEN_KEY);
+      if (legacy && !localStorage.getItem(TOKEN_KEY)) {
+        localStorage.setItem(TOKEN_KEY, legacy);
+      }
+      if (legacy != null) localStorage.removeItem(LEGACY_TOKEN_KEY);
+      // Same migration for the refresh token (§8.1.2 / #268): an operator
+      // who logged in via the legacy OAuth-callback page before the rename
+      // has a lingering 'adminRefreshToken'; move it to the canonical key
+      // so the new refresh-on-401 consumer finds it.
+      const legacyRefresh = localStorage.getItem('adminRefreshToken');
+      if (legacyRefresh && !localStorage.getItem(REFRESH_KEY)) {
+        localStorage.setItem(REFRESH_KEY, legacyRefresh);
+      }
+      if (legacyRefresh != null) localStorage.removeItem('adminRefreshToken');
+    } catch (e) { /* localStorage unavailable — nothing to migrate */ }
+  })();
+
   let currentUser = null;
   const subscribers = new Set();
 
@@ -21,6 +55,15 @@
     if (t) localStorage.setItem(TOKEN_KEY, t);
     else localStorage.removeItem(TOKEN_KEY);
     notify();
+  }
+
+  function refreshToken() {
+    return localStorage.getItem(REFRESH_KEY) || '';
+  }
+
+  function setRefreshToken(t) {
+    if (t) localStorage.setItem(REFRESH_KEY, t);
+    else localStorage.removeItem(REFRESH_KEY);
   }
 
   function user() {
@@ -66,6 +109,7 @@
 
   function logout() {
     setToken('');
+    setRefreshToken('');
     setUser(null);
     window.location.href = '/admin/login.html';
   }
@@ -73,6 +117,8 @@
   global.AuroraSession = {
     token: token,
     setToken: setToken,
+    refreshToken: refreshToken,
+    setRefreshToken: setRefreshToken,
     user: user,
     setUser: setUser,
     role: role,

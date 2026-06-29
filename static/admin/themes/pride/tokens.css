@@ -1,0 +1,54 @@
+/*
+ * pride — token overrides. Extends dark.
+ *
+ * A year-round shipping theme, not a Pride-month token. A LIGHT warm cream /
+ * parchment base — differentiated from aurora-classic's cyberpunk dark and from
+ * glacier's cold arctic light, and a celebratory warm canvas the structural
+ * rainbow (pride/effects.css) pops against. Three clearly-separated elevation
+ * tones (the v1 near-white was too bright and the cards didn't separate),
+ * warm-neutral dark text, a deep flag-pink accent, and a status palette redone
+ * for light surfaces. Buttons take a random rainbow fill per hover (the shim in
+ * PrideHover.js). Typography, sizing, motion, and the effect library are
+ * inherited from dark. Contrast is verified by the substrate WCAG gate.
+ */
+
+:root {
+  /* Surfaces — warm cream/parchment, widened elevation gaps so cards and
+   * modals separate clearly from the background. */
+  --color-surface-primary: #efe9dc;
+  --color-surface-secondary: #e5decc;
+  --color-surface-tertiary: #d8cfb8;
+  --color-surface-overlay: rgba(40, 30, 15, 0.45);
+
+  /* Text — warm-neutral dark on cream */
+  --color-text-primary: #2a2418;
+  --color-text-secondary: #5c5040;
+  --color-text-tertiary: #857b68;
+  --color-text-inverted: #ffffff;
+
+  /* Accent — deep flag-pink (the resting/fallback accent + focus border; the
+   * per-hover button fills come from the random-rainbow shim). */
+  --color-accent-primary: #cc1b6b;
+  --color-accent-primary-hover: #d9237a;
+  --color-accent-primary-active: #a8155a;
+  --color-accent-secondary: #857b68;
+
+  /* The flag-pink accent reads at 4.41:1 as body-sized link text on the cream
+   * surface — just under AA. Links override to deeper pinks that clear 4.5:1
+   * (5.95:1 / 8.0:1) without changing the button-fill accent above (#410). */
+  --color-link: #a8155a;
+  --color-link-hover: #851146;
+
+  /* Status — redone for the cream base (deepened so they clear contrast on the
+   * darker-than-white surfaces). */
+  --color-status-success: #1f7a3f;
+  --color-status-warning: #a8650d;
+  --color-status-danger: #c41e3a;
+  --color-status-info: #1b5394;
+
+  /* Borders — warm-gray hairlines, deepened to read on cream (rainbow borders
+   * are in effects.css). */
+  --color-border-primary: rgba(40, 30, 15, 0.16);
+  --color-border-secondary: rgba(40, 30, 15, 0.08);
+  --color-border-focus: var(--color-accent-primary);
+}

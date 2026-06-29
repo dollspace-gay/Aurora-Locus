@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub mod tasks;
 
@@ -96,25 +96,25 @@ impl JobScheduler {
         tokio::spawn(Self::metrics_collection_job(Arc::clone(&self)));
 
         // Spawn federation jobs (Phase 1)
-        if self.context.config.federation.enabled && self.context.pds_discovery.is_some() {
+        if self.context.federation_enabled && self.context.pds_discovery.is_some() {
             tokio::spawn(Self::pds_discovery_refresh_job(Arc::clone(&self)));
             info!("Federation discovery job started");
         }
 
         // Spawn relay firehose subscription job (Phase 3)
-        if self.context.config.federation.enabled && self.context.relay_client.is_some() {
+        if self.context.federation_enabled && self.context.relay_client.is_some() {
             tokio::spawn(Self::relay_firehose_subscription_job(Arc::clone(&self)));
             info!("Relay firehose subscription job started");
         }
 
         // Spawn nonce cleanup job (Phase 4)
-        if self.context.config.federation.enabled && self.context.nonce_store.is_some() {
+        if self.context.federation_enabled && self.context.nonce_store.is_some() {
             tokio::spawn(Self::nonce_cleanup_job(Arc::clone(&self)));
             info!("Nonce cleanup job started");
         }
 
         // Spawn DPoP nonce cleanup job (Phase 4)
-        if self.context.config.federation.enabled && self.context.dpop_nonce_store.is_some() {
+        if self.context.federation_enabled && self.context.dpop_nonce_store.is_some() {
             tokio::spawn(Self::dpop_nonce_cleanup_job(Arc::clone(&self)));
             info!("DPoP nonce cleanup job started");
         }
@@ -544,6 +544,29 @@ impl JobScheduler {
         loop {
             interval.tick().await;
 
+            // v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6 M-5): skip
+            // the scan while the boot-seed-failure flag is set — state-mutating
+            // discovery (pending upsert / auto-accept) would be incoherent with
+            // the refused operator mutation XRPCs.
+            if scheduler
+                .context
+                .boot_seed_failed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                debug!("Skipping discovery scan: boot_seed_failed flag is set");
+                continue;
+            }
+
+            // v0.9 Federation Pattern-1 Phase C (#353 / design §3.2): read the
+            // discovery mode once at scan-start. `discovery-disabled` skips the
+            // scan entirely (no fetch, no scheduled_discovery_ran audit).
+            let mode =
+                crate::api::federation_discovery::current_mode(&scheduler.context).await;
+            if mode == crate::api::federation_discovery::DiscoveryMode::DiscoveryDisabled {
+                debug!("Discovery mode is discovery-disabled; skipping scheduled scan");
+                continue;
+            }
+
             if let Some(discovery) = &scheduler.context.pds_discovery {
                 info!("Running PDS discovery refresh");
 
@@ -551,6 +574,15 @@ impl JobScheduler {
                     Ok(_) => {
                         let instances = discovery.get_known_instances().await;
                         info!("PDS discovery: {} instance(s) found", instances.len());
+                        // Mode-aware per-peer processing + scheduled_discovery_ran
+                        // audit (the scan_id is generated inside process_scan).
+                        crate::api::federation_discovery::process_scan(
+                            &scheduler.context,
+                            &instances,
+                            mode,
+                            true,
+                        )
+                        .await;
                     }
                     Err(e) => error!("Failed to refresh PDS instances: {}", e),
                 }

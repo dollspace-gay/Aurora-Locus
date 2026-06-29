@@ -3,9 +3,12 @@
 //! Provides high-level interface for interacting with the PLC directory,
 //! including fetching DID documents, comparing keys, and updating signing keys.
 
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+
 use crate::identity::did_document::DidDocument;
 use crate::{
-    crypto::plc::{register_plc_did, PlcOperationBuilder, PlcSigner},
+    crypto::plc::{register_plc_did, PlcOperation, PlcOperationBuilder, PlcSigner, ServiceEntry},
     error::{PdsError, PdsResult},
 };
 
@@ -33,6 +36,110 @@ impl Default for PlcClientConfig {
 pub struct PlcClient {
     config: PlcClientConfig,
     http_client: reqwest::Client,
+}
+
+/// One accepted PLC operation in a DID's signing-key history (key-rotation arc
+/// #366 Phase A1). The full ordered list (from [`PlcClient::get_op_history`]) is
+/// the canonical key history the history-aware verifier resolves each commit's
+/// signing key against.
+///
+/// `op_cid` is kept as a `String` to match [`PlcClient::get_last_op`]'s CID
+/// convention (the design's `Cid` placeholder is not load-bearing — the windowing
+/// in Phase A2 keys off `accepted_at` + `signing_did_key`). `accepted_at` is the
+/// operation's `createdAt`, which is the validity-window boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlcOpHistoryEntry {
+    /// CID of the PLC operation.
+    pub op_cid: String,
+    /// The operation's accepted-at timestamp (`createdAt`) — the validity-window
+    /// boundary for the key this operation publishes.
+    pub accepted_at: DateTime<Utc>,
+    /// The `atproto` signing key this operation publishes, in did:key form.
+    pub signing_did_key: String,
+}
+
+/// Parse a PLC `/log/audit` response array into the ordered signing-key history.
+///
+/// Pure (no I/O) so the parse contract is unit-testable without an HTTP layer.
+/// The audit-log shape (per `@did-plc/lib`, documented at `get_last_op`) is an
+/// oldest-first array of `{cid, did, operation, nullified, createdAt}`; this
+/// function is the multi-entry generalization of `get_last_op`'s per-entry
+/// extraction (which already iterates the full array reading `nullified`, so the
+/// homogeneous-entry shape is established by the existing parser, not assumed).
+///
+/// Skips nullified entries and tombstone operations (no `atproto` key). Fails
+/// closed (`PdsError::IdentityResolution`) on a malformed entry rather than
+/// silently dropping it — an incomplete history would resolve commits against the
+/// wrong key in Phase A2.
+fn parse_op_history(did: &str, entries: &[serde_json::Value]) -> PdsResult<Vec<PlcOpHistoryEntry>> {
+    let mut history = Vec::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        // Skip nullified (rejected) ops — accepted history only.
+        if entry.get("nullified").and_then(|n| n.as_bool()).unwrap_or(false) {
+            continue;
+        }
+
+        let created_at_str = entry.get("createdAt").and_then(|v| v.as_str()).ok_or_else(|| {
+            PdsError::IdentityResolution(format!(
+                "PLC audit-log entry {} for {} missing createdAt",
+                idx, did
+            ))
+        })?;
+        let accepted_at = DateTime::parse_from_rfc3339(created_at_str)
+            .map_err(|e| {
+                PdsError::IdentityResolution(format!(
+                    "PLC audit-log entry {} for {} has unparseable createdAt '{}': {}",
+                    idx, did, created_at_str, e
+                ))
+            })?
+            .with_timezone(&Utc);
+
+        let op_cid = entry
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                PdsError::IdentityResolution(format!(
+                    "PLC audit-log entry {} for {} missing cid",
+                    idx, did
+                ))
+            })?
+            .to_string();
+
+        let op_value = entry.get("operation").ok_or_else(|| {
+            PdsError::IdentityResolution(format!(
+                "PLC audit-log entry {} for {} missing operation",
+                idx, did
+            ))
+        })?;
+
+        // A tombstone op publishes no signing key — it terminates the DID; skip
+        // it (the windows before it stand). Detect by type before the full parse
+        // so a tombstone's shape never trips the parse-fail-closed path.
+        if op_value.get("type").and_then(|v| v.as_str()) == Some("plc_tombstone") {
+            continue;
+        }
+
+        let op: PlcOperation = serde_json::from_value(op_value.clone()).map_err(|e| {
+            PdsError::IdentityResolution(format!(
+                "PLC audit-log entry {} for {}: unparseable operation: {}",
+                idx, did, e
+            ))
+        })?;
+
+        let signing_did_key = op.verification_methods.get("atproto").ok_or_else(|| {
+            PdsError::IdentityResolution(format!(
+                "PLC audit-log entry {} for {}: operation has no atproto verification method",
+                idx, did
+            ))
+        })?;
+
+        history.push(PlcOpHistoryEntry {
+            op_cid,
+            accepted_at,
+            signing_did_key: signing_did_key.clone(),
+        });
+    }
+    Ok(history)
 }
 
 impl PlcClient {
@@ -151,6 +258,59 @@ impl PlcClient {
         Ok((op, cid))
     }
 
+    /// Fetch the full ordered history of accepted PLC operations for `did` from
+    /// the directory's audit log (Arc 13 / key-rotation arc #366 Phase A1).
+    ///
+    /// Where [`Self::get_last_op`] returns only the last accepted entry, this
+    /// returns every accepted (non-nullified) operation that publishes an
+    /// `atproto` signing key, oldest-first — the key history a commit chain that
+    /// spans rotations must be verified against (consumed by Phase A2's
+    /// history-aware verifier).
+    ///
+    /// Each entry carries the operation CID, its `createdAt` timestamp (the
+    /// validity-window boundary), and the `atproto` signing key did:key the
+    /// operation publishes. Tombstone operations (no `atproto` key) and
+    /// nullified entries are skipped.
+    ///
+    /// Errors (`PdsError::IdentityResolution`): network failure, non-2xx from the
+    /// directory, malformed audit-log JSON.
+    pub async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>> {
+        if !did.starts_with("did:plc:") {
+            return Err(PdsError::Validation(
+                "Only did:plc identifiers are supported".to_string(),
+            ));
+        }
+
+        let url = format!(
+            "{}/{}/log/audit",
+            self.config.plc_url.trim_end_matches('/'),
+            did
+        );
+
+        let response = self.http_client.get(&url).send().await.map_err(|e| {
+            PdsError::IdentityResolution(format!("Failed to fetch PLC audit log: {}", e))
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(PdsError::IdentityResolution(format!(
+                "PLC audit log returned error {}: {}",
+                status, error_body
+            )));
+        }
+
+        let entries: Vec<serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| PdsError::IdentityResolution(format!("Invalid PLC audit log JSON: {}", e)))?;
+
+        parse_op_history(did, &entries)
+    }
+
     /// Fetch DID document from PLC directory
     pub async fn get_document(&self, did: &str) -> PdsResult<DidDocument> {
         if !did.starts_with("did:plc:") {
@@ -261,39 +421,314 @@ impl PlcClient {
         Ok(())
     }
 
-    /// Check if key rotation is needed
+    /// v0.9 Federation runtime-mutability arc §2.3 (#399) — publish a
+    /// service-endpoint update to the PLC directory, re-pointing the account's
+    /// `AtprotoPersonalDataServer` service at `new_endpoint`. Used by the
+    /// post-restart bulk did:plc update (Phase E2) after a `service.public_url`
+    /// change.
     ///
-    /// Compares current PLC key with desired key
-    pub async fn needs_rotation(&self, did: &str, desired_key: &str) -> PdsResult<bool> {
-        let doc = self.get_document(did).await?;
-        let current_key = self.get_signing_key(&doc)?;
+    /// Signed with the PDS-wide rotation key (`plc_rotation_key`), NOT a
+    /// per-account rotation key — that column was dropped in migration 0009
+    /// (LB-2). Mirrors [`update_signing_key`](Self::update_signing_key): a diff
+    /// op carrying only the `atproto_pds` service. (Like `update_signing_key`,
+    /// this operates against a weak-mode directory; the snapshot-mutator refactor
+    /// that carries all fields forward is the same future Arc 13 Step 1.2 work
+    /// both methods await.)
+    pub async fn update_service_endpoint(
+        &self,
+        did: &str,
+        new_endpoint: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        // Fetch current doc (mirrors update_signing_key; prev handling matches —
+        // left to the directory pending the snapshot-mutator refactor).
+        let _current_doc = self.get_document(did).await?;
 
-        Ok(!self.keys_match(&current_key, desired_key))
+        // Diff op: only the atproto_pds service, with the new endpoint. The
+        // service key is `atproto_pds`; the type is `AtprotoPersonalDataServer`.
+        let mut services = std::collections::BTreeMap::new();
+        services.insert(
+            "atproto_pds".to_string(),
+            ServiceEntry {
+                type_: "AtprotoPersonalDataServer".to_string(),
+                endpoint: new_endpoint.to_string(),
+            },
+        );
+        let operation = PlcOperationBuilder::new().services(services).build()?;
+
+        // Sign with the PDS-wide rotation key and submit.
+        let signed_operation = rotation_key_signer.sign_operation(operation)?;
+        register_plc_did(&self.config.plc_url, did, signed_operation).await?;
+
+        tracing::info!(did = %did, endpoint = %new_endpoint, "Successfully updated service endpoint in PLC directory");
+
+        Ok(())
     }
 
-    /// Rotate signing key if needed
-    ///
-    /// Convenience method that checks if rotation is needed and performs it
-    pub async fn rotate_key_if_needed(
+    // `needs_rotation` + `rotate_key_if_needed` were removed in B4 (#375): the
+    // CLI was their sole consumer, and the B4 reshape replaced that
+    // rotate-if-needed flow with the explicit no-op check + per-account-key
+    // publish that mirrors the admin handler. The current-vs-desired comparison
+    // they provided is now done inline via get_document/get_signing_key/keys_match.
+}
+
+/// The PLC-directory operations that rotation + rebuild flows reach through
+/// `AppContext` (key-rotation arc #372 / B1). Behind a trait so unit tests can
+/// substitute [`MockPlcClient`]. `PlcClient` is the production impl; `AppContext`
+/// holds `Arc<dyn PlcClientApi>`.
+///
+/// Only the ctx-reached methods are here. `PlcClient`'s other inherent methods
+/// (e.g. `get_last_op`) stay inherent for the ad-hoc callers (identity /
+/// dev_routes) that hold a concrete `PlcClient`.
+#[async_trait]
+pub trait PlcClientApi: Send + Sync {
+    async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>>;
+    async fn get_document(&self, did: &str) -> PdsResult<DidDocument>;
+    fn get_signing_key(&self, doc: &DidDocument) -> PdsResult<String>;
+    fn keys_match(&self, key1: &str, key2: &str) -> bool;
+    async fn update_signing_key(
         &self,
         did: &str,
         new_signing_key: &str,
         rotation_key_signer: &PlcSigner,
-    ) -> PdsResult<bool> {
-        if !self.needs_rotation(did, new_signing_key).await? {
-            tracing::debug!(did = %did, "Key rotation not needed - keys match");
-            return Ok(false);
-        }
+    ) -> PdsResult<()>;
+    /// v0.9 Federation runtime-mutability arc §2.3 (#399) — re-point the PDS
+    /// service endpoint. Composed by Phase E2's bulk did:plc update via
+    /// `ctx.plc_client`.
+    async fn update_service_endpoint(
+        &self,
+        did: &str,
+        new_endpoint: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()>;
+}
 
-        self.update_signing_key(did, new_signing_key, rotation_key_signer)
-            .await?;
-        Ok(true)
+#[async_trait]
+impl PlcClientApi for PlcClient {
+    async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>> {
+        // Fully-qualified to call the inherent method (not recurse into the trait).
+        PlcClient::get_op_history(self, did).await
     }
+    async fn get_document(&self, did: &str) -> PdsResult<DidDocument> {
+        PlcClient::get_document(self, did).await
+    }
+    fn get_signing_key(&self, doc: &DidDocument) -> PdsResult<String> {
+        PlcClient::get_signing_key(self, doc)
+    }
+    fn keys_match(&self, key1: &str, key2: &str) -> bool {
+        PlcClient::keys_match(self, key1, key2)
+    }
+    async fn update_signing_key(
+        &self,
+        did: &str,
+        new_signing_key: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        PlcClient::update_signing_key(self, did, new_signing_key, rotation_key_signer).await
+    }
+    async fn update_service_endpoint(
+        &self,
+        did: &str,
+        new_endpoint: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        PlcClient::update_service_endpoint(self, did, new_endpoint, rotation_key_signer).await
+    }
+}
+
+/// Test-only mock of [`PlcClientApi`] (key-rotation arc #372 / B1, extended B3
+/// / #374). Returns pre-configured op-histories and, for the rotation
+/// write-path, a pre-configured current signing key per DID (so the no-op
+/// short-circuit comparison and the published-key flow can be exercised without
+/// a live PLC). Tests inject it by reassigning `AppContext::plc_client` (a `pub`
+/// field).
+#[cfg(test)]
+pub(crate) struct MockPlcClient {
+    // Interior-mutable (Mutex) so `update_signing_key` — which the trait gives
+    // `&self` — can record the published key + append to op-history, letting
+    // round-trip tests (#376 / C1) observe rotations accumulate across mixed
+    // entry points without a live PLC.
+    op_histories: std::sync::Mutex<std::collections::HashMap<String, Vec<PlcOpHistoryEntry>>>,
+    /// Per-DID current signing key in multibase form (the bare `z...`, no
+    /// `did:key:` prefix) — what `get_document` + `get_signing_key` surface.
+    current_signing_keys: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Per-DID last published service endpoint (#399) — what
+    /// `update_service_endpoint` records, so bulk-update tests can observe the
+    /// re-point without a live PLC.
+    published_service_endpoints: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+#[cfg(test)]
+impl MockPlcClient {
+    pub(crate) fn new() -> Self {
+        Self {
+            op_histories: std::sync::Mutex::new(std::collections::HashMap::new()),
+            current_signing_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
+            published_service_endpoints: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The endpoint last published for `did` via `update_service_endpoint`
+    /// (#399), or `None` if the bulk update never touched it.
+    pub(crate) fn published_service_endpoint(&self, did: &str) -> Option<String> {
+        self.published_service_endpoints
+            .lock()
+            .unwrap()
+            .get(did)
+            .cloned()
+    }
+    pub(crate) fn with_op_history(self, did: &str, history: Vec<PlcOpHistoryEntry>) -> Self {
+        self.op_histories
+            .lock()
+            .unwrap()
+            .insert(did.to_string(), history);
+        self
+    }
+    /// Configure the DID's currently-published signing key. Accepts either
+    /// `did:key:z...` or bare `z...`; stored as the bare multibase form that
+    /// `get_signing_key` surfaces.
+    pub(crate) fn with_current_signing_key(self, did: &str, key: &str) -> Self {
+        let multibase = key.strip_prefix("did:key:").unwrap_or(key).to_string();
+        self.current_signing_keys
+            .lock()
+            .unwrap()
+            .insert(did.to_string(), multibase);
+        self
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl PlcClientApi for MockPlcClient {
+    async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>> {
+        self.op_histories
+            .lock()
+            .unwrap()
+            .get(did)
+            .cloned()
+            .ok_or_else(|| PdsError::NotFound(format!("mock: no op history configured for {did}")))
+    }
+    async fn get_document(&self, did: &str) -> PdsResult<DidDocument> {
+        let multibase = self
+            .current_signing_keys
+            .lock()
+            .unwrap()
+            .get(did)
+            .cloned()
+            .ok_or_else(|| {
+                PdsError::Internal(format!("mock: no current signing key configured for {did}"))
+            })?;
+        Ok(DidDocument {
+            context: None,
+            id: did.to_string(),
+            also_known_as: vec![],
+            service: vec![],
+            verification_method: vec![crate::identity::did_document::VerificationMethod {
+                id: format!("{did}#atproto"),
+                key_type: "Multikey".to_string(),
+                controller: did.to_string(),
+                public_key_multibase: Some(multibase),
+            }],
+        })
+    }
+    fn get_signing_key(&self, doc: &DidDocument) -> PdsResult<String> {
+        doc.verification_method
+            .iter()
+            .find_map(|m| m.public_key_multibase.clone())
+            .ok_or_else(|| {
+                PdsError::IdentityResolution("mock: no signing key in document".to_string())
+            })
+    }
+    fn keys_match(&self, key1: &str, key2: &str) -> bool {
+        key1 == key2
+    }
+    async fn update_signing_key(
+        &self,
+        did: &str,
+        new_signing_key: &str,
+        _rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        // Record the new published key (what get_document/get_signing_key now
+        // surface) and append a history entry so get_op_history reflects the
+        // rotation. accepted_at is a synthetic monotonic stamp (base + N hours,
+        // N = prior history length) so accumulated entries stay strictly ordered.
+        let multibase = new_signing_key
+            .strip_prefix("did:key:")
+            .unwrap_or(new_signing_key)
+            .to_string();
+        self.current_signing_keys
+            .lock()
+            .unwrap()
+            .insert(did.to_string(), multibase);
+        let mut histories = self.op_histories.lock().unwrap();
+        let entry_vec = histories.entry(did.to_string()).or_default();
+        let n = entry_vec.len() as i64;
+        let base = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("static base timestamp")
+            .with_timezone(&Utc);
+        entry_vec.push(PlcOpHistoryEntry {
+            op_cid: format!("bafymock-append-{did}-{n}"),
+            accepted_at: base + chrono::Duration::hours(n),
+            signing_did_key: new_signing_key.to_string(),
+        });
+        Ok(())
+    }
+    async fn update_service_endpoint(
+        &self,
+        did: &str,
+        new_endpoint: &str,
+        _rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        // Record the published endpoint so bulk-update tests can assert the
+        // re-point happened (no live PLC, no network).
+        self.published_service_endpoints
+            .lock()
+            .unwrap()
+            .insert(did.to_string(), new_endpoint.to_string());
+        Ok(())
+    }
+}
+
+/// Build a mock PLC op-history from `(signing_did_key, accepted_at_rfc3339)`
+/// pairs, ascending. CIDs are test-fake (derived from the key string).
+#[cfg(test)]
+pub(crate) fn mock_op_history(entries: &[(&str, &str)]) -> Vec<PlcOpHistoryEntry> {
+    entries
+        .iter()
+        .map(|(key, at)| PlcOpHistoryEntry {
+            op_cid: format!("bafymock-{key}"),
+            accepted_at: DateTime::parse_from_rfc3339(at)
+                .expect("test op-history timestamp is valid RFC3339")
+                .with_timezone(&Utc),
+            signing_did_key: (*key).to_string(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mock_plc_client_returns_configured_op_history() {
+        let mock = MockPlcClient::new().with_op_history(
+            "did:plc:a",
+            mock_op_history(&[
+                ("did:key:zK1", "2026-01-01T00:00:00Z"),
+                ("did:key:zK2", "2026-02-01T00:00:00Z"),
+            ]),
+        );
+        // Exercise through the trait object (the shape AppContext uses).
+        let api: &dyn PlcClientApi = &mock;
+        let h = api.get_op_history("did:plc:a").await.unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].signing_did_key, "did:key:zK1");
+        assert!(h[0].accepted_at < h[1].accepted_at);
+        assert!(
+            api.get_op_history("did:plc:unconfigured").await.is_err(),
+            "unconfigured DID errors (no silent empty history)"
+        );
+    }
 
     #[test]
     fn test_plc_client_creation() {
@@ -330,5 +765,127 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("did:plc"));
+    }
+
+    // ---- parse_op_history (Phase A1 / #367) ----
+
+    /// Build one audit-log entry. A `None` atproto key produces a tombstone op.
+    fn audit_entry(cid: &str, created_at: &str, atproto: Option<&str>, nullified: bool) -> serde_json::Value {
+        let operation = match atproto {
+            Some(key) => serde_json::json!({
+                "type": "plc_operation",
+                "rotationKeys": ["did:key:zRotation"],
+                "verificationMethods": { "atproto": key },
+                "alsoKnownAs": ["at://alice.example"],
+                "services": {},
+            }),
+            None => serde_json::json!({
+                "type": "plc_tombstone",
+                "rotationKeys": [],
+                "verificationMethods": {},
+                "alsoKnownAs": [],
+                "services": {},
+            }),
+        };
+        serde_json::json!({
+            "cid": cid,
+            "did": "did:plc:alice",
+            "operation": operation,
+            "nullified": nullified,
+            "createdAt": created_at,
+        })
+    }
+
+    #[test]
+    fn parse_op_history_single_entry() {
+        let entries = vec![audit_entry("cidA", "2026-01-01T00:00:00Z", Some("did:key:zK1"), false)];
+        let h = parse_op_history("did:plc:alice", &entries).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].op_cid, "cidA");
+        assert_eq!(h[0].signing_did_key, "did:key:zK1");
+        assert_eq!(h[0].accepted_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_op_history_three_entries_ascending() {
+        // PLC returns oldest-first; we preserve that order.
+        let entries = vec![
+            audit_entry("cid1", "2026-01-01T00:00:00Z", Some("did:key:zK1"), false),
+            audit_entry("cid2", "2026-02-01T00:00:00Z", Some("did:key:zK2"), false),
+            audit_entry("cid3", "2026-03-01T00:00:00Z", Some("did:key:zK3"), false),
+        ];
+        let h = parse_op_history("did:plc:alice", &entries).unwrap();
+        assert_eq!(h.len(), 3);
+        assert_eq!(
+            h.iter().map(|e| e.signing_did_key.as_str()).collect::<Vec<_>>(),
+            vec!["did:key:zK1", "did:key:zK2", "did:key:zK3"]
+        );
+        assert!(h[0].accepted_at < h[1].accepted_at && h[1].accepted_at < h[2].accepted_at);
+    }
+
+    #[test]
+    fn parse_op_history_skips_nullified() {
+        let entries = vec![
+            audit_entry("cid1", "2026-01-01T00:00:00Z", Some("did:key:zK1"), false),
+            audit_entry("cidX", "2026-01-15T00:00:00Z", Some("did:key:zBad"), true), // rejected
+            audit_entry("cid2", "2026-02-01T00:00:00Z", Some("did:key:zK2"), false),
+        ];
+        let h = parse_op_history("did:plc:alice", &entries).unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].signing_did_key, "did:key:zK1");
+        assert_eq!(h[1].signing_did_key, "did:key:zK2");
+    }
+
+    #[test]
+    fn parse_op_history_skips_tombstone() {
+        let entries = vec![
+            audit_entry("cid1", "2026-01-01T00:00:00Z", Some("did:key:zK1"), false),
+            audit_entry("cidT", "2026-02-01T00:00:00Z", None, false), // tombstone
+        ];
+        let h = parse_op_history("did:plc:alice", &entries).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].signing_did_key, "did:key:zK1");
+    }
+
+    #[test]
+    fn parse_op_history_fails_closed_on_bad_timestamp() {
+        let entries = vec![audit_entry("cidA", "not-a-timestamp", Some("did:key:zK1"), false)];
+        let err = parse_op_history("did:plc:alice", &entries).unwrap_err();
+        assert!(err.to_string().contains("createdAt"));
+    }
+
+    #[test]
+    fn parse_op_history_fails_closed_on_missing_cid() {
+        let mut e = audit_entry("cidA", "2026-01-01T00:00:00Z", Some("did:key:zK1"), false);
+        e.as_object_mut().unwrap().remove("cid");
+        let err = parse_op_history("did:plc:alice", &[e]).unwrap_err();
+        assert!(err.to_string().contains("cid"));
+    }
+
+    #[test]
+    fn parse_op_history_empty_array_is_empty_history() {
+        let h = parse_op_history("did:plc:alice", &[]).unwrap();
+        assert!(h.is_empty());
+    }
+
+    // v0.9 Federation runtime-mutability arc §2.3 (#399) — update_service_endpoint
+    // via the trait double (no live PLC). The mock ignores the signer, so any
+    // valid PlcSigner suffices (scalar 1).
+    #[tokio::test]
+    async fn mock_update_service_endpoint_records_publish() {
+        let signer = PlcSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let mock = MockPlcClient::new();
+        assert!(mock.published_service_endpoint("did:plc:x").is_none());
+        PlcClientApi::update_service_endpoint(&mock, "did:plc:x", "https://new.example.com", &signer)
+            .await
+            .unwrap();
+        assert_eq!(
+            mock.published_service_endpoint("did:plc:x").as_deref(),
+            Some("https://new.example.com"),
+            "mock recorded the re-pointed endpoint"
+        );
     }
 }

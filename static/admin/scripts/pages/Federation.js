@@ -10,14 +10,14 @@
     container.innerHTML =
       '<nav class="breadcrumb"><a href="#dashboard">Operations</a> <span class="breadcrumb-sep">›</span> Federation</nav>' +
       '<header class="page-header"><div><h2>Federation</h2><p class="page-subtitle">Relays, peers, federation activity</p></div></header>' +
-      '<div class="ops-section" id="fed-relay"><h3>Relay configuration</h3><p class="empty-state">Loading…</p></div>' +
-      '<div class="ops-section" id="fed-status"><h3>Federation status</h3><p class="empty-state">Loading…</p></div>' +
-      '<div class="ops-section" id="fed-peers"><h3>Known instances</h3><p class="empty-state">Loading…</p></div>' +
+      '<div class="ops-section" id="fed-relay"><h3>Relay configuration</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '<div class="ops-section" id="fed-status"><h3>Federation status</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
+      '<div class="ops-section" id="fed-peers"><h3>Known instances</h3>' + global.AuroraSkeleton.lines(3) + '</div>' +
       '<div class="ops-section">' +
       '  <h3>Controls</h3>' +
       '  <button class="btn-secondary" id="fed-discover">Trigger discovery</button>' +
       '</div>';
-    document.getElementById('fed-discover').addEventListener('click', triggerDiscovery);
+    document.getElementById('fed-discover').addEventListener('click', (e) => triggerDiscovery(e.currentTarget));
     await refresh();
     pollHandle = setInterval(refresh, 60_000);
     return { unmount: () => { if (pollHandle) clearInterval(pollHandle); pollHandle = null; } };
@@ -37,7 +37,7 @@
       document.getElementById('fed-status').innerHTML = '<h3>Federation status</h3>' +
         '<p><strong>Peer count:</strong> ' + esc(status.peerCount || 0) + '</p>' +
         '<p><strong>Recent events:</strong> ' + esc(status.recentEventCount || 0) + '</p>' +
-        '<p><strong>Last activity:</strong> ' + esc(status.lastActivityAt ? (global.AuroraFormat ? global.AuroraFormat.relativeTime(status.lastActivityAt) : status.lastActivityAt) : '—') + '</p>';
+        '<p><strong>Last activity:</strong> ' + global.AuroraTimestamp.render({ value: status.lastActivityAt, context: 'activity' }) + '</p>';
     } catch (e) {
       document.getElementById('fed-status').innerHTML = '<h3>Federation status</h3><p class="empty-state">Unavailable.</p>';
     }
@@ -54,7 +54,7 @@
         '<table class="data-table"><thead><tr><th>Hostname</th><th>Last seen</th><th>Status</th></tr></thead><tbody>' +
         items.map((i) => '<tr>' +
           '<td>' + esc(i.hostname || i.url) + '</td>' +
-          '<td>' + esc(i.lastSeenAt ? (fmt ? fmt.relativeTime(i.lastSeenAt) : i.lastSeenAt) : '—') + '</td>' +
+          '<td>' + global.AuroraTimestamp.render({ value: i.lastSeenAt, context: 'activity' }) + '</td>' +
           '<td>' + (global.AuroraStatusBadge ? global.AuroraStatusBadge.render(i.status || 'active', i.status || 'active') : '') + '</td>' +
           '</tr>').join('') +
         '</tbody></table>';
@@ -63,9 +63,9 @@
     }
   }
 
-  async function triggerDiscovery() {
+  async function triggerDiscovery(btn) {
     try {
-      await global.AuroraClient.post('tools.aurora.ops.triggerPdsDiscovery', {});
+      await global.AuroraSpinner.busy(btn, () => global.AuroraEndpoints.ops.triggerPdsDiscovery());
       global.AuroraToast.success('Discovery triggered.');
       await refresh();
     } catch (e) {

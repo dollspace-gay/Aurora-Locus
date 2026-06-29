@@ -20,6 +20,7 @@ pub mod nonce_store;
 pub mod relay;
 pub mod search;
 pub mod service_auth;
+pub mod trusted_peer_set;
 
 pub use discovery::PdsInstance;
 pub use entryway::{EntrywayAdminClient, EntrywayClient};

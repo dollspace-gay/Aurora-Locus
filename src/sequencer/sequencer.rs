@@ -3,7 +3,7 @@ use crate::{
     error::{PdsError, PdsResult},
     federation::RelayClient,
     sequencer::{
-        events::{AccountEvent, CommitEvent, IdentityEvent, SyncEvent},
+        events::{AccountEvent, CommitEvent, IdentityEvent, OpAction, SyncEvent},
         EventType, SeqEvent, SeqRow,
     },
 };
@@ -556,6 +556,318 @@ impl Sequencer {
 
         Ok(events)
     }
+
+    /// Ascending page of a DID's commit events after `after_seq` (exclusive),
+    /// for the rebuild reconstruction walk (#289). Returns the decoded commit
+    /// events plus the highest `seq` EXAMINED in the page (commit or not) — the
+    /// caller advances its cursor by that so a page consisting only of
+    /// non-commit events (account/identity/sync) doesn't stall the walk.
+    /// `last_seq == None` means the page was empty (end of history). Skips
+    /// invalidated events. `limit` defaults to (and is capped at)
+    /// `max_query_limit`.
+    pub async fn commit_events_after(
+        &self,
+        did: &str,
+        after_seq: i64,
+        limit: Option<i64>,
+    ) -> PdsResult<(Vec<(i64, CommitEvent)>, Option<i64>)> {
+        let limit = limit
+            .unwrap_or(self.config.max_query_limit)
+            .min(self.config.max_query_limit);
+        let rows = sqlx::query(
+            r#"
+            SELECT seq, did, event_type, event, invalidated, sequenced_at
+            FROM repo_seq
+            WHERE did = $1 AND seq > $2 AND NOT invalidated
+            ORDER BY seq ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(did)
+        .bind(after_seq)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        let mut out = Vec::new();
+        let mut last_seq = None;
+        for row in rows {
+            let seq_row = self.row_to_seq_row(row)?;
+            let seq = seq_row.seq;
+            last_seq = Some(seq);
+            if let Some(SeqEvent::Commit { evt, .. }) = self.decode_event(seq_row)? {
+                out.push((seq, evt));
+            }
+        }
+        Ok((out, last_seq))
+    }
+
+    /// Rebuild preflight summary (§7.4.1 / #286): walk the account's FULL commit
+    /// history ascending and aggregate what a rebuild would reconstruct, without
+    /// touching repo state. Non-destructive — the `preRebuildCheck` operator
+    /// sanity-check reads this before a rebuild is triggered.
+    ///
+    /// Pages internally by `seq` (the per-DID history can exceed
+    /// `max_query_limit`, so a single `get_events_for_did` won't cover it). The
+    /// net record count is `Σ create − Σ delete` over every commit op — the live
+    /// record count a faithful replay would land, derived from event metadata
+    /// alone (no block/MST reconstruction; that's #287's job, where it's
+    /// consumed by the swap). Returns `None` when the account has no
+    /// (non-invalidated) commit events — nothing to rebuild.
+    pub async fn rebuild_preflight(&self, did: &str) -> PdsResult<Option<RebuildPreflight>> {
+        let mut cursor = 0i64;
+        let mut commit_count: u64 = 0;
+        let mut creates: u64 = 0;
+        let mut deletes: u64 = 0;
+        let mut head_commit_cid = String::new();
+        let mut head_rev = String::new();
+        let mut first_rev: Option<String> = None;
+
+        loop {
+            let rows = sqlx::query(
+                r#"
+                SELECT seq, did, event_type, event, invalidated, sequenced_at
+                FROM repo_seq
+                WHERE did = $1 AND seq > $2 AND NOT invalidated
+                ORDER BY seq ASC
+                LIMIT $3
+                "#,
+            )
+            .bind(did)
+            .bind(cursor)
+            .bind(self.config.max_query_limit)
+            .fetch_all(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let seq_row = self.row_to_seq_row(row)?;
+                cursor = seq_row.seq;
+                if let Some(SeqEvent::Commit { evt, .. }) = self.decode_event(seq_row)? {
+                    commit_count += 1;
+                    if first_rev.is_none() {
+                        first_rev = Some(evt.rev.clone());
+                    }
+                    head_commit_cid = evt.commit.clone();
+                    head_rev = evt.rev.clone();
+                    for op in &evt.ops {
+                        match op.action {
+                            OpAction::Create => creates += 1,
+                            OpAction::Delete => deletes += 1,
+                            OpAction::Update => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        if commit_count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(RebuildPreflight {
+            commit_count,
+            record_count: creates.saturating_sub(deletes),
+            creates,
+            deletes,
+            head_commit_cid,
+            head_rev,
+            first_rev: first_rev.unwrap_or_default(),
+        }))
+    }
+
+    /// Cheap sequencer-state counts for the recovery surface (§7.4.2 / #294):
+    /// total rows, invalidated rows (always 0 under current hard-delete
+    /// semantics — see [`Self::validate_integrity`]), and the live head / min
+    /// seq. `invalidated` is derived as `total − live` to stay backend-portable
+    /// (no `WHERE invalidated = 1`, which differs SQLite INTEGER vs PG BOOLEAN).
+    pub async fn integrity_counts(&self) -> PdsResult<IntegrityCounts> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo_seq")
+            .fetch_one(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo_seq WHERE NOT invalidated")
+            .fetch_one(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        let head_seq: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(seq) FROM repo_seq WHERE NOT invalidated")
+                .fetch_one(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
+        let min_seq: Option<i64> =
+            sqlx::query_scalar("SELECT MIN(seq) FROM repo_seq WHERE NOT invalidated")
+                .fetch_one(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
+        Ok(IntegrityCounts {
+            total_rows: total.max(0) as u64,
+            invalidated_rows: (total - live).max(0) as u64,
+            head_seq,
+            min_seq,
+        })
+    }
+
+    /// Deep integrity validation of the live sequencer log (§7.4.2 / #294) — the
+    /// read-only recovery diagnostic. Walks every non-invalidated row ascending
+    /// by seq, decoding each event blob, and reports two anomaly classes plus
+    /// the state counts:
+    ///
+    /// - **Undecodable blobs**: a row whose `event` bytes fail to decode. The
+    ///   firehose *silently drops* these (consumers see fewer events with no
+    ///   error surface), so this scan is the only way to find them.
+    /// - **Per-DID rev non-monotonicity**: a commit whose `rev` is not strictly
+    ///   greater than the prior commit's `rev` for the same DID — the signature
+    ///   of a concurrent-write ordering bug (e.g. a brief leader split-brain).
+    ///
+    /// Deliberately does NOT flag seq gaps: account deletion hard-deletes rows
+    /// (`delete_all_for_user`), so gaps in `seq` are expected, not anomalies.
+    /// `scanned` is bumped per row for live progress; `cancel` is polled at each
+    /// page boundary (a cancelled scan returns its partial report).
+    pub async fn validate_integrity(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+        scanned: &std::sync::atomic::AtomicU64,
+    ) -> PdsResult<IntegrityReport> {
+        use std::collections::{BTreeSet, HashMap};
+        use std::sync::atomic::Ordering;
+
+        const SAMPLE_CAP: usize = 50;
+        const PAGE: i64 = 1000;
+
+        let counts = self.integrity_counts().await?;
+        let mut report = IntegrityReport {
+            total_rows: counts.total_rows,
+            invalidated_rows: counts.invalidated_rows,
+            head_seq: counts.head_seq,
+            min_seq: counts.min_seq,
+            rows_scanned: 0,
+            malformed_count: 0,
+            malformed: Vec::new(),
+            non_monotonic_count: 0,
+            non_monotonic: Vec::new(),
+            affected_dids: Vec::new(),
+        };
+
+        // The COMPLETE affected-DID set (not sample-bounded like `malformed`),
+        // for the slice-2 routing affordance. BTreeSet → deduped + sorted.
+        let mut affected: BTreeSet<String> = BTreeSet::new();
+        let mut last_rev: HashMap<String, String> = HashMap::new();
+        let mut cursor = 0i64;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                break; // partial report on cancel
+            }
+            let rows = self.next_events(cursor, Some(PAGE)).await?;
+            if rows.is_empty() {
+                break;
+            }
+            cursor = rows.last().map(|r| r.seq).unwrap_or(cursor);
+            for row in rows {
+                let seq = row.seq;
+                let did = row.did.clone();
+                let event_type = row.event_type.clone();
+                report.rows_scanned += 1;
+                scanned.store(report.rows_scanned, Ordering::Relaxed);
+                match self.decode_event(row) {
+                    Err(_) => {
+                        report.malformed_count += 1;
+                        affected.insert(did.clone());
+                        if report.malformed.len() < SAMPLE_CAP {
+                            report.malformed.push(MalformedRow { seq, did, event_type });
+                        }
+                    }
+                    Ok(Some(SeqEvent::Commit { evt, .. })) => {
+                        if let Some(prev) = last_rev.get(&evt.repo) {
+                            if &evt.rev <= prev {
+                                report.non_monotonic_count += 1;
+                                if report.non_monotonic.len() < SAMPLE_CAP {
+                                    report.non_monotonic.push(NonMonotonicCommit {
+                                        did: evt.repo.clone(),
+                                        seq,
+                                        rev: evt.rev.clone(),
+                                        prev_rev: prev.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        last_rev.insert(evt.repo.clone(), evt.rev.clone());
+                    }
+                    Ok(_) => {} // non-commit event decoded fine
+                }
+            }
+        }
+        report.affected_dids = affected.into_iter().collect();
+        Ok(report)
+    }
+}
+
+/// Aggregate a repo rebuild would reconstruct, computed from commit-event
+/// metadata without touching repo state (§7.4.1 / #286). `record_count` is the
+/// net live count (`creates − deletes`); the rev range bounds the history.
+#[derive(Debug, Clone)]
+pub struct RebuildPreflight {
+    pub commit_count: u64,
+    pub record_count: u64,
+    pub creates: u64,
+    pub deletes: u64,
+    pub head_commit_cid: String,
+    pub head_rev: String,
+    pub first_rev: String,
+}
+
+/// Cheap sequencer-state counts (§7.4.2 / #294).
+#[derive(Debug, Clone, Copy)]
+pub struct IntegrityCounts {
+    pub total_rows: u64,
+    /// Always 0 under current hard-delete deletion semantics; reported for
+    /// future-compat if the substrate ever adopts soft-delete.
+    pub invalidated_rows: u64,
+    pub head_seq: Option<i64>,
+    pub min_seq: Option<i64>,
+}
+
+/// A row whose `event` blob failed to decode (the firehose silently drops it).
+#[derive(Debug, Clone)]
+pub struct MalformedRow {
+    pub seq: i64,
+    pub did: String,
+    pub event_type: String,
+}
+
+/// A commit whose `rev` is not strictly greater than the prior commit's for the
+/// same DID — a concurrent-write ordering anomaly.
+#[derive(Debug, Clone)]
+pub struct NonMonotonicCommit {
+    pub did: String,
+    pub seq: i64,
+    pub rev: String,
+    pub prev_rev: String,
+}
+
+/// The deep-integrity-validation result (§7.4.2 / #294). Anomaly samples are
+/// capped (50 each); the `*_count` fields are the true totals.
+#[derive(Debug, Clone)]
+pub struct IntegrityReport {
+    pub total_rows: u64,
+    pub invalidated_rows: u64,
+    pub head_seq: Option<i64>,
+    pub min_seq: Option<i64>,
+    pub rows_scanned: u64,
+    pub malformed_count: u64,
+    pub malformed: Vec<MalformedRow>,
+    pub non_monotonic_count: u64,
+    pub non_monotonic: Vec<NonMonotonicCommit>,
+    /// Every distinct DID with at least one malformed (undecodable) event row,
+    /// deduped + sorted. Unlike `malformed` (a 50-capped sample), this is the
+    /// COMPLETE set — the routing affordance (slice 2 / #357) fans a per-account
+    /// repository rebuild (§7.4.1) over it, so it must not be sample-bounded.
+    /// The DID is the `repo_seq.did` column, available regardless of whether the
+    /// event blob decodes.
+    pub affected_dids: Vec<String>,
 }
 
 #[cfg(test)]
@@ -594,6 +906,141 @@ mod tests {
         .unwrap();
 
         Sequencer::new(db, SequencerConfig::default())
+    }
+
+    /// Build a sequencer over a pool we keep a handle to (for raw inserts of
+    /// deliberately-malformed rows the public API can't produce).
+    async fn sequencer_with_pool() -> (Sequencer, sqlx::AnyPool) {
+        let db = open_test_pool().await;
+        sqlx::query(
+            "CREATE TABLE repo_seq (seq INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT NOT NULL, \
+             event_type TEXT NOT NULL, event BLOB NOT NULL, invalidated INTEGER NOT NULL DEFAULT 0, \
+             sequenced_at TEXT NOT NULL)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        (Sequencer::new(db.clone(), SequencerConfig::default()), db)
+    }
+
+    fn commit(did: &str, rev: &str) -> CommitEvent {
+        CommitEvent::new(
+            did.to_string(),
+            format!("bafy{rev}"),
+            rev.to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn validate_integrity_clean_log_has_no_anomalies() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (seq, _db) = sequencer_with_pool().await;
+        // Ascending revs per DID — consistent.
+        seq.sequence_commit(commit("did:plc:a", "3aaa1")).await.unwrap();
+        seq.sequence_commit(commit("did:plc:b", "3bbb1")).await.unwrap();
+        seq.sequence_commit(commit("did:plc:a", "3aaa2")).await.unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let scanned = AtomicU64::new(0);
+        let r = seq.validate_integrity(&cancel, &scanned).await.unwrap();
+        assert_eq!(r.rows_scanned, 3);
+        assert_eq!(r.total_rows, 3);
+        assert_eq!(r.invalidated_rows, 0);
+        assert_eq!(r.malformed_count, 0);
+        assert_eq!(r.non_monotonic_count, 0, "ascending revs are monotonic");
+        assert_eq!(r.head_seq, Some(3));
+    }
+
+    #[tokio::test]
+    async fn validate_integrity_flags_nonmonotonic_and_malformed() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (seq, db) = sequencer_with_pool().await;
+        // did:plc:a: rev goes 3ccc then 3aaa (lower) → non-monotonic.
+        seq.sequence_commit(commit("did:plc:a", "3ccc")).await.unwrap();
+        seq.sequence_commit(commit("did:plc:a", "3aaa")).await.unwrap();
+        // A raw row with undecodable event bytes (the public API can't make this).
+        sqlx::query(
+            "INSERT INTO repo_seq (did, event_type, event, sequenced_at) VALUES ($1,$2,$3,$4)",
+        )
+        .bind("did:plc:bad")
+        .bind("commit")
+        .bind(vec![0xff_u8, 0x00, 0xff])
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let scanned = AtomicU64::new(0);
+        let r = seq.validate_integrity(&cancel, &scanned).await.unwrap();
+        assert_eq!(r.rows_scanned, 3);
+        assert_eq!(r.non_monotonic_count, 1, "the rev regression is flagged");
+        assert_eq!(r.non_monotonic[0].did, "did:plc:a");
+        assert_eq!(r.non_monotonic[0].prev_rev, "3ccc");
+        assert_eq!(r.non_monotonic[0].rev, "3aaa");
+        assert_eq!(r.malformed_count, 1, "the undecodable blob is flagged");
+        assert_eq!(r.malformed[0].did, "did:plc:bad");
+        assert_eq!(
+            r.affected_dids,
+            vec!["did:plc:bad".to_string()],
+            "the malformed row's DID is surfaced for routing"
+        );
+    }
+
+    /// `affected_dids` is the COMPLETE deduped+sorted set, NOT bounded by the
+    /// 50-row malformed sample cap — the routing affordance must rebuild every
+    /// affected account, not just the first 50 sampled rows.
+    #[tokio::test]
+    async fn validate_integrity_affected_dids_complete_and_deduped() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (seq, db) = sequencer_with_pool().await;
+
+        // 55 distinct DIDs (crosses SAMPLE_CAP = 50), plus a duplicate of one of
+        // them — so the malformed SAMPLE is capped but the affected-DID SET is
+        // complete and deduped.
+        let total_malformed = 55usize;
+        for i in 0..total_malformed {
+            sqlx::query(
+                "INSERT INTO repo_seq (did, event_type, event, sequenced_at) VALUES ($1,$2,$3,$4)",
+            )
+            .bind(format!("did:plc:bad{:03}", i))
+            .bind("commit")
+            .bind(vec![0xff_u8, 0x00, 0xff])
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        // A second malformed row for an already-seen DID (proves dedup).
+        sqlx::query("INSERT INTO repo_seq (did, event_type, event, sequenced_at) VALUES ($1,$2,$3,$4)")
+            .bind("did:plc:bad000")
+            .bind("commit")
+            .bind(vec![0x00_u8])
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let scanned = AtomicU64::new(0);
+        let r = seq.validate_integrity(&cancel, &scanned).await.unwrap();
+
+        assert_eq!(r.malformed_count, total_malformed as u64 + 1, "every malformed row counted");
+        assert_eq!(r.malformed.len(), 50, "the row SAMPLE is capped at 50");
+        assert_eq!(
+            r.affected_dids.len(),
+            total_malformed,
+            "the affected-DID SET is complete (55 distinct) and deduped, NOT sample-bounded"
+        );
+        // BTreeSet → sorted; and the duplicate collapsed.
+        assert_eq!(r.affected_dids[0], "did:plc:bad000");
+        let mut sorted = r.affected_dids.clone();
+        sorted.sort();
+        assert_eq!(sorted, r.affected_dids, "affected_dids is sorted");
     }
 
     #[tokio::test]
@@ -794,5 +1241,78 @@ mod tests {
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
         let result = sequencer.earliest_after_time(past).await.unwrap();
         assert_eq!(result, Some(1));
+    }
+
+    // ---------- §7.4.1 / #286 rebuild preflight ----------
+
+    fn op(action: OpAction, path: &str, cid: Option<&str>) -> crate::sequencer::events::CommitOp {
+        crate::sequencer::events::CommitOp {
+            action,
+            path: path.to_string(),
+            cid: cid.map(String::from),
+            prev: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_preflight_aggregates_commit_history() {
+        let seq = create_test_sequencer().await;
+        let did = "did:plc:rebuildme";
+        // commit 1: two creates.
+        seq.sequence_commit(CommitEvent::new(
+            did.to_string(), "commit1".to_string(), "rev1".to_string(), None, None, vec![],
+            vec![
+                op(OpAction::Create, "app.bsky.feed.post/a", Some("cidA")),
+                op(OpAction::Create, "app.bsky.feed.post/b", Some("cidB")),
+            ],
+        )).await.unwrap();
+        // commit 2: one create, one delete (net 0 for this commit).
+        seq.sequence_commit(CommitEvent::new(
+            did.to_string(), "commit2".to_string(), "rev2".to_string(), Some("commit1".to_string()), None, vec![],
+            vec![
+                op(OpAction::Create, "app.bsky.feed.post/c", Some("cidC")),
+                op(OpAction::Delete, "app.bsky.feed.post/a", None),
+            ],
+        )).await.unwrap();
+        // a different account's commit — must NOT be counted.
+        seq.sequence_commit(CommitEvent::new(
+            "did:plc:other".to_string(), "ox".to_string(), "rx".to_string(), None, None, vec![],
+            vec![op(OpAction::Create, "x/y", Some("z"))],
+        )).await.unwrap();
+
+        let pf = seq.rebuild_preflight(did).await.unwrap().expect("history present");
+        assert_eq!(pf.commit_count, 2, "only this DID's commits");
+        assert_eq!(pf.creates, 3);
+        assert_eq!(pf.deletes, 1);
+        assert_eq!(pf.record_count, 2, "net live = creates - deletes");
+        assert_eq!(pf.head_commit_cid, "commit2", "head = highest-seq commit");
+        assert_eq!(pf.head_rev, "rev2");
+        assert_eq!(pf.first_rev, "rev1", "first = lowest-seq commit");
+    }
+
+    #[tokio::test]
+    async fn rebuild_preflight_none_for_unknown_account() {
+        let seq = create_test_sequencer().await;
+        assert!(seq.rebuild_preflight("did:plc:nobody").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_preflight_skips_invalidated_events() {
+        let seq = create_test_sequencer().await;
+        let did = "did:plc:inval";
+        seq.sequence_commit(CommitEvent::new(
+            did.to_string(), "c1".to_string(), "r1".to_string(), None, None, vec![],
+            vec![op(OpAction::Create, "a/b", Some("c"))],
+        )).await.unwrap();
+        // Invalidate it (the WHERE NOT invalidated filter must exclude it).
+        sqlx::query("UPDATE repo_seq SET invalidated = 1 WHERE did = $1")
+            .bind(did)
+            .execute(&seq.db)
+            .await
+            .unwrap();
+        assert!(
+            seq.rebuild_preflight(did).await.unwrap().is_none(),
+            "invalidated events are excluded"
+        );
     }
 }

@@ -14,6 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
@@ -49,6 +50,10 @@ pub struct RelayClient {
     config: RelayConfig,
     http_client: Client,
     event_sender: Option<mpsc::Sender<RelayEvent>>,
+    /// v0.9 Federation Pattern-1 Phase D (#354): abort handles for the spawned
+    /// per-relay firehose tasks, so `reconfigure` can cancel them on a runtime
+    /// relay switch. Empty until `subscribe_firehose` runs.
+    firehose_handles: Vec<AbortHandle>,
 }
 
 impl RelayClient {
@@ -61,6 +66,25 @@ impl RelayClient {
                 .build()
                 .unwrap(),
             event_sender: None,
+            firehose_handles: Vec::new(),
+        }
+    }
+
+    /// Spawn one firehose task per configured relay, feeding `sender`, and record
+    /// their abort handles. v0.9 Phase D (#354): extracted from `subscribe_firehose`
+    /// so `reconfigure` can respawn **reusing the existing `event_sender`** — it
+    /// MUST NOT allocate a new channel (that would orphan the firehose consumer's
+    /// receiver and silently kill ingest; see `reconfigure`).
+    fn spawn_firehose_tasks(&mut self, sender: mpsc::Sender<RelayEvent>) {
+        let servers = self.config.servers.clone();
+        let reconnect_interval = self.config.reconnect_interval;
+        for relay_url in servers {
+            let tx = sender.clone();
+            let handle = tokio::spawn(async move {
+                Self::connect_to_relay(relay_url, tx, reconnect_interval).await;
+            })
+            .abort_handle();
+            self.firehose_handles.push(handle);
         }
     }
 
@@ -70,18 +94,38 @@ impl RelayClient {
 
         let (tx, rx) = mpsc::channel(self.config.buffer_size);
         self.event_sender = Some(tx.clone());
-
-        for relay_url in &self.config.servers {
-            let relay_url = relay_url.clone();
-            let tx = tx.clone();
-            let reconnect_interval = self.config.reconnect_interval;
-
-            tokio::spawn(async move {
-                Self::connect_to_relay(relay_url, tx, reconnect_interval).await;
-            });
-        }
+        self.spawn_firehose_tasks(tx);
 
         Ok(rx)
+    }
+
+    /// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A4) — atomically
+    /// replace the active relay set: abort the current firehose tasks, swap
+    /// `config.servers`, and respawn against the new relays.
+    ///
+    /// CRITICAL CHANNEL-REUSE CONTRACT: this reuses `self.event_sender` for the
+    /// respawned tasks and MUST NOT call `mpsc::channel(...)`. Allocating a new
+    /// channel would drop the sender the firehose consumer's `mpsc::Receiver`
+    /// is paired with, end its `recv()` loop, and silently kill firehose ingest.
+    ///
+    /// Caller MUST hold the `Arc<Mutex<RelayClient>>` lock.
+    pub async fn reconfigure(&mut self, new_relays: &[String]) -> PdsResult<()> {
+        // 1. Abort the current firehose tasks.
+        for handle in self.firehose_handles.drain(..) {
+            handle.abort();
+        }
+        // 2. Swap the active relay set (publish_event / fetch_repo read this fresh).
+        self.config.servers = new_relays.to_vec();
+        // 3. Respawn — reusing the existing sender (never a new channel).
+        if let Some(sender) = self.event_sender.clone() {
+            self.spawn_firehose_tasks(sender);
+        }
+        Ok(())
+    }
+
+    /// The current active relay set (for the describe surface / tests).
+    pub fn servers(&self) -> &[String] {
+        &self.config.servers
     }
 
     /// Connect to a relay server and stream events
@@ -261,6 +305,57 @@ mod tests {
         assert_eq!(config.reconnect_interval, 5);
         assert_eq!(config.buffer_size, 1000);
         assert!(config.enable_compression);
+    }
+
+    /// v0.9 Federation Pattern-1 Phase D (#354 / addendum R1 LB-1) — the
+    /// load-bearing channel-reuse contract: `reconfigure` must reuse the existing
+    /// `event_sender` so the firehose consumer's receiver stays OPEN. A
+    /// new-channel respawn would drop every sender and disconnect the receiver,
+    /// silently killing ingest.
+    #[tokio::test]
+    async fn reconfigure_preserves_firehose_channel() {
+        use tokio::sync::mpsc::error::TryRecvError;
+        // High reconnect interval so the (failing) connect tasks just sleep.
+        let mut client = RelayClient::new(RelayConfig {
+            servers: vec!["https://relay-a.invalid".to_string()],
+            reconnect_interval: 3600,
+            buffer_size: 8,
+            enable_compression: false,
+        });
+        let mut rx = client.subscribe_firehose().await.unwrap();
+        assert_eq!(client.servers(), ["https://relay-a.invalid".to_string()]);
+
+        // Swap to a new relay set.
+        client
+            .reconfigure(&["https://relay-b.invalid".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(client.servers(), ["https://relay-b.invalid".to_string()]);
+
+        // The receiver must still be OPEN (Empty), not Disconnected. With a
+        // new-channel respawn it would be Disconnected (all senders dropped).
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "firehose receiver disconnected after reconfigure (channel was not reused)"
+        );
+    }
+
+    /// `reconfigure` with no prior `subscribe_firehose` (event_sender None) just
+    /// swaps the relay set — nothing to respawn.
+    #[tokio::test]
+    async fn reconfigure_without_active_firehose_swaps_config() {
+        let mut client = RelayClient::new(RelayConfig {
+            servers: vec!["https://r1.invalid".to_string()],
+            reconnect_interval: 3600,
+            buffer_size: 8,
+            enable_compression: false,
+        });
+        client
+            .reconfigure(&["https://r2.invalid".to_string(), "https://r3.invalid".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(client.servers().len(), 2);
+        assert_eq!(client.servers()[0], "https://r2.invalid");
     }
 
     #[test]

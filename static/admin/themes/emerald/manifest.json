@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "themeId": "emerald",
+  "themeName": "Emerald",
+  "themeVersion": "1.0.0",
+  "substrateVersion": "1.0",
+  "extends": "dark",
+  "themeAuthor": "Aurora-Locus",
+  "themeDescription": "Deep forest base with jewel-tone green accents; gemstone depth.",
+  "files": {
+    "tokens": "tokens.css"
+  }
+}

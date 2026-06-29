@@ -1,65 +1,54 @@
-// Settings → Roles page (route: #settings/roles).
+// Configuration → Roles page (route: #configuration/roles).
 // Per docs/AURORA_ADMIN_UI_DESIGN.md §5.5.3.
 
 (function (global) {
   'use strict';
 
-  // Map UI tier slugs (plural, derived from role.name in groupRoles
-  // and embedded in route URLs like #settings/roles/moderators) to
-  // canonical Role enum strings (singular, lowercase) per
-  // src/admin/roles.rs:67-78 `Role::from_str`. The backend's
-  // grantRole / revokeRole handlers call .parse::<Role>() on the
-  // wire `role` field; passing the plural slug returns
-  // `Validation("Invalid role: moderators")` and a 400.
-  //
-  // Duplicated verbatim in pages/SettingsRolesMembers.js — the
-  // codebase doesn't have a cross-page utility location for view
-  // helpers, and manufacturing a module just for two callers is
-  // over-investment per Arc 6's anti-restructuring convention
-  // (see the parallel `settingSourceSuffix` duplication from
-  // Step 2).
-  //
-  // Unknown tier strings pass through unchanged so a future-added
-  // tier doesn't silently lose its wire form before the helper is
-  // updated — the server will reject with its native "Invalid
-  // role" message in that case.
+  function T(key, params) { return global.t ? global.t(key, params) : key; }
+
+  // Map UI tier slugs (plural — e.g. #configuration/roles/moderators) to the
+  // canonical Role enum strings the grantRole/revokeRole wire expects. §8.2.6
+  // consolidated the formerly-duplicated helper into the shared AuroraRoles
+  // primitive; this thin delegate keeps the existing call sites unchanged.
   function tierToRoleString(tier) {
-    switch (tier) {
-      case 'moderators':     return 'moderator';
-      case 'administrators': return 'admin';
-      case 'superadmins':    return 'superadmin';
-      default:               return tier;
-    }
+    return global.AuroraRoles.tierToRoleString(tier);
   }
 
   async function mount({ container }) {
     const session = global.AuroraSession;
     const isSuper = session && session.hasRole('superadmin');
     container.innerHTML =
-      '<nav class="breadcrumb"><a href="#settings/roles">Settings</a> <span class="breadcrumb-sep">›</span> Roles</nav>' +
-      '<header class="page-header"><div><h2>Roles</h2><p class="page-subtitle">Authority tiers and current members</p></div></header>' +
-      '<div id="roles-list"><p class="empty-state">Loading…</p></div>';
+      '<nav class="breadcrumb"><a href="#configuration/roles">' + esc(T('settings.roles.crumb')) + '</a> <span class="breadcrumb-sep">›</span> ' + esc(T('settings.roles.title')) + '</nav>' +
+      '<header class="page-header"><div><h2>' + esc(T('settings.roles.title')) + '</h2><p class="page-subtitle">' + esc(T('settings.roles.subtitle')) + '</p></div></header>' +
+      '<div id="roles-list">' + global.AuroraSkeleton.lines(4) + '</div>';
+    await loadRoles(isSuper);
+    return {};
+  }
+
+  async function loadRoles(isSuper) {
+    const list = document.getElementById('roles-list');
+    if (!list) return;
+    list.innerHTML = global.AuroraSkeleton.lines(4);
     try {
       const data = await global.AuroraEndpoints.atproto.listRoles();
       renderRoles(groupRoles(data), isSuper);
     } catch (e) {
-      document.getElementById('roles-list').innerHTML =
-        '<p class="empty-state">Could not load roles: ' + esc(e && e.message) + '</p>';
+      global.AuroraErrorBoundary.mount(list, {
+        message: T('settings.roles.could_not_load', { message: (e && e.message) || '' }),
+        onRetry: function () { loadRoles(isSuper); },
+      });
     }
-    return {};
   }
 
   // The com.atproto.admin.listRoles handler returns a flat array of
-  // active assignment rows: {roles: [{did, role, granted_by, ...}, ...]}.
-  // The page renders authority *tiers* (Moderators/Administrators/
-  // SuperAdmins) with their members, so group the flat assignments by
-  // role tier here. If the server ever pre-groups (members[] present on
-  // the first entry), pass it through unchanged.
+  // active assignment rows: {roles: [{did, role, granted_by, ...}, ...]}
+  // in snake_case (src/admin/roles.rs AdminRole). The page renders authority
+  // *tiers* (Moderators/Administrators/SuperAdmins) with their members, so
+  // group the flat assignments by role tier here. The backend never sends a
+  // pre-grouped (members[]) shape — #362.2 dropped the dead pass-through
+  // branch that guarded for it.
   function groupRoles(data) {
     const flat = (data && Array.isArray(data.roles)) ? data.roles : [];
-    if (flat.length > 0 && Array.isArray(flat[0].members)) {
-      return flat;
-    }
     const tiers = [
       { key: 'moderator', name: 'Moderators', description: 'Acts on subjects-as-content', members: [] },
       { key: 'admin', name: 'Administrators', description: 'Acts on accounts-as-infrastructure', members: [] },
@@ -84,17 +73,30 @@
     c.innerHTML = roles.map((role) => {
       const members = Array.isArray(role.members) ? role.members : [];
       const memberCount = members.length;
-      const memberSlug = String(role.name || role.role || '').toLowerCase().replace(/\s+/g, '-');
+      // Slug stays English-derived (the tier's `name` is the stable English
+      // label) so detail-page routing is unaffected by display localization;
+      // only the rendered NAME/description route through t(). renderRoles is
+      // always fed groupRoles' tier objects, whose canonical field is `name`
+      // — #362.2 dropped the `|| role.role` hedge (that read an AdminRole
+      // field this object never carries; the genuine `.role` reads live in
+      // groupRoles + ConfigRolesMembers and are already clean snake_case).
+      const memberSlug = String(role.name || '').toLowerCase().replace(/\s+/g, '-');
+      const displayName = role.key ? T('settings.roles.tier_' + role.key) : (role.name || 'Role');
+      const displayDesc = role.key ? T('settings.roles.desc_' + role.key) : role.description;
       return '<div class="role-card">' +
-             '  <h3>' + esc(role.name || role.role || 'Role') + ' <small style="font-weight:normal; color: var(--text-secondary);">[' + memberCount + ' member' + (memberCount === 1 ? '' : 's') + ']</small></h3>' +
-             (role.description ? '<p class="settings-help">' + esc(role.description) + '</p>' : '') +
+             '  <h3>' + esc(displayName) + ' <small style="font-weight:normal; color: var(--color-text-secondary);">[' + esc(T('settings.roles.member_count', { count: memberCount })) + ']</small></h3>' +
+             (displayDesc ? '<p class="settings-help">' + esc(displayDesc) + '</p>' : '') +
              '<div class="role-members">' +
-             (members.length === 0 ? '<p class="settings-help">No members.</p>' :
+             (members.length === 0 ? '<p class="settings-help">' + esc(T('settings.roles.no_members')) + '</p>' :
               members.slice(0, 12).map((m) => renderMemberRow(m, memberSlug, isSuper, operatorDid)).join(' ')) +
              '</div>' +
              '<div class="action-panel-buttons" style="justify-content: flex-start; gap: 0.5rem;">' +
-             (members.length > 12 ? '<a class="btn-sm btn-secondary" href="#settings/roles/' + encodeURIComponent(memberSlug) + '">View all</a>' : '') +
-             (isSuper ? '<button class="btn-sm btn-primary" data-grant="' + esc(memberSlug) + '">Grant role</button>' : '') +
+             // Always offer list→detail navigation (touch-up A): the detail
+             // page is the only place the full member table + grant/revoke
+             // affordances live, so every tier links there regardless of
+             // member count. (Was previously shown only for >12 members.)
+             '<a class="btn-sm btn-secondary" href="#configuration/roles/' + encodeURIComponent(memberSlug) + '">' + esc(T('settings.roles.view_members')) + '</a>' +
+             (isSuper ? '<button class="btn-sm btn-primary" data-grant="' + esc(memberSlug) + '">' + esc(T('settings.roles.grant')) + '</button>' : '') +
              '</div>' +
              '</div>';
     }).join('');
@@ -123,8 +125,8 @@
     const revokeBtn =
       '<button class="btn-sm btn-danger" data-revoke-did="' + esc(member.did) + '"' +
       ' data-revoke-tier="' + esc(memberSlug) + '"' +
-      (isSelf ? ' disabled title="You cannot revoke your own role"' : '') +
-      '>Revoke</button>';
+      (isSelf ? ' disabled title="' + esc(T('settings.roles.self_revoke_tooltip')) + '"' : '') +
+      '>' + esc(T('settings.roles.revoke')) + '</button>';
     return '<span class="role-member">' + badge + ' ' + revokeBtn + '</span>';
   }
 
@@ -135,11 +137,11 @@
     // REVOKE gate + required rationale lands in the audit log.
     // See V04_DESIGN §5.3.3 (destructive-confirm canonical example).
     const result = await global.AuroraModal.destructiveConfirm({
-      heading: 'Revoke ' + roleSlug + ' role from ' + did,
-      body: 'This action will be recorded in the audit trail.',
+      heading: T('settings.roles.revoke_heading', { role: roleSlug, did: did }),
+      body: T('settings.roles.revoke_body'),
       typedConfirmGate: 'REVOKE',
       rationaleRequired: true,
-      confirmLabel: 'Revoke role',
+      confirmLabel: T('settings.roles.revoke_confirm'),
     });
     if (!result.confirmed) return;
     const wireRole = tierToRoleString(roleSlug);
@@ -150,15 +152,15 @@
         rationale: result.rationale,
       });
       const auditEntryId = res && res.auditEntryId;
-      global.AuroraToast.success('Role revoked.', auditEntryId ? {
+      global.AuroraToast.success(T('settings.roles.revoke_success'), auditEntryId ? {
         action: {
-          label: 'View audit entry',
+          label: T('settings.roles.view_audit'),
           href: '#mod/audit/' + encodeURIComponent(auditEntryId),
         },
       } : undefined);
       await mountReload();
     } catch (e) {
-      global.AuroraToast.danger(e && e.message ? e.message : 'Revoke failed.');
+      global.AuroraToast.danger(e && e.message ? e.message : T('settings.roles.revoke_failed'));
     }
   }
 
@@ -173,30 +175,30 @@
     // (or rejected with deny_unknown_fields), so the form mirrors
     // the wire contract.
     const result = await global.AuroraModal.form({
-      heading: 'Grant ' + roleSlug + ' role',
-      body: 'Grant this role to a member by DID. The grant lands as one audit-chain entry.',
+      heading: T('settings.roles.grant_heading', { role: roleSlug }),
+      body: T('settings.roles.grant_body'),
       fields: [
         {
           name: 'did',
-          label: 'DID',
+          label: T('settings.roles.field_did'),
           type: 'text',
           required: true,
-          placeholder: 'did:plc:…',
+          placeholder: T('settings.roles.did_placeholder'),
           validate: (value) => {
             if (!value || !value.startsWith('did:')) {
-              return 'DID must start with "did:" (e.g., did:plc:…).';
+              return T('settings.roles.did_invalid');
             }
             return null;
           },
         },
         {
           name: 'rationale',
-          label: 'Rationale (recorded in audit log)',
+          label: T('settings.roles.field_rationale'),
           type: 'textarea',
           required: true,
         },
       ],
-      submitLabel: 'Grant role',
+      submitLabel: T('settings.roles.grant_submit'),
     });
     if (!result.submitted) return;
     // Map the tier slug (plural display form derived from role.name)
@@ -210,9 +212,9 @@
         rationale: result.values.rationale,
       });
       const auditEntryId = res && res.auditEntryId;
-      global.AuroraToast.success('Granted ' + roleSlug + ' role to ' + result.values.did + '.', auditEntryId ? {
+      global.AuroraToast.success(T('settings.roles.grant_success', { role: roleSlug, did: result.values.did }), auditEntryId ? {
         action: {
-          label: 'View audit entry',
+          label: T('settings.roles.view_audit'),
           href: '#mod/audit/' + encodeURIComponent(auditEntryId),
         },
       } : undefined);
@@ -223,7 +225,7 @@
       // otherwise. No need to hand-prefix "Grant failed:" — the
       // translation layer or fallback rendering does the right
       // thing.
-      global.AuroraToast.danger(e && e.message ? e.message : 'Grant failed.');
+      global.AuroraToast.danger(e && e.message ? e.message : T('settings.roles.grant_failed'));
     }
   }
 
@@ -232,5 +234,5 @@
   }
 
   function esc(s) { return global.AuroraDom ? global.AuroraDom.esc(s) : String(s == null ? '' : s); }
-  if (global.AuroraRouter) global.AuroraRouter.register('settingsRoles', { mount: mount });
+  if (global.AuroraRouter) global.AuroraRouter.register('configRoles', { mount: mount });
 })(window);
