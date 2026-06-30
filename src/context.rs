@@ -135,6 +135,12 @@ pub struct AppContext {
     /// in-memory; a distributed login-challenge story is a follow-up,
     /// mirroring the DPoP server-nonce posture.
     pub browser_login_nonces: Arc<DPopNonceStore>,
+    /// Phase β.4 (#420): URL-based atproto-OAuth client-metadata fetcher
+    /// (on-demand `client-metadata.json` resolution + cache). Consumed by the
+    /// β.3 authorize flow to resolve a `client_id` URL and verify its redirect
+    /// URIs. The legacy `ClientManager` (static, operator-internal) is
+    /// retained separately — strangler-fig boundary.
+    pub client_metadata_fetcher: Arc<crate::oauth::atproto::client_metadata::ClientMetadataFetcher>,
     // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
     // Cross-instance rate-limit primitive (Arc 7 Step 3).
@@ -780,6 +786,9 @@ impl AppContext {
         // Phase β.2 (#420): the AS-login challenge store. Its own keyspace,
         // always present (login is not federation-gated).
         let browser_login_nonces = Arc::new(make_dpop_store());
+        // Phase β.4 (#420): the URL-based client-metadata fetcher.
+        let client_metadata_fetcher =
+            Arc::new(crate::oauth::atproto::client_metadata::ClientMetadataFetcher::new());
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database).
         // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
@@ -1265,6 +1274,7 @@ impl AppContext {
             dpop_nonce_store,
             dpop_verifier,
             browser_login_nonces,
+            client_metadata_fetcher,
             rate_limiter,
             distributed_rate_limiter,
             mailer,
