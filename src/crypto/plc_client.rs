@@ -172,7 +172,7 @@ impl PlcClient {
         &self,
         did: &str,
     ) -> PdsResult<(crate::crypto::plc::PlcOperation, String)> {
-        if !did.starts_with("did:plc:") {
+        if !crate::identity::did_method::is_plc(did) {
             return Err(PdsError::Validation(
                 "Only did:plc identifiers are supported".to_string(),
             ));
@@ -275,7 +275,7 @@ impl PlcClient {
     /// Errors (`PdsError::IdentityResolution`): network failure, non-2xx from the
     /// directory, malformed audit-log JSON.
     pub async fn get_op_history(&self, did: &str) -> PdsResult<Vec<PlcOpHistoryEntry>> {
-        if !did.starts_with("did:plc:") {
+        if !crate::identity::did_method::is_plc(did) {
             return Err(PdsError::Validation(
                 "Only did:plc identifiers are supported".to_string(),
             ));
@@ -313,7 +313,7 @@ impl PlcClient {
 
     /// Fetch DID document from PLC directory
     pub async fn get_document(&self, did: &str) -> PdsResult<DidDocument> {
-        if !did.starts_with("did:plc:") {
+        if !crate::identity::did_method::is_plc(did) {
             return Err(PdsError::Validation(
                 "Only did:plc identifiers are supported".to_string(),
             ));

@@ -6107,8 +6107,8 @@ pub async fn retry_bulk_diddoc_update_for_did(
             auth.role
         )));
     }
-    // v0.9: only did:plc accounts exist (#381); did:web is a v0.10 path.
-    if !input.did.starts_with("did:plc:") {
+    // v0.10: route the method discrimination through the classifier (#414 Phase A).
+    if !crate::identity::did_method::is_plc(&input.did) {
         return Err(validation(format!(
             "only did:plc accounts can be re-pointed; got '{}'",
             input.did

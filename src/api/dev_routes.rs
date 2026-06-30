@@ -752,7 +752,7 @@ async fn tombstone_did(
     use crate::crypto::plc::{compute_op_cid, register_plc_did, PlcOperation, PlcSigner, PlcTombstone};
     use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
 
-    if !body.did.starts_with("did:plc:") {
+    if !crate::identity::did_method::is_plc(&body.did) {
         return Err(http_error(PdsError::Validation(
             "Only did:plc identifiers support PLC tombstone".to_string(),
         )));

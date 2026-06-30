@@ -109,6 +109,19 @@ pub fn parse_did(did: &str) -> Result<ParsedDid, ParseDidError> {
     }
 }
 
+/// True iff `did` is a well-formed did:plc. Ergonomic guard for the many sites
+/// that only need to admit/reject the PLC method. A malformed or non-plc DID is
+/// `false`, so `!is_plc(did)` rejects did:web, did:key, and malformed input —
+/// exactly matching the prior `!did.starts_with("did:plc:")` guards.
+pub fn is_plc(did: &str) -> bool {
+    matches!(parse_did(did), Ok(p) if p.method == DidMethod::Plc)
+}
+
+/// True iff `did` is a well-formed did:web. Mirror of [`is_plc`].
+pub fn is_web(did: &str) -> bool {
+    matches!(parse_did(did), Ok(p) if p.method == DidMethod::Web)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +195,18 @@ mod tests {
     #[test]
     fn rejects_malformed_web() {
         assert_eq!(parse_did("did:web:"), Err(ParseDidError::MalformedWeb));
+    }
+
+    #[test]
+    fn is_plc_is_web_helpers() {
+        assert!(is_plc("did:plc:abc"));
+        assert!(!is_plc("did:web:example.com"));
+        assert!(!is_plc("did:key:zABC"));
+        assert!(!is_plc("did:plc:")); // malformed → false (so !is_plc rejects it)
+        assert!(!is_plc("garbage"));
+        assert!(is_web("did:web:example.com:user:alice"));
+        assert!(!is_web("did:plc:abc"));
+        assert!(!is_web("did:web:")); // malformed → false
     }
 
     #[test]

@@ -56,35 +56,57 @@ pub const AURORA_LOCAL_KID: &str = "aurora-local-v1";
 ///
 /// Per §5.3.5: TTL is fixed at 60s, JWT is never cached, and the
 /// caller re-mints per forward.
+/// Read the per-account atproto signing key (hex) for an entryway-auth JWT,
+/// method-aware (v0.10 Arc 1 Phase A — R1 D-1 inline-SQL migration / R2 F-3).
+///
+/// did:plc reads `plc_keys.atproto_signing_key` (the historical inline path,
+/// lifted into this accessor). did:web is **rejected**: a public-key-only
+/// did:web account has no substrate-held signing key, and signing an
+/// entryway-auth JWT as the holder would be a sovereignty break (LOCKED Arc 1
+/// §3 / §10 — same single-key reasoning as commit signing). Holder-mediation is
+/// Arc 2 territory. A malformed DID is rejected rather than read as an empty key.
+async fn entryway_signing_key_hex(db: &AnyPool, user_did: &str) -> PdsResult<String> {
+    use crate::identity::did_method::{parse_did, DidMethod};
+    match parse_did(user_did).map(|p| p.method()) {
+        Ok(DidMethod::Plc) => {
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT atproto_signing_key FROM plc_keys WHERE did = $1")
+                    .bind(user_did)
+                    .fetch_optional(db)
+                    .await
+                    .map_err(PdsError::Database)?;
+            match row {
+                Some((key,)) if !key.is_empty() => Ok(key),
+                Some(_) => Err(PdsError::Authentication(format!(
+                    "KeyNotFound: plc_keys.atproto_signing_key is empty for {} \
+                     (legacy row pending Arc 13 v4.1 §6.3.2 forward-population)",
+                    user_did
+                ))),
+                None => Err(PdsError::NotFound(format!(
+                    "UnknownAccount: no plc_keys row for {}",
+                    user_did
+                ))),
+            }
+        }
+        Ok(DidMethod::Web) => Err(PdsError::Validation(format!(
+            "entryway-auth JWT is not available for did:web account {}: the substrate \
+             holds no signing key (holder-mediated signing is forthcoming in Arc 2)",
+            user_did
+        ))),
+        Err(e) => Err(PdsError::Validation(format!(
+            "unparseable DID {}: {}",
+            user_did, e
+        ))),
+    }
+}
+
 pub async fn entryway_auth_headers(
     db: &AnyPool,
     user_did: &str,
     entryway_did: &str,
     lxm: &str,
 ) -> PdsResult<HeaderMap> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT atproto_signing_key FROM plc_keys WHERE did = $1")
-            .bind(user_did)
-            .fetch_optional(db)
-            .await
-            .map_err(PdsError::Database)?;
-
-    let signing_key_hex = match row {
-        Some((key,)) if !key.is_empty() => key,
-        Some(_) => {
-            return Err(PdsError::Authentication(format!(
-                "KeyNotFound: plc_keys.atproto_signing_key is empty for {} \
-                 (legacy row pending Arc 13 v4.1 §6.3.2 forward-population)",
-                user_did
-            )));
-        }
-        None => {
-            return Err(PdsError::NotFound(format!(
-                "UnknownAccount: no plc_keys row for {}",
-                user_did
-            )));
-        }
-    };
+    let signing_key_hex = entryway_signing_key_hex(db, user_did).await?;
 
     let key_bytes = hex::decode(&signing_key_hex).map_err(|e| {
         PdsError::Internal(format!(

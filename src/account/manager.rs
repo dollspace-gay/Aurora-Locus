@@ -1032,6 +1032,12 @@ impl AccountManager {
     /// Apply the actual UPDATE without re-running validation. Used by
     /// `update_handle` (which validates upfront) and
     /// `update_handle_in_tx` (which validates inside the tx).
+    ///
+    /// v0.10 Arc 1 §6 served-identity-input audit (AD-2 β): this is the shared
+    /// `actor.handle` writer for **both** DID methods. For did:plc the caller
+    /// republishes the handle to the PLC directory; for did:web there is no PLC
+    /// doc — the served `alsoKnownAs` recomposes from `actor.handle` at the
+    /// per-account serve route (Phase D). No method guard here by design.
     async fn update_handle_unchecked_in_tx<'c>(
         tx: &mut sqlx::Transaction<'c, sqlx::Any>,
         did: &str,

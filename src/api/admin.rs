@@ -3863,6 +3863,12 @@ struct UpdateAccountHandleRequest {
 }
 
 /// Update account handle
+///
+/// v0.10 Arc 1 §6 served-identity-input audit (AD-2 β): the `did:` check below is
+/// a generic shape guard, not a method guard — it correctly admits did:web. A
+/// did:web handle change writes `actor.handle` (the served `alsoKnownAs`
+/// recomposes from it at the Phase D serve route) with **no PLC republish**;
+/// did:plc continues to republish. Method discrimination stays absent by design.
 async fn update_account_handle(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
@@ -4190,7 +4196,7 @@ pub(crate) async fn update_account_signing_key(
             .into_response()
     }
 
-    if !req.did.starts_with("did:plc:") {
+    if !crate::identity::did_method::is_plc(&req.did) {
         return Err(plain_err(
             StatusCode::BAD_REQUEST,
             "did must be a did:plc identifier",

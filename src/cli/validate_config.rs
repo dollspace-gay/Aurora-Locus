@@ -508,7 +508,7 @@ fn validate_identity_config(config: &ServerConfig, issues: &mut Vec<ValidationIs
     // fail verification against any per-account-key-signed JWT.
     // Warn at validate-time so this misconfiguration surfaces
     // before any runtime auth failure.
-    if config.service.service_did.starts_with("did:plc:") {
+    if crate::identity::did_method::is_plc(&config.service.service_did) {
         issues.push(ValidationIssue::warning(
             "Identity",
             format!(

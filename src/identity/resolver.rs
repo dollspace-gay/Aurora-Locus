@@ -1,4 +1,5 @@
 use crate::identity::did_document::DidDocument;
+use crate::identity::did_method::{parse_did, DidMethod};
 /// Identity Resolver - Orchestrates handle and DID resolution with caching
 use crate::{
     error::{PdsError, PdsResult},
@@ -239,15 +240,13 @@ impl IdentityResolver {
 
     /// Fetch DID document from source
     async fn fetch_did_document(&self, did: &str) -> PdsResult<DidDocument> {
-        if did.starts_with("did:plc:") {
-            self.fetch_plc_document(did).await
-        } else if did.starts_with("did:web:") {
-            self.fetch_web_document(did).await
-        } else {
-            Err(PdsError::IdentityResolution(format!(
+        match parse_did(did).map(|p| p.method()) {
+            Ok(DidMethod::Plc) => self.fetch_plc_document(did).await,
+            Ok(DidMethod::Web) => self.fetch_web_document(did).await,
+            Err(_) => Err(PdsError::IdentityResolution(format!(
                 "Unsupported DID method: {}",
                 did
-            )))
+            ))),
         }
     }
 

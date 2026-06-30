@@ -108,7 +108,13 @@ pub async fn update_handle(
     // services), mutate ONLY `also_known_as` for the new handle,
     // set `prev` to the prior op's CID, sign with the PDS-wide
     // rotation key (§6.3.2), submit. Diff-build is gone.
-    if did.starts_with("did:plc:") {
+    // v0.10 Arc 1 §6 served-identity-input audit (AD-2 β): only did:plc accounts
+    // republish a handle change to the PLC directory. A did:web handle change has
+    // no PLC doc to republish — the local `actor.handle` UPDATE below runs for
+    // both methods, and a did:web account's served `alsoKnownAs` recomposes from
+    // `actor.handle` at the per-account serve route (Phase D). No method guard
+    // here: handle mutation is allowed for both, only the PLC submission is gated.
+    if crate::identity::did_method::is_plc(&did) {
         use crate::crypto::plc::{register_plc_did, PlcOperationBuilder, PlcSigner};
         use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
 
@@ -370,7 +376,7 @@ pub async fn sign_plc_operation(
 
     // Standalone path (unchanged).
     // Ensure this is a did:plc
-    if !did.starts_with("did:plc:") {
+    if !crate::identity::did_method::is_plc(&did) {
         return Err(PdsError::Validation(
             "Only did:plc identifiers support PLC operations".to_string(),
         ));
@@ -777,7 +783,7 @@ pub async fn submit_plc_operation(
     let did = auth.did;
 
     // Ensure this is a did:plc
-    if !did.starts_with("did:plc:") {
+    if !crate::identity::did_method::is_plc(&did) {
         return Err(PdsError::Validation(
             "Only did:plc identifiers support PLC operations".to_string(),
         ));
@@ -948,7 +954,7 @@ pub async fn request_plc_operation_signature(
     let did = auth.did;
 
     // Ensure this is a did:plc — only did:plc supports PLC ops.
-    if !did.starts_with("did:plc:") {
+    if !crate::identity::did_method::is_plc(&did) {
         return Err(PdsError::Validation(
             "Only did:plc identifiers support PLC operations".to_string(),
         ));
