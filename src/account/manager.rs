@@ -2388,13 +2388,29 @@ impl AccountManager {
 
     // ==================== App Passwords ====================
 
-    /// Create an app password for third-party applications
+    /// Create an app password for third-party applications.
+    ///
+    /// did:web accounts are not offered app passwords (Arc 2 Phase β.5, SD-A5 =
+    /// (b)). App passwords are a legacy did:plc credential; a did:web holder
+    /// authenticates to third-party apps through the atproto-OAuth provider
+    /// (login-α + the `/oauth/atproto/*` flow), never via a server-held
+    /// password. The substrate never holds the did:web signing key, so issuing
+    /// it a password-shaped credential would be a category error.
     pub async fn create_app_password(
         &self,
         did: &str,
         name: &str,
         privileged: bool,
     ) -> PdsResult<String> {
+        // did:web accounts use OAuth, not app passwords (SD-A5 = (b)).
+        if crate::identity::did_method::is_web(did) {
+            return Err(PdsError::Validation(
+                "app passwords are not available for did:web accounts; \
+                 use the OAuth authorization flow instead"
+                    .to_string(),
+            ));
+        }
+
         // Validate name
         if name.is_empty() {
             return Err(PdsError::Validation(
@@ -3390,7 +3406,6 @@ mod tests {
                 },
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
-                oauth_features: Default::default(),
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -4093,6 +4108,22 @@ mod tests {
 
         let passwords = manager.list_app_passwords(&account.did).await.unwrap();
         assert_eq!(passwords.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_create_app_password_rejects_did_web() {
+        let manager = setup_test_db().await;
+        // did:web accounts are not offered app passwords (SD-A5 = (b)). The
+        // guard short-circuits before any DB lookup, so no account row is
+        // needed — a syntactic did:web is enough to trip it.
+        let err = manager
+            .create_app_password("did:web:alice.example.com", "Test App", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PdsError::Validation(ref m) if m.contains("did:web")),
+            "expected a did:web Validation rejection, got {err:?}"
+        );
     }
 
     #[tokio::test]

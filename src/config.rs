@@ -1034,9 +1034,6 @@ pub struct AuthConfig {
     /// URL to OAuth migration guide for developers
     #[serde(default = "default_migration_guide_url")]
     pub oauth_migration_guide_url: String,
-    /// OAuth feature flags for production deployment
-    #[serde(default)]
-    pub oauth_features: OAuthFeatureFlags,
 }
 
 fn default_jwt_sunset_date() -> String {
@@ -1059,105 +1056,6 @@ pub struct OAuthConfig {
     pub redirect_uri: String,
     /// PDS URL for OAuth (e.g., https://bsky.social)
     pub pds_url: String,
-}
-
-/// OAuth feature flags for controlled production deployment
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OAuthFeatureFlags {
-    /// Enable OAuth 2.1 authorization endpoints
-    #[serde(default = "default_oauth_enabled")]
-    pub enabled: bool,
-
-    /// Percentage of users to roll out OAuth to (0-100)
-    /// Allows gradual rollout based on DID hash
-    #[serde(default = "default_rollout_percentage")]
-    pub rollout_percentage: u8,
-
-    /// Require DPoP token binding (enforces security in production)
-    /// When false, DPoP is optional (development mode)
-    #[serde(default = "default_require_dpop")]
-    pub require_dpop: bool,
-
-    /// Enable authorization endpoint (/oauth/authorize)
-    #[serde(default = "default_oauth_enabled")]
-    pub enable_authorize: bool,
-
-    /// Enable token endpoint (/oauth/token)
-    #[serde(default = "default_oauth_enabled")]
-    pub enable_token: bool,
-
-    /// Enable device management endpoints
-    #[serde(default)]
-    pub enable_device_management: bool,
-
-    /// Allow JWT fallback during transition period
-    /// When false, reject all JWT tokens
-    #[serde(default = "default_allow_jwt_fallback")]
-    pub allow_jwt_fallback: bool,
-}
-
-impl Default for OAuthFeatureFlags {
-    fn default() -> Self {
-        Self {
-            enabled: default_oauth_enabled(),
-            rollout_percentage: default_rollout_percentage(),
-            require_dpop: default_require_dpop(),
-            enable_authorize: default_oauth_enabled(),
-            enable_token: default_oauth_enabled(),
-            enable_device_management: false,
-            allow_jwt_fallback: default_allow_jwt_fallback(),
-        }
-    }
-}
-
-fn default_oauth_enabled() -> bool {
-    false // Disabled by default for safety
-}
-
-fn default_rollout_percentage() -> u8 {
-    0 // Start with 0% rollout
-}
-
-fn default_require_dpop() -> bool {
-    false // Optional in development
-}
-
-fn default_allow_jwt_fallback() -> bool {
-    true // Allow JWT during transition
-}
-
-/// Load OAuth feature flags from environment variables
-fn load_oauth_features_from_env() -> OAuthFeatureFlags {
-    OAuthFeatureFlags {
-        enabled: env::var("OAUTH_ENABLED")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false),
-        rollout_percentage: env::var("OAUTH_ROLLOUT_PERCENTAGE")
-            .unwrap_or_else(|_| "0".to_string())
-            .parse()
-            .unwrap_or(0),
-        require_dpop: env::var("OAUTH_REQUIRE_DPOP")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false),
-        enable_authorize: env::var("OAUTH_ENABLE_AUTHORIZE")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false),
-        enable_token: env::var("OAUTH_ENABLE_TOKEN")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false),
-        enable_device_management: env::var("OAUTH_ENABLE_DEVICE_MANAGEMENT")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false),
-        allow_jwt_fallback: env::var("OAUTH_ALLOW_JWT_FALLBACK")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse()
-            .unwrap_or(true),
-    }
 }
 
 /// Identity configuration
@@ -2092,7 +1990,6 @@ impl ServerConfig {
                 },
                 jwt_sunset_date: default_jwt_sunset_date(),
                 oauth_migration_guide_url: default_migration_guide_url(),
-                oauth_features: load_oauth_features_from_env(),
             },
             identity: IdentityConfig {
                 did_plc_url,

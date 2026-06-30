@@ -67,7 +67,6 @@ async fn create_test_manager() -> AccountManager {
             },
             jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
             oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
-            oauth_features: Default::default(),
         },
         identity: IdentityConfig {
             did_plc_url: "https://plc.directory".to_string(),

@@ -380,7 +380,6 @@ async fn account_manager_round_trip_on_postgres() {
             },
             jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
             oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
-            oauth_features: Default::default(),
         },
         identity: IdentityConfig {
             // chainlink #109 Option A — point at the CI mock PLC on

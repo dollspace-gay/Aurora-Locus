@@ -419,7 +419,6 @@ mod tests {
                 oauth: OAuthConfig { client_id: "http://localhost:3000/client-metadata.json".to_string(), redirect_uri: "http://localhost:3000/oauth/callback".to_string(), pds_url: "https://bsky.social".to_string() },
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration".to_string(),
-                oauth_features: Default::default(),
             },
             identity: IdentityConfig { did_plc_url: "https://plc.directory".to_string(), service_handle_domains: vec![".localhost".to_string()], did_cache_stale_ttl: 3600, did_cache_max_ttl: 86400, recovery_did_key: None },
             email: None,
