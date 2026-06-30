@@ -127,6 +127,14 @@ pub struct AppContext {
     /// JTI replay set is shared with the federation §8 challenge
     /// store when federation is enabled (see field above).
     pub dpop_verifier: Arc<DPopVerifier>,
+    /// Phase β.2 (#420): single-use nonce store backing the atproto-OAuth
+    /// AS-login challenge-response (login-α). A general-purpose
+    /// `DPopNonceStore` in its own keyspace — `generate_nonce` issues the
+    /// challenge, `check_and_consume_nonce` enforces single use. Always
+    /// present (login is not federation-gated). The server-nonce half is
+    /// in-memory; a distributed login-challenge story is a follow-up,
+    /// mirroring the DPoP server-nonce posture.
+    pub browser_login_nonces: Arc<DPopNonceStore>,
     // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
     // Cross-instance rate-limit primitive (Arc 7 Step 3).
@@ -769,6 +777,9 @@ impl AppContext {
             };
             Arc::new(DPopVerifier::new(store_for_verifier))
         };
+        // Phase β.2 (#420): the AS-login challenge store. Its own keyspace,
+        // always present (login is not federation-gated).
+        let browser_login_nonces = Arc::new(make_dpop_store());
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database).
         // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
@@ -1253,6 +1264,7 @@ impl AppContext {
             nonce_store,
             dpop_nonce_store,
             dpop_verifier,
+            browser_login_nonces,
             rate_limiter,
             distributed_rate_limiter,
             mailer,

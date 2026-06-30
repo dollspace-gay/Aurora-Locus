@@ -823,6 +823,25 @@ impl AccountManager {
         .map_err(PdsError::Database)
     }
 
+    /// v0.10 Arc 2 Phase β.2 (#420) — the by-DID companion to
+    /// `get_did_web_account_by_slug`. The atproto-OAuth AS-login endpoint
+    /// (login-α) needs the holder's stored `identity_public_key` to verify
+    /// the challenge signature, and it is handed a DID (not a slug). `None`
+    /// when the DID is not a did:web account on this PDS.
+    pub async fn get_did_web_account_by_did(
+        &self,
+        did: &str,
+    ) -> PdsResult<Option<DidWebAccount>> {
+        sqlx::query_as::<_, DidWebAccount>(
+            "SELECT did, domain, slug, identity_public_key, created_at \
+             FROM did_web_account WHERE did = $1",
+        )
+        .bind(did)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)
+    }
+
     /// v0.10 Arc 1 Phase D (#414) — the actor-only serve state for the did:web
     /// document route: handle (for `alsoKnownAs`) + the AD-1 gate inputs
     /// (deactivated_at / takedown_ref presence). No `account` join, so it works

@@ -121,7 +121,11 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
         // OAuth admin routes with their own state
         .merge(oauth_admin::routes(oauth_state_store))
         // OAuth server routes (for third-party app authorization)
-        .merge(oauth_server::routes());
+        .merge(oauth_server::routes())
+        // Arc 2 Phase β (#420): the atproto-OAuth provider (strangler-fig),
+        // served under `/oauth/atproto/*`. β.2 ships the browser-session
+        // substrate + AS-login (login-α).
+        .merge(crate::oauth::atproto::routes());
 
     // Arc 11 (chainlink #56): localhost-only dev curl framework
     // under `dev.aurora.*`. Compiled into debug builds only —

@@ -10,6 +10,7 @@
 //! - https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1
 //! - https://atproto.com/specs/oauth
 
+pub mod atproto;
 pub mod authorize;
 pub mod client;
 pub mod consent;
