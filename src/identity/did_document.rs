@@ -104,6 +104,93 @@ impl DidDocument {
     }
 }
 
+/// v0.10 Arc 1 Phase D (#414 / R1 F-6) — the shared lower-level builder for an
+/// atproto DID document. Both the server-own doc (`well_known::generate_did_document`)
+/// and the per-account did:web serve route (`/user/{slug}/did.json`) call this,
+/// so the two emit structurally-identical documents from one place.
+///
+/// `verification_method_multibase` is the `#atproto` public key in multibase form
+/// (the server passes its repo key; a did:web account passes its stored
+/// `identity_public_key`). `also_known_as` is `None` for the server-own doc and
+/// `Some("at://{handle}")` for a per-account doc (AD-2 β: composed at emit from
+/// `actor.handle`, not stored). Byte-equivalence with the prior hand-built
+/// server doc is NOT required (R2 Focus #3 — no byte-sensitive consumer exists);
+/// structural equivalence is sufficient.
+pub fn build_did_document(
+    did: &str,
+    verification_method_multibase: &str,
+    service_endpoint: String,
+    also_known_as: Option<&str>,
+) -> DidDocument {
+    let service = Service {
+        id: format!("{}#atproto_pds", did),
+        service_type: "AtprotoPersonalDataServer".to_string(),
+        service_endpoint,
+    };
+    let verification_method = VerificationMethod {
+        id: format!("{}#atproto", did),
+        key_type: "Multikey".to_string(),
+        controller: did.to_string(),
+        public_key_multibase: Some(verification_method_multibase.to_string()),
+    };
+    DidDocument {
+        context: Some(serde_json::json!([
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/security/multikey/v1",
+            "https://w3id.org/security/suites/secp256k1-2019/v1"
+        ])),
+        id: did.to_string(),
+        also_known_as: also_known_as
+            .map(|h| vec![h.to_string()])
+            .unwrap_or_default(),
+        service: vec![service],
+        verification_method: vec![verification_method],
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    #[test]
+    fn build_did_document_server_own_shape() {
+        let doc = build_did_document(
+            "did:web:pds.example.com",
+            "zServerKey",
+            "https://pds.example.com".to_string(),
+            None,
+        );
+        assert_eq!(doc.id, "did:web:pds.example.com");
+        assert!(doc.also_known_as.is_empty()); // server-own doc has no alsoKnownAs
+        assert_eq!(
+            doc.get_signing_key().and_then(|vm| vm.public_key_multibase.as_deref()),
+            Some("zServerKey")
+        );
+        assert_eq!(
+            doc.get_service_endpoint().as_deref(),
+            Some("https://pds.example.com")
+        );
+        // round-trips through the resolver's parse shape (get_signing_key looks
+        // for the #atproto method id).
+        assert_eq!(doc.verification_method[0].id, "did:web:pds.example.com#atproto");
+    }
+
+    #[test]
+    fn build_did_document_per_account_composes_aka() {
+        let doc = build_did_document(
+            "did:web:pds.example.com:user:alice",
+            "zAliceKey",
+            "https://pds.example.com".to_string(),
+            Some("at://alice.pds.example.com"),
+        );
+        assert_eq!(doc.also_known_as, vec!["at://alice.pds.example.com".to_string()]);
+        assert_eq!(
+            doc.get_signing_key().and_then(|vm| vm.public_key_multibase.as_deref()),
+            Some("zAliceKey")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

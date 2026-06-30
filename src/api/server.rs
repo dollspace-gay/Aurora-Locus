@@ -1159,6 +1159,18 @@ async fn get_service_auth(
     auth: AuthContext,
     Query(req): Query<GetServiceAuthQuery>,
 ) -> PdsResult<Json<GetServiceAuthResponse>> {
+    // v0.10 Arc 1 §10 / R2 F-3: getServiceAuth signs an ES256K JWT with the
+    // caller's own `#atproto` key. A public-key-only did:web account has no
+    // substrate-held signing key, and substrate-signing it as the holder would be
+    // a sovereignty break (same single-key reasoning as commit signing). Reject
+    // cleanly here rather than failing opaquely at the key read; Arc 2 closes this
+    // via holder-mediated signing (deliberate Arc-1 capability gap).
+    if crate::identity::did_method::is_web(&auth.did) {
+        return Err(PdsError::Validation(
+            "getServiceAuth is not yet supported for did:web accounts".to_string(),
+        ));
+    }
+
     let now = Utc::now().timestamp();
 
     // Validate expiration if provided

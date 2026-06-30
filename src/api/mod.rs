@@ -11,6 +11,7 @@ pub mod blob;
 pub mod bulk_diddoc_result;
 #[cfg(debug_assertions)]
 pub mod dev_routes;
+pub mod did_web;
 pub mod federation;
 pub mod account_emit;
 pub mod firehose;
@@ -63,6 +64,7 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
 
     let router = Router::new()
         .merge(well_known::routes())
+        .merge(did_web::routes())
         .merge(server::routes())
         .merge(repo::routes())
         .merge(repo_import::routes())

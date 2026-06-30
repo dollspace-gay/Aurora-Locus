@@ -5,7 +5,7 @@
 use crate::{
     account::AppPasswordInfo,
     config::ServerConfig,
-    db::account::{ActorAccount, Session},
+    db::account::{ActorAccount, ActorServeState, DidWebAccount, Session},
     error::{PdsError, PdsResult},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -803,6 +803,42 @@ impl AccountManager {
             email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
             invites_disabled: Some(crate::db::read_bool(&row, "invites_disabled")?),
         })
+    }
+
+    /// v0.10 Arc 1 Phase B (#414) — look up a did:web account by its `slug` (the
+    /// serve-route reverse lookup for `/user/{slug}/did.json`). Returns `None`
+    /// when no row matches. The by-DID lookup and the write helper ship in Phase C
+    /// (no Arc-1-standalone bin consumer; dead-code-tax per LOCKED §4).
+    pub async fn get_did_web_account_by_slug(
+        &self,
+        slug: &str,
+    ) -> PdsResult<Option<DidWebAccount>> {
+        sqlx::query_as::<_, DidWebAccount>(
+            "SELECT did, domain, slug, identity_public_key, created_at \
+             FROM did_web_account WHERE slug = $1",
+        )
+        .bind(slug)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)
+    }
+
+    /// v0.10 Arc 1 Phase D (#414) — the actor-only serve state for the did:web
+    /// document route: handle (for `alsoKnownAs`) + the AD-1 gate inputs
+    /// (deactivated_at / takedown_ref presence). No `account` join, so it works
+    /// for any actor row. `None` when no actor row exists for the DID.
+    pub async fn get_actor_serve_state(&self, did: &str) -> PdsResult<Option<ActorServeState>> {
+        use sqlx::Row as _;
+        let row = sqlx::query("SELECT handle, deactivated_at, takedown_ref FROM actor WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        Ok(row.map(|r| ActorServeState {
+            handle: r.get::<Option<String>, _>("handle"),
+            deactivated: r.get::<Option<String>, _>("deactivated_at").is_some(),
+            taken_down: r.get::<Option<String>, _>("takedown_ref").is_some(),
+        }))
     }
 
     /// Find account by DID, handle, or email (public for password reset).

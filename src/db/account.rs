@@ -73,6 +73,42 @@ pub struct ActorAccount {
     pub invites_disabled: Option<bool>,
 }
 
+/// v0.10 Arc 1 (#414) — a did:web account's public-key-only sovereign identity.
+///
+/// Mirrors the `did_web_account` table (migration 0027 sqlite / 0028 postgres).
+/// `identity_public_key` is the holder's `#atproto` verification method
+/// (multibase / did:key); there is deliberately NO private-key field — the
+/// substrate never holds the did:web signing key (LOCKED design §4 / §6 Layer 2
+/// under SD-1 (A)). `slug` is the stable minted DID segment (AD-3) and the
+/// serve-route reverse-lookup key. `created_at` is RFC3339 text, matching the
+/// column (not parsed to a `DateTime` — the serve path doesn't arithmetic on it).
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct DidWebAccount {
+    /// The did:web DID — PK and FK to `actor(did)` (ON DELETE CASCADE).
+    pub did: String,
+    /// The did:web host.
+    pub domain: String,
+    /// Stable minted DID segment; UNIQUE; the `/user/{slug}/did.json` lookup key.
+    pub slug: String,
+    /// The holder's `#atproto` verification-method public key (multibase).
+    pub identity_public_key: String,
+    /// Creation time, RFC3339.
+    pub created_at: String,
+}
+
+/// v0.10 Arc 1 Phase D (#414) — the actor-table fields the did:web serve route
+/// needs, read without the `account` join. `handle` composes `alsoKnownAs`
+/// (AD-2 β); `deactivated` / `taken_down` are the AD-1 serve-side gate inputs.
+/// Actor-only by design: serving an identity must not depend on the presence of
+/// an `account` row (which `get_account` requires for its `invites_disabled`
+/// read).
+#[derive(Debug, Clone)]
+pub struct ActorServeState {
+    pub handle: Option<String>,
+    pub deactivated: bool,
+    pub taken_down: bool,
+}
+
 /// PLC key storage per Arc 13 §6.3.2 key separation.
 ///
 /// The PDS-wide rotation key (which signs PLC ops) lives in
