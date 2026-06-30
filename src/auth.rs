@@ -1064,38 +1064,6 @@ pub fn extract_dpop_header(headers: &axum::http::HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Validate DPoP proof
-///
-/// Verifies that:
-/// 1. DPoP proof JWT is well-formed and signed correctly
-/// 2. JWK thumbprint matches the token's bound thumbprint
-/// 3. htm (HTTP method) and htu (HTTP URI) match the request
-/// 4. Proof is not expired and not reused (via jti)
-///
-/// This will be fully implemented when we integrate DPoP validation.
-pub async fn validate_dpop_proof(
-    _ctx: &AppContext,
-    _dpop_proof: &str,
-    _expected_thumbprint: &str,
-    _http_method: &str,
-    _http_uri: &str,
-) -> Result<(), PdsError> {
-    // TODO: Implement full DPoP proof validation
-    // For now, we'll skip DPoP validation and mark it as a future task
-
-    // Steps:
-    // 1. Parse DPoP proof JWT
-    // 2. Extract JWK from proof header
-    // 3. Compute JWK thumbprint
-    // 4. Verify thumbprint matches expected_thumbprint
-    // 5. Verify proof signature using JWK
-    // 6. Verify htm and htu claims
-    // 7. Verify jti is unique (replay prevention)
-    // 8. Verify proof is not expired
-
-    Ok(())
-}
-
 /// Argon2id password hashing.
 ///
 /// Vendored from the previously embedded `atproto::server_auth::PasswordHasher`
