@@ -1017,18 +1017,21 @@ pub async fn validate_oauth_token(
     ctx: &AppContext,
     access_token: &str,
 ) -> Result<OAuthToken, PdsError> {
-    // Query token table for this access token
-    // Note: In the actual implementation, access tokens should be stored hashed
-    // For now, we'll do a direct lookup
-
+    // Query the token table by the SHA-256 hash of the presented bearer
+    // (β.1 / R1 F-3.1). The raw bearer is never stored; `token.rs` and
+    // `token_rotation.rs` persist `access_token_hash` at issuance and refresh.
+    // `NOT revoked` both enforces revocation and lets the planner use the
+    // partial `idx_token_access_hash` index. (`NOT revoked` is the
+    // dual-dialect idiom — sqlite INTEGER and postgres BOOLEAN both honor it.)
+    let presented_hash = crate::oauth::access_token_hash(access_token);
     let row = sqlx::query(
         r#"
         SELECT token_id, did, client_id, scope, dpop_thumbprint, device_id, expires_at
         FROM token
-        WHERE token_id = ?
+        WHERE access_token_hash = $1 AND NOT revoked
         "#,
     )
-    .bind(access_token)
+    .bind(&presented_hash)
     .fetch_optional(&ctx.account_db)
     .await
     .map_err(PdsError::Database)?
@@ -2105,6 +2108,111 @@ mod admin_auth_third_path_tests {
             Err(PdsError::Authentication(_)) => {}
             other => panic!("expected Authentication (401) for unknown sid, got {:?}", other),
         }
+    }
+
+    // ---------- β.1: OAuth bearer validation (R1 F-3.1) ----------
+
+    /// Insert a `token` row directly, mirroring `oauth/token.rs`'s issuance
+    /// shape. `hash` is the stored `access_token_hash` (None => pre-β.1 row).
+    async fn seed_oauth_token(
+        ctx: &AppContext,
+        token_id: &str,
+        did: &str,
+        bearer_hash: Option<&str>,
+        revoked: bool,
+    ) {
+        let now = chrono::Utc::now();
+        let exp = (now + chrono::Duration::hours(1)).to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO token (
+                token_id, did, client_id, current_refresh_token,
+                scope, created_at, updated_at, expires_at,
+                dpop_thumbprint, device_id, access_token_hash, revoked
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            "#,
+        )
+        .bind(token_id)
+        .bind(did)
+        .bind("client-x")
+        .bind(Option::<String>::None)
+        .bind("atproto")
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(&exp)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(bearer_hash)
+        .bind(revoked)
+        .execute(&ctx.account_db)
+        .await
+        .expect("seed token row");
+    }
+
+    #[tokio::test]
+    async fn oauth_bearer_validates_by_hash_not_token_id() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let bearer = "at_deadbeefdeadbeefdeadbeefdeadbeef";
+        let token_id = "tok-hash-1";
+        let hash = crate::oauth::access_token_hash(bearer);
+        seed_oauth_token(&ctx, token_id, "did:web:alice.example.com", Some(&hash), false)
+            .await;
+
+        // F-3.1 regression: the bearer validates — lookup is by hash now, not
+        // by token_id. On HEAD before β.1 this returned Authentication error
+        // because the bearer was never stored as token_id.
+        let ok = super::validate_oauth_token(&ctx, bearer)
+            .await
+            .expect("freshly-issued bearer must validate");
+        assert_eq!(ok.did, "did:web:alice.example.com");
+        assert_eq!(ok.token_id, token_id);
+
+        // Presenting the token_id string as a bearer must NOT validate (the
+        // old broken lookup key).
+        assert!(
+            super::validate_oauth_token(&ctx, token_id).await.is_err(),
+            "token_id must not be accepted as a bearer"
+        );
+
+        // A tampered bearer (last char flipped) must not validate.
+        let tampered = "at_deadbeefdeadbeefdeadbeefdeadbeee";
+        assert!(
+            super::validate_oauth_token(&ctx, tampered).await.is_err(),
+            "tampered bearer must not validate"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_pre_beta1_null_hash_row_does_not_validate() {
+        // A row with NULL access_token_hash (a pre-β.1 broken-issuance row)
+        // never validates by bearer — a hash lookup cannot match NULL.
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        seed_oauth_token(&ctx, "tok-old", "did:web:bob.example.com", None, false).await;
+        assert!(
+            super::validate_oauth_token(&ctx, "at_oldbrokentoken")
+                .await
+                .is_err(),
+            "pre-β.1 NULL-hash row must not validate by bearer"
+        );
+        assert!(
+            super::validate_oauth_token(&ctx, "tok-old").await.is_err(),
+            "pre-β.1 row must not validate by token_id either"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_revoked_bearer_does_not_validate() {
+        // The `NOT revoked` clause in the lookup excludes revoked tokens.
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let bearer = "at_revokedrevokedrevokedrevoked01";
+        let hash = crate::oauth::access_token_hash(bearer);
+        seed_oauth_token(&ctx, "tok-rev", "did:web:carol.example.com", Some(&hash), true)
+            .await;
+        assert!(
+            super::validate_oauth_token(&ctx, bearer).await.is_err(),
+            "revoked bearer must not validate"
+        );
     }
 }
 

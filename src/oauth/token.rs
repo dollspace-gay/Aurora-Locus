@@ -198,6 +198,10 @@ async fn handle_authorization_code_grant(
     let _access_expires = now + Duration::hours(1); // 1 hour access token (TODO: store in DB)
     let refresh_expires = now + Duration::days(90); // 90 day refresh token
 
+    // Persist the SHA-256 hash of the bearer, not the bearer itself (β.1 /
+    // R1 F-3.1). `validate_oauth_token` looks the bearer up by this hash.
+    let access_token_hash = crate::oauth::access_token_hash(&access_token);
+
     // Determine token type before moving dpop_thumbprint
     let has_dpop = dpop_thumbprint.is_some();
 
@@ -206,9 +210,9 @@ async fn handle_authorization_code_grant(
         INSERT INTO token (
             token_id, did, client_id, current_refresh_token,
             scope, created_at, updated_at, expires_at,
-            dpop_thumbprint, device_id
+            dpop_thumbprint, device_id, access_token_hash
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         "#,
     )
     .bind(&token_id)
@@ -221,6 +225,7 @@ async fn handle_authorization_code_grant(
     .bind(refresh_expires.to_rfc3339())
     .bind(dpop_thumbprint)
     .bind(Option::<String>::None) // device_id (TODO: bind to device)
+    .bind(&access_token_hash)
     .execute(&ctx.account_db)
     .await?;
 

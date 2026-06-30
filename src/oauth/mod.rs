@@ -37,3 +37,19 @@ pub use scope::{
     require_scope, required_scopes_for_path, AtProtoScope, ScopeSet,
 };
 pub use token::token_endpoint;
+
+/// SHA-256 hex digest of an OAuth bearer, used for storage and lookup.
+///
+/// Phase β.1 / R1 F-3.1: the raw bearer is returned to the client but never
+/// persisted; only this digest lands in `token.access_token_hash` and serves
+/// as the `validate_oauth_token` lookup key. SHA-256 (not Argon2id) is the
+/// correct primitive here — bearers are high-entropy random tokens, not human
+/// passwords, validation runs on every XRPC, and the token's own randomness
+/// defeats brute-forcing the digest. Keeping the bearer off disk means a DB
+/// compromise yields no usable credential.
+pub(crate) fn access_token_hash(bearer: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bearer.as_bytes());
+    hex::encode(hasher.finalize())
+}
