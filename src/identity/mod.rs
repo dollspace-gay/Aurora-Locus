@@ -6,6 +6,7 @@
 pub mod cache;
 pub mod clock;
 pub mod did_document;
+pub mod did_method;
 pub mod handle_validation;
 pub mod reserved_handles;
 pub mod resolver;
