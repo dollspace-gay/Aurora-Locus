@@ -1,8 +1,8 @@
 /// HTTP server setup and routing
 use crate::{
     api::middleware::{
-        check_account_moderation, federation_enabled_gate, jwt_deprecation_headers,
-        namespace_scope_check,
+        atproto_oauth_gate, check_account_moderation, federation_enabled_gate,
+        jwt_deprecation_headers, namespace_scope_check,
     },
     context::AppContext,
     error::{PdsError, PdsResult},
@@ -97,6 +97,14 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
             ctx.clone(),
             namespace_scope_check,
         ))
+        // Arc 2 ε.3 — atproto-OAuth bearer gate (registry-gated). Resolves a
+        // `DPoP`-scheme bearer to a DID (validate + DPoP proof + registered
+        // device) and stamps the trusted internal header the fn-based auth
+        // resolvers (require_auth / require_auth_unified) read. Layered OUTER of
+        // the scope-check + moderation layers (and the handlers), so the
+        // resolved DID is set before any of them run. Strips the inbound
+        // internal header unconditionally — spoof defense.
+        .layer(middleware::from_fn_with_state(ctx.clone(), atproto_oauth_gate))
         // v0.9 Federation runtime-mutability arc §3.7 (#395) — request-layer
         // short-circuit: 503 the inbound federation operational endpoints when
         // federation.enabled resolves false (incident response, effective before

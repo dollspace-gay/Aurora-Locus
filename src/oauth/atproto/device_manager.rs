@@ -116,6 +116,39 @@ impl AtprotoDeviceManager {
             .map_err(PdsError::Database)
     }
 
+    /// Look up an ACTIVE device by DPoP thumbprint, scoped to `did` — the ε.3
+    /// registry gate. Returns `None` for an unknown, revoked, or wrong-holder
+    /// thumbprint.
+    pub async fn get_device_by_jkt(
+        &self,
+        did: &str,
+        jkt: &str,
+    ) -> PdsResult<Option<AtprotoDeviceRow>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM atproto_device \
+             WHERE did = $1 AND dpop_jkt = $2 AND revoked_at IS NULL"
+        );
+        sqlx::query_as::<_, AtprotoDeviceRow>(&sql)
+            .bind(did)
+            .bind(jkt)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(PdsError::Database)
+    }
+
+    /// Refresh `last_seen_at` (called by the ε.3 gate on each successful bearer
+    /// request). Best-effort activity tracking; not did-scoped because the
+    /// caller already resolved the device by (did, jkt).
+    pub async fn touch(&self, device_id: &str) -> PdsResult<()> {
+        sqlx::query("UPDATE atproto_device SET last_seen_at = $1 WHERE device_id = $2")
+            .bind(Utc::now().to_rfc3339())
+            .bind(device_id)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        Ok(())
+    }
+
     /// Revoke a holder's device (soft-delete) AND cascade-revoke every token
     /// bound to that device's DPoP key. After this, no bearer whose DPoP proof
     /// uses this key can pass the ε.3 gate, and its tokens are `revoked`.
@@ -216,9 +249,33 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].device_id, dev.device_id);
 
-        // Revoke → gone from the active list.
+        // Found by (did, jkt); not for a wrong did; gone after revoke.
+        assert!(mgr.get_device_by_jkt(did, &dev.dpop_jkt).await.unwrap().is_some());
+        assert!(mgr
+            .get_device_by_jkt("did:web:bob.example.com", &dev.dpop_jkt)
+            .await
+            .unwrap()
+            .is_none());
+
+        // touch advances last_seen_at.
+        sqlx::query("UPDATE atproto_device SET last_seen_at = '2000-01-01T00:00:00Z' WHERE device_id = $1")
+            .bind(&dev.device_id)
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        mgr.touch(&dev.device_id).await.unwrap();
+        let seen = mgr
+            .get_device_by_jkt(did, &dev.dpop_jkt)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_seen_at;
+        assert!(seen.as_str() > "2000-01-01T00:00:00Z");
+
+        // Revoke → gone from the active list + not found by jkt.
         mgr.revoke_device(did, &dev.device_id).await.unwrap();
         assert!(mgr.list_devices(did).await.unwrap().is_empty());
+        assert!(mgr.get_device_by_jkt(did, &dev.dpop_jkt).await.unwrap().is_none());
     }
 
     #[tokio::test]
