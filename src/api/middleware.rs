@@ -1385,6 +1385,32 @@ mod epsilon_oauth_gate_tests {
         assert_eq!(rscope, "atproto:repo.* atproto:blob.upload"); // ε.4 scope-α
     }
 
+    #[test]
+    fn translated_scope_gates_enforce_scope_end_to_end() {
+        // ε.3 (gate) → ε.4 (translation) → handler enforce_scope, tied together.
+        use crate::oauth::atproto::scope::to_internal_scope;
+        use crate::oauth::AtProtoScope;
+
+        let generic = UnifiedAuthContext::OAuth {
+            did: "did:web:x.example.com".to_string(),
+            scope: to_internal_scope("atproto transition:generic"),
+        };
+        // transition:generic admits the repo-write family + blob upload…
+        assert!(enforce_scope(&generic, &AtProtoScope::RepoCreate).is_ok());
+        assert!(enforce_scope(&generic, &AtProtoScope::RepoDelete).is_ok());
+        assert!(enforce_scope(&generic, &AtProtoScope::BlobUpload).is_ok());
+        // …but never admin.
+        assert!(enforce_scope(&generic, &AtProtoScope::AdminAll).is_err());
+
+        // Base `atproto` alone grants no write capability.
+        let base = UnifiedAuthContext::OAuth {
+            did: "did:web:y.example.com".to_string(),
+            scope: to_internal_scope("atproto"),
+        };
+        assert!(enforce_scope(&base, &AtProtoScope::RepoCreate).is_err());
+        assert!(enforce_scope(&base, &AtProtoScope::BlobUpload).is_err());
+    }
+
     #[tokio::test]
     async fn resolve_base_atproto_only_grants_no_write_scope() {
         let ctx = ctx().await;
