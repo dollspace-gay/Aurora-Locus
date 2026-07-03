@@ -170,18 +170,18 @@ async fn resolve_atproto_oauth(
     // 5. best-effort activity tracking (never fails the request).
     let _ = ctx.atproto_device_manager.touch(&device.device_id).await;
 
-    // 6. scope STUB (ε.4 replaces): require the base `atproto` scope, then admit
-    //    broadly by handing the internal all-scope to the downstream resolver.
-    if !token_info
-        .scope
-        .split_whitespace()
-        .any(|s| s == "atproto")
-    {
+    // 6. scope (ε.4 scope-α, translate-at-gate): require the base `atproto`
+    //    scope, then translate the bearer's atproto-spec scopes into the
+    //    internal-vocabulary scope string the handler-side `enforce_scope`
+    //    evaluates (transition:generic → repo.* + blob.upload; base-only → no
+    //    write capability; admin never granted).
+    if !token_info.scope.split_whitespace().any(|s| s == "atproto") {
         return Err(PdsError::Authorization(
             "token lacks the required 'atproto' scope".to_string(),
         ));
     }
-    Ok((token_info.did, "atproto:*".to_string()))
+    let internal_scope = crate::oauth::atproto::scope::to_internal_scope(&token_info.scope);
+    Ok((token_info.did, internal_scope))
 }
 
 /// Authenticate request and add session to extensions
@@ -1365,20 +1365,41 @@ mod epsilon_oauth_gate_tests {
 
 
     #[tokio::test]
-    async fn resolve_happy_path_returns_did_and_stub_scope() {
+    async fn resolve_happy_path_translates_scope() {
         let ctx = ctx().await;
         let did = "did:web:carol.example.com";
         seed_actor(&ctx, did).await;
         let (sk, jwk) = fresh_p256();
-        let (bearer, _jkt) = seed_token_and_device(&ctx, did, &jwk, "atproto").await;
+        // transition:generic → the internal repo.* + blob.upload capabilities.
+        let (bearer, _jkt) =
+            seed_token_and_device(&ctx, did, &jwk, "atproto transition:generic").await;
 
         let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
         let ath = crate::federation::dpop::compute_ath(&bearer);
         let proof = dpop_proof(&sk, &jwk, &htu, &ath);
 
-        let (rdid, rscope) = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer).await.expect("resolve");
+        let (rdid, rscope) = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
+            .await
+            .expect("resolve");
         assert_eq!(rdid, did);
-        assert_eq!(rscope, "atproto:*"); // ε.3 stub
+        assert_eq!(rscope, "atproto:repo.* atproto:blob.upload"); // ε.4 scope-α
+    }
+
+    #[tokio::test]
+    async fn resolve_base_atproto_only_grants_no_write_scope() {
+        let ctx = ctx().await;
+        let did = "did:web:grace.example.com";
+        seed_actor(&ctx, did).await;
+        let (sk, jwk) = fresh_p256();
+        // Base `atproto` only → empty internal scope (reads ok, writes 403).
+        let (bearer, _jkt) = seed_token_and_device(&ctx, did, &jwk, "atproto").await;
+        let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
+        let ath = crate::federation::dpop::compute_ath(&bearer);
+        let proof = dpop_proof(&sk, &jwk, &htu, &ath);
+        let (_did, rscope) = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
+            .await
+            .expect("resolve");
+        assert_eq!(rscope, "");
     }
 
     #[tokio::test]

@@ -163,6 +163,43 @@ impl fmt::Display for ScopeSet {
     }
 }
 
+/// Translate an atproto-OAuth scope string into the **internal**-vocabulary
+/// scope string the XRPC handlers evaluate via
+/// `crate::oauth::require_scope` / `api::middleware::enforce_scope` (Arc 2
+/// Phase ε.4, scope-α: translate-at-gate). The ε.3 gate calls this to replace
+/// its `atproto:*` stub with a real, capability-bounded mapping.
+///
+/// The translation is coarse by nature — atproto's transition scopes are
+/// broader than Aurora's fine-grained internal vocabulary:
+/// - `transition:generic` is the app-password-equivalent surface, so it grants
+///   the internal repo-write family (`atproto:repo.*`) + blob upload
+///   (`atproto:blob.upload`) — exactly the capabilities the `enforce_scope`
+///   sites gate.
+/// - the base `atproto` scope alone grants NO write capability (reads never
+///   call `enforce_scope`, so an `atproto`-only bearer can read but not write).
+/// - `transition:chat.bsky` has no Aurora `enforce_scope` site today, so it
+///   maps to nothing enforced.
+/// - **admin is never granted** — an atproto did:web bearer cannot escalate to
+///   an operator scope.
+///
+/// Input need not be a validated [`ScopeSet`] — it operates on the raw stored
+/// token scope string (space-separated), ignoring unknown tokens.
+pub fn to_internal_scope(atproto_scope: &str) -> String {
+    let mut internal: Vec<&str> = Vec::new();
+    for token in atproto_scope.split_whitespace() {
+        if token == AtprotoScope::TransitionGeneric.as_str() {
+            for cap in ["atproto:repo.*", "atproto:blob.upload"] {
+                if !internal.contains(&cap) {
+                    internal.push(cap);
+                }
+            }
+        }
+        // `atproto` (base) and `transition:chat.bsky` grant no enforced
+        // internal capability; unknown tokens are ignored.
+    }
+    internal.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +247,24 @@ mod tests {
             AtprotoScope::parse_set("atproto bogus"),
             Err(ScopeParseError::Unknown("bogus".to_string()))
         );
+    }
+
+    #[test]
+    fn to_internal_scope_maps_transition_generic_to_repo_and_blob() {
+        // The base scope alone grants no enforced write capability.
+        assert_eq!(to_internal_scope("atproto"), "");
+        // transition:generic → the repo-write family + blob upload.
+        assert_eq!(
+            to_internal_scope("atproto transition:generic"),
+            "atproto:repo.* atproto:blob.upload"
+        );
+        // chat.bsky has no enforcement site; unknown tokens ignored; no dupes.
+        assert_eq!(
+            to_internal_scope("atproto transition:chat.bsky transition:generic bogus transition:generic"),
+            "atproto:repo.* atproto:blob.upload"
+        );
+        // Admin is never granted.
+        assert!(!to_internal_scope("atproto transition:generic").contains("admin"));
     }
 
     #[test]
