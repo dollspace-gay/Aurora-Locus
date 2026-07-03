@@ -1161,15 +1161,13 @@ async fn get_service_auth(
 ) -> PdsResult<Json<GetServiceAuthResponse>> {
     // v0.10 Arc 1 §10 / R2 F-3: getServiceAuth signs an ES256K JWT with the
     // caller's own `#atproto` key. A public-key-only did:web account has no
-    // substrate-held signing key, and substrate-signing it as the holder would be
-    // a sovereignty break (same single-key reasoning as commit signing). Reject
-    // cleanly here rather than failing opaquely at the key read; Arc 2 closes this
-    // via holder-mediated signing (deliberate Arc-1 capability gap).
-    if crate::identity::did_method::is_web(&auth.did) {
-        return Err(PdsError::Validation(
-            "getServiceAuth is not yet supported for did:web accounts".to_string(),
-        ));
-    }
+    // substrate-held signing key, so signing it in-process is impossible (and
+    // substrate-signing as the holder would be a sovereignty break — the same
+    // single-key reasoning as commit signing). Arc 2 Phase δ (LOCKED §5) closes
+    // the Arc-1 gap by *mediating* the signature through the holder signing
+    // channel. The did:web branch lives at the signing step below (not here) so
+    // a did:web request still runs the full exp / takedown / protected-method
+    // validation before dispatch — identical policy to the did:plc path.
 
     let now = Utc::now().timestamp();
 
@@ -1254,25 +1252,38 @@ async fn get_service_auth(
     // one layer up. Same key surface used by genesis-commit signing
     // (Arc 15, api/account_emit.rs::create_account_emit_sequence)
     // and Arc 18's record-write fix.
-    let signing_key_bytes = ctx
-        .account_manager
-        .get_atproto_signing_key_bytes(&auth.did)
-        .await?;
+    // Generate the service-auth JWT. did:plc signs in-process with the
+    // per-account key; did:web mediates the signature through the holder
+    // channel (Arc 2 Phase δ, LOCKED §5, SD-A4 (a)).
+    let token = if crate::identity::did_method::is_web(&auth.did) {
+        mint_service_jwt_via_holder(
+            ctx.holder_signing_channel.as_ref(),
+            &auth.did,
+            &req.aud,
+            exp_duration,
+            req.lxm.as_deref(),
+        )
+        .await?
+    } else {
+        let signing_key_bytes = ctx
+            .account_manager
+            .get_atproto_signing_key_bytes(&auth.did)
+            .await?;
 
-    if signing_key_bytes.len() != 32 {
-        return Err(PdsError::Internal(
-            "Signing key must be exactly 32 bytes".to_string(),
-        ));
-    }
+        if signing_key_bytes.len() != 32 {
+            return Err(PdsError::Internal(
+                "Signing key must be exactly 32 bytes".to_string(),
+            ));
+        }
 
-    // Generate service auth JWT
-    let token = service_auth::create_service_jwt(
-        &auth.did,          // Issuer DID (authenticated user)
-        &req.aud,           // Audience DID (target service)
-        exp_duration,       // Expiration duration in seconds
-        req.lxm.as_deref(), // Optional lexicon method
-        &signing_key_bytes, // Per-account signing key (chainlink #143)
-    )?;
+        service_auth::create_service_jwt(
+            &auth.did,          // Issuer DID (authenticated user)
+            &req.aud,           // Audience DID (target service)
+            exp_duration,       // Expiration duration in seconds
+            req.lxm.as_deref(), // Optional lexicon method
+            &signing_key_bytes, // Per-account signing key (chainlink #143)
+        )?
+    };
 
     tracing::info!(
         did = %auth.did,
@@ -1283,6 +1294,33 @@ async fn get_service_auth(
     );
 
     Ok(Json(GetServiceAuthResponse { token }))
+}
+
+/// The did:web branch of getServiceAuth minting (Arc 2 Phase δ, LOCKED §5,
+/// SD-A4 (a)). Structurally parallel to [`service_auth::create_service_jwt`]'s
+/// in-process signing, but the signature comes from the account holder over
+/// the [`crate::holder_signing::HolderSigningChannel`] — the substrate never
+/// holds the did:web `#atproto` key (pre-decision 1).
+///
+/// The header + claims + signing input are built by the SAME
+/// `service_auth::service_jwt_signing_input` the did:plc path uses, so the two
+/// emit an identical JWT format; the holder's 64-byte compact ES256K signature
+/// is re-encoded to DER for the JWT wire form (`verify_service_jwt` decodes
+/// DER). Until Phase γ installs the real channel, the default
+/// `UnavailableHolderSigningChannel` makes this return a clean 4xx
+/// (`HolderSigningError::ChannelNotAvailable` → `PdsError::Validation`) — the
+/// honest successor to the pre-δ "not yet supported for did:web" rejection.
+async fn mint_service_jwt_via_holder(
+    channel: &dyn crate::holder_signing::HolderSigningChannel,
+    did: &str,
+    aud: &str,
+    exp_seconds: Option<i64>,
+    lxm: Option<&str>,
+) -> PdsResult<String> {
+    let signing_input = service_auth::service_jwt_signing_input(did, aud, exp_seconds, lxm)?;
+    let compact = channel.sign_service_auth(did, signing_input.as_bytes()).await?;
+    let der = service_auth::compact_es256k_to_der(&compact)?;
+    Ok(service_auth::assemble_service_jwt(&signing_input, &der))
 }
 
 // ==================== New Endpoints for XRPC Parity ====================
@@ -1901,6 +1939,79 @@ async fn reserve_signing_key(
     );
 
     Ok(Json(ReserveSigningKeyResponse { signing_key }))
+}
+
+#[cfg(test)]
+mod service_auth_holder_mediation_tests {
+    use super::*;
+    use crate::holder_signing::{MockHolderSigningChannel, UnavailableHolderSigningChannel};
+
+    #[tokio::test]
+    async fn mint_via_unavailable_channel_is_client_error_not_5xx() {
+        // Before Phase γ, the default channel makes the did:web branch return an
+        // honest 4xx — the successor to the pre-δ "not supported for did:web"
+        // rejection. Must NOT be a 5xx (holder unavailability is client-visible
+        // state, not a server bug).
+        let ch = UnavailableHolderSigningChannel;
+        let err = mint_service_jwt_via_holder(
+            &ch,
+            "did:web:alice.example.com",
+            "did:web:appview.test",
+            Some(60),
+            Some("com.atproto.repo.createRecord"),
+        )
+        .await
+        .expect_err("unavailable channel must fail");
+        assert!(matches!(err, PdsError::Validation(_)), "want 4xx Validation");
+        assert!(err.to_string().contains("Phase γ pending"));
+    }
+
+    #[tokio::test]
+    async fn mint_via_mock_holder_produces_verifiable_jwt() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use k256::ecdsa::{signature::Verifier, Signature};
+
+        let did = "did:web:alice.example.com";
+        let aud = "did:web:appview.test";
+        let mock = MockHolderSigningChannel::new();
+
+        let jwt = mint_service_jwt_via_holder(
+            &mock,
+            did,
+            aud,
+            Some(60),
+            Some("com.atproto.repo.createRecord"),
+        )
+        .await
+        .expect("mint via holder");
+
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT is header.claims.sig");
+
+        // Header shape matches the did:plc path (ES256K / JWT).
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header["alg"], "ES256K");
+        assert_eq!(header["typ"], "JWT");
+
+        // Claims carry iss = holder, aud = target, and the lxm.
+        let claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(claims["iss"], did);
+        assert_eq!(claims["aud"], aud);
+        assert_eq!(claims["lxm"], "com.atproto.repo.createRecord");
+
+        // The holder's signature verifies over the signing input via the SAME
+        // DER-decode path a receiving peer uses (service_auth::verify_service_jwt
+        // → Signature::from_der). This proves the compact→DER re-encode is
+        // wire-correct and the assembled JWT is verifiable.
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let sig = Signature::from_der(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap())
+            .expect("signature segment is DER");
+        mock.verifying_key()
+            .verify(signing_input.as_bytes(), &sig)
+            .expect("holder signature verifies against the mock's public key");
+    }
 }
 
 #[cfg(test)]

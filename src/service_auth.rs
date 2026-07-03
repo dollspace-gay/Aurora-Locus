@@ -263,18 +263,39 @@ pub fn create_service_jwt(
     lxm: Option<&str>,
     signing_key: &[u8],
 ) -> PdsResult<String> {
-    // Determine expiration
+    // Build the signing input (header + claims), then sign it in-process with
+    // the substrate-held key. The did:web holder-mediated path
+    // (`mint_service_jwt_via_holder`) reuses the SAME builder + assembler so the
+    // two emit an identical JWT format; only the signature source differs.
+    let signing_input = service_jwt_signing_input(iss, aud, exp_seconds, lxm)?;
+
+    let signing_key = SigningKey::from_slice(signing_key)
+        .map_err(|e| PdsError::Authentication(format!("Invalid signing key: {}", e)))?;
+    let signature: Signature = signing_key.sign(signing_input.as_bytes());
+    Ok(assemble_service_jwt(&signing_input, signature.to_der().as_bytes()))
+}
+
+/// Build a service-auth JWT's **signing input** — `base64url(header) + "." +
+/// base64url(claims)` — the exact bytes that get signed.
+///
+/// Shared by the in-process signer ([`create_service_jwt`], did:plc) and the
+/// holder-mediated signer (`mint_service_jwt_via_holder`, did:web, Phase δ), so
+/// both produce a byte-identical JWT format and only the *source* of the
+/// signature differs. Enforces the same expiration window (`claims.validate`).
+pub fn service_jwt_signing_input(
+    iss: &str,
+    aud: &str,
+    exp_seconds: Option<i64>,
+    lxm: Option<&str>,
+) -> PdsResult<String> {
     let now = Utc::now().timestamp();
     let default_exp = if lxm.is_some() {
         MAX_EXP_WITH_METHOD
     } else {
         MAX_EXP_WITHOUT_METHOD
     };
+    let exp = now + exp_seconds.unwrap_or(default_exp);
 
-    let exp_duration = exp_seconds.unwrap_or(default_exp);
-    let exp = now + exp_duration;
-
-    // Create claims
     let claims = ServiceAuthClaims {
         iss: iss.to_string(),
         aud: aud.to_string(),
@@ -282,46 +303,36 @@ pub fn create_service_jwt(
         lxm: lxm.map(|s| s.to_string()),
         jti: None, // Can be added if replay protection is needed
     };
-
-    // Validate claims
     claims.validate()?;
 
-    // Convert signing key bytes to k256 SigningKey
-    let signing_key = SigningKey::from_slice(signing_key)
-        .map_err(|e| PdsError::Authentication(format!("Invalid signing key: {}", e)))?;
-
-    // Create JWT manually since jsonwebtoken doesn't support ES256K
-    // JWT format: header.payload.signature (all base64url encoded)
-
-    // Create header for ES256K
-    let header = serde_json::json!({
-        "alg": "ES256K",
-        "typ": "JWT"
-    });
-
+    // JWT is hand-rolled because jsonwebtoken doesn't support ES256K.
+    let header = serde_json::json!({ "alg": "ES256K", "typ": "JWT" });
     let header_json = serde_json::to_string(&header)
         .map_err(|e| PdsError::Jwt(format!("Failed to serialize header: {}", e)))?;
     let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
 
-    // Serialize claims
     let claims_json = serde_json::to_string(&claims)
         .map_err(|e| PdsError::Jwt(format!("Failed to serialize claims: {}", e)))?;
     let claims_b64 = URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
 
-    // Create signing input
-    let signing_input = format!("{}.{}", header_b64, claims_b64);
+    Ok(format!("{}.{}", header_b64, claims_b64))
+}
 
-    // Sign with secp256k1
-    let signature: Signature = signing_key.sign(signing_input.as_bytes());
+/// Assemble the final JWT string from a signing input and the DER-encoded
+/// signature bytes: `signing_input + "." + base64url(signature_der)`.
+pub fn assemble_service_jwt(signing_input: &str, signature_der: &[u8]) -> String {
+    format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(signature_der))
+}
 
-    // Encode signature (DER format)
-    let signature_bytes = signature.to_der();
-    let signature_b64 = URL_SAFE_NO_PAD.encode(signature_bytes.as_bytes());
-
-    // Combine into final JWT
-    let token = format!("{}.{}.{}", header_b64, claims_b64, signature_b64);
-
-    Ok(token)
+/// Re-encode a 64-byte compact `R‖S` ES256K signature (the shape a holder
+/// returns over [`crate::holder_signing::HolderSigningChannel`]) into the DER
+/// form the service-auth / entryway JWT wire format uses — `verify_service_jwt`
+/// decodes signatures with `Signature::from_der`.
+pub fn compact_es256k_to_der(compact: &[u8]) -> PdsResult<Vec<u8>> {
+    let signature = Signature::from_slice(compact).map_err(|e| {
+        PdsError::Jwt(format!("holder returned an invalid compact ES256K signature: {}", e))
+    })?;
+    Ok(signature.to_der().as_bytes().to_vec())
 }
 
 /// Verify a service auth JWT token

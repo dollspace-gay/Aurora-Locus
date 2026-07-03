@@ -23,6 +23,7 @@ pub mod db;
 pub mod distributed;
 pub mod error;
 pub mod federation;
+pub mod holder_signing;
 pub mod identity;
 pub mod jobs;
 pub mod kryphocron;

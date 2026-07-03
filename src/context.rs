@@ -141,6 +141,15 @@ pub struct AppContext {
     /// URIs. The legacy `ClientManager` (static, operator-internal) is
     /// retained separately — strangler-fig boundary.
     pub client_metadata_fetcher: Arc<crate::oauth::atproto::client_metadata::ClientMetadataFetcher>,
+    /// v0.10 Arc 2 Phase δ (LOCKED §5) — holder-mediated signing seam. did:web
+    /// accounts sign *as the holder* (pre-decision 1: the substrate never holds
+    /// their `#atproto` key), so getServiceAuth / entryway-auth JWTs and (Phase
+    /// γ) repo commits for a did:web holder route through this channel instead
+    /// of an in-process key read. Constructed as
+    /// [`crate::holder_signing::UnavailableHolderSigningChannel`] by default
+    /// (returns a clean "channel not yet available" 4xx); Phase γ installs the
+    /// real channel here.
+    pub holder_signing_channel: Arc<dyn crate::holder_signing::HolderSigningChannel>,
     // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
     // Cross-instance rate-limit primitive (Arc 7 Step 3).
@@ -789,6 +798,10 @@ impl AppContext {
         // Phase β.4 (#420): the URL-based client-metadata fetcher.
         let client_metadata_fetcher =
             Arc::new(crate::oauth::atproto::client_metadata::ClientMetadataFetcher::new());
+        // Phase δ (Arc 2 §5): holder-signing seam. Default = unavailable; Phase
+        // γ swaps in the real channel at this construction site.
+        let holder_signing_channel: Arc<dyn crate::holder_signing::HolderSigningChannel> =
+            Arc::new(crate::holder_signing::UnavailableHolderSigningChannel);
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database).
         // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
@@ -1275,6 +1288,7 @@ impl AppContext {
             dpop_verifier,
             browser_login_nonces,
             client_metadata_fetcher,
+            holder_signing_channel,
             rate_limiter,
             distributed_rate_limiter,
             mailer,
@@ -1432,8 +1446,14 @@ impl AppContext {
                     .to_string(),
             )
         })?;
-        crate::federation::entryway_auth_headers(&self.account_db, user_did, entryway_did, lxm)
-            .await
+        crate::federation::entryway_auth_headers(
+            &self.account_db,
+            self.holder_signing_channel.as_ref(),
+            user_did,
+            entryway_did,
+            lxm,
+        )
+        .await
     }
 }
 

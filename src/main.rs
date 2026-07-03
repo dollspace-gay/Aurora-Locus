@@ -22,6 +22,7 @@ mod db;
 mod distributed;
 mod error;
 mod federation;
+mod holder_signing;
 mod identity;
 mod jobs;
 mod kryphocron;

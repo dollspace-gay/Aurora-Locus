@@ -548,6 +548,7 @@ async fn fed_mint_service_token(
 ) -> Result<Json<FedMintServiceTokenResponse>, (StatusCode, String)> {
     let headers = crate::federation::entryway_auth_headers(
         &ctx.account_db,
+        ctx.holder_signing_channel.as_ref(),
         &body.user_did,
         &body.aud,
         &body.lxm,
@@ -644,6 +645,7 @@ async fn fed_simulate_forward(
         let synthetic_aud = format!("did:web:{}", host_from_url(&body.stub_url));
         crate::federation::entryway_auth_headers(
             &ctx.account_db,
+            ctx.holder_signing_channel.as_ref(),
             user_did,
             &synthetic_aud,
             &body.nsid,
