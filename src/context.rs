@@ -150,6 +150,13 @@ pub struct AppContext {
     /// (returns a clean "channel not yet available" 4xx); Phase γ installs the
     /// real channel here.
     pub holder_signing_channel: Arc<dyn crate::holder_signing::HolderSigningChannel>,
+    /// v0.10 Arc 2 Phase ε (#422) — the atproto-OAuth device registry. Backs the
+    /// `/oauth/atproto/device/*` management endpoints and the ε.3 general-XRPC
+    /// bearer gate (a bearer's DPoP proof key must match a registered device row
+    /// for its DID). Did-keyed, browser-session-aligned — parallel to the legacy
+    /// `oauth_device_manager` (strangler-fig).
+    pub atproto_device_manager:
+        Arc<crate::oauth::atproto::device_manager::AtprotoDeviceManager>,
     // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
     // Cross-instance rate-limit primitive (Arc 7 Step 3).
@@ -802,6 +809,10 @@ impl AppContext {
         // γ swaps in the real channel at this construction site.
         let holder_signing_channel: Arc<dyn crate::holder_signing::HolderSigningChannel> =
             Arc::new(crate::holder_signing::UnavailableHolderSigningChannel);
+        // Phase ε (Arc 2 #422): the atproto device registry.
+        let atproto_device_manager = Arc::new(
+            crate::oauth::atproto::device_manager::AtprotoDeviceManager::new(account_db.clone()),
+        );
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database).
         // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
@@ -1289,6 +1300,7 @@ impl AppContext {
             browser_login_nonces,
             client_metadata_fetcher,
             holder_signing_channel,
+            atproto_device_manager,
             rate_limiter,
             distributed_rate_limiter,
             mailer,

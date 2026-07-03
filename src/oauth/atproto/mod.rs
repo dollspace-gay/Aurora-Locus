@@ -16,6 +16,8 @@ pub mod authorize;
 pub mod browser_session;
 pub mod client_metadata;
 pub mod consent;
+pub mod device;
+pub mod device_manager;
 pub mod login;
 pub mod metadata;
 pub mod par;
@@ -67,6 +69,12 @@ pub fn routes() -> Router<AppContext> {
             "/.well-known/oauth-authorization-server",
             get(metadata::authorization_server_metadata),
         )
+        // ε.1 — holder device + grant management (browser-session authed).
+        .route("/oauth/atproto/device/register", post(device::register))
+        .route("/oauth/atproto/device/list", get(device::list))
+        .route("/oauth/atproto/device/revoke", post(device::revoke))
+        .route("/oauth/atproto/grant/list", get(device::grant_list))
+        .route("/oauth/atproto/grant/revoke", post(device::grant_revoke))
 }
 
 /// Generate a 256-bit opaque, URL-safe token — the CSPRNG primitive behind

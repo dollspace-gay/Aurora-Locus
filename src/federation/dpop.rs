@@ -538,7 +538,13 @@ pub fn compute_ath(access_token: &str) -> String {
 ///
 /// The thumbprint is used for token binding - it uniquely identifies the client's key.
 /// Reference: RFC 7638
-fn compute_jwk_thumbprint(jwk: &Value) -> PdsResult<String> {
+///
+/// Exposed `pub(crate)` for the atproto device registry (Arc 2 Phase ε): a
+/// registered device's `dpop_jkt` is this thumbprint of its `dpop_public_key`,
+/// and it must equal the thumbprint `verify_dpop_proof` returns for an incoming
+/// proof (identical canonicalisation) so the ε.3 registry gate lines up with
+/// the token's DPoP binding.
+pub(crate) fn compute_jwk_thumbprint(jwk: &Value) -> PdsResult<String> {
     // Extract required fields in canonical order: kty, crv, x, y (for EC keys)
     let kty = jwk["kty"]
         .as_str()
