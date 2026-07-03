@@ -1,32 +1,28 @@
 //! OAuth 2.1 Implementation for ATProto
 //!
-//! This module implements the OAuth 2.1 specification with ATProto extensions:
-//! - DPoP (Demonstrating Proof-of-Possession) token binding
-//! - PKCE (Proof Key for Code Exchange) authorization flow
-//! - Multi-device support with device management
-//! - Refresh token rotation with replay detection
+//! The **atproto-OAuth provider** lives in [`atproto`] (Arc 2 β–ε: the
+//! did:web-holder OAuth substrate). The pre-strangler-fig legacy `/oauth/*`
+//! provider — its authorize/consent/token handlers plus the `ClientManager` and
+//! (legacy) `DeviceManager` — was retired in Phase ζ: it was mounted but had no
+//! live driver post-strangler-fig (its client registry was never consumed, and
+//! ε shipped the atproto device registry). What remains here is the **shared**
+//! surface the atproto provider + the XRPC layer consume: the scope vocabulary
+//! ([`scope`]), refresh-token rotation ([`token_rotation`]), the distributed
+//! OAuth-flow-state adapter ([`flow_state_adapter`], still live), and
+//! [`access_token_hash`].
 //!
 //! References:
 //! - https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1
 //! - https://atproto.com/specs/oauth
 
 pub mod atproto;
-pub mod authorize;
-pub mod client;
-pub mod consent;
-pub mod device;
 pub mod flow_state_adapter;
 pub mod models;
 pub mod scope;
-pub mod token;
 pub mod token_rotation;
 
 pub use flow_state_adapter::OAuthFlowStateAdapter;
 
-pub use authorize::authorize;
-pub use client::ClientManager;
-pub use consent::{consent_screen, deny_authorization, grant_authorization};
-pub use device::DeviceManager;
 // Re-exports surface scope helpers at the canonical `oauth::` path. Some
 // of them (lexicon_to_scope / require_all_scopes / require_any_scope) are
 // only consumed by integration tests today; rust's unused_imports lint
@@ -37,7 +33,6 @@ pub use scope::{
     enforce_namespace_scope, lexicon_to_scope, require_all_scopes, require_any_scope,
     require_scope, required_scopes_for_path, AtProtoScope, ScopeSet,
 };
-pub use token::token_endpoint;
 
 /// SHA-256 hex digest of an OAuth bearer, used for storage and lookup.
 ///

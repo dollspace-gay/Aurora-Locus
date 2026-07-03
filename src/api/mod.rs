@@ -31,7 +31,6 @@ pub mod moderation;
 pub mod moderation_defaults;
 pub mod reviewer_assignment;
 pub mod oauth_admin;
-pub mod oauth_server;
 pub mod pending_restart;
 pub mod kryphocron_endpoints;
 pub mod registry;
@@ -120,8 +119,7 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
         .merge(appview::routes()) // AppView proxy with read-after-write
         // OAuth admin routes with their own state
         .merge(oauth_admin::routes(oauth_state_store))
-        // OAuth server routes (for third-party app authorization)
-        .merge(oauth_server::routes())
+        // (legacy `/oauth/*` provider retired in Phase ζ — undriven post-strangler-fig)
         // Arc 2 Phase β (#420): the atproto-OAuth provider (strangler-fig),
         // served under `/oauth/atproto/*`. β.2 ships the browser-session
         // substrate + AS-login (login-α).

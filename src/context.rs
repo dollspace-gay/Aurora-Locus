@@ -20,7 +20,6 @@ use crate::{
     },
     identity::{DidCache, IdentityResolver, IdentityResolverApi, IdentityResolverConfig},
     mailer::Mailer,
-    oauth::{ClientManager, DeviceManager},
     rate_limit::RateLimiter,
     read_after_write::LocalRecordsCache,
     sequencer::{Sequencer, SequencerConfig},
@@ -85,11 +84,8 @@ pub struct AppContext {
     /// v0.9 Arc B (§11) — installed-theme registry, enumerated + validated
     /// at startup; serves the active theme's resolved token CSS to the UI.
     pub theme_registry: Arc<crate::themes::ThemeRegistry>,
-    // OAuth server components (for third-party app authorization)
-    #[allow(dead_code)] // Future OAuth client management
-    pub oauth_client_manager: Arc<ClientManager>,
-    #[allow(dead_code)] // Future OAuth device flow
-    pub oauth_device_manager: Arc<DeviceManager>,
+    // (legacy OAuth ClientManager/DeviceManager retired in Phase ζ — the atproto
+    // provider ships its own client-metadata fetcher + device registry.)
     // Sequencer for event streaming
     pub sequencer: Arc<Sequencer>,
     // Relay client for federation
@@ -138,8 +134,8 @@ pub struct AppContext {
     /// Phase β.4 (#420): URL-based atproto-OAuth client-metadata fetcher
     /// (on-demand `client-metadata.json` resolution + cache). Consumed by the
     /// β.3 authorize flow to resolve a `client_id` URL and verify its redirect
-    /// URIs. The legacy `ClientManager` (static, operator-internal) is
-    /// retained separately — strangler-fig boundary.
+    /// URIs. (The legacy static `ClientManager` this replaced was retired in
+    /// Phase ζ.)
     pub client_metadata_fetcher: Arc<crate::oauth::atproto::client_metadata::ClientMetadataFetcher>,
     /// v0.10 Arc 2 Phase δ (LOCKED §5) — holder-mediated signing seam. did:web
     /// accounts sign *as the holder* (pre-decision 1: the substrate never holds
@@ -153,8 +149,8 @@ pub struct AppContext {
     /// v0.10 Arc 2 Phase ε (#422) — the atproto-OAuth device registry. Backs the
     /// `/oauth/atproto/device/*` management endpoints and the ε.3 general-XRPC
     /// bearer gate (a bearer's DPoP proof key must match a registered device row
-    /// for its DID). Did-keyed, browser-session-aligned — parallel to the legacy
-    /// `oauth_device_manager` (strangler-fig).
+    /// for its DID). Did-keyed, browser-session-aligned. (The legacy
+    /// `oauth_device_manager` this superseded was retired in Phase ζ.)
     pub atproto_device_manager:
         Arc<crate::oauth::atproto::device_manager::AtprotoDeviceManager>,
     // Rate limiter (governor-backed, per-instance).
@@ -372,8 +368,6 @@ impl std::fmt::Debug for AppContext {
             .field("label_manager", &"<LabelManager>")
             .field("invite_manager", &"<InviteCodeManager>")
             .field("report_manager", &"<ReportManager>")
-            .field("oauth_client_manager", &"<ClientManager>")
-            .field("oauth_device_manager", &"<DeviceManager>")
             .field("sequencer", &"<Sequencer>")
             .field(
                 "relay_client",
@@ -643,13 +637,6 @@ impl AppContext {
         ));
         let invite_manager = Arc::new(InviteCodeManager::new(account_db.clone()));
         let report_manager = Arc::new(ReportManager::new(account_db.clone()));
-
-        // Initialize OAuth server managers
-        // For now, initialize with empty client list. In production, load from config.
-        // TODO: Add OAuth client configuration to ServerConfig
-        tracing::info!("Initializing OAuth server managers (ClientManager, DeviceManager)");
-        let oauth_client_manager = Arc::new(ClientManager::new(account_db.clone(), vec![]));
-        let oauth_device_manager = Arc::new(DeviceManager::new(account_db.clone()));
 
         // v0.9 Federation runtime-mutability arc §2.1 (#397) — resolve the master
         // federation gate from the runtime override (federation.enabled row →
@@ -1287,8 +1274,6 @@ impl AppContext {
             invite_manager,
             report_manager,
             theme_registry,
-            oauth_client_manager,
-            oauth_device_manager,
             sequencer,
             relay_client,
             federation_auth,
