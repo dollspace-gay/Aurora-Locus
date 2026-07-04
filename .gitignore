@@ -34,3 +34,6 @@ __pycache__/
 docs/internal
 phase-b/*
 !phase-b/mock-plc.py
+
+# runtime artifacts
+*.pid
