@@ -139,7 +139,7 @@ impl From<ServiceAuthError> for PdsError {
             // Cluster 2 Member 2.2 (#144) — LOAD-BEARING. Route the
             // typed DidTombstoned variant to PdsError::DidTombstoned
             // (→ HTTP 400 `{"error": "DidTombstoned", ...}` via
-            // src/error.rs:620-624) BEFORE the catch-all below.
+            // src/error.rs:863-865) BEFORE the catch-all below.
             // Omitting this arm — or placing it after the catch-all —
             // silently defeats the entire #144 fix: the new variant
             // falls through to PdsError::Authentication → HTTP 401

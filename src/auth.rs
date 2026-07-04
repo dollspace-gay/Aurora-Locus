@@ -620,7 +620,7 @@ fn log_service_auth_error(err: &crate::service_auth::ServiceAuthError, expected_
         // The actual wire shape (HTTP 400 + `{"error":"DidTombstoned",
         // ...}`) is produced by the From<ServiceAuthError> for
         // PdsError impl + IntoResponse for PdsError::DidTombstoned
-        // (src/error.rs:620-624).
+        // (src/error.rs:863-865).
         ServiceAuthError::DidTombstoned(did) => {
             tracing::debug!("service-auth: issuer DID tombstoned: {}", did);
         }

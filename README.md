@@ -106,7 +106,7 @@ curl -s http://localhost:2583/xrpc/com.atproto.server.describeServer | jq
 
 ## API Endpoints
 
-Aurora Locus serves the standard ATProto XRPC surface (`com.atproto.*` for accounts, repo, sync, identity, and blob; OAuth at `/oauth/*`; well-known endpoints at `/.well-known/*`) plus the `tools.aurora.*` admin / moderator / ops / superadmin namespace with Aurora-specific extensions. The broad XRPC surface follows the ATProto spec and is discoverable at runtime from `com.atproto.server.describeServer`; the admin / moderation / ops surface is documented in detail.
+Aurora Locus serves the standard ATProto XRPC surface (`com.atproto.*` for accounts, repo, sync, identity, and blob; OAuth at `/oauth/atproto/*`; well-known endpoints at `/.well-known/*`) plus the `tools.aurora.*` admin / moderator / ops / superadmin namespace with Aurora-specific extensions. The broad XRPC surface follows the ATProto spec and is discoverable at runtime from `com.atproto.server.describeServer`; the admin / moderation / ops surface is documented in detail.
 
 See [docs/operator/admin-endpoint-reference.md](docs/operator/admin-endpoint-reference.md) for the admin / moderation / ops endpoint inventory.
 
