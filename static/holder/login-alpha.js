@@ -38,20 +38,8 @@ function qs(root, sel) {
   return root.querySelector(sel);
 }
 
-// Method picker: reveal the section matching the selected radio.
-function wireMethodPicker() {
-  const radios = document.querySelectorAll('input[name="login_method"]');
-  if (radios.length === 0) return;
-  const show = (method) => {
-    document.querySelectorAll("[data-login-section]").forEach((el) => {
-      el.hidden = el.getAttribute("data-login-section") !== method;
-    });
-  };
-  radios.forEach((r) => r.addEventListener("change", () => show(r.value)));
-  const checked = document.querySelector('input[name="login_method"]:checked');
-  show(checked ? checked.value : "password");
-}
-
+// The method picker toggle lives in passkey-login.js (always loaded); this
+// island only wires the login-α form.
 function wireLoginAlpha() {
   const form = document.getElementById("login-alpha-form");
   if (!form) return;
@@ -101,5 +89,4 @@ function wireLoginAlpha() {
   });
 }
 
-wireMethodPicker();
 wireLoginAlpha();

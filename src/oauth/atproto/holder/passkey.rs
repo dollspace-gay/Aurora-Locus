@@ -34,11 +34,11 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
-    CreationChallengeResponse, PasskeyRegistration, RegisterPublicKeyCredential, Webauthn,
-    WebauthnBuilder,
+    CreationChallengeResponse, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
+    RegisterPublicKeyCredential, RequestChallengeResponse, Webauthn, WebauthnBuilder,
 };
 
-use super::super::browser_session::BrowserSessionContext;
+use super::super::browser_session::{self, BrowserSessionContext};
 use crate::context::AppContext;
 use crate::error::{PdsError, PdsResult};
 
@@ -93,12 +93,20 @@ struct StoredRegistration {
     created_at: Instant,
 }
 
+/// A stored authentication (login) ceremony, awaiting the browser's response.
+struct StoredAuthentication {
+    auth: PasskeyAuthentication,
+    did: String,
+    created_at: Instant,
+}
+
 /// In-memory, single-use, TTL'd store of in-flight passkey ceremonies, keyed by
-/// an opaque `challenge_id`. Registration only for now; authentication is added
-/// alongside the login ceremony.
+/// an opaque `challenge_id`. Registration + authentication live in separate
+/// keyspaces (a challenge_id is only ever one kind).
 #[derive(Default)]
 pub struct PasskeyChallengeStore {
     registrations: Mutex<HashMap<String, StoredRegistration>>,
+    authentications: Mutex<HashMap<String, StoredAuthentication>>,
 }
 
 impl PasskeyChallengeStore {
@@ -132,6 +140,40 @@ impl PasskeyChallengeStore {
             return None;
         }
         Some((stored.reg, stored.did))
+    }
+
+    /// Stash an authentication ceremony bound to `did`; returns its
+    /// `challenge_id`.
+    pub fn store_authentication(&self, auth: PasskeyAuthentication, did: String) -> String {
+        let id = Uuid::new_v4().to_string();
+        let mut map = self
+            .authentications
+            .lock()
+            .expect("challenge store not poisoned");
+        map.retain(|_, v| v.created_at.elapsed() < CHALLENGE_TTL);
+        map.insert(
+            id.clone(),
+            StoredAuthentication {
+                auth,
+                did,
+                created_at: Instant::now(),
+            },
+        );
+        id
+    }
+
+    /// Pop an authentication ceremony by `challenge_id`. `None` if absent or
+    /// expired. Returns `(auth_state, did)`.
+    pub fn take_authentication(&self, id: &str) -> Option<(PasskeyAuthentication, String)> {
+        let mut map = self
+            .authentications
+            .lock()
+            .expect("challenge store not poisoned");
+        let stored = map.remove(id)?;
+        if stored.created_at.elapsed() >= CHALLENGE_TTL {
+            return None;
+        }
+        Some((stored.auth, stored.did))
     }
 }
 
@@ -248,6 +290,141 @@ pub async fn register_finish(
     }
 }
 
+// ---------- authentication (login) ceremony endpoints ----------
+
+#[derive(Debug, Deserialize)]
+pub struct LoginStartRequest {
+    /// Handle or typed DID the holder is signing in as.
+    pub identifier: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LoginStartResponse {
+    pub challenge_id: String,
+    pub options: RequestChallengeResponse,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginFinishRequest {
+    pub challenge_id: String,
+    pub credential: PublicKeyCredential,
+}
+
+/// `POST /oauth/atproto/holder/login/passkey/start`
+///
+/// Pre-auth: resolve the identifier to a local DID, look up that holder's
+/// passkeys, and issue an assertion challenge allow-listing exactly those
+/// credentials. A holder with no passkey gets a uniform 404 (use another
+/// method) — the allow-list is the holder's own credentials, so this reveals
+/// only whether *this account* has a passkey, not credential material.
+pub async fn login_start(
+    State(ctx): State<AppContext>,
+    Json(body): Json<LoginStartRequest>,
+) -> Response {
+    let did = match super::login::resolve_local_did(&ctx, body.identifier.trim()).await {
+        Some(d) => d,
+        None => return (StatusCode::NOT_FOUND, "no such account").into_response(),
+    };
+    let passkeys = ctx
+        .holder_auth_methods
+        .list_passkeys_for_did(&did)
+        .await
+        .unwrap_or_default();
+    if passkeys.is_empty() {
+        return (StatusCode::NOT_FOUND, "no passkey registered").into_response();
+    }
+    match ctx
+        .passkey_webauthn
+        .webauthn
+        .start_passkey_authentication(&passkeys)
+    {
+        Ok((options, auth)) => {
+            let challenge_id = ctx.passkey_challenges.store_authentication(auth, did);
+            Json(LoginStartResponse {
+                challenge_id,
+                options,
+            })
+            .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not start passkey sign-in",
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /oauth/atproto/holder/login/passkey/finish`
+///
+/// Pre-auth: verify the assertion against the stored ceremony, confirm the
+/// asserted credential belongs to the ceremony's DID, update the credential
+/// counter if changed, mint a browser session, and return the redirect. All
+/// failures collapse to a uniform 401.
+pub async fn login_finish(
+    State(ctx): State<AppContext>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<LoginFinishRequest>,
+) -> Response {
+    let uniform_401 =
+        || (StatusCode::UNAUTHORIZED, "passkey sign-in failed").into_response();
+
+    let (auth, ceremony_did) = match ctx.passkey_challenges.take_authentication(&body.challenge_id) {
+        Some(v) => v,
+        None => return uniform_401(),
+    };
+    let result = match ctx
+        .passkey_webauthn
+        .webauthn
+        .finish_passkey_authentication(&body.credential, &auth)
+    {
+        Ok(r) => r,
+        Err(_) => return uniform_401(),
+    };
+    // The asserted credential must belong to the DID the ceremony was issued
+    // for (defense against using a valid assertion for another holder's row).
+    let (method_id, mut passkey) = match ctx
+        .holder_auth_methods
+        .get_passkey_by_credential_id(&ceremony_did, result.cred_id().as_slice())
+        .await
+    {
+        Ok(Some(v)) => v,
+        _ => return uniform_401(),
+    };
+    // Persist a counter/backup-state change if the authenticator reported one.
+    if passkey.update_credential(&result) == Some(true) {
+        let _ = ctx
+            .holder_auth_methods
+            .update_passkey(&method_id, &passkey)
+            .await;
+    }
+    let _ = ctx.holder_auth_methods.touch(&method_id).await;
+
+    // Mint a fresh session (session-fixation defense mirrors password/login-α).
+    if let Some(old) = browser_session::read_session_cookie(&headers) {
+        let _ = browser_session::delete_session(&ctx.account_db, &old).await;
+    }
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let session =
+        match browser_session::create_session(&ctx.account_db, &ceremony_did, user_agent, None)
+            .await
+        {
+            Ok(s) => s,
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "could not start a session")
+                    .into_response()
+            }
+        };
+    let cookie = browser_session::set_session_cookie(&session.id);
+    (
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({ "redirect": super::HOME_PATH })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +534,75 @@ mod tests {
             super::super::auth_method_manager::AuthMethodType::Passkey
         );
         assert_eq!(methods[0].device_name.as_deref(), Some("Test Key"));
+    }
+
+    // Full authentication ceremony: register a passkey, then sign in with the
+    // same software authenticator.
+    #[tokio::test]
+    async fn passkey_authentication_ceremony_verifies() {
+        use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+        use webauthn_authenticator_rs::WebauthnAuthenticator;
+
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let did = "did:web:bob.example.com";
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+            .bind(did)
+            .bind("bob.example.com")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let origin = Url::parse("http://localhost:2583").unwrap();
+        // ONE authenticator holds the credential across both ceremonies.
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+        // --- register ---
+        let (ccr, reg) = ctx
+            .passkey_webauthn
+            .webauthn
+            .start_passkey_registration(holder_user_id(did), did, did, None)
+            .unwrap();
+        let reg_cred = authenticator.do_registration(origin.clone(), ccr).unwrap();
+        let passkey = ctx
+            .passkey_webauthn
+            .webauthn
+            .finish_passkey_registration(&reg_cred, &reg)
+            .unwrap();
+        ctx.holder_auth_methods
+            .register_passkey(did, &passkey, Some("Key"))
+            .await
+            .unwrap();
+
+        // --- authenticate ---
+        let passkeys = ctx.holder_auth_methods.list_passkeys_for_did(did).await.unwrap();
+        let (rcr, auth_state) = ctx
+            .passkey_webauthn
+            .webauthn
+            .start_passkey_authentication(&passkeys)
+            .unwrap();
+        let assertion = authenticator.do_authentication(origin, rcr).unwrap();
+        let result = ctx
+            .passkey_webauthn
+            .webauthn
+            .finish_passkey_authentication(&assertion, &auth_state)
+            .unwrap();
+
+        // The asserted credential resolves to the holder's stored passkey row.
+        let found = ctx
+            .holder_auth_methods
+            .get_passkey_by_credential_id(did, result.cred_id().as_slice())
+            .await
+            .unwrap();
+        assert!(found.is_some(), "asserted credential must match a stored row");
+        let (_id, stored) = found.unwrap();
+        assert_eq!(stored.cred_id(), passkey.cred_id());
+
+        // A different holder's DID does not resolve the same credential.
+        let other = ctx
+            .holder_auth_methods
+            .get_passkey_by_credential_id("did:web:eve.example.com", result.cred_id().as_slice())
+            .await
+            .unwrap();
+        assert!(other.is_none(), "credential is DID-scoped");
     }
 }

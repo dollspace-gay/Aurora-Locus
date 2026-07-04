@@ -80,6 +80,17 @@ pub fn routes() -> Router<AppContext> {
             "/oauth/atproto/holder/login/challenge",
             get(login::login_challenge),
         )
+        // Passkey sign-in ceremony (pre-auth). start issues an assertion
+        // challenge for the resolved holder's passkeys; finish verifies + mints
+        // a session. JSON/fetch (consumed by passkey-login.js).
+        .route(
+            "/oauth/atproto/holder/login/passkey/start",
+            post(passkey::login_start),
+        )
+        .route(
+            "/oauth/atproto/holder/login/passkey/finish",
+            post(passkey::login_finish),
+        )
         // Landing page + sign-out.
         .route("/oauth/atproto/holder/home", get(home::home_page))
         .route("/oauth/atproto/holder/logout", post(logout::logout))

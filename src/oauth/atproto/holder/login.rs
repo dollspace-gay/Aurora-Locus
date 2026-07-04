@@ -258,7 +258,7 @@ async fn mint_session_redirect(
 /// directly against the `actor` table — deliberately NOT via
 /// `get_account_by_handle`, whose account-table join errors for a did:web
 /// holder that has only an `actor` row and no `account` row.
-async fn resolve_local_did(ctx: &AppContext, identifier: &str) -> Option<String> {
+pub(crate) async fn resolve_local_did(ctx: &AppContext, identifier: &str) -> Option<String> {
     if identifier.starts_with("did:") {
         return Some(identifier.to_string());
     }
@@ -313,22 +313,24 @@ autocomplete=\"current-password\" required>\n\
     <button type=\"submit\">Sign in</button>\n\
   </form>";
 
-    let main = if login_alpha_enabled {
-        // Method picker + password form + login-α form. login-alpha.js reveals
-        // the selected section, fetches a challenge, signs SHA-256(nonce) with
-        // the pasted #atproto key, and submits did/nonce/signature. The private
-        // key field has NO `name`, so it never reaches the server even if the
-        // island fails to load.
-        format!(
-            "<main class=\"holder-shell\">\n\
-  <h1>Sign in</h1>\n\
-  {error_banner}\n\
-  <fieldset class=\"holder-methods\">\n\
-    <legend>Sign-in method</legend>\n\
-    <label><input type=\"radio\" name=\"login_method\" value=\"password\" checked> Password</label>\n\
-    <label><input type=\"radio\" name=\"login_method\" value=\"login_alpha\"> Sign with your #atproto key</label>\n\
-  </fieldset>\n\
-{password_form}\n\
+    // Passkey is always offered (a holder either has one or gets a graceful "no
+    // passkey" error at start). The section is driven by passkey-login.js:
+    // enter handle → fetch assertion challenge → navigator.credentials.get() →
+    // POST the assertion → redirect.
+    let passkey_form = "\
+  <form id=\"login-passkey-form\" class=\"holder-form\" data-login-section=\"passkey\" hidden>\n\
+    <label for=\"pk-identifier\">Handle</label>\n\
+    <input id=\"pk-identifier\" data-pk-identifier type=\"text\" autocomplete=\"username\" \
+autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\">\n\
+    <button type=\"submit\">Sign in with passkey</button>\n\
+    <p class=\"holder-note\" data-pk-status role=\"status\"></p>\n\
+  </form>";
+
+    // login-α is conditional on the config (the in-browser secp256k1 signer).
+    let (alpha_radio, alpha_form, alpha_note, alpha_script) = if login_alpha_enabled {
+        (
+            "    <label><input type=\"radio\" name=\"login_method\" value=\"login_alpha\"> Sign with your #atproto key</label>\n",
+            "\
   <form method=\"post\" action=\"/oauth/atproto/holder/login\" class=\"holder-form\" \
 id=\"login-alpha-form\" data-login-section=\"login_alpha\" hidden>\n\
     <label for=\"la-identifier\">Handle</label>\n\
@@ -345,24 +347,39 @@ autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\"></textarea>\n\
     <p class=\"holder-note\" data-la-status role=\"status\"></p>\n\
   </form>\n\
   <p class=\"holder-note\">Your private key is used in your browser to sign a \
-challenge and is never sent to the server.</p>\n\
-  <script type=\"module\" src=\"/holder/login-alpha.js\"></script>\n\
-</main>",
-            error_banner = error_banner,
-            password_form = password_form,
+challenge and is never sent to the server.</p>",
+            "",
+            "  <script type=\"module\" src=\"/holder/login-alpha.js\"></script>\n",
         )
     } else {
-        format!(
-            "<main class=\"holder-shell\">\n\
+        ("", "", "", "")
+    };
+
+    let main = format!(
+        "<main class=\"holder-shell\">\n\
   <h1>Sign in</h1>\n\
   {error_banner}\n\
+  <fieldset class=\"holder-methods\">\n\
+    <legend>Sign-in method</legend>\n\
+    <label><input type=\"radio\" name=\"login_method\" value=\"password\" checked> Password</label>\n\
+    <label><input type=\"radio\" name=\"login_method\" value=\"passkey\"> Passkey</label>\n\
+{alpha_radio}\
+  </fieldset>\n\
 {password_form}\n\
-  <p class=\"holder-note\">Passkey and security-key sign-in are coming soon.</p>\n\
+{passkey_form}\n\
+{alpha_form}\n\
+{alpha_note}\
+  <script type=\"module\" src=\"/holder/passkey-login.js\"></script>\n\
+{alpha_script}\
 </main>",
-            error_banner = error_banner,
-            password_form = password_form,
-        )
-    };
+        error_banner = error_banner,
+        alpha_radio = alpha_radio,
+        password_form = password_form,
+        passkey_form = passkey_form,
+        alpha_form = alpha_form,
+        alpha_note = alpha_note,
+        alpha_script = alpha_script,
+    );
     // Pre-auth page: link the operator's active theme (no per-holder id yet).
     super::view::page_shell("Sign in", None, &main)
 }
@@ -430,8 +447,9 @@ mod tests {
         // The shared shell links the active theme + holder stylesheet.
         assert!(html.contains("href=\"/theme/active.css\""));
         assert!(html.contains("href=\"/holder/holder.css\""));
-        // login-α disabled → "coming soon" note, no key-signing form.
-        assert!(html.contains("coming soon"));
+        // Passkey is always offered + its island loaded; login-α is off here.
+        assert!(html.contains("value=\"passkey\""));
+        assert!(html.contains("/holder/passkey-login.js"));
         assert!(!html.contains("login-alpha.js"));
     }
 

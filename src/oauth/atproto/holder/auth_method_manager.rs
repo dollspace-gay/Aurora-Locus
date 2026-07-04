@@ -337,6 +337,51 @@ impl HolderAuthMethodManager {
         }
         Ok(out)
     }
+
+    /// Look up a passkey method by its credential id, scoped to `did` (the
+    /// authentication ceremony's DID). Returns `(method_id, Passkey)`. DID-scoped
+    /// so a valid assertion cannot be applied to another holder's credential row.
+    pub async fn get_passkey_by_credential_id(
+        &self,
+        did: &str,
+        credential_id: &[u8],
+    ) -> PdsResult<Option<(String, Passkey)>> {
+        let row = sqlx::query(
+            "SELECT id, passkey_data FROM holder_auth_method \
+             WHERE did = $1 AND method_type = 'passkey' AND passkey_credential_id = $2 \
+             AND passkey_data IS NOT NULL",
+        )
+        .bind(did)
+        .bind(credential_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        match row {
+            Some(row) => {
+                let id: String = row.try_get("id").map_err(PdsError::Database)?;
+                let data: String = row.try_get("passkey_data").map_err(PdsError::Database)?;
+                let passkey: Passkey = serde_json::from_str(&data)
+                    .map_err(|e| PdsError::Internal(format!("corrupt passkey_data: {e}")))?;
+                Ok(Some((id, passkey)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Re-persist a passkey after `Passkey::update_credential` changed it (a new
+    /// signature counter / backup-state). Only the serialized blob changes.
+    pub async fn update_passkey(&self, method_id: &str, passkey: &Passkey) -> PdsResult<()> {
+        let data = serde_json::to_string(passkey)
+            .map_err(|e| PdsError::Internal(format!("failed to serialize passkey: {e}")))?;
+        sqlx::query("UPDATE holder_auth_method SET passkey_data = $1 WHERE id = $2")
+            .bind(&data)
+            .bind(method_id)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
