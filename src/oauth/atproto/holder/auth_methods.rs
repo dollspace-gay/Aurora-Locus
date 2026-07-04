@@ -253,10 +253,17 @@ fn render_body(
     <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\n\
     <button type=\"submit\">Add password</button>\n\
   </form>\n\
+  <form id=\"add-passkey-form\" class=\"holder-form\">\n\
+    <label for=\"pk-device-name\">Passkey name (optional)</label>\n\
+    <input id=\"pk-device-name\" data-pk-device-name type=\"text\" autocomplete=\"off\">\n\
+    <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\n\
+    <button type=\"submit\">Add passkey</button>\n\
+    <p class=\"holder-note\" data-pk-status role=\"status\"></p>\n\
+  </form>\n\
   <div class=\"holder-actions\">\n\
-    <button type=\"button\" disabled>Passkey (coming soon)</button>\n\
     {login_alpha_control}\n\
   </div>\n\
+  <script type=\"module\" src=\"/holder/passkey-register.js\"></script>\n\
 </main>",
         banner = banner,
         rows = rows,
@@ -546,7 +553,10 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 128 * 1024).await.unwrap();
         let html = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(html.contains("Password"));
-        assert!(html.contains("Passkey (coming soon)"));
+        // Passkey is now a functional add form + island (no longer "coming soon").
+        assert!(html.contains("Add passkey"));
+        assert!(html.contains("/holder/passkey-register.js"));
+        // login-α is disabled here, so it renders its coming-soon control.
         assert!(html.contains("Key-signing sign-in (coming soon)"));
         assert!(html.contains("Add password"));
     }
