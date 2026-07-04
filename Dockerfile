@@ -7,13 +7,17 @@
 # (`DATABASE_URL`/3000; the app reads `PDS_*` and listens on 2583).
 
 # ---- builder ----
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.91-bookworm AS builder
 WORKDIR /app
 
 # openssl-sys (transitive) needs the system lib + pkg-config to build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# proto-blue-codegen is invoked as a subprocess by kryphocron-lexicons' build.rs
+# (§5.2 fallback integration path). Install it before building Aurora.
+RUN cargo install proto-blue-codegen --version '~0.3.1'
 
 # Build inputs. `build.rs` (vergen build-info) and the `libs/` workspace member
 # are required to compile; `migrations/` is embedded at compile time by the
