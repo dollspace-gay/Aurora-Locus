@@ -415,16 +415,22 @@ mod tests {
         }
     }
 
+    async fn alpha_disabled_ctx() -> AppContext {
+        let mut ctx = ctx().await;
+        ctx.holder_login_alpha_enabled = false;
+        ctx
+    }
+
     #[tokio::test]
     async fn login_page_renders_form() {
-        let html = login_page(State(ctx().await)).await.0;
+        let html = login_page(State(alpha_disabled_ctx().await)).await.0;
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("name=\"handle\""));
         assert!(html.contains("name=\"password\""));
         // The shared shell links the active theme + holder stylesheet.
         assert!(html.contains("href=\"/theme/active.css\""));
         assert!(html.contains("href=\"/holder/holder.css\""));
-        // login-α off by default → "coming soon" note, no key-signing form.
+        // login-α disabled → "coming soon" note, no key-signing form.
         assert!(html.contains("coming soon"));
         assert!(!html.contains("login-alpha.js"));
     }
@@ -664,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_alpha_disabled_rejects_challenge_and_post() {
-        let ctx = ctx().await; // login-α off (default)
+        let ctx = alpha_disabled_ctx().await; // explicitly disabled
         let kp = Secp256k1KeyPair::generate();
         let did = "did:web:erin.example.com";
         seed_web_holder_key(&ctx, did, "erin.example.com", &multibase_pubkey(&kp)).await;

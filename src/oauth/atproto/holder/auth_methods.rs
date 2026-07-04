@@ -484,12 +484,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_login_alpha_disabled_by_default() {
-        let ctx = ctx().await;
+    async fn add_login_alpha_rejected_when_disabled() {
+        let mut ctx = ctx().await;
+        ctx.holder_login_alpha_enabled = false;
         let did = "did:web:frank.example.com";
         let s = session_for(&ctx, did).await;
         let csrf = s.csrf_token.clone();
-        assert!(!ctx.holder_login_alpha_enabled);
         let resp = add_login_alpha(
             Some(sctx(s)),
             State(ctx.clone()),
@@ -501,8 +501,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_login_alpha_registers_when_enabled() {
+        let mut ctx = ctx().await;
+        ctx.holder_login_alpha_enabled = true;
+        let did = "did:web:frank2.example.com";
+        let s = session_for(&ctx, did).await;
+        let csrf = s.csrf_token.clone();
+        let resp = add_login_alpha(
+            Some(sctx(s.clone())),
+            State(ctx.clone()),
+            Form(CsrfOnlyForm { csrf_token: csrf.clone() }),
+        )
+        .await;
+        assert!(resp.headers().get(axum::http::header::LOCATION).unwrap().to_str().unwrap().contains("ok=login_alpha_added"));
+        let methods = ctx.holder_auth_methods.list_for_did(did).await.unwrap();
+        assert_eq!(methods.len(), 1);
+        assert_eq!(
+            methods[0].method_type,
+            crate::oauth::atproto::holder::auth_method_manager::AuthMethodType::LoginAlpha
+        );
+        // A second opt-in is refused (Conflict → error banner).
+        let again = add_login_alpha(
+            Some(sctx(s)),
+            State(ctx.clone()),
+            Form(CsrfOnlyForm { csrf_token: csrf }),
+        )
+        .await;
+        assert!(again.headers().get(axum::http::header::LOCATION).unwrap().to_str().unwrap().contains("error=login_alpha_exists"));
+    }
+
+    #[tokio::test]
     async fn page_renders_methods_and_coming_soon() {
-        let ctx = ctx().await;
+        let mut ctx = ctx().await;
+        ctx.holder_login_alpha_enabled = false; // exercise the coming-soon render
         let did = "did:web:grace.example.com";
         let s = session_for(&ctx, did).await;
         ctx.holder_auth_methods.register_password(did, "passwordone").await.unwrap();
@@ -518,5 +549,23 @@ mod tests {
         assert!(html.contains("Passkey (coming soon)"));
         assert!(html.contains("Key-signing sign-in (coming soon)"));
         assert!(html.contains("Add password"));
+    }
+
+    #[tokio::test]
+    async fn page_renders_login_alpha_optin_when_enabled() {
+        let mut ctx = ctx().await;
+        ctx.holder_login_alpha_enabled = true;
+        let s = session_for(&ctx, "did:web:grace2.example.com").await;
+        let resp = auth_methods_page(
+            Some(sctx(s)),
+            State(ctx.clone()),
+            Query(Banner { ok: None, error: None }),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(resp.into_body(), 128 * 1024).await.unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        // Functional opt-in form, not the disabled "coming soon" control.
+        assert!(html.contains("Opt in to key-signing sign-in"));
+        assert!(!html.contains("Key-signing sign-in (coming soon)"));
     }
 }

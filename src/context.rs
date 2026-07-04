@@ -158,12 +158,12 @@ pub struct AppContext {
     /// password verification for did:web holders. Did-keyed, over `account_db`.
     pub holder_auth_methods:
         Arc<crate::oauth::atproto::holder::auth_method_manager::HolderAuthMethodManager>,
-    /// Holder UI Phase 1 (#424) — whether login-α (the `#atproto`-key challenge
-    /// method) is usable at the web-UI layer. Default `false`: login-α needs a
-    /// vendored in-browser secp256k1 signer that is not shipped yet, so the
-    /// holder UI shows it as "coming soon" and does not offer it for sign-in.
-    /// Set `PDS_HOLDER_LOGIN_ALPHA_ENABLED=true` once the signer lands. (β.2's
-    /// machine AS-login endpoint is unaffected — it verifies server-side.)
+    /// Holder UI — whether login-α (the `#atproto`-key challenge method) is
+    /// usable at the web-UI layer. Default `true` since Phase 2.a (#425): the
+    /// in-browser secp256k1 signer (`static/holder/noble-secp256k1.js`) is
+    /// vendored, so the holder login page offers key sign-in. An operator
+    /// disables it with `PDS_HOLDER_LOGIN_ALPHA_ENABLED=false`. (β.2's machine
+    /// AS-login endpoint is unaffected — it verifies server-side.)
     pub holder_login_alpha_enabled: bool,
     /// Holder UI Phase 1 (#424) — per-holder display preferences (theme). The
     /// first per-account preferences store; over `account_db`.
@@ -822,12 +822,14 @@ impl AppContext {
                 account_db.clone(),
             ),
         );
-        // Holder UI Phase 1 (#424): login-α web-UI gate (default off — the
-        // in-browser secp256k1 signer is not shipped yet).
+        // Holder UI Phase 2.a (#425): login-α web-UI gate. Default ON now that
+        // the in-browser secp256k1 signer (static/holder/noble-secp256k1.js) is
+        // vendored. An operator disables it with
+        // `PDS_HOLDER_LOGIN_ALPHA_ENABLED=false`.
         let holder_login_alpha_enabled = std::env::var("PDS_HOLDER_LOGIN_ALPHA_ENABLED")
             .ok()
             .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+            .unwrap_or(true);
         // Holder UI Phase 1 (#424): per-holder display preferences.
         let holder_preferences = Arc::new(
             crate::oauth::atproto::holder::preferences_manager::AtprotoHolderPreferencesManager::new(
