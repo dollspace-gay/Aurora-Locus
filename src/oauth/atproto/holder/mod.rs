@@ -39,6 +39,8 @@ pub mod auth_methods;
 pub mod home;
 pub mod login;
 pub mod logout;
+pub mod preferences;
+pub mod preferences_manager;
 pub mod view;
 
 /// Where unauthenticated holder pages send the browser.
@@ -94,5 +96,10 @@ pub fn routes() -> Router<AppContext> {
         .route(
             "/oauth/atproto/holder/auth-methods/set-primary",
             post(auth_methods::set_primary),
+        )
+        // Per-holder display preferences (theme picker).
+        .route(
+            "/oauth/atproto/holder/preferences",
+            get(preferences::preferences_page).post(preferences::set_preferences),
         )
 }

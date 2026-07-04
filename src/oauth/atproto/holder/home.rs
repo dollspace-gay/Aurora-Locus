@@ -14,10 +14,17 @@ use crate::oauth::atproto::browser_session::BrowserSessionContext;
 use crate::oauth::atproto::html::html_escape;
 
 /// `GET /oauth/atproto/holder/home`
-pub async fn home_page(session: Option<BrowserSessionContext>, State(_ctx): State<AppContext>) -> Response {
+pub async fn home_page(session: Option<BrowserSessionContext>, State(ctx): State<AppContext>) -> Response {
     let Some(session) = session else {
         return Redirect::to(super::LOGIN_PATH).into_response();
     };
+    // Honor the holder's chosen theme (None → operator active).
+    let theme = ctx
+        .holder_preferences
+        .get(&session.session.did)
+        .await
+        .ok()
+        .and_then(|p| p.theme);
     let did = html_escape(&session.session.did);
     let csrf = html_escape(&session.session.csrf_token);
     let body = format!(
@@ -38,9 +45,7 @@ pub async fn home_page(session: Option<BrowserSessionContext>, State(_ctx): Stat
         did = did,
         csrf = csrf,
     );
-    // Phase 1: operator active theme. The per-holder theme picker (and themed
-    // home) land with the preferences page.
-    Html(page_shell("Your account", None, &body)).into_response()
+    Html(page_shell("Your account", theme.as_deref(), &body)).into_response()
 }
 
 #[cfg(test)]

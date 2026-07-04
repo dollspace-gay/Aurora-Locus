@@ -165,6 +165,10 @@ pub struct AppContext {
     /// Set `PDS_HOLDER_LOGIN_ALPHA_ENABLED=true` once the signer lands. (β.2's
     /// machine AS-login endpoint is unaffected — it verifies server-side.)
     pub holder_login_alpha_enabled: bool,
+    /// Holder UI Phase 1 (#424) — per-holder display preferences (theme). The
+    /// first per-account preferences store; over `account_db`.
+    pub holder_preferences:
+        Arc<crate::oauth::atproto::holder::preferences_manager::AtprotoHolderPreferencesManager>,
     // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
     // Cross-instance rate-limit primitive (Arc 7 Step 3).
@@ -824,6 +828,12 @@ impl AppContext {
             .ok()
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
+        // Holder UI Phase 1 (#424): per-holder display preferences.
+        let holder_preferences = Arc::new(
+            crate::oauth::atproto::holder::preferences_manager::AtprotoHolderPreferencesManager::new(
+                account_db.clone(),
+            ),
+        );
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database).
         // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
@@ -1312,6 +1322,7 @@ impl AppContext {
             atproto_device_manager,
             holder_auth_methods,
             holder_login_alpha_enabled,
+            holder_preferences,
             rate_limiter,
             distributed_rate_limiter,
             mailer,
