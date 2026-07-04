@@ -15,3 +15,4 @@ consumers at HEAD**.
   extraction is the reference model for fixing `install.sh`'s signing-key format bug.)
 - `compute_checksums.py` — one-shot util to hand-seed `_sqlx_migrations` rows; superseded by boot auto-migrate.
 - `provision_db.py` — one-shot empty-DB creator; superseded by boot auto-migrate.
+- `test_data/` — three orphan per-actor `store.sqlite` fixtures (did_plc_test123/456/789) from the founding era; no code or test references them (grep-clean, incl. dynamic-path checks). Binary SQLite blobs.
