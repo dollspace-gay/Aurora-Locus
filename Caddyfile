@@ -1,0 +1,8 @@
+# Aurora Locus — Caddy reverse proxy with automatic Let's Encrypt TLS.
+# (housekeeping #421 B.6). AURORA_DOMAIN is supplied by docker-compose from the
+# environment; it must resolve (A/AAAA) to this host and match PDS_HOSTNAME.
+# Caddy auto-provisions + renews the certificate on first startup.
+
+{$AURORA_DOMAIN} {
+	reverse_proxy aurora-locus:2583
+}
