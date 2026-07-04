@@ -36,6 +36,8 @@ use crate::oauth::atproto::browser_session::BrowserSessionContext;
 
 pub mod auth_method_manager;
 pub mod auth_methods;
+pub mod devices;
+pub mod grants;
 pub mod home;
 pub mod login;
 pub mod logout;
@@ -102,4 +104,14 @@ pub fn routes() -> Router<AppContext> {
             "/oauth/atproto/holder/preferences",
             get(preferences::preferences_page).post(preferences::set_preferences),
         )
+        // Device management (list + revoke; registration happens in the OAuth
+        // client flow, not here).
+        .route("/oauth/atproto/holder/devices", get(devices::devices_page))
+        .route(
+            "/oauth/atproto/holder/devices/revoke",
+            post(devices::revoke),
+        )
+        // Connected apps (OAuth grants) — list + revoke.
+        .route("/oauth/atproto/holder/grants", get(grants::grants_page))
+        .route("/oauth/atproto/holder/grants/revoke", post(grants::revoke))
 }
