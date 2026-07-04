@@ -18,6 +18,8 @@ pub mod client_metadata;
 pub mod consent;
 pub mod device;
 pub mod device_manager;
+pub mod holder;
+pub mod html;
 pub mod login;
 pub mod metadata;
 pub mod par;
@@ -75,6 +77,13 @@ pub fn routes() -> Router<AppContext> {
         .route("/oauth/atproto/device/revoke", post(device::revoke))
         .route("/oauth/atproto/grant/list", get(device::grant_list))
         .route("/oauth/atproto/grant/revoke", post(device::grant_revoke))
+        // Holder self-service UI (Phase 1, chainlink #424) — server-rendered
+        // pages under `/oauth/atproto/holder/*`. The session cookie's
+        // `Path=/oauth` scope reaches them, so the browser sends the holder's
+        // session automatically. Sub-phase 1.1 merges the (empty) scaffold;
+        // later sub-phases wire the login/home/devices/grants/preferences pages
+        // into `holder::routes()`.
+        .merge(holder::routes())
 }
 
 /// Generate a 256-bit opaque, URL-safe token — the CSPRNG primitive behind

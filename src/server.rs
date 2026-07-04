@@ -74,6 +74,17 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
             }
         }));
 
+    // Static file serving for the did:web holder self-service UI
+    // (Phase 1, chainlink #424). Serves the JS crypto islands
+    // (secp256k1 login signing, P-256 DPoP keygen) + CSS from disk,
+    // parallel to the admin static tree. These assets are public
+    // (client-side crypto code + styling, no secrets) and carry no
+    // session — the authenticated holder *pages* are handler-rendered
+    // under /oauth/atproto/holder/* where the Path=/oauth session
+    // cookie reaches them. The /holder/* asset prefix is a distinct
+    // path from those pages, so there is no route collision.
+    let holder_static = Router::new().nest_service("/holder", ServeDir::new("static/holder"));
+
     // Build router with middleware
     Router::new()
         // Metrics endpoint (no middleware)
@@ -85,6 +96,9 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
         .with_state(ctx.clone())
         // Merge admin static files (after with_state so it doesn't need state)
         .merge(admin_static)
+        // Merge holder self-service static assets (JS/CSS islands, also
+        // state-free — served after with_state like the admin tree).
+        .merge(holder_static)
         // Apply moderation check middleware (checks if account is suspended/taken down)
         .layer(middleware::from_fn_with_state(
             ctx.clone(),

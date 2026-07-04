@@ -18,6 +18,7 @@ use chrono::{Duration, Utc};
 
 use super::browser_session::{self, BrowserSession};
 use super::client_metadata::ClientMetadata;
+use super::html::html_escape;
 use super::params::{self, RawAuthParams};
 use super::request_store::{self, AtprotoAuthorizationRequest};
 use crate::context::AppContext;
@@ -300,23 +301,6 @@ fn internal_error_page(e: crate::error::PdsError) -> Response {
     )
 }
 
-/// Escape the five HTML-significant characters so interpolated client-supplied
-/// values (client_name, redirect_uri, scopes) cannot break out of the markup.
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,14 +326,6 @@ mod tests {
             code_challenge_method: Some("S256".to_string()),
             request_uri: None,
         }
-    }
-
-    #[test]
-    fn html_escape_neutralises_markup() {
-        assert_eq!(
-            html_escape(r#"<script>"&'"#),
-            "&lt;script&gt;&quot;&amp;&#x27;"
-        );
     }
 
     #[tokio::test]
