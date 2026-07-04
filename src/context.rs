@@ -153,6 +153,11 @@ pub struct AppContext {
     /// `oauth_device_manager` this superseded was retired in Phase ζ.)
     pub atproto_device_manager:
         Arc<crate::oauth::atproto::device_manager::AtprotoDeviceManager>,
+    /// Holder UI Phase 1 (#424) — the holder auth-method registry (SD-A5 =
+    /// flexible). Backs the holder self-service login + auth-method management;
+    /// password verification for did:web holders. Did-keyed, over `account_db`.
+    pub holder_auth_methods:
+        Arc<crate::oauth::atproto::holder::auth_method_manager::HolderAuthMethodManager>,
     // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
     // Cross-instance rate-limit primitive (Arc 7 Step 3).
@@ -800,6 +805,12 @@ impl AppContext {
         let atproto_device_manager = Arc::new(
             crate::oauth::atproto::device_manager::AtprotoDeviceManager::new(account_db.clone()),
         );
+        // Holder UI Phase 1 (#424): the holder auth-method registry.
+        let holder_auth_methods = Arc::new(
+            crate::oauth::atproto::holder::auth_method_manager::HolderAuthMethodManager::new(
+                account_db.clone(),
+            ),
+        );
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database).
         // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
@@ -1286,6 +1297,7 @@ impl AppContext {
             client_metadata_fetcher,
             holder_signing_channel,
             atproto_device_manager,
+            holder_auth_methods,
             rate_limiter,
             distributed_rate_limiter,
             mailer,

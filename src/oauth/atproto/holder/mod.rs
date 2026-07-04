@@ -28,16 +28,30 @@
 //! - **1.3:** home, devices, grants pages (+ P-256 DPoP-keygen island).
 //! - **1.4:** preferences page + logout, with the per-holder theme picker.
 
+use axum::routing::get;
 use axum::Router;
 
 use crate::context::AppContext;
 
+pub mod auth_method_manager;
+pub mod login;
+pub mod view;
+
 /// Build the holder self-service routes, merged into the atproto-OAuth provider
 /// router by [`super::routes`].
 ///
-/// Sub-phase 1.1 returns an empty router: the scaffold is in place and the
-/// merge point is live, but no page handlers are wired yet. Each later
-/// sub-phase adds its `.route(...)` lines here.
+/// Phase 1 wires the login surface here; later commits add the interior pages
+/// (home / devices / grants / preferences / auth-methods) + logout. All pages
+/// sit under `/oauth/atproto/holder/*`, inside the session cookie's
+/// `Path=/oauth` scope.
 pub fn routes() -> Router<AppContext> {
     Router::new()
+        // Holder login (password; passkey + login-α deferred). Pre-auth: the
+        // GET renders the form, the POST verifies the credential and mints a
+        // browser session. No session-CSRF token (there is no session yet — the
+        // security property is the credential itself, matching β.2's AS-login).
+        .route(
+            "/oauth/atproto/holder/login",
+            get(login::login_page).post(login::submit_login),
+        )
 }
