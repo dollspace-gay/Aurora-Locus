@@ -41,6 +41,7 @@ pub mod grants;
 pub mod home;
 pub mod login;
 pub mod logout;
+pub mod passkey;
 pub mod preferences;
 pub mod preferences_manager;
 pub mod view;
@@ -103,6 +104,17 @@ pub fn routes() -> Router<AppContext> {
         .route(
             "/oauth/atproto/holder/auth-methods/set-primary",
             post(auth_methods::set_primary),
+        )
+        // Passkey registration ceremony (holder authenticated). start issues a
+        // creation challenge; finish verifies the attestation + persists the
+        // passkey. JSON/fetch (the browser's credential objects are structured).
+        .route(
+            "/oauth/atproto/holder/auth-methods/passkey/start",
+            post(passkey::register_start),
+        )
+        .route(
+            "/oauth/atproto/holder/auth-methods/passkey/finish",
+            post(passkey::register_finish),
         )
         // Per-holder display preferences (theme picker).
         .route(

@@ -88,7 +88,7 @@ aws-credential-types = "1"
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 url = "2.5"
 base64 = "0.22"
 # jsonwebtoken 10 requires picking a crypto provider feature explicitly —

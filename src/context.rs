@@ -169,6 +169,13 @@ pub struct AppContext {
     /// first per-account preferences store; over `account_db`.
     pub holder_preferences:
         Arc<crate::oauth::atproto::holder::preferences_manager::AtprotoHolderPreferencesManager>,
+    /// Holder UI Phase 2.b (#427) — the WebAuthn relying-party context for the
+    /// holder-UI passkey ceremonies. RP id = service hostname, RP origin =
+    /// effective public URL. Arc-backed internally (cheap to clone).
+    pub passkey_webauthn: crate::oauth::atproto::holder::passkey::WebauthnCtx,
+    /// Holder UI Phase 2.b (#427) — in-memory store of in-flight passkey
+    /// ceremonies (registration challenge state), keyed by opaque challenge_id.
+    pub passkey_challenges: Arc<crate::oauth::atproto::holder::passkey::PasskeyChallengeStore>,
     // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
     // Cross-instance rate-limit primitive (Arc 7 Step 3).
@@ -836,6 +843,14 @@ impl AppContext {
                 account_db.clone(),
             ),
         );
+        // Holder UI Phase 2.b (#427): the WebAuthn RP context + passkey ceremony
+        // challenge store.
+        let passkey_webauthn = crate::oauth::atproto::holder::passkey::WebauthnCtx::new(
+            &config.service.hostname,
+            &config.service.effective_public_url(),
+        )?;
+        let passkey_challenges =
+            Arc::new(crate::oauth::atproto::holder::passkey::PasskeyChallengeStore::new());
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database).
         // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
@@ -1325,6 +1340,8 @@ impl AppContext {
             holder_auth_methods,
             holder_login_alpha_enabled,
             holder_preferences,
+            passkey_webauthn,
+            passkey_challenges,
             rate_limiter,
             distributed_rate_limiter,
             mailer,

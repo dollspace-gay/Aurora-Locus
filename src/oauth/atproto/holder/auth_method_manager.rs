@@ -16,6 +16,7 @@
 use chrono::Utc;
 use sqlx::{AnyPool, Row};
 use uuid::Uuid;
+use webauthn_rs::prelude::Passkey;
 
 use crate::error::{PdsError, PdsResult};
 
@@ -277,6 +278,64 @@ impl HolderAuthMethodManager {
             .map_err(PdsError::Database)?;
         tx.commit().await.map_err(PdsError::Database)?;
         Ok(())
+    }
+
+    /// Register a WebAuthn passkey method for `did`. The `Passkey` is stored
+    /// whole (serde_json) in `passkey_data`; its credential id
+    /// ([`Passkey::cred_id`]) is extracted into `passkey_credential_id` for the
+    /// partial-unique index + authentication lookup. The holder's first method
+    /// becomes primary. Returns the new method id.
+    pub async fn register_passkey(
+        &self,
+        did: &str,
+        passkey: &Passkey,
+        device_name: Option<&str>,
+    ) -> PdsResult<String> {
+        let data = serde_json::to_string(passkey)
+            .map_err(|e| PdsError::Internal(format!("failed to serialize passkey: {e}")))?;
+        let credential_id: Vec<u8> = passkey.cred_id().to_vec();
+        let is_primary = self.count_for_did(did).await? == 0;
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO holder_auth_method \
+             (id, did, method_type, is_primary, passkey_credential_id, passkey_device_name, \
+              passkey_data, created_at) \
+             VALUES ($1, $2, 'passkey', $3, $4, $5, $6, $7)",
+        )
+        .bind(&id)
+        .bind(did)
+        .bind(is_primary)
+        .bind(&credential_id)
+        .bind(device_name)
+        .bind(&data)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        Ok(id)
+    }
+
+    /// Load a holder's registered passkeys (deserialized). Used to build the
+    /// `exclude_credentials` list at registration and the allow-list at
+    /// authentication.
+    pub async fn list_passkeys_for_did(&self, did: &str) -> PdsResult<Vec<Passkey>> {
+        let rows = sqlx::query(
+            "SELECT passkey_data FROM holder_auth_method \
+             WHERE did = $1 AND method_type = 'passkey' AND passkey_data IS NOT NULL",
+        )
+        .bind(did)
+        .fetch_all(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let data: String = row.try_get("passkey_data").map_err(PdsError::Database)?;
+            let passkey: Passkey = serde_json::from_str(&data)
+                .map_err(|e| PdsError::Internal(format!("corrupt passkey_data: {e}")))?;
+            out.push(passkey);
+        }
+        Ok(out)
     }
 }
 
