@@ -122,7 +122,6 @@ fn normalize_pg_isolation(raw: &str) -> String {
 /// Resolve the connection URL for an `AnyPool` from a `DatabaseConfig`.
 /// SQLite gets a `sqlite://` prefix and `?mode=rwc` so the file is
 /// created if missing, matching the legacy `create_pool` behaviour.
-#[allow(dead_code)] // Phase 3 (#76) wires this into AppContext.
 fn any_url_for(config: &DatabaseConfig, fallback_sqlite_path: &Path) -> String {
     match config.backend {
         DatabaseBackend::Sqlite => {
@@ -145,7 +144,6 @@ fn any_url_for(config: &DatabaseConfig, fallback_sqlite_path: &Path) -> String {
 /// Calls `sqlx::any::install_default_drivers()` once on first use so the
 /// `Any` driver knows how to dispatch `sqlite://` and `postgres://` URLs
 /// to the correct concrete driver.
-#[allow(dead_code)] // Phase 3 (#76) calls this from AppContext::new.
 pub async fn create_any_pool(
     config: &DatabaseConfig,
     fallback_sqlite_path: &Path,
@@ -198,7 +196,6 @@ pub async fn create_any_pool(
 
 /// Run backend-appropriate migrations against an `AnyPool`. Dispatches
 /// to `migrations/` for SQLite and `migrations/postgres/` for Postgres.
-#[allow(dead_code)] // Phase 3 (#76) calls this from AppContext::new.
 pub async fn run_any_migrations(pool: &AnyPool, config: &DatabaseConfig) -> PdsResult<()> {
     match config.backend {
         DatabaseBackend::Sqlite => sqlx::migrate!("./migrations")

@@ -261,7 +261,6 @@ impl BlobStore {
     /// Commit a staged blob to permanent storage (Phase 2 of two-phase upload)
     ///
     /// Moves blob from temp to permanent storage and creates metadata
-    #[allow(dead_code)] // Future blob commit functionality
     /// Arc 16c §9.3.3.2 — two-phase upload commit: promote bytes from
     /// temp path to CID-derived final position, establish durability,
     /// THEN open the DB transaction that calls
