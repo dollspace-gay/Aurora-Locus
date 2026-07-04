@@ -159,25 +159,45 @@ header comment in `tests/postgres_smoke_test.rs` for the rationale.
 
 ## Deployment
 
-### Docker (Recommended)
+### Docker Compose with automatic TLS (recommended)
+
+The shipped `docker-compose.yml` runs the PDS behind a [Caddy](https://caddyserver.com)
+sidecar that provisions and renews a Let's Encrypt certificate automatically — no
+manual cert wrangling.
+
+**Prerequisite:** a domain whose DNS `A`/`AAAA` record points at this host (Caddy
+answers the ACME HTTP-01 challenge on port 80, so 80 + 443 must be reachable from
+the internet).
 
 ```bash
-# Build image
-docker build -t aurora-locus .
+cp .env.example .env
+# Edit .env: set AURORA_DOMAIN (your domain), PDS_HOSTNAME (same domain),
+# PDS_SERVICE_DID, and the required secrets (PDS_JWT_SECRET, the two
+# *_K256_PRIVATE_KEY_HEX signing keys — 32-byte raw hex).
+docker compose up -d
+```
 
-# Run container
+Caddy publishes 80/443 and reverse-proxies HTTPS to the PDS (internal port
+`2583`); the PDS itself is not exposed to the host. Check health with
+`curl -fsS https://$AURORA_DOMAIN/health/ready`.
+
+### Single container (no built-in TLS)
+
+For a PDS behind your own reverse proxy / TLS terminator:
+
+```bash
+docker build -t aurora-locus .
 docker run -d \
   -p 2583:2583 \
-  -v $(pwd)/data:/app/data \
-  -v $(pwd)/.env:/app/.env \
+  -v $(pwd)/data:/data \
+  --env-file .env \
   --name aurora-locus \
   aurora-locus
 ```
 
 The container listens on `PDS_PORT` (default `2583`). To run on a different
-port, set `PDS_PORT` in `.env` and adjust the port mapping to match
-(`-p <host-port>:<PDS_PORT>`) — the container-side port must equal
-`PDS_PORT` or the published mapping won't reach the server.
+port, set `PDS_PORT` in `.env` and adjust the mapping to match
+(`-p <host-port>:<PDS_PORT>`).
 
 ### Systemd Service
 

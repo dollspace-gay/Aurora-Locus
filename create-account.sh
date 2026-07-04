@@ -169,18 +169,15 @@ create_account() {
 
         if [ "$MAKE_ADMIN" = "yes" ]; then
             echo ""
-            print_info "To grant admin access, you have two options:"
+            print_info "To grant admin access, insert an admin_roles row:"
             echo ""
-            echo "Option 1: Add DID to .env (recommended for OAuth admin)"
-            echo "  Edit .env and add to PDS_ADMIN_DIDS:"
-            echo "  PDS_ADMIN_DIDS=$DID"
-            echo "  Then restart the server"
-            echo ""
-            echo "Option 2: Add to database (for API key admin)"
-            echo "  sqlite3 data/accounts.db"
-            echo "  INSERT INTO admin_role (did, role, granted_by, granted_at, revoked)"
+            echo "  sqlite3 \"\${PDS_DATA_DIRECTORY:-./data}/account.sqlite\""
+            echo "  INSERT INTO admin_roles (did, role, granted_by, granted_at, revoked)"
             echo "    VALUES ('$DID', 'superadmin', 'system', datetime('now'), 0);"
             echo "  .exit"
+            echo ""
+            print_info "(Admin is resolved live per-request from the admin_roles"
+            print_info " table — there is no PDS_ADMIN_DIDS env var. Restart not required.)"
             echo ""
         fi
 
