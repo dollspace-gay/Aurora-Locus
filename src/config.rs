@@ -1037,7 +1037,12 @@ pub struct AuthConfig {
 }
 
 fn default_jwt_sunset_date() -> String {
-    // Default to 90 days from now
+    // Fallback only: a rolling 90-days-from-boot window used when
+    // `PDS_JWT_SUNSET_DATE` is unset. Because it recomputes on each boot it
+    // never actually arrives — operators pinning a real deprecation deadline
+    // MUST set `PDS_JWT_SUNSET_DATE` (housekeeping #421 §5: the env override was
+    // added so the field is tunable like every other; the rolling default is
+    // documented, not silent).
     use chrono::{Duration, Utc};
     let sunset = Utc::now() + Duration::days(90);
     sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
@@ -1092,6 +1097,10 @@ pub struct EmailConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteConfig {
     pub required: bool,
+    // NOTE (housekeeping #421 §5): `interval`/`epoch` have zero runtime readers
+    // (dead fields). Removal is deferred — it fans out to ~8 test-construction
+    // sites; batch it with the `blob_metadata`/`stage_ttl_seconds` removal (same
+    // fan-out) in a focused config-field-removal commit.
     pub interval: u64,
     pub epoch: String,
 }
@@ -1988,8 +1997,10 @@ impl ServerConfig {
                     redirect_uri: oauth_redirect_uri,
                     pds_url: oauth_pds_url,
                 },
-                jwt_sunset_date: default_jwt_sunset_date(),
-                oauth_migration_guide_url: default_migration_guide_url(),
+                jwt_sunset_date: env::var("PDS_JWT_SUNSET_DATE")
+                    .unwrap_or_else(|_| default_jwt_sunset_date()),
+                oauth_migration_guide_url: env::var("PDS_OAUTH_MIGRATION_GUIDE_URL")
+                    .unwrap_or_else(|_| default_migration_guide_url()),
             },
             identity: IdentityConfig {
                 did_plc_url,
