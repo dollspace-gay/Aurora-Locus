@@ -1,5 +1,3 @@
-// Allow dead_code - reserved handle checking for future use
-#![allow(dead_code)]
 
 //! Reserved handle system - prevents registration of system-level and protocol handles
 //!
@@ -188,6 +186,7 @@ pub fn is_reserved(handle: &str) -> bool {
 }
 
 /// Check if a handle is reserved, returning a detailed reason
+#[allow(dead_code)] // exercised by in-file tests only; no production consumer
 pub fn check_reserved(handle: &str) -> Result<(), String> {
     if is_reserved(handle) {
         Err(format!(
@@ -200,11 +199,13 @@ pub fn check_reserved(handle: &str) -> Result<(), String> {
 }
 
 /// Get the full list of reserved handles (for administrative purposes)
+#[allow(dead_code)] // exercised by in-file tests only; no production consumer
 pub fn get_reserved_handles() -> Vec<&'static str> {
     RESERVED_HANDLES.iter().copied().collect()
 }
 
 /// Get count of reserved handles
+#[allow(dead_code)] // exercised by in-file tests only; no production consumer
 pub fn reserved_count() -> usize {
     RESERVED_HANDLES.len()
 }

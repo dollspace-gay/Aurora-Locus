@@ -1,5 +1,3 @@
-// Allow dead_code - handle validation utilities for future use
-#![allow(dead_code)]
 
 /// Comprehensive handle validation following ATProto spec
 ///
@@ -179,6 +177,7 @@ fn is_valid_tld(tld: &str) -> bool {
 ///
 /// For now, we only support ASCII handles. Future enhancement would add
 /// punycode encoding for internationalized domain names (IDN).
+#[allow(dead_code)] // exercised by in-file tests only; no production consumer
 pub fn normalize_handle(handle: &str) -> String {
     // For now, just lowercase
     // TODO: Add punycode support for IDN
