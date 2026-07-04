@@ -28,14 +28,30 @@
 //! - **1.3:** home, devices, grants pages (+ P-256 DPoP-keygen island).
 //! - **1.4:** preferences page + logout, with the per-holder theme picker.
 
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use crate::context::AppContext;
+use crate::oauth::atproto::browser_session::BrowserSessionContext;
 
 pub mod auth_method_manager;
+pub mod auth_methods;
+pub mod home;
 pub mod login;
+pub mod logout;
 pub mod view;
+
+/// Where unauthenticated holder pages send the browser.
+pub(crate) const LOGIN_PATH: &str = "/oauth/atproto/holder/login";
+/// The holder home / landing page.
+pub(crate) const HOME_PATH: &str = "/oauth/atproto/holder/home";
+
+/// CSRF check for holder form POSTs: the submitted token must equal the
+/// session's per-session token (β.3 consent discipline; the `request_id`/page
+/// is never a trust token).
+pub(crate) fn csrf_ok(session: &BrowserSessionContext, presented: &str) -> bool {
+    presented == session.session.csrf_token
+}
 
 /// Build the holder self-service routes, merged into the atproto-OAuth provider
 /// router by [`super::routes`].
@@ -53,5 +69,30 @@ pub fn routes() -> Router<AppContext> {
         .route(
             "/oauth/atproto/holder/login",
             get(login::login_page).post(login::submit_login),
+        )
+        // Landing page + sign-out.
+        .route("/oauth/atproto/holder/home", get(home::home_page))
+        .route("/oauth/atproto/holder/logout", post(logout::logout))
+        // Sign-in method management (password add/remove/set-primary; passkey +
+        // login-α opt-in gated by `holder_login_alpha_enabled`).
+        .route(
+            "/oauth/atproto/holder/auth-methods",
+            get(auth_methods::auth_methods_page),
+        )
+        .route(
+            "/oauth/atproto/holder/auth-methods/add-password",
+            post(auth_methods::add_password),
+        )
+        .route(
+            "/oauth/atproto/holder/auth-methods/add-login-alpha",
+            post(auth_methods::add_login_alpha),
+        )
+        .route(
+            "/oauth/atproto/holder/auth-methods/remove",
+            post(auth_methods::remove),
+        )
+        .route(
+            "/oauth/atproto/holder/auth-methods/set-primary",
+            post(auth_methods::set_primary),
         )
 }

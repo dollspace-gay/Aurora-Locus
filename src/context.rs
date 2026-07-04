@@ -158,6 +158,13 @@ pub struct AppContext {
     /// password verification for did:web holders. Did-keyed, over `account_db`.
     pub holder_auth_methods:
         Arc<crate::oauth::atproto::holder::auth_method_manager::HolderAuthMethodManager>,
+    /// Holder UI Phase 1 (#424) — whether login-α (the `#atproto`-key challenge
+    /// method) is usable at the web-UI layer. Default `false`: login-α needs a
+    /// vendored in-browser secp256k1 signer that is not shipped yet, so the
+    /// holder UI shows it as "coming soon" and does not offer it for sign-in.
+    /// Set `PDS_HOLDER_LOGIN_ALPHA_ENABLED=true` once the signer lands. (β.2's
+    /// machine AS-login endpoint is unaffected — it verifies server-side.)
+    pub holder_login_alpha_enabled: bool,
     // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
     // Cross-instance rate-limit primitive (Arc 7 Step 3).
@@ -811,6 +818,12 @@ impl AppContext {
                 account_db.clone(),
             ),
         );
+        // Holder UI Phase 1 (#424): login-α web-UI gate (default off — the
+        // in-browser secp256k1 signer is not shipped yet).
+        let holder_login_alpha_enabled = std::env::var("PDS_HOLDER_LOGIN_ALPHA_ENABLED")
+            .ok()
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database).
         // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
@@ -1298,6 +1311,7 @@ impl AppContext {
             holder_signing_channel,
             atproto_device_manager,
             holder_auth_methods,
+            holder_login_alpha_enabled,
             rate_limiter,
             distributed_rate_limiter,
             mailer,
