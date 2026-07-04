@@ -74,6 +74,11 @@ pub fn routes() -> Router<AppContext> {
             "/oauth/atproto/holder/login",
             get(login::login_page).post(login::submit_login),
         )
+        // login-α challenge issuance (consumed by login-alpha.js).
+        .route(
+            "/oauth/atproto/holder/login/challenge",
+            get(login::login_challenge),
+        )
         // Landing page + sign-out.
         .route("/oauth/atproto/holder/home", get(home::home_page))
         .route("/oauth/atproto/holder/logout", post(logout::logout))

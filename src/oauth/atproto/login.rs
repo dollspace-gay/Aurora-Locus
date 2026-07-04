@@ -179,7 +179,11 @@ fn login_failed() -> PdsError {
 
 /// Verify a login-α challenge signature: a 64-byte compact ES256K signature
 /// over `SHA-256(challenge)`, against a multibase secp256k1 public key.
-fn verify_login_signature(
+///
+/// `pub(crate)` so the holder self-service login (Phase 2.a) reuses the exact
+/// same verification primitive as this machine AS-login — one implementation of
+/// the login-α signature check.
+pub(crate) fn verify_login_signature(
     identity_public_key: &str,
     challenge: &str,
     signature_b64: &str,
