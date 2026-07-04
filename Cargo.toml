@@ -173,6 +173,7 @@ flate2 = "1.1.5"
 # TAR archive serialization for tools.aurora.admin.exportAccountForensic
 # (Phase 3.8 / chainlink #105 / docs/AURORA_ADMIN_UI_DESIGN.md §8.7).
 tar = "0.4"
+webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -192,3 +193,4 @@ serde_urlencoded = "0.7"
 # multi-instance leader election and LISTEN/NOTIFY cache invalidation.
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
+webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
