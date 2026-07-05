@@ -18,7 +18,7 @@
 #      `PlcSigner` decodes; the previous installer emitted DER and never booted).
 #   2. A small fixed set of deployment-identity keys is derived from the one
 #      value the operator must supply, their public domain (PDS_HOSTNAME,
-#      AURORA_DOMAIN, PDS_SERVICE_DID, PDS_PUBLIC_URL, PDS_SERVICE_HANDLE_DOMAINS).
+#      AURORA_DOMAIN, PDS_SERVICE_DID, PDS_SERVICE_PUBLIC_URL, PDS_SERVICE_HANDLE_DOMAINS).
 #   3. Everything else is copied verbatim (working defaults + all documentation).
 #
 # Beyond the .env, the installer brings the NATIVE deploy path up to parity with
@@ -751,7 +751,7 @@ if [[ "$DOMAIN" != "localhost" ]]; then
     OVERRIDE[PDS_HOSTNAME]="$DOMAIN"
     OVERRIDE[AURORA_DOMAIN]="$DOMAIN"
     OVERRIDE[PDS_SERVICE_DID]="did:web:$DOMAIN"
-    OVERRIDE[PDS_PUBLIC_URL]="https://$DOMAIN"
+    OVERRIDE[PDS_SERVICE_PUBLIC_URL]="https://$DOMAIN"
     OVERRIDE[PDS_SERVICE_HANDLE_DOMAINS]=".$DOMAIN"
 fi
 
