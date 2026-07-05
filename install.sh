@@ -151,6 +151,67 @@ APACHE
 
 # ---- rustup bootstrap -------------------------------------------------------
 
+# Echo the pinned channel from rust-toolchain.toml (e.g. "1.91"), or nothing if
+# the file/line is absent. Tolerates single/double quotes, surrounding
+# whitespace, trailing comments, and a missing or comment-only file.
+read_pinned_channel() {
+    local f="$REPO_ROOT/rust-toolchain.toml" line
+    [[ -f "$f" ]] || { echo ""; return 0; }
+    line="$(grep -E '^[[:space:]]*channel[[:space:]]*=' "$f" 2>/dev/null | head -1)"
+    [[ -n "$line" ]] || { echo ""; return 0; }
+    line="${line#*=}"        # drop up to the '='
+    line="${line%%#*}"       # drop a trailing comment
+    line="${line//\"/}"      # drop double quotes
+    line="${line//\'/}"      # drop single quotes
+    line="$(echo "$line" | tr -d '[:space:]')"
+    echo "$line"
+}
+
+# Bug 1 fix: rustup-init ran with --default-toolchain none, so nothing was
+# installed and no default is set — a later `cargo` in the workspace would only
+# auto-install if cwd happens to be the workspace. Explicitly install the pinned
+# channel and set it as the default so cargo works from any directory.
+ensure_pinned_toolchain() {
+    local ch; ch="$(read_pinned_channel)"
+    if [[ -z "$ch" ]]; then
+        warn "No pinned channel found in rust-toolchain.toml — leaving toolchain"
+        warn "selection to rustup's on-demand install in the workspace."
+        return 0
+    fi
+    info "Installing the pinned Rust toolchain ($ch) …"
+    rustup toolchain install "$ch"
+    rustup default "$ch"
+    success "Active toolchain: $(rustup show active-toolchain 2>/dev/null || echo "$ch")"
+}
+
+# Bug 2 fix: rustup-init was run with --no-modify-path (no rc edits without
+# consent), so ~/.cargo/bin is on install.sh's PATH (we source it) but NOT the
+# operator's parent shell — the banner's `cargo` next-step would resolve to an
+# older system cargo, or nothing. Offer to persist it (opt-in; auto-yes under
+# --non-interactive). New shells then get cargo; the banner still prints how to
+# fix the CURRENT shell.
+offer_shell_rc_append() {
+    local rc="$HOME/.bashrc"
+    if [[ -f "$rc" ]] && grep -qF '.cargo/env' "$rc"; then
+        info "~/.bashrc already sources ~/.cargo/env — new shells get cargo automatically."
+        return 0
+    fi
+    local do_it=false
+    if [[ "$NON_INTERACTIVE" == true ]]; then
+        do_it=true
+    else
+        info "cargo is installed under ~/.cargo/bin, which is not yet on your shell's PATH."
+        read -r -p "Add cargo to your PATH permanently? (appends to ~/.bashrc) [Y/n]: " ans
+        [[ -z "$ans" || "${ans,,}" == "y" || "${ans,,}" == "yes" ]] && do_it=true
+    fi
+    if [[ "$do_it" == true ]]; then
+        printf '\n# Added by aurora-locus install.sh — put rustup/cargo on PATH\n. "$HOME/.cargo/env"\n' >> "$rc"
+        success "Appended cargo env to $rc (effective in new shells)."
+    else
+        info "Left ~/.bashrc unchanged."
+    fi
+}
+
 bootstrap_rustup() {
     if command -v rustup >/dev/null 2>&1; then
         success "rustup found — toolchain resolves from rust-toolchain.toml"
@@ -176,16 +237,27 @@ bootstrap_rustup() {
         return 0
     fi
 
-    info "Installing rustup (no shell-rc edits; toolchain auto-selected on first cargo run) …"
+    info "Installing rustup (no rc edits yet; the pinned toolchain is installed next) …"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
+    # Put rustup + cargo on install.sh's own PATH for the rest of this run.
     # shellcheck disable=SC1091
     [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+    if ! command -v rustup >/dev/null 2>&1; then
+        err "rustup-init ran but rustup is not on PATH."
+        err "Open a new shell (or 'source \$HOME/.cargo/env') and re-run install.sh."
+        exit 1
+    fi
+
+    ensure_pinned_toolchain   # bug 1
+    offer_shell_rc_append     # bug 2
+
     if ! command -v cargo >/dev/null 2>&1; then
         err "rustup installed but cargo is not on PATH."
         err "Open a new shell (or 'source \$HOME/.cargo/env') and re-run install.sh."
         exit 1
     fi
-    success "rustup installed — cargo available"
+    RUSTUP_INSTALLED_THIS_RUN=true
+    success "rustup + pinned toolchain installed — cargo available"
 }
 
 # ---- Caddy install ----------------------------------------------------------
@@ -408,6 +480,10 @@ EMIT_PROXY=""        # internal: render a proxy config to stdout and exit
 # reverse-proxy result state (for the banner)
 RP_SUMMARY="not configured"
 RP_CERTBOT_HINT=false
+
+# true once install.sh has installed rustup this run (drives the current-shell
+# PATH hint in the banner)
+RUSTUP_INSTALLED_THIS_RUN=false
 
 usage() {
     cat <<EOF
@@ -670,6 +746,12 @@ echo "  data directory $DATA_DIR"
 echo "  domain         $DOMAIN"
 echo "  reverse proxy  $RP_SUMMARY"
 echo
+if [[ "$RUSTUP_INSTALLED_THIS_RUN" == true ]]; then
+    info "cargo was just installed. To use it in THIS shell, run:"
+    echo "  source \"\$HOME/.cargo/env\""
+    info "(new shells pick it up automatically if you let install.sh update ~/.bashrc.)"
+    echo
+fi
 info "Verify the configuration before first boot:"
 echo "  cargo run --release -- validate-config"
 echo
