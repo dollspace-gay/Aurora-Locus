@@ -255,7 +255,18 @@ impl AdminRoleManager {
         Ok(())
     }
 
-    /// Get active admin role for a DID
+    /// Get active admin role for a DID.
+    ///
+    /// Scope note (v0.10): the `admin_roles` table's `did` column is a free
+    /// reference with no `account` foreign key, so it may hold rows for
+    /// non-local DIDs (legacy data, migration state). Under the v0.10
+    /// constitutional claim, admin/superadmin roles are effectively grantable
+    /// only to DIDs that also have a local `account` row — the OAuth admin flow
+    /// (`api::oauth_admin::authorize_local_admin`) gates on local-account
+    /// existence BEFORE consulting this table, so a role row for a non-local DID
+    /// is inert (the login is refused with a 403 before the role is read). The
+    /// constraint is enforced at the OAuth layer, not the schema, to keep a
+    /// future relaxation (e.g. federated moderator roles) migration-free.
     pub async fn get_role(&self, did: &str) -> PdsResult<Option<AdminRole>> {
         let row = sqlx::query(
             r#"

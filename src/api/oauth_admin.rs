@@ -425,11 +425,88 @@ struct OAuthLoginResponse {
     role: Option<String>,
 }
 
+/// Resolve an authenticated OAuth login (`did`) into PDS-side admin session
+/// tokens, enforcing the v0.10 constitutional claim that admin/superadmin roles
+/// are restricted to LOCAL accounts — DIDs with a row in this PDS's `account`
+/// table. Returns `(access_token, refresh_token, role)` from a real account
+/// session, i.e. the tokens `route_local_verify` (`account_manager
+/// ::validate_access_token`) accepts on every subsequent request.
+///
+/// Two rejections, both 403, in this order:
+///  1. **Non-local DID** — the DID authenticated as a valid ATProto identity
+///     but has no local account. Admin trust is a claim about accounts the
+///     operator controls on THIS PDS, so it cannot hold a role here (even if a
+///     legacy `admin_roles` row exists). Checked FIRST so the message is
+///     accurate rather than a misleading "not an admin".
+///  2. **Local non-admin** — a local account with no `admin_roles` entry.
+///
+/// This replaces the pre-v0.10 split that minted an "AS-only" HS256 admin JWT
+/// backed by `operator_session_store` for admins without a local account. Those
+/// tokens were not understood by `route_local_verify`, so every request after
+/// login 401'd and the browser looped back to the login page. Constraining
+/// admins to local accounts means the login always yields a real, validatable
+/// account session and that path is gone.
+async fn authorize_local_admin(
+    ctx: &AppContext,
+    did: &str,
+) -> Result<(String, String, String), (StatusCode, String)> {
+    // (1) Local-account gate — runs before the admin_roles lookup.
+    if ctx.account_manager.get_account(did).await.is_err() {
+        tracing::warn!(
+            did = %did,
+            "Admin OAuth login rejected: DID has no local account. Admin roles \
+             are restricted to accounts hosted on this PDS."
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Admin roles are restricted to accounts hosted on this PDS. \
+             Log in with a local account."
+                .to_string(),
+        ));
+    }
+
+    // (2) Admin authorisation. Authority comes from the admin_role table only
+    // (resolved live per request, #267). The first SuperAdmin is inserted
+    // directly per the README "First Admin User" bootstrap; subsequent grants
+    // flow through tools.aurora.superadmin.grantRole and the audit chain.
+    let admin_role = ctx.admin_role_manager.get_role(did).await.map_err(|e| {
+        tracing::error!("Failed to query admin role: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to check admin status".to_string(),
+        )
+    })?;
+    let Some(admin_role) = admin_role else {
+        tracing::warn!("User {} is not an admin on this PDS", did);
+        return Err((
+            StatusCode::FORBIDDEN,
+            "User is not authorized as an admin on this PDS".to_string(),
+        ));
+    };
+    let role = admin_role.role.as_str().to_string();
+    tracing::info!("Admin {} authenticated with role {}", did, role);
+
+    // A local account is guaranteed above, so this always yields a real account
+    // session whose tokens `route_local_verify` validates.
+    let session = ctx
+        .account_manager
+        .create_session(did, None)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to create session: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create session: {}", e),
+            )
+        })?;
+
+    Ok((session.access_token, session.refresh_token, role))
+}
+
 /// Handle OAuth callback
 async fn handle_oauth_callback(
     State(ctx): State<AppContext>,
     axum::Extension(state_store): axum::Extension<OAuthStateStore>,
-    headers: axum::http::HeaderMap,
     Query(params): Query<OAuthCallbackParams>,
 ) -> Result<axum::response::Html<String>, (StatusCode, String)> {
     tracing::info!("Handling OAuth callback");
@@ -492,112 +569,10 @@ async fn handle_oauth_callback(
     let did = token_set.sub.clone();
     tracing::info!("OAuth authentication successful for DID: {}", did);
 
-    // Admin authorisation check. Authority comes from the admin_role
-    // table only. The first SuperAdmin must be inserted directly into
-    // admin_role per the bootstrap path in README "First Admin User";
-    // subsequent grants flow through tools.aurora.superadmin.grantRole
-    // and the audit chain.
-    let admin_role = ctx.admin_role_manager.get_role(&did).await.map_err(|e| {
-        tracing::error!("Failed to query admin role: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to check admin status".to_string(),
-        )
-    })?;
-
-    let Some(ref admin_role) = admin_role else {
-        tracing::warn!("User {} is not an admin on this PDS", did);
-        return Err((
-            StatusCode::FORBIDDEN,
-            "User is not authorized as an admin on this PDS".to_string(),
-        ));
-    };
-
-    let role = Some(admin_role.role.as_str().to_string());
-
-    tracing::info!("Admin {} authenticated with role {:?}", did, role);
-
-    // Mint PDS-side tokens (real session if the user has an account, otherwise a
-    // 24h admin-scoped JWT for AS-only admins).
-    let account_exists = ctx.account_manager.get_account(&did).await.is_ok();
-
-    let (access_token, refresh_token) = if account_exists {
-        let session = ctx
-            .account_manager
-            .create_session(&did, None)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to create session: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create session: {}", e),
-                )
-            })?;
-
-        (session.access_token, session.refresh_token)
-    } else {
-
-        // Record a server-side operator session (§8.1.7 / #271). It outlives
-        // the 24h access token, so tie its lifetime to the 30d refresh
-        // window. `refresh_id` is the rotation-chain head (#272). Both the
-        // access and refresh tokens carry the resulting `sid` so the auth
-        // path can validate/touch/revoke this session per request.
-        let refresh_id = uuid::Uuid::new_v4().to_string();
-        let source_ip =
-            crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
-                .map(|ip| ip.to_string());
-        let user_agent = headers
-            .get(axum::http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let sid = ctx
-            .operator_session_store
-            .create(
-                &did,
-                source_ip.as_deref(),
-                user_agent.as_deref(),
-                &refresh_id,
-                chrono::Duration::days(30),
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to create operator session: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to create session".to_string(),
-                )
-            })?;
-
-        let now = chrono::Utc::now().timestamp();
-
-        let access_token =
-            mint_admin_access_jwt(&ctx.config.authentication.jwt_secret, &did, Some(&sid))
-                .map_err(|e| {
-                    tracing::error!("Failed to create JWT: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to create token".to_string(),
-                    )
-                },
-            )?;
-
-        let refresh_token = mint_admin_refresh_jwt(
-            &ctx.config.authentication.jwt_secret,
-            &did,
-            &sid,
-            &refresh_id,
-            now + 2592000, // 30 days
-        )
-        .map_err(|e| {
-            tracing::error!("Failed to create refresh token: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create refresh token".to_string(),
-            )
-        })?;
-
-        (access_token, refresh_token)
-    };
+    // v0.10 constitutional claim: admin/superadmin roles are restricted to LOCAL
+    // accounts. Resolve the login into a real account session (the tokens the
+    // request-auth path validates), rejecting non-local DIDs and non-admins.
+    let (access_token, refresh_token, role) = authorize_local_admin(&ctx, &did).await?;
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -698,7 +673,7 @@ async fn client_metadata(State(ctx): State<AppContext>) -> Json<ClientMetadataRe
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_refresh, mint_admin_access_jwt, RefreshRequest};
+    use super::{authorize_local_admin, handle_refresh, mint_admin_access_jwt, RefreshRequest};
     use crate::admin::roles::Role;
     use crate::config::*;
     use crate::AppContext;
@@ -978,5 +953,98 @@ mod tests {
         .await
         .expect_err("stale rid must be rejected");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Seed a local account (actor + account rows) so `get_account` /
+    /// `create_session` resolve — bypasses createAccount's PLC round-trip.
+    async fn seed_local_account(ctx: &AppContext, did: &str, handle: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at, takedown_ref, deactivated_at, delete_after)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
+        )
+        .bind(did)
+        .bind(handle)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled)
+             VALUES (?1, ?2, 'test-hash', NULL, 0)",
+        )
+        .bind(did)
+        .bind(Some("admin@example.test"))
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+    }
+
+    // Fix 1 (#432): admin OAuth is constrained to local accounts.
+
+    #[tokio::test]
+    async fn authorize_local_admin_rejects_non_local_did() {
+        let ctx = create_test_context().await;
+        // A DID that OAuth-authenticated but has NO local account — and even
+        // carries a (legacy) admin_roles row — must still be refused, because
+        // the local-account gate runs BEFORE the role lookup.
+        let did = "did:plc:nonlocaladmin0000000000000";
+        ctx.admin_role_manager
+            .grant_role(did, Role::SuperAdmin, "system", None)
+            .await
+            .unwrap();
+        let err = authorize_local_admin(&ctx, did)
+            .await
+            .expect_err("non-local DID must be refused");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            err.1.contains("hosted on this PDS"),
+            "expected local-account message, got: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_local_admin_happy_path_mints_validatable_session() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:localadmin00000000000000000";
+        seed_local_account(&ctx, did, "admin.localhost").await;
+        ctx.admin_role_manager
+            .grant_role(did, Role::SuperAdmin, "system", None)
+            .await
+            .unwrap();
+
+        let (access, refresh, role) = authorize_local_admin(&ctx, did)
+            .await
+            .expect("local admin must be authorized");
+        assert_eq!(role, "superadmin");
+        assert!(!refresh.is_empty());
+
+        // The minted access token must validate via the exact path
+        // route_local_verify uses — proving the login→401→login loop is gone.
+        let validated = ctx
+            .account_manager
+            .validate_access_token(&access)
+            .await
+            .expect("session access token must validate via account_manager");
+        assert_eq!(validated.did, did);
+    }
+
+    #[tokio::test]
+    async fn authorize_local_admin_rejects_local_non_admin() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:localnonadmin000000000000";
+        seed_local_account(&ctx, did, "bob.localhost").await;
+        // Local account, but NO admin_roles entry — the existing "not an admin"
+        // 403 must still fire (no regression).
+        let err = authorize_local_admin(&ctx, did)
+            .await
+            .expect_err("local non-admin must be refused");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            err.1.contains("not authorized as an admin"),
+            "expected not-an-admin message, got: {}",
+            err.1
+        );
     }
 }
