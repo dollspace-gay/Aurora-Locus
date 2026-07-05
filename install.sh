@@ -21,13 +21,18 @@
 #      AURORA_DOMAIN, PDS_SERVICE_DID, PDS_PUBLIC_URL, PDS_SERVICE_HANDLE_DOMAINS).
 #   3. Everything else is copied verbatim (working defaults + all documentation).
 #
+# Beyond the .env, the installer brings the NATIVE deploy path up to parity with
+# the docker-compose path by handling the two prerequisites operators otherwise
+# solve by hand:
+#   - the Rust toolchain (bootstraps rustup if absent; the pinned toolchain then
+#     auto-selects from rust-toolchain.toml on the first cargo invocation), and
+#   - TLS termination (detects an installed reverse proxy — Caddy / nginx /
+#     Apache — and writes a site config for the operator's domain, or offers to
+#     install Caddy on a fresh host for automatic Let's Encrypt).
+#
 # Admin access is NOT an env var (the old `PDS_ADMIN_DIDS` never had a consumer).
 # It is granted per-DID from the `admin_roles` table via the offline
 # `grant-admin` subcommand; the installer prints that as a post-boot step.
-#
-# TLS is out of scope for the native path — run your own reverse proxy (nginx,
-# standalone Caddy, or a cloud load balancer). The docker-compose path ships a
-# Caddy sidecar with automatic Let's Encrypt (see docker-compose.yml / README).
 
 set -euo pipefail
 
@@ -46,6 +51,339 @@ header() {
     echo -e "${NC}"
 }
 
+# ---- privilege / platform helpers ------------------------------------------
+
+# Run a command as root: directly if already root, via sudo if available,
+# otherwise fail with a clear message. Used for package installs and writes
+# under /etc.
+run_root() {
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        err "This step needs root privileges (or sudo), which are not available."
+        return 1
+    fi
+}
+
+# Echo the distro family: debian | rhel | arch | unknown.
+detect_distro() {
+    if [[ -f /etc/debian_version ]]; then echo debian
+    elif [[ -f /etc/redhat-release ]]; then echo rhel
+    elif [[ -f /etc/arch-release ]]; then echo arch
+    else echo unknown; fi
+}
+
+# True if systemd reports the given unit active.
+svc_active() {
+    command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$1" 2>/dev/null
+}
+
+# ---- reverse-proxy config renderers ----------------------------------------
+#
+# Pure functions: each echoes the site config it would write, with the
+# operator's domain substituted, and touches nothing. `--emit-proxy-config`
+# exposes them for preview/testing. The proxy's own runtime variables ($host,
+# $scheme, …) are protected by a quoted heredoc and survive the substitution —
+# only the __AURORA_DOMAIN__ token is replaced.
+
+render_caddy_block() {
+    cat <<CADDY
+${DOMAIN} {
+    reverse_proxy localhost:2583
+}
+CADDY
+}
+
+render_nginx_conf() {
+    sed "s/__AURORA_DOMAIN__/${DOMAIN}/g" <<'NGINX'
+server {
+    listen 443 ssl http2;
+    server_name __AURORA_DOMAIN__;
+
+    # certbot-managed certs (adjust path if your certs live elsewhere)
+    ssl_certificate     /etc/letsencrypt/live/__AURORA_DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__AURORA_DOMAIN__/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:2583;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+    }
+}
+
+server {
+    listen 80;
+    server_name __AURORA_DOMAIN__;
+    return 301 https://$host$request_uri;
+}
+NGINX
+}
+
+render_apache_conf() {
+    sed "s/__AURORA_DOMAIN__/${DOMAIN}/g" <<'APACHE'
+<VirtualHost *:443>
+    ServerName __AURORA_DOMAIN__
+
+    SSLEngine on
+    SSLCertificateFile      /etc/letsencrypt/live/__AURORA_DOMAIN__/fullchain.pem
+    SSLCertificateKeyFile   /etc/letsencrypt/live/__AURORA_DOMAIN__/privkey.pem
+
+    ProxyPass        / http://127.0.0.1:2583/
+    ProxyPassReverse / http://127.0.0.1:2583/
+    ProxyPreserveHost On
+    RequestHeader set X-Forwarded-Proto "https"
+</VirtualHost>
+
+<VirtualHost *:80>
+    ServerName __AURORA_DOMAIN__
+    Redirect permanent / https://__AURORA_DOMAIN__/
+</VirtualHost>
+APACHE
+}
+
+# ---- rustup bootstrap -------------------------------------------------------
+
+bootstrap_rustup() {
+    if command -v rustup >/dev/null 2>&1; then
+        success "rustup found — toolchain resolves from rust-toolchain.toml"
+        return 0
+    fi
+    if [[ "$SKIP_RUSTUP" == true ]]; then
+        warn "rustup not found and --skip-rustup set — provide a Rust toolchain yourself before building."
+        return 0
+    fi
+
+    local do_install=false
+    if [[ "$NON_INTERACTIVE" == true ]]; then
+        do_install=true
+    else
+        warn "rustup is not installed. Distro 'rust' packages are often too old to"
+        warn "parse this workspace's lockfile; rustup is the supported toolchain."
+        read -r -p "Install rustup now? [Y/n]: " ans
+        [[ -z "$ans" || "${ans,,}" == "y" || "${ans,,}" == "yes" ]] && do_install=true
+    fi
+
+    if [[ "$do_install" != true ]]; then
+        warn "Skipping rustup install — install a Rust toolchain before 'cargo run'."
+        return 0
+    fi
+
+    info "Installing rustup (no shell-rc edits; toolchain auto-selected on first cargo run) …"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
+    # shellcheck disable=SC1091
+    [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+    if ! command -v cargo >/dev/null 2>&1; then
+        err "rustup installed but cargo is not on PATH."
+        err "Open a new shell (or 'source \$HOME/.cargo/env') and re-run install.sh."
+        exit 1
+    fi
+    success "rustup installed — cargo available"
+}
+
+# ---- Caddy install ----------------------------------------------------------
+
+install_caddy() {
+    local distro; distro="$(detect_distro)"
+    info "Installing Caddy ($distro) …"
+    case "$distro" in
+        debian)
+            run_root bash -c "
+                apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg &&
+                curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg &&
+                curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list &&
+                apt-get update &&
+                apt-get install -y caddy
+            " ;;
+        rhel)
+            run_root bash -c "
+                dnf install -y 'dnf-command(copr)' &&
+                dnf copr enable -y @caddy/caddy &&
+                dnf install -y caddy
+            " ;;
+        arch)
+            run_root pacman -Sy --noconfirm caddy ;;
+        *)
+            err "Automatic Caddy install is not supported on this distro."
+            err "Install Caddy manually (https://caddyserver.com/docs/install), then"
+            err "re-run with --reverse-proxy=caddy."
+            return 1 ;;
+    esac
+}
+
+# ---- reverse-proxy detection + configuration --------------------------------
+
+# Echo which proxy to configure: an active one wins; else the sole installed
+# one; else "none" (nothing installed) or "multi:<list>" (several, none active).
+detect_reverse_proxy() {
+    if svc_active caddy;  then echo caddy;  return; fi
+    if svc_active nginx;  then echo nginx;  return; fi
+    if svc_active apache2 || svc_active httpd; then echo apache; return; fi
+
+    local installed=()
+    command -v caddy >/dev/null 2>&1 && installed+=(caddy)
+    command -v nginx >/dev/null 2>&1 && installed+=(nginx)
+    { command -v apache2 >/dev/null 2>&1 || command -v httpd >/dev/null 2>&1; } && installed+=(apache)
+
+    case "${#installed[@]}" in
+        0) echo none ;;
+        1) echo "${installed[0]}" ;;
+        *) echo "multi:${installed[*]}" ;;
+    esac
+}
+
+configure_caddy() {
+    if ! command -v caddy >/dev/null 2>&1; then
+        install_caddy || { err "Caddy install failed."; exit 1; }
+    fi
+    local cf=/etc/caddy/Caddyfile block ts=""
+    block="$(render_caddy_block)"
+
+    if run_root test -s "$cf"; then
+        if run_root grep -qF "${DOMAIN} {" "$cf" 2>/dev/null; then
+            warn "Caddyfile already has a block for $DOMAIN — leaving it untouched."
+            RP_SUMMARY="Caddy (existing $DOMAIN block kept)"
+            return 0
+        fi
+        ts="$(date +%Y%m%d%H%M%S)"
+        run_root cp "$cf" "$cf.bak.$ts"
+        warn "Existing Caddyfile backed up to $cf.bak.$ts"
+        printf '\n%s\n' "$block" | run_root tee -a "$cf" >/dev/null
+    else
+        run_root mkdir -p /etc/caddy
+        printf '%s\n' "$block" | run_root tee "$cf" >/dev/null
+    fi
+
+    if ! run_root caddy validate --config "$cf" 2>/dev/null; then
+        err "caddy validate failed for $cf."
+        if [[ -n "$ts" ]]; then
+            run_root cp "$cf.bak.$ts" "$cf"
+            err "Restored the previous Caddyfile from backup."
+        fi
+        exit 1
+    fi
+
+    run_root systemctl daemon-reload || true
+    run_root systemctl enable caddy || true
+    run_root systemctl reload caddy || run_root systemctl restart caddy || true
+    success "Caddy configured for $DOMAIN (automatic Let's Encrypt TLS)."
+    RP_SUMMARY="Caddy (automatic Let's Encrypt)"
+}
+
+configure_nginx() {
+    command -v nginx >/dev/null 2>&1 || { err "nginx not found on PATH."; exit 1; }
+    local conf link=""
+    if [[ -d /etc/nginx/sites-available ]]; then
+        conf=/etc/nginx/sites-available/aurora-locus.conf
+        link=/etc/nginx/sites-enabled/aurora-locus.conf
+    else
+        conf=/etc/nginx/conf.d/aurora-locus.conf
+    fi
+
+    render_nginx_conf | run_root tee "$conf" >/dev/null
+    [[ -n "$link" ]] && run_root ln -sf "$conf" "$link"
+
+    if ! run_root nginx -t 2>/dev/null; then
+        err "nginx -t failed — removing the site config."
+        run_root rm -f "$conf"
+        [[ -n "$link" ]] && run_root rm -f "$link"
+        exit 1
+    fi
+    run_root systemctl reload nginx || true
+    success "nginx site written: $conf"
+    RP_SUMMARY="nginx"
+    run_root test -d "/etc/letsencrypt/live/$DOMAIN" || RP_CERTBOT_HINT=true
+}
+
+configure_apache() {
+    local conf reload_svc
+    if command -v apache2 >/dev/null 2>&1 || [[ "$(detect_distro)" == debian ]]; then
+        conf=/etc/apache2/sites-available/aurora-locus.conf
+        reload_svc=apache2
+        local m
+        for m in proxy proxy_http ssl headers; do run_root a2enmod "$m" >/dev/null 2>&1 || true; done
+        render_apache_conf | run_root tee "$conf" >/dev/null
+        run_root a2ensite aurora-locus.conf >/dev/null 2>&1 || true
+        if ! run_root apache2ctl configtest 2>/dev/null; then
+            err "apache2ctl configtest failed — removing the site config."
+            run_root rm -f "$conf"; exit 1
+        fi
+    else
+        conf=/etc/httpd/conf.d/aurora-locus.conf
+        reload_svc=httpd
+        render_apache_conf | run_root tee "$conf" >/dev/null
+        if ! run_root httpd -t 2>/dev/null; then
+            err "httpd -t failed — removing the site config."
+            run_root rm -f "$conf"; exit 1
+        fi
+    fi
+    run_root systemctl reload "$reload_svc" || true
+    success "Apache site written: $conf"
+    RP_SUMMARY="Apache"
+    run_root test -d "/etc/letsencrypt/live/$DOMAIN" || RP_CERTBOT_HINT=true
+}
+
+# Orchestrate reverse-proxy setup based on RP_MODE + detection.
+setup_reverse_proxy() {
+    if [[ "$RP_MODE" == none ]]; then
+        RP_SUMMARY="not configured (--reverse-proxy=none)"
+        info "Skipping reverse-proxy setup — Aurora will listen on localhost:2583."
+        info "Point your own proxy (Traefik, HAProxy, cloud LB, …) at that address."
+        return 0
+    fi
+    if [[ "$DOMAIN" == localhost ]]; then
+        RP_SUMMARY="not configured (localhost dev)"
+        info "Localhost install — skipping reverse-proxy / TLS setup."
+        return 0
+    fi
+
+    local choice="$RP_MODE"
+    if [[ "$choice" == auto ]]; then
+        choice="$(detect_reverse_proxy)"
+        if [[ "$choice" == multi:* ]]; then
+            local list="${choice#multi:}"
+            warn "Multiple reverse proxies installed ($list) and none is active."
+            if [[ "$NON_INTERACTIVE" == true ]]; then
+                choice="${list%% *}"
+                info "Non-interactive: choosing $choice."
+            else
+                read -r -p "Which should I configure? [caddy/nginx/apache]: " choice
+            fi
+        fi
+    fi
+
+    case "$choice" in
+        caddy)  configure_caddy ;;
+        nginx)  configure_nginx ;;
+        apache) configure_apache ;;
+        none)
+            info "No reverse proxy detected. Caddy gives you automatic Let's Encrypt TLS on a fresh host."
+            local do_it=false
+            if [[ "$NON_INTERACTIVE" == true ]]; then
+                do_it=true
+            else
+                read -r -p "Install and configure Caddy now? [Y/n]: " a
+                [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && do_it=true
+            fi
+            if [[ "$do_it" == true ]]; then
+                configure_caddy
+            else
+                RP_SUMMARY="not configured"
+                warn "No reverse proxy configured — Aurora will listen on localhost:2583 only."
+            fi ;;
+        *)
+            err "Unknown reverse-proxy choice: '$choice' (expected caddy|nginx|apache|none)."
+            exit 1 ;;
+    esac
+}
+
 # ---- locate the repo --------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,6 +391,7 @@ REPO_ROOT="$SCRIPT_DIR"
 ENV_EXAMPLE="$REPO_ROOT/.env.example"
 ENV_OUT="$REPO_ROOT/.env"
 SETUP_DB="$REPO_ROOT/scripts/setup-database.sh"
+SYSTEMD_UNIT="packaging/systemd/aurora-locus.service"
 
 # ---- arguments --------------------------------------------------------------
 
@@ -62,37 +401,76 @@ NON_INTERACTIVE=false
 FORCE=false
 ADMIN_DID=""
 COMPOSE_ENV=true     # set false when the operator declines to overwrite an existing .env
+RP_MODE="auto"       # auto | caddy | nginx | apache | none
+SKIP_RUSTUP=false
+EMIT_PROXY=""        # internal: render a proxy config to stdout and exit
+
+# reverse-proxy result state (for the banner)
+RP_SUMMARY="not configured"
+RP_CERTBOT_HINT=false
 
 usage() {
     cat <<EOF
-Aurora Locus installer — composes a working .env from .env.example.
+Aurora Locus installer — composes .env from .env.example and brings up the
+native deploy path (Rust toolchain + reverse-proxy TLS) to Docker parity.
 
 Usage: ./install.sh [options]
 
-  --domain DOMAIN       Public domain for this PDS (e.g. pds.example.com).
-                        Derives PDS_HOSTNAME / AURORA_DOMAIN / PDS_SERVICE_DID /
-                        PDS_PUBLIC_URL / PDS_SERVICE_HANDLE_DOMAINS. Omit for a
-                        localhost dev install.
-  --data-dir PATH       Data directory (default: ./data).
-  --admin-did DID       DID to print grant-admin bootstrap instructions for.
-  --non-interactive     Never prompt; use defaults / provided flags. Requires
-                        --force to overwrite an existing .env.
-  --force               Overwrite an existing .env (backs it up to .env.bak).
-  -h, --help            Show this help.
+  --domain DOMAIN         Public domain for this PDS (e.g. pds.example.com).
+                          Derives the identity keys and drives reverse-proxy
+                          config. Omit for a localhost dev install (no TLS).
+  --data-dir PATH         Data directory (default: ./data).
+  --admin-did DID         DID to print grant-admin bootstrap instructions for.
+  --reverse-proxy MODE    auto (default) | caddy | nginx | apache | none.
+                          auto detects an installed/active proxy, or offers to
+                          install Caddy on a fresh host. none skips TLS setup.
+  --no-caddy              Alias for --reverse-proxy=none.
+  --skip-rustup           Do not offer to install rustup if it is missing.
+  --non-interactive       Never prompt; accept installs, use defaults / flags.
+                          Requires --force to overwrite an existing .env.
+  --force                 Overwrite an existing .env (backs it up to .env.bak).
+  --emit-proxy-config T   Print the reverse-proxy config (T = caddy|nginx|apache)
+                          for --domain to stdout and exit (preview; no changes).
+  -h, --help              Show this help.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --domain)          DOMAIN="${2:?--domain needs a value}"; shift 2 ;;
-        --data-dir)        DATA_DIR="${2:?--data-dir needs a value}"; shift 2 ;;
-        --admin-did)       ADMIN_DID="${2:?--admin-did needs a value}"; shift 2 ;;
-        --non-interactive) NON_INTERACTIVE=true; shift ;;
-        --force)           FORCE=true; shift ;;
-        -h|--help)         usage; exit 0 ;;
+        --domain)              DOMAIN="${2:?--domain needs a value}"; shift 2 ;;
+        --data-dir)            DATA_DIR="${2:?--data-dir needs a value}"; shift 2 ;;
+        --admin-did)           ADMIN_DID="${2:?--admin-did needs a value}"; shift 2 ;;
+        --reverse-proxy)       RP_MODE="${2:?--reverse-proxy needs a value}"; shift 2 ;;
+        --reverse-proxy=*)     RP_MODE="${1#*=}"; shift ;;
+        --no-caddy)            RP_MODE="none"; shift ;;
+        --skip-rustup)         SKIP_RUSTUP=true; shift ;;
+        --non-interactive)     NON_INTERACTIVE=true; shift ;;
+        --force)               FORCE=true; shift ;;
+        --emit-proxy-config)   EMIT_PROXY="${2:?--emit-proxy-config needs a value}"; shift 2 ;;
+        --emit-proxy-config=*) EMIT_PROXY="${1#*=}"; shift ;;
+        -h|--help)             usage; exit 0 ;;
         *) err "Unknown option: $1"; echo; usage; exit 1 ;;
     esac
 done
+
+case "$RP_MODE" in
+    auto|caddy|nginx|apache|none) : ;;
+    *) err "Invalid --reverse-proxy '$RP_MODE' (expected auto|caddy|nginx|apache|none)."; exit 1 ;;
+esac
+
+# ---- preview short-circuit --------------------------------------------------
+# `--emit-proxy-config` renders a config and exits before any prereqs or writes.
+
+if [[ -n "$EMIT_PROXY" ]]; then
+    [[ -z "$DOMAIN" ]] && DOMAIN="example.com"
+    case "$EMIT_PROXY" in
+        caddy)  render_caddy_block ;;
+        nginx)  render_nginx_conf ;;
+        apache) render_apache_conf ;;
+        *) err "Unknown --emit-proxy-config type '$EMIT_PROXY' (expected caddy|nginx|apache)."; exit 1 ;;
+    esac
+    exit 0
+fi
 
 # ---- prerequisites ----------------------------------------------------------
 
@@ -110,14 +488,12 @@ if ! command -v openssl >/dev/null 2>&1; then
 fi
 success "openssl found"
 
-if command -v cargo >/dev/null 2>&1; then
-    success "cargo found — you can build/run natively (cargo run --release)"
-elif command -v docker >/dev/null 2>&1; then
-    success "docker found — you can run via docker compose up -d"
-else
-    warn "Neither cargo nor docker found. Install one before running the server:"
-    warn "  • Rust toolchain (see rust-toolchain.toml for the pinned version), or"
-    warn "  • Docker + Docker Compose (see docker-compose.yml)."
+# Rust toolchain: bootstrap rustup if missing (unless --skip-rustup). The pinned
+# toolchain in rust-toolchain.toml is fetched on the first cargo invocation.
+bootstrap_rustup
+
+if command -v docker >/dev/null 2>&1; then
+    info "docker also present — the docker-compose path is available as an alternative."
 fi
 
 # ---- gather operator input --------------------------------------------------
@@ -275,6 +651,11 @@ else
     mkdir -p "$DATA_DIR"
 fi
 
+# ---- reverse proxy / TLS ----------------------------------------------------
+
+echo
+setup_reverse_proxy
+
 # ---- final instructions -----------------------------------------------------
 
 header "Install complete"
@@ -287,15 +668,25 @@ else
 fi
 echo "  data directory $DATA_DIR"
 echo "  domain         $DOMAIN"
+echo "  reverse proxy  $RP_SUMMARY"
 echo
 info "Verify the configuration before first boot:"
 echo "  cargo run --release -- validate-config"
 echo
 info "Start the server (schema migrations run automatically on first boot):"
-echo "  cargo run --release            # native"
-echo "  # or"
-echo "  docker compose up -d           # container + automatic-TLS Caddy sidecar"
+echo "  cargo run --release"
 echo
+info "Or run it as a systemd service (recommended for production):"
+echo "  sudo cp $SYSTEMD_UNIT /etc/systemd/system/"
+echo "  sudo systemctl daemon-reload"
+echo "  sudo systemctl enable --now aurora-locus"
+echo "  # (review the unit's User / WorkingDirectory / paths first)"
+echo
+if [[ "$RP_CERTBOT_HINT" == true ]]; then
+    info "Provision a TLS certificate (nginx/Apache don't do it automatically):"
+    echo "  sudo certbot --nginx -d $DOMAIN     # or --apache"
+    echo
+fi
 info "Grant your first admin (admin is table-based, not an env var):"
 echo "  1. Create an account:  ./create-account.sh   (or the createAccount XRPC)"
 if [[ -n "$ADMIN_DID" ]]; then
@@ -306,8 +697,7 @@ fi
 info "(grant-admin is offline and runs migrations itself, so it works before the"
 info " first server boot; the DID must be an account that already exists.)"
 echo
-if [[ "$DOMAIN" != "localhost" ]]; then
-    warn "Native install does not terminate TLS. Put a reverse proxy (nginx, Caddy,"
-    warn "or a cloud load balancer) in front of :2583 for $DOMAIN, or use the"
-    warn "docker-compose path which bundles automatic Let's Encrypt."
+if [[ "$RP_SUMMARY" == "not configured"* && "$DOMAIN" != "localhost" ]]; then
+    warn "No reverse proxy was configured. Aurora listens on localhost:2583 —"
+    warn "terminate TLS and forward to that address with your proxy of choice."
 fi

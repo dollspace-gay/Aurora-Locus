@@ -1,0 +1,32 @@
+# Aurora-Locus PDS — systemd service template.
+#
+# This is a TEMPLATE, not auto-installed by install.sh. Copy it into place and
+# adjust the paths/User to your deployment, then enable it:
+#
+#   sudo cp packaging/systemd/aurora-locus.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now aurora-locus
+#
+# Assumptions to review before enabling:
+#   - the repo lives at /opt/aurora-locus (adjust WorkingDirectory + ExecStart);
+#   - a dedicated unprivileged `aurora` user owns the data directory + .env;
+#   - the release binary has been built (`cargo build --release`).
+# It gives a native deploy the same restart-on-failure supervision that the
+# docker-compose path gets from Compose's restart policy.
+
+[Unit]
+Description=Aurora-Locus PDS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aurora
+WorkingDirectory=/opt/aurora-locus
+EnvironmentFile=/opt/aurora-locus/.env
+ExecStart=/opt/aurora-locus/target/release/aurora-locus
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
