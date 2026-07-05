@@ -22,8 +22,10 @@
 //!
 //! See `docs/internal/dev-routes.md` for curl examples and a
 //! typical workflow.
-
-#![cfg(debug_assertions)]
+//!
+//! This whole module is debug-only; the gate lives on the `pub mod dev_routes`
+//! declaration in `api/mod.rs` (`#[cfg(debug_assertions)]`), so no inner
+//! `#![cfg(debug_assertions)]` is needed here (it would duplicate that gate).
 
 use axum::{
     extract::State,
