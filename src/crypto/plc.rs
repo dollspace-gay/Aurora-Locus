@@ -42,9 +42,14 @@ use std::collections::BTreeMap;
 ///
 /// Field naming on the wire: camelCase (`rotationKeys`,
 /// `verificationMethods`, `alsoKnownAs`) per `#[serde(rename_all)]`.
-/// Field-absence convention: `prev` and `sig` omitted when `None`
-/// (§6.3.1 Case II via [`op_to_canonical_lex_value`] for CBOR;
-/// `serde`'s `skip_serializing_if` for JSON serialization).
+/// Field-absence convention: `sig` is omitted when `None`; `prev` is
+/// ALWAYS serialized — a CID string for updates, explicit `null` for
+/// genesis ops. The did:plc spec requires `prev` be present-as-null on a
+/// creation ("the key should actually be part of the object, with value
+/// null, not simply omitted"), in BOTH the JSON submitted to PLC and the
+/// DAG-CBOR the DID suffix is digested over (§6.3.1). Omitting it makes
+/// production `plc.directory` reject the op with 400 "Not a valid
+/// operation".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlcOperation {
@@ -63,9 +68,9 @@ pub struct PlcOperation {
     /// `"atproto_pds"` → `ServiceEntry { type_:
     /// "AtprotoPersonalDataServer", endpoint: <pds-url> }`.
     pub services: BTreeMap<String, ServiceEntry>,
-    /// CID of the previous accepted op for this DID. `None` for
-    /// genesis ops; `Some(cid_string)` for updates.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// CID of the previous accepted op for this DID. `None` for genesis
+    /// ops — serialized as an explicit `null`, never omitted (did:plc
+    /// spec); `Some(cid_string)` for updates.
     pub prev: Option<String>,
     /// Base64url-no-pad ECDSA signature over canonical DAG-CBOR
     /// of the op with `sig: None`. `None` before signing.
@@ -205,7 +210,10 @@ impl PlcOperationBuilder {
 
 /// §6.3.1 Case II canonical-CBOR converter. Builds a
 /// [`LexValue::Map`] whose entries match the AT Protocol PLC op
-/// wire shape, omitting `prev` and `sig` when `None`.
+/// wire shape. `sig` is omitted when `None`; `prev` is always present
+/// — a CID string for updates, explicit CBOR `null` for genesis ops
+/// (present-as-null per the did:plc spec, so the DID suffix digested
+/// over this CBOR matches what `plc.directory` computes).
 ///
 /// Map ordering input is informational — `proto_blue::lex_cbor::encode`
 /// re-sorts map keys by byte-length then lexicographically per
@@ -243,9 +251,17 @@ pub fn op_to_canonical_lex_value(op: &PlcOperation) -> LexValue {
         .map(|(k, v)| (k.clone(), service_entry_to_lex(v)))
         .collect();
     m.insert("services".to_string(), LexValue::Map(svc_lex));
-    if let Some(prev) = &op.prev {
-        m.insert("prev".to_string(), LexValue::String(prev.clone()));
-    }
+    // `prev` is always present per the did:plc spec: a CID string for
+    // updates, explicit CBOR null for genesis ops (present-as-null, not
+    // omitted). This CBOR is what the DID suffix + op CID are digested
+    // over, so it must match the JSON submitted to PLC.
+    m.insert(
+        "prev".to_string(),
+        match &op.prev {
+            Some(prev) => LexValue::String(prev.clone()),
+            None => LexValue::Null,
+        },
+    );
     if let Some(sig) = &op.sig {
         m.insert("sig".to_string(), LexValue::String(sig.clone()));
     }
@@ -266,9 +282,10 @@ fn service_entry_to_lex(s: &ServiceEntry) -> LexValue {
 /// of the unsigned genesis op, base32-lower (no padding), first 24
 /// chars. The full DID is `format!("did:plc:{}", suffix)`.
 ///
-/// Call site convention: pass the unsigned genesis op (`sig: None`
-/// and `prev: None`) — this is what the PLC spec digests for
-/// suffix derivation.
+/// Call site convention: pass the unsigned genesis op (`sig: None`;
+/// `prev: None`, which is digested as an explicit CBOR `null` per the
+/// did:plc spec) — this is what the PLC spec digests for suffix
+/// derivation.
 pub fn derive_did_suffix(unsigned_op: &PlcOperation) -> PdsResult<String> {
     let lex = op_to_canonical_lex_value(unsigned_op);
     let cbor = lex_encode(&lex)
@@ -524,11 +541,16 @@ mod tests {
     }
 
     #[test]
-    fn test_op_to_canonical_lex_value_omits_none_prev_and_sig() {
+    fn test_op_to_canonical_lex_value_genesis_prev_null_sig_omitted() {
         let op = sample_op();
         let lex = op_to_canonical_lex_value(&op);
         if let LexValue::Map(m) = &lex {
-            assert!(!m.contains_key("prev"));
+            // Genesis: `prev` present as explicit CBOR null (did:plc spec);
+            // `sig` omitted (unsigned op).
+            assert!(
+                matches!(m.get("prev"), Some(LexValue::Null)),
+                "genesis prev must be present as CBOR null, not omitted"
+            );
             assert!(!m.contains_key("sig"));
             // Required fields present.
             assert!(m.contains_key("type"));
@@ -612,11 +634,48 @@ mod tests {
     }
 
     #[test]
-    fn test_json_omits_none_prev_and_sig_via_serde() {
+    fn test_json_genesis_prev_null_sig_omitted_via_serde() {
         let op = sample_op();
         let json = serde_json::to_value(&op).unwrap();
-        assert!(json.get("prev").is_none(), "JSON omits absent prev");
+        // Genesis: `prev` serialized as explicit JSON null (present); `sig`
+        // omitted (unsigned op).
+        assert_eq!(
+            json.get("prev"),
+            Some(&serde_json::Value::Null),
+            "JSON must emit prev: null on genesis, not omit it"
+        );
         assert!(json.get("sig").is_none(), "JSON omits absent sig");
+    }
+
+    #[test]
+    fn test_genesis_prev_null_in_both_json_and_cbor() {
+        // Regression guard for the did:plc "prev present-as-null on genesis"
+        // rule (spec §prev): production `plc.directory` rejects a genesis op
+        // that omits `prev` with 400 "Not a valid operation". The submitted
+        // JSON and the DAG-CBOR the DID suffix is digested over must BOTH
+        // carry `prev` as an explicit null, or the op is rejected / the DID
+        // fails to match PLC's recomputation.
+        let signer = PlcSigner::new(&[42u8; 32]).unwrap();
+        let signed = signer.sign_operation(sample_op()).unwrap();
+
+        // JSON actually POSTed to PLC (`register_plc_did` uses `.json(&op)`).
+        let json = serde_json::to_value(&signed).unwrap();
+        assert_eq!(
+            json.get("prev"),
+            Some(&serde_json::Value::Null),
+            "submitted genesis JSON must carry prev: null"
+        );
+
+        // DAG-CBOR the DID suffix / op CID are digested over.
+        let lex = op_to_canonical_lex_value(&signed);
+        if let LexValue::Map(m) = &lex {
+            assert!(
+                matches!(m.get("prev"), Some(LexValue::Null)),
+                "genesis CBOR must carry prev as null so the DID matches PLC's digest"
+            );
+        } else {
+            panic!("expected LexValue::Map");
+        }
     }
 
     #[test]
