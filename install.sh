@@ -57,10 +57,11 @@ SETUP_DB="$REPO_ROOT/scripts/setup-database.sh"
 # ---- arguments --------------------------------------------------------------
 
 DOMAIN=""
-DATA_DIR="./data"
+DATA_DIR=""          # empty = "not set"; prompted (interactive) or defaults to ./data
 NON_INTERACTIVE=false
 FORCE=false
 ADMIN_DID=""
+COMPOSE_ENV=true     # set false when the operator declines to overwrite an existing .env
 
 usage() {
     cat <<EOF
@@ -136,6 +137,18 @@ else
     info "Configuring for domain: $DOMAIN"
 fi
 
+# Data directory: prompt when interactive and not supplied via --data-dir; empty
+# defaults to ./data. Mirrors the domain-prompt pattern.
+if [[ -z "$DATA_DIR" && "$NON_INTERACTIVE" == false ]]; then
+    echo
+    info "Data directory for databases, blobs and the actor store."
+    read -r -p "Data directory [./data]: " DATA_DIR
+fi
+if [[ -z "$DATA_DIR" ]]; then
+    DATA_DIR="./data"
+fi
+info "Data directory: $DATA_DIR"
+
 # ---- guard an existing .env -------------------------------------------------
 
 if [[ -f "$ENV_OUT" ]]; then
@@ -148,13 +161,25 @@ if [[ -f "$ENV_OUT" ]]; then
     else
         read -r -p ".env already exists. Overwrite? (backs up to .env.bak) [y/N]: " ans
         if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
-            err "Aborted — existing .env left untouched."
-            exit 1
+            COMPOSE_ENV=false
+            info "Keeping existing .env — skipping .env composition step."
+            # Prefer the existing .env's data directory so the rest of the
+            # install (dir prep, final banner) reflects what the server will use.
+            existing_dd="$(grep -E '^PDS_DATA_DIRECTORY=' "$ENV_OUT" | tail -1 | cut -d= -f2- || true)"
+            if [[ -n "$existing_dd" ]]; then
+                DATA_DIR="$existing_dd"
+                info "Using PDS_DATA_DIRECTORY from the existing .env: $DATA_DIR"
+            fi
+        else
+            cp "$ENV_OUT" "$ENV_OUT.bak"
+            warn "Existing .env backed up to .env.bak"
         fi
-        cp "$ENV_OUT" "$ENV_OUT.bak"
-        warn "Existing .env backed up to .env.bak"
     fi
 fi
+
+# ---- compose .env (skipped when keeping an existing .env) -------------------
+
+if [[ "$COMPOSE_ENV" == true ]]; then
 
 # ---- deployment-identity overrides (rule 2) --------------------------------
 #
@@ -235,6 +260,10 @@ mv "$tmp_env" "$ENV_OUT"
 chmod 600 "$ENV_OUT"
 success ".env written ($generated_count secrets generated, $overridden_count identity fields set for $DOMAIN)"
 
+else
+    info "Existing .env left in place (composition skipped)."
+fi
+
 # ---- data directory + schema ------------------------------------------------
 
 echo
@@ -251,7 +280,11 @@ fi
 header "Install complete"
 
 echo "Configuration:"
-echo "  .env           $ENV_OUT   (chmod 600)"
+if [[ "$COMPOSE_ENV" == true ]]; then
+    echo "  .env           $ENV_OUT   (chmod 600)"
+else
+    echo "  .env           $ENV_OUT   (kept existing — not modified)"
+fi
 echo "  data directory $DATA_DIR"
 echo "  domain         $DOMAIN"
 echo
