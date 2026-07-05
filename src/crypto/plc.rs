@@ -278,16 +278,19 @@ fn service_entry_to_lex(s: &ServiceEntry) -> LexValue {
     LexValue::Map(m)
 }
 
-/// §6.3.1 DID-suffix derivation. SHA-256 over canonical DAG-CBOR
-/// of the unsigned genesis op, base32-lower (no padding), first 24
-/// chars. The full DID is `format!("did:plc:{}", suffix)`.
+/// §6.3.1 DID-suffix derivation. SHA-256 over the canonical DAG-CBOR
+/// of the SIGNED genesis op (the `sig` field included), base32-lower
+/// (no padding), first 24 chars. The full DID is
+/// `format!("did:plc:{}", suffix)`.
 ///
-/// Call site convention: pass the unsigned genesis op (`sig: None`;
-/// `prev: None`, which is digested as an explicit CBOR `null` per the
-/// did:plc spec) — this is what the PLC spec digests for suffix
-/// derivation.
-pub fn derive_did_suffix(unsigned_op: &PlcOperation) -> PdsResult<String> {
-    let lex = op_to_canonical_lex_value(unsigned_op);
+/// Call site convention: pass the SIGNED genesis op (the output of
+/// [`PlcSigner::sign_operation`]). Per the did:plc spec the DID is
+/// derived from the signed operation — the same bytes `plc.directory`
+/// recomputes from the submitted body to validate `POST /{did}`, so
+/// deriving over the unsigned op produces a mismatching DID. `prev` is
+/// digested as an explicit CBOR `null` on genesis (chainlink #430).
+pub fn derive_did_suffix(op: &PlcOperation) -> PdsResult<String> {
+    let lex = op_to_canonical_lex_value(op);
     let cbor = lex_encode(&lex)
         .map_err(|e| PdsError::Internal(format!("DAG-CBOR encode failed: {}", e)))?;
     let mut hasher = Sha256::new();
@@ -676,6 +679,45 @@ mod tests {
         } else {
             panic!("expected LexValue::Map");
         }
+    }
+
+    #[test]
+    fn test_did_suffix_derived_from_signed_op_matches_plc_convention() {
+        // did:plc derives the DID from the SIGNED genesis op (sig field
+        // included) — the exact bytes plc.directory recomputes to validate
+        // POST /{did}. Deriving over the unsigned op yields a different
+        // suffix and a DID-identity rejection. Guard the distinction and pin
+        // the digest to the signed CBOR (chainlink #430 follow-on).
+        let signer = PlcSigner::new(&[42u8; 32]).unwrap();
+        let unsigned = sample_op();
+        let signed = signer.sign_operation(unsigned.clone()).unwrap();
+        assert!(signed.sig.is_some(), "sign_operation must set sig");
+
+        let from_signed = derive_did_suffix(&signed).unwrap();
+        let from_unsigned = derive_did_suffix(&unsigned).unwrap();
+        assert_ne!(
+            from_signed, from_unsigned,
+            "signed vs unsigned genesis must digest differently — the sig field \
+             participates in the DID derivation, so the account-manager must \
+             derive from the signed op"
+        );
+
+        // Pin `from_signed` to hash(canonical DAG-CBOR of the SIGNED op)
+        // base32-lower[..24] — i.e. digested over the signed bytes, matching
+        // what PLC computes from the submitted body.
+        let cbor = lex_encode(&op_to_canonical_lex_value(&signed)).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&cbor);
+        let hash = hasher.finalize();
+        let expected = base32::encode(
+            base32::Alphabet::Rfc4648Lower { padding: false },
+            &hash,
+        )[..24]
+            .to_string();
+        assert_eq!(
+            from_signed, expected,
+            "DID suffix must be the digest of the signed op's canonical CBOR"
+        );
     }
 
     #[test]

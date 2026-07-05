@@ -1275,16 +1275,22 @@ impl AccountManager {
             .services(services)
             .build()?;
 
-        // §6.3.1 / Step 0.6.1: DID suffix is SHA-256 of canonical
-        // DAG-CBOR of unsigned op, base32-lower (no padding), first
-        // 24 chars.
-        let did_suffix = derive_did_suffix(&unsigned)?;
-        let did = format!("did:plc:{}", did_suffix);
-
-        // §6.3.2: the PDS-wide rotation key signs (its `did:key`
+        // §6.3.2: the PDS-wide rotation key signs FIRST (its `did:key`
         // is in `rotation_keys[0]`, satisfying chainlink #61 §1.4.5
-        // signer-in-rotation-keys invariant).
+        // signer-in-rotation-keys invariant). Signing must precede DID
+        // derivation because the did:plc spec derives the DID from the
+        // SIGNED genesis op.
         let signed_operation = rotation_signer.sign_operation(unsigned)?;
+
+        // §6.3.1 / Step 0.6.1: per the did:plc spec, the DID suffix is
+        // SHA-256 of the canonical DAG-CBOR of the SIGNED genesis op
+        // (sig field included), base32-lower (no padding), first 24
+        // chars — the same bytes plc.directory recomputes from the
+        // submitted body to validate `POST /{did}`. Deriving from the
+        // unsigned op yields a different suffix and a DID-identity
+        // rejection (chainlink #430 follow-on).
+        let did_suffix = derive_did_suffix(&signed_operation)?;
+        let did = format!("did:plc:{}", did_suffix);
 
         let plc_url = self.config.identity.did_plc_url.as_str();
 
