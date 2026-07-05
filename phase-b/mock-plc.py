@@ -646,14 +646,18 @@ class MockHandler(BaseHTTPRequestHandler):
 
         # Genesis-op did derivation correctness check: the did
         # the caller is POSTing under MUST equal
-        # `did:plc:<base32lower(sha256(canonical_unsigned_cbor))[:24]>`.
-        # If it doesn't match, the genesis op wasn't actually
-        # constructed for this DID — reject.
+        # `did:plc:<base32lower(sha256(canonical_signed_cbor))[:24]>`.
+        # Per the did:plc spec the DID is derived from the SIGNED genesis
+        # operation (the `sig` field IS included in the digested CBOR) — the
+        # same bytes production plc.directory recomputes. Earlier this mock
+        # digested the *unsigned* form (sig stripped), which disagreed with
+        # Aurora + production once chainlink #431 corrected Aurora to
+        # derive-from-signed (CI run #81 InvalidSignature). If it doesn't
+        # match, the genesis op wasn't actually constructed for this DID.
         if is_genesis and op_type == "plc_operation" and self.strict_mode:
-            unsigned = {k: v for k, v in op.items() if k != "sig"}
-            unsigned_cbor = dag_cbor_encode(unsigned)
+            signed_cbor = dag_cbor_encode(op)
             expected_suffix = base32_lower_no_pad(
-                hashlib.sha256(unsigned_cbor).digest()
+                hashlib.sha256(signed_cbor).digest()
             )[:24]
             expected_did = f"did:plc:{expected_suffix}"
             if did != expected_did:

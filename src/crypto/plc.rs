@@ -721,6 +721,27 @@ mod tests {
     }
 
     #[test]
+    fn test_did_suffix_known_answer_vector_matches_strict_dag_cbor() {
+        // Known-answer vector pinning proto-blue's DAG-CBOR to a spec-strict
+        // encoding (chainlink #433). The suffix below was cross-verified
+        // byte-for-byte against an independent, hand-rolled RFC-8949-strict
+        // DAG-CBOR encoder (phase-b/mock-plc.py's `dag_cbor_encode`, which
+        // sorts map keys by byte-length then lexicographically, encodes `null`
+        // as 0xf6, and uses canonical uints): both hash the signed op below to
+        // this exact suffix. If proto-blue's canonicalization ever drifts from
+        // spec-strict form, this breaks — before a non-canonical DID can reach
+        // production `plc.directory`. The vector is fixed by `sample_op()` +
+        // the deterministic secp256k1 key `[42; 32]`.
+        let signer = PlcSigner::new(&[42u8; 32]).unwrap();
+        let signed = signer.sign_operation(sample_op()).unwrap();
+        assert_eq!(
+            derive_did_suffix(&signed).unwrap(),
+            "j6ivb4xbpaj2fn3i5dseb3f6",
+            "proto-blue DAG-CBOR diverged from the spec-strict encoding"
+        );
+    }
+
+    #[test]
     fn test_public_key_extraction() {
         let signer = PlcSigner::new(&[42u8; 32]).unwrap();
         let pk = signer.public_key_hex();
