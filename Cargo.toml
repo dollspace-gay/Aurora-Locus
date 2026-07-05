@@ -59,7 +59,10 @@ serde_json = "1"
 serde_yaml = "0.9"
 
 # Configuration
-dotenv = "0.15"
+# dotenvy is the maintained fork of the (unmaintained) dotenv crate; identical
+# API. Migrated off dotenv 0.15 to clear the RUSTSEC-2021-0141 unmaintained
+# advisory (housekeeping #421).
+dotenvy = "0.15"
 
 # Error handling
 thiserror = "2"

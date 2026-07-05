@@ -1642,7 +1642,7 @@ impl EntrywayConfig {
 impl ServerConfig {
     /// Load configuration from environment variables
     pub fn from_env() -> PdsResult<Self> {
-        dotenv::dotenv().ok();
+        dotenvy::dotenv().ok();
 
         let hostname = env::var("PDS_HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
         let port = env::var("PDS_PORT")
@@ -2790,7 +2790,7 @@ mod env_example_lint_tests {
     //! in `.env.example`. Operators routinely export only
     //! `PDS_DATA_DIRECTORY` for per-instance overlays (e.g., Phase B
     //! pds-a / pds-b); committed `.env.example` entries are copied into
-    //! the operator's local `.env`, dotenv populates them at process
+    //! the operator's local `.env`, dotenvy populates them at process
     //! start (since the operator's shell didn't export them), and the
     //! derivation-from-data-directory path is silently bypassed —
     //! stranding components at the .env-set path instead of following
@@ -2826,7 +2826,7 @@ mod env_example_lint_tests {
                  PDS_DATA_DIRECTORY; committing them as active values \
                  creates a precedence trap where operator-shell-exported \
                  PDS_DATA_DIRECTORY no longer moves the component (the \
-                 dotenv-loaded .env value wins because the operator's \
+                 dotenvy-loaded .env value wins because the operator's \
                  shell didn't export this specific key). Comment the \
                  entry out — operators who genuinely want a non-default \
                  component path can uncomment. See chainlink #94.",
