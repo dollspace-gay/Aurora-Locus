@@ -1,4 +1,8 @@
 .env
+# install.sh backs up an overwritten .env to .env.bak (real secrets); ignore the
+# whole .env* family but keep the tracked template.
+.env*
+!.env.example
 admin_login.bat
 build.log
 create_admin_account.bat
