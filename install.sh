@@ -260,6 +260,97 @@ bootstrap_rustup() {
     success "rustup + pinned toolchain installed — cargo available"
 }
 
+# ---- system C toolchain preflight -------------------------------------------
+
+# Rust crates with C dependencies (openssl-sys, libc, ring, …) need a C compiler
+# and the openssl development headers to build; without them the first
+# `cargo run` dies with "linker `cc` not found" or an openssl-sys build error.
+# Run this BEFORE bootstrap_rustup so rustup-init doesn't first emit its own
+# "no default linker (cc) was found" warning. Idempotent: a present toolchain is
+# detected and skipped.
+ensure_c_toolchain() {
+    local missing=()
+    command -v cc         >/dev/null 2>&1 || missing+=("C compiler (cc)")
+    if command -v pkg-config >/dev/null 2>&1; then
+        pkg-config --exists openssl 2>/dev/null || missing+=("openssl development headers")
+    else
+        missing+=("pkg-config")
+        missing+=("openssl development headers")   # can't probe without pkg-config
+    fi
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        success "C build toolchain found (cc, pkg-config, openssl headers)"
+        return 0
+    fi
+
+    warn "System C toolchain is incomplete — missing: ${missing[*]}."
+    warn "Rust crates like libc and openssl-sys need a C compiler and openssl dev headers."
+
+    local do_install=false
+    if [[ "$NON_INTERACTIVE" == true ]]; then
+        do_install=true
+    else
+        read -r -p "Install the C build toolchain + openssl dev headers now? [Y/n]: " ans
+        [[ -z "$ans" || "${ans,,}" == "y" || "${ans,,}" == "yes" ]] && do_install=true
+    fi
+    if [[ "$do_install" != true ]]; then
+        err "Cannot build Aurora without a C compiler and openssl development headers."
+        err "Install them for your distro and re-run install.sh."
+        exit 1
+    fi
+
+    local distro; distro="$(detect_distro)"
+    info "Installing the C build toolchain ($distro) …"
+    case "$distro" in
+        debian) run_root bash -c "apt-get update && apt-get install -y build-essential pkg-config libssl-dev" ;;
+        rhel)   run_root dnf install -y gcc gcc-c++ make openssl-devel pkgconf-pkg-config ;;
+        arch)   run_root pacman -S --needed --noconfirm base-devel openssl pkgconf ;;
+        *)
+            err "Automatic C-toolchain install is not supported on this distro."
+            err "Install a C compiler, pkg-config, and the openssl development headers"
+            err "(e.g. build-essential + pkg-config + libssl-dev on Debian/Ubuntu), then re-run."
+            exit 1 ;;
+    esac
+
+    hash -r 2>/dev/null || true   # forget stale command lookups after the install
+    if command -v cc >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1 \
+       && pkg-config --exists openssl 2>/dev/null; then
+        success "C build toolchain installed"
+    else
+        err "The C-toolchain install did not satisfy all prerequisites (cc / pkg-config / openssl headers)."
+        err "Install them manually for your distro and re-run install.sh."
+        exit 1
+    fi
+}
+
+# ---- proto-blue-codegen preflight -------------------------------------------
+
+# kryphocron-lexicons' build.rs invokes the proto-blue-codegen binary as a
+# subprocess (§5.2 fallback integration path); without it on PATH the workspace
+# build fails inside that crate. Install it once cargo is available. The ~0.3.1
+# constraint is the one that crate's build.rs error message prescribes.
+# Idempotent: a present binary is detected and skipped.
+ensure_proto_blue_codegen() {
+    if command -v proto-blue-codegen >/dev/null 2>&1; then
+        success "proto-blue-codegen found"
+        return 0
+    fi
+    if ! command -v cargo >/dev/null 2>&1; then
+        warn "cargo is not available — skipping proto-blue-codegen."
+        warn "After you have a Rust toolchain, run: cargo install proto-blue-codegen --version '~0.3.1'"
+        return 0
+    fi
+    info "Installing proto-blue-codegen (required by kryphocron-lexicons build.rs) …"
+    cargo install proto-blue-codegen --version '~0.3.1'
+    hash -r 2>/dev/null || true   # forget stale command lookups after the install
+    if ! command -v proto-blue-codegen >/dev/null 2>&1; then
+        err "proto-blue-codegen installed but the binary is not on PATH."
+        err "Ensure ~/.cargo/bin is on PATH ('source \$HOME/.cargo/env') and re-run install.sh."
+        exit 1
+    fi
+    success "proto-blue-codegen installed ($(proto-blue-codegen --version 2>/dev/null || echo 'version unknown'))"
+}
+
 # ---- Caddy install ----------------------------------------------------------
 
 install_caddy() {
@@ -564,9 +655,18 @@ if ! command -v openssl >/dev/null 2>&1; then
 fi
 success "openssl found"
 
+# System C toolchain (cc + pkg-config + openssl headers): needed to build crates
+# with C dependencies. Done BEFORE rustup so rustup-init doesn't emit its own
+# "no default linker (cc) was found" warning the operator would have to ignore.
+ensure_c_toolchain
+
 # Rust toolchain: bootstrap rustup if missing (unless --skip-rustup). The pinned
 # toolchain in rust-toolchain.toml is fetched on the first cargo invocation.
 bootstrap_rustup
+
+# proto-blue-codegen: build-time codegen binary kryphocron-lexicons' build.rs
+# invokes; install once cargo is available so the first `cargo build` succeeds.
+ensure_proto_blue_codegen
 
 if command -v docker >/dev/null 2>&1; then
     info "docker also present — the docker-compose path is available as an alternative."
