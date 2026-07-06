@@ -356,11 +356,37 @@ async fn initiate_oauth(
 ) -> Result<Redirect, (StatusCode, String)> {
     tracing::info!("Initiating OAuth admin login");
 
+    // #432 Fix 2 front-door: admin login is restricted to LOCAL accounts. When
+    // a handle hint is supplied, reject a non-local one HERE — before the OAuth
+    // round-trip — so the operator sees a clear error instead of failing at the
+    // callback. Resolution is against the LOCAL account store only (not PLC), so
+    // a handle that happens to resolve elsewhere is still refused. The no-hint
+    // case is caught by Fix 1's callback gate (`authorize_local_admin`).
+    if let Some(handle) = params.handle.as_deref() {
+        if ctx.account_manager.get_account_by_identifier(handle).await.is_err() {
+            tracing::warn!(
+                handle = %handle,
+                "Admin login rejected: handle has no local account on this PDS"
+            );
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Admin login requires an account hosted on this PDS.".to_string(),
+            ));
+        }
+    }
+
     let oauth_client = build_oauth_client(&ctx);
 
-    // Discover the AS for this PDS.
-    let pds_url = &ctx.config.authentication.oauth.pds_url;
-    let server_metadata = oauth_client.discover_server(pds_url).await.map_err(|e| {
+    // #432 Fix 2: admins are local accounts (see `authorize_local_admin`), so
+    // the authorization server is always THIS PDS. Discover against our own
+    // issuer — `ctx.service_url()` == `service.effective_public_url()`, the same
+    // value the AS metadata publishes as `issuer` and did.json as
+    // `serviceEndpoint` — rather than the legacy external `oauth.pds_url`
+    // (bsky.social), where a local handle is unknown. proto-blue then routes the
+    // browser to `{issuer}/oauth/atproto/authorize` (PAR-based, per our AS
+    // metadata) and the callback lands back at `/admin-oauth/callback`.
+    let pds_url = ctx.service_url();
+    let server_metadata = oauth_client.discover_server(&pds_url).await.map_err(|e| {
         tracing::error!("Failed to discover server metadata: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -673,7 +699,10 @@ async fn client_metadata(State(ctx): State<AppContext>) -> Json<ClientMetadataRe
 
 #[cfg(test)]
 mod tests {
-    use super::{authorize_local_admin, handle_refresh, mint_admin_access_jwt, RefreshRequest};
+    use super::{
+        authorize_local_admin, handle_refresh, initiate_oauth, mint_admin_access_jwt,
+        OAuthInitParams, OAuthStateStore, RefreshRequest,
+    };
     use crate::admin::roles::Role;
     use crate::config::*;
     use crate::AppContext;
@@ -981,6 +1010,28 @@ mod tests {
     }
 
     // Fix 1 (#432): admin OAuth is constrained to local accounts.
+
+    #[tokio::test]
+    async fn initiate_oauth_rejects_non_local_handle_at_front_door() {
+        // Fix 2 (#432) front-door: a handle hint with no local account is
+        // refused before any OAuth round-trip (no network / discovery reached).
+        let ctx = create_test_context().await;
+        let res = initiate_oauth(
+            State(ctx),
+            axum::Extension(OAuthStateStore::new()),
+            axum::extract::Query(OAuthInitParams {
+                handle: Some("stranger.example.com".to_string()),
+            }),
+        )
+        .await;
+        let err = res.expect_err("non-local handle must be refused at the front door");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            err.1.contains("hosted on this PDS"),
+            "expected local-account message, got: {}",
+            err.1
+        );
+    }
 
     #[tokio::test]
     async fn authorize_local_admin_rejects_non_local_did() {
