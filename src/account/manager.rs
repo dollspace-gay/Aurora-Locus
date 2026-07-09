@@ -345,6 +345,32 @@ impl AccountManager {
         did: &str,
         app_password_name: Option<String>,
     ) -> PdsResult<Session> {
+        // Regular sessions: 1h access / 180d refresh, no IP binding.
+        self.create_session_with(
+            did,
+            app_password_name,
+            Duration::hours(1),
+            Duration::days(180),
+            None,
+        )
+        .await
+    }
+
+    /// Create a session with explicit access- and refresh-token lifetimes and an
+    /// optional bound IP. [`AccountManager::create_session`] is the
+    /// regular-default wrapper; admin sessions (Phase 4 · #442) pass a short 15m
+    /// access lifetime + a role-based refresh (idle-timeout) lifetime.
+    ///
+    /// `bound_ip` is persisted on the `session` row for the IP-binding commit; it
+    /// is NOT enforced here (enforcement lands with the trust_proxy-gated check).
+    pub async fn create_session_with(
+        &self,
+        did: &str,
+        app_password_name: Option<String>,
+        access_ttl: Duration,
+        refresh_ttl: Duration,
+        bound_ip: Option<String>,
+    ) -> PdsResult<Session> {
         let session_id = Uuid::new_v4().to_string();
 
         // Generate JWT tokens
@@ -352,12 +378,12 @@ impl AccountManager {
         let refresh_token_str = self.generate_refresh_token(did, &session_id)?;
 
         let now = Utc::now();
-        let expires_at = now + Duration::hours(1); // Access token expires in 1 hour
+        let expires_at = now + access_ttl;
 
         // Insert session
         sqlx::query(
-            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)"
+            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name, bound_ip)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
         )
         .bind(&session_id)
         .bind(did)
@@ -366,13 +392,14 @@ impl AccountManager {
         .bind(now.to_rfc3339())
         .bind(expires_at.to_rfc3339())
         .bind(&app_password_name)
+        .bind(&bound_ip)
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
 
         // Store refresh token
         let refresh_token_id = Uuid::new_v4().to_string();
-        let refresh_expires = now + Duration::days(180); // Refresh token expires in 6 months
+        let refresh_expires = now + refresh_ttl;
 
         sqlx::query(
             "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used, next_id)
@@ -536,6 +563,23 @@ impl AccountManager {
     /// When a token is refreshed, the old token remains valid for 2 hours but points to
     /// the new token, preventing race conditions.
     pub async fn refresh_session(&self, refresh_token: &str) -> PdsResult<Session> {
+        // Regular sessions: 1h access / 180d refresh.
+        self.refresh_session_with(refresh_token, Duration::hours(1), Duration::days(180))
+            .await
+    }
+
+    /// Rotate a session's tokens with explicit access-/refresh-token lifetimes
+    /// (Phase 4 · #442). Admin refresh passes a 15m access lifetime + the
+    /// role-based refresh (idle-timeout) lifetime, so activity within the window
+    /// slides the session and idle beyond it expires. The rotated session carries
+    /// the previous session's `bound_ip` forward, so an IP-bound session stays
+    /// bound across refreshes.
+    pub async fn refresh_session_with(
+        &self,
+        refresh_token: &str,
+        access_ttl: Duration,
+        refresh_ttl: Duration,
+    ) -> PdsResult<Session> {
         let now = Utc::now();
 
         // Find and validate refresh token. Lookup + expiry are shared with
@@ -583,10 +627,22 @@ impl AccountManager {
             ));
         }
 
+        // Carry the previous session's bound IP forward so an IP-bound admin
+        // session stays bound across refreshes (Phase 4 · #442). The old session
+        // still exists (its access token is valid until expiry) and still points
+        // at the token being refreshed.
+        let bound_ip: Option<String> =
+            sqlx::query_scalar("SELECT bound_ip FROM session WHERE refresh_token = $1")
+                .bind(refresh_token)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(PdsError::Database)?
+                .flatten();
+
         // Create new refresh token
         let new_token_id = uuid::Uuid::new_v4().to_string();
         let new_refresh_token = self.generate_refresh_token(&did, &new_token_id)?;
-        let refresh_expires = now + Duration::days(180); // 180 days
+        let refresh_expires = now + refresh_ttl;
 
         // Insert new refresh token
         sqlx::query(
@@ -621,12 +677,12 @@ impl AccountManager {
         // Create new access token
         let new_session_id = uuid::Uuid::new_v4().to_string();
         let access_token = self.generate_access_token(&did, &new_session_id)?;
-        let access_expires = now + Duration::hours(1);
+        let access_expires = now + access_ttl;
 
-        // Insert new session
+        // Insert new session (carrying the bound IP forward)
         sqlx::query(
-            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name)
-             VALUES ($1, $2, $3, $4, $5, $6, NULL)"
+            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name, bound_ip)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)"
         )
         .bind(&new_session_id)
         .bind(&did)
@@ -634,6 +690,7 @@ impl AccountManager {
         .bind(&new_refresh_token)
         .bind(now.to_rfc3339())
         .bind(access_expires.to_rfc3339())
+        .bind(&bound_ip)
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;

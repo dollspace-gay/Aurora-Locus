@@ -3,8 +3,8 @@ use crate::{
     account::AccountManager,
     actor_store::{ActorStore, ActorStoreConfig},
     admin::{
-        AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager,
-        OperatorSessionStore, ReportManager,
+        security_config::AdminSecurityStore, AdminRoleManager, InviteCodeManager, LabelManager,
+        ModerationManager, OperatorSessionStore, ReportManager,
     },
     blob_store::{BlobBackendType, BlobStorageConfig, BlobStore, BlobStoreConfig},
     config::{BlobstoreConfig, DatabaseConfig, DistributedStateMode, ServerConfig},
@@ -73,6 +73,9 @@ pub struct AppContext {
     pub plc_client: Arc<dyn crate::crypto::plc_client::PlcClientApi>,
     // Admin & Moderation
     pub admin_role_manager: Arc<AdminRoleManager>,
+    /// Per-DID admin security settings (Phase 4 · #442): IP binding, session
+    /// lifetime override, TOTP enrollment state. Over `account_db`.
+    pub admin_security_store: Arc<AdminSecurityStore>,
     /// Per-operator session store (§8.1.7 / #271): backs admin session
     /// listing, force-logout, and refresh rotation. Keyed by the `sid`
     /// claim carried in admin access/refresh tokens.
@@ -386,6 +389,7 @@ impl std::fmt::Debug for AppContext {
             .field("blob_store", &"<BlobStore>")
             .field("identity_resolver", &"<dyn IdentityResolverApi>")
             .field("admin_role_manager", &"<AdminRoleManager>")
+            .field("admin_security_store", &"<AdminSecurityStore>")
             .field("operator_session_store", &"<OperatorSessionStore>")
             .field("moderation_manager", &"<ModerationManager>")
             .field("label_manager", &"<LabelManager>")
@@ -642,6 +646,7 @@ impl AppContext {
 
         // Initialize admin & moderation managers
         let admin_role_manager = Arc::new(AdminRoleManager::new(account_db.clone()));
+        let admin_security_store = Arc::new(AdminSecurityStore::new(account_db.clone()));
         let operator_session_store = Arc::new(OperatorSessionStore::new(account_db.clone()));
         // v0.9 Arc H §7.4.3 (#291) — bulk repository-repair scan substrate.
         let scan_findings_store =
@@ -1319,6 +1324,7 @@ impl AppContext {
             blob_store,
             identity_resolver,
             admin_role_manager,
+            admin_security_store,
             operator_session_store,
             moderation_manager,
             label_manager,
