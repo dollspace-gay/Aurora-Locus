@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0]
+
+> The full v0.10.0 changelog — a from-scratch pass over the cycle's ~40+
+> commits — is pending review. The entries below are only the tail-end tooling
+> changes committed after the version bump; the rest of the cycle is not yet
+> enumerated here.
+
 ### Added
 
 - `test/install-sh-smoke/` — containerized preflight smoke for `install.sh` on Rocky Linux, AlmaLinux, and Arch, asserting each distro takes the correct package-manager branch (`dnf` for Rocky/Alma, `pacman` for Arch) and installs a working C toolchain. Run with `test/install-sh-smoke/run-smoke.sh`

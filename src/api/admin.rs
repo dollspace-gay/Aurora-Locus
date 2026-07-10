@@ -12454,7 +12454,7 @@ mod tests {
             r#"},"#,
             // ---- implementation, version (literals) ----
             r#""implementation":"aurora-locus","#,
-            r#""version":"0.9.0""#,
+            r#""version":"0.10.0""#,
             r#"}"#,
         );
         assert_eq!(
@@ -12658,7 +12658,7 @@ mod tests {
         // version comes from CARGO_PKG_VERSION; pinned to the
         // current cycle release per CR-4 / chainlink #117. Bump in
         // lockstep with Cargo.toml when the cycle increments.
-        assert_eq!(resp.version, "0.9.0");
+        assert_eq!(resp.version, "0.10.0");
 
         // Families object must include the four Aurora namespaces, each
         // a JSON array (possibly empty for namespaces that haven't
