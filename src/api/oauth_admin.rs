@@ -306,9 +306,9 @@ async fn handle_refresh(
     }
 
     // Path 2: account-backed admin refresh token (rotates). Phase 4 · #442:
-    // rotate with a 15m access token + the DID's role-based refresh (idle)
-    // lifetime (honoring any per-account override), so admin sessions slide on
-    // activity and expire on idle. The DID is read directly (not via
+    // re-mint both tokens with the DID's single role-based (task-time) lifetime
+    // (honoring any per-account override), so admin sessions slide on activity
+    // and expire on idle. The DID is read directly (not via
     // validate_refresh_token, whose fail-closed semantics would reject a
     // grace-period token that refresh_session handles); a non-admin token (no
     // role) keeps the regular refresh lifetimes.
@@ -330,13 +330,13 @@ async fn handle_refresh(
                 Some(d) => ctx.admin_security_store.get_config(d).await.ok().flatten(),
                 None => None,
             };
-            let refresh_secs =
+            let lifetime_secs =
                 sec::compute_admin_session_lifetime_secs(ar.role, cfg.as_ref());
             ctx.account_manager
                 .refresh_session_with(
                     &req.refresh_token,
-                    chrono::Duration::seconds(sec::ADMIN_ACCESS_TOKEN_LIFETIME_SECS),
-                    chrono::Duration::seconds(refresh_secs),
+                    chrono::Duration::seconds(lifetime_secs),
+                    chrono::Duration::seconds(lifetime_secs),
                 )
                 .await
         }
@@ -673,21 +673,22 @@ async fn authorize_local_admin(
     tracing::info!("Admin {} authenticated with role {}", did, role);
 
     // A local account is guaranteed above, so this always yields a real account
-    // session whose tokens `route_local_verify` validates. Phase 4 · #442: a 15m
-    // access token + a role-based refresh (idle-timeout) lifetime, honoring any
-    // per-account override. bound_ip is None here — IP binding wires in a later
-    // commit.
+    // session whose tokens `route_local_verify` validates. Phase 4 · #442:
+    // access and refresh tokens share a single role-based (task-time) lifetime,
+    // honoring any per-account override, so activity slides the whole session
+    // and idle past the window expires it. bound_ip is None here — IP binding
+    // wires in a later commit.
     use crate::admin::security_config as sec;
     let security_config = ctx.admin_security_store.get_config(did).await.ok().flatten();
-    let refresh_secs =
+    let lifetime_secs =
         sec::compute_admin_session_lifetime_secs(admin_role.role, security_config.as_ref());
     let session = ctx
         .account_manager
         .create_session_with(
             did,
             None,
-            chrono::Duration::seconds(sec::ADMIN_ACCESS_TOKEN_LIFETIME_SECS),
-            chrono::Duration::seconds(refresh_secs),
+            chrono::Duration::seconds(lifetime_secs),
+            chrono::Duration::seconds(lifetime_secs),
             None,
         )
         .await
@@ -1541,7 +1542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_session_uses_15m_access_and_role_based_refresh() {
+    async fn admin_session_uses_single_role_based_lifetime() {
         let ctx = create_test_context().await;
         let did = "did:plc:seclifetime000000000000000";
         seed_local_account(&ctx, did, "admin.localhost").await;
@@ -1554,7 +1555,8 @@ mod tests {
         let (access, refresh, role) = authorize_local_admin(&ctx, did).await.unwrap();
         assert_eq!(role, "superadmin");
 
-        // Access token expires ~15 minutes out (fixed for all roles).
+        // Both tokens share the superadmin 15m task-time lifetime — activity
+        // slides the whole session, idle past the window expires it.
         let access_exp: String =
             sqlx::query_scalar("SELECT expires_at FROM session WHERE access_token = $1")
                 .bind(&access)
@@ -1564,10 +1566,9 @@ mod tests {
         let access_secs = (parse_rfc3339(&access_exp) - before).num_seconds();
         assert!(
             (14 * 60..=16 * 60).contains(&access_secs),
-            "access token should be ~15m, got {access_secs}s"
+            "superadmin access should be ~15m, got {access_secs}s"
         );
 
-        // Refresh token expires ~1 hour out (superadmin role default).
         let refresh_exp: String =
             sqlx::query_scalar("SELECT expires_at FROM refresh_token WHERE token = $1")
                 .bind(&refresh)
@@ -1576,8 +1577,8 @@ mod tests {
                 .unwrap();
         let refresh_secs = (parse_rfc3339(&refresh_exp) - before).num_seconds();
         assert!(
-            (59 * 60..=61 * 60).contains(&refresh_secs),
-            "superadmin refresh should be ~1h, got {refresh_secs}s"
+            (14 * 60..=16 * 60).contains(&refresh_secs),
+            "superadmin refresh should also be ~15m, got {refresh_secs}s"
         );
     }
 
@@ -1590,14 +1591,27 @@ mod tests {
             .grant_role(did, Role::SuperAdmin, "system", None)
             .await
             .unwrap();
-        // Override the superadmin 1h default to 2h.
+        // Override the superadmin 15m default to 2h — both tokens honor it.
         ctx.admin_security_store
             .set_session_lifetime(did, Some(7200))
             .await
             .unwrap();
 
         let before = chrono::Utc::now();
-        let (_access, refresh, _role) = authorize_local_admin(&ctx, did).await.unwrap();
+        let (access, refresh, _role) = authorize_local_admin(&ctx, did).await.unwrap();
+
+        let access_exp: String =
+            sqlx::query_scalar("SELECT expires_at FROM session WHERE access_token = $1")
+                .bind(&access)
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        let access_secs = (parse_rfc3339(&access_exp) - before).num_seconds();
+        assert!(
+            (119 * 60..=121 * 60).contains(&access_secs),
+            "overridden access should be ~2h, got {access_secs}s"
+        );
+
         let refresh_exp: String =
             sqlx::query_scalar("SELECT expires_at FROM refresh_token WHERE token = $1")
                 .bind(&refresh)

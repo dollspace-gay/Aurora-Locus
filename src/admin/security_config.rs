@@ -2,9 +2,15 @@
 //! lifetime override, and TOTP enrollment state, keyed by DID in the
 //! `admin_security_config` table. A sibling to `admin_roles`; absence of a row
 //! means all defaults, so a config is only written when a DID opts into a
-//! feature. This commit (Phase 4 · 2/4) uses the store for the session-lifetime
-//! override + the role-based sliding-refresh defaults; IP binding and TOTP wire
-//! their columns in later commits.
+//! feature. The store backs the session-lifetime override + the role-based
+//! sliding-refresh defaults; IP binding and TOTP wire their columns in later
+//! commits.
+//!
+//! Sliding-refresh model: access and refresh tokens share a single lifetime,
+//! sized to the role's typical task time (SuperAdmin 15m / Admin 30m /
+//! Moderator 1h). Both tokens are minted with that lifetime and every refresh
+//! re-mints both, so activity slides the whole session forward and idle past
+//! the window expires it. A per-account override replaces the role default.
 
 use crate::error::{PdsError, PdsResult};
 use chrono::Utc;
@@ -18,12 +24,6 @@ pub const MIN_SESSION_LIFETIME_SECS: i64 = 60;
 /// Maximum accepted session-lifetime override — 30 days.
 pub const MAX_SESSION_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
 
-/// Admin access-token lifetime — a fixed 15 minutes for every role. Access
-/// tokens are short-lived per-request credentials, refreshed frequently, so a
-/// stolen one has a small blast radius. Only the refresh (idle) lifetime is
-/// role-based.
-pub const ADMIN_ACCESS_TOKEN_LIFETIME_SECS: i64 = 15 * 60;
-
 /// A DID's admin security settings. Callers treat a `None` from
 /// [`AdminSecurityStore::get_config`] as "all defaults"; this struct is only
 /// materialised for a DID that has a row.
@@ -31,7 +31,8 @@ pub const ADMIN_ACCESS_TOKEN_LIFETIME_SECS: i64 = 15 * 60;
 pub struct AdminSecurityConfig {
     pub did: String,
     pub ip_binding_enabled: bool,
-    /// Refresh-token (idle) lifetime override in seconds; `None` = role default.
+    /// Session lifetime override in seconds — applies to both the access and
+    /// refresh tokens; `None` = role default.
     pub session_lifetime_secs: Option<i64>,
     pub totp_secret_encrypted: Option<String>,
     pub totp_confirmed_at: Option<String>,
@@ -122,18 +123,20 @@ impl AdminSecurityStore {
     }
 }
 
-/// Role-based refresh-token (idle-timeout) lifetime, before any override.
+/// Role-based session lifetime (both tokens, idle-timeout), before any
+/// override. Sized to the role's typical task time: the shorter the burst of
+/// work a role does, the tighter its idle window.
 fn role_default_lifetime_secs(role: Role) -> i64 {
     match role {
-        Role::SuperAdmin => 60 * 60, // 1h — highest privilege, irreversible ops
-        Role::Admin => 4 * 60 * 60,  // 4h — standard, mostly-reversible ops
-        Role::Moderator => 8 * 60 * 60, // 8h — reversible actions, work-shift
+        Role::SuperAdmin => 15 * 60, // 15m — one-off structural changes, short tasks
+        Role::Admin => 30 * 60,      // 30m — triage + config + investigation
+        Role::Moderator => 60 * 60,  // 1h — content review, appeals, evidence
     }
 }
 
-/// The admin refresh-token lifetime in seconds: the per-account override when
-/// set (bounds-validated at write time, re-clamped here defensively against a
-/// bad row), else the role default.
+/// The admin session lifetime in seconds — governs both the access and refresh
+/// tokens: the per-account override when set (bounds-validated at write time,
+/// re-clamped here defensively against a bad row), else the role default.
 pub fn compute_admin_session_lifetime_secs(
     role: Role,
     config: Option<&AdminSecurityConfig>,
@@ -149,10 +152,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn role_defaults_are_1h_4h_8h() {
-        assert_eq!(compute_admin_session_lifetime_secs(Role::SuperAdmin, None), 3600);
-        assert_eq!(compute_admin_session_lifetime_secs(Role::Admin, None), 14400);
-        assert_eq!(compute_admin_session_lifetime_secs(Role::Moderator, None), 28800);
+    fn role_defaults_are_15m_30m_1h() {
+        assert_eq!(compute_admin_session_lifetime_secs(Role::SuperAdmin, None), 15 * 60);
+        assert_eq!(compute_admin_session_lifetime_secs(Role::Admin, None), 30 * 60);
+        assert_eq!(compute_admin_session_lifetime_secs(Role::Moderator, None), 60 * 60);
     }
 
     fn cfg(secs: Option<i64>) -> AdminSecurityConfig {
@@ -172,10 +175,10 @@ mod tests {
             compute_admin_session_lifetime_secs(Role::SuperAdmin, Some(&cfg(Some(3600 * 2)))),
             7200,
         );
-        // NULL override → role default (superadmin 1h), not the override.
+        // NULL override → role default (superadmin 15m), not the override.
         assert_eq!(
             compute_admin_session_lifetime_secs(Role::SuperAdmin, Some(&cfg(None))),
-            3600,
+            15 * 60,
         );
     }
 
