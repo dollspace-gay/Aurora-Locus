@@ -1,0 +1,26 @@
+# install.sh preflight smoke — Arch Linux (arch / pacman branch).
+#
+# Verifies that on Arch, detect_distro resolves to `arch` (/etc/arch-release) and
+# ensure_c_toolchain takes the `pacman -S base-devel …` branch, leaving a working
+# C toolchain. Preflight smoke only (see Dockerfile.rocky for the full
+# rationale). A red build → flag via chainlink, do NOT patch install.sh.
+FROM archlinux:latest
+
+# Minimal prereqs ONLY: git + openssl (curl + bash ship in the base). `pacman -Sy`
+# also syncs the package DB so install.sh's `pacman -S base-devel` (which does not
+# self-sync) can resolve. Deliberately NOT base-devel — ensure_c_toolchain must
+# find the toolchain missing for the pacman branch to fire.
+RUN pacman -Sy --noconfirm git openssl
+
+WORKDIR /aurora
+COPY install.sh .env.example ./
+
+RUN bash install.sh --non-interactive --skip-rustup --reverse-proxy none --domain localhost \
+        > /tmp/install.log 2>&1 || true; \
+    if grep -q "C build toolchain (arch)" /tmp/install.log \
+       && grep -q "C build toolchain installed" /tmp/install.log; then \
+        echo "SMOKE-OK: Arch -> arch/pacman preflight branch exercised and completed"; \
+    else \
+        echo "SMOKE-FAIL: Arch -> arch/pacman preflight branch did not complete"; \
+        echo "----- install.log -----"; cat /tmp/install.log; exit 1; \
+    fi

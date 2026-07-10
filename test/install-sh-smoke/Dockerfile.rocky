@@ -1,0 +1,34 @@
+# install.sh preflight smoke — Rocky Linux (rhel / dnf branch).
+#
+# Verifies that on Rocky, install.sh's detect_distro resolves to `rhel`
+# (/etc/redhat-release) and ensure_c_toolchain takes the `dnf install` branch,
+# leaving a working C toolchain (cc + pkg-config + openssl headers).
+#
+# This is a PREFLIGHT smoke, not a full install: --skip-rustup + no cargo means
+# bootstrap_rustup / proto-blue-codegen / cargo build are all skipped, so the
+# only heavy step is the toolchain install this test targets. A green build
+# means the branch ran and completed; a red build means it did not (flag via
+# chainlink — do NOT patch install.sh from here without review).
+FROM rockylinux:9
+
+# Minimal prereqs ONLY: git + openssl (curl + bash ship in the base image).
+# Deliberately NOT the C toolchain — ensure_c_toolchain must find it MISSING for
+# the dnf branch to fire.
+RUN dnf -y install git openssl && dnf clean all
+
+WORKDIR /aurora
+# Only what the preflight touches (the branch runs before any project build).
+COPY install.sh .env.example ./
+
+# Run through the toolchain preflight non-interactively, then assert the
+# rhel/dnf branch ran and left a complete toolchain. `|| true` because install.sh
+# continues (and exits non-zero) after the preflight; we judge on the log.
+RUN bash install.sh --non-interactive --skip-rustup --reverse-proxy none --domain localhost \
+        > /tmp/install.log 2>&1 || true; \
+    if grep -q "C build toolchain (rhel)" /tmp/install.log \
+       && grep -q "C build toolchain installed" /tmp/install.log; then \
+        echo "SMOKE-OK: Rocky -> rhel/dnf preflight branch exercised and completed"; \
+    else \
+        echo "SMOKE-FAIL: Rocky -> rhel/dnf preflight branch did not complete"; \
+        echo "----- install.log -----"; cat /tmp/install.log; exit 1; \
+    fi

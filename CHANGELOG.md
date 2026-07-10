@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `test/install-sh-smoke/` — containerized preflight smoke for `install.sh` on Rocky Linux, AlmaLinux, and Arch, asserting each distro takes the correct package-manager branch (`dnf` for Rocky/Alma, `pacman` for Arch) and installs a working C toolchain. Run with `test/install-sh-smoke/run-smoke.sh`
+
 ### Changed
 
 - `create-account.sh` now uses `PDS_SERVICE_PUBLIC_URL` as the API endpoint when set (falling back to the internal `PDS_HOSTNAME:PDS_PORT`), adds connect/response timeouts to its curl calls so an unreachable server fails fast, and accepts the "make admin?" prompt case-insensitively (`yes`/`y` in any case)
