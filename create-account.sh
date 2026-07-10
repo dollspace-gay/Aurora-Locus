@@ -80,14 +80,23 @@ load_config() {
         export "$key=$value"
     done < <(grep -E '^[A-Z_]+=.*' .env)
 
-    PDS_URL="http://${PDS_HOSTNAME}:${PDS_PORT}"
+    # Prefer the deployment's canonical public URL when set. The config designates
+    # PDS_SERVICE_PUBLIC_URL as the real endpoint and the hostname:port form as the
+    # "internal :2583 leak"; its default is http://localhost:2583, so standard
+    # installs are unchanged, while a real deployment (PDS_HOSTNAME set to a public
+    # domain not served on :2583) now reaches the API instead of a dead port.
+    if [ -n "${PDS_SERVICE_PUBLIC_URL:-}" ]; then
+        PDS_URL="${PDS_SERVICE_PUBLIC_URL%/}"
+    else
+        PDS_URL="http://${PDS_HOSTNAME}:${PDS_PORT}"
+    fi
 }
 
 # Check if server is running
 check_server() {
     print_info "Checking if PDS is running..."
 
-    if ! curl -s "${PDS_URL}/health" > /dev/null 2>&1; then
+    if ! curl -s --connect-timeout 5 --max-time 10 "${PDS_URL}/health" > /dev/null 2>&1; then
         print_error "PDS server is not running at ${PDS_URL}"
         echo ""
         print_info "Start the server with:"
@@ -142,7 +151,8 @@ create_account() {
     print_info "Creating account: $FULL_HANDLE"
 
     # Call API
-    RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${PDS_URL}/xrpc/com.atproto.server.createAccount" \
+    RESPONSE=$(curl -s -w "\n%{http_code}" --connect-timeout 5 --max-time 30 \
+      -X POST "${PDS_URL}/xrpc/com.atproto.server.createAccount" \
       -H "Content-Type: application/json" \
       -d "{\"handle\":\"$FULL_HANDLE\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}")
 
@@ -162,12 +172,14 @@ create_account() {
         echo "  Handle:   $FULL_HANDLE"
         echo "  Email:    $EMAIL"
         echo "  DID:      $DID"
+        echo "  PDS URL:  $PDS_URL"
         echo ""
 
-        # Check if this should be an admin
+        # Check if this should be an admin. Accept any case + the y/yes forms.
         prompt MAKE_ADMIN "Make this account an admin? (yes/no)" "no"
+        MAKE_ADMIN=$(printf '%s' "$MAKE_ADMIN" | tr '[:upper:]' '[:lower:]')
 
-        if [ "$MAKE_ADMIN" = "yes" ]; then
+        if [ "$MAKE_ADMIN" = "yes" ] || [ "$MAKE_ADMIN" = "y" ]; then
             echo ""
             print_info "To grant admin access, insert an admin_roles row:"
             echo ""
