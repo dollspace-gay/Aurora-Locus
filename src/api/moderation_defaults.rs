@@ -507,6 +507,7 @@ mod tests {
                 repo_signing_key: "a".repeat(64),
                 plc_rotation_key: "b".repeat(64),
                 password_login_enabled: false,
+                admin_totp_encryption_key_hex: None,
                 oauth: OAuthConfig {
                     client_id: "http://localhost:3000/client-metadata.json".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),

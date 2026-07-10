@@ -1064,6 +1064,23 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(revoke_operator_sessions),
             CapsBuilder::new(Family::Admin),
         )
+        // Phase 4 (#442) — self-service admin TOTP 2FA. Every operator manages
+        // their OWN enrollment (keyed on auth.did); all three are step-up gated.
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.enrollTotp",
+            post(enroll_totp),
+            CapsBuilder::new(Family::Admin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.confirmTotp",
+            post(confirm_totp),
+            CapsBuilder::new(Family::Admin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.disableTotp",
+            post(disable_totp),
+            CapsBuilder::new(Family::Admin),
+        )
         .build()
 }
 
@@ -1730,6 +1747,259 @@ async fn set_session_lifetime(
         success: true,
         did: req.did,
         session_lifetime_secs: req.session_lifetime_secs,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// Map any `Display` error to a generic 500 JSON body. Trims the boilerplate
+/// from the multi-step hardening handlers below.
+fn internal_error<E: std::fmt::Display>(e: E) -> (StatusCode, Json<serde_json::Value>) {
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalServerError",
+        e.to_string(),
+    )
+}
+
+/// Request for `tools.aurora.admin.confirmTotp`.
+#[derive(Debug, Deserialize)]
+struct ConfirmTotpRequest {
+    code: String,
+}
+
+/// Output for `tools.aurora.admin.enrollTotp`: the secret to add to an
+/// authenticator app (base32 + otpauth URI). TOTP is NOT enforced at login until
+/// the caller confirms a code via `confirmTotp`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrollTotpOutput {
+    secret: String,
+    provisioning_uri: String,
+    audit_entry_id: String,
+}
+
+/// Output for `confirmTotp` / `disableTotp`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TotpStatusOutput {
+    success: bool,
+    audit_entry_id: String,
+}
+
+/// `tools.aurora.admin.enrollTotp` — begin TOTP 2FA enrollment for the caller's
+/// OWN account (Phase 4 · #442). Self-service (keyed on `auth.did`), step-up
+/// gated. Generates a secret, stores it encrypted-at-rest (pending, unconfirmed),
+/// and returns the base32 secret + otpauth URI. Refuses (503) when no encryption
+/// key is configured — a secret is never persisted in plaintext. 409 if TOTP is
+/// already enabled (disable first), so a fresh secret can't silently replace a
+/// confirmed one.
+async fn enroll_totp(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<EnrollTotpOutput>, (StatusCode, Json<serde_json::Value>)> {
+    require_step_up(&ctx, &auth).await?;
+
+    let cipher = ctx.admin_totp_cipher.as_ref().ok_or_else(|| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TotpUnavailable",
+            "TOTP is unavailable: set PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX to enable enrollment",
+        )
+    })?;
+
+    if let Some(cfg) = ctx
+        .admin_security_store
+        .get_config(&auth.did)
+        .await
+        .map_err(internal_error)?
+    {
+        if cfg.totp_confirmed_at.is_some() {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "AlreadyEnabled",
+                "TOTP is already enabled; disable it before re-enrolling",
+            ));
+        }
+    }
+
+    let enrollment =
+        crate::admin::totp::generate_enrollment(&auth.did).map_err(internal_error)?;
+    let encrypted = cipher.encrypt(&enrollment.secret_bytes).map_err(internal_error)?;
+
+    let subject = Subject::Repo {
+        did: auth.did.clone(),
+    };
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    crate::admin::security_config::AdminSecurityStore::set_totp_pending_in_tx(
+        &mut tx,
+        &auth.did,
+        &encrypted,
+    )
+    .await
+    .map_err(internal_error)?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "admin.totp.enroll",
+            subject: Some(&subject),
+            rationale: "self-service TOTP enrollment (pending confirmation)",
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(Json(EnrollTotpOutput {
+        secret: enrollment.secret_base32,
+        provisioning_uri: enrollment.provisioning_uri,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// `tools.aurora.admin.confirmTotp` — confirm a pending enrollment by proving a
+/// current code (Phase 4 · #442). Self-service, step-up gated. On success sets
+/// `totp_confirmed_at`, after which login enforces TOTP. 400 if there is no
+/// pending enrollment or it is already confirmed; 401 on a wrong code.
+async fn confirm_totp(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<ConfirmTotpRequest>,
+) -> Result<Json<TotpStatusOutput>, (StatusCode, Json<serde_json::Value>)> {
+    require_step_up(&ctx, &auth).await?;
+
+    let cipher = ctx.admin_totp_cipher.as_ref().ok_or_else(|| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TotpUnavailable",
+            "TOTP is unavailable: set PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX",
+        )
+    })?;
+
+    let cfg = ctx
+        .admin_security_store
+        .get_config(&auth.did)
+        .await
+        .map_err(internal_error)?
+        .filter(|c| c.totp_secret_encrypted.is_some())
+        .ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "NoPendingEnrollment",
+                "no pending TOTP enrollment to confirm; call enrollTotp first",
+            )
+        })?;
+    if cfg.totp_confirmed_at.is_some() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "AlreadyConfirmed",
+            "TOTP is already confirmed",
+        ));
+    }
+
+    let secret_enc = cfg
+        .totp_secret_encrypted
+        .as_deref()
+        .expect("totp_secret_encrypted is Some by the filter above");
+    let secret = cipher.decrypt(secret_enc).map_err(internal_error)?;
+    if !crate::admin::totp::verify_code(secret, req.code.trim()).map_err(internal_error)? {
+        return Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "InvalidCode",
+            "invalid TOTP code",
+        ));
+    }
+
+    let subject = Subject::Repo {
+        did: auth.did.clone(),
+    };
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    let confirmed =
+        crate::admin::security_config::AdminSecurityStore::confirm_totp_in_tx(&mut tx, &auth.did)
+            .await
+            .map_err(internal_error)?;
+    if !confirmed {
+        // Raced with a disable between the read and the write.
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "NoPendingEnrollment",
+            "no pending TOTP enrollment to confirm",
+        ));
+    }
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "admin.totp.confirm",
+            subject: Some(&subject),
+            rationale: "self-service TOTP confirmation (2FA now enforced at login)",
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(Json(TotpStatusOutput {
+        success: true,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// `tools.aurora.admin.disableTotp` — turn off TOTP for the caller's OWN account
+/// (Phase 4 · #442). Self-service, step-up gated. Idempotent: clearing when TOTP
+/// was never set is a no-op success.
+async fn disable_totp(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<TotpStatusOutput>, (StatusCode, Json<serde_json::Value>)> {
+    require_step_up(&ctx, &auth).await?;
+
+    let subject = Subject::Repo {
+        did: auth.did.clone(),
+    };
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    crate::admin::security_config::AdminSecurityStore::clear_totp_in_tx(&mut tx, &auth.did)
+        .await
+        .map_err(internal_error)?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "admin.totp.disable",
+            subject: Some(&subject),
+            rationale: "self-service TOTP disabled",
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(Json(TotpStatusOutput {
+        success: true,
         audit_entry_id: audit_entry_id.to_string(),
     }))
 }
@@ -9823,6 +10093,7 @@ mod tests {
                 repo_signing_key: "a".repeat(64),
                 plc_rotation_key: "b".repeat(64),
                 password_login_enabled: false,
+                admin_totp_encryption_key_hex: None,
                 oauth: OAuthConfig {
                     client_id: "http://localhost:3000/client-metadata.json".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -10348,6 +10619,209 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // Phase 4 (#442): self-service admin TOTP 2FA — enroll / confirm / disable.
+    const TOTP_TEST_KEY_HEX: &str =
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    async fn totp_test_context() -> AppContext {
+        create_test_context_with(|c| {
+            c.authentication.admin_totp_encryption_key_hex = Some(TOTP_TEST_KEY_HEX.to_string());
+        })
+        .await
+    }
+
+    fn admin_auth(did: &str, session_id: &str, role: Role) -> AdminAuthContext {
+        AdminAuthContext {
+            did: did.to_string(),
+            session: ValidatedSession {
+                did: did.to_string(),
+                session_id: session_id.to_string(),
+                is_app_password: false,
+            },
+            role,
+        }
+    }
+
+    /// Seed a self-service admin with a fresh (step-up-passing) session; returns
+    /// its session id.
+    async fn seed_admin_with_session(ctx: &AppContext, did: &str, handle: &str) -> String {
+        seed_test_account(ctx, did, handle, None).await;
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "system", None)
+            .await
+            .unwrap();
+        ctx.account_manager
+            .create_session(did, None)
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// Compute the current TOTP code for a DID's stored (encrypted) secret.
+    async fn current_totp_code(ctx: &AppContext, did: &str) -> String {
+        let enc = ctx
+            .admin_security_store
+            .get_config(did)
+            .await
+            .unwrap()
+            .unwrap()
+            .totp_secret_encrypted
+            .unwrap();
+        let secret = ctx.admin_totp_cipher.as_ref().unwrap().decrypt(&enc).unwrap();
+        totp_rs::TOTP::new(totp_rs::Algorithm::SHA1, 6, 1, 30, secret)
+            .unwrap()
+            .generate_current()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn totp_enroll_confirm_disable_round_trip() {
+        let ctx = totp_test_context().await;
+        let did = "did:plc:totpround";
+        let sid = seed_admin_with_session(&ctx, did, "totpround.localhost").await;
+
+        // Enroll → pending secret + provisioning URI, not yet confirmed.
+        let out = enroll_totp(State(ctx.clone()), admin_auth(did, &sid, Role::Admin))
+            .await
+            .expect("enroll")
+            .0;
+        assert!(!out.secret.is_empty());
+        assert!(out.provisioning_uri.starts_with("otpauth://totp/"));
+        let cfg = ctx.admin_security_store.get_config(did).await.unwrap().unwrap();
+        assert!(cfg.totp_secret_encrypted.is_some(), "secret stored");
+        assert!(cfg.totp_confirmed_at.is_none(), "not yet confirmed");
+        // Stored form is not the base32 secret in the clear (it's encrypted).
+        assert_ne!(cfg.totp_secret_encrypted.as_deref().unwrap(), out.secret);
+
+        // Confirm with the live code → enforced from now on.
+        let code = current_totp_code(&ctx, did).await;
+        let confirmed = confirm_totp(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(ConfirmTotpRequest { code }),
+        )
+        .await
+        .expect("confirm")
+        .0;
+        assert!(confirmed.success);
+        assert!(ctx
+            .admin_security_store
+            .get_config(did)
+            .await
+            .unwrap()
+            .unwrap()
+            .totp_confirmed_at
+            .is_some());
+
+        // Disable → fully cleared.
+        let _ = disable_totp(State(ctx.clone()), admin_auth(did, &sid, Role::Admin))
+            .await
+            .expect("disable");
+        let cfg = ctx.admin_security_store.get_config(did).await.unwrap().unwrap();
+        assert!(cfg.totp_secret_encrypted.is_none());
+        assert!(cfg.totp_confirmed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn totp_enroll_refuses_without_encryption_key() {
+        // A context WITHOUT the key → cipher absent → 503 (never plaintext).
+        let ctx = create_test_context().await;
+        let did = "did:plc:totpnokey";
+        let sid = seed_admin_with_session(&ctx, did, "totpnokey.localhost").await;
+        let err = enroll_totp(State(ctx), admin_auth(did, &sid, Role::Admin))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.1 .0["error"], "TotpUnavailable");
+    }
+
+    #[tokio::test]
+    async fn totp_enroll_conflicts_when_already_enabled() {
+        let ctx = totp_test_context().await;
+        let did = "did:plc:totpdup";
+        let sid = seed_admin_with_session(&ctx, did, "totpdup.localhost").await;
+        let _ = enroll_totp(State(ctx.clone()), admin_auth(did, &sid, Role::Admin))
+            .await
+            .unwrap();
+        let code = current_totp_code(&ctx, did).await;
+        let _ = confirm_totp(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(ConfirmTotpRequest { code }),
+        )
+        .await
+        .unwrap();
+        // Re-enroll while confirmed → 409.
+        let err = enroll_totp(State(ctx.clone()), admin_auth(did, &sid, Role::Admin))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn totp_confirm_rejects_wrong_code_and_missing_pending() {
+        let ctx = totp_test_context().await;
+        let did = "did:plc:totpwrong";
+        let sid = seed_admin_with_session(&ctx, did, "totpwrong.localhost").await;
+
+        // No pending enrollment → 400.
+        let err = confirm_totp(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(ConfirmTotpRequest {
+                code: "000000".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // Enroll, then confirm with a deliberately wrong code → 401, unconfirmed.
+        let _ = enroll_totp(State(ctx.clone()), admin_auth(did, &sid, Role::Admin))
+            .await
+            .unwrap();
+        let live = current_totp_code(&ctx, did).await;
+        let wrong = if live == "000000" { "111111" } else { "000000" };
+        let err = confirm_totp(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(ConfirmTotpRequest {
+                code: wrong.to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert!(ctx
+            .admin_security_store
+            .get_config(did)
+            .await
+            .unwrap()
+            .unwrap()
+            .totp_confirmed_at
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn totp_enroll_requires_step_up() {
+        let ctx = totp_test_context().await;
+        let did = "did:plc:totpstale";
+        let sid = seed_admin_with_session(&ctx, did, "totpstale.localhost").await;
+        // Age the session past the step-up window.
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        sqlx::query("UPDATE session SET authenticated_at = $1 WHERE id = $2")
+            .bind(&stale)
+            .bind(&sid)
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let err = enroll_totp(State(ctx), admin_auth(did, &sid, Role::Admin))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0["error"], "StepUpRequired");
     }
 
     #[tokio::test]
@@ -11664,7 +12138,7 @@ mod tests {
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
-            // tools.aurora.admin (21 endpoints)
+            // tools.aurora.admin (24 endpoints)
             r#""tools.aurora.admin":["#,
             r#""emitEvent","#,
             r#""batchTakedownAccounts","#,
@@ -11687,7 +12161,10 @@ mod tests {
             r#""listInstalled","#,
             r#""listSessions","#,
             r#""revokeSession","#,
-            r#""revokeOperatorSessions""#,
+            r#""revokeOperatorSessions","#,
+            r#""enrollTotp","#,
+            r#""confirmTotp","#,
+            r#""disableTotp""#,
             r#"],"#,
             // tools.aurora.moderator (7 endpoints)
             r#""tools.aurora.moderator":["#,

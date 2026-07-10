@@ -420,6 +420,7 @@ mod tests {
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration".to_string(),
                 password_login_enabled: false,
+                admin_totp_encryption_key_hex: None,
             },
             identity: IdentityConfig { did_plc_url: "https://plc.directory".to_string(), service_handle_domains: vec![".localhost".to_string()], did_cache_stale_ttl: 3600, did_cache_max_ttl: 86400, recovery_did_key: None },
             email: None,

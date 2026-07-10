@@ -367,6 +367,9 @@ struct AdminLoginRequest {
     /// Handle or email of the local admin account.
     identifier: String,
     password: String,
+    /// TOTP code (#442), required only for admins who have confirmed 2FA.
+    #[serde(default)]
+    totp_code: Option<String>,
 }
 
 /// Response from `POST /admin-oauth/password-login`. Mirrors the token shape the
@@ -463,6 +466,27 @@ async fn handle_password_login(
         ));
     };
 
+    // TOTP 2FA (#442): if this admin has confirmed TOTP, require + verify a code
+    // before releasing the session. `login` already minted the session, so on any
+    // TOTP failure we revoke it and return the SAME generic 401 as a bad password
+    // — otherwise a TOTP-specific error would confirm the password was correct
+    // (a password oracle).
+    if let Some(cfg) = ctx
+        .admin_security_store
+        .get_config(&account.did)
+        .await
+        .ok()
+        .flatten()
+    {
+        if cfg.totp_confirmed_at.is_some()
+            && !verify_login_totp(&ctx, &cfg, req.totp_code.as_deref()).await
+        {
+            let _ = ctx.account_manager.delete_session(&session.id).await;
+            tracing::debug!(did = %account.did, "admin password login rejected: TOTP failed");
+            return Err((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()));
+        }
+    }
+
     tracing::info!(
         did = %account.did,
         role = %admin_role.role.as_str(),
@@ -474,6 +498,27 @@ async fn handle_password_login(
         did: account.did,
         role: admin_role.role.as_str().to_string(),
     }))
+}
+
+/// Verify a login-time TOTP code against a DID's confirmed secret (#442). Fails
+/// closed on every ambiguity: no code submitted, no encryption key configured, a
+/// decrypt failure, or a bad code all return `false`.
+async fn verify_login_totp(
+    ctx: &AppContext,
+    cfg: &crate::admin::security_config::AdminSecurityConfig,
+    submitted: Option<&str>,
+) -> bool {
+    let (Some(code), Some(enc), Some(cipher)) = (
+        submitted,
+        cfg.totp_secret_encrypted.as_deref(),
+        ctx.admin_totp_cipher.as_ref(),
+    ) else {
+        return false;
+    };
+    match cipher.decrypt(enc) {
+        Ok(secret) => crate::admin::totp::verify_code(secret, code.trim()).unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 /// Generate a PKCE `(code_verifier, S256 code_challenge)` pair (RFC 7636). The
@@ -680,6 +725,22 @@ async fn authorize_local_admin(
     // wires in a later commit.
     use crate::admin::security_config as sec;
     let security_config = ctx.admin_security_store.get_config(did).await.ok().flatten();
+    // TOTP-enrolled admins must use the password-login form, which verifies the
+    // code (#442). The OAuth browser redirect has no code-entry step, so minting
+    // a session here would be a silent 2FA bypass; block + direct to password
+    // login rather than skip the second factor.
+    if security_config
+        .as_ref()
+        .and_then(|c| c.totp_confirmed_at.as_deref())
+        .is_some()
+    {
+        tracing::warn!(did = %did, "OAuth admin login blocked: account has TOTP enabled");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "This admin account has TOTP enabled; sign in via the password login form."
+                .to_string(),
+        ));
+    }
     let lifetime_secs =
         sec::compute_admin_session_lifetime_secs(admin_role.role, security_config.as_ref());
     let session = ctx
@@ -938,7 +999,7 @@ mod tests {
     const TEST_SECRET: &str = "test-secret-key-aurora-admin-test-32xx";
 
     async fn create_test_context() -> AppContext {
-        build_test_context(None, true).await
+        build_test_context(None, true, None).await
     }
 
     /// As `create_test_context`, but with an explicit `service.public_url` — used
@@ -946,6 +1007,7 @@ mod tests {
     async fn build_test_context(
         public_url: Option<String>,
         password_login_enabled: bool,
+        admin_totp_encryption_key_hex: Option<String>,
     ) -> AppContext {
         let dir = tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
@@ -988,6 +1050,7 @@ mod tests {
                 oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration"
                     .to_string(),
                 password_login_enabled,
+                admin_totp_encryption_key_hex,
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -1298,6 +1361,7 @@ mod tests {
             Json(AdminLoginRequest {
                 identifier: "admin.localhost".to_string(),
                 password: "correct-horse-battery-staple".to_string(),
+                totp_code: None,
             }),
         )
         .await
@@ -1329,6 +1393,7 @@ mod tests {
             Json(AdminLoginRequest {
                 identifier: "admin.localhost".to_string(),
                 password: "the-WRONG-password".to_string(),
+                totp_code: None,
             }),
         )
         .await
@@ -1353,6 +1418,7 @@ mod tests {
             Json(AdminLoginRequest {
                 identifier: "bob.localhost".to_string(),
                 password: "bobs-password".to_string(),
+                totp_code: None,
             }),
         )
         .await
@@ -1369,6 +1435,7 @@ mod tests {
             Json(AdminLoginRequest {
                 identifier: "ghost.localhost".to_string(),
                 password: "whatever".to_string(),
+                totp_code: None,
             }),
         )
         .await
@@ -1383,12 +1450,13 @@ mod tests {
     #[tokio::test]
     async fn password_login_gate_redirects_to_admin_when_disabled() {
         use axum::http::header;
-        let ctx = build_test_context(None, false).await;
+        let ctx = build_test_context(None, false, None).await;
         let resp = password_login_gate(
             State(ctx),
             Json(AdminLoginRequest {
                 identifier: "admin.localhost".to_string(),
                 password: "whatever".to_string(),
+                totp_code: None,
             }),
         )
         .await;
@@ -1404,12 +1472,13 @@ mod tests {
     async fn password_login_gate_delegates_when_enabled() {
         // Enabled: the gate passes through to the handler, which rejects an
         // unknown identifier with 401 (not a 302) — proving delegation.
-        let ctx = build_test_context(None, true).await;
+        let ctx = build_test_context(None, true, None).await;
         let resp = password_login_gate(
             State(ctx),
             Json(AdminLoginRequest {
                 identifier: "ghost.localhost".to_string(),
                 password: "whatever".to_string(),
+                totp_code: None,
             }),
         )
         .await;
@@ -1502,6 +1571,112 @@ mod tests {
         assert!(
             err.1.contains("not authorized as an admin"),
             "expected not-an-admin message, got: {}",
+            err.1
+        );
+    }
+
+    // Phase 4 (#442): admin TOTP 2FA at login — enforced on the password path,
+    // and the OAuth path blocked for TOTP-enrolled admins (no bypass).
+    const TOTP_LOGIN_KEY_HEX: &str =
+        "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+    /// Store a CONFIRMED TOTP enrollment for a DID and return the raw secret so a
+    /// test can compute live codes.
+    async fn seed_confirmed_totp(ctx: &AppContext, did: &str) -> Vec<u8> {
+        let enrollment = crate::admin::totp::generate_enrollment(did).unwrap();
+        let enc = ctx
+            .admin_totp_cipher
+            .as_ref()
+            .expect("test context has a TOTP key")
+            .encrypt(&enrollment.secret_bytes)
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO admin_security_config \
+             (did, ip_binding_enabled, totp_secret_encrypted, totp_confirmed_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(did)
+        .bind(false)
+        .bind(&enc)
+        .bind(&now)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        enrollment.secret_bytes
+    }
+
+    fn totp_code_for(secret: &[u8]) -> String {
+        totp_rs::TOTP::new(totp_rs::Algorithm::SHA1, 6, 1, 30, secret.to_vec())
+            .unwrap()
+            .generate_current()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn password_login_enforces_totp_when_enrolled() {
+        let ctx = build_test_context(None, true, Some(TOTP_LOGIN_KEY_HEX.to_string())).await;
+        let did = "did:plc:totplogin0000000000000000";
+        seed_password_admin(&ctx, did, "totp.localhost", "correct-horse", Some(Role::Admin)).await;
+        let secret = seed_confirmed_totp(&ctx, did).await;
+
+        // Correct password + correct code → success.
+        let ok = handle_password_login(
+            State(ctx.clone()),
+            Json(AdminLoginRequest {
+                identifier: "totp.localhost".to_string(),
+                password: "correct-horse".to_string(),
+                totp_code: Some(totp_code_for(&secret)),
+            }),
+        )
+        .await
+        .expect("valid password + TOTP logs in");
+        assert_eq!(ok.0.did, did);
+
+        // Correct password, MISSING code → 401 (fails closed).
+        let err = handle_password_login(
+            State(ctx.clone()),
+            Json(AdminLoginRequest {
+                identifier: "totp.localhost".to_string(),
+                password: "correct-horse".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+
+        // Correct password, WRONG code → 401. (Pick a code different from live.)
+        let live = totp_code_for(&secret);
+        let wrong = if live == "000000" { "111111" } else { "000000" };
+        let err = handle_password_login(
+            State(ctx.clone()),
+            Json(AdminLoginRequest {
+                identifier: "totp.localhost".to_string(),
+                password: "correct-horse".to_string(),
+                totp_code: Some(wrong.to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oauth_login_blocked_for_totp_enrolled_admin() {
+        let ctx = build_test_context(None, true, Some(TOTP_LOGIN_KEY_HEX.to_string())).await;
+        let did = "did:plc:totpoauth0000000000000000";
+        seed_password_admin(&ctx, did, "totpoauth.localhost", "pw", Some(Role::Admin)).await;
+        seed_confirmed_totp(&ctx, did).await;
+
+        // The OAuth callback path (authorize_local_admin) has no code-entry step,
+        // so it must refuse rather than silently skip the second factor.
+        let err = authorize_local_admin(&ctx, did).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            err.1.contains("password login"),
+            "message should redirect to password login, got: {}",
             err.1
         );
     }
@@ -1660,7 +1835,7 @@ mod tests {
         // A context whose public URL IS that in-process AS (Aurora talks to its
         // own AS); both the admin client and the AS handlers derive their URLs
         // from this, so their DPoP htu values line up.
-        let ctx = build_test_context(Some(as_url.clone()), true).await;
+        let ctx = build_test_context(Some(as_url.clone()), true, None).await;
 
         // Serve Aurora's real AS routes on the same ctx (shared account_db).
         let app = crate::oauth::atproto::routes().with_state(ctx.clone());

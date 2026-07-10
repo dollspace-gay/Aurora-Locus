@@ -159,6 +159,88 @@ impl AdminSecurityStore {
         }
         Ok(())
     }
+
+    /// Store a pending (unconfirmed) TOTP secret for a DID (#442): sets
+    /// `totp_secret_encrypted` and clears `totp_confirmed_at`, so a half-finished
+    /// enrollment is not enforced at login. Upserts, preserving the other
+    /// settings. Transaction-aware for atomic mutation + audit.
+    pub async fn set_totp_pending_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        encrypted_secret: &str,
+    ) -> PdsResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let updated = sqlx::query(
+            "UPDATE admin_security_config \
+             SET totp_secret_encrypted = $1, totp_confirmed_at = NULL, updated_at = $2 \
+             WHERE did = $3",
+        )
+        .bind(encrypted_secret)
+        .bind(&now)
+        .bind(did)
+        .execute(&mut **tx)
+        .await
+        .map_err(PdsError::Database)?
+        .rows_affected();
+
+        if updated == 0 {
+            sqlx::query(
+                "INSERT INTO admin_security_config (did, ip_binding_enabled, totp_secret_encrypted, updated_at) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(did)
+            .bind(false)
+            .bind(encrypted_secret)
+            .bind(&now)
+            .execute(&mut **tx)
+            .await
+            .map_err(PdsError::Database)?;
+        }
+        Ok(())
+    }
+
+    /// Mark a DID's pending TOTP secret as confirmed (#442): sets
+    /// `totp_confirmed_at = now`. Returns `false` if there was no row with a
+    /// pending secret to confirm (caller maps to a 400). Transaction-aware.
+    pub async fn confirm_totp_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+    ) -> PdsResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        let updated = sqlx::query(
+            "UPDATE admin_security_config \
+             SET totp_confirmed_at = $1, updated_at = $2 \
+             WHERE did = $3 AND totp_secret_encrypted IS NOT NULL",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(did)
+        .execute(&mut **tx)
+        .await
+        .map_err(PdsError::Database)?
+        .rows_affected();
+        Ok(updated > 0)
+    }
+
+    /// Clear a DID's TOTP entirely (#442): nulls both the secret and the
+    /// confirmation. A no-op (0 rows) when TOTP was never set. Transaction-aware.
+    pub async fn clear_totp_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+    ) -> PdsResult<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE admin_security_config \
+             SET totp_secret_encrypted = NULL, totp_confirmed_at = NULL, updated_at = $1 \
+             WHERE did = $2",
+        )
+        .bind(&now)
+        .bind(did)
+        .execute(&mut **tx)
+        .await
+        .map_err(PdsError::Database)?;
+        Ok(())
+    }
 }
 
 /// Validate a session-lifetime override is within `[MIN, MAX]`. `None` (revert

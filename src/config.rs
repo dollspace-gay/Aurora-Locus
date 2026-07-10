@@ -1042,6 +1042,12 @@ pub struct AuthConfig {
     /// here at startup; not a runtime toggle.
     #[serde(default)]
     pub password_login_enabled: bool,
+    /// AES-256 key (hex, 64 chars) for encrypting admin TOTP secrets at rest
+    /// (#442), from `PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX`. `None` when unset — TOTP
+    /// enrollment then refuses rather than persisting a plaintext secret. Read
+    /// once at boot; decoded to key bytes at cipher-construction time.
+    #[serde(default)]
+    pub admin_totp_encryption_key_hex: Option<String>,
 }
 
 fn default_jwt_sunset_date() -> String {
@@ -1739,6 +1745,35 @@ impl ServerConfig {
             tracing::info!("Password login: DISABLED (default)");
         }
 
+        // Admin TOTP secret-encryption key (#442). Validated eagerly at boot so a
+        // malformed key fails startup rather than the first enrollment. Absent =
+        // TOTP enrollment unavailable (refuses rather than storing plaintext).
+        let admin_totp_encryption_key_hex = env::var("PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        match admin_totp_encryption_key_hex.as_deref() {
+            Some(hex_key) => {
+                let decoded = hex::decode(hex_key.trim()).map_err(|_| {
+                    PdsError::Validation(
+                        "PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX is not valid hex".to_string(),
+                    )
+                })?;
+                if decoded.len() != 32 {
+                    return Err(PdsError::Validation(
+                        "PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX must be 32 bytes (64 hex chars)"
+                            .to_string(),
+                    ));
+                }
+                tracing::info!("Admin TOTP: encryption key configured (2FA enrollment available)");
+            }
+            None => {
+                tracing::info!(
+                    "Admin TOTP: no encryption key set — 2FA enrollment unavailable \
+                     (set PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX to enable)"
+                );
+            }
+        }
+
         let did_plc_url =
             env::var("PDS_DID_PLC_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
         let service_handle_domains = env::var("PDS_SERVICE_HANDLE_DOMAINS")
@@ -2024,6 +2059,7 @@ impl ServerConfig {
                 oauth_migration_guide_url: env::var("PDS_OAUTH_MIGRATION_GUIDE_URL")
                     .unwrap_or_else(|_| default_migration_guide_url()),
                 password_login_enabled,
+                admin_totp_encryption_key_hex,
             },
             identity: IdentityConfig {
                 did_plc_url,

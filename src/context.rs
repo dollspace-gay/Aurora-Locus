@@ -3,8 +3,8 @@ use crate::{
     account::AccountManager,
     actor_store::{ActorStore, ActorStoreConfig},
     admin::{
-        security_config::AdminSecurityStore, AdminRoleManager, InviteCodeManager, LabelManager,
-        ModerationManager, OperatorSessionStore, ReportManager,
+        security_config::AdminSecurityStore, totp::AdminTotpCipher, AdminRoleManager,
+        InviteCodeManager, LabelManager, ModerationManager, OperatorSessionStore, ReportManager,
     },
     blob_store::{BlobBackendType, BlobStorageConfig, BlobStore, BlobStoreConfig},
     config::{BlobstoreConfig, DatabaseConfig, DistributedStateMode, ServerConfig},
@@ -76,6 +76,10 @@ pub struct AppContext {
     /// Per-DID admin security settings (Phase 4 · #442): IP binding, session
     /// lifetime override, TOTP enrollment state. Over `account_db`.
     pub admin_security_store: Arc<AdminSecurityStore>,
+    /// AES-256-GCM cipher for admin TOTP secrets at rest (Phase 4 · #442).
+    /// `None` when `PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX` is unset — TOTP
+    /// enrollment then refuses rather than persisting a plaintext secret.
+    pub admin_totp_cipher: Option<Arc<AdminTotpCipher>>,
     /// Per-operator session store (§8.1.7 / #271): backs admin session
     /// listing, force-logout, and refresh rotation. Keyed by the `sid`
     /// claim carried in admin access/refresh tokens.
@@ -390,6 +394,10 @@ impl std::fmt::Debug for AppContext {
             .field("identity_resolver", &"<dyn IdentityResolverApi>")
             .field("admin_role_manager", &"<AdminRoleManager>")
             .field("admin_security_store", &"<AdminSecurityStore>")
+            .field(
+                "admin_totp_cipher",
+                &self.admin_totp_cipher.as_ref().map(|_| "<AdminTotpCipher>"),
+            )
             .field("operator_session_store", &"<OperatorSessionStore>")
             .field("moderation_manager", &"<ModerationManager>")
             .field("label_manager", &"<LabelManager>")
@@ -647,6 +655,13 @@ impl AppContext {
         // Initialize admin & moderation managers
         let admin_role_manager = Arc::new(AdminRoleManager::new(account_db.clone()));
         let admin_security_store = Arc::new(AdminSecurityStore::new(account_db.clone()));
+        // Admin TOTP cipher (#442): present only when a key is configured. The
+        // key was already validated at config load, so this decode succeeds; a
+        // belt-and-braces `?` still surfaces any drift rather than panicking.
+        let admin_totp_cipher = AdminTotpCipher::from_config(
+            config.authentication.admin_totp_encryption_key_hex.as_deref(),
+        )?
+        .map(Arc::new);
         let operator_session_store = Arc::new(OperatorSessionStore::new(account_db.clone()));
         // v0.9 Arc H §7.4.3 (#291) — bulk repository-repair scan substrate.
         let scan_findings_store =
@@ -1325,6 +1340,7 @@ impl AppContext {
             identity_resolver,
             admin_role_manager,
             admin_security_store,
+            admin_totp_cipher,
             operator_session_store,
             moderation_manager,
             label_manager,
